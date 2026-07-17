@@ -13,13 +13,9 @@ permissions:
 
 jobs:
   benchmark:
-    runs-on: [self-hosted, m5-bench]
+    # Blacksmith supports 6- and 12-vCPU macOS 26 runners.
+    runs-on: blacksmith-12vcpu-macos-26
     timeout-minutes: 180
-    env:
-      LIGHTER_BENCH_EXEC: /opt/bench/bench-exec.sh
-      LIGHTER_JANITOR: /opt/bench/janitor.sh
-      LIGHTER_QUARANTINE_FLAG: /opt/bench/quarantine.flag
-      LIGHTER_JOB_WS: /Users/Shared/bench-jobs/lighter-prover-current
     steps:
       - name: Host preflight
         run: |
@@ -27,9 +23,7 @@ jobs:
           test "${GITHUB_REF}" = refs/heads/master
           test "$(uname -s)" = Darwin
           test "$(uname -m)" = arm64
-          test ! -e "${LIGHTER_QUARANTINE_FLAG}"
-          test -e "${LIGHTER_BENCH_EXEC}"
-          test -e "${LIGHTER_JANITOR}"
+          test -x /usr/bin/sandbox-exec
           command -v cargo jq rustup >/dev/null
 
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -49,18 +43,3 @@ jobs:
           path: |
             score.json
             score.json.sha256
-
-      - name: Clean benchmark workspace
-        if: always()
-        run: |
-          if [[ -d "${LIGHTER_JOB_WS}" ]]; then
-            sudo -n "${LIGHTER_BENCH_EXEC}" "${LIGHTER_JOB_WS}" \
-              /bin/sh -c 'find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null; true' || true
-            rm -rf "${LIGHTER_JOB_WS}" || true
-          fi
-
-      - name: Janitor reset and integrity audit
-        if: always()
-        run: |
-          sudo -n "${LIGHTER_JANITOR}"
-          test ! -e "${LIGHTER_QUARANTINE_FLAG}"

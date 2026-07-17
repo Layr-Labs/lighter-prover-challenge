@@ -36,11 +36,12 @@ is no separate score command or log parser. Local results are not ranked.
 
 ## Ranked use
 
-The ranked workflow runs on the same `m5-bench` hosts as MLX Fast. It uses the
-host's audited `/opt/bench/bench-exec.sh` bridge to run the frozen baseline and
-the submitted prover as the unprivileged `bench` user. The runner-owned steps
-validate the commit, compile it, and seal the paired score; they never execute
-the submitted prover directly.
+Both workflows are manual-only and run on a pinned
+`blacksmith-12vcpu-macos-26` runner. Ranked runs validate the candidate commit,
+compile the frozen baseline and candidate, and time both on the same ephemeral
+machine. The submitted prover is a child of the frozen Rust timer/verifier and
+cannot report its own time or score. macOS Sandbox confines that child to the
+per-run scratch directory and blocks network access.
 
 The workflow:
 
@@ -50,10 +51,11 @@ The workflow:
 3. Use the trusted `bench` timer, never candidate-reported timings.
 4. Require the verified proofs and expected public outputs before writing
    `score.json`.
-5. Clean the workspace and invoke the host janitor after every run.
+5. Upload the runner-computed score and checksum.
 
-The M5 hosts must have `cargo`, `rustup`, `jq`, and the toolchain named by
-`rust-toolchain` installed. No Lighter-specific host executable is required.
+Blacksmith's GitHub App must have access to this repository. Its documentation
+states that jobs using a `blacksmith-*` label remain queued when the app is not
+allowed to access the repository.
 
 For now, the ranked workflow uses the checked-in 500-transaction
 `bench/bench_test.json` fixture as its only case. Replace it with the private
