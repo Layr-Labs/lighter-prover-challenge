@@ -115,4 +115,4 @@ jq -e '
   and .metrics.runtime == "official-paired"
   and .metrics.verified_proofs == .metrics.expected_proofs
 ' "${result}" >/dev/null
-shasum -a 256 "${result}" > "${result}.sha256"
+(cd "${root}" && shasum -a 256 score.json > score.json.sha256)
