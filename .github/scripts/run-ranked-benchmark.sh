@@ -21,7 +21,7 @@ if [[ -n "${invalid}" ]]; then
 fi
 
 toolchain="$(tr -d '[:space:]' < rust-toolchain)"
-rustup run "${toolchain}" rustc --version >/dev/null
+rustup toolchain install "${toolchain}" --profile minimal --no-self-update
 RUSTUP_TOOLCHAIN="${toolchain}" cargo fetch --locked --manifest-path challenge/Cargo.toml
 RUSTUP_TOOLCHAIN="${toolchain}" \
 RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native}" \
