@@ -15,8 +15,6 @@ score.local-iterate.json
 score.local-submit.json
 benchmark-integrity.json
 benchmark-results/
-BENCHMARK_ASSESSMENT.md
-AGENT_BENCHMARK_ASSESSMENT.md
 
 # Runner-only source data. Never commit this directory.
 /testdata/lighter-api/private/
