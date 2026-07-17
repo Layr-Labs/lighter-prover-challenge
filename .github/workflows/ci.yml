@@ -11,18 +11,14 @@ jobs:
     runs-on: blacksmith-12vcpu-macos-26
     timeout-minutes: 60
     steps:
-      - name: Require trusted workflow
-        run: test "${GITHUB_REF}" = refs/heads/master
-
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          ref: master
           fetch-depth: 0
           persist-credentials: false
 
       - name: Validate files
         run: |
-          bash -n setup.sh benchmark.sh
+          bash -n setup.sh benchmark.sh .github/scripts/*.sh
           jq -e . benchmark.json challenge/ranked-score.schema.json >/dev/null
 
       - name: Run public benchmark

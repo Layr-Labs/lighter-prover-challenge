@@ -43,6 +43,11 @@ machine. The submitted prover is a child of the frozen Rust timer/verifier and
 cannot report its own time or score. macOS Sandbox confines that child to the
 per-run scratch directory and blocks network access.
 
+Dispatch either workflow from GitHub's branch selector. No commit SHA input is
+required. Ranked runs use `github.sha` from the selected branch, verify that it
+is based on current `master`, and overlay only `challenge/submission/` onto a
+separate trusted `master` checkout.
+
 The workflow:
 
 1. Reject changes outside `challenge/submission/`, fetch locked dependencies

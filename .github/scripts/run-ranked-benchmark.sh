@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-candidate_sha="${1:?usage: run-ranked-benchmark.sh CANDIDATE_SHA}"
 root="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
-result="${root}/score.json"
-
-[[ "${candidate_sha}" =~ ^[0-9a-f]{40}$ ]]
-
 cd "${root}"
+root="$(pwd -P)"
+candidate_root="$(cd "${root}/.lighter-candidate" && pwd -P)"
+result="${root}/score.json"
 baseline_sha="$(git rev-parse HEAD)"
-git cat-file -e "${candidate_sha}^{commit}"
-git merge-base --is-ancestor "${baseline_sha}" "${candidate_sha}"
+candidate_sha="$(git -C "${candidate_root}" rev-parse HEAD)"
+[[ "${candidate_sha}" =~ ^[0-9a-f]{40}$ ]]
+git -C "${candidate_root}" cat-file -e "${baseline_sha}^{commit}"
+base_sha="$(git -C "${candidate_root}" merge-base "${baseline_sha}" "${candidate_sha}")"
+if [[ "${base_sha}" != "${baseline_sha}" ]]; then
+  echo "Candidate must be based on current master ${baseline_sha}; merge-base is ${base_sha}" >&2
+  exit 1
+fi
 
-invalid="$(git diff --name-only --no-renames "${baseline_sha}" "${candidate_sha}" \
+invalid="$(git -C "${candidate_root}" diff --name-only --no-renames "${baseline_sha}" "${candidate_sha}" \
   | grep -v '^challenge/submission/' || true)"
 if [[ -n "${invalid}" ]]; then
   echo "Only challenge/submission/ may change:" >&2
@@ -67,7 +71,8 @@ baseline_json="$(run_prover baseline)"
 remove_sandbox
 
 rm -rf challenge/submission
-git archive "${candidate_sha}" challenge/submission | tar -x
+git -C "${candidate_root}" archive "${candidate_sha}" challenge/submission | tar -x -C "${root}"
+rm -rf "${candidate_root}"
 RUSTUP_TOOLCHAIN="${toolchain}" \
 RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native}" \
 CARGO_NET_OFFLINE=true \

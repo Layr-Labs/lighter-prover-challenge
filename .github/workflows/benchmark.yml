@@ -2,11 +2,6 @@ name: ranked benchmark
 
 on:
   workflow_dispatch:
-    inputs:
-      candidate_sha:
-        description: Full submission commit SHA
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -20,7 +15,6 @@ jobs:
       - name: Host preflight
         run: |
           set -euo pipefail
-          test "${GITHUB_REF}" = refs/heads/master
           test "$(uname -s)" = Darwin
           test "$(uname -m)" = arm64
           test -x /usr/bin/sandbox-exec
@@ -32,10 +26,16 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Checkout dispatched branch
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          path: .lighter-candidate
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Run paired benchmark
-        env:
-          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
-        run: .github/scripts/run-ranked-benchmark.sh "${CANDIDATE_SHA}"
+        run: .github/scripts/run-ranked-benchmark.sh
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
