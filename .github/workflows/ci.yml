@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check submission boundary
+        if: startsWith(github.head_ref, 'submissions/')
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          bad="$(git diff --name-only "${BASE}" "${HEAD}" | grep -v '^challenge/submission/' || true)"
+          test -z "${bad}" || { echo "Only challenge/submission/ is editable:"; echo "${bad}"; exit 1; }
+
+      - name: Validate files
+        run: |
+          bash -n setup.sh benchmark.sh
+          jq -e . benchmark.json challenge/ranked-score.schema.json >/dev/null
+
+      - name: Run public benchmark
+        run: |
+          ./setup.sh
+          ./benchmark.sh --local-iterate

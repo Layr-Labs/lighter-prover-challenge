@@ -1,0 +1,29 @@
+// Portions of this file are derived from plonky2-keccak256
+// Copyright (c) 2023 qope
+// Licensed under the MIT License. See THIRD_PARTY_NOTICES for details.
+
+pub const KECCAK_ROUNDS: usize = 24;
+
+#[rustfmt::skip]
+pub const ROUND_CONSTANTS: [[u32; 2]; 24] = [
+    [0x00000001, 0x00000000], [0x00008082, 0x00000000],
+    [0x0000808A, 0x80000000], [0x80008000, 0x80000000],
+    [0x0000808B, 0x00000000], [0x80000001, 0x00000000],
+    [0x80008081, 0x80000000], [0x00008009, 0x80000000],
+    [0x0000008A, 0x00000000], [0x00000088, 0x00000000],
+    [0x80008009, 0x00000000], [0x8000000A, 0x00000000],
+    [0x8000808B, 0x00000000], [0x0000008B, 0x80000000],
+    [0x00008089, 0x80000000], [0x00008003, 0x80000000],
+    [0x00008002, 0x80000000], [0x00000080, 0x80000000],
+    [0x0000800A, 0x00000000], [0x8000000A, 0x80000000],
+    [0x80008081, 0x80000000], [0x00008080, 0x80000000],
+    [0x80000001, 0x00000000], [0x80008008, 0x80000000],
+];
+
+pub const KECCAK_WITDH: usize = 25;
+
+pub const ROTR: [u8; KECCAK_WITDH] = [
+    0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14,
+];
+
+pub const KECCAK_OUTPUT_LENGHT: usize = 32;

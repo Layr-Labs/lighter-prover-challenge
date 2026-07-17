@@ -1,0 +1,49 @@
+[workspace]
+members = ["circuit", "bench", "desertexit/circuits"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "Business Source License 1.1"
+
+[workspace.dependencies]
+ahash = { version = "0.8.7", default-features = false, features = [
+  "compile-time-rng",
+] } # NOTE: Be sure to keep this version the same as the dependency in `hashbrown`.
+anyhow = { version = "1.0.40", default-features = false }
+hashbrown = { version = "0.14.3", default-features = false, features = [
+  "ahash",
+  "serde",
+] } # NOTE: When upgrading, see `ahash` dependency.
+itertools = { version = "0.13.0", default-features = false }
+log = { version = "0.4.14", default-features = false }
+num = { version = "0.4", default-features = false, features = [
+  "rand",
+  "serde",
+] }
+bincode = "1.3.3"
+rand = "0.8"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_with = { version = "3.8.3", features = ["hex"] }
+serde_json = { version = "1.0" }
+static_assertions = { version = "1.1.0", default-features = false }
+hex = { version = "0.4.3" }
+sha2 = { version = "0.10.6" }
+unroll = { version = "0.1.5", default-features = false }
+rayon = "1.5.1"
+plonky2 = { git = "https://github.com/elliottech/plonky2", rev = "e1c2d35450948b88fca6a7e69e2643c3ecad3caa", package = "plonky2"} # dev branch
+lazy_static = "1.4.0"
+env_logger = "0.11.3"
+ff = { package = "ff", version = "0.13", features = ["derive"] }
+paste = "1.0"
+clap = { version = "4.5.21", features = ["derive"] }
+clap_derive = { version = "4.0.0-rc.1" }
+
+# Dev dependencies
+tiny-keccak = { version = "2.0.2", features = ["keccak"] }
+
+[profile.release]
+incremental = true
+
+# [patch."https://github.com/elliottech/plonky2.git"]
+# plonky2={path = "../plonky2/plonky2"}

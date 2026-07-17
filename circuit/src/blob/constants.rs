@@ -1,0 +1,30 @@
+// Copyright (c) Elliot Technologies, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
+use crate::types::constants::POSITION_LIST_SIZE;
+
+pub const BLOB_WIDTH: usize = 4096;
+
+pub const BLOB_DATA_BYTES_COUNT: usize = BLOB_WIDTH * 31;
+
+pub const BLOB_WIDTH_BITS: usize = 12;
+
+pub const BLOB_VERSION_INDEX: usize = 0;
+pub const BLOB_VERSION_SIZE: usize = 2;
+
+pub const BLOB_RESERVED_INDEX: usize = BLOB_VERSION_INDEX + BLOB_VERSION_SIZE;
+pub const BLOB_RESERVED_SIZE: usize = 32;
+
+pub const BLOB_MARK_PRICE_INDEX: usize = BLOB_RESERVED_INDEX + BLOB_RESERVED_SIZE;
+pub const MARK_PRICE_BYTE_SIZE: usize = 4;
+
+pub const BLOB_FUNDING_INDEX: usize =
+    BLOB_MARK_PRICE_INDEX + MARK_PRICE_BYTE_SIZE * POSITION_LIST_SIZE;
+pub const FUNDING_BYTE_SIZE: usize = 9;
+
+pub const BLOB_QUOTE_MULTIPLIER_INDEX: usize =
+    BLOB_FUNDING_INDEX + FUNDING_BYTE_SIZE * POSITION_LIST_SIZE;
+pub const QUOTE_MULTIPLIER_BYTE_SIZE: usize = 2;
+
+pub const BLOB_ACCOUNT_OFFSET: usize =
+    BLOB_QUOTE_MULTIPLIER_INDEX + QUOTE_MULTIPLIER_BYTE_SIZE * POSITION_LIST_SIZE;

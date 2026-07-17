@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Lighter prover ranked score",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["score", "passed", "metrics"],
+  "properties": {
+    "score": {"type": "number", "exclusiveMinimum": 0},
+    "passed": {"const": true},
+    "metrics": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "runtime",
+        "candidate_seconds",
+        "baseline_seconds",
+        "speedup",
+        "verified_proofs",
+        "expected_proofs",
+        "transactions",
+        "candidate_sha",
+        "baseline_sha",
+        "circuit_digest",
+        "case_id"
+      ],
+      "properties": {
+        "runtime": {"const": "official-paired"},
+        "candidate_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "baseline_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "speedup": {"type": "number", "exclusiveMinimum": 0},
+        "verified_proofs": {"type": "integer", "minimum": 1},
+        "expected_proofs": {"type": "integer", "minimum": 1},
+        "transactions": {"type": "integer", "minimum": 1},
+        "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "baseline_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "circuit_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "case_id": {"type": "string", "minLength": 1, "maxLength": 128}
+      }
+    }
+  }
+}
