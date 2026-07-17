@@ -20,8 +20,10 @@ jobs:
         run: |
           bash -n setup.sh benchmark.sh .github/scripts/*.sh
           jq -e . benchmark.json challenge/ranked-score.schema.json >/dev/null
+          .github/scripts/test-sandbox-prove.sh
 
       - name: Run public benchmark
         run: |
           ./setup.sh
+          .github/scripts/test-prover-timeout.sh
           ./benchmark.sh --local-iterate

@@ -9,7 +9,8 @@ use std::env;
 use std::fs::{self, File};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use api::{Circuits, Proofs};
 use circuit::block::Block;
@@ -23,6 +24,7 @@ use serde_json::json;
 const TX_PER_PROOF: usize = 4;
 const CHAIN_ID: u32 = 304;
 const MACHINE: &str = "Apple M4 Max, 14 cores, 36 GB, macOS 26.5";
+const DEFAULT_PROVE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 fn main() {
     env_logger::Builder::from_env(Env::default().default_filter_or("info,circuit=error")).init();
@@ -47,13 +49,28 @@ fn main() {
     let proof_path = "proof.bin";
     let prove = env::current_exe().unwrap().with_file_name("prove");
 
+    let timeout = prove_timeout();
     let started = Instant::now();
-    let status = Command::new(prove)
+    let mut child = Command::new(prove)
         .args(["bench_test.json", proof_path])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn()
         .expect("cannot start prover");
+    let status = loop {
+        match child.try_wait().expect("cannot wait for prover") {
+            Some(status) => break status,
+            None if started.elapsed() >= timeout => {
+                child.kill().expect("cannot kill timed-out prover");
+                let status = child.wait().expect("cannot reap timed-out prover");
+                panic!(
+                    "prover timed out after {}s: {status}",
+                    timeout.as_secs()
+                );
+            }
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    };
     let proving_time = started.elapsed();
     assert!(status.success(), "prover failed: {status}");
 
@@ -89,6 +106,15 @@ fn main() {
     fs::write(&temporary, format!("{rendered}\n")).expect("cannot write score");
     fs::rename(temporary, output).expect("cannot publish score");
     println!("{rendered}");
+}
+
+fn prove_timeout() -> Duration {
+    env::var("LIGHTER_PROVE_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&seconds| seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_PROVE_TIMEOUT)
 }
 
 fn verify(block: &Block<F>, circuits: &Circuits, proofs: &Proofs) {
