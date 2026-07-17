@@ -36,22 +36,28 @@ is no separate score command or log parser. Local results are not ranked.
 
 ## Ranked use
 
-The GitHub workflow calls one runner-owned program:
+The ranked workflow runs on the same `m5-bench` hosts as MLX Fast. It uses the
+host's audited `/opt/bench/bench-exec.sh` bridge to run the frozen baseline and
+the submitted prover as the unprivileged `bench` user. The runner-owned steps
+validate the commit, compile it, and seal the paired score; they never execute
+the submitted prover directly.
 
-```text
-/opt/lighter-bench/run --trusted-repo REPO --candidate SHA --cases DIR --output score.json
-```
+The workflow:
 
-That program is the security boundary. It must:
-
-1. Reject changes outside `challenge/submission/` and build without network.
-2. Hash the candidate binary, then select a hidden case.
-3. Run the pinned baseline and candidate on the same machine and case.
-4. Use the trusted `bench` timer, never candidate-reported timings.
-5. Require the verified proofs and expected public outputs before writing
+1. Reject changes outside `challenge/submission/`, fetch locked dependencies
+   from the trusted checkout, then build offline with the pinned Rust toolchain.
+2. Run the pinned baseline and candidate on the same machine and case.
+3. Use the trusted `bench` timer, never candidate-reported timings.
+4. Require the verified proofs and expected public outputs before writing
    `score.json`.
-6. Run without network, enforce CPU/memory/time limits, and clean all processes
-   and scratch data after each run.
+5. Clean the workspace and invoke the host janitor after every run.
+
+The M5 hosts must have `cargo`, `rustup`, `jq`, and the toolchain named by
+`rust-toolchain` installed. No Lighter-specific host executable is required.
+
+For now, the ranked workflow uses the checked-in 500-transaction
+`bench/bench_test.json` fixture as its only case. Replace it with the private
+fixture pool once the complete prover exports are available.
 
 Use a rotating pool of complete prover fixtures and a separate final holdout
 pool. Randomly changing JSON fields is invalid because state roots and Merkle

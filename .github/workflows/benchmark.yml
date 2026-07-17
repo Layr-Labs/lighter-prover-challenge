@@ -13,30 +13,35 @@ permissions:
 
 jobs:
   benchmark:
-    runs-on: [self-hosted, lighter-prover-bench]
-    environment: lighter-prover-private
+    runs-on: [self-hosted, m5-bench]
     timeout-minutes: 180
+    env:
+      LIGHTER_BENCH_EXEC: /opt/bench/bench-exec.sh
+      LIGHTER_JANITOR: /opt/bench/janitor.sh
+      LIGHTER_QUARANTINE_FLAG: /opt/bench/quarantine.flag
+      LIGHTER_JOB_WS: /Users/Shared/bench-jobs/lighter-prover-current
     steps:
-      - name: Require trusted workflow
-        run: test "${GITHUB_REF}" = refs/heads/main
+      - name: Host preflight
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REF}" = refs/heads/master
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          test ! -e "${LIGHTER_QUARANTINE_FLAG}"
+          test -e "${LIGHTER_BENCH_EXEC}"
+          test -e "${LIGHTER_JANITOR}"
+          command -v cargo jq rustup >/dev/null
 
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          ref: main
+          ref: master
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Run trusted benchmark
+      - name: Run paired benchmark
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
-        run: |
-          [[ "${CANDIDATE_SHA}" =~ ^[0-9a-f]{40}$ ]]
-          /opt/lighter-bench/run \
-            --trusted-repo "${GITHUB_WORKSPACE}" \
-            --candidate "${CANDIDATE_SHA}" \
-            --cases /opt/lighter-bench/private \
-            --output score.json
-          jq -e '.passed == true and .score > 0 and .score == .metrics.speedup' score.json >/dev/null
-          shasum -a 256 score.json > score.json.sha256
+        run: .github/scripts/run-ranked-benchmark.sh "${CANDIDATE_SHA}"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -45,6 +50,17 @@ jobs:
             score.json
             score.json.sha256
 
-      - name: Clean runner
+      - name: Clean benchmark workspace
         if: always()
-        run: /opt/lighter-bench/run --clean
+        run: |
+          if [[ -d "${LIGHTER_JOB_WS}" ]]; then
+            sudo -n "${LIGHTER_BENCH_EXEC}" "${LIGHTER_JOB_WS}" \
+              /bin/sh -c 'find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null; true' || true
+            rm -rf "${LIGHTER_JOB_WS}" || true
+          fi
+
+      - name: Janitor reset and integrity audit
+        if: always()
+        run: |
+          sudo -n "${LIGHTER_JANITOR}"
+          test ! -e "${LIGHTER_QUARANTINE_FLAG}"
