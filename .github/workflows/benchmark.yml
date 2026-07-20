@@ -8,8 +8,7 @@ permissions:
 
 jobs:
   benchmark:
-    # Blacksmith supports 6- and 12-vCPU macOS 26 runners.
-    runs-on: blacksmith-12vcpu-macos-26
+    runs-on: [self-hosted, macOS, ARM64, lighter-prover-challenge-m3]
     timeout-minutes: 180
     steps:
       - name: Host preflight
