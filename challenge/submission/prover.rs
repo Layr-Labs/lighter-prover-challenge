@@ -10,6 +10,7 @@ use circuit::block_tx::{BlockTx, BlockTxWitness};
 use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, Circuit as _};
 use circuit::block_tx_constraints::{BlockTxCircuit, Circuit as _};
 use circuit::types::config::F;
+use plonky2::field::types::Field;
 
 use crate::api::{Circuits, Proof, Proofs};
 
@@ -28,20 +29,33 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proofs {
     // chain proof and tx proof i. Crucially, tx proof i+1 depends only on tx
     // proof i (its output state), NOT on the chain. So the two chains are
     // independent and overlap: while one thread proves the next tx, the other
-    // folds the previous tx into the cyclic chain. Same inputs, same circuits,
-    // so the proofs are identical to the sequential version.
-    let base_chain = BlockTxChainCircuit::cyclic_base_proof(
-        &circuits.chain_data,
-        &circuits.dummy_data,
-        block.block_number,
-        block.created_at,
-        pre_output.new_state_root,
+    // folds the previous tx into the cyclic chain. Inputs, circuits, and the
+    // final statement remain unchanged.
+    // At tx_index == 0 the chain circuit verifies `circuits.dummy_proof`, not
+    // the supplied cyclic proof. It still consumes the cyclic proof's public
+    // inputs as the initial block state and checks their verifier-data suffix.
+    // Reuse the already-built dummy proof body and replace the same state
+    // inputs that `cyclic_base_proof` would set. The verifier-data suffix is
+    // left byte-for-byte unchanged.
+    let mut base_chain = circuits.dummy_proof.clone();
+    base_chain.public_inputs[0] = F::from_canonical_u64(block.block_number);
+    base_chain.public_inputs[1] = F::from_canonical_u64(block.created_at as u64);
+    for (index, element) in [
         pre_output.new_state_root,
         pre_output.new_validium_root,
+        pre_output.new_state_root,
         block.old_account_delta_tree_root,
-        circuits.chain_witness_size,
-        &pre_output.new_state_metadata,
-    );
+    ]
+    .iter()
+    .flat_map(|hash| hash.elements)
+    .enumerate()
+    {
+        base_chain.public_inputs[2 + index] = element;
+    }
+    let metadata = pre_output.new_state_metadata.to_public_inputs();
+    base_chain.public_inputs
+        [circuits.chain_witness_size..circuits.chain_witness_size + metadata.len()]
+        .copy_from_slice(&metadata);
 
     // Bounded buffer keeps at most a couple of tx proofs in flight so the two
     // stages overlap without letting the producer race unboundedly ahead.
