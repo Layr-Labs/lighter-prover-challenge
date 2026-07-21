@@ -10,7 +10,23 @@ jobs:
   benchmark:
     runs-on: [self-hosted, macOS, ARM64, lighter-prover-challenge-m3]
     timeout-minutes: 180
+    env:
+      # Pinned explicitly so both rust-cache (cache key) and the build see the
+      # exact same flags. Must match the default in run-ranked-benchmark.sh.
+      RUSTFLAGS: "-C target-cpu=native"
     steps:
+      # Self-hosted runners provision rustup persistently. Re-install the
+      # manager only if it is missing (e.g. after a cache-tool cleaned
+      # ~/.cargo/bin); the pinned toolchains under ~/.rustup are untouched.
+      - name: Ensure rustup is available
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain none --no-modify-path --profile minimal
+          fi
+          echo "${CARGO_HOME:-${HOME}/.cargo}/bin" >> "${GITHUB_PATH}"
+
       - name: Host preflight
         run: |
           set -euo pipefail
@@ -32,6 +48,26 @@ jobs:
           path: .lighter-candidate
           fetch-depth: 0
           persist-credentials: false
+
+      # Install the pinned toolchain before rust-cache: the action derives part
+      # of its key from `rustc -vV`, so the toolchain must exist first.
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(tr -d '[:space:]' < rust-toolchain)"
+          rustup toolchain install "${toolchain}" --profile minimal --no-self-update
+
+      # Cache DEPENDENCY artifacts only; local crates always rebuild from clean
+      # sources. Key covers rustc, Cargo.lock/Cargo.toml, rust-toolchain, and
+      # RUSTFLAGS. Self-prunes (mtime > 1 week + GitHub LRU) to bound disk.
+      - name: Cache Rust dependency artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: challenge
+          shared-key: challenge-deps
+          # This runner is long-lived: never let the cache cleaner delete the
+          # persistently installed rustup/cargo/rustc from ~/.cargo/bin.
+          cache-bin: "false"
 
       - name: Run paired benchmark
         run: .github/scripts/run-ranked-benchmark.sh
