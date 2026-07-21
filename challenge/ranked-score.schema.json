@@ -13,8 +13,7 @@
       "required": [
         "runtime",
         "candidate_seconds",
-        "baseline_seconds",
-        "speedup",
+        "transactions_per_second",
         "verified_proofs",
         "expected_proofs",
         "transactions",
@@ -24,10 +23,9 @@
         "case_id"
       ],
       "properties": {
-        "runtime": {"const": "official-paired"},
+        "runtime": {"const": "official-throughput"},
         "candidate_seconds": {"type": "number", "exclusiveMinimum": 0},
-        "baseline_seconds": {"type": "number", "exclusiveMinimum": 0},
-        "speedup": {"type": "number", "exclusiveMinimum": 0},
+        "transactions_per_second": {"type": "number", "exclusiveMinimum": 0},
         "verified_proofs": {"type": "integer", "minimum": 1},
         "expected_proofs": {"type": "integer", "minimum": 1},
         "transactions": {"type": "integer", "minimum": 1},

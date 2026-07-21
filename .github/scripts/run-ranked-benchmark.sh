@@ -27,6 +27,14 @@ fi
 toolchain="$(tr -d '[:space:]' < rust-toolchain)"
 rustup toolchain install "${toolchain}" --profile minimal --no-self-update
 RUSTUP_TOOLCHAIN="${toolchain}" cargo fetch --locked --manifest-path challenge/Cargo.toml
+
+# Swap in the candidate submission before the single build. The baseline is no
+# longer built or proved: the ranked score is the candidate's own proving
+# throughput (transactions per second), not a baseline/candidate ratio.
+rm -rf challenge/submission
+git -C "${candidate_root}" archive "${candidate_sha}" challenge/submission | tar -x -C "${root}"
+rm -rf "${candidate_root}"
+
 RUSTUP_TOOLCHAIN="${toolchain}" \
 RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native}" \
 CARGO_NET_OFFLINE=true \
@@ -37,11 +45,6 @@ install_sandbox() {
   cp .github/scripts/sandbox-prove.sh challenge/target/release/prove
   cp .github/scripts/prover.sb challenge/target/release/prover.sb
   chmod +x challenge/target/release/prove
-}
-
-remove_sandbox() {
-  mv -f challenge/target/release/prove-bin challenge/target/release/prove
-  rm -f challenge/target/release/prover.sb
 }
 
 circuit_digest="$(
@@ -67,40 +70,27 @@ run_prover() {
 }
 
 install_sandbox
-baseline_json="$(run_prover baseline)"
-remove_sandbox
-
-rm -rf challenge/submission
-git -C "${candidate_root}" archive "${candidate_sha}" challenge/submission | tar -x -C "${root}"
-rm -rf "${candidate_root}"
-RUSTUP_TOOLCHAIN="${toolchain}" \
-RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native}" \
-CARGO_NET_OFFLINE=true \
-  cargo build --release --locked --manifest-path challenge/Cargo.toml --bins
-
-install_sandbox
 candidate_json="$(run_prover candidate)"
 
-baseline_seconds="$(jq -r '.metrics.proving_seconds' <<< "${baseline_json}")"
 candidate_seconds="$(jq -r '.metrics.proving_seconds' <<< "${candidate_json}")"
+transactions="$(jq -r '.metrics.transactions' <<< "${candidate_json}")"
 
 jq -n \
-  --argjson baseline_seconds "${baseline_seconds}" \
   --argjson candidate_seconds "${candidate_seconds}" \
+  --argjson transactions "${transactions}" \
   --arg baseline_sha "${baseline_sha}" \
   --arg candidate_sha "${candidate_sha}" \
   --arg circuit_digest "${circuit_digest}" \
   '{
-    score: ($baseline_seconds / $candidate_seconds),
+    score: ($transactions / $candidate_seconds),
     passed: true,
     metrics: {
-      runtime: "official-paired",
+      runtime: "official-throughput",
       candidate_seconds: $candidate_seconds,
-      baseline_seconds: $baseline_seconds,
-      speedup: ($baseline_seconds / $candidate_seconds),
-      verified_proofs: 2,
-      expected_proofs: 2,
-      transactions: 500,
+      transactions_per_second: ($transactions / $candidate_seconds),
+      verified_proofs: 1,
+      expected_proofs: 1,
+      transactions: $transactions,
       candidate_sha: $candidate_sha,
       baseline_sha: $baseline_sha,
       circuit_digest: $circuit_digest,
@@ -111,8 +101,8 @@ jq -n \
 jq -e '
   .passed == true
   and .score > 0
-  and .score == .metrics.speedup
-  and .metrics.runtime == "official-paired"
+  and .score == .metrics.transactions_per_second
+  and .metrics.runtime == "official-throughput"
   and .metrics.verified_proofs == .metrics.expected_proofs
 ' "${result}" >/dev/null
 (cd "${root}" && shasum -a 256 score.json > score.json.sha256)
