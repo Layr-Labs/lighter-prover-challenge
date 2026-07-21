@@ -5,7 +5,19 @@
   "category": "rust",
   "direction": "+",
   "editablePaths": [
-    "challenge/submission"
+    "challenge/submission",
+    "circuit/src/byte/split_gate.rs",
+    "circuit/src/eddsa/gates/mul_quintic_ext_base.rs",
+    "circuit/src/eddsa/gates/square_quintic_ext_base.rs",
+    "circuit/src/uint/mod.rs",
+    "circuit/src/uint/range_check.rs",
+    "circuit/src/uint/u16/gates/add_many_u16.rs",
+    "circuit/src/uint/u16/gates/subtraction_u16.rs",
+    "circuit/src/uint/u32/gates/add_many_u32.rs",
+    "circuit/src/uint/u32/gates/arithmetic_u32.rs",
+    "circuit/src/uint/u32/gates/subtraction_u32.rs",
+    "circuit/src/uint/u48/subtraction_u48.rs",
+    "circuit/gpu"
   ],
   "setupCommand": ["bash", "-lc", "./setup.sh"],
   "preSubmitCommand": ["bash", "-lc", "./benchmark.sh --local-submit"],
