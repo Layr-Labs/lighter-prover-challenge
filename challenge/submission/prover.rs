@@ -11,6 +11,7 @@ use circuit::types::config::F;
 use crate::api::{Circuits, Proofs};
 
 pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proofs {
+    // Minimal E2E pipeline test: no-op edit to validate submit -> PR -> Actions -> scoring.
     let pre = BlockPreExecutionCircuit::prove(
         &circuits.pre_data,
         &BlockPreExec::from_block(block),
