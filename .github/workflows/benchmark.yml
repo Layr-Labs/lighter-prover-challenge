@@ -33,7 +33,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Run paired benchmark
+      - name: Run ranked benchmark
         run: .github/scripts/run-ranked-benchmark.sh
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
