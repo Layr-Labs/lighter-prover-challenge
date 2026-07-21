@@ -57,14 +57,9 @@ jobs:
           toolchain="$(tr -d '[:space:]' < rust-toolchain)"
           rustup toolchain install "${toolchain}" --profile minimal --no-self-update
 
-      # Cache compiled DEPENDENCY artifacts only. rust-cache strips the local
-      # crate (lighter-prover-challenge) and all incremental artifacts before
-      # saving, so the workspace's own crates always rebuild from clean sources
-      # and no submission-derived object can persist across runs. The key hashes
-      # the resolved rustc (release/host/commit-hash), all Cargo.lock/Cargo.toml
-      # + rust-toolchain files, and RUST* env vars (incl. RUSTFLAGS), so a change
-      # to any of those misses the cache. It also self-prunes (mtime > 1 week +
-      # GitHub cache LRU/10GB) so runner disk stays bounded.
+      # Cache DEPENDENCY artifacts only; local crates always rebuild from clean
+      # sources. Key covers rustc, Cargo.lock/Cargo.toml, rust-toolchain, and
+      # RUSTFLAGS. Self-prunes (mtime > 1 week + GitHub LRU) to bound disk.
       - name: Cache Rust dependency artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
