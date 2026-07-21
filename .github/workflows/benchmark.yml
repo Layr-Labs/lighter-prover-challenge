@@ -15,6 +15,18 @@ jobs:
       # exact same flags. Must match the default in run-ranked-benchmark.sh.
       RUSTFLAGS: "-C target-cpu=native"
     steps:
+      # Self-hosted runners provision rustup persistently. Re-install the
+      # manager only if it is missing (e.g. after a cache-tool cleaned
+      # ~/.cargo/bin); the pinned toolchains under ~/.rustup are untouched.
+      - name: Ensure rustup is available
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain none --no-modify-path --profile minimal
+          fi
+          echo "${CARGO_HOME:-${HOME}/.cargo}/bin" >> "${GITHUB_PATH}"
+
       - name: Host preflight
         run: |
           set -euo pipefail
@@ -58,6 +70,9 @@ jobs:
         with:
           workspaces: challenge
           shared-key: challenge-deps
+          # This runner is long-lived: never let the cache cleaner delete the
+          # persistently installed rustup/cargo/rustc from ~/.cargo/bin.
+          cache-bin: "false"
 
       - name: Run paired benchmark
         run: .github/scripts/run-ranked-benchmark.sh

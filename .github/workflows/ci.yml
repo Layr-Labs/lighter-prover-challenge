@@ -25,6 +25,18 @@ jobs:
           bash -n setup.sh benchmark.sh .github/scripts/*.sh
           jq -e . benchmark.json challenge/ranked-score.schema.json >/dev/null
 
+      # Self-hosted runners provision rustup persistently. Re-install the
+      # manager only if it is missing (e.g. after a cache-tool cleaned
+      # ~/.cargo/bin); the pinned toolchains under ~/.rustup are untouched.
+      - name: Ensure rustup is available
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain none --no-modify-path --profile minimal
+          fi
+          echo "${CARGO_HOME:-${HOME}/.cargo}/bin" >> "${GITHUB_PATH}"
+
       # Install the pinned toolchain before rust-cache so its key derivation
       # (`rustc -vV`) sees the correct compiler.
       - name: Install pinned Rust toolchain
@@ -42,6 +54,9 @@ jobs:
         with:
           workspaces: challenge
           shared-key: challenge-deps
+          # This runner is long-lived: never let the cache cleaner delete the
+          # persistently installed rustup/cargo/rustc from ~/.cargo/bin.
+          cache-bin: "false"
 
       - name: Run public benchmark
         run: |
