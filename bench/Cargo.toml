@@ -10,6 +10,10 @@ license.workspace = true
 name = "bench"
 path = "src/bin/bench.rs"
 
+[[bin]]
+name = "prove"
+path = "src/bin/prove.rs"
+
 [features]
 default = ["parallel", "std"]
 parallel = ["plonky2/parallel"]

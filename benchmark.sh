@@ -2,39 +2,61 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-cd "${root}"
+candidate_root="${LIGHTER_CANDIDATE_ROOT:-${root}}"
+candidate_root="$(cd "${candidate_root}" && pwd -P)"
+fixture="${LIGHTER_FIXTURE:-${root}/benchmark-tools/fixtures/bench-current-500.json}"
+score="${LIGHTER_SCORE_PATH:-${root}/score.json}"
+transactions="${LIGHTER_TRANSACTIONS:-500}"
+mode="${LIGHTER_BENCHMARK_MODE:-official-throughput}"
+worker="${candidate_root}/target/release/prove"
+verifier="${root}/benchmark-tools/trusted/lighter-benchmark-verifier"
 
-case "${1:---local-iterate}" in
-  --local-iterate)
-    mode=local-iterate
-    transactions=32
-    fixture=testdata/prover/public/bench_test_32.json
-    ;;
-  --local-submit)
-    mode=local-submit
-    transactions=500
-    fixture=bench/bench_test.json
-    ;;
-  *) echo "usage: ./benchmark.sh [--local-iterate|--local-submit]" >&2; exit 2 ;;
-esac
+rm -f "${score}"
+[[ -f "${fixture}" ]] || {
+  echo "Missing current-main fixture: ${fixture}" >&2
+  echo "Export it from the current Lighter prover pipeline; the historical bench fixture is incompatible." >&2
+  exit 1
+}
+if [[ ! -x "${worker}" || ! -x "${verifier}" ]]; then
+  LIGHTER_CANDIDATE_ROOT="${candidate_root}" "${root}/setup.sh"
+fi
+(
+  cd "${root}/benchmark-tools/trusted"
+  shasum -a 256 -c SHA256SUMS
+)
 
-bench="${root}/challenge/target/release/bench"
-prove="${root}/challenge/target/release/prove"
-if [[ ! -x "${bench}" || ! -x "${prove}" ]]; then
-  ./setup.sh
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/lighter-benchmark.XXXXXX")"
+scratch="$(cd "${scratch}" && pwd -P)"
+sandbox_profile=""
+cleanup() {
+  rm -rf "${scratch}"
+  [[ -z "${sandbox_profile}" ]] || rm -f "${sandbox_profile}"
+}
+trap cleanup EXIT
+
+if [[ "$(uname -s)" == Darwin && -x /usr/bin/sandbox-exec ]]; then
+  [[ "${scratch}" != *\"* && "${scratch}" != *\\* && "${scratch}" != *$'\n'* ]] || {
+    echo "scratch path contains unsupported characters" >&2
+    exit 1
+  }
+  sandbox_profile="$(mktemp -t lighter-benchmark.XXXXXX.sb)"
+  printf '%s\n' \
+    '(version 1)' \
+    '(allow default)' \
+    '(deny network*)' \
+    '(deny process-fork)' \
+    '(deny file-write*)' \
+    "(allow file-write* (subpath \"${scratch}\"))" \
+    > "${sandbox_profile}"
+elif [[ "${LIGHTER_REQUIRE_SANDBOX:-0}" == 1 ]]; then
+  echo "sandbox-exec is required for the ranked benchmark" >&2
+  exit 1
+else
+  echo "WARNING: candidate worker is not sandboxed (local development only)" >&2
 fi
 
-scratch="$(mktemp -d "${TMPDIR:-/tmp}/lighter-prover.XXXXXX")"
-trap 'rm -rf "${scratch}"' EXIT
-
-cp "${fixture}" "${scratch}/bench_test.json"
-
-output="${LIGHTER_SCORE_PATH:-score.${mode}.json}"
-[[ "${output}" = /* ]] || output="${root}/${output}"
-commit="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-(cd "${scratch}" && RUST_LOG="info,circuit=error" \
-  "${bench}" "${mode}" "${transactions}" "${commit}" "${output}")
-
-if [[ "${output}" != "${root}/score.json" ]]; then
-  cp "${output}" "${root}/score.json"
-fi
+candidate_sha="$(git -C "${candidate_root}" rev-parse HEAD 2>/dev/null || echo unknown)"
+args=("${worker}" "${fixture}" "${scratch}" "${score}"
+  "${mode}" "${transactions}" "${candidate_sha}")
+[[ -z "${sandbox_profile}" ]] || args+=("${sandbox_profile}")
+"${verifier}" "${args[@]}"

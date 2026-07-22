@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["score", "passed", "metrics"],
+  "properties": {
+    "score": { "type": "number", "exclusiveMinimum": 0 },
+    "passed": { "const": true },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runtime",
+        "timing_authority",
+        "proving_seconds",
+        "transactions",
+        "transactions_per_second",
+        "candidate_sha",
+        "verifier_source_rev",
+        "verifier_sha256",
+        "protocol_version",
+        "fixture_id",
+        "verified_proofs",
+        "expected_proofs"
+      ],
+      "properties": {
+        "runtime": { "type": "string" },
+        "timing_authority": { "const": "trusted verifier parent" },
+        "proving_seconds": { "type": "number", "exclusiveMinimum": 0 },
+        "transactions": { "type": "integer", "minimum": 1 },
+        "transactions_per_second": { "type": "number", "exclusiveMinimum": 0 },
+        "candidate_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "verifier_source_rev": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "verifier_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "protocol_version": { "const": "lighter-proof-v1" },
+        "fixture_id": { "type": "string", "minLength": 1 },
+        "verified_proofs": { "const": 2 },
+        "expected_proofs": { "const": 2 }
+      }
+    }
+  }
+}

@@ -6,39 +6,50 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: lighter-prover-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   benchmark:
     runs-on: [self-hosted, macOS, ARM64, lighter-prover-challenge-m3]
     timeout-minutes: 180
+    env:
+      LIGHTER_REQUIRE_SANDBOX: "1"
+      LIGHTER_BENCHMARK_MODE: official-throughput
+      LIGHTER_TRANSACTIONS: "500"
+      RUSTFLAGS: -C target-cpu=native
+
     steps:
-      - name: Host preflight
-        run: |
-          set -euo pipefail
-          test "$(uname -s)" = Darwin
-          test "$(uname -m)" = arm64
-          test -x /usr/bin/sandbox-exec
-          command -v cargo jq rustup >/dev/null
-
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          ref: master
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Checkout dispatched branch
+      - name: Checkout dispatched commit
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ github.sha }}
-          path: .lighter-candidate
-          fetch-depth: 0
+          clean: true
           persist-credentials: false
 
-      - name: Run ranked benchmark
-        run: .github/scripts/run-ranked-benchmark.sh
+      - name: Host preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(uname -s)" == Darwin ]]
+          [[ "$(uname -m)" == arm64 ]]
+          command -v cargo
+          command -v codesign
+          command -v rustup
+          command -v sandbox-exec
+          command -v shasum
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - name: Setup benchmark
+        run: ./setup.sh
+
+      - name: Benchmark submission
+        run: ./benchmark.sh
+
+      - name: Upload score
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6fb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: lighter-prover-score-${{ github.run_id }}
-          path: |
-            score.json
-            score.json.sha256
+          path: score.json
+          if-no-files-found: error

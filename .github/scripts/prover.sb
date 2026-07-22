@@ -1,7 +1,0 @@
-(version 1)
-(allow default)
-(deny network*)
-(deny process-fork)
-(deny file-write*)
-(allow file-write* (literal "/dev/null"))
-(allow file-write* (subpath (param "SCRATCH")))
