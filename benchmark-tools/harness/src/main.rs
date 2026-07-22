@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use std::{env, thread};
 
 use bincode::Options;
-use circuit::block::Block;
+use circuit::block::{Block, BlockWitness};
 use circuit::block_pre_execution::BlockPreExecWitness;
 use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
 use circuit::block_tx_chain::BlockTxChainWitness;
@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 
 const TX_PER_PROOF: usize = 4;
 const CHAIN_ID: u32 = 304;
+const ON_CHAIN_OPERATIONS_LIMIT: usize = 1;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_PROOF_BYTES: u64 = 256 * 1024 * 1024;
@@ -55,7 +56,12 @@ impl Circuits {
         let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
         let pre_data = pre.builder.build::<C>();
 
-        let chain = BlockTxChainCircuit::define(CIRCUIT_CONFIG, &tx_data, TX_PER_PROOF, 1);
+        let chain = BlockTxChainCircuit::define(
+            CIRCUIT_CONFIG,
+            &tx_data,
+            TX_PER_PROOF,
+            ON_CHAIN_OPERATIONS_LIMIT,
+        );
         let chain_data = chain.builder.build::<C>();
 
         // Exercise the exact cyclic base-proof construction used by the worker
@@ -282,24 +288,53 @@ fn verify(
     circuits.chain_data.verify(proofs.chain.clone())?;
 
     let pre = BlockPreExecWitness::from_public_inputs(&proofs.pre.public_inputs);
-    let chain = BlockTxChainWitness::from_public_inputs(&proofs.chain.public_inputs, 1, 1);
-    if pre.block_number != block.block_number
-        || pre.created_at != block.created_at
-        || pre.old_state_root != block.old_state_root
-        || chain.block_number != block.block_number
-        || chain.created_at != block.created_at
-        || chain.old_state_root != pre.new_state_root
-        || chain.new_validium_root != block.new_validium_root
-        || chain.new_state_root != block.new_state_root
-        || chain.new_account_delta_tree_root != block.new_account_delta_tree_root
-        || chain.on_chain_operations_count != block.on_chain_operations_count
-        || chain.on_chain_operations_pub_data != block.on_chain_operations_pub_data
-        || chain.priority_operations_count != block.priority_operations_count
-        || chain.new_public_market_details != block.new_public_market_details
-    {
-        return Err("proof public outputs do not match the trusted fixture".into());
+    let chain = BlockTxChainWitness::from_public_inputs(
+        &proofs.chain.public_inputs,
+        ON_CHAIN_OPERATIONS_LIMIT,
+        1,
+    );
+    let expected = expected_block_witness(block);
+    let checks = [
+        (pre.block_number == block.block_number, "pre.block_number"),
+        (pre.created_at == block.created_at, "pre.created_at"),
+        (pre.old_state_root == block.old_state_root, "pre.old_state_root"),
+        (chain.block_number == expected.block_number, "chain.block_number"),
+        (chain.created_at == expected.created_at, "chain.created_at"),
+        (chain.old_state_root == pre.new_state_root, "chain.old_state_root"),
+        (
+            chain.new_validium_root == expected.new_validium_root,
+            "chain.new_validium_root",
+        ),
+        (chain.new_state_root == expected.new_state_root, "chain.new_state_root"),
+        (
+            chain.new_account_delta_tree_root == expected.new_account_delta_tree_root,
+            "chain.new_account_delta_tree_root",
+        ),
+        (
+            chain.on_chain_operations_count == expected.on_chain_operations_count,
+            "chain.on_chain_operations_count",
+        ),
+        (
+            chain.on_chain_operations_pub_data == expected.on_chain_operations_pub_data,
+            "chain.on_chain_operations_pub_data",
+        ),
+        (
+            chain.priority_operations_count == expected.priority_operations_count,
+            "chain.priority_operations_count",
+        ),
+        (
+            chain.new_public_market_details == expected.new_public_market_details,
+            "chain.new_public_market_details",
+        ),
+    ];
+    if let Some((_, field)) = checks.into_iter().find(|(matches, _)| !matches) {
+        return Err(format!("proof public output does not match trusted fixture: {field}").into());
     }
     Ok(())
+}
+
+fn expected_block_witness(block: &Block<F>) -> BlockWitness<F> {
+    BlockWitness::from_block(block, ON_CHAIN_OPERATIONS_LIMIT)
 }
 
 fn prepare_scratch(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -367,6 +402,32 @@ mod tests {
             .expect("fixture deserialization thread must complete");
 
         assert_eq!(transaction_count, 500);
+    }
+
+    #[test]
+    fn fixture_public_outputs_use_circuit_padding() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let fixture =
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/bench.json");
+                let json =
+                    fs::read_to_string(fixture).expect("protected fixture must be readable");
+                let block: Block<F> =
+                    serde_json::from_str(&json).expect("protected fixture must deserialize");
+                let expected = expected_block_witness(&block);
+
+                assert!(block.on_chain_operations_pub_data.is_empty());
+                assert_eq!(expected.on_chain_operations_pub_data.len(), 1);
+                assert!(
+                    expected.on_chain_operations_pub_data[0]
+                        .iter()
+                        .all(|byte| *byte == 0)
+                );
+            })
+            .expect("fixture normalization thread must start")
+            .join()
+            .expect("fixture normalization thread must complete");
     }
 
     #[test]

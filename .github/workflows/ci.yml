@@ -98,3 +98,6 @@ jobs:
           cd benchmark-tools/trusted
           shasum -a 256 -c SHA256SUMS
           codesign --verify --strict --verbose=2 lighter-benchmark-verifier
+
+      - name: Test published trusted verifier
+        run: ./.github/scripts/test-trusted-verifier.sh
