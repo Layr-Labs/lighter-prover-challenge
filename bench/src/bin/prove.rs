@@ -18,6 +18,8 @@ use circuit::types::config::F;
 
 const TX_PER_PROOF: usize = 4;
 const CHAIN_ID: u32 = 304;
+// Reduce write calls without changing the proof representation; exercised by the dev E2E.
+const PROOF_OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -29,7 +31,10 @@ fn main() {
     let block: Block<F> = serde_json::from_str(&json).expect("invalid prover fixture");
     let proofs = prover::prove_block(&block, &Circuits::new(TX_PER_PROOF, CHAIN_ID), TX_PER_PROOF);
     bincode::serialize_into(
-        BufWriter::new(File::create(output).expect("cannot create proof output")),
+        BufWriter::with_capacity(
+            PROOF_OUTPUT_BUFFER_BYTES,
+            File::create(output).expect("cannot create proof output"),
+        ),
         &proofs,
     )
     .expect("cannot write proof output");
