@@ -48,7 +48,7 @@ jobs:
 
       - name: Upload score
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6fb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: lighter-prover-score-${{ github.run_id }}
           path: score.json
