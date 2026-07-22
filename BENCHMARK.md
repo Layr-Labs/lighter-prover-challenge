@@ -1,7 +1,7 @@
 # Lighter prover benchmark
 
-This benchmark measures verified proving throughput against the current Lighter
-circuit baseline (`23d1596`). The candidate is built directly from the upstream
+This benchmark measures verified proving throughput against the pinned Lighter
+circuit baseline (`8d7d809`). The candidate is built directly from the upstream
 workspace; there is no separate challenge crate or file overlay.
 
 ## Editable surface

@@ -29,7 +29,7 @@ const CHAIN_ID: u32 = 304;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_PROOF_BYTES: u64 = 256 * 1024 * 1024;
-const VERIFIER_SOURCE_REV: &str = "23d1596b832db24f1007e20220ba1556d23b0c68";
+const VERIFIER_SOURCE_REV: &str = "8d7d809f925c479e1f18761566d9b94a7279e238";
 const PROTOCOL_VERSION: &str = "lighter-proof-v1";
 
 type Proof = ProofWithPublicInputs<F, C, D>;

@@ -22,7 +22,6 @@ impl AccountPositionTarget {
             self.initial_margin_fraction,
             self.total_order_count,
             self.total_position_tied_order_count,
-            self.margin_set_flag,
         ]);
     }
 
