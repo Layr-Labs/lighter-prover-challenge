@@ -29,7 +29,12 @@ fn main() {
 
     let json = fs::read_to_string(fixture).expect("cannot read prover fixture");
     let block: Block<F> = serde_json::from_str(&json).expect("invalid prover fixture");
+    plonky2::reset_metal_gpu_allocation_stats();
     let proofs = prover::prove_block(&block, &Circuits::new(TX_PER_PROOF, CHAIN_ID), TX_PER_PROOF);
+    assert!(
+        plonky2::metal_gpu_allocation_count() > 0,
+        "Metal GPU proving path was not exercised"
+    );
     bincode::serialize_into(
         BufWriter::with_capacity(
             PROOF_OUTPUT_BUFFER_BYTES,

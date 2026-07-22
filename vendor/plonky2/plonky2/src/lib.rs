@@ -21,5 +21,17 @@ pub mod plonk;
 pub mod recursion;
 pub mod util;
 
+/// Reset Metal allocation counters before an instrumented proving run.
+#[cfg(feature = "metal")]
+pub fn reset_metal_gpu_allocation_stats() {
+    hash::metal::tracking::reset_allocation_stats();
+}
+
+/// Return the number of Metal buffer allocations in the current process.
+#[cfg(feature = "metal")]
+pub fn metal_gpu_allocation_count() -> usize {
+    hash::metal::tracking::get_allocation_count()
+}
+
 #[cfg(test)]
 mod lookup_test;
