@@ -5,6 +5,8 @@
   "category": "rust",
   "direction": "+",
   "editablePaths": [
+    "Cargo.toml",
+    "Cargo.lock",
     "circuit",
     "bench",
     "vendor"

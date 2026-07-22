@@ -297,15 +297,27 @@ fn verify(
     let checks = [
         (pre.block_number == block.block_number, "pre.block_number"),
         (pre.created_at == block.created_at, "pre.created_at"),
-        (pre.old_state_root == block.old_state_root, "pre.old_state_root"),
-        (chain.block_number == expected.block_number, "chain.block_number"),
+        (
+            pre.old_state_root == block.old_state_root,
+            "pre.old_state_root",
+        ),
+        (
+            chain.block_number == expected.block_number,
+            "chain.block_number",
+        ),
         (chain.created_at == expected.created_at, "chain.created_at"),
-        (chain.old_state_root == pre.new_state_root, "chain.old_state_root"),
+        (
+            chain.old_state_root == pre.new_state_root,
+            "chain.old_state_root",
+        ),
         (
             chain.new_validium_root == expected.new_validium_root,
             "chain.new_validium_root",
         ),
-        (chain.new_state_root == expected.new_state_root, "chain.new_state_root"),
+        (
+            chain.new_state_root == expected.new_state_root,
+            "chain.new_state_root",
+        ),
         (
             chain.new_account_delta_tree_root == expected.new_account_delta_tree_root,
             "chain.new_account_delta_tree_root",
@@ -409,10 +421,8 @@ mod tests {
         std::thread::Builder::new()
             .stack_size(32 * 1024 * 1024)
             .spawn(|| {
-                let fixture =
-                    Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/bench.json");
-                let json =
-                    fs::read_to_string(fixture).expect("protected fixture must be readable");
+                let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/bench.json");
+                let json = fs::read_to_string(fixture).expect("protected fixture must be readable");
                 let block: Block<F> =
                     serde_json::from_str(&json).expect("protected fixture must deserialize");
                 let expected = expected_block_witness(&block);
