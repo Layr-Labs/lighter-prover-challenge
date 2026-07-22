@@ -4,7 +4,7 @@
 # the Flock challenge, then publishes the verifier into the caller's worktree.
 set -euo pipefail
 
-readonly REVIEWED_COMMIT=e41cf802fe49df35908584982268135fa92abff1
+readonly REVIEWED_COMMIT=af7e477b39c9178f9cf141e44ce634ea60d4a338
 readonly TOOLCHAIN=nightly-2025-12-06
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
