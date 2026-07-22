@@ -14,7 +14,7 @@ use crate::circuit_logger::CircuitBuilderLogging;
 use crate::types::config::Builder;
 use crate::utils::CircuitBuilderUtils;
 
-pub const SYSTEM_CONFIG_SIZE: usize = 8;
+pub const SYSTEM_CONFIG_SIZE: usize = 4;
 
 #[derive(Clone, Debug, Deserialize, Copy)]
 #[serde(default)]
@@ -27,14 +27,6 @@ pub struct SystemConfig {
     pub liquidity_pool_cooldown_period: i64,
     #[serde(rename = "spwlm")]
     pub staking_pool_lockup_period: i64,
-    #[serde(rename = "mpstf")]
-    pub max_integrator_spot_taker_fee: i64,
-    #[serde(rename = "mpsmf")]
-    pub max_integrator_spot_maker_fee: i64,
-    #[serde(rename = "mpptf")]
-    pub max_integrator_perps_taker_fee: i64,
-    #[serde(rename = "mppmf")]
-    pub max_integrator_perps_maker_fee: i64,
 }
 
 impl Default for SystemConfig {
@@ -54,23 +46,15 @@ impl SystemConfig {
             staking_pool_index: i64::try_from(pis[1].to_canonical_u64()).unwrap(),
             liquidity_pool_cooldown_period: i64::try_from(pis[2].to_canonical_u64()).unwrap(),
             staking_pool_lockup_period: i64::try_from(pis[3].to_canonical_u64()).unwrap(),
-            max_integrator_spot_taker_fee: i64::try_from(pis[4].to_canonical_u64()).unwrap(),
-            max_integrator_spot_maker_fee: i64::try_from(pis[5].to_canonical_u64()).unwrap(),
-            max_integrator_perps_taker_fee: i64::try_from(pis[6].to_canonical_u64()).unwrap(),
-            max_integrator_perps_maker_fee: i64::try_from(pis[7].to_canonical_u64()).unwrap(),
         }
     }
 
     pub fn empty() -> Self {
-        Self {
+        SystemConfig {
             liquidity_pool_index: 0,
             staking_pool_index: 0,
             liquidity_pool_cooldown_period: 0,
             staking_pool_lockup_period: 0,
-            max_integrator_spot_taker_fee: 0,
-            max_integrator_spot_maker_fee: 0,
-            max_integrator_perps_taker_fee: 0,
-            max_integrator_perps_maker_fee: 0,
         }
     }
 
@@ -79,10 +63,6 @@ impl SystemConfig {
             && self.staking_pool_index == 0
             && self.liquidity_pool_cooldown_period == 0
             && self.staking_pool_lockup_period == 0
-            && self.max_integrator_spot_taker_fee == 0
-            && self.max_integrator_spot_maker_fee == 0
-            && self.max_integrator_perps_taker_fee == 0
-            && self.max_integrator_perps_maker_fee == 0
     }
 }
 
@@ -92,10 +72,6 @@ pub struct SystemConfigTarget {
     pub staking_pool_index: Target,
     pub liquidity_pool_cooldown_period: Target,
     pub staking_pool_lockup_period: Target,
-    pub max_integrator_spot_taker_fee: Target,
-    pub max_integrator_spot_maker_fee: Target,
-    pub max_integrator_perps_taker_fee: Target,
-    pub max_integrator_perps_maker_fee: Target,
 }
 
 impl SystemConfigTarget {
@@ -105,10 +81,6 @@ impl SystemConfigTarget {
             staking_pool_index: builder.add_virtual_target(),
             liquidity_pool_cooldown_period: builder.add_virtual_target(),
             staking_pool_lockup_period: builder.add_virtual_target(),
-            max_integrator_spot_taker_fee: builder.add_virtual_target(),
-            max_integrator_spot_maker_fee: builder.add_virtual_target(),
-            max_integrator_perps_taker_fee: builder.add_virtual_target(),
-            max_integrator_perps_maker_fee: builder.add_virtual_target(),
         }
     }
 
@@ -123,22 +95,6 @@ impl SystemConfigTarget {
             self.staking_pool_lockup_period,
             other.staking_pool_lockup_period,
         );
-        builder.connect(
-            self.max_integrator_spot_taker_fee,
-            other.max_integrator_spot_taker_fee,
-        );
-        builder.connect(
-            self.max_integrator_spot_maker_fee,
-            other.max_integrator_spot_maker_fee,
-        );
-        builder.connect(
-            self.max_integrator_perps_taker_fee,
-            other.max_integrator_perps_taker_fee,
-        );
-        builder.connect(
-            self.max_integrator_perps_maker_fee,
-            other.max_integrator_perps_maker_fee,
-        );
     }
 
     pub fn is_equal(builder: &mut Builder, a: &Self, b: &Self) -> BoolTarget {
@@ -150,22 +106,6 @@ impl SystemConfigTarget {
                 b.liquidity_pool_cooldown_period,
             ),
             builder.is_equal(a.staking_pool_lockup_period, b.staking_pool_lockup_period),
-            builder.is_equal(
-                a.max_integrator_spot_taker_fee,
-                b.max_integrator_spot_taker_fee,
-            ),
-            builder.is_equal(
-                a.max_integrator_spot_maker_fee,
-                b.max_integrator_spot_maker_fee,
-            ),
-            builder.is_equal(
-                a.max_integrator_perps_taker_fee,
-                b.max_integrator_perps_taker_fee,
-            ),
-            builder.is_equal(
-                a.max_integrator_perps_maker_fee,
-                b.max_integrator_perps_maker_fee,
-            ),
         ];
         builder.multi_and(&assertions)
     }
@@ -176,10 +116,6 @@ impl SystemConfigTarget {
             builder.is_zero(self.staking_pool_index),
             builder.is_zero(self.liquidity_pool_cooldown_period),
             builder.is_zero(self.staking_pool_lockup_period),
-            builder.is_zero(self.max_integrator_spot_taker_fee),
-            builder.is_zero(self.max_integrator_spot_maker_fee),
-            builder.is_zero(self.max_integrator_perps_taker_fee),
-            builder.is_zero(self.max_integrator_perps_maker_fee),
         ];
         builder.multi_and(&assertions)
     }
@@ -190,10 +126,6 @@ impl SystemConfigTarget {
             staking_pool_index: builder.zero(),
             liquidity_pool_cooldown_period: builder.zero(),
             staking_pool_lockup_period: builder.zero(),
-            max_integrator_spot_taker_fee: builder.zero(),
-            max_integrator_spot_maker_fee: builder.zero(),
-            max_integrator_perps_taker_fee: builder.zero(),
-            max_integrator_perps_maker_fee: builder.zero(),
         }
     }
 
@@ -210,26 +142,6 @@ impl SystemConfigTarget {
             self.liquidity_pool_cooldown_period,
             &format!("{} liquidity_pool_cooldown_period", tag),
         );
-        builder.println(
-            self.staking_pool_lockup_period,
-            &format!("{} staking_pool_lockup_period", tag),
-        );
-        builder.println(
-            self.max_integrator_spot_taker_fee,
-            &format!("{} max_integrator_spot_taker_fee", tag),
-        );
-        builder.println(
-            self.max_integrator_spot_maker_fee,
-            &format!("{} max_integrator_spot_maker_fee", tag),
-        );
-        builder.println(
-            self.max_integrator_perps_taker_fee,
-            &format!("{} max_integrator_perps_taker_fee", tag),
-        );
-        builder.println(
-            self.max_integrator_perps_maker_fee,
-            &format!("{} max_integrator_perps_maker_fee", tag),
-        );
     }
 
     pub fn hash(&self, builder: &mut Builder) -> HashOutTarget {
@@ -238,10 +150,6 @@ impl SystemConfigTarget {
             self.staking_pool_index,
             self.liquidity_pool_cooldown_period,
             self.staking_pool_lockup_period,
-            self.max_integrator_spot_taker_fee,
-            self.max_integrator_spot_maker_fee,
-            self.max_integrator_perps_taker_fee,
-            self.max_integrator_perps_maker_fee,
         ];
 
         builder.hash_n_to_hash_no_pad::<Poseidon2Hash>(elements)
@@ -252,10 +160,6 @@ impl SystemConfigTarget {
         builder.register_public_input(self.staking_pool_index);
         builder.register_public_input(self.liquidity_pool_cooldown_period);
         builder.register_public_input(self.staking_pool_lockup_period);
-        builder.register_public_input(self.max_integrator_spot_taker_fee);
-        builder.register_public_input(self.max_integrator_spot_maker_fee);
-        builder.register_public_input(self.max_integrator_perps_taker_fee);
-        builder.register_public_input(self.max_integrator_perps_maker_fee);
     }
 
     pub fn from_public_inputs(pis: &[Target]) -> Self {
@@ -265,10 +169,6 @@ impl SystemConfigTarget {
             staking_pool_index: pis[1],
             liquidity_pool_cooldown_period: pis[2],
             staking_pool_lockup_period: pis[3],
-            max_integrator_spot_taker_fee: pis[4],
-            max_integrator_spot_maker_fee: pis[5],
-            max_integrator_perps_taker_fee: pis[6],
-            max_integrator_perps_maker_fee: pis[7],
         }
     }
 }
@@ -303,22 +203,6 @@ impl<T: Witness<F>, F: PrimeField64> SystemConfigTargetWitness<F> for T {
             system_config_target.staking_pool_lockup_period,
             F::from_canonical_i64(system_config.staking_pool_lockup_period),
         )?;
-        self.set_target(
-            system_config_target.max_integrator_spot_taker_fee,
-            F::from_canonical_i64(system_config.max_integrator_spot_taker_fee),
-        )?;
-        self.set_target(
-            system_config_target.max_integrator_spot_maker_fee,
-            F::from_canonical_i64(system_config.max_integrator_spot_maker_fee),
-        )?;
-        self.set_target(
-            system_config_target.max_integrator_perps_taker_fee,
-            F::from_canonical_i64(system_config.max_integrator_perps_taker_fee),
-        )?;
-        self.set_target(
-            system_config_target.max_integrator_perps_maker_fee,
-            F::from_canonical_i64(system_config.max_integrator_perps_maker_fee),
-        )?;
 
         Ok(())
     }
@@ -346,26 +230,6 @@ pub fn select_system_config_target(
             is_enabled,
             a.staking_pool_lockup_period,
             b.staking_pool_lockup_period,
-        ),
-        max_integrator_spot_taker_fee: builder.select(
-            is_enabled,
-            a.max_integrator_spot_taker_fee,
-            b.max_integrator_spot_taker_fee,
-        ),
-        max_integrator_spot_maker_fee: builder.select(
-            is_enabled,
-            a.max_integrator_spot_maker_fee,
-            b.max_integrator_spot_maker_fee,
-        ),
-        max_integrator_perps_taker_fee: builder.select(
-            is_enabled,
-            a.max_integrator_perps_taker_fee,
-            b.max_integrator_perps_taker_fee,
-        ),
-        max_integrator_perps_maker_fee: builder.select(
-            is_enabled,
-            a.max_integrator_perps_maker_fee,
-            b.max_integrator_perps_maker_fee,
         ),
     }
 }

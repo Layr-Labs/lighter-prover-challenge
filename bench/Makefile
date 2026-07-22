@@ -2,11 +2,9 @@
 build:
 	@echo ""
 	@export RUSTFLAGS="-C target-cpu=native"
-	cargo build --release --bin bench;
-	@mv ../target/release/bench bench;
+	cargo build --release --bin prove
 
-run: 
-	@echo ""
-	@./bench
+run:
+	@cd .. && ./benchmark.sh
 
 build-and-run: build run

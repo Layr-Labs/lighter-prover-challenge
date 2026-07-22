@@ -149,18 +149,11 @@ impl Verify for InternalCancelOrderTxTarget {
             tx_state.register_stack[0].instruction_type,
             cancel_all_isolated_margin_orders,
         );
-        let cancel_all_market_account_orders =
-            builder.constant_from_u8(CANCEL_ALL_MARKET_ACCOUNT_ORDERS);
-        let is_cancel_all_market_account_orders = builder.is_equal(
-            tx_state.register_stack[0].instruction_type,
-            cancel_all_market_account_orders,
-        );
         self.is_cancel_all_kind = builder.multi_or(&[
             is_cancel_all_account_orders,
             is_cancel_position_tied_account_orders,
             is_cancel_all_cross_margin_orders,
             is_cancel_all_isolated_margin_orders,
-            is_cancel_all_market_account_orders,
         ]);
         self.is_register_set =
             builder.multi_or(&[self.is_cancel_all_kind, is_cancel_single_account_order]);
@@ -277,17 +270,6 @@ impl Verify for InternalCancelOrderTxTarget {
             );
         }
 
-        // Verify CANCEL_ALL_MARKET_ACCOUNT_ORDERS mode
-        {
-            let is_enabled_and_cancel_all_market =
-                builder.and(is_enabled, is_cancel_all_market_account_orders);
-            builder.conditional_assert_eq(
-                is_enabled_and_cancel_all_market,
-                tx_state.register_stack[0].market_index,
-                market_index,
-            );
-        }
-
         self.success = is_enabled;
     }
 }
@@ -386,7 +368,6 @@ impl Apply for InternalCancelOrderTxTarget {
             tx_state.account_order.owner_account_index,
             tx_state.account_order.to_trigger_order_index0,
             tx_state.account_order.to_trigger_order_index1,
-            1,
         );
 
         // Cancel order - account order leaf

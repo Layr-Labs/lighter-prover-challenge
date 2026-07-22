@@ -89,13 +89,12 @@ impl AccountPositionTarget {
         }
     }
 
-    /// Caller needs to make sure margin_mode is boolean.
-    pub fn is_isolated_unsafe(&self) -> BoolTarget {
+    pub fn is_isolated(&self) -> BoolTarget {
         BoolTarget::new_unsafe(self.margin_mode)
     }
 
-    pub fn is_cross_unsafe(&self, builder: &mut Builder) -> BoolTarget {
-        builder.not(self.is_isolated_unsafe())
+    pub fn is_cross(&self, builder: &mut Builder) -> BoolTarget {
+        builder.not(self.is_isolated())
     }
 
     pub fn print(&self, builder: &mut Builder, tag: &str) {
@@ -241,7 +240,7 @@ impl AccountPositionTarget {
             ),
             margin_mode: builder.select(flag, sub_position.margin_mode, owner_position.margin_mode),
 
-            // No need to select allocated_margin as insurance fund doesn't have isolated positions
+            // No need to select allocated_margin and margin_mode as insurance fund doesn't have isolated positions
             ..owner_position.clone()
         }
     }
@@ -384,10 +383,7 @@ pub fn random_access_account_position(
         margin_mode: builder.random_access(access_index, v.iter().map(|x| x.margin_mode).collect()),
         allocated_margin: builder.random_access_bigint(
             access_index,
-            v.iter()
-                .map(|x| x.allocated_margin.clone())
-                .collect::<Vec<BigIntTarget>>()
-                .as_ref(),
+            v.iter().map(|x| x.allocated_margin.clone()).collect(),
             BIG_U96_LIMBS,
         ),
     }

@@ -1,5 +1,6 @@
 [workspace]
 members = ["circuit", "bench", "desertexit/circuits"]
+exclude = ["vendor/plonky2"]
 resolver = "2"
 
 [workspace.package]
@@ -31,7 +32,7 @@ hex = { version = "0.4.3" }
 sha2 = { version = "0.10.6" }
 unroll = { version = "0.1.5", default-features = false }
 rayon = "1.5.1"
-plonky2 = { git = "https://github.com/elliottech/plonky2", rev = "e1c2d35450948b88fca6a7e69e2643c3ecad3caa", package = "plonky2"} # dev branch
+plonky2 = { path = "vendor/plonky2/plonky2", package = "plonky2", features = ["metal"] }
 lazy_static = "1.4.0"
 env_logger = "0.11.3"
 ff = { package = "ff", version = "0.13", features = ["derive"] }
@@ -44,6 +45,3 @@ tiny-keccak = { version = "2.0.2", features = ["keccak"] }
 
 [profile.release]
 incremental = true
-
-# [patch."https://github.com/elliottech/plonky2.git"]
-# plonky2={path = "../plonky2/plonky2"}

@@ -363,6 +363,8 @@ impl Verify for L2CreateGroupedOrdersTxTarget {
         let nil_trigger_price = builder.constant(F::from_canonical_i64(NIL_ORDER_TRIGGER_PRICE));
         let nil_order_expiry = builder.constant(F::from_canonical_i64(NIL_ORDER_EXPIRY));
 
+        let nil_client_order_index = builder.constant_u64(NIL_CLIENT_ORDER_INDEX as u64);
+
         let is_enabled = tx_type.is_l2_create_grouped_orders;
         self.success = is_enabled;
 
@@ -408,36 +410,6 @@ impl Verify for L2CreateGroupedOrdersTxTarget {
 
         self.order_count = builder.add(self.is_otoco.target, two);
 
-        // Make sure given cloids are either nil or unique
-        {
-            let nil_cloid = builder.constant_i64(NIL_CLIENT_ORDER_INDEX);
-            let _0_is_nil = builder.is_equal(self.orders[0].client_order_index, nil_cloid);
-            let _1_is_nil = builder.is_equal(self.orders[1].client_order_index, nil_cloid);
-            let _2_is_nil = builder.is_equal(self.orders[2].client_order_index, nil_cloid);
-            let _0_eq_1 = builder.is_equal(
-                self.orders[0].client_order_index,
-                self.orders[1].client_order_index,
-            );
-            let _0_eq_2 = builder.is_equal(
-                self.orders[0].client_order_index,
-                self.orders[2].client_order_index,
-            );
-            let _1_eq_2 = builder.is_equal(
-                self.orders[1].client_order_index,
-                self.orders[2].client_order_index,
-            );
-            let _0_eq_any = builder.or(_0_eq_1, _0_eq_2);
-            let _1_eq_any = builder.or(_1_eq_2, _0_eq_1);
-            let _2_eq_any = builder.or(_0_eq_2, _1_eq_2);
-            let should_all_be_false = [
-                builder.and_not(_0_eq_any, _0_is_nil),
-                builder.and_not(_1_eq_any, _1_is_nil),
-                builder.and_not(_2_eq_any, _2_is_nil),
-            ];
-            let should_be_false = builder.multi_or(&should_all_be_false);
-            builder.conditional_assert_false(is_enabled, should_be_false);
-        }
-
         // First order should always fit into 48 bits, rest are equal to first order or zero
         builder.register_range_check(self.orders[0].base_amount, ORDER_SIZE_BITS);
 
@@ -454,6 +426,12 @@ impl Verify for L2CreateGroupedOrdersTxTarget {
             let flag = builder.and(is_enabled, self.order_exists[i]);
 
             builder.conditional_assert_eq(flag, self.market_index, self.orders[i].market_index);
+
+            builder.conditional_assert_eq(
+                flag,
+                self.orders[i].client_order_index,
+                nil_client_order_index,
+            );
 
             // Assert reduce only is 0 or 1
             builder.assert_bool(BoolTarget::new_unsafe(self.orders[i].reduce_only));
@@ -647,8 +625,6 @@ impl Verify for L2CreateGroupedOrdersTxTarget {
                 is_order_empty,
             ]);
             self.success = builder.and(self.success, is_valid_base_size_and_price_or_zero);
-
-            self.success = builder.and(self.success, tx_state.is_cloid_unique[i]);
         }
 
         let invalid_reduce_only_direction = is_not_valid_reduce_only_direction(
@@ -666,6 +642,7 @@ impl Verify for L2CreateGroupedOrdersTxTarget {
 
 impl Apply for L2CreateGroupedOrdersTxTarget {
     fn apply(&mut self, builder: &mut Builder, tx_state: &mut TxState) -> BoolTarget {
+        let nil_order_index = builder.constant_i64(NIL_ORDER_INDEX);
         let nil_nonce = builder.constant_i64(NIL_ORDER_NONCE_INDEX);
 
         let mut order_instructions: [BaseRegisterInfoTarget; MAX_NB_GROUPED_ORDERS] =
@@ -674,9 +651,6 @@ impl Apply for L2CreateGroupedOrdersTxTarget {
         let trigger_status_na = builder.constant_from_u8(TRIGGER_STATUS_NA);
         let trigger_status_mark_price = builder.constant_from_u8(TRIGGER_STATUS_MARK_PRICE);
         let trigger_status_parent_order = builder.constant_from_u8(TRIGGER_STATUS_PARENT_ORDER);
-
-        let (generic_field_1, generic_field_2, generic_field_3) =
-            tx_state.attributes.get_register_generic_fields(builder);
 
         let execute_transaction = builder.constant_from_u8(EXECUTE_TRANSACTION);
         let insert_order = builder.constant_from_u8(INSERT_ORDER);
@@ -718,7 +692,7 @@ impl Apply for L2CreateGroupedOrdersTxTarget {
                 pending_size: self.base_amounts[i],
 
                 pending_order_index: order_index,
-                pending_client_order_index: self.orders[i].client_order_index,
+                pending_client_order_index: nil_order_index,
                 pending_initial_size: self.base_amounts[i],
                 pending_price: self.orders[i].price,
                 pending_nonce: order_nonce,
@@ -736,10 +710,6 @@ impl Apply for L2CreateGroupedOrdersTxTarget {
                 pending_to_trigger_order_index0: builder.zero(),
                 pending_to_trigger_order_index1: builder.zero(),
                 pending_to_cancel_order_index0: builder.zero(),
-
-                generic_field_1,
-                generic_field_2,
-                generic_field_3,
             };
         }
 
@@ -842,16 +812,10 @@ impl Apply for L2CreateGroupedOrdersTxTarget {
             );
         }
 
-        // Inserted registers won't have a hole in the middle.
         for i in 0..MAX_NB_GROUPED_ORDERS {
             let instruction_flag =
                 builder.is_equal(order_instructions[i].instruction_type, insert_order);
-            tx_state.put_to_instruction_stack_unsafe(
-                builder,
-                instruction_flag,
-                &order_instructions[i],
-                MAX_NB_GROUPED_ORDERS - i - 1,
-            );
+            tx_state.insert_to_instruction_stack(builder, instruction_flag, &order_instructions[i]);
         }
         tx_state.matching_engine_flag = builder.or(tx_state.matching_engine_flag, self.success);
 

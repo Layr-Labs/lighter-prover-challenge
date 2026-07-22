@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use anyhow::Result;
-use plonky2::field::types::PrimeField64;
+use plonky2::field::types::{Field, Field64, PrimeField64};
 use plonky2::hash::hash_types::RichField;
 use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::iop::witness::Witness;
@@ -10,11 +10,10 @@ use serde::Deserialize;
 
 use crate::bool_utils::CircuitBuilderBoolUtils;
 use crate::circuit_logger::CircuitBuilderLogging;
-use crate::tx_attributes::is_integrator_fee_disabled;
-use crate::types::config::Builder;
+use crate::types::config::{Builder, F};
 use crate::utils::CircuitBuilderUtils;
 
-pub const BASE_REGISTER_INFO_SIZE: usize = 23;
+pub const BASE_REGISTER_INFO_SIZE: usize = 20;
 
 #[derive(Clone, Debug, Deserialize, Copy)]
 #[serde(default)]
@@ -64,6 +63,9 @@ pub struct BaseRegisterInfo {
     #[serde(rename = "ptp")]
     pub pending_trigger_price: u32,
 
+    #[serde(rename = "gf0")]
+    pub generic_field_0: i64,
+
     #[serde(rename = "pts")]
     pub pending_trigger_status: u8,
 
@@ -75,26 +77,17 @@ pub struct BaseRegisterInfo {
 
     #[serde(rename = "ptcoi0")]
     pub pending_to_cancel_order_index0: i64,
-
-    #[serde(rename = "gf0")]
-    pub generic_field_0: i64,
-    #[serde(rename = "gf1")]
-    pub generic_field_1: i64,
-    #[serde(rename = "gf2")]
-    pub generic_field_2: i64,
-    #[serde(rename = "gf3")]
-    pub generic_field_3: i64,
 }
 
 impl Default for BaseRegisterInfo {
     fn default() -> Self {
-        Self::empty()
+        BaseRegisterInfo::empty()
     }
 }
 
 impl BaseRegisterInfo {
     pub fn empty() -> Self {
-        Self {
+        BaseRegisterInfo {
             instruction_type: 0,
             market_index: 0,
             account_index: 0,
@@ -115,9 +108,6 @@ impl BaseRegisterInfo {
             pending_to_trigger_order_index0: 0,
             pending_to_trigger_order_index1: 0,
             pending_to_cancel_order_index0: 0,
-            generic_field_1: 0,
-            generic_field_2: 0,
-            generic_field_3: 0,
         }
     }
 
@@ -142,9 +132,31 @@ impl BaseRegisterInfo {
             && self.pending_to_trigger_order_index0 == 0
             && self.pending_to_trigger_order_index1 == 0
             && self.pending_to_cancel_order_index0 == 0
-            && self.generic_field_1 == 0
-            && self.generic_field_2 == 0
-            && self.generic_field_3 == 0
+    }
+
+    pub fn get_hash_parameters(&self) -> Vec<F> {
+        vec![
+            F::from_canonical_u8(self.instruction_type),
+            F::from_canonical_u16(self.market_index),
+            F::from_canonical_i64(self.account_index),
+            F::from_canonical_i64(self.pending_size),
+            F::from_canonical_i64(self.pending_order_index),
+            F::from_canonical_i64(self.pending_client_order_index),
+            F::from_canonical_i64(self.pending_initial_size),
+            F::from_canonical_i64(self.pending_price),
+            F::from_canonical_i64(self.pending_nonce),
+            F::from_canonical_u8(self.pending_is_ask),
+            F::from_canonical_u8(self.pending_type),
+            F::from_canonical_u8(self.pending_time_in_force),
+            F::from_canonical_u8(self.pending_reduce_only),
+            F::from_canonical_i64(self.pending_expiry),
+            F::from_canonical_i64(self.generic_field_0),
+            F::from_canonical_u32(self.pending_trigger_price),
+            F::from_canonical_u8(self.pending_trigger_status),
+            F::from_canonical_i64(self.pending_to_trigger_order_index0),
+            F::from_canonical_i64(self.pending_to_trigger_order_index1),
+            F::from_canonical_i64(self.pending_to_cancel_order_index0),
+        ]
     }
 
     pub fn from_vec<F>(pis: &[F]) -> Self
@@ -173,9 +185,6 @@ impl BaseRegisterInfo {
             pending_to_trigger_order_index0: i64::try_from(pis[17].to_canonical_u64()).unwrap(),
             pending_to_trigger_order_index1: i64::try_from(pis[18].to_canonical_u64()).unwrap(),
             pending_to_cancel_order_index0: i64::try_from(pis[19].to_canonical_u64()).unwrap(),
-            generic_field_1: i64::try_from(pis[20].to_canonical_u64()).unwrap(),
-            generic_field_2: i64::try_from(pis[21].to_canonical_u64()).unwrap(),
-            generic_field_3: i64::try_from(pis[22].to_canonical_u64()).unwrap(),
         }
     }
 }
@@ -207,15 +216,11 @@ pub struct BaseRegisterInfoTarget {
     pub pending_to_trigger_order_index0: Target,
     pub pending_to_trigger_order_index1: Target,
     pub pending_to_cancel_order_index0: Target,
-
-    pub generic_field_1: Target,
-    pub generic_field_2: Target,
-    pub generic_field_3: Target,
 }
 
 impl BaseRegisterInfoTarget {
     pub fn new(builder: &mut Builder) -> Self {
-        Self {
+        BaseRegisterInfoTarget {
             instruction_type: builder.add_virtual_target(),
             market_index: builder.add_virtual_target(),
             account_index: builder.add_virtual_target(),
@@ -241,10 +246,6 @@ impl BaseRegisterInfoTarget {
             pending_to_trigger_order_index0: builder.add_virtual_target(),
             pending_to_trigger_order_index1: builder.add_virtual_target(),
             pending_to_cancel_order_index0: builder.add_virtual_target(),
-
-            generic_field_1: builder.add_virtual_target(),
-            generic_field_2: builder.add_virtual_target(),
-            generic_field_3: builder.add_virtual_target(),
         }
     }
 
@@ -281,9 +282,6 @@ impl BaseRegisterInfoTarget {
             self.pending_to_cancel_order_index0,
             other.pending_to_cancel_order_index0,
         );
-        builder.connect(self.generic_field_1, other.generic_field_1);
-        builder.connect(self.generic_field_2, other.generic_field_2);
-        builder.connect(self.generic_field_3, other.generic_field_3);
     }
 
     pub fn is_equal(builder: &mut Builder, a: &Self, b: &Self) -> BoolTarget {
@@ -317,49 +315,38 @@ impl BaseRegisterInfoTarget {
                 a.pending_to_cancel_order_index0,
                 b.pending_to_cancel_order_index0,
             ),
-            builder.is_equal(a.generic_field_1, b.generic_field_1),
-            builder.is_equal(a.generic_field_2, b.generic_field_2),
-            builder.is_equal(a.generic_field_3, b.generic_field_3),
         ];
         builder.multi_and(&assertions)
     }
 
     pub fn is_empty(&self, builder: &mut Builder) -> BoolTarget {
-        // Adding following fields does not overflow Goldilocks, as long as
-        // these fields are guaranteed by business logic to fit these sizes.
-        let added = builder.add_many([
-            self.instruction_type,           // 8 bits
-            self.market_index,               // 16 bits
-            self.account_index,              // 48 bits
-            self.pending_size,               // 48 bits
-            self.pending_client_order_index, // 48 bits
-            self.pending_initial_size,       // 48 bits
-            self.pending_price,              // 32 bits
-            self.pending_nonce,              // 48 bits
-            self.pending_is_ask.target,      // 1 bit
-            self.pending_type,               // 8 bits
-            self.pending_time_in_force,      // 8 bits
-            self.pending_reduce_only,        // 8 bits
-            self.pending_expiry,             // 48 bits
-            self.pending_trigger_price,      // 32 bits
-            self.pending_trigger_status,     // 2 bits
-            self.generic_field_2,            // generic but 32 bits
-            self.generic_field_3,            // generic but 32 bits
-        ]);
         let assertions = [
-            builder.is_zero(added),
+            builder.is_zero(self.instruction_type),
+            builder.is_zero(self.market_index),
+            builder.is_zero(self.account_index),
+            builder.is_zero(self.pending_size),
             builder.is_zero(self.pending_order_index),
+            builder.is_zero(self.pending_client_order_index),
+            builder.is_zero(self.pending_initial_size),
+            builder.is_zero(self.pending_price),
+            builder.is_zero(self.pending_nonce),
+            builder.is_zero(self.pending_is_ask.target),
+            builder.is_zero(self.pending_type),
+            builder.is_zero(self.pending_time_in_force),
+            builder.is_zero(self.pending_reduce_only),
+            builder.is_zero(self.pending_expiry),
+            builder.is_zero(self.generic_field_0),
+            builder.is_zero(self.pending_trigger_price),
+            builder.is_zero(self.pending_trigger_status),
             builder.is_zero(self.pending_to_trigger_order_index0),
             builder.is_zero(self.pending_to_trigger_order_index1),
             builder.is_zero(self.pending_to_cancel_order_index0),
-            builder.is_zero(self.generic_field_0), // Generic
-            builder.is_zero(self.generic_field_1), // Generic
         ];
         builder.multi_and(&assertions)
     }
 
     pub fn empty(builder: &mut Builder) -> Self {
-        Self {
+        BaseRegisterInfoTarget {
             instruction_type: builder.zero(),
             market_index: builder.zero(),
             account_index: builder.zero(),
@@ -385,10 +372,6 @@ impl BaseRegisterInfoTarget {
             pending_to_trigger_order_index0: builder.zero(),
             pending_to_trigger_order_index1: builder.zero(),
             pending_to_cancel_order_index0: builder.zero(),
-
-            generic_field_1: builder.zero(),
-            generic_field_2: builder.zero(),
-            generic_field_3: builder.zero(),
         }
     }
 
@@ -446,12 +429,6 @@ impl BaseRegisterInfoTarget {
             self.pending_to_cancel_order_index0,
             &format!("{} pending_to_cancel_order_index0", tag),
         );
-        builder.println(
-            self.generic_field_1,
-            &format!("{} pending_integrator_fee_collector_index", tag),
-        );
-        builder.println(self.generic_field_2, &format!("{} generic_field_2", tag));
-        builder.println(self.generic_field_3, &format!("{} generic_field_3", tag));
     }
 
     pub fn get_hash_parameters(&self) -> Vec<Target> {
@@ -476,9 +453,6 @@ impl BaseRegisterInfoTarget {
             self.pending_to_trigger_order_index0,
             self.pending_to_trigger_order_index1,
             self.pending_to_cancel_order_index0,
-            self.generic_field_1,
-            self.generic_field_2,
-            self.generic_field_3,
         ]
     }
 
@@ -503,9 +477,6 @@ impl BaseRegisterInfoTarget {
         builder.register_public_input(self.pending_to_trigger_order_index0);
         builder.register_public_input(self.pending_to_trigger_order_index1);
         builder.register_public_input(self.pending_to_cancel_order_index0);
-        builder.register_public_input(self.generic_field_1);
-        builder.register_public_input(self.generic_field_2);
-        builder.register_public_input(self.generic_field_3);
     }
 
     /// Converts a slice of `Target` into a `BaseRegisterInfoTarget`. Follow same order as [`Self::register_public_input`].
@@ -532,29 +503,7 @@ impl BaseRegisterInfoTarget {
             pending_to_trigger_order_index0: pis[17],
             pending_to_trigger_order_index1: pis[18],
             pending_to_cancel_order_index0: pis[19],
-            generic_field_1: pis[20],
-            generic_field_2: pis[21],
-            generic_field_3: pis[22],
         }
-    }
-
-    pub fn to_order_fields_from_generic_fields(
-        &self,
-        builder: &mut Builder,
-    ) -> (
-        Target, // integrator_fee_collector_index
-        Target, // integrator_taker_fee
-        Target, // integrator_maker_fee
-        Target, // order_flags
-    ) {
-        let zero = builder.zero();
-        let is_integrator_fee_disabled = is_integrator_fee_disabled(builder, self.generic_field_1);
-        (
-            self.generic_field_1,
-            builder.select(is_integrator_fee_disabled, zero, self.generic_field_2),
-            builder.select(is_integrator_fee_disabled, zero, self.generic_field_3),
-            builder.select(is_integrator_fee_disabled, self.generic_field_2, zero),
-        )
     }
 }
 
@@ -649,18 +598,6 @@ impl<T: Witness<F>, F: PrimeField64> BaseRegisterInfoTargetWitness<F> for T {
             register_target.pending_to_cancel_order_index0,
             F::from_canonical_i64(register.pending_to_cancel_order_index0),
         )?;
-        self.set_target(
-            register_target.generic_field_1,
-            F::from_canonical_i64(register.generic_field_1),
-        )?;
-        self.set_target(
-            register_target.generic_field_2,
-            F::from_canonical_i64(register.generic_field_2),
-        )?;
-        self.set_target(
-            register_target.generic_field_3,
-            F::from_canonical_i64(register.generic_field_3),
-        )?;
 
         Ok(())
     }
@@ -733,9 +670,6 @@ pub fn select_register_target(
             a.pending_to_cancel_order_index0,
             b.pending_to_cancel_order_index0,
         ),
-        generic_field_1: builder.select(is_enabled, a.generic_field_1, b.generic_field_1),
-        generic_field_2: builder.select(is_enabled, a.generic_field_2, b.generic_field_2),
-        generic_field_3: builder.select(is_enabled, a.generic_field_3, b.generic_field_3),
     }
 }
 
@@ -783,12 +717,6 @@ impl BaseRegisterInfoTarget {
                 .constant_i64(rand::thread_rng().gen_range(0..=(1usize << 48) - 1) as i64),
             pending_to_cancel_order_index0: builder
                 .constant_i64(rand::thread_rng().gen_range(0..=(1usize << 48) - 1) as i64),
-            generic_field_1: builder
-                .constant_i64(rand::thread_rng().gen_range(0..=(1usize << 48) - 1) as i64),
-            generic_field_2: builder
-                .constant_i64(rand::thread_rng().gen_range(0..=(1usize << 32) - 1) as i64),
-            generic_field_3: builder
-                .constant_i64(rand::thread_rng().gen_range(0..=(1usize << 32) - 1) as i64),
         }
     }
 }

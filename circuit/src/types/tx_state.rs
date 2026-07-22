@@ -1,11 +1,13 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
+use plonky2::hash::hash_types::HashOutTarget;
 use plonky2::iop::target::{BoolTarget, Target};
 
 use super::account_order::AccountOrderTarget;
 use super::api_key::ApiKeyTarget;
 use super::config::Builder;
+use super::constants::{ACCOUNT_ORDERS_MERKLE_LEVELS, NEW_INSTRUCTIONS_MAX_SIZE};
 use super::register::{RegisterStackTarget, select_register_target};
 use crate::bigint::bigint::BigIntTarget;
 use crate::bigint::biguint::CircuitBuilderBiguint;
@@ -13,19 +15,15 @@ use crate::bigint::comparison::CircuitBuilderBiguintSubtractiveComparison;
 use crate::bool_utils::CircuitBuilderBoolUtils;
 use crate::comparison::CircuitBuilderSubtractiveComparison;
 use crate::signed::signed_target::SignedTarget;
-use crate::tx_attributes::TxAttributesTarget;
 use crate::types::account::AccountTarget;
 use crate::types::account_asset::AccountAssetTarget;
 use crate::types::account_delta::AccountDeltaTarget;
-use crate::types::account_margined_asset::AccountMarginedAssetTarget;
 use crate::types::account_position::AccountPositionTarget;
 use crate::types::asset::AssetTarget;
 use crate::types::config::BIG_U96_LIMBS;
 use crate::types::constants::{
-    NB_ACCOUNTS_PER_TX, NB_ASSETS_PER_TX, NB_CLOID_UNIQUENESS_CHECK_PER_TX,
-    NEW_INSTRUCTIONS_MAX_SIZE, ORDER_BASE_AMOUNT_BITS, ORDER_BOOK_MERKLE_LEVELS,
+    NB_ACCOUNTS_PER_TX, NB_ASSETS_PER_TX, ORDER_BASE_AMOUNT_BITS, ORDER_BOOK_MERKLE_LEVELS,
 };
-use crate::types::margined_asset::MarginedAssetTarget;
 use crate::types::market::MarketTarget;
 use crate::types::market_details::MarketDetailsTarget;
 use crate::types::order::OrderTarget;
@@ -47,22 +45,17 @@ pub struct TxState {
     pub account_order: AccountOrderTarget,
     pub accounts: [AccountTarget; NB_ACCOUNTS_PER_TX],
     pub account_assets: [[AccountAssetTarget; NB_ASSETS_PER_TX]; NB_ACCOUNTS_PER_TX],
-    pub account_margined_assets:
-        [[AccountMarginedAssetTarget; NB_ASSETS_PER_TX]; NB_ACCOUNTS_PER_TX], // First two slots are mutable, third slot is immutable and read-only
     pub accounts_delta: [AccountDeltaTarget; NB_ACCOUNTS_PER_TX],
     pub market: MarketTarget,
     pub market_details: MarketDetailsTarget,
     pub order: OrderTarget,
     pub order_book_tree_path: [OrderBookNodeTarget; ORDER_BOOK_MERKLE_LEVELS],
-    pub assets: [AssetTarget; NB_ASSETS_PER_TX], // First slot is mutable, second and third slot is immutable and read-only
-    pub margined_asset: [MarginedAssetTarget; NB_ASSETS_PER_TX], // First two slots are mutable, third slot is immutable and read-only
+    pub assets: [AssetTarget; NB_ASSETS_PER_TX],
     pub asset_indices: [Target; NB_ASSETS_PER_TX],
 
     /***********/
     /* Helpers */
     /***********/
-    pub next_margin_asset_index: Target,
-    pub first_asset_margin_index: Target,
     pub is_new_account: [BoolTarget; NB_ACCOUNTS_PER_TX],
     pub positions: [AccountPositionTarget; NB_ACCOUNTS_PER_TX - 1],
     pub risk_infos: [RiskInfoTarget; NB_ACCOUNTS_PER_TX - 1],
@@ -79,15 +72,10 @@ pub struct TxState {
     pub is_sender_receiver_different: BoolTarget,
     pub fee_account_is_taker: BoolTarget,
     pub fee_account_is_maker: BoolTarget,
-    pub is_cloid_unique: [BoolTarget; NB_CLOID_UNIQUENESS_CHECK_PER_TX],
+    pub taker_client_order_proof: [HashOutTarget; ACCOUNT_ORDERS_MERKLE_LEVELS],
     pub public_pool_share: PublicPoolShareTarget,
     pub apply_pool_share_delta_flag: BoolTarget,
     pub between_strategies_flag: BoolTarget, // Indicates that we are transfering between different strategies of the same account
-
-    /**************/
-    /* Attributes */
-    /**************/
-    pub attributes: TxAttributesTarget,
 }
 
 impl Default for TxState {
@@ -100,16 +88,12 @@ impl Default for TxState {
             api_key: ApiKeyTarget::default(),
             account_order: AccountOrderTarget::default(),
             accounts: core::array::from_fn(|_| AccountTarget::default()),
+            assets: core::array::from_fn(|_| AssetTarget::default()),
             account_assets: core::array::from_fn(|_| {
                 core::array::from_fn(|_| AccountAssetTarget::default())
             }),
-            account_margined_assets: core::array::from_fn(|_| {
-                core::array::from_fn(|_| AccountMarginedAssetTarget::default())
-            }),
-            accounts_delta: core::array::from_fn(|_| AccountDeltaTarget::default()),
-            assets: core::array::from_fn(|_| AssetTarget::default()),
-            margined_asset: core::array::from_fn(|_| MarginedAssetTarget::default()),
             asset_indices: core::array::from_fn(|_| Target::default()),
+            accounts_delta: core::array::from_fn(|_| AccountDeltaTarget::default()),
             market: MarketTarget::default(),
             market_details: MarketDetailsTarget::default(), // Only relevant for perps
             order: OrderTarget::default(),
@@ -130,49 +114,42 @@ impl Default for TxState {
             is_sender_receiver_different: BoolTarget::default(),
             fee_account_is_taker: BoolTarget::default(),
             fee_account_is_maker: BoolTarget::default(),
-            is_cloid_unique: core::array::from_fn(|_| BoolTarget::default()),
+            taker_client_order_proof: core::array::from_fn(|_| HashOutTarget {
+                elements: core::array::from_fn(|_| Target::default()),
+            }),
             public_pool_share: PublicPoolShareTarget::default(),
             apply_pool_share_delta_flag: BoolTarget::default(),
             between_strategies_flag: BoolTarget::default(),
-            next_margin_asset_index: Target::default(),
-            first_asset_margin_index: Target::default(),
-
-            attributes: TxAttributesTarget::default(),
         }
     }
 }
 
 impl TxState {
-    pub fn get_attribute(&self, attribute_type: usize) -> Target {
-        self.attributes.get(attribute_type)
-    }
-
-    /// Caller's responsibility to ensure there are no overrides, meaning
-    /// only one branch of code that writes to same index should be enabled.
-    pub fn put_to_instruction_stack_unsafe(
+    pub fn insert_to_instruction_stack(
         &mut self,
         builder: &mut Builder,
         is_enabled: BoolTarget,
         instruction: &BaseRegisterInfoTarget,
-        target_index: usize,
     ) {
+        for i in 0..NEW_INSTRUCTIONS_MAX_SIZE {
+            let i_target = builder.constant_usize(i);
+            let i_eq_instruction_count = builder.is_equal(self.new_instructions_count, i_target);
+            let flag = builder.and(is_enabled, i_eq_instruction_count);
+
+            let index = NEW_INSTRUCTIONS_MAX_SIZE - 1 - i;
+            self.new_instructions[index] =
+                select_register_target(builder, flag, instruction, &self.new_instructions[index]);
+        }
         self.new_instructions_count = builder.add(self.new_instructions_count, is_enabled.target);
-        self.new_instructions[target_index] = select_register_target(
-            builder,
-            is_enabled,
-            instruction,
-            &self.new_instructions[target_index],
-        );
     }
 
-    pub fn push_instruction_stack<const MAX_NEW_INSTR: usize>(&mut self, builder: &mut Builder) {
-        self.register_stack.push_instructions::<MAX_NEW_INSTR>(
+    pub fn push_instruction_stack(&mut self, builder: &mut Builder) {
+        self.register_stack.push_instructions(
             builder,
             &self.new_instructions,
             self.new_instructions_count,
         );
         self.new_instructions_count = builder.zero();
-        self.new_instructions = [BaseRegisterInfoTarget::empty(builder); NEW_INSTRUCTIONS_MAX_SIZE];
     }
 
     pub fn is_valid_base_size_and_price(
@@ -219,7 +196,7 @@ mod tests {
     use super::*;
     use crate::bool_utils::CircuitBuilderBoolUtils;
     use crate::types::config::{Builder, C, F};
-    use crate::types::constants::{INSERT_MAX_SIX_REGISTERS, REGISTER_STACK_SIZE};
+    use crate::types::constants::REGISTER_STACK_SIZE;
     use crate::types::tx_state::TxState;
 
     #[test]
@@ -237,12 +214,7 @@ mod tests {
                 let new_instruction = BaseRegisterInfoTarget::random(&mut builder);
 
                 // Insert to new instructions stack - False flag
-                tx_state.put_to_instruction_stack_unsafe(
-                    &mut builder,
-                    _false,
-                    &new_instruction,
-                    NEW_INSTRUCTIONS_MAX_SIZE - 1 - j,
-                );
+                tx_state.insert_to_instruction_stack(&mut builder, _false, &new_instruction);
                 let current_count = builder.constant_usize(j);
                 builder.conditional_assert_eq(
                     _true,
@@ -254,12 +226,7 @@ mod tests {
                 builder.assert_true(check);
 
                 // Insert to new instructions stack - True flag
-                tx_state.put_to_instruction_stack_unsafe(
-                    &mut builder,
-                    _true,
-                    &new_instruction,
-                    NEW_INSTRUCTIONS_MAX_SIZE - 1 - j,
-                );
+                tx_state.insert_to_instruction_stack(&mut builder, _true, &new_instruction);
                 let current_count = builder.constant_usize(j + 1);
                 builder.conditional_assert_eq(
                     _true,
@@ -275,7 +242,7 @@ mod tests {
             }
 
             // Push to register stack - True flag
-            tx_state.push_instruction_stack::<NEW_INSTRUCTIONS_MAX_SIZE>(&mut builder);
+            tx_state.push_instruction_stack(&mut builder);
             let current_count_in_new_instructions = zero;
             builder.conditional_assert_eq(
                 _true,
@@ -313,35 +280,25 @@ mod tests {
 
         let mut tx_state = init_tx_state(&mut builder);
 
-        // insert INSERT_MAX_SIX_REGISTERS instructions
-        for i in 0..INSERT_MAX_SIX_REGISTERS {
+        // insert NEW_INSTRUCTIONS_MAX_SIZE instructions
+        for _ in 0..NEW_INSTRUCTIONS_MAX_SIZE {
             let new_instruction = BaseRegisterInfoTarget::random(&mut builder);
-            tx_state.put_to_instruction_stack_unsafe(
-                &mut builder,
-                _true,
-                &new_instruction,
-                INSERT_MAX_SIX_REGISTERS - 1 - i,
-            );
+            tx_state.insert_to_instruction_stack(&mut builder, _true, &new_instruction);
         }
         // Push to register stack
-        tx_state.push_instruction_stack::<INSERT_MAX_SIX_REGISTERS>(&mut builder);
-        // insert REGISTER_STACK_SIZE - INSERT_MAX_SIX_REGISTERS instructions
-        for i in INSERT_MAX_SIX_REGISTERS..REGISTER_STACK_SIZE {
+        tx_state.push_instruction_stack(&mut builder);
+        // insert REGISTER_STACK_SIZE - NEW_INSTRUCTIONS_MAX_SIZE instructions
+        for _ in NEW_INSTRUCTIONS_MAX_SIZE..REGISTER_STACK_SIZE {
             let new_instruction = BaseRegisterInfoTarget::random(&mut builder);
-            tx_state.put_to_instruction_stack_unsafe(
-                &mut builder,
-                _true,
-                &new_instruction,
-                REGISTER_STACK_SIZE - 1 - i,
-            );
+            tx_state.insert_to_instruction_stack(&mut builder, _true, &new_instruction);
         }
         // Push to register stack
-        tx_state.push_instruction_stack::<INSERT_MAX_SIX_REGISTERS>(&mut builder);
+        tx_state.push_instruction_stack(&mut builder);
 
         // Now inserting one more instruction should fail
         let new_instruction = BaseRegisterInfoTarget::random(&mut builder);
-        tx_state.put_to_instruction_stack_unsafe(&mut builder, _true, &new_instruction, 0);
-        tx_state.push_instruction_stack::<INSERT_MAX_SIX_REGISTERS>(&mut builder);
+        tx_state.insert_to_instruction_stack(&mut builder, _true, &new_instruction);
+        tx_state.push_instruction_stack(&mut builder);
 
         let data = builder.build::<C>();
         data.verify(data.prove(PartialWitness::<F>::new()).unwrap())

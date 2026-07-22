@@ -112,7 +112,7 @@ pub trait CircuitBuilderBigInt<F: RichField + Extendable<D>, const D: usize> {
     fn random_access_bigint(
         &mut self,
         access_index: Target,
-        v: &[BigIntTarget],
+        v: Vec<BigIntTarget>,
         limb_count: usize,
     ) -> BigIntTarget;
 
@@ -199,17 +199,14 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderBigInt<F, D> fo
     }
 
     fn is_zero_bigint(&mut self, a: &BigIntTarget) -> BoolTarget {
+        let is_zero_abs = self.is_zero_biguint(&a.abs);
         let is_sign_zero = self.is_zero(a.sign.target);
-        let is_abs_zero = self.is_zero_biguint(&a.abs);
-        self.and(is_sign_zero, is_abs_zero)
+        self.and(is_zero_abs, is_sign_zero)
     }
 
     fn add_virtual_bigint_target_safe(&mut self, num_limbs: usize) -> BigIntTarget {
         let abs = self.add_virtual_biguint_target_safe(num_limbs);
         let sign = self.add_virtual_sign_target_safe();
-        let abs_is_zero = self.is_zero_biguint(&abs);
-        let sign_is_zero = self.is_zero(sign.target);
-        self.connect(abs_is_zero.target, sign_is_zero.target);
         BigIntTarget { abs, sign }
     }
 
@@ -452,7 +449,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderBigInt<F, D> fo
     fn random_access_bigint(
         &mut self,
         access_index: Target,
-        v: &[BigIntTarget],
+        v: Vec<BigIntTarget>,
         limb_count: usize,
     ) -> BigIntTarget {
         BigIntTarget {

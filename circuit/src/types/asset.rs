@@ -15,19 +15,20 @@ use crate::bigint::biguint::{BigUintTarget, CircuitBuilderBiguint, WitnessBigUin
 use crate::bool_utils::CircuitBuilderBoolUtils;
 use crate::circuit_logger::CircuitBuilderLogging;
 use crate::eddsa::gadgets::curve::PartialWitnessCurve;
+use crate::hash_utils::CircuitBuilderHashUtils;
 use crate::poseidon2::Poseidon2Hash;
 use crate::types::config::BIG_U64_LIMBS;
-use crate::types::constants::*;
-use crate::uint::u32::gadgets::arithmetic_u32::U32Target;
+use crate::types::constants::{ASSET_LIST_SIZE, MAX_ASSET_INDEX, MIN_ASSET_INDEX};
+use crate::uint::u32::gadgets::arithmetic_u32::{CircuitBuilderU32, U32Target};
 use crate::utils::CircuitBuilderUtils;
 
-pub const ASSET_SIZE: usize = 8;
+pub const ASSET_SIZE: usize = 7;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(bound = "")]
 #[serde(default)]
 pub struct Asset {
-    #[serde(rename = "ai")]
+    #[serde(rename = "i")]
     pub asset_index: i16,
     #[serde(rename = "em")]
     pub extension_multiplier: i64, // 56 bits
@@ -37,8 +38,6 @@ pub struct Asset {
     pub min_withdrawal_amount: i64, // 60 bits
     #[serde(rename = "mm", default)]
     pub margin_mode: u8,
-    #[serde(rename = "mi", default)]
-    pub margin_index: u8,
 }
 
 impl Asset {
@@ -58,7 +57,6 @@ impl Asset {
                 as i64,
             min_withdrawal_amount: (pis[6].to_canonical_u64() << 32 | pis[5].to_canonical_u64())
                 as i64,
-            margin_index: u8::try_from(pis[7].to_canonical_u64()).unwrap(),
         }
     }
 
@@ -69,7 +67,6 @@ impl Asset {
             min_transfer_amount: 0,
             min_withdrawal_amount: 0,
             margin_mode: 0,
-            margin_index: 0,
         }
     }
 }
@@ -80,7 +77,6 @@ pub struct AssetTarget {
     pub min_transfer_amount: BigUintTarget,
     pub min_withdrawal_amount: BigUintTarget,
     pub margin_mode: Target,
-    pub margin_index: Target,
 }
 
 impl AssetTarget {
@@ -90,7 +86,6 @@ impl AssetTarget {
             extension_multiplier: builder.add_virtual_biguint_target_unsafe(BIG_U64_LIMBS),
             min_transfer_amount: builder.add_virtual_biguint_target_unsafe(BIG_U64_LIMBS),
             min_withdrawal_amount: builder.add_virtual_biguint_target_unsafe(BIG_U64_LIMBS),
-            margin_index: builder.add_virtual_target(),
         }
     }
 
@@ -108,34 +103,17 @@ impl AssetTarget {
             min_withdrawal_amount: BigUintTarget {
                 limbs: vec![U32Target(pis[5]), U32Target(pis[6])],
             },
-            margin_index: pis[7],
         }
     }
 
     pub fn is_empty(&self, builder: &mut Builder) -> BoolTarget {
-        // Adding 6 u32 limbs and a bool does not overflow Goldilocks, as long as
-        // limbs are guaranteed by business logic to fit 32 bits.
-        let added = builder.add_many(
-            [
-                &self.extension_multiplier,
-                &self.min_transfer_amount,
-                &self.min_withdrawal_amount,
-            ]
-            .iter()
-            .flat_map(|x| x.limbs.iter().map(|limb| limb.0))
-            .chain([self.margin_mode, self.margin_index])
-            .collect::<Vec<_>>(),
-        );
-        builder.is_zero(added)
-    }
-
-    pub fn margin_index(&self, builder: &mut Builder) -> Target {
-        let nil_margined_asset_index = builder.constant_u64(MARGINED_ASSET_LIST_SIZE as u64);
-        builder.select(
-            BoolTarget::new_unsafe(self.margin_mode), // 0 disabled, 1 enabled
-            self.margin_index,
-            nil_margined_asset_index,
-        )
+        let assertions = [
+            builder.is_zero(self.margin_mode),
+            builder.is_zero_biguint(&self.extension_multiplier),
+            builder.is_zero_biguint(&self.min_transfer_amount),
+            builder.is_zero_biguint(&self.min_withdrawal_amount),
+        ];
+        builder.multi_and(&assertions)
     }
 
     pub fn print(&self, builder: &mut Builder, tag: &str) {
@@ -152,11 +130,10 @@ impl AssetTarget {
             &format!("{} min_withdrawal_amount", tag),
         );
         builder.println(self.margin_mode, &format!("{} margin_mode", tag));
-        builder.println(self.margin_index, &format!("{} margin_index", tag));
     }
 
     pub fn get_hash_parameters(&self) -> Vec<Target> {
-        let mut elements = vec![self.margin_index, self.margin_mode];
+        let mut elements = vec![self.margin_mode];
 
         [
             &self.extension_multiplier,
@@ -178,7 +155,6 @@ impl AssetTarget {
     pub fn empty(builder: &mut Builder) -> Self {
         Self {
             margin_mode: builder.zero(),
-            margin_index: builder.zero(),
             extension_multiplier: builder.zero_biguint(),
             min_transfer_amount: builder.zero_biguint(),
             min_withdrawal_amount: builder.zero_biguint(),
@@ -192,10 +168,34 @@ impl AssetTarget {
         builder.register_public_input_biguint(&self.extension_multiplier);
         builder.register_public_input_biguint(&self.min_transfer_amount);
         builder.register_public_input_biguint(&self.min_withdrawal_amount);
-        builder.register_public_input(self.margin_index);
 
         let public_inputs_after = builder.num_public_inputs();
         assert_eq!(public_inputs_after - public_inputs_before, ASSET_SIZE);
+    }
+
+    pub fn hash(&self, builder: &mut Builder) -> HashOutTarget {
+        let mut elements = vec![self.margin_mode];
+
+        [
+            &self.extension_multiplier,
+            &self.min_transfer_amount,
+            &self.min_withdrawal_amount,
+        ]
+        .iter()
+        .for_each(|biguint_target| {
+            let mut limbs = biguint_target.limbs.clone();
+            limbs.resize(BIG_U64_LIMBS, builder.zero_u32());
+            for limb in limbs {
+                elements.push(limb.0);
+            }
+        });
+
+        let non_empty_hash = builder.hash_n_to_hash_no_pad::<Poseidon2Hash>(elements);
+
+        let empty_hash = builder.zero_hash_out();
+        let is_empty = self.is_empty(builder);
+
+        builder.select_hash(is_empty, &empty_hash, &non_empty_hash)
     }
 }
 
@@ -222,8 +222,6 @@ pub fn random_access_assets(
             BIG_U64_LIMBS,
         ),
         margin_mode: builder.random_access(access_index, v.iter().map(|x| x.margin_mode).collect()),
-        margin_index: builder
-            .random_access(access_index, v.iter().map(|x| x.margin_index).collect()),
     }
 }
 
@@ -248,7 +246,6 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
             &BigUint::from_u64(b.min_withdrawal_amount as u64).unwrap(),
         )?;
         self.set_target(a.margin_mode, F::from_canonical_u8(b.margin_mode))?;
-        self.set_target(a.margin_index, F::from_canonical_u8(b.margin_index))?;
 
         Ok(())
     }
@@ -263,7 +260,6 @@ pub fn diff_assets(builder: &mut Builder, new: &AssetTarget, old: &AssetTarget) 
         min_withdrawal_amount: builder
             .biguint_vector_diff(&new.min_withdrawal_amount, &old.min_withdrawal_amount),
         margin_mode: builder.sub(new.margin_mode, old.margin_mode),
-        margin_index: builder.sub(new.margin_index, old.margin_index),
     }
 }
 
@@ -290,7 +286,6 @@ pub fn apply_diff_assets(
             &old.min_withdrawal_amount,
         ),
         margin_mode: builder.mul_add(flag.target, diff.margin_mode, old.margin_mode),
-        margin_index: builder.mul_add(flag.target, diff.margin_index, old.margin_index),
     }
 }
 
@@ -299,7 +294,6 @@ pub fn connect_assets(builder: &mut Builder, a: &AssetTarget, b: &AssetTarget) {
     builder.connect_biguint(&a.min_transfer_amount, &b.min_transfer_amount);
     builder.connect_biguint(&a.min_withdrawal_amount, &b.min_withdrawal_amount);
     builder.connect(a.margin_mode, b.margin_mode);
-    builder.connect(a.margin_index, b.margin_index);
 }
 
 pub fn all_assets_hash(
@@ -336,20 +330,19 @@ pub fn select_asset_target(
             &b.min_withdrawal_amount,
         ),
         margin_mode: builder.select(flag, a.margin_mode, b.margin_mode),
-        margin_index: builder.select(flag, a.margin_index, b.margin_index),
     }
 }
 
+// Caller's responsibility to ensure asset_index is in range [0, 2^6-1]
 pub fn ensure_valid_asset_index(
     builder: &mut Builder,
     is_enabled: BoolTarget,
     asset_index: Target,
 ) {
-    let nil_asset_index = builder.constant_u64(NIL_ASSET_INDEX);
-    builder.conditional_assert_not_eq(is_enabled, asset_index, nil_asset_index);
-}
-
-pub fn is_universal_asset(builder: &mut Builder, asset_index: Target) -> BoolTarget {
-    let assertions = [builder.is_equal_constant(asset_index, USDC_ASSET_INDEX)];
-    builder.multi_or(&assertions)
+    let assertions = [
+        builder.is_equal_constant(asset_index, MIN_ASSET_INDEX - 1),
+        builder.is_equal_constant(asset_index, MAX_ASSET_INDEX + 1),
+    ];
+    let is_invalid = builder.multi_or(&assertions);
+    builder.conditional_assert_false(is_enabled, is_invalid);
 }

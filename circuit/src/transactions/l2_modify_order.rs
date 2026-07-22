@@ -7,20 +7,19 @@ use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::iop::witness::Witness;
 use serde::Deserialize;
 
+use crate::bigint::biguint::CircuitBuilderBiguint;
+use crate::bigint::comparison::CircuitBuilderBiguintSubtractiveComparison;
 use crate::bool_utils::CircuitBuilderBoolUtils;
 use crate::comparison::CircuitBuilderSubtractiveComparison;
 use crate::eddsa::gadgets::base_field::QuinticExtensionTarget;
 use crate::eddsa::schnorr::hash_to_quintic_extension_circuit;
+use crate::liquidation::get_available_asset_balance_const;
 use crate::matching_engine::{
-    decrement_locked_balance_for_order, decrement_order_count_in_place, get_next_order_nonce,
-    trigger_child_orders,
-};
-use crate::tx_attributes::{
-    ATTR_INTEGRATOR_FEE_COLLECTOR_INDEX, ATTR_INTEGRATOR_MAKER_FEE, ATTR_INTEGRATOR_TAKER_FEE,
-    ATTR_SELF_TRADE_BEHAVIOR_MODE, ATTR_SELF_TRADE_EQUALITY_MODE,
+    decrement_locked_balance_for_order, decrement_order_count_in_place,
+    get_locked_amount_and_ask_asset_index, get_next_order_nonce, trigger_child_orders,
 };
 use crate::tx_interface::{Apply, TxHash, Verify};
-use crate::types::account_order::{AccountOrderTarget, OrderFlags, select_account_order_target};
+use crate::types::account_order::{AccountOrderTarget, select_account_order_target};
 use crate::types::account_order_type::AccountOrderTypes;
 use crate::types::config::{Builder, F};
 use crate::types::constants::*;
@@ -94,9 +93,6 @@ impl L2ModifyOrderTxTarget {
         builder: &mut Builder,
         account_order: &AccountOrderTarget,
     ) -> BaseRegisterInfoTarget {
-        let (generic_field_1, generic_field_2, generic_field_3) =
-            account_order.get_register_generic_fields_from_order(builder);
-
         BaseRegisterInfoTarget {
             instruction_type: builder.constant(F::from_canonical_u8(INSERT_ORDER)),
 
@@ -123,10 +119,6 @@ impl L2ModifyOrderTxTarget {
             pending_to_trigger_order_index0: account_order.to_trigger_order_index0,
             pending_to_trigger_order_index1: account_order.to_trigger_order_index1,
             pending_to_cancel_order_index0: account_order.to_cancel_order_index0,
-
-            generic_field_1,
-            generic_field_2,
-            generic_field_3,
         }
     }
 
@@ -158,30 +150,6 @@ impl L2ModifyOrderTxTarget {
             tx_state.account_order.initial_base_amount,
             tx_state.account_order.remaining_base_amount,
         );
-
-        // Integrator fee information
-        {
-            account_order.integrator_fee_collector_index = builder.select(
-                flag,
-                tx_state.get_attribute(ATTR_INTEGRATOR_FEE_COLLECTOR_INDEX),
-                account_order.integrator_fee_collector_index,
-            );
-            account_order.integrator_taker_fee = builder.select(
-                flag,
-                tx_state.get_attribute(ATTR_INTEGRATOR_TAKER_FEE),
-                account_order.integrator_taker_fee,
-            );
-            account_order.integrator_maker_fee = builder.select(
-                flag,
-                tx_state.get_attribute(ATTR_INTEGRATOR_MAKER_FEE),
-                account_order.integrator_maker_fee,
-            );
-            account_order.order_flags = OrderFlags {
-                self_trade_behavior_mode: tx_state.get_attribute(ATTR_SELF_TRADE_BEHAVIOR_MODE),
-                self_trade_equality_mode: tx_state.get_attribute(ATTR_SELF_TRADE_EQUALITY_MODE),
-            }
-            .to_target(builder);
-        }
 
         // Base amount is zero
         {
@@ -441,6 +409,82 @@ impl Verify for L2ModifyOrderTxTarget {
             TIMESTAMP_BITS,
         );
         self.success = builder.and(self.success, is_order_expiry_gt_block_created_at);
+
+        // Spot balance check
+        {
+            let spot_success_flag = builder.and_not(self.success, self.is_perps_market);
+
+            // Check if the new base amount will exceed the matched base amount (initial - remaining)
+            // If so, we calculate old and new locked balances and see if the available asset balance
+            // allows that to happen.
+            let matched_base_amount = builder.sub(
+                tx_state.account_order.initial_base_amount,
+                tx_state.account_order.remaining_base_amount,
+            );
+            let new_base_amount_gt_matched_amount = builder.is_gt(
+                self.base_amount,
+                matched_base_amount,
+                ORDER_BASE_AMOUNT_BITS,
+            );
+            let flag = builder.and(spot_success_flag, new_base_amount_gt_matched_amount);
+
+            let (old_locked_amount, ask_asset_index) = get_locked_amount_and_ask_asset_index(
+                builder,
+                flag,
+                &tx_state.market,
+                tx_state.account_order.remaining_base_amount,
+                tx_state.account_order.price,
+                tx_state.account_order.is_ask,
+            );
+
+            let new_remaining_base_amount = builder.sub(self.base_amount, matched_base_amount);
+            let (new_locked_amount, _) = get_locked_amount_and_ask_asset_index(
+                builder,
+                flag,
+                &tx_state.market,
+                new_remaining_base_amount,
+                self.price,
+                tx_state.account_order.is_ask,
+            );
+            let (locked_amount_delta, old_amount_was_greater) =
+                builder.try_sub_biguint(&new_locked_amount, &old_locked_amount);
+            let new_locked_gte_old = builder.not(BoolTarget::new_unsafe(old_amount_was_greater.0));
+
+            let is_base_asset = builder.is_equal(
+                tx_state.account_assets[OWNER_ACCOUNT_ID][BASE_ASSET_ID].index_0,
+                ask_asset_index,
+            );
+
+            let base_asset_available_balance = get_available_asset_balance_const(
+                builder,
+                PRODUCT_TYPE_SPOT,
+                &tx_state.accounts[OWNER_ACCOUNT_ID],
+                &tx_state.account_assets[OWNER_ACCOUNT_ID][BASE_ASSET_ID],
+                tx_state.is_asset_used_as_margin[OWNER_ACCOUNT_ID][BASE_ASSET_ID],
+                &tx_state.risk_infos[OWNER_ACCOUNT_ID].cross_risk_parameters,
+            );
+            let quote_asset_available_balance = get_available_asset_balance_const(
+                builder,
+                PRODUCT_TYPE_SPOT,
+                &tx_state.accounts[OWNER_ACCOUNT_ID],
+                &tx_state.account_assets[OWNER_ACCOUNT_ID][QUOTE_ASSET_ID],
+                tx_state.is_asset_used_as_margin[OWNER_ACCOUNT_ID][QUOTE_ASSET_ID],
+                &tx_state.risk_infos[OWNER_ACCOUNT_ID].cross_risk_parameters,
+            );
+
+            let available_balance = builder.select_biguint(
+                is_base_asset,
+                &base_asset_available_balance,
+                &quote_asset_available_balance,
+            );
+            let not_enough_available_balance =
+                builder.is_lt_biguint(&available_balance, &locked_amount_delta);
+
+            let should_be_false =
+                builder.multi_and(&[flag, new_locked_gte_old, not_enough_available_balance]);
+
+            builder.conditional_assert_false(self.success, should_be_false);
+        }
     }
 }
 
@@ -531,7 +575,7 @@ impl Apply for L2ModifyOrderTxTarget {
 
         // Set new register
         let instruction = self.get_instruction_from_account_order(builder, &new_account_order);
-        tx_state.put_to_instruction_stack_unsafe(builder, is_in_progress_order, &instruction, 0);
+        tx_state.insert_to_instruction_stack(builder, is_in_progress_order, &instruction);
 
         // Set new account order
         tx_state.account_order = select_account_order_target(
@@ -551,7 +595,6 @@ impl Apply for L2ModifyOrderTxTarget {
             new_account_order.to_trigger_order_index0,
             new_account_order.to_trigger_order_index1,
             new_account_order.initial_base_amount,
-            1,
         );
 
         tx_state.update_impact_prices_flag =

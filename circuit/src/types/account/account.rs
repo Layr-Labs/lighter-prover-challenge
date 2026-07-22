@@ -14,28 +14,18 @@ use serde::Deserialize;
 
 use crate::bigint::bigint::{BigIntTarget, CircuitBuilderBigInt, WitnessBigInt};
 use crate::bigint::biguint::{BigUintTarget, CircuitBuilderBiguint, WitnessBigUint};
-use crate::bigint::comparison::CircuitBuilderBiguintSubtractiveComparison;
-use crate::bigint::unsafe_big::{CircuitBuilderUnsafeBig, UnsafeBigTarget};
 use crate::bool_utils::CircuitBuilderBoolUtils;
 use crate::circuit_logger::CircuitBuilderLogging;
 use crate::comparison::CircuitBuilderSubtractiveComparison;
 use crate::deserializers;
 use crate::eddsa::gadgets::curve::PartialWitnessCurve;
 use crate::hash_utils::CircuitBuilderHashUtils;
-use crate::types::account_margined_asset::{
-    AccountMarginedAsset, AccountMarginedAssetTarget, AccountMarginedAssetTargetWitness,
-    random_access_account_margined_asset_target,
-};
+use crate::types::account_asset::AccountAssetTarget;
 use crate::types::account_position::{
     AccountPosition, AccountPositionTarget, AccountPositionTargetWitness,
 };
-use crate::types::approved_integrator::{
-    ApprovedIntegrator, ApprovedIntegratorTarget, ApprovedIntegratorWitness,
-};
-use crate::types::asset::{AssetTarget, is_universal_asset};
-use crate::types::config::{BIG_U96_LIMBS, BIG_U128_LIMBS, BIG_U160_LIMBS, Builder};
+use crate::types::config::{BIG_U96_LIMBS, BIG_U160_LIMBS, Builder};
 use crate::types::constants::*;
-use crate::types::margined_asset::MarginedAssetTarget;
 use crate::types::pending_unlock::{
     PendingUnlock, PendingUnlockTarget, PendingUnlockWitness, select_pending_unlock_target,
 };
@@ -43,7 +33,6 @@ use crate::types::public_pool::{
     PublicPoolInfo, PublicPoolInfoTarget, PublicPoolInfoWitness, PublicPoolShare,
     PublicPoolShareTarget, PublicPoolShareWitness, select_public_pool_share_target,
 };
-use crate::uint::u32::gadgets::arithmetic_u32::CircuitBuilderU32;
 use crate::utils::CircuitBuilderUtils;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,9 +57,9 @@ where
     #[serde(rename = "bm", default)]
     pub account_trading_mode: u8,
 
-    #[serde(rename = "ma")]
-    #[serde(deserialize_with = "deserializers::margined_account_assets")]
-    pub margined_assets: [AccountMarginedAsset; MARGINED_ASSET_LIST_SIZE], // 96 bits
+    #[serde(rename = "col")]
+    #[serde(deserialize_with = "deserializers::int_to_bigint")]
+    pub collateral: BigInt, // 96 bits
 
     #[serde(rename = "ab")]
     #[serde(deserialize_with = "deserializers::aggregated_balances")]
@@ -82,9 +71,6 @@ where
 
     #[serde(rename = "pwi", default)]
     pub pending_unlocks: [PendingUnlock; MAX_PENDING_UNLOCKS],
-
-    #[serde(rename = "aiw", default)]
-    pub approved_integrators: [ApprovedIntegrator; MAX_APPROVED_INTEGRATORS],
 
     #[serde(rename = "pps", default)]
     pub public_pool_shares: [PublicPoolShare; SHARES_LIST_SIZE],
@@ -137,12 +123,11 @@ where
             l1_address: BigUint::ZERO,
             account_type: 0,
             account_trading_mode: ACCOUNT_ACCOUNT_TRADING_MODE_SIMPLE,
-            margined_assets: [AccountMarginedAsset::empty(); MARGINED_ASSET_LIST_SIZE],
+            collateral: BigInt::ZERO,
             aggregated_balances: [BigInt::ZERO; NB_ASSETS_PER_TX],
             positions: array::from_fn(|_| AccountPosition::default()),
             public_pool_shares: array::from_fn(|_| PublicPoolShare::default()),
             pending_unlocks: array::from_fn(|_| PendingUnlock::default()),
-            approved_integrators: array::from_fn(|_| ApprovedIntegrator::default()),
             public_pool_info: PublicPoolInfo::default(),
             total_order_count: 0,
             total_non_cross_order_count: 0,
@@ -165,11 +150,10 @@ pub struct AccountTarget {
     pub account_type: Target,
     pub account_trading_mode: Target,
 
-    pub margined_assets: [AccountMarginedAssetTarget; MARGINED_ASSET_LIST_SIZE],
+    pub collateral: BigIntTarget,
     pub aggregated_balances: [BigIntTarget; NB_ASSETS_PER_TX],
     pub positions: [AccountPositionTarget; POSITION_LIST_SIZE],
 
-    pub approved_integrators: [ApprovedIntegratorTarget; MAX_APPROVED_INTEGRATORS],
     pub pending_unlocks: [PendingUnlockTarget; MAX_PENDING_UNLOCKS],
     pub public_pool_shares: [PublicPoolShareTarget; SHARES_LIST_SIZE],
     pub public_pool_info: PublicPoolInfoTarget,
@@ -189,19 +173,18 @@ pub struct AccountTarget {
 
 impl Default for AccountTarget {
     fn default() -> Self {
-        Self {
+        AccountTarget {
             master_account_index: Target::default(),
             account_index: Target::default(),
             l1_address: BigUintTarget::default(),
             account_type: Target::default(),
             account_trading_mode: Target::default(),
 
-            margined_assets: array::from_fn(|_| AccountMarginedAssetTarget::default()),
+            collateral: BigIntTarget::default(),
             aggregated_balances: array::from_fn(|_| BigIntTarget::default()),
 
             positions: array::from_fn(|_| AccountPositionTarget::default()),
 
-            approved_integrators: array::from_fn(|_| ApprovedIntegratorTarget::default()),
             pending_unlocks: array::from_fn(|_| PendingUnlockTarget::default()),
             public_pool_shares: array::from_fn(|_| PublicPoolShareTarget::default()),
             public_pool_info: PublicPoolInfoTarget::default(),
@@ -227,21 +210,20 @@ impl Default for AccountTarget {
 
 impl AccountTarget {
     pub fn new(builder: &mut Builder) -> Self {
-        Self {
+        AccountTarget {
             master_account_index: builder.add_virtual_target(),
             account_index: builder.add_virtual_target(),
             l1_address: builder.add_virtual_biguint_target_unsafe(BIG_U160_LIMBS), // safe because it is read from the state using merkle proofs
             account_type: builder.add_virtual_target(),
             account_trading_mode: builder.add_virtual_target(),
 
-            margined_assets: array::from_fn(|_| AccountMarginedAssetTarget::new(builder)), // safe because it is read from the state using merkle proofs
+            collateral: builder.add_virtual_bigint_target_unsafe(BIG_U96_LIMBS), // safe because it is read from the state using merkle proofs
             aggregated_balances: array::from_fn(|_| {
-                builder.add_virtual_bigint_target_unsafe(BIG_U96_LIMBS) // safe because it is read from the state using merkle proofs
+                builder.add_virtual_bigint_target_unsafe(BIG_U96_LIMBS)
             }),
 
             positions: array::from_fn(|_| AccountPositionTarget::new(builder)),
 
-            approved_integrators: array::from_fn(|_| ApprovedIntegratorTarget::new(builder)),
             pending_unlocks: array::from_fn(|_| PendingUnlockTarget::new(builder)),
             public_pool_shares: array::from_fn(|_| PublicPoolShareTarget::new(builder)),
             public_pool_info: PublicPoolInfoTarget::new(builder),
@@ -262,21 +244,20 @@ impl AccountTarget {
     }
 
     pub fn new_fee_account(builder: &mut Builder) -> Self {
-        Self {
+        AccountTarget {
             master_account_index: builder.add_virtual_target(),
             account_index: builder.add_virtual_target(),
             l1_address: builder.add_virtual_biguint_target_unsafe(BIG_U160_LIMBS), // safe because it is read from the state using merkle proofs
             account_type: builder.add_virtual_target(),
             account_trading_mode: builder.add_virtual_target(),
 
-            margined_assets: array::from_fn(|_| AccountMarginedAssetTarget::new(builder)), // safe because it is read from the state using merkle proofs
+            collateral: builder.add_virtual_bigint_target_unsafe(BIG_U96_LIMBS), // safe because it is read from the state using merkle proofs
             aggregated_balances: array::from_fn(|_| {
-                builder.add_virtual_bigint_target_unsafe(BIG_U96_LIMBS) // safe because it is read from the state using merkle proofs
+                builder.add_virtual_bigint_target_unsafe(BIG_U96_LIMBS)
             }),
 
             positions: array::from_fn(|_| AccountPositionTarget::default()), // Unused for fee accounts
 
-            approved_integrators: array::from_fn(|_| ApprovedIntegratorTarget::new(builder)),
             pending_unlocks: array::from_fn(|_| PendingUnlockTarget::new(builder)),
             public_pool_shares: array::from_fn(|_| PublicPoolShareTarget::default()),
             public_pool_info: PublicPoolInfoTarget::new(builder),
@@ -335,14 +316,12 @@ impl AccountTarget {
     }
 
     pub fn get_total_unlock_amount(&self, builder: &mut Builder) -> BigUintTarget {
-        let mut total_unlock_amount = UnsafeBigTarget {
-            limbs: vec![builder.zero(); BIG_U96_LIMBS],
-        };
+        let mut total_unlock_amount = builder.zero_biguint();
         for pu in self.pending_unlocks.iter() {
-            let unsafe_amount = builder.unsafe_big_from_biguint(&pu.amount);
-            total_unlock_amount = builder.add_unsafe_big(&total_unlock_amount, &unsafe_amount);
+            total_unlock_amount =
+                builder.add_biguint_non_carry(&total_unlock_amount, &pu.amount, BIG_U96_LIMBS);
         }
-        builder.unsafe_big32_to_biguint(&total_unlock_amount, BIG_U96_LIMBS)
+        total_unlock_amount
     }
 
     pub fn add_pending_unlock(
@@ -502,6 +481,31 @@ impl AccountTarget {
         builder.conditional_assert_true(is_enabled, applied);
     }
 
+    pub fn are_assets_used_as_margin(
+        builder: &mut Builder,
+        account_assets: &[AccountAssetTarget; NB_ASSETS_PER_TX],
+    ) -> (BoolTarget, BoolTarget) {
+        let first_asset = &account_assets[0];
+        let is_first_asset_usdc = builder.is_equal_constant(first_asset.index_0, USDC_ASSET_INDEX);
+        let is_first_asset_used_as_margin =
+            builder.is_equal_constant(first_asset.margin_mode, ACCOUNT_ASSET_MARGIN_MODE_ENABLED);
+        let is_first_asset_used_as_collateral =
+            builder.or(is_first_asset_usdc, is_first_asset_used_as_margin);
+
+        let second_asset = &account_assets[1];
+        let is_second_asset_usdc =
+            builder.is_equal_constant(second_asset.index_0, USDC_ASSET_INDEX);
+        let is_second_asset_used_as_margin =
+            builder.is_equal_constant(second_asset.margin_mode, ACCOUNT_ASSET_MARGIN_MODE_ENABLED);
+        let is_second_asset_used_as_collateral =
+            builder.or(is_second_asset_usdc, is_second_asset_used_as_margin);
+
+        (
+            is_first_asset_used_as_collateral,
+            is_second_asset_used_as_collateral,
+        )
+    }
+
     pub fn print(&self, builder: &mut Builder, tag: &str) {
         builder.println(
             self.master_account_index,
@@ -510,9 +514,7 @@ impl AccountTarget {
         builder.println(self.account_index, &format!("{}: account_index", tag));
         builder.println_biguint(&self.l1_address, &format!("{}: l1_address", tag));
         builder.println(self.account_type, &format!("{}: account_type", tag));
-        for (i, margined_asset) in self.margined_assets.iter().enumerate() {
-            margined_asset.print(builder, &format!("{}: margined_asset_{}", tag, i));
-        }
+        builder.println_bigint(&self.collateral, &format!("{}: collateral", tag));
         builder.println_hash_out(
             &self.aggregated_balances_root,
             &format!("{}: aggregated_balances_root", tag),
@@ -520,11 +522,6 @@ impl AccountTarget {
 
         for (i, agg_bal) in self.aggregated_balances.iter().enumerate() {
             builder.println_bigint(agg_bal, &format!("{}: aggregated_balance_{}", tag, i));
-        }
-
-        for i in 0..MAX_APPROVED_INTEGRATORS {
-            self.approved_integrators[i]
-                .print(builder, &format!("{}: approved_integrator_{}", tag, i));
         }
 
         builder.println_hash_out(&self.asset_root, &format!("{}: asset_root", tag));
@@ -550,31 +547,11 @@ impl AccountTarget {
 
         self.public_pool_info.print(builder, tag);
     }
+}
 
-    pub fn get_margined_asset_balance_const(&self, margin_index: usize) -> BigIntTarget {
-        self.margined_assets[margin_index].balance.clone()
-    }
-
-    pub fn get_margined_asset_balances(
-        builder: &mut Builder,
-        accounts: &[AccountTarget; NB_ACCOUNTS_PER_TX],
-        assets: &[AssetTarget; NB_ASSETS_PER_TX],
-        first_margin_index: Target,
-    ) -> [[AccountMarginedAssetTarget; NB_ASSETS_PER_TX]; NB_ACCOUNTS_PER_TX] {
-        let second_margin_index = assets[1].margin_index(builder);
-
-        array::from_fn(|i| {
-            let mut v = accounts[i].margined_assets.to_vec();
-            v.push(AccountMarginedAssetTarget::empty(builder));
-            [
-                random_access_account_margined_asset_target(builder, first_margin_index, &v),
-                random_access_account_margined_asset_target(builder, second_margin_index, &v),
-            ]
-        })
-    }
-
+impl AccountTarget {
     /// Return cross or strategy collateral based on account type. Assumes `strategy_index` isn't nil.
-    pub fn get_relevant_usdc_collateral(
+    pub fn get_relevant_collateral(
         &self,
         builder: &mut Builder,
         strategy_index: Target,
@@ -584,322 +561,146 @@ impl AccountTarget {
             .get_strategy_balance(builder, strategy_index);
         let is_insurance_fund =
             builder.is_equal_constant(self.account_type, INSURANCE_FUND_ACCOUNT_TYPE as u64);
-        builder.select_bigint(
-            is_insurance_fund,
-            &strategy_balance,
-            &self.get_margined_asset_balance_const(USDC_MARGIN_ASSET_INDEX),
-        )
+        builder.select_bigint(is_insurance_fund, &strategy_balance, &self.collateral)
     }
 
     /// Short hand for Perps USDC delta update
-    /// Because USDC spot balance is always zero for unified accounts, we can directly apply delta to margin balance
-    /// ignoring "use spot balance for negative delta" logic in [`AccountTarget::apply_asset_delta`] function
     pub fn apply_collateral_delta(
-        &self,
+        &mut self,
         builder: &mut Builder,
         is_enabled: BoolTarget,
         collateral_delta: &BigIntTarget,
         strategy_balance: &mut BigIntTarget,
-        margin_balance: &mut BigIntTarget,
     ) {
-        let collateral_delta = builder.mul_bigint_by_bool(collateral_delta, is_enabled);
-        *margin_balance =
-            builder.add_bigint_non_carry(margin_balance, &collateral_delta, BIG_U96_LIMBS);
-
-        let is_insurance_fund =
-            builder.is_equal_constant(self.account_type, INSURANCE_FUND_ACCOUNT_TYPE as u64);
-        let strategy_delta = builder.mul_bigint_by_bool(&collateral_delta, is_insurance_fund);
-        *strategy_balance =
-            builder.add_bigint_non_carry(strategy_balance, &strategy_delta, BIG_U96_LIMBS);
+        let _true = builder._true();
+        AccountTarget::apply_asset_delta_const(
+            builder,
+            is_enabled,
+            PRODUCT_TYPE_PERPS,
+            self,
+            None,
+            _true,
+            collateral_delta,
+            strategy_balance,
+        );
     }
 
-    /// Caller's responsibility to ensure delta is positive, caller account is UTA and asset is margined
-    /// For inflows, prioritize adding balance to margin balance for margin enabled assets
-    pub fn get_uta_margin_and_balance_inflow_deltas(
+    pub fn apply_asset_delta_const(
         builder: &mut Builder,
         is_enabled: BoolTarget,
-        asset_delta: &BigUintTarget,
-        margined_asset_balance: &BigIntTarget,
-        margined_asset: &MarginedAssetTarget,
-    ) -> (BigUintTarget, BigUintTarget) {
-        let zero_biguint = builder.zero_biguint();
-
-        let asset_delta = builder.mul_biguint_by_bool(asset_delta, is_enabled);
-
-        // Account for supply caps
-        let is_caps_enabled = {
-            let is_universal_asset = is_universal_asset(builder, margined_asset.asset_index);
-            builder.not(is_universal_asset)
-        };
-        let remaining_supply =
-            margined_asset.get_remaining_supply_cap(builder, margined_asset_balance);
-        let is_remaining_lt_delta = builder.is_lt_biguint(&remaining_supply, &asset_delta);
-        let cap_flag = builder.multi_and(&[is_caps_enabled, is_remaining_lt_delta]);
-
-        let margined_balance_delta =
-            builder.select_biguint(cap_flag, &remaining_supply, &asset_delta);
-
-        let unmargined_balance_delta = builder.sub_biguint(&asset_delta, &remaining_supply);
-        let balance_delta =
-            builder.select_biguint(cap_flag, &unmargined_balance_delta, &zero_biguint);
-
-        (margined_balance_delta, balance_delta)
-    }
-
-    /// Caller's responsibility to ensure delta is negative, caller account is UTA and asset is margined
-    /// For outflows, prioritize subtracting balance from spot balance for margin enabled assets to avoid unnecessary margin calls
-    pub fn get_uta_margin_and_balance_outflow_deltas(
-        builder: &mut Builder,
-        is_enabled: BoolTarget,
+        product_type: u64,
+        account: &mut AccountTarget,
+        account_asset: Option<&mut AccountAssetTarget>,
+        is_asset_used_as_margin: BoolTarget,
         asset_delta: &BigIntTarget,
-        asset_balance: &BigUintTarget,
-    ) -> (BigIntTarget, BigIntTarget) {
-        let zero_bigint = builder.zero_bigint();
-
-        let asset_delta = builder.mul_bigint_by_bool(asset_delta, is_enabled);
-
-        // Take from margin balance when balance isn't enough
-        let is_insufficient_balance = builder.is_lt_biguint(asset_balance, &asset_delta.abs);
-
-        let excess_delta_abs = builder.sub_biguint(&asset_delta.abs, asset_balance);
-        let excess_delta = builder.negative_biguint(&excess_delta_abs);
-        let margined_balance_delta =
-            builder.select_bigint(is_insufficient_balance, &excess_delta, &zero_bigint);
-
-        let neg_balance = builder.negative_biguint(asset_balance);
-        let balance_delta =
-            builder.select_bigint(is_insufficient_balance, &neg_balance, &asset_delta);
-
-        (margined_balance_delta, balance_delta)
-    }
-
-    pub fn apply_asset_delta_raw(
-        builder: &mut Builder,
-        is_enabled: BoolTarget,
-        product_type: Target,
-        asset_index: Target,
-        margined_asset: &mut MarginedAssetTarget,
-        asset_balance: &mut BigUintTarget,
-        asset_delta: &BigIntTarget,
-        margin_balance: &mut BigIntTarget,
-
-        can_be_universal_asset: bool,
+        strategy_balance: &mut BigIntTarget,
     ) {
         let asset_delta = builder.mul_bigint_by_bool(asset_delta, is_enabled);
 
-        let is_spot = BoolTarget::new_unsafe(product_type);
-        let is_perps = builder.not(is_spot);
-
-        // Spot
-        {
-            let spot_delta = builder.mul_bigint_by_bool(&asset_delta, is_spot);
-            let balance_bigint = builder.biguint_to_bigint(asset_balance);
-            let new_spot_balance =
-                builder.add_bigint_non_carry(&balance_bigint, &spot_delta, BIG_U96_LIMBS);
-            let is_new_spot_balance_negative = builder.is_sign_negative(new_spot_balance.sign);
-            builder.assert_false(is_new_spot_balance_negative);
-            *asset_balance = new_spot_balance.abs;
+        if product_type == PRODUCT_TYPE_PERPS {
+            account.collateral =
+                builder.add_bigint_non_carry(&account.collateral, &asset_delta, BIG_U96_LIMBS);
+            account.apply_strategy_delta(builder, is_enabled, strategy_balance, &asset_delta);
+            return;
         }
 
-        // Perps
-        {
-            let perps_delta = builder.mul_bigint_by_bool(&asset_delta, is_perps);
+        let is_unified_and_asset_used_as_margin =
+            builder.and(account.is_unified_mode(), is_asset_used_as_margin);
+        let update_collateral = builder.and(is_enabled, is_unified_and_asset_used_as_margin);
+        let update_asset_balance = builder.and_not(is_enabled, update_collateral);
 
-            let caps_enabled = if can_be_universal_asset {
-                let is_universal_asset = is_universal_asset(builder, asset_index);
-                builder.not(is_universal_asset)
-            } else {
-                builder._true()
-            };
+        let account_asset =
+            account_asset.expect("account asset must be provided for non-perps products");
+        let account_asset_balance = builder.biguint_to_bigint(&account_asset.balance);
 
-            // Remaining supply cap check
-            {
-                let is_delta_positive = builder.is_sign_positive(perps_delta.sign);
-                let remaining_supply_cap =
-                    margined_asset.get_remaining_supply_cap(builder, margin_balance);
-                let remaining_supply_flag = builder.multi_and(&[caps_enabled, is_delta_positive]);
+        let new_asset_balance =
+            builder.add_bigint_non_carry(&account_asset_balance, &asset_delta, BIG_U96_LIMBS);
+        let is_new_asset_balance_negative = builder.is_sign_negative(new_asset_balance.sign);
+        builder.conditional_assert_false(update_asset_balance, is_new_asset_balance_negative); // Asset balance cannot be negative
 
-                let is_remaining_supply_cap_lt_delta =
-                    builder.is_lt_biguint(&remaining_supply_cap, &perps_delta.abs);
-                builder.conditional_assert_false(
-                    remaining_supply_flag,
-                    is_remaining_supply_cap_lt_delta,
-                );
-            }
+        account_asset.balance = builder.select_biguint(
+            update_asset_balance,
+            &new_asset_balance.abs,
+            &account_asset.balance,
+        );
 
-            // Apply margin delta
-            *margin_balance =
-                builder.add_bigint_non_carry(margin_balance, &perps_delta, BIG_U96_LIMBS);
-
-            // Apply TSA delta
-            let cap_delta = builder.mul_bigint_by_bool(&perps_delta, caps_enabled);
-            let tsa_bigint = builder.biguint_to_bigint(&margined_asset.total_supplied_amount);
-            let new_tsa = builder.add_bigint_non_carry(&tsa_bigint, &cap_delta, BIG_U96_LIMBS);
-            let is_new_tsa_negative = builder.is_sign_negative(new_tsa.sign);
-            builder.assert_false(is_new_tsa_negative); // Total supplied amount cannot be negative
-            margined_asset.total_supplied_amount = new_tsa.abs;
-        }
+        let new_collateral =
+            builder.add_bigint_non_carry(&account.collateral, &asset_delta, BIG_U96_LIMBS);
+        account.collateral =
+            builder.select_bigint(update_collateral, &new_collateral, &account.collateral);
+        account.apply_strategy_delta(builder, update_collateral, strategy_balance, &asset_delta);
     }
 
-    /// Call this function for negative part first when transferring, so that total supplied amount
-    /// is not overflowed between operations.
     pub fn apply_asset_delta(
         builder: &mut Builder,
         is_enabled: BoolTarget,
         product_type: Target,
-        asset_index: Target,
-        margined_asset: &mut MarginedAssetTarget, // Has just enough fields for use
+        account: &mut AccountTarget,
+        account_asset: &mut AccountAssetTarget,
         is_asset_used_as_margin: BoolTarget,
         asset_delta: &BigIntTarget,
-        is_account_unified: BoolTarget,
-        is_insurance_fund: BoolTarget,
-        asset_balance: &mut BigUintTarget,
-        margin_balance: &mut BigIntTarget,
         strategy_balance: &mut BigIntTarget,
-        allow_overflow: bool,
-    ) -> BoolTarget {
-        let zero_bigint = builder.zero_bigint();
-        let mut is_spot_balance_valid = builder._true();
-        let limb_count = if allow_overflow {
-            BIG_U128_LIMBS
-        } else {
-            BIG_U96_LIMBS
-        };
-
+    ) {
         let asset_delta = builder.mul_bigint_by_bool(asset_delta, is_enabled);
 
-        let is_perps = builder.is_equal_constant(product_type, PRODUCT_TYPE_PERPS);
+        let is_spot = BoolTarget::new_unsafe(product_type);
 
-        let is_asset_universal = is_universal_asset(builder, asset_index);
-        let is_asset_not_universal = builder.not(is_asset_universal);
-        let is_account_simple = builder.not(is_account_unified);
-        let is_account_unified_and_asset_not_used_as_margin =
-            builder.and_not(is_account_unified, is_asset_used_as_margin);
-
-        let is_account_simple_and_asset_non_universal_and_perps =
-            builder.multi_and(&[is_account_simple, is_perps, is_asset_not_universal]);
-        // Simple accounts can't have non-universal margined assets.
-        builder.conditional_assert_false(
-            is_enabled,
-            is_account_simple_and_asset_non_universal_and_perps,
+        let is_account_isolated = builder.is_equal_constant(
+            account.account_trading_mode,
+            ACCOUNT_ACCOUNT_TRADING_MODE_SIMPLE as u64,
         );
-
-        let is_account_unified_and_asset_is_not_margin_and_perps =
-            builder.multi_and(&[is_account_unified_and_asset_not_used_as_margin, is_perps]);
-        // For unified accounts, if asset is not margin enabled, it can't have perps balance
-        builder.conditional_assert_false(
+        let is_asset_not_used_as_margin = builder.not(is_asset_used_as_margin);
+        let is_account_isolated_or_asset_not_used_as_margin =
+            builder.or(is_account_isolated, is_asset_not_used_as_margin);
+        let update_asset_balance = builder.multi_and(&[
             is_enabled,
-            is_account_unified_and_asset_is_not_margin_and_perps,
-        );
-
-        let is_delta_positive = builder.is_sign_positive(asset_delta.sign);
-
-        let remaining_supply_cap = margined_asset.get_remaining_supply_cap(builder, margin_balance);
-        let is_remaining_supply_cap_lt_delta =
-            builder.is_lt_biguint(&remaining_supply_cap, &asset_delta.abs);
-        let should_cap_margin_delta = builder.multi_and(&[
-            is_enabled,
-            is_asset_not_universal,
-            is_delta_positive,
-            is_remaining_supply_cap_lt_delta,
+            is_spot,
+            is_account_isolated_or_asset_not_used_as_margin,
         ]);
 
-        let positive_margin_delta = builder.select_biguint(
-            should_cap_margin_delta,
-            &remaining_supply_cap,
-            &asset_delta.abs,
+        let is_account_unified_and_asset_used_as_margin =
+            builder.not(is_account_isolated_or_asset_not_used_as_margin);
+        let is_perps_and_asset_used_as_margin = builder.and_not(is_asset_used_as_margin, is_spot);
+        let mut update_collateral = builder.or(
+            is_account_unified_and_asset_used_as_margin,
+            is_perps_and_asset_used_as_margin,
         );
-        let (positive_spot_delta, borrow) =
-            builder.try_sub_biguint(&asset_delta.abs, &positive_margin_delta);
-        builder.conditional_assert_zero_u32(is_enabled, borrow);
+        update_collateral = builder.and(update_collateral, is_enabled);
 
-        let spot_balance = asset_balance.clone();
-        let negative_spot_delta = builder.min_biguint(&spot_balance, &asset_delta.abs);
-        let (negative_margin_delta, borrow) =
-            builder.try_sub_biguint(&asset_delta.abs, &negative_spot_delta);
-        builder.conditional_assert_zero_u32(is_enabled, borrow);
+        let account_asset_balance = builder.biguint_to_bigint(&account_asset.balance);
 
-        let positive_margin_delta = builder.biguint_to_bigint(&positive_margin_delta);
-        let negative_margin_delta = builder.negative_biguint(&negative_margin_delta);
-        let mut unified_margin_delta = builder.select_bigint(
-            is_delta_positive,
-            &positive_margin_delta,
-            &negative_margin_delta,
-        );
-        unified_margin_delta = builder.select_bigint(
-            is_account_unified_and_asset_not_used_as_margin,
-            &zero_bigint,
-            &unified_margin_delta,
-        );
-        let positive_spot_delta = builder.biguint_to_bigint(&positive_spot_delta);
-        let negative_spot_delta = builder.negative_biguint(&negative_spot_delta);
-        let mut unified_spot_delta = builder.select_bigint(
-            is_delta_positive,
-            &positive_spot_delta,
-            &negative_spot_delta,
-        );
-        unified_spot_delta = builder.select_bigint(
-            is_account_unified_and_asset_not_used_as_margin,
-            &asset_delta,
-            &unified_spot_delta,
+        let new_asset_balance =
+            builder.add_bigint_non_carry(&account_asset_balance, &asset_delta, BIG_U96_LIMBS);
+        let is_new_asset_balance_negative = builder.is_sign_negative(new_asset_balance.sign);
+        builder.conditional_assert_false(update_asset_balance, is_new_asset_balance_negative); // Asset balance cannot be negative
+        account_asset.balance = builder.select_biguint(
+            update_asset_balance,
+            &new_asset_balance.abs,
+            &account_asset.balance,
         );
 
-        let simple_margin_delta = builder.select_bigint(is_perps, &asset_delta, &zero_bigint);
-        let simple_spot_delta = builder.select_bigint(is_perps, &zero_bigint, &asset_delta);
+        let new_collateral =
+            builder.add_bigint_non_carry(&account.collateral, &asset_delta, BIG_U96_LIMBS);
+        account.collateral =
+            builder.select_bigint(update_collateral, &new_collateral, &account.collateral);
+        account.apply_strategy_delta(builder, update_collateral, strategy_balance, &asset_delta);
+    }
 
-        let margin_delta = builder.select_bigint(
-            is_account_unified,
-            &unified_margin_delta,
-            &simple_margin_delta,
-        );
-        let spot_delta =
-            builder.select_bigint(is_account_unified, &unified_spot_delta, &simple_spot_delta);
+    pub fn apply_strategy_delta(
+        &mut self,
+        builder: &mut Builder,
+        is_enabled: BoolTarget,
+        strategy_balance: &mut BigIntTarget,
+        delta: &BigIntTarget,
+    ) {
+        let is_insurance_fund =
+            builder.is_equal_constant(self.account_type, INSURANCE_FUND_ACCOUNT_TYPE as u64);
+        let flag = builder.and(is_enabled, is_insurance_fund);
 
-        // Update margin balance
-        *margin_balance = builder.add_bigint_non_carry(margin_balance, &margin_delta, limb_count);
-        if !allow_overflow {
-            let is_margin_balance_negative = builder.is_sign_negative(margin_balance.sign);
-            let is_asset_not_universal_and_balance_negative =
-                builder.and(is_asset_not_universal, is_margin_balance_negative);
-            // Margin balance cannot be negative for non-universal assets
-            builder
-                .conditional_assert_false(is_enabled, is_asset_not_universal_and_balance_negative);
-        }
+        let delta = builder.mul_bigint_by_bool(delta, flag);
 
-        // Update spot balance
-        let spot_balance_bigint = builder.biguint_to_bigint(&spot_balance);
-        let new_spot_balance =
-            builder.add_bigint_non_carry(&spot_balance_bigint, &spot_delta, limb_count);
-
-        let is_new_spot_balance_negative = builder.is_sign_negative(new_spot_balance.sign);
-        if !allow_overflow {
-            // Spot balance can't be negative
-            builder.conditional_assert_false(is_enabled, is_new_spot_balance_negative);
-        } else {
-            is_spot_balance_valid = builder.not(is_new_spot_balance_negative);
-        }
-
-        *asset_balance = builder.select_biguint(is_enabled, &new_spot_balance.abs, asset_balance);
-
-        // Apply strategy delta for the margin delta portion
-        let is_asset_usdc = builder.is_equal_constant(asset_index, USDC_ASSET_INDEX);
-        let is_strategy_delta = builder.and(is_asset_usdc, is_insurance_fund);
-        let strategy_delta = builder.mul_bigint_by_bool(&margin_delta, is_strategy_delta);
-        *strategy_balance =
-            builder.add_bigint_non_carry(strategy_balance, &strategy_delta, BIG_U96_LIMBS);
-
-        // Apply margin balance total supplied amount
-        let supply_delta = builder.mul_bigint_by_bool(&margin_delta, is_asset_not_universal);
-        let mut total_supplied_amount_big =
-            builder.biguint_to_bigint(&margined_asset.total_supplied_amount);
-        total_supplied_amount_big =
-            builder.add_bigint_non_carry(&total_supplied_amount_big, &supply_delta, limb_count);
-        let new_total_supplied_amount_is_negative =
-            builder.is_sign_negative(total_supplied_amount_big.sign);
-        builder.conditional_assert_false(is_enabled, new_total_supplied_amount_is_negative);
-        margined_asset.total_supplied_amount = total_supplied_amount_big.abs;
-
-        is_spot_balance_valid
+        let new_balance = builder.add_bigint_non_carry(strategy_balance, &delta, BIG_U96_LIMBS);
+        *strategy_balance = builder.select_bigint(flag, &new_balance, strategy_balance);
     }
 }
 
@@ -921,9 +722,6 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
         }
         for i in 0..b.public_pool_shares.len() {
             self.set_public_pool_share(&a.public_pool_shares[i], &b.public_pool_shares[i])?;
-        }
-        for i in 0..b.approved_integrators.len() {
-            self.set_approved_integrator(&a.approved_integrators[i], &b.approved_integrators[i])?;
         }
 
         Ok(())
@@ -949,9 +747,7 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
             a.account_trading_mode,
             F::from_canonical_u8(b.account_trading_mode),
         )?;
-        for i in 0..MARGINED_ASSET_LIST_SIZE {
-            self.set_account_margined_asset_target(&a.margined_assets[i], &b.margined_assets[i])?;
-        }
+        self.set_bigint_target(&a.collateral, &b.collateral)?;
         for i in 0..NB_ASSETS_PER_TX {
             self.set_bigint_target(&a.aggregated_balances[i], &b.aggregated_balances[i])?;
         }

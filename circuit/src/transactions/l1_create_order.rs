@@ -121,9 +121,6 @@ impl L1CreateOrderTxTarget {
             pending_to_trigger_order_index0: builder.zero(),
             pending_to_trigger_order_index1: builder.zero(),
             pending_to_cancel_order_index0: builder.zero(),
-            generic_field_1: builder.zero(),
-            generic_field_2: builder.zero(),
-            generic_field_3: builder.zero(),
         }
     }
 }
@@ -244,7 +241,7 @@ impl Apply for L1CreateOrderTxTarget {
     fn apply(&mut self, builder: &mut Builder, tx_state: &mut TxState) -> BoolTarget {
         // Set new register
         let new_register = self.get_pending_order_register(builder, tx_state);
-        tx_state.put_to_instruction_stack_unsafe(builder, self.success, &new_register, 0);
+        tx_state.insert_to_instruction_stack(builder, self.success, &new_register);
 
         // Set new market
         let is_ask_and_success = builder.and(self.success, self.is_ask);

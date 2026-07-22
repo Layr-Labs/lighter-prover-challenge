@@ -6,6 +6,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
 jobs:
   test:
     runs-on: [self-hosted, macOS, ARM64, lighter-prover-challenge-m3]
@@ -18,12 +22,82 @@ jobs:
 
       - name: Validate files
         run: |
-          bash -n setup.sh benchmark.sh .github/scripts/*.sh
-          jq -e . benchmark.json challenge/ranked-score.schema.json >/dev/null
-          .github/scripts/test-sandbox-prove.sh
+          shopt -s nullglob
+          scripts=(
+            setup.sh
+            benchmark.sh
+            benchmark-tools/build-trusted-verifier.sh
+            .github/scripts/*.sh
+            .yukon/hooks/yukon-trace.sh
+          )
+          bash -n "${scripts[@]}"
+          jq empty \
+            benchmark.json \
+            benchmark-tools/ranked-score.schema.json \
+            .claude/settings.local.json \
+            .cursor/hooks.json \
+            opencode.json
+          readonly codex_config_blob=96847337b37a6af48dd81690ada916e159318b7c
+          actual_blob="$(git hash-object .codex/config.toml)"
+          [[ "${actual_blob}" == "${codex_config_blob}" ]] || {
+            echo ".codex/config.toml does not match the reviewed blob" >&2
+            exit 1
+          }
 
-      - name: Run public benchmark
+      - name: Check Rust formatting
         run: |
-          ./setup.sh
-          .github/scripts/test-prover-timeout.sh
-          ./benchmark.sh --local-iterate
+          toolchain="$(tr -d '[:space:]' < rust-toolchain)"
+          rustup toolchain install "${toolchain}" \
+            --profile minimal \
+            --component rustfmt \
+            --no-self-update
+
+          format_root="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/lighter-fmt.XXXXXX")"
+          cleanup() { rm -rf "${format_root}"; }
+          trap cleanup EXIT
+          cp Cargo.toml Cargo.lock "${format_root}/"
+          cp -R bench circuit desertexit "${format_root}/"
+          ln -s "${PWD}/vendor" "${format_root}/vendor"
+
+          for source in \
+            circuit/src/tx.rs \
+            circuit/src/types/order_book_node.rs
+          do
+            count="$(
+              awk '$0 == "#[serde(bound = \"\")] " { count++ }
+                   END { print count + 0 }' "${format_root}/${source}"
+            )"
+            (( count <= 1 )) || {
+              echo "${source} has an unexpected rustfmt exception count" >&2
+              exit 1
+            }
+            awk '$0 == "#[serde(bound = \"\")] " { sub(/ $/, "") }
+                 { print }' \
+              "${format_root}/${source}" > "${format_root}/${source}.normalized"
+            mv "${format_root}/${source}.normalized" "${format_root}/${source}"
+          done
+
+          cargo "+${toolchain}" fmt \
+            --manifest-path "${format_root}/Cargo.toml" \
+            --all \
+            -- \
+            --check
+          cargo "+${toolchain}" fmt \
+            --manifest-path benchmark-tools/harness/Cargo.toml \
+            -- \
+            --check
+
+      - name: Test trusted verifier harness
+        run: cargo test --locked --manifest-path benchmark-tools/harness/Cargo.toml
+
+      - name: Build candidate worker
+        run: cargo build --release --locked --manifest-path Cargo.toml -p bench --bin prove
+
+      - name: Verify trusted verifier
+        run: |
+          cd benchmark-tools/trusted
+          shasum -a 256 -c SHA256SUMS
+          codesign --verify --strict --verbose=2 lighter-benchmark-verifier
+
+      - name: Test published trusted verifier
+        run: ./.github/scripts/test-trusted-verifier.sh

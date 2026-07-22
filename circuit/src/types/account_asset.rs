@@ -12,6 +12,7 @@ use serde::Deserialize;
 
 use super::config::Builder;
 use crate::bigint::biguint::{BigUintTarget, CircuitBuilderBiguint, WitnessBigUint};
+use crate::bool_utils::CircuitBuilderBoolUtils;
 use crate::circuit_logger::CircuitBuilderLogging;
 use crate::deserializers;
 use crate::eddsa::gadgets::curve::PartialWitnessCurve;
@@ -33,6 +34,8 @@ pub struct AccountAsset {
     #[serde(rename = "lb")]
     #[serde(deserialize_with = "deserializers::int_to_biguint")]
     pub locked_balance: BigUint,
+    #[serde(rename = "mm", default)]
+    pub margin_mode: u8,
 }
 
 impl Default for AccountAsset {
@@ -41,6 +44,7 @@ impl Default for AccountAsset {
             index_0: 0,
             balance: BigUint::ZERO,
             locked_balance: BigUint::ZERO,
+            margin_mode: 0,
         }
     }
 }
@@ -59,6 +63,7 @@ pub struct AccountAssetTarget {
     pub index_0: Target,
     pub balance: BigUintTarget,
     pub locked_balance: BigUintTarget,
+    pub margin_mode: Target,
 }
 
 impl AccountAssetTarget {
@@ -67,6 +72,7 @@ impl AccountAssetTarget {
             index_0: builder.add_virtual_target(),
             balance: builder.add_virtual_biguint_target_unsafe(BIG_U96_LIMBS),
             locked_balance: builder.add_virtual_biguint_target_unsafe(BIG_U96_LIMBS),
+            margin_mode: builder.add_virtual_target(),
         }
     }
 
@@ -78,15 +84,12 @@ impl AccountAssetTarget {
     }
 
     pub fn is_empty(&self, builder: &mut Builder) -> BoolTarget {
-        // Adding 6 u32 limbs and a bool does not overflow Goldilocks, as long as
-        // limbs are guaranteed by business logic to fit 32 bits.
-        let added = builder.add_many(
-            [&self.balance, &self.locked_balance]
-                .iter()
-                .flat_map(|x| x.limbs.iter().map(|limb| limb.0))
-                .collect::<Vec<_>>(),
-        );
-        builder.is_zero(added)
+        let assertions = [
+            builder.is_zero_biguint(&self.balance),
+            builder.is_zero_biguint(&self.locked_balance),
+            builder.is_zero(self.margin_mode),
+        ];
+        builder.multi_and(&assertions)
     }
 
     pub fn print(&self, builder: &mut Builder, tag: &str) {
@@ -110,6 +113,8 @@ impl AccountAssetTarget {
             elements.push(limb.0);
         }
 
+        elements.push(self.margin_mode);
+
         let non_empty_hash = builder.hash_n_to_hash_no_pad::<Poseidon2Hash>(elements);
 
         let empty_hash = builder.zero_hash_out();
@@ -130,6 +135,7 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
         self.set_target(a.index_0, F::from_canonical_i64(b.index_0))?;
         self.set_biguint_target(&a.balance, &b.balance)?;
         self.set_biguint_target(&a.locked_balance, &b.locked_balance)?;
+        self.set_target(a.margin_mode, F::from_canonical_u8(b.margin_mode))?;
 
         Ok(())
     }
@@ -144,6 +150,7 @@ pub fn diff_account_asset(
         index_0: old.index_0,
         balance: builder.biguint_vector_diff(&new.balance, &old.balance),
         locked_balance: builder.biguint_vector_diff(&new.locked_balance, &old.locked_balance),
+        margin_mode: new.margin_mode,
     }
 }
 
@@ -157,6 +164,7 @@ pub fn apply_diff_account_asset(
         index_0: old.index_0,
         balance: builder.biguint_vector_sum(flag, &diff.balance, &old.balance),
         locked_balance: builder.biguint_vector_sum(flag, &diff.locked_balance, &old.locked_balance),
+        margin_mode: builder.select(flag, diff.margin_mode, old.margin_mode),
     }
 }
 
@@ -170,5 +178,6 @@ pub fn select_account_asset_target(
         index_0: builder.select(flag, a.index_0, b.index_0),
         balance: builder.select_biguint(flag, &a.balance, &b.balance),
         locked_balance: builder.select_biguint(flag, &a.locked_balance, &b.locked_balance),
+        margin_mode: builder.select(flag, a.margin_mode, b.margin_mode),
     }
 }

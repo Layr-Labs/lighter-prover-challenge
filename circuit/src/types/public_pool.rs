@@ -173,12 +173,28 @@ impl PublicPoolInfoTarget {
         }
     }
 
+    pub fn is_empty(&self, builder: &mut Builder) -> BoolTarget {
+        let mut assertions = vec![
+            builder.is_zero(self.status),
+            builder.is_zero(self.operator_fee),
+            builder.is_zero(self.min_operator_share_rate),
+            builder.is_zero(self.total_shares),
+            builder.is_zero(self.operator_shares),
+        ];
+
+        for i in 0..NB_STRATEGIES {
+            assertions.push(builder.is_zero_bigint(&self.strategies[i]));
+        }
+
+        builder.multi_and(&assertions)
+    }
+
     pub fn get_strategy_balance(
         &self,
         builder: &mut Builder,
         strategy_index: Target,
     ) -> BigIntTarget {
-        builder.random_access_bigint(strategy_index, self.strategies.as_ref(), BIG_U96_LIMBS)
+        builder.random_access_bigint(strategy_index, self.strategies.to_vec(), BIG_U96_LIMBS)
     }
 }
 

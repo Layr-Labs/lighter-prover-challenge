@@ -6,15 +6,11 @@ target/
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
 
-vendor
-
-# Benchmark outputs.
+.lighter-candidate/
+.trusted-benchmark/
 score.json
 score.json.sha256
-score.local-iterate.json
-score.local-submit.json
-benchmark-integrity.json
 benchmark-results/
 
-# Runner-only source data. Never commit this directory.
-/testdata/lighter-api/private/
+# Keep repository tracing hooks visible despite common global excludes.
+!/.claude/settings.local.json

@@ -1,16 +1,20 @@
 {
   "schemaVersion": 1,
   "name": "lighter-prover-challenge",
-  "description": "Generate valid proofs for the frozen Lighter block transaction and recursive chain circuits as quickly as possible.",
+  "description": "Optimize the current Lighter prover and circuit for verified transaction-proof throughput.",
   "category": "rust",
   "direction": "+",
   "editablePaths": [
-    "challenge/submission"
+    "Cargo.toml",
+    "Cargo.lock",
+    "circuit",
+    "bench",
+    "vendor"
   ],
   "setupCommand": ["bash", "-lc", "./setup.sh"],
-  "preSubmitCommand": ["bash", "-lc", "./benchmark.sh --local-submit"],
-  "benchmarkCommand": ["bash", "-lc", "./benchmark.sh --local-iterate"],
+  "benchmarkCommand": ["bash", "-lc", "./benchmark.sh"],
   "scorePath": "score.json",
+  "maxSubmissionBytes": 67108864,
   "runner": {
     "provider": "github-actions",
     "workflow": "benchmark.yml"

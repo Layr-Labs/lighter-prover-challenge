@@ -63,7 +63,6 @@ pub mod recursion;
 pub mod signed;
 pub mod transactions;
 pub mod tx;
-pub mod tx_attributes;
 pub mod tx_constraints;
 pub mod tx_interface;
 pub mod types;
