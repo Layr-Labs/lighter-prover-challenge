@@ -4,7 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 candidate_root="${LIGHTER_CANDIDATE_ROOT:-${root}}"
 candidate_root="$(cd "${candidate_root}" && pwd -P)"
-fixture="${LIGHTER_FIXTURE:-${root}/benchmark-tools/fixtures/bench-current-500.json}"
+fixture="${LIGHTER_FIXTURE:-${root}/benchmark-tools/fixtures/bench.json}"
 score="${LIGHTER_SCORE_PATH:-${root}/score.json}"
 transactions="${LIGHTER_TRANSACTIONS:-500}"
 mode="${LIGHTER_BENCHMARK_MODE:-official-throughput}"
@@ -13,8 +13,7 @@ verifier="${root}/benchmark-tools/trusted/lighter-benchmark-verifier"
 
 rm -f "${score}"
 [[ -f "${fixture}" ]] || {
-  echo "Missing current-main fixture: ${fixture}" >&2
-  echo "Export it from the current Lighter prover pipeline; the historical bench fixture is incompatible." >&2
+  echo "Missing protected benchmark fixture: ${fixture}" >&2
   exit 1
 }
 if [[ ! -x "${worker}" || ! -x "${verifier}" ]]; then

@@ -35,14 +35,12 @@ require a reviewed benchmark-version update and a newly published verifier.
 
 ## Fixture status
 
-Current upstream `main` changed the witness and state-root format for universal
-cross margin without updating the historical `bench/bench_test.json`. That file
-does not deserialize/prove against `23d1596` and is not a correctness anchor.
-
-Before ranked runs are enabled, export a complete 500-transaction fixture from
-the current Lighter prover pipeline to
-`benchmark-tools/fixtures/bench-current-500.json`, then validate a CPU proof and
-a Metal proof against the protected CPU verifier.
+The benchmark reuses the repository's existing 500-transaction
+`bench/bench_test.json` blob as protected
+`benchmark-tools/fixtures/bench.json`. The trusted verifier remains the
+correctness authority: the fixture must deserialize under the current circuit,
+and both candidate proofs and their public outputs must verify before a score is
+written.
 
 ## Local use
 
