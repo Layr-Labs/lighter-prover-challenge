@@ -34,19 +34,9 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ "$(uname -s)" == Darwin && -x /usr/bin/sandbox-exec ]]; then
-  [[ "${scratch}" != *\"* && "${scratch}" != *\\* && "${scratch}" != *$'\n'* ]] || {
-    echo "scratch path contains unsupported characters" >&2
-    exit 1
-  }
   sandbox_profile="$(mktemp -t lighter-benchmark.XXXXXX.sb)"
-  printf '%s\n' \
-    '(version 1)' \
-    '(allow default)' \
-    '(deny network*)' \
-    '(deny process-fork)' \
-    '(deny file-write*)' \
-    "(allow file-write* (subpath \"${scratch}\"))" \
-    > "${sandbox_profile}"
+  "${root}/.github/scripts/write-benchmark-sandbox-profile.sh" \
+    "${scratch}" "${sandbox_profile}"
 elif [[ "${LIGHTER_REQUIRE_SANDBOX:-0}" == 1 ]]; then
   echo "sandbox-exec is required for the ranked benchmark" >&2
   exit 1
@@ -54,7 +44,7 @@ else
   echo "WARNING: candidate worker is not sandboxed (local development only)" >&2
 fi
 
-candidate_sha="$(git -C "${candidate_root}" rev-parse HEAD 2>/dev/null || echo unknown)"
+candidate_sha="${LIGHTER_CANDIDATE_SHA:-$(git -C "${candidate_root}" rev-parse HEAD 2>/dev/null || echo unknown)}"
 args=("${worker}" "${fixture}" "${scratch}" "${score}"
   "${mode}" "${transactions}" "${candidate_sha}")
 [[ -z "${sandbox_profile}" ]] || args+=("${sandbox_profile}")

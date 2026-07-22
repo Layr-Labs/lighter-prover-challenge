@@ -44,6 +44,12 @@ jobs:
             exit 1
           }
 
+      - name: Test private benchmark workflow contract
+        run: ./.github/scripts/test-private-benchmark-workflow.sh
+
+      - name: Test benchmark sandbox restrictions
+        run: ./.github/scripts/test-benchmark-sandbox.sh
+
       - name: Check Rust formatting
         run: |
           toolchain="$(tr -d '[:space:]' < rust-toolchain)"
