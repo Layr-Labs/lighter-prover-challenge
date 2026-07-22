@@ -4,6 +4,7 @@
 use core::array;
 
 use anyhow::Result;
+use num::BigUint;
 use plonky2::field::extension::Extendable;
 use plonky2::field::secp256k1_scalar::Secp256K1Scalar;
 use plonky2::field::types::{Field, PrimeField64};
@@ -30,11 +31,9 @@ use crate::hash_utils::CircuitBuilderHashUtils;
 use crate::hints::CircuitBuilderHints;
 use crate::matching_engine::{execute_matching, get_impact_prices, get_order_book_path_delta};
 use crate::merkle_helpers::{
-    account_client_order_index_to_merkle_path, account_index_to_merkle_path,
-    account_order_index_to_merkle_path, api_key_index_to_merkle_path, asset_index_to_merkle_path,
-    conditional_verify_merkle_proof, market_index_to_merkle_path,
-    perps_market_index_to_merkle_path, recalculate_root, try_verify_merkle_proof,
-    verify_merkle_proof,
+    account_index_to_merkle_path, account_order_index_to_merkle_path, api_key_index_to_merkle_path,
+    asset_index_to_merkle_path, conditional_verify_merkle_proof, market_index_to_merkle_path,
+    perps_market_index_to_merkle_path, recalculate_root, verify_merkle_proof,
 };
 use crate::order_book_tree_helpers::{
     order_indexes_to_merkle_path, recalculate_order_book_tree_root,
@@ -62,14 +61,8 @@ use crate::transactions::internal_exit_position::{
 use crate::transactions::internal_liquidate_position::{
     InternalLiquidatePositionTxTarget, InternalLiquidatePositionTxTargetWitness,
 };
-use crate::transactions::internal_liquidate_spot::{
-    InternalLiquidateSpotTxTarget, InternalLiquidateSpotTxTargetWitness,
-};
 use crate::transactions::internal_pending_unlock::{
     InternalPendingUnlockTxTarget, InternalPendingUnlockTxTargetWitness,
-};
-use crate::transactions::internal_transfer::{
-    InternalTransferTxTarget, InternalTransferTxTargetWitness,
 };
 use crate::transactions::l1_burn_shares::{L1BurnSharesTxTarget, L1BurnSharesTxTargetWitness};
 use crate::transactions::l1_cancel_all_orders::{
@@ -94,9 +87,6 @@ use crate::transactions::l1_update_market::{
     L1UpdateMarketTxTarget, L1UpdateMarketTxTargetWitness,
 };
 use crate::transactions::l1_withdraw::{L1WithdrawTxTarget, L1WithdrawTxTargetWitness};
-use crate::transactions::l2_approve_integrator::{
-    L2ApproveIntegratorTxTarget, L2ApproveIntegratorTxTargetWitness,
-};
 use crate::transactions::l2_burn_shares::{L2BurnSharesTxTarget, L2BurnSharesTxTargetWitness};
 use crate::transactions::l2_cancel_all_orders::{
     L2CancelAllOrdersTxTarget, L2CancelAllOrdersTxTargetWitness,
@@ -131,14 +121,8 @@ use crate::transactions::l2_transfer::{L2TransferTxTarget, L2TransferTxTargetWit
 use crate::transactions::l2_unstake_assets::{
     L2UnstakeAssetsTxTarget, L2UnstakeAssetsTxTargetWitness,
 };
-use crate::transactions::l2_update_account_asset_config::{
-    L2UpdateAccountAssetConfigTxTarget, L2UpdateAccountAssetConfigTxTargetWitness,
-};
 use crate::transactions::l2_update_account_config::{
     L2UpdateAccountConfigTxTarget, L2UpdateAccountConfigTxTargetWitness,
-};
-use crate::transactions::l2_update_asset_config::{
-    L2UpdateAssetConfigTxTarget, L2UpdateAssetConfigTxTargetWitness,
 };
 use crate::transactions::l2_update_leverage::{
     L2UpdateLeverageTxTarget, L2UpdateLeverageTxTargetWitness,
@@ -154,24 +138,16 @@ use crate::transactions::l2_update_public_pool::{
 };
 use crate::transactions::l2_withdraw::{L2WithdrawTxTarget, L2WithdrawTxTargetWitness};
 use crate::tx::Tx;
-use crate::tx_attributes::{ATTR_SKIP_TX_NONCE, TxAttributesTarget, TxAttributesTargetWitness};
 use crate::tx_interface::TransactionTarget;
 use crate::types::account::{AccountTarget, AccountTargetWitness};
 use crate::types::account_asset::{AccountAssetTarget, AccountAssetTargetWitness};
 use crate::types::account_delta::{AccountDeltaTarget, AccountDeltaTargetWitness};
-use crate::types::account_margined_asset::{
-    AccountMarginedAssetTarget, select_account_margined_asset_target,
-};
 use crate::types::account_order::{AccountOrderTarget, AccountOrderTargetWitness};
 use crate::types::account_position::{AccountPositionTarget, PositionWithDelta};
 use crate::types::api_key::{ApiKeyTarget, ApiKeyTargetWitness};
-use crate::types::asset::{AssetTarget, apply_diff_assets, diff_assets, random_access_assets};
+use crate::types::asset::{AssetTarget, apply_diff_assets, diff_assets, select_asset_target};
 use crate::types::config::{BIG_U96_LIMBS, Builder, F};
 use crate::types::constants::*;
-use crate::types::margined_asset::{
-    MarginedAssetTarget, apply_diff_margined_assets, diff_margined_assets,
-    random_access_margined_assets,
-};
 use crate::types::market::{MarketTarget, MarketTargetWitness};
 use crate::types::market_details::{
     MarketDetailsTarget, apply_diff_market_details, diff_market_details,
@@ -232,10 +208,6 @@ pub struct TxTarget {
     pub l2_update_account_config_tx_target: TransactionTarget<L2UpdateAccountConfigTxTarget>,
     pub l2_strategy_transfer_tx_target: TransactionTarget<L2StrategyTransferTxTarget>,
     pub l2_update_market_config_tx_target: TransactionTarget<L2UpdateMarketConfigTxTarget>,
-    pub l2_approve_integrator_tx_target: TransactionTarget<L2ApproveIntegratorTxTarget>,
-    pub l2_update_asset_config_tx_target: TransactionTarget<L2UpdateAssetConfigTxTarget>,
-    pub l2_update_account_asset_config_tx_target:
-        TransactionTarget<L2UpdateAccountAssetConfigTxTarget>,
 
     /*************************/
     /* Internal Transactions */
@@ -248,8 +220,6 @@ pub struct TxTarget {
     pub internal_liquidate_position_tx_target: TransactionTarget<InternalLiquidatePositionTxTarget>,
     pub internal_create_order_tx_target: TransactionTarget<InternalCreateOrderTxTarget>,
     pub internal_pending_unlock_tx_target: TransactionTarget<InternalPendingUnlockTxTarget>,
-    pub internal_transfer_tx_target: TransactionTarget<InternalTransferTxTarget>,
-    pub internal_liquidate_spot_tx_target: TransactionTarget<InternalLiquidateSpotTxTarget>,
 
     /***********************/
     /*  Transactions Data  */
@@ -306,17 +276,12 @@ pub struct TxTarget {
     pub impact_bid_order: OrderTarget,
     pub impact_ask_order_book_tree_path: [OrderBookNodeTarget; ORDER_BOOK_MERKLE_LEVELS],
     pub impact_bid_order_book_tree_path: [OrderBookNodeTarget; ORDER_BOOK_MERKLE_LEVELS],
-
-    /******************/
-    /*  TX ATTRIBUTES */
-    /******************/
-    pub attributes: TxAttributesTarget,
 }
 
 impl TxTarget {
     /// Initializes the transaction virtual targets
     pub fn new(builder: &mut Builder) -> Self {
-        Self {
+        TxTarget {
             tx_type: builder.add_virtual_target(),
 
             /***********************/
@@ -399,15 +364,6 @@ impl TxTarget {
             l2_update_market_config_tx_target: TransactionTarget::new(
                 L2UpdateMarketConfigTxTarget::new(builder),
             ),
-            l2_approve_integrator_tx_target: TransactionTarget::new(
-                L2ApproveIntegratorTxTarget::new(builder),
-            ),
-            l2_update_asset_config_tx_target: TransactionTarget::new(
-                L2UpdateAssetConfigTxTarget::new(builder),
-            ),
-            l2_update_account_asset_config_tx_target: TransactionTarget::new(
-                L2UpdateAccountAssetConfigTxTarget::new(builder),
-            ),
 
             /*************************/
             /* Internal Transactions */
@@ -435,12 +391,6 @@ impl TxTarget {
             ),
             internal_pending_unlock_tx_target: TransactionTarget::new(
                 InternalPendingUnlockTxTarget::new(builder),
-            ),
-            internal_transfer_tx_target: TransactionTarget::new(InternalTransferTxTarget::new(
-                builder,
-            )),
-            internal_liquidate_spot_tx_target: TransactionTarget::new(
-                InternalLiquidateSpotTxTarget::new(builder),
             ),
 
             /***********************/
@@ -515,11 +465,6 @@ impl TxTarget {
             impact_bid_order: OrderTarget::new(builder),
             impact_ask_order_book_tree_path: array::from_fn(|_| OrderBookNodeTarget::new(builder)),
             impact_bid_order_book_tree_path: array::from_fn(|_| OrderBookNodeTarget::new(builder)),
-
-            /******************/
-            /*  TX ATTRIBUTES */
-            /******************/
-            attributes: TxAttributesTarget::new(builder),
         }
     }
 
@@ -532,7 +477,6 @@ impl TxTarget {
         system_config_before: &SystemConfigTarget,
         register_stack_before: &RegisterStackTarget,
         all_assets_before: &[AssetTarget; ASSET_LIST_SIZE],
-        all_margined_assets_before: &[MarginedAssetTarget; MARGINED_ASSET_LIST_SIZE],
         all_market_details_before: &[MarketDetailsTarget; POSITION_LIST_SIZE],
         account_tree_root_before: HashOutTarget,
         account_pub_data_tree_root_before: HashOutTarget,
@@ -546,7 +490,6 @@ impl TxTarget {
         SystemConfigTarget,                                  // system config after
         RegisterStackTarget,                                 // register stack after
         [AssetTarget; ASSET_LIST_SIZE],                      // all assets after
-        [MarginedAssetTarget; MARGINED_ASSET_LIST_SIZE],     // all margined assets after
         [MarketDetailsTarget; POSITION_LIST_SIZE],           // all market details after
         HashOutTarget,                                       // account tree root after
         HashOutTarget, // account public data delta tree root after
@@ -572,36 +515,14 @@ impl TxTarget {
                 instruction_type: register_stack_before[0].instruction_type,
                 tx_sender_account_partial: partial_main_account,
                 sub_account_index: self.accounts_before[SUB_ACCOUNT_ID].account_index,
-                skip_tx_nonce: self.attributes.get(ATTR_SKIP_TX_NONCE),
             },
         );
 
         /**********************************/
         /*  Initialize Helper State Data  */
         /**********************************/
-        let assets_before: [AssetTarget; NB_ASSETS_PER_TX] = core::array::from_fn(|i| {
-            random_access_assets(builder, self.asset_indices[i], all_assets_before.to_vec())
-        });
-        // Load the margin asset belongs to first asset loaded. For L1 register/update asset, load the target margin index
-        let mut first_asset_margin_index = assets_before[0].margin_index(builder);
-        first_asset_margin_index = builder.select(
-            tx_type.is_l1_register_asset,
-            self.l1_register_asset_tx_target.inner.margin_index,
-            first_asset_margin_index,
-        );
-        let second_asset_margin_index = assets_before[1].margin_index(builder);
-        let margined_asset_before = [
-            random_access_margined_assets(
-                builder,
-                first_asset_margin_index,
-                all_margined_assets_before,
-            ),
-            random_access_margined_assets(
-                builder,
-                second_asset_margin_index,
-                all_margined_assets_before,
-            ),
-        ];
+        let assets_before = self.get_assets(builder, all_assets_before);
+
         let market_details_before =
             self.get_market_details_with_random_access(builder, all_market_details_before);
         let positions_with_pub_data_before: [PositionWithDelta; NB_ACCOUNTS_PER_TX - 1] =
@@ -612,29 +533,10 @@ impl TxTarget {
                 &self.accounts_delta_before[..NB_ACCOUNTS_PER_TX - 1],
             );
 
-        let account_margined_assets_before: [[AccountMarginedAssetTarget; NB_ASSETS_PER_TX];
-            NB_ACCOUNTS_PER_TX] = AccountTarget::get_margined_asset_balances(
-            builder,
-            &self.accounts_before,
-            &assets_before,
-            first_asset_margin_index,
-        );
         let is_asset_used_as_margin: [[BoolTarget; NB_ASSETS_PER_TX]; NB_ACCOUNTS_PER_TX] =
             core::array::from_fn(|i| {
-                account_margined_assets_before[i]
-                    .iter()
-                    .enumerate()
-                    .map(|(j, account_margined_asset)| {
-                        let is_usdc =
-                            builder.is_equal_constant(self.asset_indices[j], USDC_ASSET_INDEX);
-                        builder.or(
-                            is_usdc,
-                            BoolTarget::new_unsafe(account_margined_asset.margin_mode),
-                        )
-                    })
-                    .collect::<Vec<BoolTarget>>()
-                    .try_into()
-                    .unwrap()
+                AccountTarget::are_assets_used_as_margin(builder, &self.account_assets_before[i])
+                    .into()
             });
 
         let risk_infos_before = self.get_risk_infos_before(
@@ -643,7 +545,6 @@ impl TxTarget {
             &positions_with_pub_data_before,
             &market_details_before,
             all_market_details_before,
-            all_margined_assets_before,
         );
         let (strategy_indexes, strategies_before) =
             self.get_strategies_before(builder, &tx_type, &market_details_before);
@@ -661,21 +562,10 @@ impl TxTarget {
         let old_position_delta_hashes: [HashOutTarget; NB_ACCOUNTS_PER_TX - 1] =
             array::from_fn(|i| positions_with_pub_data_before[i].delta.hash(builder));
 
-        self.attributes.sanitize_and_normalize(
-            builder,
-            &self.accounts_before[OWNER_ACCOUNT_ID],
-            &self.market_before,
-            system_config_before,
-            block_created_at,
-        );
-
         // /******************************/
         // /*  Initialize Tx State Data  */
         // /******************************/
         let tx_state = &mut TxState {
-            first_asset_margin_index,
-            next_margin_asset_index: self
-                .get_next_margin_asset_index(builder, all_margined_assets_before),
             new_instructions: [BaseRegisterInfoTarget::empty(builder); NEW_INSTRUCTIONS_MAX_SIZE],
             new_instructions_count: builder.zero(),
             register_stack: *register_stack_before,
@@ -699,9 +589,7 @@ impl TxTarget {
             api_key: self.api_key_before.clone(),
             account_order: self.account_order_before.clone(),
             account_assets: self.account_assets_before.clone(),
-            account_margined_assets: account_margined_assets_before.clone(),
             assets: assets_before.clone(),
-            margined_asset: margined_asset_before.clone(),
             asset_indices: self.asset_indices,
             block_timestamp: block_created_at,
             is_sender_receiver_different: builder.is_not_equal(
@@ -716,12 +604,11 @@ impl TxTarget {
                 self.accounts_before[FEE_ACCOUNT_ID].account_index,
                 self.accounts_before[MAKER_ACCOUNT_ID].account_index,
             ),
-            is_cloid_unique: self.get_is_cloid_unique_infos(builder, &tx_type),
+            taker_client_order_proof: self.account_orders_tree_merkle_proof[2],
             public_pool_share: public_pool_share_before,
             apply_pool_share_delta_flag: builder._false(),
             between_strategies_flag: builder
                 .is_equal_constant(self.tx_type, TX_TYPE_L2_STRATEGY_TRANSFER as u64),
-            attributes: self.attributes.clone(),
         };
 
         self.validate_asset_indices(builder, tx_state);
@@ -732,10 +619,10 @@ impl TxTarget {
         /*      APPLY TRANSACTION      */
         /*******************************/
         self.apply_transaction(builder, tx_state, &tx_type);
-        tx_state.push_instruction_stack::<INSERT_MAX_THREE_REGISTERS>(builder);
+        tx_state.push_instruction_stack(builder);
 
         execute_matching(builder, tx_state, block_created_at);
-        tx_state.push_instruction_stack::<NEW_INSTRUCTIONS_MAX_SIZE>(builder);
+        tx_state.push_instruction_stack(builder);
 
         /*******************************/
         /*      GENERATE PUB DATA      */
@@ -755,13 +642,7 @@ impl TxTarget {
             &mut position_bucket_hashes,
         );
 
-        self.apply_aggregated_balance_deltas(builder, tx_state, &account_margined_assets_before);
-
-        self.apply_margin_balance_deltas(
-            builder,
-            tx_state,
-            &[first_asset_margin_index, second_asset_margin_index],
-        );
+        self.apply_asset_deltas(builder, tx_state);
 
         self.apply_public_pool_share_delta(builder, tx_state, &public_pool_share_before);
 
@@ -780,29 +661,8 @@ impl TxTarget {
             &tx_state.market_details,
         );
 
-        let (current_all_assets, current_all_margined_assets) = self.update_assets(
-            builder,
-            all_assets_before,
-            &assets_before,
-            &tx_state.assets,
-            all_margined_assets_before,
-            &[tx_state.first_asset_margin_index, second_asset_margin_index],
-            &margined_asset_before
-                .iter()
-                .take(2)
-                .cloned()
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap(),
-            &tx_state
-                .margined_asset
-                .iter()
-                .take(2)
-                .cloned()
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap(),
-        );
+        let current_all_assets =
+            self.update_assets(builder, all_assets_before, &assets_before, &tx_state.assets);
 
         /*************************/
         /*  VERIFY STATE LEAVES  */
@@ -840,7 +700,6 @@ impl TxTarget {
             tx_state.system_config,
             tx_state.register_stack,
             current_all_assets,
-            current_all_margined_assets,
             current_all_market_details,
             current_account_tree_root,
             current_account_pub_data_tree_root,
@@ -856,30 +715,12 @@ impl TxTarget {
         //     SystemConfigTarget::empty(builder),
         //     RegisterStackTarget::empty(builder),
         //     all_assets_before.clone(),
-        //     all_margined_assets_before.clone(),
         //     all_market_details_before.clone(),
         //     builder.zero_hash_out(),
         //     builder.zero_hash_out(),
         //     builder.zero_hash_out(),
         //     builder.zero_hash_out(),
         // )
-    }
-
-    fn get_next_margin_asset_index(
-        &self,
-        builder: &mut Builder,
-        all_margined_assets_before: &[MarginedAssetTarget; MARGINED_ASSET_LIST_SIZE],
-    ) -> Target {
-        let mut margin_index = builder.constant_u64(NIL_MARGIN_ASSET_INDEX);
-        let mut applied = builder._false();
-        for i in 0..MARGINED_ASSET_LIST_SIZE {
-            let i_target = builder.constant_usize(i);
-            let is_empty = builder.is_zero(all_margined_assets_before[i].asset_index);
-            let flag = builder.and_not(is_empty, applied);
-            margin_index = builder.select(flag, i_target, margin_index);
-            applied = builder.or(applied, flag);
-        }
-        margin_index
     }
 
     /// Computes the two risk slots we use in tx_state
@@ -910,7 +751,6 @@ impl TxTarget {
         positions_with_pub_data_before: &[PositionWithDelta; NB_ACCOUNTS_PER_TX - 1],
         current_market_details_before: &MarketDetailsTarget,
         all_market_details_before: &[MarketDetailsTarget; POSITION_LIST_SIZE],
-        all_margined_assets_before: &[MarginedAssetTarget; MARGINED_ASSET_LIST_SIZE],
     ) -> [RiskInfoTarget; NB_ACCOUNTS_PER_TX - 1] {
         let default_strategy_index = builder.constant_usize(DEFAULT_STRATEGY_INDEX);
 
@@ -930,45 +770,31 @@ impl TxTarget {
             };
 
             let strategy_index = {
-                let mut strategy_index = builder.select(
+                let strategy_index = builder.select(
+                    use_strategy,
+                    current_market_details_before.strategy_index,
+                    default_strategy_index,
+                );
+                builder.select(
                     tx_type.is_l2_strategy_transfer,
                     self.l2_strategy_transfer_tx_target
                         .inner
                         .from_strategy_index,
-                    current_market_details_before.strategy_index,
-                );
-                strategy_index = builder.select(
-                    tx_type.is_internal_transfer,
-                    self.internal_transfer_tx_target.inner.strategy_index,
                     strategy_index,
-                );
-                builder.select(use_strategy, strategy_index, default_strategy_index)
+                )
             };
 
-            let mut margined_assets = self.accounts_before[OWNER_ACCOUNT_ID]
-                .margined_assets
-                .clone();
-            let usdc_collateral = {
+            let collateral = {
                 // use insurance fund's whole collateral if is_share_burn_tx
                 // if not is_share_burn_tx; use owner account collateral, or strategy balance if insurance fund
                 let relevant_collateral = self.accounts_before[OWNER_ACCOUNT_ID]
-                    .get_relevant_usdc_collateral(builder, strategy_index);
+                    .get_relevant_collateral(builder, strategy_index);
                 builder.select_bigint(
                     tx_type.is_share_burn_tx,
-                    &self.accounts_before[SUB_ACCOUNT_ID]
-                        .get_margined_asset_balance_const(USDC_MARGIN_ASSET_INDEX),
+                    &self.accounts_before[SUB_ACCOUNT_ID].collateral,
                     &relevant_collateral,
                 )
             };
-            margined_assets[USDC_MARGIN_ASSET_INDEX].balance = usdc_collateral;
-            let zero_bigint = builder.zero_bigint();
-            for i in 1..MARGINED_ASSET_LIST_SIZE {
-                margined_assets[i].balance = builder.select_bigint(
-                    tx_type.is_share_burn_tx,
-                    &zero_bigint,
-                    &margined_assets[i].balance,
-                );
-            }
 
             // Put the pool positions for share-burning txs. If account is not insurance fund, positions' strategy
             // indices will be zero anyways, don't override them. Furthermore, insurance fund can't have isolated
@@ -991,7 +817,7 @@ impl TxTarget {
 
             let partial_account = AccountTarget {
                 positions,
-                margined_assets,
+                collateral,
                 ..AccountTarget::default() // Partial
             };
 
@@ -1043,23 +869,20 @@ impl TxTarget {
                 default_strategy_index,
             );
 
-            let mut margined_assets = self.accounts_before[SUB_ACCOUNT_ID].margined_assets.clone();
-            let usdc_collateral = {
+            let collateral = {
                 // use insurance fund's whole collateral if use_strategy is false
                 let relevant_collateral = self.accounts_before[SUB_ACCOUNT_ID]
-                    .get_relevant_usdc_collateral(builder, strategy_index);
+                    .get_relevant_collateral(builder, strategy_index);
                 builder.select_bigint(
                     use_strategy,
                     &relevant_collateral,
-                    &self.accounts_before[SUB_ACCOUNT_ID]
-                        .get_margined_asset_balance_const(USDC_MARGIN_ASSET_INDEX),
+                    &self.accounts_before[SUB_ACCOUNT_ID].collateral,
                 )
             };
-            margined_assets[USDC_MARGIN_ASSET_INDEX].balance = usdc_collateral;
 
             let partial_account = AccountTarget {
                 positions: self.accounts_before[SUB_ACCOUNT_ID].positions.clone(),
-                margined_assets,
+                collateral,
                 ..AccountTarget::default() // Partial
             };
 
@@ -1099,7 +922,6 @@ impl TxTarget {
                 &positions_with_pub_data_before[OWNER_ACCOUNT_ID].position,
                 &current_market_details_0,
                 &all_market_details_0,
-                all_margined_assets_before,
                 strategy_index_0,
             ),
             RiskInfoTarget::new(
@@ -1108,7 +930,6 @@ impl TxTarget {
                 &positions_with_pub_data_before[SUB_ACCOUNT_ID].position,
                 &current_market_details_1,
                 &all_market_details_1,
-                all_margined_assets_before,
                 strategy_index_1,
             ),
         ]
@@ -1123,58 +944,19 @@ impl TxTarget {
         [Target; NB_ACCOUNTS_PER_TX],
         [BigIntTarget; NB_ACCOUNTS_PER_TX],
     ) {
-        let default_strategy_index = builder.constant_usize(DEFAULT_STRATEGY_INDEX);
+        let strategy_index_0 = builder.select(
+            tx_type.is_l2_strategy_transfer,
+            self.l2_strategy_transfer_tx_target
+                .inner
+                .from_strategy_index,
+            current_market_details.strategy_index,
+        );
 
-        let strategy_index_0 = {
-            let use_strategy = {
-                let assertions = [
-                    builder.not(tx_type.is_share_burn_tx), // First slot will be cross risk of sub account, not the owner
-                    builder.is_equal_constant(
-                        self.accounts_before[OWNER_ACCOUNT_ID].account_type,
-                        INSURANCE_FUND_ACCOUNT_TYPE as u64,
-                    ),
-                ];
-                builder.multi_and(&assertions)
-            };
-
-            let mut result = builder.select(
-                tx_type.is_l2_strategy_transfer,
-                self.l2_strategy_transfer_tx_target
-                    .inner
-                    .from_strategy_index,
-                current_market_details.strategy_index,
-            );
-            result = builder.select(
-                tx_type.is_internal_transfer,
-                self.internal_transfer_tx_target.inner.strategy_index,
-                result,
-            );
-            builder.select(use_strategy, result, default_strategy_index)
-        };
-
-        let strategy_index_1 = {
-            let is_second_account_insurance_fund = builder.is_equal_constant(
-                self.accounts_before[SUB_ACCOUNT_ID].account_type,
-                INSURANCE_FUND_ACCOUNT_TYPE as u64,
-            );
-            let use_strategy =
-                builder.and_not(is_second_account_insurance_fund, tx_type.is_l2_mint_shares);
-
-            // Override strategy indices with 0 unless the sub account is an insurance fund.
-            // Strategy transfer transactions don't use a sub account and the target strategy balance increases,
-            // so we don't need to check for l2_strategy_transfer here.
-            let mut result = builder.select(
-                tx_type.is_l2_strategy_transfer,
-                self.l2_strategy_transfer_tx_target.inner.to_strategy_index,
-                current_market_details.strategy_index,
-            );
-            result = builder.select(
-                tx_type.is_internal_transfer,
-                self.internal_transfer_tx_target.inner.strategy_index,
-                result,
-            );
-            builder.select(use_strategy, result, default_strategy_index)
-        };
+        let strategy_index_1 = builder.select(
+            tx_type.is_l2_strategy_transfer,
+            self.l2_strategy_transfer_tx_target.inner.to_strategy_index,
+            current_market_details.strategy_index,
+        );
 
         (
             [
@@ -1266,13 +1048,7 @@ impl TxTarget {
 
     /// If account is using unified trading mode, then usdc `balance` should be empty and `collateral` should be used,
     /// which is accounted for in `apply_account_delta`.
-    fn apply_aggregated_balance_deltas(
-        &self,
-        builder: &mut Builder,
-        tx_state: &mut TxState,
-        account_margined_assets_before: &[[AccountMarginedAssetTarget; NB_ASSETS_PER_TX];
-             NB_ACCOUNTS_PER_TX],
-    ) {
+    fn apply_asset_deltas(&self, builder: &mut Builder, tx_state: &mut TxState) {
         for i in 0..NB_ACCOUNTS_PER_TX {
             let old_lit_unlock = self.accounts_before[i].get_total_unlock_amount(builder);
             let new_lit_unlock = tx_state.accounts[i].get_total_unlock_amount(builder);
@@ -1284,47 +1060,27 @@ impl TxTarget {
                 let add_to_new_balance_for_pending_unlocs =
                     builder.mul_biguint_by_bool(&new_lit_unlock, is_lit);
 
-                let old_extended_spot_balance = builder.add_biguint_non_carry(
+                let old_extended_balance = builder.add_biguint_non_carry(
                     &self.account_assets_before[i][j].balance,
                     &add_to_old_balance_for_pending_unlocks,
                     BIG_U96_LIMBS,
                 );
-                let old_spot_balance = builder.div_biguint(
-                    &old_extended_spot_balance,
+                let old_balance = builder.div_biguint(
+                    &old_extended_balance,
                     &tx_state.assets[j].extension_multiplier,
                 );
-                let old_spot_balance_bigint = builder.biguint_to_bigint(&old_spot_balance);
-                let old_margin_balance = builder.euclidian_div_by_biguint(
-                    &account_margined_assets_before[i][j].balance,
-                    &tx_state.assets[j].extension_multiplier,
-                    BIG_U96_LIMBS,
-                );
-                let old_balance_bigint = builder.add_bigint_non_carry(
-                    &old_spot_balance_bigint,
-                    &old_margin_balance,
-                    BIG_U96_LIMBS,
-                );
+                let old_balance_bigint = builder.biguint_to_bigint(&old_balance);
 
-                let new_extended_spot_balance = builder.add_biguint_non_carry(
+                let new_extended_balance = builder.add_biguint_non_carry(
                     &tx_state.account_assets[i][j].balance,
                     &add_to_new_balance_for_pending_unlocs,
                     BIG_U96_LIMBS,
                 );
-                let new_spot_balance = builder.div_biguint(
-                    &new_extended_spot_balance,
+                let new_balance = builder.div_biguint(
+                    &new_extended_balance,
                     &tx_state.assets[j].extension_multiplier,
                 );
-                let new_spot_balance_bigint = builder.biguint_to_bigint(&new_spot_balance);
-                let new_margin_balance = builder.euclidian_div_by_biguint(
-                    &tx_state.account_margined_assets[i][j].balance,
-                    &tx_state.assets[j].extension_multiplier,
-                    BIG_U96_LIMBS,
-                );
-                let new_balance_bigint = builder.add_bigint_non_carry(
-                    &new_spot_balance_bigint,
-                    &new_margin_balance,
-                    BIG_U96_LIMBS,
-                );
+                let new_balance_bigint = builder.biguint_to_bigint(&new_balance);
 
                 let balance_delta = builder.sub_bigint_non_carry(
                     &new_balance_bigint,
@@ -1345,29 +1101,6 @@ impl TxTarget {
                         &balance_delta,
                         BIG_U96_LIMBS,
                     );
-            }
-        }
-    }
-
-    fn apply_margin_balance_deltas(
-        &self,
-        builder: &mut Builder,
-        tx_state: &mut TxState,
-        asset_margin_indices: &[Target; NB_ASSETS_PER_TX],
-    ) {
-        for acc in 0..NB_ACCOUNTS_PER_TX {
-            for ass in 0..NB_ASSETS_PER_TX {
-                for ma in 0..MARGINED_ASSET_LIST_SIZE {
-                    let is_margin_index =
-                        builder.is_equal_constant(asset_margin_indices[ass], ma as u64);
-                    tx_state.accounts[acc].margined_assets[ma] =
-                        select_account_margined_asset_target(
-                            builder,
-                            is_margin_index,
-                            &tx_state.account_margined_assets[acc][ass],
-                            &tx_state.accounts[acc].margined_assets[ma],
-                        );
-                }
             }
         }
     }
@@ -1483,7 +1216,7 @@ impl TxTarget {
             SignedTarget::new_unsafe(share_amount_delta),
         );
 
-        let principal_delta = builder.sub(
+        let entry_usdc_delta = builder.sub(
             tx_state.public_pool_share.principal_amount,
             public_pool_share_before.principal_amount,
         );
@@ -1496,7 +1229,7 @@ impl TxTarget {
             tx_state.apply_pool_share_delta_flag,
             tx_state.public_pool_share.public_pool_index,
             share_amount_delta,
-            principal_delta,
+            entry_usdc_delta,
             entry_timestamp_delta,
         );
     }
@@ -1557,8 +1290,23 @@ impl TxTarget {
         tx_state: &mut TxState,
         position_usdc_deltas: &[BigIntTarget; NB_ACCOUNTS_PER_TX - 1],
     ) {
+        let usdc_to_collateral_multiplier =
+            builder.constant_biguint(&BigUint::from(USDC_TO_COLLATERAL_MULTIPLIER as u64));
         for i in 0..NB_ACCOUNTS_PER_TX {
-            let mut collateral_delta = builder.zero_bigint();
+            let old_collateral = builder.euclidian_div_by_biguint(
+                &self.accounts_before[i].collateral,
+                &usdc_to_collateral_multiplier,
+                BIG_U96_LIMBS,
+            );
+
+            let new_collateral = builder.euclidian_div_by_biguint(
+                &tx_state.accounts[i].collateral,
+                &usdc_to_collateral_multiplier,
+                BIG_U96_LIMBS,
+            );
+
+            let mut collateral_delta =
+                builder.sub_bigint_non_carry(&new_collateral, &old_collateral, BIG_U96_LIMBS);
 
             // Account for position changes except for fee account
             if i < NB_ACCOUNTS_PER_TX - 1 {
@@ -1586,6 +1334,9 @@ impl TxTarget {
                 collateral_delta = builder
                     .mul_bigint_by_bool(&collateral_delta, tx_state.is_sender_receiver_different);
             }
+
+            let ignore_collateral = builder.not(tx_state.between_strategies_flag);
+            collateral_delta = builder.mul_bigint_by_bool(&collateral_delta, ignore_collateral);
 
             // Apply collateral delta to usdc asset balance
             let zero_bigint = builder.zero_bigint();
@@ -1886,10 +1637,6 @@ impl TxTarget {
         );
         let new_account_delta_hash = tx_state.accounts_delta[account_id].hash(builder);
 
-        // builder.println_hash_out(&new_account_hash, "new_account_hash");
-        // builder.println_hash_out(&new_account_pub_data_hash, "new_account_pub_data_hash");
-        // builder.println_hash_out(&new_account_delta_hash, "new_account_delta_hash");
-
         (
             recalculate_root(
                 builder,
@@ -1992,15 +1739,6 @@ impl TxTarget {
                 })
             }),
         ];
-
-        // builder.println_hash_out(&new_hashes[0][0][0], "0 0");
-        // builder.println_hash_out(&new_hashes[1][0][0], "0 1");
-        // builder.println_hash_out(&new_hashes[2][0][0], "0 2");
-
-        // builder.println_hash_out(&new_hashes[0][0][1], "1 0");
-        // builder.println_hash_out(&new_hashes[1][0][1], "1 1");
-        // builder.println_hash_out(&new_hashes[2][0][1], "1 2");
-
         let mut roots: [[HashOutTarget; NB_ACCOUNTS_PER_TX]; 3] = [
             core::array::from_fn(|j| tx_state.accounts[j].asset_root),
             core::array::from_fn(|j| tx_state.accounts[j].aggregated_balances_root),
@@ -2078,10 +1816,6 @@ impl TxTarget {
         );
         let order_belongs_to_maker_account =
             builder.and_not(maker_index_eq_owner_index, is_account_order_index_nil);
-        let use_maker_account = builder.and(
-            order_belongs_to_maker_account,
-            tx_state.is_sender_receiver_different,
-        );
 
         // Verify that index_0 is either 0 or a valid order index
         let is_index_0_is_zero = builder.is_zero(self.account_order_before.index_0);
@@ -2099,7 +1833,7 @@ impl TxTarget {
 
         // Set oid leaf and recalculate root
         let old_account_orders_root = builder.select_hash(
-            use_maker_account,
+            order_belongs_to_maker_account,
             &self.accounts_before[MAKER_ACCOUNT_ID].account_orders_root,
             &self.accounts_before[TAKER_ACCOUNT_ID].account_orders_root,
         );
@@ -2159,12 +1893,12 @@ impl TxTarget {
         // Set the new account orders root in the account metadata
 
         tx_state.accounts[TAKER_ACCOUNT_ID].account_orders_root = builder.select_hash(
-            use_maker_account,
+            order_belongs_to_maker_account,
             &self.accounts_before[TAKER_ACCOUNT_ID].account_orders_root,
             &new_account_orders_root,
         );
         tx_state.accounts[MAKER_ACCOUNT_ID].account_orders_root = builder.select_hash(
-            use_maker_account,
+            order_belongs_to_maker_account,
             &new_account_orders_root,
             &self.accounts_before[MAKER_ACCOUNT_ID].account_orders_root,
         );
@@ -2540,83 +2274,7 @@ impl TxTarget {
             selected_hash,
         );
 
-        let l2_approve_integrator_tx_hash = self.l2_approve_integrator_tx_target.hash(
-            builder,
-            self.nonce,
-            self.expired_at,
-            chain_id,
-        );
-        selected_hash = builder.select_quintic_ext(
-            tx_type.is_l2_approve_integrator,
-            l2_approve_integrator_tx_hash,
-            selected_hash,
-        );
-
-        let l2_update_account_asset_config_tx_hash = self
-            .l2_update_account_asset_config_tx_target
-            .hash(builder, self.nonce, self.expired_at, chain_id);
-        selected_hash = builder.select_quintic_ext(
-            tx_type.is_l2_update_account_asset_config,
-            l2_update_account_asset_config_tx_hash,
-            selected_hash,
-        );
-
-        let l2_update_asset_config_tx_hash = self.l2_update_asset_config_tx_target.hash(
-            builder,
-            self.nonce,
-            self.expired_at,
-            chain_id,
-        );
-        selected_hash = builder.select_quintic_ext(
-            tx_type.is_l2_update_asset_config,
-            l2_update_asset_config_tx_hash,
-            selected_hash,
-        );
-
-        self.attributes.aggregate_tx_hash(builder, selected_hash)
-    }
-
-    fn get_is_cloid_unique_infos(
-        &self,
-        builder: &mut Builder,
-        tx_type: &TxTypeTargets,
-    ) -> [BoolTarget; NB_CLOID_UNIQUENESS_CHECK_PER_TX] {
-        let nil_cloid = builder.constant_i64(NIL_CLIENT_ORDER_INDEX);
-        let cloids = [
-            {
-                let select_1 = builder.select(
-                    tx_type.is_l2_create_order,
-                    self.l2_create_order_tx_target.inner.client_order_index,
-                    nil_cloid,
-                );
-                builder.select(
-                    tx_type.is_l2_create_grouped_orders,
-                    self.l2_create_grouped_orders_tx_target.inner.orders[0].client_order_index,
-                    select_1,
-                )
-            },
-            builder.select(
-                tx_type.is_l2_create_grouped_orders,
-                self.l2_create_grouped_orders_tx_target.inner.orders[1].client_order_index,
-                nil_cloid,
-            ),
-            builder.select(
-                tx_type.is_l2_create_grouped_orders,
-                self.l2_create_grouped_orders_tx_target.inner.orders[2].client_order_index,
-                nil_cloid,
-            ),
-        ];
-        let empty_hash = builder.zero_hash_out();
-        core::array::from_fn(|i| {
-            let path = account_client_order_index_to_merkle_path(builder, cloids[i]);
-            try_verify_merkle_proof(
-                builder,
-                &self.accounts_before[0].account_orders_root,
-                empty_hash,
-                self.account_orders_tree_merkle_proof[2 + i],
-                path,
-            )
-        })
+        selected_hash
     }
 
     /// Verifies asset indices
@@ -2730,12 +2388,6 @@ impl TxTarget {
             .verify(builder, tx_type, tx_state);
         self.l2_update_market_config_tx_target
             .verify(builder, tx_type, tx_state);
-        self.l2_approve_integrator_tx_target
-            .verify(builder, tx_type, tx_state);
-        self.l2_update_account_asset_config_tx_target
-            .verify(builder, tx_type, tx_state);
-        self.l2_update_asset_config_tx_target
-            .verify(builder, tx_type, tx_state);
 
         /*************************/
         /* Internal Transactions */
@@ -2755,10 +2407,6 @@ impl TxTarget {
         self.internal_create_order_tx_target
             .verify(builder, tx_type, tx_state);
         self.internal_pending_unlock_tx_target
-            .verify(builder, tx_type, tx_state);
-        self.internal_transfer_tx_target
-            .verify(builder, tx_type, tx_state);
-        self.internal_liquidate_spot_tx_target
             .verify(builder, tx_type, tx_state);
     }
 
@@ -2930,12 +2578,6 @@ impl TxTarget {
         self.l2_strategy_transfer_tx_target.apply(builder, tx_state);
         self.l2_update_market_config_tx_target
             .apply(builder, tx_state);
-        self.l2_approve_integrator_tx_target
-            .apply(builder, tx_state);
-        self.l2_update_account_asset_config_tx_target
-            .apply(builder, tx_state);
-        self.l2_update_asset_config_tx_target
-            .apply(builder, tx_state);
 
         /*************************/
         /* Internal Transactions */
@@ -2954,14 +2596,27 @@ impl TxTarget {
             .apply(builder, tx_state);
         self.internal_pending_unlock_tx_target
             .apply(builder, tx_state);
-        self.internal_transfer_tx_target.apply(builder, tx_state);
-        self.internal_liquidate_spot_tx_target
-            .apply(builder, tx_state);
 
         // Increase ApiKey Nonce for all Layer2 transactions
-        let next_nonce = builder.add_one(self.nonce);
-        tx_state.api_key.nonce =
-            builder.select(tx_type.is_layer2, next_nonce, tx_state.api_key.nonce);
+        tx_state.api_key.nonce = builder.add(tx_state.api_key.nonce, tx_type.is_layer2.target);
+    }
+
+    fn get_assets(
+        &self,
+        builder: &mut Builder,
+        all_assets: &[AssetTarget; ASSET_LIST_SIZE],
+    ) -> [AssetTarget; NB_ASSETS_PER_TX] {
+        core::array::from_fn(|i| {
+            // random_access_assets(builder, self.asset_indices[i], all_assets.to_vec())
+            let mut asset = all_assets[0].clone();
+            for j in MIN_ASSET_INDEX..=MAX_ASSET_INDEX {
+                let asset_index_target = builder.constant_u64(j);
+                let is_current_asset = builder.is_equal(asset_index_target, self.asset_indices[i]);
+                asset =
+                    select_asset_target(builder, is_current_asset, &all_assets[j as usize], &asset);
+            }
+            asset
+        })
     }
 
     fn get_market_details_with_random_access(
@@ -3010,19 +2665,12 @@ impl TxTarget {
         all_assets: &[AssetTarget; ASSET_LIST_SIZE],
         old_assets: &[AssetTarget; NB_ASSETS_PER_TX],
         new_assets: &[AssetTarget; NB_ASSETS_PER_TX],
-        all_margined_assets: &[MarginedAssetTarget; MARGINED_ASSET_LIST_SIZE],
-        margin_indices: &[Target; NB_ASSETS_PER_TX],
-        old_margined_assets: &[MarginedAssetTarget; NB_ASSETS_PER_TX],
-        new_margined_assets: &[MarginedAssetTarget; NB_ASSETS_PER_TX],
-    ) -> (
-        [AssetTarget; ASSET_LIST_SIZE],
-        [MarginedAssetTarget; MARGINED_ASSET_LIST_SIZE],
-    ) {
+    ) -> [AssetTarget; ASSET_LIST_SIZE] {
         let (diff0, diff1) = (
             diff_assets(builder, &new_assets[0], &old_assets[0]),
             diff_assets(builder, &new_assets[1], &old_assets[1]),
         );
-        let new_all_assets: [AssetTarget; ASSET_LIST_SIZE] = (0..ASSET_LIST_SIZE as u64)
+        (0..ASSET_LIST_SIZE as u64)
             .map(|asset_index| {
                 let mut asset = all_assets[asset_index as usize].clone();
                 if !(MIN_ASSET_INDEX..=MAX_ASSET_INDEX).contains(&asset_index) {
@@ -3042,43 +2690,7 @@ impl TxTarget {
             })
             .collect::<Vec<_>>()
             .try_into()
-            .unwrap();
-
-        let diff_margined_asset_0 =
-            diff_margined_assets(builder, &new_margined_assets[0], &old_margined_assets[0]);
-        let diff_margined_asset_1 =
-            diff_margined_assets(builder, &new_margined_assets[1], &old_margined_assets[1]);
-
-        let new_all_margined_assets: [MarginedAssetTarget; MARGINED_ASSET_LIST_SIZE] = (0
-            ..MARGINED_ASSET_LIST_SIZE as u64)
-            .map(|asset_index| {
-                let mut margined_asset = all_margined_assets[asset_index as usize].clone();
-
-                let margin_index_target = builder.constant_u64(asset_index);
-
-                for i in 0..NB_ASSETS_PER_TX {
-                    let is_current_asset = builder.is_equal(margin_index_target, margin_indices[i]);
-                    let diff = if i == 0 {
-                        &diff_margined_asset_0
-                    } else {
-                        &diff_margined_asset_1
-                    };
-
-                    margined_asset = apply_diff_margined_assets(
-                        builder,
-                        is_current_asset,
-                        diff,
-                        &margined_asset,
-                    );
-                }
-
-                margined_asset
-            })
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap();
-
-        (new_all_assets, new_all_margined_assets)
+            .unwrap()
     }
 
     fn update_market_details(
@@ -3302,18 +2914,6 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
             &a.l2_update_market_config_tx_target.inner,
             &b.l2_update_market_config_tx,
         )?;
-        self.set_l2_approve_integrator_tx_target(
-            &a.l2_approve_integrator_tx_target.inner,
-            &b.l2_approve_integrator_tx,
-        )?;
-        self.set_l2_update_account_asset_config_tx_target(
-            &a.l2_update_account_asset_config_tx_target.inner,
-            &b.l2_update_account_asset_config_tx,
-        )?;
-        self.set_l2_update_asset_config_tx_target(
-            &a.l2_update_asset_config_tx_target.inner,
-            &b.l2_update_asset_config_tx,
-        )?;
 
         /*************************/
         /* Internal Transactions */
@@ -3349,14 +2949,6 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
         self.set_internal_pending_unlock_tx_target(
             &a.internal_pending_unlock_tx_target.inner,
             &b.internal_pending_unlock_tx,
-        )?;
-        self.set_internal_transfer_tx_target(
-            &a.internal_transfer_tx_target.inner,
-            &b.internal_transfer_tx,
-        )?;
-        self.set_internal_liquidate_spot_tx_target(
-            &a.internal_liquidate_spot_tx_target.inner,
-            &b.internal_liquidate_spot_tx,
         )?;
 
         /***********************/
@@ -3462,12 +3054,18 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
             )?;
         }
         for i in 0..ACCOUNT_ORDERS_MERKLE_LEVELS {
-            for j in 0..NB_ACCOUNT_ORDERS_PATHS_PER_TX {
-                self.set_hash_target(
-                    a.account_orders_tree_merkle_proof[j][i],
-                    b.account_orders_tree_merkle_proof[j][i],
-                )?;
-            }
+            self.set_hash_target(
+                a.account_orders_tree_merkle_proof[0][i],
+                b.account_orders_tree_merkle_proof[0][i],
+            )?;
+            self.set_hash_target(
+                a.account_orders_tree_merkle_proof[1][i],
+                b.account_orders_tree_merkle_proof[1][i],
+            )?;
+            self.set_hash_target(
+                a.account_orders_tree_merkle_proof[2][i],
+                b.account_orders_tree_merkle_proof[2][i],
+            )?;
         }
         for i in 0..NB_ACCOUNTS_PER_TX {
             for j in 0..NB_ASSETS_PER_TX {
@@ -3514,8 +3112,6 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
                 &b.impact_bid_order_book_tree_path[i],
             )?;
         }
-
-        self.set_attributes_tx_target(&a.attributes, &b.attributes)?;
 
         Ok(())
     }

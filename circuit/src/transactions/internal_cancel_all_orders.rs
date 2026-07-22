@@ -33,11 +33,11 @@ pub struct InternalCancelAllOrdersTxTarget {
     pub market_index: Target,  // 8 bits, perps only
 
     // helpers
-    is_liquidation: BoolTarget,
-    is_dms: BoolTarget,
+    pub is_liquidation: BoolTarget,
+    pub is_dms: BoolTarget,
 
     // outputs
-    success: BoolTarget,
+    pub success: BoolTarget,
 }
 
 impl InternalCancelAllOrdersTxTarget {
@@ -89,10 +89,10 @@ impl Verify for InternalCancelAllOrdersTxTarget {
             execute_transaction,
         );
 
-        let is_in_liquidation = tx_state.risk_infos[OWNER_ACCOUNT_ID]
+        let is_not_in_liquidation = tx_state.risk_infos[OWNER_ACCOUNT_ID]
             .current_risk_parameters
-            .is_in_liquidation(builder);
-        self.is_liquidation = builder.and(is_enabled, is_in_liquidation);
+            .is_not_in_liquidation(builder);
+        self.is_liquidation = builder.and_not(is_enabled, is_not_in_liquidation);
         let is_dms = tx_state.accounts[OWNER_ACCOUNT_ID]
             .should_dms_be_triggered(builder, tx_state.block_timestamp);
         self.is_dms = builder.and(is_enabled, is_dms);
@@ -118,9 +118,15 @@ impl Apply for InternalCancelAllOrdersTxTarget {
     fn apply(&mut self, builder: &mut Builder, state: &mut TxState) -> BoolTarget {
         apply_immediate_cancel_all(builder, self.is_dms, state, self.account_index);
 
-        let is_position_isolated = state.positions[OWNER_ACCOUNT_ID].is_isolated_unsafe();
+        let isolated_margin_mode = builder.constant_usize(ISOLATED_MARGIN);
+        let is_position_isolated = builder.is_equal(
+            state.positions[OWNER_ACCOUNT_ID].margin_mode,
+            isolated_margin_mode,
+        );
+        let is_position_cross = builder.not(is_position_isolated);
+
         let is_liquidation_and_isolated = builder.and(self.is_liquidation, is_position_isolated);
-        let is_liquidation_and_cross = builder.and_not(self.is_liquidation, is_position_isolated);
+        let is_liquidation_and_cross = builder.and(self.is_liquidation, is_position_cross);
 
         apply_isolated_cancel_all(
             builder,

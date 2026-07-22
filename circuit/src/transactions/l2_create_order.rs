@@ -7,19 +7,21 @@ use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::iop::witness::Witness;
 use serde::Deserialize;
 
+use crate::bigint::biguint::CircuitBuilderBiguint;
+use crate::bigint::comparison::CircuitBuilderBiguintSubtractiveComparison;
 use crate::bool_utils::CircuitBuilderBoolUtils;
 use crate::comparison::CircuitBuilderSubtractiveComparison;
 use crate::eddsa::gadgets::base_field::QuinticExtensionTarget;
 use crate::eddsa::schnorr::hash_to_quintic_extension_circuit;
+use crate::hash_utils::CircuitBuilderHashUtils;
+use crate::liquidation::get_available_asset_balance_const;
 use crate::matching_engine::{
-    get_next_order_nonce, increment_order_count_in_place, is_not_valid_reduce_only_direction,
+    get_locked_amount_and_ask_asset_index, get_next_order_nonce, increment_order_count_in_place,
+    is_not_valid_reduce_only_direction,
 };
-use crate::tx_attributes::{
-    ATTR_INTEGRATOR_FEE_COLLECTOR_INDEX, ATTR_INTEGRATOR_MAKER_FEE, ATTR_INTEGRATOR_TAKER_FEE,
-    ATTR_SELF_TRADE_BEHAVIOR_MODE, ATTR_SELF_TRADE_EQUALITY_MODE, TxAttributesTarget,
-};
+use crate::merkle_helpers::{account_client_order_index_to_merkle_path, try_verify_merkle_proof};
 use crate::tx_interface::{Apply, TxHash, Verify};
-use crate::types::account_order::{AccountOrderTarget, OrderFlags, select_account_order_target};
+use crate::types::account_order::{AccountOrderTarget, select_account_order_target};
 use crate::types::account_order_type::AccountOrderTypes;
 use crate::types::config::{Builder, F};
 use crate::types::constants::*;
@@ -129,14 +131,25 @@ impl L2CreateOrderTxTarget {
         }
     }
 
-    fn get_in_progress_order_register(
+    fn is_client_order_index_unique(
         &self,
         builder: &mut Builder,
-        tx_attributes: &TxAttributesTarget,
-    ) -> BaseRegisterInfoTarget {
-        let (generic_field_1, generic_field_2, generic_field_3) =
-            tx_attributes.get_register_generic_fields(builder);
+        tx_state: &TxState,
+        client_order_index: Target,
+    ) -> BoolTarget {
+        let empty_hash = builder.zero_hash_out();
+        let account_orders_merkle_path_for_cloid =
+            account_client_order_index_to_merkle_path(builder, client_order_index);
+        try_verify_merkle_proof(
+            builder,
+            &tx_state.accounts[0].account_orders_root,
+            empty_hash,
+            tx_state.taker_client_order_proof,
+            account_orders_merkle_path_for_cloid,
+        )
+    }
 
+    fn get_in_progress_order_register(&self, builder: &mut Builder) -> BaseRegisterInfoTarget {
         BaseRegisterInfoTarget {
             instruction_type: builder.constant(F::from_canonical_u8(INSERT_ORDER)),
 
@@ -163,18 +176,10 @@ impl L2CreateOrderTxTarget {
             pending_to_trigger_order_index0: builder.zero(),
             pending_to_trigger_order_index1: builder.zero(),
             pending_to_cancel_order_index0: builder.zero(),
-
-            generic_field_1,
-            generic_field_2,
-            generic_field_3,
         }
     }
 
-    fn get_pending_account_order(
-        &self,
-        builder: &mut Builder,
-        tx_attributes: &TxAttributesTarget,
-    ) -> AccountOrderTarget {
+    fn get_pending_account_order(&self, builder: &mut Builder) -> AccountOrderTarget {
         AccountOrderTarget {
             index_0: self.next_order_index,
             index_1: self.client_order_index,
@@ -194,15 +199,6 @@ impl L2CreateOrderTxTarget {
             reduce_only: self.reduce_only,
             trigger_price: self.trigger_price,
             expiry: self.order_expiry,
-
-            integrator_fee_collector_index: tx_attributes.get(ATTR_INTEGRATOR_FEE_COLLECTOR_INDEX),
-            integrator_taker_fee: tx_attributes.get(ATTR_INTEGRATOR_TAKER_FEE),
-            integrator_maker_fee: tx_attributes.get(ATTR_INTEGRATOR_MAKER_FEE),
-            order_flags: OrderFlags {
-                self_trade_behavior_mode: tx_attributes.get(ATTR_SELF_TRADE_BEHAVIOR_MODE),
-                self_trade_equality_mode: tx_attributes.get(ATTR_SELF_TRADE_EQUALITY_MODE),
-            }
-            .to_target(builder),
 
             trigger_status: self.trigger_status,
             to_trigger_order_index0: builder.zero(),
@@ -306,12 +302,6 @@ impl Verify for L2CreateOrderTxTarget {
             spot_flag,
             tx_state.market.quote_asset_id,
             tx_state.asset_indices[QUOTE_ASSET_ID],
-        );
-        let perps_flag = builder.and(is_enabled, self.is_perps_market);
-        builder.conditional_assert_eq_constant(
-            perps_flag,
-            tx_state.asset_indices[TX_ASSET_ID],
-            USDC_ASSET_INDEX,
         );
 
         // TimeInForce - Either IOC (0), GTT (1) or POST_ONLY (2)
@@ -450,8 +440,11 @@ impl Verify for L2CreateOrderTxTarget {
             self.trigger_status,
         );
 
-        // Client order id uniqueness check
-        self.success = builder.and(self.success, tx_state.is_cloid_unique[0]);
+        let is_unique_cloid =
+            self.is_client_order_index_unique(builder, tx_state, self.client_order_index);
+        let is_zero_cloid = builder.is_zero(self.client_order_index);
+        let cloid_check = builder.or(is_unique_cloid, is_zero_cloid);
+        self.success = builder.and(self.success, cloid_check);
 
         // Verify order base amounts
         self.calculated_base_amount = self.base_amount;
@@ -514,6 +507,50 @@ impl Verify for L2CreateOrderTxTarget {
             );
             let is_insurance_or_public_pool = builder.or(is_insurance_fund, is_public_pool);
             builder.conditional_assert_false(flag, is_insurance_or_public_pool);
+
+            // Make sure user has enough available balance to lock for limit orders
+            let (amount_to_lock, ask_asset_index) = get_locked_amount_and_ask_asset_index(
+                builder,
+                flag,
+                &tx_state.market,
+                self.calculated_base_amount,
+                self.price,
+                self.is_ask,
+            );
+            let is_base_asset = builder.is_equal(
+                tx_state.account_assets[OWNER_ACCOUNT_ID][BASE_ASSET_ID].index_0,
+                ask_asset_index,
+            );
+
+            let base_asset_available_balance = get_available_asset_balance_const(
+                builder,
+                PRODUCT_TYPE_SPOT,
+                &tx_state.accounts[OWNER_ACCOUNT_ID],
+                &tx_state.account_assets[OWNER_ACCOUNT_ID][BASE_ASSET_ID],
+                tx_state.is_asset_used_as_margin[OWNER_ACCOUNT_ID][BASE_ASSET_ID],
+                &tx_state.risk_infos[OWNER_ACCOUNT_ID].cross_risk_parameters,
+            );
+            let quote_asset_available_balance = get_available_asset_balance_const(
+                builder,
+                PRODUCT_TYPE_SPOT,
+                &tx_state.accounts[OWNER_ACCOUNT_ID],
+                &tx_state.account_assets[OWNER_ACCOUNT_ID][QUOTE_ASSET_ID],
+                tx_state.is_asset_used_as_margin[OWNER_ACCOUNT_ID][QUOTE_ASSET_ID],
+                &tx_state.risk_infos[OWNER_ACCOUNT_ID].cross_risk_parameters,
+            );
+            let available_balance = builder.select_biguint(
+                is_base_asset,
+                &base_asset_available_balance,
+                &quote_asset_available_balance,
+            );
+            let spot_balance_check_inv =
+                builder.multi_or(&[is_ioc, order_type_target.is_twap_order]);
+            let spot_balance_check_flag = builder.and_not(flag, spot_balance_check_inv);
+            builder.conditional_assert_lte_biguint(
+                spot_balance_check_flag,
+                &amount_to_lock,
+                &available_balance,
+            );
         }
 
         // Perps validations
@@ -586,7 +623,7 @@ impl Apply for L2CreateOrderTxTarget {
         {
             let should_update_for_pending_order = builder.and(self.success, self.is_pending_order);
             // Set new account order info
-            let new_account_order = self.get_pending_account_order(builder, &tx_state.attributes);
+            let new_account_order = self.get_pending_account_order(builder);
             tx_state.account_order = select_account_order_target(
                 builder,
                 should_update_for_pending_order,
@@ -605,9 +642,9 @@ impl Apply for L2CreateOrderTxTarget {
         // In progress order - call matching engine
         {
             // Set new register
-            let new_register = self.get_in_progress_order_register(builder, &tx_state.attributes);
+            let new_register = self.get_in_progress_order_register(builder);
             let in_progress_flag = builder.and_not(self.success, self.is_pending_order);
-            tx_state.put_to_instruction_stack_unsafe(builder, in_progress_flag, &new_register, 0);
+            tx_state.insert_to_instruction_stack(builder, in_progress_flag, &new_register);
 
             // Update matching engine flag if cloid not enabled and order is not pending
             tx_state.matching_engine_flag =

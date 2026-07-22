@@ -11,3 +11,6 @@ target/
 score.json
 score.json.sha256
 benchmark-results/
+
+# Keep repository tracing hooks visible despite common global excludes.
+!/.claude/settings.local.json

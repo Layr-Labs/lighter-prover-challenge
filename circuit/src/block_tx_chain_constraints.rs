@@ -27,12 +27,10 @@ use crate::builder::custom::cyclic_base_proof;
 use crate::byte::split_gate::ByteDecompositionGate;
 use crate::hash_utils::CircuitBuilderHashUtils;
 use crate::poseidon2::Poseidon2Gate;
-use crate::types::approve_integrator::ApproveIntegratorMessageTarget;
 use crate::types::asset::all_assets_hash;
 use crate::types::change_pub_key::ChangePubKeyMessageTarget;
 use crate::types::config::{Builder, C, CIRCUIT_CONFIG, D, F};
 use crate::types::constants::ON_CHAIN_OPERATIONS_PUB_DATA_BYTES_SIZE;
-use crate::types::margined_asset::all_margined_assets_hash;
 use crate::types::market_details::{
     PublicMarketDetailsTarget, all_market_details_hash, all_public_market_details_hash,
 };
@@ -235,9 +233,6 @@ impl BlockTxChainCircuit {
         block
             .transfer_message
             .conditional_assert_empty(&mut self.builder, is_first_recursion);
-        block
-            .approve_integrator_message
-            .conditional_assert_empty(&mut self.builder, is_first_recursion);
 
         block
             .on_chain_operations_pub_data
@@ -260,8 +255,6 @@ impl BlockTxChainCircuit {
         let system_config_hash = current_tx.old_system_config.hash(&mut self.builder);
         let register_stack_hash = current_tx.register_stack_before.hash(&mut self.builder);
         let all_assets_hash = all_assets_hash(&mut self.builder, &current_tx.all_assets_before);
-        let all_margined_assets_hash =
-            all_margined_assets_hash(&mut self.builder, &current_tx.all_margined_assets_before);
         let all_market_details_hash =
             all_market_details_hash(&mut self.builder, &current_tx.all_market_details_before);
         let all_public_market_details_hash = all_public_market_details_hash(
@@ -273,7 +266,6 @@ impl BlockTxChainCircuit {
             current_tx.old_account_tree_root,
             current_tx.old_market_tree_root,
             all_assets_hash,
-            all_margined_assets_hash,
             all_market_details_hash,
             state_metadata_hash,
             system_config_hash,
@@ -333,8 +325,6 @@ impl Circuit<C, F, D> for BlockTxChainCircuit {
         let system_config_hash = current_tx.new_system_config.hash(&mut circuit.builder);
         let register_stack_hash = current_tx.register_stack_after.hash(&mut circuit.builder);
         let all_assets_hash = all_assets_hash(&mut circuit.builder, &current_tx.all_assets_after);
-        let all_margined_assets_hash =
-            all_margined_assets_hash(&mut circuit.builder, &current_tx.all_margined_assets_after);
         let all_market_details_hash =
             all_market_details_hash(&mut circuit.builder, &current_tx.all_market_details_after);
         let all_public_market_details_hash = all_public_market_details_hash(
@@ -347,7 +337,6 @@ impl Circuit<C, F, D> for BlockTxChainCircuit {
             current_tx.new_account_tree_root,
             current_tx.new_market_tree_root,
             all_assets_hash,
-            all_margined_assets_hash,
             all_market_details_hash,
             state_metadata_hash,
             system_config_hash,
@@ -387,21 +376,6 @@ impl Circuit<C, F, D> for BlockTxChainCircuit {
             is_transfer_message_exists,
             &current_tx.transfer_message,
             &block.transfer_message,
-        );
-
-        // Treasury can't call L2 approve_integrator, so if account index is zero, then approve_integrator_message is empty
-        let is_approve_integrator_message_exists = circuit
-            .builder
-            .is_not_zero(current_tx.approve_integrator_message.account_index);
-        circuit.builder.conditional_assert_zero(
-            is_approve_integrator_message_exists,
-            block.approve_integrator_message.account_index,
-        );
-        let approve_integrator_message = ApproveIntegratorMessageTarget::select(
-            &mut circuit.builder,
-            is_approve_integrator_message_exists,
-            &current_tx.approve_integrator_message,
-            &block.approve_integrator_message,
         );
 
         let on_chain_operation_exists = circuit
@@ -459,7 +433,6 @@ impl Circuit<C, F, D> for BlockTxChainCircuit {
 
             change_pub_key_message,
             transfer_message,
-            approve_integrator_message,
 
             on_chain_operations_count: circuit.builder.add(
                 block.on_chain_operations_count,

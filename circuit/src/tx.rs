@@ -18,9 +18,7 @@ use crate::transactions::internal_create_order::InternalCreateOrderTx;
 use crate::transactions::internal_deleverage::InternalDeleverageTx;
 use crate::transactions::internal_exit_position::InternalExitPositionTx;
 use crate::transactions::internal_liquidate_position::InternalLiquidatePositionTx;
-use crate::transactions::internal_liquidate_spot::InternalLiquidateSpotTx;
 use crate::transactions::internal_pending_unlock::InternalPendingUnlockTx;
-use crate::transactions::internal_transfer::InternalTransferTx;
 use crate::transactions::l1_burn_shares::L1BurnSharesTx;
 use crate::transactions::l1_cancel_all_orders::L1CancelAllOrdersTx;
 use crate::transactions::l1_change_pubkey::L1ChangePubKeyTx;
@@ -32,7 +30,6 @@ use crate::transactions::l1_set_system_config::L1SetSystemConfigTx;
 use crate::transactions::l1_update_asset::L1UpdateAssetTx;
 use crate::transactions::l1_update_market::L1UpdateMarketTx;
 use crate::transactions::l1_withdraw::L1WithdrawTx;
-use crate::transactions::l2_approve_integrator::L2ApproveIntegratorTx;
 use crate::transactions::l2_burn_shares::L2BurnSharesTx;
 use crate::transactions::l2_cancel_all_orders::L2CancelAllOrdersTx;
 use crate::transactions::l2_cancel_order::L2CancelOrderTx;
@@ -49,15 +46,12 @@ use crate::transactions::l2_stake_assets::L2StakeAssetsTx;
 use crate::transactions::l2_strategy_transfer::L2StrategyTransferTx;
 use crate::transactions::l2_transfer::L2TransferTx;
 use crate::transactions::l2_unstake_assets::L2UnstakeAssetsTx;
-use crate::transactions::l2_update_account_asset_config::L2UpdateAccountAssetConfigTx;
 use crate::transactions::l2_update_account_config::L2UpdateAccountConfigTx;
-use crate::transactions::l2_update_asset_config::L2UpdateAssetConfigTx;
 use crate::transactions::l2_update_leverage::L2UpdateLeverageTx;
 use crate::transactions::l2_update_margin::L2UpdateMarginTx;
 use crate::transactions::l2_update_market_config::L2UpdateMarketConfigTx;
 use crate::transactions::l2_update_public_pool::L2UpdatePublicPoolTx;
 use crate::transactions::l2_withdraw::L2WithdrawTx;
-use crate::tx_attributes::TxAttributes;
 use crate::types::account::Account;
 use crate::types::account_asset::AccountAsset;
 use crate::types::account_delta::AccountDelta;
@@ -71,7 +65,7 @@ use crate::types::order_book_node::OrderBookNode;
 
 #[serde_as]
 #[derive(Clone, Debug, Deserialize)]
-#[serde(bound = "")]
+#[serde(bound = "")] 
 pub struct Tx<F>
 where
     F: Field + Extendable<5> + RichField,
@@ -211,25 +205,9 @@ where
     #[serde(default)]
     pub l2_update_account_config_tx: L2UpdateAccountConfigTx,
 
-    #[serde(rename = "2ai")]
-    #[serde(default)]
-    pub l2_approve_integrator_tx: L2ApproveIntegratorTx,
-
-    #[serde(rename = "2uaac")]
-    #[serde(default)]
-    pub l2_update_account_asset_config_tx: L2UpdateAccountAssetConfigTx,
-
-    #[serde(rename = "2uasc")]
-    #[serde(default)]
-    pub l2_update_asset_config_tx: L2UpdateAssetConfigTx,
-
     #[serde(rename = "Ic")]
     #[serde(default)]
     pub internal_claim_order_tx: InternalClaimOrderTx,
-
-    #[serde(rename = "It")]
-    #[serde(default)]
-    pub internal_transfer_tx: InternalTransferTx,
 
     #[serde(rename = "Ico")]
     #[serde(default)]
@@ -258,10 +236,6 @@ where
     #[serde(rename = "Icr")]
     #[serde(default)]
     pub internal_create_order_tx: InternalCreateOrderTx,
-
-    #[serde(rename = "Ils")]
-    #[serde(default)]
-    pub internal_liquidate_spot_tx: InternalLiquidateSpotTx,
 
     #[serde(rename = "nonce", default)]
     pub nonce: i64,
@@ -316,7 +290,6 @@ where
     pub order_before: Order,
 
     #[serde(rename = "aab")]
-    #[serde(deserialize_with = "deserializers::account_assets_before")]
     #[serde(default)]
     pub account_assets_before: [[AccountAsset; NB_ASSETS_PER_TX]; NB_ACCOUNTS_PER_TX],
 
@@ -395,13 +368,6 @@ where
     #[serde(rename = "iaop")]
     #[serde_as(as = "[_; ORDER_BOOK_MERKLE_LEVELS]")]
     pub impact_bid_order_book_tree_path: [OrderBookNode<F>; ORDER_BOOK_MERKLE_LEVELS],
-
-    /******************/
-    /*  TX ATTRIBUTES */
-    /******************/
-    #[serde(rename = "l2txa", default)]
-    #[serde(deserialize_with = "deserializers::tx_attributes")]
-    pub attributes: TxAttributes,
 }
 
 impl Tx<F> {

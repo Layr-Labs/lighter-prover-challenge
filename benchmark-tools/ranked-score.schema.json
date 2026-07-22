@@ -20,6 +20,7 @@
         "verifier_sha256",
         "protocol_version",
         "fixture_id",
+        "fixture_sha256",
         "verified_proofs",
         "expected_proofs"
       ],
@@ -34,6 +35,7 @@
         "verifier_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "protocol_version": { "const": "lighter-proof-v1" },
         "fixture_id": { "type": "string", "minLength": 1 },
+        "fixture_sha256": { "const": "d014c969a88bcb0f1673acc410c9e75d1cac53d575463514855050226759c23f" },
         "verified_proofs": { "const": 2 },
         "expected_proofs": { "const": 2 }
       }

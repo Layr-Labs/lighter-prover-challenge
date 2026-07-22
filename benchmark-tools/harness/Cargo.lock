@@ -200,7 +200,7 @@ dependencies = [
 [[package]]
 name = "circuit"
 version = "0.0.1"
-source = "git+https://github.com/elliottech/lighter-prover.git?rev=8d7d809f925c479e1f18761566d9b94a7279e238#8d7d809f925c479e1f18761566d9b94a7279e238"
+source = "git+https://github.com/elliottech/lighter-prover.git?rev=5bbb307dfb26276c48054f2c3ea9dcfe80d3678a#5bbb307dfb26276c48054f2c3ea9dcfe80d3678a"
 dependencies = [
  "anyhow",
  "bincode",

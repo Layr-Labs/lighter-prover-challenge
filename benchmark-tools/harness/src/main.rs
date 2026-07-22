@@ -29,8 +29,10 @@ const CHAIN_ID: u32 = 304;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_PROOF_BYTES: u64 = 256 * 1024 * 1024;
-const VERIFIER_SOURCE_REV: &str = "8d7d809f925c479e1f18761566d9b94a7279e238";
+const VERIFIER_SOURCE_REV: &str = "5bbb307dfb26276c48054f2c3ea9dcfe80d3678a";
 const PROTOCOL_VERSION: &str = "lighter-proof-v1";
+const EXPECTED_FIXTURE_SHA256: &str =
+    "d014c969a88bcb0f1673acc410c9e75d1cac53d575463514855050226759c23f";
 
 type Proof = ProofWithPublicInputs<F, C, D>;
 
@@ -104,6 +106,7 @@ struct ScoreMetrics {
     verifier_sha256: String,
     protocol_version: &'static str,
     fixture_id: String,
+    fixture_sha256: String,
     verified_proofs: usize,
     expected_proofs: usize,
 }
@@ -116,8 +119,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = fs::remove_file(&config.score);
 
-    let json = fs::read_to_string(&config.fixture)?;
-    let block: Block<F> = serde_json::from_str(&json)?;
+    let (fixture, fixture_sha256) = read_verified_fixture(&config.fixture)?;
+    let block: Block<F> = serde_json::from_slice(&fixture)?;
     if block.txs.len() != config.transactions {
         return Err(format!(
             "fixture contains {} transactions; expected {}",
@@ -174,6 +177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             verifier_sha256,
             protocol_version: PROTOCOL_VERSION,
             fixture_id,
+            fixture_sha256,
             verified_proofs: 2,
             expected_proofs: 2,
         },
@@ -310,15 +314,86 @@ fn prepare_scratch(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn executable_sha256() -> Result<String, Box<dyn std::error::Error>> {
-    let mut file = File::open(env::current_exe()?)?;
+    Ok(file_sha256(&env::current_exe()?)?)
+}
+
+fn read_verified_fixture(path: &Path) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
+    let bytes = fs::read(path)?;
+    let digest = sha256(&bytes[..])?;
+    if digest != EXPECTED_FIXTURE_SHA256 {
+        return Err(format!(
+            "fixture SHA-256 mismatch: expected {EXPECTED_FIXTURE_SHA256}, got {digest}"
+        )
+        .into());
+    }
+    Ok((bytes, digest))
+}
+
+fn file_sha256(path: &Path) -> Result<String, std::io::Error> {
+    sha256(File::open(path)?)
+}
+
+fn sha256(mut reader: impl Read) -> Result<String, std::io::Error> {
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protected_fixture_deserializes_with_500_transactions() {
+        let transaction_count = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/bench.json");
+                let json = fs::read_to_string(fixture).expect("protected fixture must be readable");
+                let block: Block<F> =
+                    serde_json::from_str(&json).expect("protected fixture must deserialize");
+
+                block.txs.len()
+            })
+            .expect("fixture deserialization thread must start")
+            .join()
+            .expect("fixture deserialization thread must complete");
+
+        assert_eq!(transaction_count, 500);
+    }
+
+    #[test]
+    fn approved_fixture_passes_sha256_validation() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/bench.json");
+
+        let (_, digest) =
+            read_verified_fixture(&fixture).expect("approved fixture must pass SHA-256 validation");
+
+        assert_eq!(digest, EXPECTED_FIXTURE_SHA256);
+    }
+
+    #[test]
+    fn mismatching_fixture_is_rejected() {
+        let fixture = env::temp_dir().join(format!(
+            "lighter-harness-mismatching-fixture-{}.json",
+            std::process::id()
+        ));
+        fs::write(&fixture, b"{}\n").expect("temporary fixture must be writable");
+
+        let result = read_verified_fixture(&fixture);
+        fs::remove_file(&fixture).expect("temporary fixture must be removable");
+
+        let error = result.expect_err("mismatching fixture must be rejected");
+        assert!(
+            error.to_string().contains("fixture SHA-256 mismatch"),
+            "unexpected error: {error}"
+        );
+    }
 }

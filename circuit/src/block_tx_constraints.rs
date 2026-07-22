@@ -19,13 +19,13 @@ use plonky2::util::timing::TimingTree;
 use crate::block_tx::BlockTx;
 use crate::bool_utils::CircuitBuilderBoolUtils;
 use crate::tx_constraints::{TxTarget, TxTargetWitness};
-use crate::types::approve_integrator::ApproveIntegratorMessageTarget;
 use crate::types::asset::{AssetTarget, AssetTargetWitness, connect_assets};
 use crate::types::change_pub_key::ChangePubKeyMessageTarget;
 use crate::types::config::{Builder, C, D, F};
-use crate::types::constants::*;
-use crate::types::margined_asset::{
-    MarginedAssetTarget, MarginedAssetTargetWitness, connect_margined_assets,
+use crate::types::constants::{
+    ASSET_LIST_SIZE, MAX_PRIORITY_OPERATIONS_PUB_DATA_BYTES_PER_TX,
+    ON_CHAIN_OPERATIONS_PUB_DATA_BYTES_SIZE, OWNER_ACCOUNT_ID, POSITION_LIST_SIZE, TIMESTAMP_BITS,
+    TX_TYPE_L2_CHANGE_PUB_KEY, TX_TYPE_L2_TRANSFER,
 };
 use crate::types::market_details::{
     MarketDetailsTarget, MarketDetailsWitness, connect_market_details,
@@ -34,7 +34,6 @@ use crate::types::register::{RegisterInfoTargetWitness, RegisterStackTarget};
 use crate::types::system_config::{SystemConfigTarget, SystemConfigTargetWitness};
 use crate::types::transfer::TransferMessageTarget;
 use crate::uint::u8::{CircuitBuilderU8, U8Target};
-use crate::utils::CircuitBuilderUtils;
 
 pub trait Circuit<
     C: GenericConfig<D, F = F>,
@@ -75,7 +74,6 @@ pub struct BlockTxTarget {
     pub old_system_config: SystemConfigTarget,
     pub register_stack_before: RegisterStackTarget,
     pub all_assets_before: [AssetTarget; ASSET_LIST_SIZE],
-    pub all_margined_assets_before: [MarginedAssetTarget; MARGINED_ASSET_LIST_SIZE],
     pub all_market_details_before: [MarketDetailsTarget; POSITION_LIST_SIZE],
 
     /**************************/
@@ -91,7 +89,6 @@ pub struct BlockTxTarget {
     pub new_system_config: SystemConfigTarget,
     pub register_stack_after: RegisterStackTarget,
     pub all_assets_after: [AssetTarget; ASSET_LIST_SIZE],
-    pub all_margined_assets_after: [MarginedAssetTarget; MARGINED_ASSET_LIST_SIZE],
     pub all_market_details_after: [MarketDetailsTarget; POSITION_LIST_SIZE],
 
     /**************************/
@@ -106,7 +103,6 @@ pub struct BlockTxTarget {
     /*******************************/
     pub change_pub_key_message: ChangePubKeyMessageTarget,
     pub transfer_message: TransferMessageTarget,
-    pub approve_integrator_message: ApproveIntegratorMessageTarget,
 
     // /*************************/
     // /*       PUB DATA        */
@@ -124,63 +120,6 @@ pub struct BlockTxTarget {
     pub txs: Vec<TxTarget>,
 }
 
-impl Default for BlockTxTarget {
-    fn default() -> Self {
-        Self {
-            created_at: Target::default(),
-
-            old_system_config: SystemConfigTarget::default(),
-            register_stack_before: RegisterStackTarget::default(),
-            all_assets_before: core::array::from_fn(|_| AssetTarget::default()),
-            all_margined_assets_before: core::array::from_fn(|_| MarginedAssetTarget::default()),
-            all_market_details_before: core::array::from_fn(|_| MarketDetailsTarget::default()),
-
-            old_account_tree_root: HashOutTarget {
-                elements: core::array::from_fn(|_| Target::default()),
-            },
-            old_account_pub_data_tree_root: HashOutTarget {
-                elements: core::array::from_fn(|_| Target::default()),
-            },
-            old_market_tree_root: HashOutTarget {
-                elements: core::array::from_fn(|_| Target::default()),
-            },
-
-            new_system_config: SystemConfigTarget::default(),
-            register_stack_after: RegisterStackTarget::default(),
-            all_assets_after: core::array::from_fn(|_| AssetTarget::default()),
-            all_margined_assets_after: core::array::from_fn(|_| MarginedAssetTarget::default()),
-            all_market_details_after: core::array::from_fn(|_| MarketDetailsTarget::default()),
-
-            new_account_tree_root: HashOutTarget {
-                elements: core::array::from_fn(|_| Target::default()),
-            },
-            new_account_pub_data_tree_root: HashOutTarget {
-                elements: core::array::from_fn(|_| Target::default()),
-            },
-            new_market_tree_root: HashOutTarget {
-                elements: core::array::from_fn(|_| Target::default()),
-            },
-
-            change_pub_key_message: ChangePubKeyMessageTarget::default(),
-            transfer_message: TransferMessageTarget::default(),
-            approve_integrator_message: ApproveIntegratorMessageTarget::default(),
-
-            old_account_delta_tree_root: HashOutTarget {
-                elements: core::array::from_fn(|_| Target::default()),
-            },
-            new_account_delta_tree_root: HashOutTarget {
-                elements: core::array::from_fn(|_| Target::default()),
-            },
-            priority_operations_count: Target::default(),
-            priority_operations_pub_data: core::array::from_fn(|_| U8Target::default()),
-            on_chain_operations_count: Target::default(),
-            on_chain_operations_pub_data: core::array::from_fn(|_| U8Target::default()),
-
-            txs: vec![],
-        }
-    }
-}
-
 impl Circuit<C, F, D> for BlockTxCircuit {
     fn define(config: CircuitConfig, tx_limit: usize, chain_id: u32) -> Self {
         let mut circuit = Self::new(config, tx_limit);
@@ -195,7 +134,6 @@ impl Circuit<C, F, D> for BlockTxCircuit {
             new_system_config,
             register_stack_after,
             all_assets_after,
-            all_margined_assets_after,
             all_market_details_after,
             account_tree_root_after,
             account_pub_data_tree_root_after,
@@ -212,7 +150,6 @@ impl Circuit<C, F, D> for BlockTxCircuit {
             &new_system_config,
             &register_stack_after,
             &all_assets_after,
-            &all_margined_assets_after,
             &all_market_details_after,
             on_chain_operations_count,
             &on_chain_operations_pub_data,
@@ -256,11 +193,6 @@ impl Circuit<C, F, D> for BlockTxCircuit {
             .zip_eq(block.all_assets_before.iter())
             .try_for_each(|(t, ai)| pw.set_asset_target(t, ai))?;
         target
-            .all_margined_assets_before
-            .iter()
-            .zip_eq(block.all_margined_assets_before.iter())
-            .try_for_each(|(t, mai)| pw.set_margined_asset_target(t, mai))?;
-        target
             .all_market_details_before
             .iter()
             .zip_eq(block.all_market_details_before.iter())
@@ -295,15 +227,11 @@ impl BlockTxCircuit {
         Self {
             target: BlockTxTarget {
                 created_at: builder.add_virtual_target(),
+
                 old_system_config: SystemConfigTarget::new(&mut builder),
                 register_stack_before: RegisterStackTarget::new(&mut builder),
                 all_assets_before: (0..ASSET_LIST_SIZE)
                     .map(|_| AssetTarget::new(&mut builder))
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .unwrap(),
-                all_margined_assets_before: (0..MARGINED_ASSET_LIST_SIZE)
-                    .map(|_| MarginedAssetTarget::new(&mut builder))
                     .collect::<Vec<_>>()
                     .try_into()
                     .unwrap(),
@@ -315,22 +243,13 @@ impl BlockTxCircuit {
 
                 old_account_tree_root: builder.add_virtual_hash(),
                 old_account_pub_data_tree_root: builder.add_virtual_hash(),
-                old_market_tree_root: builder.add_virtual_hash(),
                 old_account_delta_tree_root: builder.add_virtual_hash(),
+                old_market_tree_root: builder.add_virtual_hash(),
 
-                txs: (0..tx_limit).map(|_| TxTarget::new(&mut builder)).collect(),
-
-                // ..Default::default() //
-                // Comment out the following to avoid "generators weren't run"
                 new_system_config: SystemConfigTarget::new(&mut builder),
                 register_stack_after: RegisterStackTarget::new(&mut builder),
                 all_assets_after: (0..ASSET_LIST_SIZE)
                     .map(|_| AssetTarget::new(&mut builder))
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .unwrap(),
-                all_margined_assets_after: (0..MARGINED_ASSET_LIST_SIZE)
-                    .map(|_| MarginedAssetTarget::new(&mut builder))
                     .collect::<Vec<_>>()
                     .try_into()
                     .unwrap(),
@@ -347,7 +266,6 @@ impl BlockTxCircuit {
 
                 change_pub_key_message: ChangePubKeyMessageTarget::new(&mut builder),
                 transfer_message: TransferMessageTarget::new(&mut builder),
-                approve_integrator_message: ApproveIntegratorMessageTarget::new(&mut builder),
 
                 priority_operations_count: builder.add_virtual_target(),
                 priority_operations_pub_data: builder
@@ -360,6 +278,8 @@ impl BlockTxCircuit {
                     .add_virtual_u8_targets_unsafe(ON_CHAIN_OPERATIONS_PUB_DATA_BYTES_SIZE)
                     .try_into()
                     .unwrap(), // safe because it is connected to output of split_bytes which are range-checked
+
+                txs: (0..tx_limit).map(|_| TxTarget::new(&mut builder)).collect(),
             },
 
             builder,
@@ -377,15 +297,10 @@ impl BlockTxCircuit {
         self.builder
             .register_public_hashout(self.target.old_account_delta_tree_root);
 
+        // Old market details
         self.target.all_assets_before.iter().for_each(|asset| {
             asset.register_public_input(&mut self.builder);
         });
-        self.target
-            .all_margined_assets_before
-            .iter()
-            .for_each(|margined_asset| {
-                margined_asset.register_public_input(&mut self.builder);
-            });
         self.target
             .all_market_details_before
             .iter()
@@ -413,15 +328,10 @@ impl BlockTxCircuit {
         self.builder
             .register_public_hashout(self.target.new_account_delta_tree_root);
 
+        // New market details
         self.target.all_assets_after.iter().for_each(|asset| {
             asset.register_public_input(&mut self.builder);
         });
-        self.target
-            .all_margined_assets_after
-            .iter()
-            .for_each(|margined_asset| {
-                margined_asset.register_public_input(&mut self.builder);
-            });
         self.target
             .all_market_details_after
             .iter()
@@ -436,10 +346,6 @@ impl BlockTxCircuit {
         // Transfer message
         self.target
             .transfer_message
-            .register_public_input(&mut self.builder);
-        // Approve integrator message
-        self.target
-            .approve_integrator_message
             .register_public_input(&mut self.builder);
 
         // On chain ops pub data
@@ -485,7 +391,6 @@ impl BlockTxCircuit {
         SystemConfigTarget,                                        // new system config
         RegisterStackTarget,                                       // new register stack
         [AssetTarget; ASSET_LIST_SIZE],                            // new assets
-        [MarginedAssetTarget; MARGINED_ASSET_LIST_SIZE],           // new margined assets
         [MarketDetailsTarget; POSITION_LIST_SIZE],                 // new market details
         HashOutTarget,                                             // new account tree root
         HashOutTarget,                                             // new account pub data tree root
@@ -509,7 +414,6 @@ impl BlockTxCircuit {
         let mut current_system_config = self.target.old_system_config;
         let mut current_register_stack = self.target.register_stack_before;
         let mut current_all_assets = self.target.all_assets_before.clone();
-        let mut current_all_margined_assets = self.target.all_margined_assets_before.clone();
         let mut current_all_market_details = self.target.all_market_details_before.clone();
         let mut current_account_tree_root = self.target.old_account_tree_root;
         let mut current_account_pub_data_tree_root = self.target.old_account_pub_data_tree_root;
@@ -528,7 +432,6 @@ impl BlockTxCircuit {
                 new_system_config,
                 register_stack_after,
                 all_assets_after,
-                all_margined_assets_after,
                 all_market_details_after,
                 account_tree_root_after,
                 account_pub_data_tree_root_after,
@@ -542,7 +445,6 @@ impl BlockTxCircuit {
                 &current_system_config,
                 &current_register_stack,
                 &current_all_assets,
-                &current_all_margined_assets,
                 &current_all_market_details,
                 current_account_tree_root,
                 current_account_pub_data_tree_root,
@@ -553,7 +455,6 @@ impl BlockTxCircuit {
             current_system_config = new_system_config;
             current_register_stack = register_stack_after;
             current_all_assets = all_assets_after;
-            current_all_margined_assets = all_margined_assets_after;
             current_all_market_details = all_market_details_after;
             current_account_tree_root = account_tree_root_after;
             current_account_pub_data_tree_root = account_pub_data_tree_root_after;
@@ -588,7 +489,6 @@ impl BlockTxCircuit {
             current_system_config,
             current_register_stack,
             current_all_assets,
-            current_all_margined_assets,
             current_all_market_details,
             current_account_tree_root,
             current_account_pub_data_tree_root,
@@ -607,7 +507,6 @@ impl BlockTxCircuit {
         new_system_config: &SystemConfigTarget,
         register_stack_after: &RegisterStackTarget,
         all_assets_after: &[AssetTarget; ASSET_LIST_SIZE],
-        all_margined_assets_after: &[MarginedAssetTarget; MARGINED_ASSET_LIST_SIZE],
         all_market_details_after: &[MarketDetailsTarget; POSITION_LIST_SIZE],
         on_chain_operations_count: Target,
         on_chain_operations_pub_data: &[U8Target; ON_CHAIN_OPERATIONS_PUB_DATA_BYTES_SIZE],
@@ -616,7 +515,6 @@ impl BlockTxCircuit {
     ) {
         self.handle_change_pub_key();
         self.handle_transfer(chain_id);
-        self.handle_approve_integrator(chain_id);
 
         self.handle_on_chain_pub_data(on_chain_operations_count, on_chain_operations_pub_data);
         self.handle_priority_operation_pub_data(
@@ -651,13 +549,6 @@ impl BlockTxCircuit {
             .zip_eq(all_assets_after)
             .for_each(|(a, b)| {
                 connect_assets(&mut self.builder, a, b);
-            });
-        self.target
-            .all_margined_assets_after
-            .iter()
-            .zip_eq(all_margined_assets_after)
-            .for_each(|(a, b)| {
-                connect_margined_assets(&mut self.builder, a, b);
             });
         self.target
             .all_market_details_after
@@ -757,80 +648,6 @@ impl BlockTxCircuit {
             &mut self.builder,
             &transfer_message,
             &self.target.transfer_message,
-        );
-    }
-
-    fn handle_approve_integrator(&mut self, chain_id: u32) {
-        let l2_approve_integrator = self.builder.constant_from_u8(TX_TYPE_L2_APPROVE_INTEGRATOR);
-        let mut count = self.builder.zero();
-
-        let mut approve_integrator_message =
-            ApproveIntegratorMessageTarget::empty(&mut self.builder);
-
-        let chain_id = self.builder.constant(F::from_canonical_u32(chain_id));
-        for tx in self.target.txs.iter() {
-            let is_approve_integrator = self.builder.is_equal(tx.tx_type, l2_approve_integrator);
-            let is_same_master_account = self.builder.is_equal(
-                tx.accounts_before[0].master_account_index,
-                tx.accounts_before[1].master_account_index,
-            );
-            // 0-fee integrators skip L1 signature check (like same master account)
-            let fees_added = self.builder.add_many([
-                tx.l2_approve_integrator_tx_target.inner.max_perps_taker_fee,
-                tx.l2_approve_integrator_tx_target.inner.max_perps_maker_fee,
-                tx.l2_approve_integrator_tx_target.inner.max_spot_taker_fee,
-                tx.l2_approve_integrator_tx_target.inner.max_spot_maker_fee,
-            ]);
-            let no_fees = self.builder.is_zero(fees_added);
-            let skip_l1_signature = self.builder.or(is_same_master_account, no_fees);
-            let needs_l1_signature = self
-                .builder
-                .and_not(is_approve_integrator, skip_l1_signature);
-
-            count = self.builder.add(needs_l1_signature.target, count);
-
-            approve_integrator_message = ApproveIntegratorMessageTarget::select(
-                &mut self.builder,
-                needs_l1_signature,
-                &ApproveIntegratorMessageTarget {
-                    account_index: tx.l2_approve_integrator_tx_target.inner.account_index,
-                    api_key_index: tx.l2_approve_integrator_tx_target.inner.api_key_index,
-
-                    integrator_account_index: tx
-                        .l2_approve_integrator_tx_target
-                        .inner
-                        .integrator_account_index,
-                    max_perps_taker_fee: tx
-                        .l2_approve_integrator_tx_target
-                        .inner
-                        .max_perps_taker_fee,
-                    max_perps_maker_fee: tx
-                        .l2_approve_integrator_tx_target
-                        .inner
-                        .max_perps_maker_fee,
-                    max_spot_taker_fee: tx.l2_approve_integrator_tx_target.inner.max_spot_taker_fee,
-                    max_spot_maker_fee: tx.l2_approve_integrator_tx_target.inner.max_spot_maker_fee,
-                    approval_expiry: tx.l2_approve_integrator_tx_target.inner.approval_expiry,
-
-                    nonce: tx.nonce,
-                    chain_id,
-
-                    l1_address: tx.accounts_before[OWNER_ACCOUNT_ID].l1_address.clone(),
-                    l1_pk: tx.l1_pub_key.clone(),
-                    l1_signature: tx.l1_signature.clone(),
-                },
-                &approve_integrator_message,
-            );
-        }
-
-        // Verify that there is at most one approve_integrator message in the block
-        let c_sq_minus_c = self.builder.mul_sub(count, count, count);
-        self.builder.assert_zero(c_sq_minus_c);
-
-        ApproveIntegratorMessageTarget::connect(
-            &mut self.builder,
-            &approve_integrator_message,
-            &self.target.approve_integrator_message,
         );
     }
 

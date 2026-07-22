@@ -34,7 +34,6 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits, tx_per_proof: usize) -
     );
 
     let mut assets = block.all_assets.clone();
-    let mut margined_assets = pre_output.new_margined_assets.clone();
     let mut markets = pre_output.new_market_details.clone();
     let mut system_config = block.old_system_config;
     let mut registers = block.register_stack_before;
@@ -49,7 +48,6 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits, tx_per_proof: usize) -
             old_system_config: system_config,
             register_stack_before: registers,
             all_assets_before: assets.clone(),
-            all_margined_assets_before: margined_assets.clone(),
             all_market_details_before: markets.clone(),
             old_account_tree_root: account_root,
             old_account_pub_data_tree_root: account_data_root,
@@ -62,7 +60,6 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits, tx_per_proof: usize) -
             .expect("block transaction proof failed");
         let output = BlockTxWitness::from_public_inputs(&tx.public_inputs);
         assets = output.all_assets_after;
-        margined_assets = output.all_margined_assets_after;
         markets = output.all_market_details_after;
         system_config = output.new_system_config;
         registers = output.register_stack_after;
