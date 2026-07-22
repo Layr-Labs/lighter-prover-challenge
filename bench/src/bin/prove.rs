@@ -18,8 +18,8 @@ use circuit::types::config::F;
 
 const TX_PER_PROOF: usize = 4;
 const CHAIN_ID: u32 = 304;
-// Reduce write calls without changing the proof representation; exercised by the dev E2E.
-const PROOF_OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
+// Keep the promoted writer path while exercising a second submission from that baseline.
+const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
     let mut args = env::args().skip(1);
