@@ -11,6 +11,8 @@ mod prover;
 use std::env;
 use std::fs::{self, File};
 use std::io::BufWriter;
+use std::thread;
+use std::time::Duration;
 
 use api::Circuits;
 use circuit::block::Block;
@@ -22,6 +24,8 @@ const CHAIN_ID: u32 = 304;
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
+    thread::sleep(Duration::from_secs(15));
+
     let mut args = env::args().skip(1);
     let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
