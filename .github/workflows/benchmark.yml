@@ -53,7 +53,8 @@ jobs:
           set -euo pipefail
           [[ "${GITHUB_REF_TYPE}" == branch ]]
           [[ "${GITHUB_REF_NAME}" == "${DEFAULT_BRANCH}" ||
-             "${GITHUB_REF_NAME}" == submissions/* ]] || {
+             "${GITHUB_REF_NAME}" == submissions/* ||
+             "${GITHUB_REF_NAME}" == yukon/baseline/* ]] || {
             echo "ranked benchmark ref is not allowed: ${GITHUB_REF_NAME}" >&2
             exit 1
           }

@@ -85,7 +85,8 @@ Only the second job uses the protected GitHub Environment
 `benchmark-private-data`. Configure that Environment exactly as follows:
 
 - deployment branches and tags: **Selected branches and tags**;
-- branch rules: the repository default branch and `submissions/*`; no tag rule;
+- branch rules: the repository default branch, `submissions/*`, and
+  `yukon/baseline/*`; no tag rule;
 - required reviewers: the trusted ranked-benchmark approvers;
 - prevent self-review: enabled;
 - secret `R2_ACCESS_KEY_ID`: the bucket-scoped token access-key ID;
