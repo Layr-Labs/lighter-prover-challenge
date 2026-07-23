@@ -46,6 +46,7 @@ benchmark_job="$(awk '/^  benchmark:/{capture=1} capture' "${workflow}")"
 
 require_in "${build_job}" "runs-on: [self-hosted, macOS, ARM64, lighter-prover-challenge-m3]"
 require_in "${build_job}" 'ref: ${{ github.sha }}'
+require_in "${build_job}" "set-safe-directory: false"
 require_in "${build_job}" 'DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}'
 require_in "${build_job}" '[[ "${GITHUB_REF_TYPE}" == branch ]]'
 require_in "${build_job}" '[[ "${GITHUB_REF_NAME}" == "${DEFAULT_BRANCH}" ||'
