@@ -19,7 +19,8 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, lighter-prover-challenge-m3]
     timeout-minutes: 180
     env:
-      RUSTFLAGS: -C target-cpu=native
+      GIT_CONFIG_GLOBAL: /dev/null
+      GIT_CONFIG_NOSYSTEM: "1"
 
     steps:
       - name: Checkout candidate
@@ -28,17 +29,6 @@ jobs:
           ref: ${{ github.sha }}
           clean: true
           persist-credentials: false
-
-      - name: Host preflight
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$(uname -s)" == Darwin ]]
-          [[ "$(uname -m)" == arm64 ]]
-          command -v cargo
-          command -v codesign
-          command -v rustup
-          command -v shasum
 
       - name: Guard ranked ref
         env:
@@ -53,23 +43,69 @@ jobs:
             exit 1
           }
 
-      - name: Build candidate worker
-        run: ./setup.sh
-
-      - name: Stage candidate artifact
+      - name: Host bridge preflight
         shell: bash
         run: |
           set -euo pipefail
-          worker="${GITHUB_WORKSPACE}/target/release/prove"
-          [[ -f "${worker}" && ! -L "${worker}" ]]
+          bridge="/opt/lighter-prover-challenge/bench-exec.sh"
+          work_root="/opt/lighter-prover-challenge/work"
+          [[ "$(/usr/bin/uname -s)" == Darwin ]]
+          [[ "$(/usr/bin/uname -m)" == arm64 ]]
+          [[ -f "${bridge}" && ! -L "${bridge}" && -x "${bridge}" ]]
+          [[ "$(/usr/bin/stat -Lf "%u" "${bridge}")" == 0 ]]
+          bridge_mode="$(/usr/bin/stat -Lf "%Lp" "${bridge}")"
+          [[ "${bridge_mode}" =~ ^[0-7]{3,4}$ ]]
+          (( (8#${bridge_mode} & 8#022) == 0 ))
+          [[ -x /usr/bin/git ]]
+          [[ -x /usr/bin/shasum ]]
+          [[ -d "${RUNNER_TEMP:?}" && ! -L "${RUNNER_TEMP}" ]]
+          case "${RUNNER_TEMP:?}" in
+            "${work_root}"/*) ;;
+            *) echo "runner temp is outside the bridge work root" >&2; exit 1 ;;
+          esac
+          case "${GITHUB_WORKSPACE:?}" in
+            "${work_root}"/*) ;;
+            *) echo "workspace is outside the bridge work root" >&2; exit 1 ;;
+          esac
+          /usr/bin/sudo -n -l "${bridge}" >/dev/null
 
+      - name: Archive candidate source
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          archive="${RUNNER_TEMP}/lighter-candidate-source.tar"
+          /bin/rm -f -- "${archive}"
+          (
+            cd "${GITHUB_WORKSPACE}"
+            /usr/bin/env -i \
+              HOME="${RUNNER_TEMP}" \
+              PATH="/usr/bin:/bin" \
+              GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_CONFIG_NOSYSTEM=1 \
+              /usr/bin/git archive --format=tar HEAD
+          ) > "${archive}"
+          /bin/chmod 0644 "${archive}"
+          [[ -f "${archive}" && ! -L "${archive}" ]]
+          [[ "$(/usr/bin/stat -Lf "%z" "${archive}")" -gt 0 ]]
+
+      - name: Build and stage candidate artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/lighter-candidate-source.tar"
           artifact_dir="${RUNNER_TEMP:?}/lighter-candidate-build"
-          rm -rf "${artifact_dir}"
-          install -d -m 0700 "${artifact_dir}"
-          install -m 0755 "${worker}" "${artifact_dir}/prove"
+          /bin/rm -rf -- "${artifact_dir}"
+          /usr/bin/install -d -m 0700 "${artifact_dir}"
+          worker="${artifact_dir}/prove"
+
+          [[ -f "${archive}" && ! -L "${archive}" ]]
+          /usr/bin/sudo -n /opt/lighter-prover-challenge/bench-exec.sh build \
+            "${archive}" "${worker}"
+          [[ -f "${worker}" && ! -L "${worker}" ]]
           (
             cd "${artifact_dir}"
-            shasum -a 256 prove > prove.sha256
+            /usr/bin/shasum -a 256 prove > prove.sha256
           )
 
       - name: Upload candidate artifact
@@ -95,6 +131,7 @@ jobs:
       AWS_EC2_METADATA_DISABLED: "true"
       R2_AWS_CLI: /usr/local/bin/aws
       LIGHTER_REQUIRE_SANDBOX: "1"
+      LIGHTER_USE_BENCH_BRIDGE: "1"
       LIGHTER_BENCHMARK_MODE: official-throughput
       LIGHTER_TRANSACTIONS: "500"
       LIGHTER_CANDIDATE_SHA: ${{ github.sha }}
@@ -115,9 +152,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          bridge="/opt/lighter-prover-challenge/bench-exec.sh"
+          work_root="/opt/lighter-prover-challenge/work"
           [[ "$(/usr/bin/uname -s)" == Darwin ]]
           [[ "$(/usr/bin/uname -m)" == arm64 ]]
+          [[ -f "${bridge}" && ! -L "${bridge}" && -x "${bridge}" ]]
+          [[ "$(/usr/bin/stat -Lf "%u" "${bridge}")" == 0 ]]
+          bridge_mode="$(/usr/bin/stat -Lf "%Lp" "${bridge}")"
+          [[ "${bridge_mode}" =~ ^[0-7]{3,4}$ ]]
+          (( (8#${bridge_mode} & 8#022) == 0 ))
+          /usr/bin/sudo -n -l "${bridge}" >/dev/null
+          [[ -d "${RUNNER_TEMP:?}" && ! -L "${RUNNER_TEMP}" ]]
+          case "${RUNNER_TEMP:?}" in
+            "${work_root}"/*) ;;
+            *) echo "runner temp is outside the bridge work root" >&2; exit 1 ;;
+          esac
+          case "${GITHUB_WORKSPACE:?}" in
+            "${work_root}"/*) ;;
+            *) echo "workspace is outside the bridge work root" >&2; exit 1 ;;
+          esac
           [[ -x benchmark-tools/trusted/lighter-benchmark-verifier ]]
+          [[ -f .github/scripts/prove-via-bench.sh &&
+             ! -L .github/scripts/prove-via-bench.sh ]]
           [[ -x "${R2_AWS_CLI}" ]]
           old_ifs="${IFS}"
           IFS=:
@@ -185,12 +241,15 @@ jobs:
           candidate_root="$(/usr/bin/mktemp -d "${RUNNER_TEMP}/lighter-candidate-root.XXXXXX")"
           /usr/bin/install -d -m 0755 "${candidate_root}/target/release"
           /usr/bin/install -m 0755 "${artifact_dir}/prove" \
+            "${candidate_root}/target/release/prove-bin"
+          /usr/bin/install -m 0755 ".github/scripts/prove-via-bench.sh" \
             "${candidate_root}/target/release/prove"
           printf 'LIGHTER_CANDIDATE_ROOT=%s\n' "${candidate_root}" >> "${GITHUB_ENV}"
           printf 'LIGHTER_CANDIDATE_SHA256=%s\n' "${expected_sha256}" >> "${GITHUB_ENV}"
 
       - name: Benchmark submission
         env:
+          TMPDIR: ${{ runner.temp }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -211,7 +270,7 @@ jobs:
 
           unset R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET_ENDPOINT
           installed_sha256="$(
-            /usr/bin/shasum -a 256 "${LIGHTER_CANDIDATE_ROOT}/target/release/prove" |
+            /usr/bin/shasum -a 256 "${LIGHTER_CANDIDATE_ROOT}/target/release/prove-bin" |
               /usr/bin/awk '{ print $1 }'
           )"
           [[ "${installed_sha256}" == "${LIGHTER_CANDIDATE_SHA256}" ]]
