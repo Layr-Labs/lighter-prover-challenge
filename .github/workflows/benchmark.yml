@@ -1,28 +1,40 @@
 name: ranked benchmark
 
+# Run ranked evaluations only when an operator explicitly dispatches them.
+# GitHub uses the workflow definition and commit from the dispatched ref, so
+# access to allowed refs is part of this workflow's security boundary.
 on:
   workflow_dispatch:
 
+# Neither job needs to modify repository contents.
 permissions:
   contents: read
 
+# Start every run step with a clean Bash process and strict error handling.
 defaults:
   run:
     shell: bash --noprofile --norc -euo pipefail {0}
 
+# Keep at most one ranked run active for a given ref. A newer dispatch replaces
+# an older run for that same ref.
 concurrency:
   group: lighter-prover-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # Compile candidate-controlled source without giving the job access to the
+  # private-fixture Environment or its R2 credentials.
   build:
     runs-on: [self-hosted, macOS, ARM64, lighter-prover-challenge-m3]
     timeout-minutes: 180
     env:
+      # Prevent candidate or host Git configuration from changing Git behavior.
       GIT_CONFIG_GLOBAL: /dev/null
       GIT_CONFIG_NOSYSTEM: "1"
 
     steps:
+      # Materialize exactly the commit selected by workflow_dispatch. Do not
+      # persist credentials or add the candidate workspace to safe.directory.
       - name: Checkout candidate
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -31,6 +43,8 @@ jobs:
           persist-credentials: false
           set-safe-directory: false
 
+      # Fail before archiving or building unless the dispatched ref is the
+      # default branch or a branch in the submissions namespace.
       - name: Guard ranked ref
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
@@ -44,6 +58,9 @@ jobs:
             exit 1
           }
 
+      # Verify the fixed root bridge and all paths crossing into it. The bridge
+      # is the host-installed privilege boundary that runs candidate work as the
+      # disposable benchmark identity.
       - name: Host bridge preflight
         shell: bash
         run: |
@@ -70,6 +87,9 @@ jobs:
           esac
           /usr/bin/sudo -n -l "${bridge}" >/dev/null
 
+      # Produce a regular Git archive instead of letting the root bridge consume
+      # the mutable checkout directly. A minimal environment constrains Git's
+      # configuration and executable search path.
       - name: Archive candidate source
         shell: bash
         run: |
@@ -90,6 +110,9 @@ jobs:
           [[ -f "${archive}" && ! -L "${archive}" ]]
           [[ "$(/usr/bin/stat -Lf "%z" "${archive}")" -gt 0 ]]
 
+      # Ask the root bridge to extract and compile the archive under the
+      # disposable benchmark user. Stage only the resulting worker and its
+      # checksum in a runner-private directory.
       - name: Build and stage candidate artifact
         shell: bash
         run: |
@@ -109,6 +132,8 @@ jobs:
             /usr/bin/shasum -a 256 prove > prove.sha256
           )
 
+      # Transfer the worker to the credentialed job using an artifact name that
+      # is unique to this workflow run and retry attempt.
       - name: Upload candidate artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -118,12 +143,17 @@ jobs:
             ${{ runner.temp }}/lighter-candidate-build/prove.sha256
           if-no-files-found: error
 
+  # Run the prebuilt candidate against the private fixture. This job starts only
+  # after the uncredentialed build succeeds and is the sole consumer of the
+  # benchmark-private-data Environment.
   benchmark:
     needs: build
     runs-on: [self-hosted, macOS, ARM64, lighter-prover-challenge-m3]
     timeout-minutes: 180
     environment: benchmark-private-data
     env:
+      # Use only fixed system executables and ignore all user/system Git and AWS
+      # configuration. Disable cloud instance-metadata credential discovery.
       PATH: /usr/bin:/bin:/usr/sbin:/sbin
       GIT_CONFIG_GLOBAL: /dev/null
       GIT_CONFIG_NOSYSTEM: "1"
@@ -131,6 +161,10 @@ jobs:
       AWS_SHARED_CREDENTIALS_FILE: /dev/null
       AWS_EC2_METADATA_DISABLED: "true"
       R2_AWS_CLI: /usr/local/bin/aws
+
+      # Require the ranked host bridge and fixed benchmark parameters. Record
+      # the dispatched commit, rather than the trusted harness checkout, as the
+      # candidate provenance in score.json.
       LIGHTER_REQUIRE_SANDBOX: "1"
       LIGHTER_USE_BENCH_BRIDGE: "1"
       LIGHTER_BENCHMARK_MODE: official-throughput
@@ -141,6 +175,8 @@ jobs:
       R2_BUCKET: lighter-prover-private
 
     steps:
+      # Replace the candidate checkout with benchmark scripts and verifier data
+      # from the repository's trusted default branch.
       - name: Checkout trusted benchmark harness
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -149,6 +185,9 @@ jobs:
           persist-credentials: false
           set-safe-directory: false
 
+      # Fail closed unless the runner, bridge, work directories, PATH entries,
+      # AWS CLI, sandbox tools, and committed verifier all match the expected
+      # ownership, permission, checksum, and code-signing requirements.
       - name: Host preflight
         shell: bash
         run: |
@@ -202,6 +241,8 @@ jobs:
           /usr/bin/codesign --verify --strict \
             benchmark-tools/trusted/lighter-benchmark-verifier
 
+      # Create an empty private destination before the artifact action writes
+      # files into it.
       - name: Prepare artifact download
         shell: bash
         run: |
@@ -210,12 +251,16 @@ jobs:
           /bin/rm -rf "${artifact_dir}"
           /usr/bin/install -d -m 0700 "${artifact_dir}"
 
+      # Fetch only the artifact produced by this run and attempt.
       - name: Download candidate artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: lighter-prover-candidate-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/lighter-candidate-artifact
 
+      # Require exactly a regular worker and one canonical checksum file, verify
+      # their integrity, then install the untrusted binary as prove-bin beside
+      # the trusted prove wrapper. Export only their paths and digest.
       - name: Validate and install candidate worker
         shell: bash
         run: |
@@ -248,6 +293,10 @@ jobs:
           printf 'LIGHTER_CANDIDATE_ROOT=%s\n' "${candidate_root}" >> "${GITHUB_ENV}"
           printf 'LIGHTER_CANDIDATE_SHA256=%s\n' "${expected_sha256}" >> "${GITHUB_ENV}"
 
+      # This is the only step that receives R2 credentials. Download the fixture
+      # into a private directory, verify its configured digest, erase credentials
+      # from the environment, recheck the candidate binary, and invoke the
+      # trusted verifier through benchmark.sh.
       - name: Benchmark submission
         env:
           TMPDIR: ${{ runner.temp }}
@@ -277,6 +326,8 @@ jobs:
           [[ "${installed_sha256}" == "${LIGHTER_CANDIDATE_SHA256}" ]]
           LIGHTER_FIXTURE="${private_fixture}" ./benchmark.sh
 
+      # Publish only a successfully generated score. Because this step does not
+      # override normal success gating, benchmark failures upload nothing.
       - name: Upload score
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
