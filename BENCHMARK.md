@@ -139,8 +139,9 @@ code.
 
 The root supervisor runs the janitor after every one-job JIT runner exit, before
 the next registration. The janitor terminates uid-560 processes, verifies that
-none survive, purges its writable state, and deletes/recreates the account and
-home. Runner-state cleanup separately resets uid 502 between registrations.
+none survive, purges its writable state, verifies the locked fixed identity,
+and rebuilds its home from a root-owned template. Runner-state cleanup
+separately resets uid 502 processes and workspace state between registrations.
 Cleanup, quarantine, and signal handling fail closed, and the JIT wallclock is
 four hours. Do not enable this workflow until the focused host package and its
 on-host build/prove, Seatbelt, sudo-grant, and janitor checks pass.
