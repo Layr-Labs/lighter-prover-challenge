@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "name": "lighter-prover-challenge",
+  "description": "Optimize verified private active-witness throughput; public synthetic scores are provisional smoke results only.",
+  "category": "rust",
+  "direction": "+",
+  "editablePaths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "circuit",
+    "bench",
+    "vendor"
+  ],
+  "setupCommand": ["bash", "-lc", "./setup.sh"],
+  "benchmarkCommand": ["bash", "-lc", "./benchmark.sh"],
+  "scorePath": "score.json",
+  "maxSubmissionBytes": 67108864,
+  "runner": {
+    "provider": "github-actions",
+    "workflow": "benchmark.yml"
+  }
+}
