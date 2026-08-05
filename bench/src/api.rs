@@ -7,6 +7,7 @@ use circuit::block_pre_execution_constraints::{
 };
 use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, BlockTxChainTarget, Circuit as _};
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _};
+use circuit::builder::custom::cyclic_base_proof;
 use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
 use plonky2::plonk::circuit_data::CircuitData;
@@ -50,7 +51,7 @@ struct PathCircuits {
 }
 
 impl PathCircuits {
-    fn build(tx_per_proof: usize, mode: u8, _label: &str) -> Self {
+    fn build(tx_per_proof: usize, mode: u8, label: &str) -> Self {
         let tx = BlockTxCircuit::define(CIRCUIT_CONFIG, tx_per_proof, CHAIN_ID, mode);
         let tx_target = tx.target;
         let tx_data = tx.builder.build::<C>();
@@ -60,9 +61,11 @@ impl PathCircuits {
         let chain_target = chain.target;
         let chain_data = chain.builder.build::<C>();
 
-        // The per-block cyclic base proof (a valid proof of this same dummy
-        // circuit) fills both step-zero witness roles, so no standalone
-        // all-zero dummy proof is needed.
+        // The runtime cyclic base proof doubles as the dummy-slot witness for
+        // every chain recursion step, so no separate all-zero dummy proof is
+        // proven here (it was redundant work: both prove the same dummy
+        // circuit against the same verifier data).
+        let _ = label;
         let dummy_chain_circuit = dummy_circuit(&chain_data.common);
 
         Self {

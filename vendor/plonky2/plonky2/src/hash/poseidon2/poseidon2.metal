@@ -24,7 +24,10 @@ inline ulong gl_mul(ulong a, ulong b) {
     if (reduced > low) {
         reduced -= GOLDILOCKS_EPSILON;
     }
-    return gl_add(reduced, high_low * GOLDILOCKS_EPSILON);
+    // t1 <= p - 2^32, so after a wrapped addition its correction cannot wrap again.
+    ulong addend = high_low * GOLDILOCKS_EPSILON;
+    ulong result = reduced + addend;
+    return result + (result < reduced) * GOLDILOCKS_EPSILON;
 }
 
 inline ulong gl_canonicalize(ulong value) {
@@ -164,7 +167,7 @@ kernel void poseidon2_hash_parents(
     const device ulong* input = children + (ulong)gid * 8;
     ulong state[12] = { 0 };
     for (uint i = 0; i < 8; ++i) {
-        // Every child was canonicalized when the previous leaf or parent kernel wrote it.
+        // Leaf and parent kernels canonicalize every stored digest, so all children are canonical.
         state[i] = input[i];
     }
     poseidon2(state, parameters);
