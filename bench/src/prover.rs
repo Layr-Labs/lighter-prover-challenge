@@ -141,15 +141,23 @@ fn prove_tx_witness(
     tx_data: &CircuitData<F, C, D>,
     partition_witness: PartitionWitness<'_, F>,
 ) -> Proof {
+    let mut timing = TimingTree::new(
+        match path {
+            TxPath::Heavy => "HeavyTxProof",
+            TxPath::Light => "LightTxProof",
+        },
+        log::Level::Debug,
+    );
     let proof = prove_with_partition_witness::<F, C, D>(
         &tx_data.prover_only,
         &tx_data.common,
         partition_witness,
-        &mut TimingTree::default(),
+        &mut timing,
     )
     .unwrap_or_else(|error| {
         panic!("{path:?} block transaction chunk #{chunk_index} proof failed: {error:?}")
     });
+    timing.print();
     #[cfg(debug_assertions)]
     tx_data
         .verify(proof.clone())
@@ -358,44 +366,57 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     block.tx_chunks = tx_chunks;
     block.tx_chunks.push(Vec::new());
 
-    let (light_chain_proof, heavy_chain_proof) = std::thread::scope(|scope| {
-        let heavy_handle = std::thread::Builder::new()
-            .name("heavy-tx-chain".into())
-            .stack_size(PROVER_THREAD_STACK_BYTES)
-            .spawn_scoped(scope, || {
-                prove_path(
-                    TxPath::Heavy,
-                    heavy_chunks,
-                    circuits,
-                    block.block_number,
-                    block.created_at,
-                    block.old_account_delta_tree_root,
-                    &pre_output,
-                    state_metadata_hash,
-                )
-            })
-            .expect("heavy transaction chain thread must start");
-        let light_chain_proof = prove_path(
-            TxPath::Light,
-            light_chunks,
-            circuits,
-            block.block_number,
-            block.created_at,
-            block.old_account_delta_tree_root,
-            &pre_output,
-            state_metadata_hash,
-        );
-        let heavy_chain_proof = heavy_handle
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        (light_chain_proof, heavy_chain_proof)
-    });
+    let (light_chain_proof, heavy_chain_proof, (block_target, block_data)) =
+        std::thread::scope(|scope| {
+            // The final block circuit is only consumed by the final block proof,
+            // after both transaction paths and their chain recursion complete.
+            // Building it here overlaps its CPU-only construction with proving
+            // instead of paying it as a serial stage before proving starts.
+            let block_build_handle = std::thread::Builder::new()
+                .name("block-circuit-build".into())
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, || circuits.build_block_circuit())
+                .expect("block circuit build thread must start");
+            let heavy_handle = std::thread::Builder::new()
+                .name("heavy-tx-chain".into())
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, || {
+                    prove_path(
+                        TxPath::Heavy,
+                        heavy_chunks,
+                        circuits,
+                        block.block_number,
+                        block.created_at,
+                        block.old_account_delta_tree_root,
+                        &pre_output,
+                        state_metadata_hash,
+                    )
+                })
+                .expect("heavy transaction chain thread must start");
+            let light_chain_proof = prove_path(
+                TxPath::Light,
+                light_chunks,
+                circuits,
+                block.block_number,
+                block.created_at,
+                block.old_account_delta_tree_root,
+                &pre_output,
+                state_metadata_hash,
+            );
+            let heavy_chain_proof = heavy_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let block_circuit = block_build_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            (light_chain_proof, heavy_chain_proof, block_circuit)
+        });
 
     let (light_chain_input, heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
     BlockCircuit::prove(
-        &circuits.block_target,
-        &circuits.block_data,
+        &block_target,
+        &block_data,
         &block,
         &pre_proof,
         light_chain_input,
