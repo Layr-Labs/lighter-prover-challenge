@@ -24,7 +24,20 @@ inline ulong gl_mul(ulong a, ulong b) {
     if (reduced > low) {
         reduced -= GOLDILOCKS_EPSILON;
     }
-    return gl_add(reduced, high_low * GOLDILOCKS_EPSILON);
+
+    // Single-correction add. `gl_add` is the general case and applies two
+    // conditional corrections, but here the addend is high_low * (2^32 - 1)
+    // with high_low < 2^32, so it is bounded by 2^64 - 2^32 and one correction
+    // always suffices (this is plonky2's `add_no_canonicalize_trashing_input`).
+    // gl_mul is the hottest operation in the permutation -- pow7 is 4 muls and
+    // the internal linear layer is 12 per round across 22 rounds -- so removing
+    // one branch here is worth more than it looks.
+    ulong addend = high_low * GOLDILOCKS_EPSILON;
+    ulong sum = reduced + addend;
+    if (sum < reduced) {
+        sum += GOLDILOCKS_EPSILON;
+    }
+    return sum;
 }
 
 inline ulong gl_canonicalize(ulong value) {
@@ -141,8 +154,22 @@ kernel void poseidon2_hash_leaves(
     ulong state[12] = { 0 };
     for (uint offset = 0; offset < leaf_width; offset += 8) {
         uint chunk_size = min(8u, leaf_width - offset);
-        for (uint i = 0; i < chunk_size; ++i) {
-            state[i] = gl_canonicalize(input[offset + i]);
+        // Absorb with a compile-time trip count so every index into `state` is
+        // constant. A runtime bound makes the compiler spill the array from
+        // registers to thread-local memory, and then every access inside
+        // poseidon2 becomes a memory access. The parent kernel already absorbs
+        // with a constant bound of 8, which is why it measured ~58K perm/ms
+        // against this kernel's ~40K.
+        //
+        // Elements at or past chunk_size must retain the previous permutation's
+        // output rather than being zeroed, so the store is predicated. The load
+        // index is clamped because the load is now unconditional; leaf_width > 4
+        // here, so leaf_width - 1 cannot underflow.
+        for (uint i = 0; i < 8; ++i) {
+            ulong value = gl_canonicalize(input[min(offset + i, leaf_width - 1)]);
+            if (i < chunk_size) {
+                state[i] = value;
+            }
         }
         poseidon2(state, parameters);
     }
