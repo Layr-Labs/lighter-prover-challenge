@@ -12,9 +12,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::BufWriter;
 
-use api::{
-    Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
-};
+use api::{HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT};
 use circuit::block::Block;
 use circuit::types::config::F;
 
@@ -26,6 +24,12 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
+    // Local profiling only: the ranked sandbox clears the environment, so this
+    // never initializes there and stderr logging stays off.
+    if api::phase_timing_enabled() {
+        env_logger::init();
+    }
+
     let mut args = env::args().skip(1);
     let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
@@ -40,7 +44,7 @@ fn main() {
         PUBLIC_LIGHT_TX_COUNT,
     )
     .expect("invalid prover fixture");
-    let proof = prover::prove_block(&block, &Circuits::new());
+    let proof = prover::prove_fixture(&block);
     bincode::serialize_into(
         BufWriter::with_capacity(
             PROOF_OUTPUT_BUFFER_BYTES,

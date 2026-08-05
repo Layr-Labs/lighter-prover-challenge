@@ -12,6 +12,11 @@ impl<F: Field> Packable for F {
     default type Packing = Self;
 }
 
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+impl Packable for crate::goldilocks_field::GoldilocksField {
+    type Packing = crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx2",
