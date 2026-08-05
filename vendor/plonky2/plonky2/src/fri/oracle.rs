@@ -14,16 +14,25 @@ use crate::fri::prover::fri_proof;
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
 use crate::fri::FriParams;
 use crate::hash::hash_types::RichField;
-use crate::hash::merkle_tree::MerkleTree;
+use crate::hash::merkle_tree::{MerkleLeaves, MerkleTree};
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
 use crate::timed;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_strict, reverse_bits, reverse_index_bits_in_place, transpose};
+use crate::util::{log2_strict, reverse_bits, transpose_to_bitrev_flat};
 
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
+
+/// Output layout for [`PolynomialBatch::fill_lde_batch`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BatchLayout {
+    /// `out[point * width + column]`
+    PointMajor,
+    /// `out[column * num_points + point]`
+    PolyMajor,
+}
 
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
 #[derive(Eq, PartialEq, Debug)]
@@ -94,12 +103,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             Self::lde_values(&polynomials, rate_bits, blinding, fft_root_table)
         );
 
-        let mut leaves = timed!(timing, "transpose LDEs", transpose(&lde_values));
-        reverse_index_bits_in_place(&mut leaves);
         let merkle_tree = timed!(
             timing,
             "build Merkle tree",
-            MerkleTree::new(leaves, cap_height)
+            MerkleTree::new_columns(lde_values, cap_height)
         );
 
         Self {
@@ -126,8 +133,21 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .par_iter()
             .map(|p| {
                 assert_eq!(p.len(), degree, "Polynomial degrees inconsistent");
-                p.lde(rate_bits)
-                    .coset_fft_with_options(F::coset_shift(), Some(rate_bits), fft_root_table)
+                // Fused zero-pad + coset-shift multiply: the shift powers only
+                // touch the first `degree` coefficients, and everything past
+                // them is zero, so one LDE-sized buffer suffices instead of
+                // `lde()` allocating one and `coset_fft` allocating another.
+                let lde_len = degree << rate_bits;
+                let mut buffer = Vec::with_capacity(lde_len);
+                buffer.extend(
+                    F::coset_shift()
+                        .powers()
+                        .zip(&p.coeffs)
+                        .map(|(r, &c)| r * c),
+                );
+                buffer.resize(lde_len, F::ZERO);
+                PolynomialCoeffs::new(buffer)
+                    .fft_with_options(Some(rate_bits), fft_root_table)
                     .values
             })
             .chain(
@@ -138,12 +158,73 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .collect()
     }
 
-    /// Fetches LDE values at the `index * step`th point.
+    /// The number of value columns in this oracle, excluding any salt columns.
+    pub(crate) fn lde_row_width(&self) -> usize {
+        self.merkle_tree.leaf_width() - if self.blinding { SALT_SIZE } else { 0 }
+    }
+
+    /// Fetches LDE values at the `index * step`th point. Only available for
+    /// row-major leaf storage; column-major oracles use [`Self::fill_lde_batch`].
     pub fn get_lde_values(&self, index: usize, step: usize) -> &[F] {
         let index = index * step;
         let index = reverse_bits(index, self.degree_log + self.rate_bits);
-        let slice = &self.merkle_tree.leaves[index];
+        let slice = self.merkle_tree.get(index);
         &slice[..slice.len() - if self.blinding { SALT_SIZE } else { 0 }]
+    }
+
+    /// Gathers LDE values for a batch of points into `out`, in either layout,
+    /// for both leaf storage modes. Point `k` (of `indices`) and column `c`
+    /// (of `col_range`, indexing as in `get_lde_values(i, step)[c]`) land at
+    /// `out[k * col_range.len() + (c - start)]` for `PointMajor` or
+    /// `out[(c - start) * indices.len() + k]` for `PolyMajor`.
+    pub(crate) fn fill_lde_batch(
+        &self,
+        indices: &[usize],
+        step: usize,
+        col_range: core::ops::Range<usize>,
+        layout: BatchLayout,
+        out: &mut Vec<F>,
+    ) {
+        let n = indices.len();
+        let start = col_range.start;
+        let w = col_range.len();
+        out.clear();
+        out.resize(n * w, F::ZERO);
+        match &self.merkle_tree.leaves {
+            MerkleLeaves::Columns { columns, .. } => {
+                for (ci, c) in col_range.enumerate() {
+                    let column = &columns[c];
+                    match layout {
+                        BatchLayout::PolyMajor => {
+                            let destination = &mut out[ci * n..(ci + 1) * n];
+                            for (k, &i) in indices.iter().enumerate() {
+                                destination[k] = column[i * step];
+                            }
+                        }
+                        BatchLayout::PointMajor => {
+                            for (k, &i) in indices.iter().enumerate() {
+                                out[k * w + ci] = column[i * step];
+                            }
+                        }
+                    }
+                }
+            }
+            MerkleLeaves::Rows { .. } => {
+                for (k, &i) in indices.iter().enumerate() {
+                    let row = &self.get_lde_values(i, step)[start..start + w];
+                    match layout {
+                        BatchLayout::PointMajor => {
+                            out[k * w..(k + 1) * w].copy_from_slice(row);
+                        }
+                        BatchLayout::PolyMajor => {
+                            for (ci, &value) in row.iter().enumerate() {
+                                out[ci * n + k] = value;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Like `get_lde_values`, but fetches LDE values from a batch of `P::WIDTH` points, and returns
@@ -152,13 +233,28 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     where
         P: PackedField<Scalar = F>,
     {
+        let leaf_size = self.lde_row_width();
+        if let MerkleLeaves::Columns { columns, .. } = &self.merkle_tree.leaves {
+            return (0..leaf_size)
+                .map(|j| {
+                    let column = &columns[j];
+                    let mut packed = P::ZEROS;
+                    packed
+                        .as_slice_mut()
+                        .iter_mut()
+                        .enumerate()
+                        .for_each(|(l, packed_l)| *packed_l = column[(index_start + l) * step]);
+                    packed
+                })
+                .collect_vec();
+        }
+
         let row_wise = (0..P::WIDTH)
             .map(|i| self.get_lde_values(index_start + i, step))
             .collect_vec();
 
         // This is essentially a transpose, but we will not use the generic transpose method as we
         // want inner lists to be of type P, not Vecs which would involve allocation.
-        let leaf_size = row_wise[0].len();
         (0..leaf_size)
             .map(|j| {
                 let mut packed = P::ZEROS;

@@ -153,6 +153,50 @@ kernel void poseidon2_hash_leaves(
     }
 }
 
+kernel void poseidon2_hash_leaves_colmajor(
+    const device ulong* leaves [[buffer(0)]],
+    device ulong* hashes [[buffer(1)]],
+    constant ulong* parameters [[buffer(2)]],
+    constant uint& leaf_width [[buffer(3)]],
+    constant uint& leaf_count [[buffer(4)]],
+    constant uint& log_leaf_count [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= leaf_count) {
+        return;
+    }
+
+    // Input is column-major: column j occupies leaves[j * leaf_count..(j + 1) *
+    // leaf_count] in natural row order, so adjacent threads read adjacent
+    // addresses. The digest of natural row gid belongs to tree leaf
+    // reverse_bits(gid), so outputs scatter by bit reversal.
+    uint out_row = log_leaf_count == 0
+        ? gid
+        : (reverse_bits(gid) >> (32 - log_leaf_count));
+    device ulong* output = hashes + (ulong)out_row * 4;
+    if (leaf_width <= 4) {
+        uint i = 0;
+        for (; i < leaf_width; ++i) {
+            output[i] = gl_canonicalize(leaves[(ulong)i * leaf_count + gid]);
+        }
+        for (; i < 4; ++i) {
+            output[i] = 0;
+        }
+        return;
+    }
+
+    ulong state[12] = { 0 };
+    for (uint offset = 0; offset < leaf_width; offset += 8) {
+        uint chunk_size = min(8u, leaf_width - offset);
+        for (uint i = 0; i < chunk_size; ++i) {
+            state[i] = gl_canonicalize(leaves[(ulong)(offset + i) * leaf_count + gid]);
+        }
+        poseidon2(state, parameters);
+    }
+    for (uint i = 0; i < 4; ++i) {
+        output[i] = gl_canonicalize(state[i]);
+    }
+}
+
 kernel void poseidon2_hash_parents(
     const device ulong* children [[buffer(0)]],
     device ulong* parents [[buffer(1)]],

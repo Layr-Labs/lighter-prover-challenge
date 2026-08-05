@@ -511,10 +511,20 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     fn try_build_merkle_tree(
-        leaves: &[Vec<F>],
+        leaves: &[F],
+        leaf_width: usize,
+        num_leaves: usize,
         cap_height: usize,
     ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
-        super::metal::build_merkle_tree(leaves, cap_height)
+        super::metal::build_merkle_tree(leaves, leaf_width, num_leaves, cap_height)
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn try_build_merkle_tree_columns(
+        columns: &[Vec<F>],
+        cap_height: usize,
+    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
+        super::metal::build_merkle_tree_columns(columns, cap_height)
     }
 }
 
