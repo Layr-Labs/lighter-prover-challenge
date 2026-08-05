@@ -61,7 +61,7 @@ fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
     (light, heavy)
 }
 
-pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
+pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     let pre_proof = BlockPreExecutionCircuit::prove(
         &circuits.pre_data,
         &BlockPreExec::from_block(block),
@@ -92,16 +92,31 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
     let mut heavy_jump =
         JumpState::initial(pre_output.new_state_root, block.old_account_delta_tree_root);
     let mut light_jump = heavy_jump;
+    let mut heavy_step = 0;
+    let mut light_step = 0;
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
-    for route in chunk_routes(block) {
-        let txs = &block.tx_chunks[route.chunk_index];
-        let is_light = route.path == TxPath::Light;
+    let tx_chunks = std::mem::take(&mut block.tx_chunks);
+    for (chunk_index, txs) in tx_chunks.into_iter().enumerate() {
+        let is_light = txs
+            .first()
+            .expect("block transaction chunk must not be empty")
+            .tx_circuit_type
+            == TX_LIGHT;
+        let chain_step = if is_light {
+            let step = light_step;
+            light_step += 1;
+            step
+        } else {
+            let step = heavy_step;
+            heavy_step += 1;
+            step
+        };
         let block_tx = BlockTx {
             created_at: block.created_at,
             state_metadata_hash,
             old_jump: if is_light { light_jump } else { heavy_jump },
-            txs: txs.clone(),
+            txs,
         };
 
         let tx_proof = if is_light {
@@ -120,7 +135,7 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
         .unwrap_or_else(|error| {
             panic!(
                 "block transaction chunk #{} proof failed: {error:?}",
-                route.chunk_index
+                chunk_index
             )
         });
 
@@ -130,7 +145,7 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
             light_chain_proof = BlockTxChainCircuit::prove(
                 &circuits.light_chain_target,
                 &circuits.light_chain_data,
-                route.chain_step,
+                chain_step,
                 &light_chain_proof,
                 &circuits.dummy_light_proof,
                 &tx_proof,
@@ -138,7 +153,7 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
             .unwrap_or_else(|error| {
                 panic!(
                     "light block transaction chain step #{} failed: {error:?}",
-                    route.chain_step
+                    chain_step
                 )
             });
         } else {
@@ -146,7 +161,7 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
             heavy_chain_proof = BlockTxChainCircuit::prove(
                 &circuits.heavy_chain_target,
                 &circuits.heavy_chain_data,
-                route.chain_step,
+                chain_step,
                 &heavy_chain_proof,
                 &circuits.dummy_heavy_proof,
                 &tx_proof,
@@ -154,11 +169,13 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
             .unwrap_or_else(|error| {
                 panic!(
                     "heavy block transaction chain step #{} failed: {error:?}",
-                    route.chain_step
+                    chain_step
                 )
             });
         }
     }
+
+    block.tx_chunks = vec![Vec::new()];
 
     let (light_chain_input, heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
@@ -184,7 +201,7 @@ mod tests {
 
     #[test]
     fn prove_block_returns_one_final_block_proof() {
-        let prove: fn(&Block<F>, &Circuits) -> Proof = prove_block;
+        let prove: fn(Block<F>, &Circuits) -> Proof = prove_block;
         let _ = prove;
     }
 
