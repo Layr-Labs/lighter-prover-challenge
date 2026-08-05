@@ -5,14 +5,15 @@ use itertools::Itertools;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
+use crate::field::batch_util::batch_multiply_inplace;
 use crate::field::extension::Extendable;
 use crate::field::fft::FftRootTable;
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
+use crate::fri::FriParams;
 use crate::fri::proof::FriProof;
 use crate::fri::prover::fri_proof;
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
-use crate::fri::FriParams;
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
@@ -118,6 +119,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Vec<Vec<F>> {
         let degree = polynomials[0].len();
+        let coset_powers = F::coset_shift().powers().take(degree).collect::<Vec<_>>();
 
         // If blinding, salt with two random elements to each leaf vector.
         let salt_size = if blinding { SALT_SIZE } else { 0 };
@@ -126,9 +128,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .par_iter()
             .map(|p| {
                 assert_eq!(p.len(), degree, "Polynomial degrees inconsistent");
-                p.lde(rate_bits)
-                    .coset_fft_with_options(F::coset_shift(), Some(rate_bits), fft_root_table)
-                    .values
+                let mut lde = p.lde(rate_bits);
+                batch_multiply_inplace(&mut lde.coeffs[..degree], &coset_powers);
+                lde.fft_with_options(Some(rate_bits), fft_root_table).values
             })
             .chain(
                 (0..salt_size)
@@ -234,5 +236,37 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         );
 
         fri_proof
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::Sample;
+    use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    #[test]
+    fn shared_coset_powers_match_per_polynomial_shifts() {
+        const D: usize = 2;
+        const RATE_BITS: usize = 3;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let polynomials = (0..7)
+            .map(|_| PolynomialCoeffs::new(F::rand_vec(1 << 8)))
+            .collect::<Vec<_>>();
+        let expected = polynomials
+            .iter()
+            .map(|polynomial| {
+                polynomial
+                    .lde(RATE_BITS)
+                    .coset_fft_with_options(F::coset_shift(), Some(RATE_BITS), None)
+                    .values
+            })
+            .collect::<Vec<_>>();
+        let actual = PolynomialBatch::<F, C, D>::lde_values(&polynomials, RATE_BITS, false, None);
+
+        assert_eq!(actual, expected);
     }
 }

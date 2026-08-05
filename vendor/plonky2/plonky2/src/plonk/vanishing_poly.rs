@@ -6,7 +6,6 @@ use plonky2_field::polynomial::PolynomialCoeffs;
 
 use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
-use crate::field::batch_util::batch_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
@@ -713,22 +712,14 @@ pub fn evaluate_gate_constraints_base_batch<F: RichField + Extendable<D>, const 
     let mut constraints_batch = vec![F::ZERO; common_data.num_gate_constraints * vars_batch.len()];
     for (i, gate) in common_data.gates.iter().enumerate() {
         let selector_index = common_data.selectors_info.selector_indices[i];
-        let gate_constraints_batch = gate.0.eval_filtered_base_batch(
+        gate.0.eval_filtered_base_batch(
             vars_batch,
             i,
             selector_index,
             common_data.selectors_info.groups[selector_index].clone(),
             common_data.selectors_info.num_selectors(),
             common_data.num_lookup_selectors,
-        );
-        debug_assert!(
-            gate_constraints_batch.len() <= constraints_batch.len(),
-            "num_constraints() gave too low of a number"
-        );
-        // below adds all constraints for all points
-        batch_add_inplace(
-            &mut constraints_batch[..gate_constraints_batch.len()],
-            &gate_constraints_batch,
+            &mut constraints_batch,
         );
     }
     constraints_batch

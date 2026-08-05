@@ -6,13 +6,13 @@ use core::cmp::max;
 use core::iter::Sum;
 use core::ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign};
 
-use anyhow::{ensure, Result};
+use anyhow::{Result, ensure};
 use itertools::Itertools;
 use plonky2_util::log2_strict;
 use serde::{Deserialize, Serialize};
 
 use crate::extension::{Extendable, FieldExtension};
-use crate::fft::{fft, fft_with_options, ifft, FftRootTable};
+use crate::fft::{FftRootTable, fft, fft_with_options, ifft};
 use crate::types::Field;
 
 /// A polynomial in point-value form.
@@ -440,8 +440,8 @@ impl<F: Field> Mul for &PolynomialCoeffs<F> {
 mod tests {
     use std::time::Instant;
 
-    use rand::rngs::OsRng;
     use rand::Rng;
+    use rand::rngs::OsRng;
 
     use super::*;
     use crate::goldilocks_field::GoldilocksField;
