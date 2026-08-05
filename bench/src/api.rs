@@ -44,76 +44,94 @@ pub struct Circuits {
     pub dummy_light_proof: Proof,
 }
 
+/// The transaction circuit, its chain-recursion circuit, and the chain's dummy artifacts for one
+/// of the two transaction widths. Nothing here depends on the other width.
+struct PathCircuits {
+    tx_target: BlockTxTarget,
+    tx_data: CircuitData<F, C, D>,
+    chain_target: BlockTxChainTarget,
+    chain_data: CircuitData<F, C, D>,
+    dummy_chain_circuit: CircuitData<F, C, D>,
+    dummy_proof: Proof,
+}
+
+impl PathCircuits {
+    fn build(tx_per_proof: usize, mode: u8, label: &str) -> Self {
+        let tx = BlockTxCircuit::define(CIRCUIT_CONFIG, tx_per_proof, CHAIN_ID, mode);
+        let tx_target = tx.target;
+        let tx_data = tx.builder.build::<C>();
+
+        let chain =
+            BlockTxChainCircuit::define(CIRCUIT_CONFIG, &tx_data, ON_CHAIN_OPERATIONS_LIMIT);
+        let chain_target = chain.target;
+        let chain_data = chain.builder.build::<C>();
+
+        let dummy_chain_circuit = dummy_circuit(&chain_data.common);
+        let dummy_proof = cyclic_base_proof(
+            &chain_data.common,
+            &chain_data.verifier_only,
+            &dummy_chain_circuit,
+            [].into_iter().collect(),
+        )
+        .unwrap_or_else(|error| panic!("cannot construct {label} chain dummy proof: {error:?}"));
+
+        Self {
+            tx_target,
+            tx_data,
+            chain_target,
+            chain_data,
+            dummy_chain_circuit,
+            dummy_proof,
+        }
+    }
+}
+
 impl Circuits {
     pub fn new() -> Self {
-        let heavy_tx =
-            BlockTxCircuit::define(CIRCUIT_CONFIG, HEAVY_TX_PER_PROOF, CHAIN_ID, HEAVY_TX_MODE);
-        let heavy_tx_target = heavy_tx.target;
-        let heavy_tx_data = heavy_tx.builder.build::<C>();
-
-        let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
-        let pre_target = pre.target;
-        let pre_data = pre.builder.build::<C>();
-
-        let light_tx =
-            BlockTxCircuit::define(CIRCUIT_CONFIG, LIGHT_TX_PER_PROOF, CHAIN_ID, LIGHT_TX_MODE);
-        let light_tx_target = light_tx.target;
-        let light_tx_data = light_tx.builder.build::<C>();
-
-        let heavy_chain =
-            BlockTxChainCircuit::define(CIRCUIT_CONFIG, &heavy_tx_data, ON_CHAIN_OPERATIONS_LIMIT);
-        let heavy_chain_target = heavy_chain.target;
-        let heavy_chain_data = heavy_chain.builder.build::<C>();
-
-        let light_chain =
-            BlockTxChainCircuit::define(CIRCUIT_CONFIG, &light_tx_data, ON_CHAIN_OPERATIONS_LIMIT);
-        let light_chain_target = light_chain.target;
-        let light_chain_data = light_chain.builder.build::<C>();
+        // The heavy path, the light path, and the pre-execution circuit are mutually independent,
+        // so build all three concurrently. Only the final block circuit needs the others and
+        // therefore stays sequential. The circuit definitions themselves are unchanged, so the
+        // resulting verifier data is identical to the sequential build.
+        let ((heavy, light), (pre_target, pre_data)) = rayon::join(
+            || {
+                rayon::join(
+                    || PathCircuits::build(HEAVY_TX_PER_PROOF, HEAVY_TX_MODE, "heavy"),
+                    || PathCircuits::build(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE, "light"),
+                )
+            },
+            || {
+                let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
+                (pre.target, pre.builder.build::<C>())
+            },
+        );
 
         let block = BlockCircuit::define(
             CIRCUIT_CONFIG,
             &pre_data,
-            &light_chain_data,
-            &heavy_chain_data,
+            &light.chain_data,
+            &heavy.chain_data,
             ON_CHAIN_OPERATIONS_LIMIT,
         );
         let block_target = block.target;
         let block_data = block.builder.build::<C>();
 
-        let dummy_heavy_chain_circuit = dummy_circuit(&heavy_chain_data.common);
-        let dummy_light_chain_circuit = dummy_circuit(&light_chain_data.common);
-        let dummy_heavy_proof = cyclic_base_proof(
-            &heavy_chain_data.common,
-            &heavy_chain_data.verifier_only,
-            &dummy_heavy_chain_circuit,
-            [].into_iter().collect(),
-        )
-        .expect("cannot construct heavy chain dummy proof");
-        let dummy_light_proof = cyclic_base_proof(
-            &light_chain_data.common,
-            &light_chain_data.verifier_only,
-            &dummy_light_chain_circuit,
-            [].into_iter().collect(),
-        )
-        .expect("cannot construct light chain dummy proof");
-
         Self {
-            heavy_tx_target,
-            heavy_tx_data,
-            light_tx_target,
-            light_tx_data,
+            heavy_tx_target: heavy.tx_target,
+            heavy_tx_data: heavy.tx_data,
+            light_tx_target: light.tx_target,
+            light_tx_data: light.tx_data,
             pre_target,
             pre_data,
-            heavy_chain_target,
-            heavy_chain_data,
-            light_chain_target,
-            light_chain_data,
+            heavy_chain_target: heavy.chain_target,
+            heavy_chain_data: heavy.chain_data,
+            light_chain_target: light.chain_target,
+            light_chain_data: light.chain_data,
             block_target,
             block_data,
-            dummy_heavy_chain_circuit,
-            dummy_light_chain_circuit,
-            dummy_heavy_proof,
-            dummy_light_proof,
+            dummy_heavy_chain_circuit: heavy.dummy_chain_circuit,
+            dummy_light_chain_circuit: light.dummy_chain_circuit,
+            dummy_heavy_proof: heavy.dummy_proof,
+            dummy_light_proof: light.dummy_proof,
         }
     }
 }
