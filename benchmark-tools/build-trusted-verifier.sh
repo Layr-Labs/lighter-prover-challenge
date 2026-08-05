@@ -10,7 +10,7 @@
 # benchmark-tools/check-trusted-verifier-reproducibility.sh before republishing.
 set -euo pipefail
 
-readonly REVIEWED_COMMIT=a37311606ff35331a5ea920e7caeb8fa4f0150bc
+readonly REVIEWED_COMMIT=8d6e4bafd7fb9f41743aca9c7e95e8e56168e4f6
 readonly TOOLCHAIN=nightly-2025-12-06
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
