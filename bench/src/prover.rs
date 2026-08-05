@@ -5,16 +5,20 @@ use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
 use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
-use circuit::block_tx::{BlockTx, BlockTxWitness, JumpState};
+use circuit::block_tx::{BlockTx, JumpState, JumpStateTarget};
 use circuit::block_tx_chain_constraints::{
     BlockTxChainCircuit, BlockTxChainTarget, Circuit as _, cyclic_base_witness,
 };
-use circuit::block_tx_constraints::{BlockTxCircuit, Circuit as _};
+use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _};
 use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
-use plonky2::hash::hash_types::HashOut;
+use plonky2::hash::hash_types::{HashOut, HashOutTarget};
+use plonky2::iop::generator::generate_partial_witness;
+use plonky2::iop::witness::{PartitionWitness, Witness};
 use plonky2::plonk::circuit_data::CircuitData;
+use plonky2::plonk::prover::prove_with_partition_witness;
+use plonky2::util::timing::TimingTree;
 
 use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
 
@@ -75,6 +79,80 @@ fn chain_step_proof(
     })
 }
 
+fn hash_from_witness(witness: &impl Witness<F>, target: &HashOutTarget) -> HashOut<F> {
+    HashOut {
+        elements: target.elements.map(|element| witness.get_target(element)),
+    }
+}
+
+fn jump_from_witness(witness: &impl Witness<F>, target: &JumpStateTarget) -> JumpState<F> {
+    JumpState {
+        last_active_tx_index: witness.get_target(target.last_active_tx_index),
+        prev_new_state_root: hash_from_witness(witness, &target.prev_new_state_root),
+        prev_new_delta_root: hash_from_witness(witness, &target.prev_new_delta_root),
+        run_start_prev_index: witness.get_target(target.run_start_prev_index),
+        run_start_old_state_root: hash_from_witness(witness, &target.run_start_old_state_root),
+        run_start_old_delta_root: hash_from_witness(witness, &target.run_start_old_delta_root),
+        coverage_hash: hash_from_witness(witness, &target.coverage_hash),
+        claims_hash: hash_from_witness(witness, &target.claims_hash),
+        tx_count: witness.get_target(target.tx_count),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_tx_witness<'a>(
+    path: TxPath,
+    chunk_index: usize,
+    txs: Vec<Tx<F>>,
+    tx_data: &'a CircuitData<F, C, D>,
+    tx_target: &BlockTxTarget,
+    created_at: i64,
+    state_metadata_hash: HashOut<F>,
+    old_jump: JumpState<F>,
+) -> (PartitionWitness<'a, F>, JumpState<F>) {
+    let block_tx = BlockTx {
+        created_at,
+        state_metadata_hash,
+        old_jump,
+        txs,
+    };
+    let partial_witness =
+        BlockTxCircuit::generate_witness(&block_tx, tx_target).unwrap_or_else(|error| {
+            panic!("{path:?} block transaction chunk #{chunk_index} witness failed: {error:?}")
+        });
+    let partition_witness =
+        generate_partial_witness::<F, C, D>(partial_witness, &tx_data.prover_only, &tx_data.common)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{path:?} block transaction chunk #{chunk_index} generators failed: {error:?}"
+                )
+            });
+    let new_jump = jump_from_witness(&partition_witness, &tx_target.new_jump);
+    (partition_witness, new_jump)
+}
+
+fn prove_tx_witness(
+    path: TxPath,
+    chunk_index: usize,
+    tx_data: &CircuitData<F, C, D>,
+    partition_witness: PartitionWitness<'_, F>,
+) -> Proof {
+    let proof = prove_with_partition_witness::<F, C, D>(
+        &tx_data.prover_only,
+        &tx_data.common,
+        partition_witness,
+        &mut TimingTree::default(),
+    )
+    .unwrap_or_else(|error| {
+        panic!("{path:?} block transaction chunk #{chunk_index} proof failed: {error:?}")
+    });
+    #[cfg(debug_assertions)]
+    tx_data
+        .verify(proof.clone())
+        .expect("transaction proof self-check failed");
+    proof
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_path(
     path: TxPath,
@@ -116,13 +194,28 @@ fn prove_path(
         old_account_delta_tree_root,
     );
     let mut jump = JumpState::initial(pre_output.new_state_root, old_account_delta_tree_root);
+    let mut chunks = chunks.into_iter();
+    let (mut current_chunk_index, first_txs) =
+        chunks.next().expect("transaction path must not be empty");
+    let (mut current_witness, next_jump) = generate_tx_witness(
+        path,
+        current_chunk_index,
+        first_txs,
+        tx_data,
+        tx_target,
+        created_at,
+        state_metadata_hash,
+        jump,
+    );
+    jump = next_jump;
 
     std::thread::scope(|scope| {
         let base = &base_proof;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
+        let mut current_step = 0u64;
 
-        for (step, (chunk_index, txs)) in chunks.into_iter().enumerate() {
+        loop {
             if let Some((chain_step, tx_proof)) = pending_tx.take() {
                 let previous_proof = chain.take().map(ChainState::wait);
                 let handle = std::thread::Builder::new()
@@ -144,18 +237,43 @@ fn prove_path(
                 chain = Some(ChainState::InFlight(handle));
             }
 
-            let block_tx = BlockTx {
-                created_at,
-                state_metadata_hash,
-                old_jump: jump,
-                txs,
-            };
-            let tx_proof =
-                BlockTxCircuit::prove(tx_data, &block_tx, tx_target).unwrap_or_else(|error| {
-                    panic!("block transaction chunk #{chunk_index} proof failed: {error:?}")
-                });
-            jump = BlockTxWitness::from_public_inputs(&tx_proof.public_inputs).new_jump;
-            pending_tx = Some((step as u64, tx_proof));
+            let witness = current_witness;
+            let proof_handle = std::thread::Builder::new()
+                .name(format!("{path:?}-tx-proof-{current_step}"))
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    prove_tx_witness(path, current_chunk_index, tx_data, witness)
+                })
+                .expect("transaction proof pipeline thread must start");
+
+            let next_witness = chunks.next().map(|(chunk_index, txs)| {
+                let (witness, next_jump) = generate_tx_witness(
+                    path,
+                    chunk_index,
+                    txs,
+                    tx_data,
+                    tx_target,
+                    created_at,
+                    state_metadata_hash,
+                    jump,
+                );
+                jump = next_jump;
+                (chunk_index, witness)
+            });
+
+            let tx_proof = proof_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            pending_tx = Some((current_step, tx_proof));
+            current_step += 1;
+
+            match next_witness {
+                Some((chunk_index, witness)) => {
+                    current_chunk_index = chunk_index;
+                    current_witness = witness;
+                }
+                None => break,
+            }
         }
 
         if let Some((chain_step, tx_proof)) = pending_tx.take() {
