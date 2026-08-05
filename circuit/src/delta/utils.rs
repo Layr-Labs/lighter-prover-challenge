@@ -14,14 +14,9 @@ use crate::types::config::Builder;
 use crate::types::constants::ASSET_LIST_SIZE_BITS;
 
 pub fn digest(builder: &mut Builder, target: Target, selector: BoolTarget, degree: &mut Target) {
-    static mut INDEX: u64 = 0;
-    unsafe {
-        // when printing index append zeros so that it has length 3
-        builder.sequence_digest_target(0, target, selector);
-        let one = builder.one();
-        *degree = builder.mul_add(one, selector.target, *degree);
-        INDEX += 1;
-    }
+    builder.sequence_digest_target(0, target, selector);
+    let one = builder.one();
+    *degree = builder.mul_add(one, selector.target, *degree);
 }
 
 // [is_negative + 32 + 16, 16 + 32]

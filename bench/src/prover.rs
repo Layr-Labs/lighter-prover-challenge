@@ -57,6 +57,18 @@ fn chunk_routes(block: &Block<F>) -> Vec<ChunkRoute> {
         .collect()
 }
 
+fn split_chunk_routes(routes: Vec<ChunkRoute>) -> (Vec<ChunkRoute>, Vec<ChunkRoute>) {
+    let mut heavy_routes = Vec::new();
+    let mut light_routes = Vec::new();
+    for route in routes {
+        match route.path {
+            TxPath::Heavy => heavy_routes.push(route),
+            TxPath::Light => light_routes.push(route),
+        }
+    }
+    (heavy_routes, light_routes)
+}
+
 fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
     (light, heavy)
 }
@@ -70,95 +82,108 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
     .expect("block pre-execution proof failed");
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
 
-    let mut heavy_chain_proof = BlockTxChainCircuit::cyclic_base_proof(
-        &circuits.heavy_chain_data,
-        &circuits.dummy_heavy_chain_circuit,
-        block.block_number,
-        block.created_at,
-        pre_output.new_state_root,
-        pre_output.new_validium_root,
-        block.old_account_delta_tree_root,
-    );
-    let mut light_chain_proof = BlockTxChainCircuit::cyclic_base_proof(
-        &circuits.light_chain_data,
-        &circuits.dummy_light_chain_circuit,
-        block.block_number,
-        block.created_at,
-        pre_output.new_state_root,
-        pre_output.new_validium_root,
-        block.old_account_delta_tree_root,
-    );
-
-    let mut heavy_jump =
-        JumpState::initial(pre_output.new_state_root, block.old_account_delta_tree_root);
-    let mut light_jump = heavy_jump;
     let state_metadata_hash = pre_output.new_state_metadata.hash();
-
-    for route in chunk_routes(block) {
-        let txs = &block.tx_chunks[route.chunk_index];
-        let is_light = route.path == TxPath::Light;
-        let block_tx = BlockTx {
-            created_at: block.created_at,
-            state_metadata_hash,
-            old_jump: if is_light { light_jump } else { heavy_jump },
-            txs: txs.clone(),
-        };
-
-        let tx_proof = if is_light {
-            BlockTxCircuit::prove(
-                &circuits.light_tx_data,
-                &block_tx,
-                &circuits.light_tx_target,
-            )
-        } else {
-            BlockTxCircuit::prove(
-                &circuits.heavy_tx_data,
-                &block_tx,
-                &circuits.heavy_tx_target,
-            )
-        }
-        .unwrap_or_else(|error| {
-            panic!(
-                "block transaction chunk #{} proof failed: {error:?}",
-                route.chunk_index
-            )
-        });
-
-        let tx_output = BlockTxWitness::from_public_inputs(&tx_proof.public_inputs);
-        if is_light {
-            light_jump = tx_output.new_jump;
-            light_chain_proof = BlockTxChainCircuit::prove(
-                &circuits.light_chain_target,
-                &circuits.light_chain_data,
-                route.chain_step,
-                &light_chain_proof,
-                &circuits.dummy_light_proof,
-                &tx_proof,
-            )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "light block transaction chain step #{} failed: {error:?}",
-                    route.chain_step
-                )
-            });
-        } else {
-            heavy_jump = tx_output.new_jump;
-            heavy_chain_proof = BlockTxChainCircuit::prove(
-                &circuits.heavy_chain_target,
+    let (heavy_routes, light_routes) = split_chunk_routes(chunk_routes(block));
+    let (heavy_chain_proof, light_chain_proof) = rayon::join(
+        || {
+            let mut chain_proof = BlockTxChainCircuit::cyclic_base_proof(
                 &circuits.heavy_chain_data,
-                route.chain_step,
-                &heavy_chain_proof,
-                &circuits.dummy_heavy_proof,
-                &tx_proof,
-            )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "heavy block transaction chain step #{} failed: {error:?}",
-                    route.chain_step
+                &circuits.dummy_heavy_chain_circuit,
+                block.block_number,
+                block.created_at,
+                pre_output.new_state_root,
+                pre_output.new_validium_root,
+                block.old_account_delta_tree_root,
+            );
+            let mut jump =
+                JumpState::initial(pre_output.new_state_root, block.old_account_delta_tree_root);
+
+            for route in heavy_routes {
+                let block_tx = BlockTx {
+                    created_at: block.created_at,
+                    state_metadata_hash,
+                    old_jump: jump,
+                    txs: block.tx_chunks[route.chunk_index].clone(),
+                };
+                let tx_proof = BlockTxCircuit::prove(
+                    &circuits.heavy_tx_data,
+                    &block_tx,
+                    &circuits.heavy_tx_target,
                 )
-            });
-        }
-    }
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "block transaction chunk #{} proof failed: {error:?}",
+                        route.chunk_index
+                    )
+                });
+                jump = BlockTxWitness::from_public_inputs(&tx_proof.public_inputs).new_jump;
+                chain_proof = BlockTxChainCircuit::prove(
+                    &circuits.heavy_chain_target,
+                    &circuits.heavy_chain_data,
+                    route.chain_step,
+                    &chain_proof,
+                    &circuits.dummy_heavy_proof,
+                    &tx_proof,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "heavy block transaction chain step #{} failed: {error:?}",
+                        route.chain_step
+                    )
+                });
+            }
+            chain_proof
+        },
+        || {
+            let mut chain_proof = BlockTxChainCircuit::cyclic_base_proof(
+                &circuits.light_chain_data,
+                &circuits.dummy_light_chain_circuit,
+                block.block_number,
+                block.created_at,
+                pre_output.new_state_root,
+                pre_output.new_validium_root,
+                block.old_account_delta_tree_root,
+            );
+            let mut jump =
+                JumpState::initial(pre_output.new_state_root, block.old_account_delta_tree_root);
+
+            for route in light_routes {
+                let block_tx = BlockTx {
+                    created_at: block.created_at,
+                    state_metadata_hash,
+                    old_jump: jump,
+                    txs: block.tx_chunks[route.chunk_index].clone(),
+                };
+                let tx_proof = BlockTxCircuit::prove(
+                    &circuits.light_tx_data,
+                    &block_tx,
+                    &circuits.light_tx_target,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "block transaction chunk #{} proof failed: {error:?}",
+                        route.chunk_index
+                    )
+                });
+                jump = BlockTxWitness::from_public_inputs(&tx_proof.public_inputs).new_jump;
+                chain_proof = BlockTxChainCircuit::prove(
+                    &circuits.light_chain_target,
+                    &circuits.light_chain_data,
+                    route.chain_step,
+                    &chain_proof,
+                    &circuits.dummy_light_proof,
+                    &tx_proof,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "light block transaction chain step #{} failed: {error:?}",
+                        route.chain_step
+                    )
+                });
+            }
+            chain_proof
+        },
+    );
 
     let (light_chain_input, heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
@@ -219,6 +244,12 @@ mod tests {
                             TxPath::Heavy
                         };
                     assert_eq!(route.path, expected_path);
+                    assert!(block.tx_chunks[route.chunk_index].iter().all(|tx| {
+                        matches!(
+                            (route.path, tx.tx_circuit_type),
+                            (TxPath::Heavy, TX_HEAVY) | (TxPath::Light, TX_LIGHT)
+                        )
+                    }));
                 }
 
                 let heavy_steps = routes
@@ -233,13 +264,28 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert_eq!(heavy_steps, vec![0, 1, 2]);
                 assert_eq!(light_steps, (0..49).collect::<Vec<_>>());
-                assert!(routes.iter().all(|route| {
-                    let circuit_type = block.tx_chunks[route.chunk_index][0].tx_circuit_type;
-                    matches!(
-                        (route.path, circuit_type),
-                        (TxPath::Heavy, TX_HEAVY) | (TxPath::Light, TX_LIGHT)
-                    )
-                }));
+
+                let (heavy_routes, light_routes) = split_chunk_routes(routes.clone());
+                assert!(heavy_routes
+                    .windows(2)
+                    .all(|pair| pair[0].chunk_index < pair[1].chunk_index));
+                assert!(light_routes
+                    .windows(2)
+                    .all(|pair| pair[0].chunk_index < pair[1].chunk_index));
+                assert_eq!(
+                    heavy_routes
+                        .iter()
+                        .map(|route| route.chain_step)
+                        .collect::<Vec<_>>(),
+                    vec![0, 1, 2]
+                );
+                assert_eq!(
+                    light_routes
+                        .iter()
+                        .map(|route| route.chain_step)
+                        .collect::<Vec<_>>(),
+                    (0..49).collect::<Vec<_>>()
+                );
             })
             .expect("orchestration test thread must start")
             .join()
