@@ -70,7 +70,7 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
     .expect("block pre-execution proof failed");
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
 
-    let mut heavy_chain_proof = BlockTxChainCircuit::cyclic_base_proof(
+    let heavy_base_proof = BlockTxChainCircuit::cyclic_base_proof(
         &circuits.heavy_chain_data,
         &circuits.dummy_heavy_chain_circuit,
         block.block_number,
@@ -79,7 +79,7 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
         pre_output.new_validium_root,
         block.old_account_delta_tree_root,
     );
-    let mut light_chain_proof = BlockTxChainCircuit::cyclic_base_proof(
+    let light_base_proof = BlockTxChainCircuit::cyclic_base_proof(
         &circuits.light_chain_data,
         &circuits.dummy_light_chain_circuit,
         block.block_number,
@@ -88,6 +88,8 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
         pre_output.new_validium_root,
         block.old_account_delta_tree_root,
     );
+    let mut heavy_chain_proof = None;
+    let mut light_chain_proof = None;
 
     let mut heavy_jump =
         JumpState::initial(pre_output.new_state_root, block.old_account_delta_tree_root);
@@ -101,7 +103,7 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
             created_at: block.created_at,
             state_metadata_hash,
             old_jump: if is_light { light_jump } else { heavy_jump },
-            txs: txs.clone(),
+            txs,
         };
 
         let tx_proof = if is_light {
@@ -127,41 +129,49 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
         let tx_output = BlockTxWitness::from_public_inputs(&tx_proof.public_inputs);
         if is_light {
             light_jump = tx_output.new_jump;
-            light_chain_proof = BlockTxChainCircuit::prove(
-                &circuits.light_chain_target,
-                &circuits.light_chain_data,
-                route.chain_step,
-                &light_chain_proof,
-                &circuits.dummy_light_proof,
-                &tx_proof,
-            )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "light block transaction chain step #{} failed: {error:?}",
-                    route.chain_step
+            let previous_proof = light_chain_proof.as_ref().unwrap_or(&light_base_proof);
+            light_chain_proof = Some(
+                BlockTxChainCircuit::prove(
+                    &circuits.light_chain_target,
+                    &circuits.light_chain_data,
+                    route.chain_step,
+                    previous_proof,
+                    &light_base_proof,
+                    &tx_proof,
                 )
-            });
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "light block transaction chain step #{} failed: {error:?}",
+                        route.chain_step
+                    )
+                }),
+            );
         } else {
             heavy_jump = tx_output.new_jump;
-            heavy_chain_proof = BlockTxChainCircuit::prove(
-                &circuits.heavy_chain_target,
-                &circuits.heavy_chain_data,
-                route.chain_step,
-                &heavy_chain_proof,
-                &circuits.dummy_heavy_proof,
-                &tx_proof,
-            )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "heavy block transaction chain step #{} failed: {error:?}",
-                    route.chain_step
+            let previous_proof = heavy_chain_proof.as_ref().unwrap_or(&heavy_base_proof);
+            heavy_chain_proof = Some(
+                BlockTxChainCircuit::prove(
+                    &circuits.heavy_chain_target,
+                    &circuits.heavy_chain_data,
+                    route.chain_step,
+                    previous_proof,
+                    &heavy_base_proof,
+                    &tx_proof,
                 )
-            });
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "heavy block transaction chain step #{} failed: {error:?}",
+                        route.chain_step
+                    )
+                }),
+            );
         }
     }
 
+    let light_chain_proof = light_chain_proof.as_ref().unwrap_or(&light_base_proof);
+    let heavy_chain_proof = heavy_chain_proof.as_ref().unwrap_or(&heavy_base_proof);
     let (light_chain_input, heavy_chain_input) =
-        final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
+        final_chain_inputs(light_chain_proof, heavy_chain_proof);
     BlockCircuit::prove(
         &circuits.block_target,
         &circuits.block_data,

@@ -7,7 +7,6 @@ use circuit::block_pre_execution_constraints::{
 };
 use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, BlockTxChainTarget, Circuit as _};
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _};
-use circuit::builder::custom::cyclic_base_proof;
 use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
 use plonky2::plonk::circuit_data::CircuitData;
@@ -40,8 +39,6 @@ pub struct Circuits {
     pub block_data: CircuitData<F, C, D>,
     pub dummy_heavy_chain_circuit: CircuitData<F, C, D>,
     pub dummy_light_chain_circuit: CircuitData<F, C, D>,
-    pub dummy_heavy_proof: Proof,
-    pub dummy_light_proof: Proof,
 }
 
 impl Circuits {
@@ -82,20 +79,6 @@ impl Circuits {
 
         let dummy_heavy_chain_circuit = dummy_circuit(&heavy_chain_data.common);
         let dummy_light_chain_circuit = dummy_circuit(&light_chain_data.common);
-        let dummy_heavy_proof = cyclic_base_proof(
-            &heavy_chain_data.common,
-            &heavy_chain_data.verifier_only,
-            &dummy_heavy_chain_circuit,
-            [].into_iter().collect(),
-        )
-        .expect("cannot construct heavy chain dummy proof");
-        let dummy_light_proof = cyclic_base_proof(
-            &light_chain_data.common,
-            &light_chain_data.verifier_only,
-            &dummy_light_chain_circuit,
-            [].into_iter().collect(),
-        )
-        .expect("cannot construct light chain dummy proof");
 
         Self {
             heavy_tx_target,
@@ -112,8 +95,6 @@ impl Circuits {
             block_data,
             dummy_heavy_chain_circuit,
             dummy_light_chain_circuit,
-            dummy_heavy_proof,
-            dummy_light_proof,
         }
     }
 }
