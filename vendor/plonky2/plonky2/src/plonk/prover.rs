@@ -605,7 +605,7 @@ fn compute_all_lookup_polys<
     }
 }
 
-const BATCH_SIZE: usize = 32;
+const BATCH_SIZE: usize = 64;
 
 fn compute_quotient_polys<
     'a,
