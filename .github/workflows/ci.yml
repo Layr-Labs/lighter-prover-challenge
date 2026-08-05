@@ -1,0 +1,138 @@
+name: ci
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  test:
+    runs-on: [self-hosted, macOS, ARM64, lighter-prover-challenge-m4]
+    env:
+      RUST_TOOLCHAIN_BIN: /opt/lighter-prover-challenge/rustup/toolchains/nightly-2025-12-06-aarch64-apple-darwin/bin
+      RUSTC: /opt/lighter-prover-challenge/rustup/toolchains/nightly-2025-12-06-aarch64-apple-darwin/bin/rustc
+      PATH: /opt/lighter-prover-challenge/rustup/toolchains/nightly-2025-12-06-aarch64-apple-darwin/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+      RUSTFMT: /opt/lighter-prover-challenge/rustup/toolchains/nightly-2025-12-06-aarch64-apple-darwin/bin/rustfmt
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate files
+        run: |
+          shopt -s nullglob
+          scripts=(
+            setup.sh
+            benchmark.sh
+            benchmark-tools/build-trusted-verifier.sh
+            benchmark-tools/check-trusted-verifier-reproducibility.sh
+            .github/scripts/*.sh
+            .yukon/hooks/yukon-trace.sh
+          )
+          bash -n "${scripts[@]}"
+          jq empty \
+            benchmark.json \
+            benchmark-tools/ranked-score.schema.json \
+            .claude/settings.local.json \
+            .cursor/hooks.json \
+            opencode.json
+
+      # Replaces the single .codex/config.toml blob pin: every agent trace hook file is now
+      # regenerated locally and compared byte for byte, tolerating only a bump of the inert
+      # trace-config version marker. The refresh procedure is documented in the script header.
+      - name: Verify agent trace hook configuration
+        run: ./.github/scripts/verify-agent-trace-configs.sh
+
+      - name: Test agent trace hook configuration check
+        run: ./.github/scripts/test-agent-trace-configs.sh
+
+      - name: Test private benchmark workflow contract
+        run: ./.github/scripts/test-private-benchmark-workflow.sh
+
+      - name: Test private fixture bundle extraction
+        run: ./.github/scripts/test-private-fixture-bundle.sh
+
+      - name: Test trusted bench bridge wrapper
+        run: /bin/bash .github/scripts/test-prove-via-bench.sh
+
+      - name: Test benchmark sandbox restrictions
+        run: ./.github/scripts/test-benchmark-sandbox.sh
+
+      - name: Check Rust formatting
+        run: |
+          toolchain="$(< rust-toolchain)"
+          [[ "${toolchain}" == "nightly-2025-12-06" ]] || {
+            echo "rust-toolchain must pin nightly-2025-12-06" >&2
+            exit 1
+          }
+          for binary in cargo rustc rustfmt cargo-fmt; do
+            path="${RUST_TOOLCHAIN_BIN}/${binary}"
+            [[ -f "${path}" && ! -L "${path}" && -x "${path}" ]] || {
+              echo "required pinned Rust tool is missing or unsafe: ${path}" >&2
+              exit 1
+            }
+          done
+
+          format_root="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/lighter-fmt.XXXXXX")"
+          cleanup() { rm -rf "${format_root}"; }
+          trap cleanup EXIT
+          cp Cargo.toml Cargo.lock "${format_root}/"
+          cp -R bench circuit desertexit "${format_root}/"
+          ln -s "${PWD}/vendor" "${format_root}/vendor"
+
+          for source in \
+            circuit/src/tx.rs \
+            circuit/src/types/order_book_node.rs
+          do
+            count="$(
+              awk '$0 == "#[serde(bound = \"\")] " { count++ }
+                   END { print count + 0 }' "${format_root}/${source}"
+            )"
+            (( count <= 1 )) || {
+              echo "${source} has an unexpected rustfmt exception count" >&2
+              exit 1
+            }
+            awk '$0 == "#[serde(bound = \"\")] " { sub(/ $/, "") }
+                 { print }' \
+              "${format_root}/${source}" > "${format_root}/${source}.normalized"
+            mv "${format_root}/${source}.normalized" "${format_root}/${source}"
+          done
+
+          "${RUST_TOOLCHAIN_BIN}/cargo-fmt" fmt \
+            --manifest-path "${format_root}/Cargo.toml" \
+            --all \
+            -- \
+            --check
+          "${RUST_TOOLCHAIN_BIN}/cargo-fmt" fmt \
+            --manifest-path benchmark-tools/harness/Cargo.toml \
+            -- \
+            --check
+
+      - name: Test trusted verifier harness
+        run: |
+          "${RUST_TOOLCHAIN_BIN}/cargo" test --locked --manifest-path benchmark-tools/harness/Cargo.toml
+
+      - name: Build candidate worker
+        run: |
+          "${RUST_TOOLCHAIN_BIN}/cargo" build --release --locked --manifest-path Cargo.toml -p bench --bin prove
+
+      # SHA256SUMS is the authenticity control: it binds the published binary to
+      # the reviewed commit. The codesign check is ad-hoc, so it is
+      # tamper-evidence only and attests no signer identity.
+      - name: Verify trusted verifier pin and tamper-evidence
+        run: |
+          cd benchmark-tools/trusted
+          shasum -a 256 -c SHA256SUMS \
+            || { echo "verifier does not match the pinned SHA-256" >&2; exit 1; }
+          codesign --verify --strict --verbose=2 lighter-benchmark-verifier \
+            || { echo "verifier failed its ad-hoc code-signature integrity check" >&2; exit 1; }
+
+      - name: Test published trusted verifier
+        run: ./.github/scripts/test-trusted-verifier.sh

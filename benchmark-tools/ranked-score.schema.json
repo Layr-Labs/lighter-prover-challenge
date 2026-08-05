@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["score", "passed", "metrics"],
+  "properties": {
+    "score": { "type": "number", "exclusiveMinimum": 0 },
+    "passed": { "const": true },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runtime",
+        "benchmark_case",
+        "provisional",
+        "competitive",
+        "cacheable",
+        "transaction_count_source",
+        "timing_authority",
+        "proving_seconds",
+        "transactions",
+        "transactions_per_second",
+        "candidate_sha",
+        "verifier_source_rev",
+        "verifier_sha256",
+        "protocol_version",
+        "fixture_id",
+        "fixture_count",
+        "verified_proofs",
+        "expected_proofs"
+      ],
+      "properties": {
+        "runtime": {
+          "enum": ["public-synthetic-smoke", "official-throughput"]
+        },
+        "benchmark_case": {
+          "enum": ["public-synthetic-provisional", "private-active-ranked"]
+        },
+        "provisional": { "type": "boolean" },
+        "competitive": { "type": "boolean" },
+        "cacheable": { "type": "boolean" },
+        "transaction_count_source": {
+          "enum": [
+            "synthetic-configuration-unbound-by-proof",
+            "parsed-active-witness"
+          ]
+        },
+        "timing_authority": { "const": "trusted verifier parent" },
+        "proving_seconds": { "type": "number", "exclusiveMinimum": 0 },
+        "transactions": { "type": "integer", "minimum": 1 },
+        "transactions_per_second": { "type": "number", "exclusiveMinimum": 0 },
+        "candidate_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "verifier_source_rev": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "verifier_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "protocol_version": { "const": "lighter-mixed-block-proof-v1" },
+        "fixture_id": { "type": "string", "minLength": 1 },
+        "fixture_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "fixture_count": { "type": "integer", "minimum": 1 },
+        "verified_proofs": { "type": "integer", "minimum": 1 },
+        "expected_proofs": { "type": "integer", "minimum": 1 }
+      },
+      "oneOf": [
+        {
+          "required": ["fixture_sha256"],
+          "properties": {
+            "runtime": { "const": "public-synthetic-smoke" },
+            "benchmark_case": { "const": "public-synthetic-provisional" },
+            "provisional": { "const": true },
+            "competitive": { "const": false },
+            "cacheable": { "const": true },
+            "transaction_count_source": {
+              "const": "synthetic-configuration-unbound-by-proof"
+            },
+            "transactions": { "const": 500 },
+            "fixture_count": { "const": 1 },
+            "verified_proofs": { "const": 1 },
+            "expected_proofs": { "const": 1 },
+            "fixture_sha256": {
+              "const": "6f1fbd2d5e64ed84f656b0c2dc299a8628801ac66488dfe021fdc4b2af53eb4b"
+            }
+          }
+        },
+        {
+          "not": { "required": ["fixture_sha256"] },
+          "properties": {
+            "runtime": { "const": "official-throughput" },
+            "benchmark_case": { "const": "private-active-ranked" },
+            "provisional": { "const": false },
+            "competitive": { "const": true },
+            "cacheable": { "const": false },
+            "transaction_count_source": {
+              "const": "parsed-active-witness"
+            },
+            "transactions": { "type": "integer", "minimum": 500, "multipleOf": 500 },
+            "fixture_id": { "const": "ranked-v1" },
+            "fixture_count": { "type": "integer", "minimum": 1 },
+            "verified_proofs": { "type": "integer", "minimum": 1 },
+            "expected_proofs": { "type": "integer", "minimum": 1 }
+          }
+        }
+      ]
+    }
+  }
+}

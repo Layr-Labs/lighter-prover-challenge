@@ -1,0 +1,46 @@
+Lighter Prover Challenge — Licensing Notice
+==========================================
+
+This repository contains two separately licensed bodies of work. The root
+`LICENSE` file is the Business Source License 1.1 text for Elliot Technologies'
+Lighter Prover; it does **not** relicense Eigen Labs challenge infrastructure.
+
+1. Business Source License 1.1 (Elliot Technologies, Inc.)
+---------------------------------------------------------
+Applies to the Lighter Prover Licensed Work: the cryptographic engine that
+generates and verifies zero-knowledge proofs for Lighter transactions
+(circuit logic and the underlying crypto libraries it is built on).
+
+In this tree, that primarily includes:
+
+- `circuit/`, `bench/`, `desertexit/`, `snark/`
+- Root Rust/Go build metadata for that prover (`Cargo.toml`, `Cargo.lock`,
+  `go.mod`, `go.sum`, `rust-toolchain`, `rustfmt.toml`, `build_circuits.sh`)
+- The BSL text in `LICENSE`
+
+See `LICENSE` for parameters (Change Date: 2029-01-01; Change License: GPLv2+).
+
+2. MIT License (Eigen Labs, Inc.)
+---------------------------------
+Applies to challenge harness and platform glue that launches the prover, times
+it, scores it, and records agent sessions. This code does not itself perform
+proving.
+
+In this tree, that primarily includes:
+
+- `benchmark-tools/`, `benchmark.sh`, `setup.sh`, `BENCHMARK.md`, `benchmark.json`
+- `.github/` (workflows and CI scripts)
+- Agent-trace hook configs and wrappers (`.yukon/`, `.claude/`, `.codex/`,
+  `.cursor/`, `.omp/`, `.opencode/`, `.pi/`, `opencode.json`)
+- This `NOTICE` file and `LICENSE-MIT`
+
+See `LICENSE-MIT`.
+
+3. Third-party and vendored code
+--------------------------------
+Other components retain their upstream licenses (for example `vendor/plonky2/`
+under MIT OR Apache-2.0). See `THIRD_PARTY_NOTICES` and per-directory license
+files.
+
+If a path is not listed above, check neighboring license/notice files; do not
+assume the root BSL covers Eigen Labs materials or the reverse.
