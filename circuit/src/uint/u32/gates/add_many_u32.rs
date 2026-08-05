@@ -12,8 +12,10 @@ use core::marker::PhantomData;
 
 use anyhow::Result;
 use plonky2::field::extension::Extendable;
+use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
 use plonky2::gates::gate::Gate;
+use plonky2::gates::packed_util::PackedEvaluableBase;
 use plonky2::gates::util::StridedConstraintConsumer;
 use plonky2::hash::hash_types::RichField;
 use plonky2::iop::ext_target::ExtensionTarget;
@@ -23,7 +25,10 @@ use plonky2::iop::wire::Wire;
 use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
-use plonky2::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBase};
+use plonky2::plonk::vars::{
+    EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch,
+    EvaluationVarsBasePacked,
+};
 use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
 
 use crate::utils::ceil_div_usize;
@@ -160,45 +165,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32AddManyGate
 
     fn eval_unfiltered_base_one(
         &self,
-        vars: EvaluationVarsBase<F>,
-        mut yield_constr: StridedConstraintConsumer<F>,
+        _vars: EvaluationVarsBase<F>,
+        _yield_constr: StridedConstraintConsumer<F>,
     ) {
-        for i in 0..self.num_ops {
-            let addends: Vec<F> = (0..self.num_addends)
-                .map(|j| vars.local_wires[self.wire_ith_op_jth_addend(i, j)])
-                .collect();
-            let carry = vars.local_wires[self.wire_ith_carry(i)];
+        panic!("use eval_unfiltered_base_packed instead");
+    }
 
-            let computed_output = addends.iter().fold(F::ZERO, |x, &y| x + y) + carry;
-
-            let output_result = vars.local_wires[self.wire_ith_output_result(i)];
-            let output_carry = vars.local_wires[self.wire_ith_output_carry(i)];
-
-            let base = F::from_canonical_u64(1 << 32u64);
-            let combined_output = output_carry * base + output_result;
-
-            yield_constr.one(combined_output - computed_output);
-
-            let mut combined_result_limbs = F::ZERO;
-            let mut combined_carry_limbs = F::ZERO;
-            let base = F::from_canonical_u64(1u64 << Self::limb_bits());
-            for j in (0..Self::num_limbs()).rev() {
-                let this_limb = vars.local_wires[self.wire_ith_output_jth_limb(i, j)];
-                let max_limb = 1 << Self::limb_bits();
-                let product = (0..max_limb)
-                    .map(|x| this_limb - F::from_canonical_usize(x))
-                    .product();
-                yield_constr.one(product);
-
-                if j < Self::num_result_limbs() {
-                    combined_result_limbs = base * combined_result_limbs + this_limb;
-                } else {
-                    combined_carry_limbs = base * combined_carry_limbs + this_limb;
-                }
-            }
-            yield_constr.one(combined_result_limbs - output_result);
-            yield_constr.one(combined_carry_limbs - output_carry);
-        }
+    fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
+        self.eval_unfiltered_base_batch_packed(vars_base)
     }
 
     fn eval_unfiltered_circuit(
@@ -291,6 +265,48 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32AddManyGate
 
     fn num_constraints(&self) -> usize {
         self.num_ops * (3 + Self::num_limbs())
+    }
+}
+
+impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
+    for U32AddManyGate<F, D>
+{
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+        &self,
+        vars: EvaluationVarsBasePacked<P>,
+        mut yield_constr: StridedConstraintConsumer<P>,
+    ) {
+        for i in 0..self.num_ops {
+            let carry = vars.local_wires[self.wire_ith_carry(i)];
+            let computed_output = (0..self.num_addends).fold(carry, |sum, j| {
+                sum + vars.local_wires[self.wire_ith_op_jth_addend(i, j)]
+            });
+
+            let output_result = vars.local_wires[self.wire_ith_output_result(i)];
+            let output_carry = vars.local_wires[self.wire_ith_output_carry(i)];
+            let combined_output = output_carry * F::from_canonical_u64(1 << 32u64) + output_result;
+
+            yield_constr.one(combined_output - computed_output);
+
+            let mut combined_result_limbs = P::ZEROS;
+            let mut combined_carry_limbs = P::ZEROS;
+            let base = F::from_canonical_u64(1u64 << Self::limb_bits());
+            for j in (0..Self::num_limbs()).rev() {
+                let this_limb = vars.local_wires[self.wire_ith_output_jth_limb(i, j)];
+                let product = (0..1 << Self::limb_bits())
+                    .map(|x| this_limb - F::from_canonical_usize(x))
+                    .product();
+                yield_constr.one(product);
+
+                if j < Self::num_result_limbs() {
+                    combined_result_limbs = combined_result_limbs * base + this_limb;
+                } else {
+                    combined_carry_limbs = combined_carry_limbs * base + this_limb;
+                }
+            }
+            yield_constr.one(combined_result_limbs - output_result);
+            yield_constr.one(combined_carry_limbs - output_carry);
+        }
     }
 }
 

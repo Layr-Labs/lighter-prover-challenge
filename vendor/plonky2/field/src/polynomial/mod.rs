@@ -292,6 +292,24 @@ impl<F: Field> PolynomialCoeffs<F> {
         modified_poly.fft_with_options(zero_factor, root_table)
     }
 
+    /// Low-degree extends this polynomial and evaluates it on a coset, using one padded buffer.
+    pub fn coset_lde_fft_with_options(
+        &self,
+        shift: F,
+        rate_bits: usize,
+        root_table: Option<&FftRootTable<F>>,
+    ) -> PolynomialValues<F> {
+        let mut modified_coeffs = vec![F::ZERO; self.len() << rate_bits];
+        modified_coeffs[..self.len()]
+            .iter_mut()
+            .zip(&self.coeffs)
+            .zip(shift.powers())
+            .for_each(|((output, &coefficient), power)| {
+                *output = coefficient * power;
+            });
+        PolynomialCoeffs::new(modified_coeffs).fft_with_options(Some(rate_bits), root_table)
+    }
+
     pub fn to_extension<const D: usize>(&self) -> PolynomialCoeffs<F::Extension>
     where
         F: Extendable<D>,
@@ -492,6 +510,28 @@ mod tests {
 
         let ifft_coeffs = PolynomialValues::new(coset_evals).coset_ifft(shift);
         assert_eq!(poly, ifft_coeffs);
+    }
+
+    #[test]
+    fn test_coset_lde_fft_matches_composed_operations() {
+        type F = GoldilocksField;
+
+        for log_len in 3..8 {
+            let poly = PolynomialCoeffs::new(F::rand_vec(1 << log_len));
+            for rate_bits in 1..4 {
+                let expected = poly.lde(rate_bits).coset_fft_with_options(
+                    F::coset_shift(),
+                    Some(rate_bits),
+                    None,
+                );
+                let actual = poly.coset_lde_fft_with_options(
+                    F::coset_shift(),
+                    rate_bits,
+                    None,
+                );
+                assert_eq!(actual, expected);
+            }
+        }
     }
 
     #[test]
