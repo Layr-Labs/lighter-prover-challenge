@@ -146,6 +146,7 @@ dependencies = [
  "num_cpus",
  "paste",
  "plonky2",
+ "plonky2_maybe_rayon",
  "rand",
  "rayon",
  "serde",

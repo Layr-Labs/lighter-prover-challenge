@@ -25,6 +25,7 @@ itertools = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
 plonky2 = { workspace = true, default-features = true }
+plonky2_maybe_rayon = { path = "../vendor/plonky2/maybe_rayon", default-features = false, features = ["parallel"] }
 lazy_static = { workspace = true }
 serde = { workspace = true }
 rayon = { workspace = true }

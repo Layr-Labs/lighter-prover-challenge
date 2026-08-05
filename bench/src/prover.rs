@@ -10,6 +10,7 @@ use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, Circuit as _};
 use circuit::block_tx_constraints::{BlockTxCircuit, Circuit as _};
 use circuit::types::config::F;
 use circuit::types::constants::TX_LIGHT;
+use plonky2_maybe_rayon::*;
 
 use crate::api::{Circuits, Proof};
 
@@ -89,44 +90,57 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
         block.old_account_delta_tree_root,
     );
 
-    let mut heavy_jump =
+    let initial_jump =
         JumpState::initial(pre_output.new_state_root, block.old_account_delta_tree_root);
-    let mut light_jump = heavy_jump;
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
-    for route in chunk_routes(block) {
-        let txs = &block.tx_chunks[route.chunk_index];
-        let is_light = route.path == TxPath::Light;
-        let block_tx = BlockTx {
+    // The per-chunk transaction proofs are independent of one another (their
+    // jump links are pure public-input plumbing resolved by the fold pass
+    // below), so build every BlockTx witness up front and prove them all in
+    // parallel. Only the chain-fold steps, which consume the proofs in
+    // per-path order, remain sequential.
+    let routes = chunk_routes(block);
+    let block_txs: Vec<BlockTx<F>> = routes
+        .iter()
+        .map(|route| BlockTx {
             created_at: block.created_at,
             state_metadata_hash,
-            old_jump: if is_light { light_jump } else { heavy_jump },
-            txs: txs.clone(),
-        };
+            old_jump: initial_jump,
+            txs: block.tx_chunks[route.chunk_index].clone(),
+        })
+        .collect();
+    let tx_proofs: Vec<Proof> = routes.par_iter()
+        .zip(block_txs.par_iter())
+        .map(|(route, block_tx)| {
+            let is_light = route.path == TxPath::Light;
+            let result = if is_light {
+                BlockTxCircuit::prove(
+                    &circuits.light_tx_data,
+                    block_tx,
+                    &circuits.light_tx_target,
+                )
+            } else {
+                BlockTxCircuit::prove(
+                    &circuits.heavy_tx_data,
+                    block_tx,
+                    &circuits.heavy_tx_target,
+                )
+            };
+            result.unwrap_or_else(|error| {
+                panic!(
+                    "block transaction chunk #{} proof failed: {error:?}",
+                    route.chunk_index
+                )
+            })
+        })
+        .collect();
 
-        let tx_proof = if is_light {
-            BlockTxCircuit::prove(
-                &circuits.light_tx_data,
-                &block_tx,
-                &circuits.light_tx_target,
-            )
-        } else {
-            BlockTxCircuit::prove(
-                &circuits.heavy_tx_data,
-                &block_tx,
-                &circuits.heavy_tx_target,
-            )
-        }
-        .unwrap_or_else(|error| {
-            panic!(
-                "block transaction chunk #{} proof failed: {error:?}",
-                route.chunk_index
-            )
-        });
+    for (route, tx_proof) in routes.iter().zip(tx_proofs.into_iter()) {
+        let is_light = route.path == TxPath::Light;
 
         let tx_output = BlockTxWitness::from_public_inputs(&tx_proof.public_inputs);
         if is_light {
-            light_jump = tx_output.new_jump;
+            let _ = tx_output;
             light_chain_proof = BlockTxChainCircuit::prove(
                 &circuits.light_chain_target,
                 &circuits.light_chain_data,
@@ -142,7 +156,7 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
                 )
             });
         } else {
-            heavy_jump = tx_output.new_jump;
+            let _ = tx_output;
             heavy_chain_proof = BlockTxChainCircuit::prove(
                 &circuits.heavy_chain_target,
                 &circuits.heavy_chain_data,
