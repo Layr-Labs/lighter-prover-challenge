@@ -6,13 +6,23 @@ use circuit::block_constraints::{BlockCircuit, Circuit as _};
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
 use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
 use circuit::block_tx::{BlockTx, BlockTxWitness, JumpState};
-use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, Circuit as _, cyclic_base_witness};
+use circuit::block_tx_chain_constraints::{
+    BlockTxChainCircuit, BlockTxChainTarget, Circuit as _, cyclic_base_witness,
+};
 use circuit::block_tx_constraints::{BlockTxCircuit, Circuit as _};
 use circuit::tx::Tx;
-use circuit::types::config::F;
+use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
+use plonky2::hash::hash_types::HashOut;
+use plonky2::plonk::circuit_data::CircuitData;
 
 use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TxPath {
+    Heavy,
+    Light,
+}
 
 fn chunk_is_light(txs: &[Tx<F>]) -> bool {
     txs.first()
@@ -25,6 +35,148 @@ fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
     (light, heavy)
 }
 
+enum ChainState<'scope> {
+    Ready(Proof),
+    InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
+}
+
+impl ChainState<'_> {
+    fn wait(self) -> Proof {
+        match self {
+            ChainState::Ready(proof) => proof,
+            ChainState::InFlight(handle) => handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chain_step_proof(
+    path: TxPath,
+    chain_target: &BlockTxChainTarget,
+    chain_data: &CircuitData<F, C, D>,
+    chain_step: u64,
+    previous_proof: Option<&Proof>,
+    base_proof: &Proof,
+    dummy_proof: &Proof,
+    tx_proof: &Proof,
+) -> Proof {
+    BlockTxChainCircuit::prove(
+        chain_target,
+        chain_data,
+        chain_step,
+        previous_proof.unwrap_or(base_proof),
+        dummy_proof,
+        tx_proof,
+    )
+    .unwrap_or_else(|error| {
+        panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_path(
+    path: TxPath,
+    chunks: Vec<(usize, Vec<Tx<F>>)>,
+    circuits: &Circuits,
+    block_number: u64,
+    created_at: i64,
+    old_account_delta_tree_root: HashOut<F>,
+    pre_output: &BlockPreExecWitness<F>,
+    state_metadata_hash: HashOut<F>,
+) -> Proof {
+    assert!(
+        !chunks.is_empty(),
+        "{path:?} transaction path must contain at least one chunk"
+    );
+    let (tx_data, tx_target, chain_data, chain_target, dummy_proof) = match path {
+        TxPath::Light => (
+            &circuits.light_tx_data,
+            &circuits.light_tx_target,
+            &circuits.light_chain_data,
+            &circuits.light_chain_target,
+            &circuits.dummy_light_proof,
+        ),
+        TxPath::Heavy => (
+            &circuits.heavy_tx_data,
+            &circuits.heavy_tx_target,
+            &circuits.heavy_chain_data,
+            &circuits.heavy_chain_target,
+            &circuits.dummy_heavy_proof,
+        ),
+    };
+
+    let base_proof = cyclic_base_witness(
+        dummy_proof,
+        block_number,
+        created_at,
+        pre_output.new_state_root,
+        pre_output.new_validium_root,
+        old_account_delta_tree_root,
+    );
+    let mut jump = JumpState::initial(pre_output.new_state_root, old_account_delta_tree_root);
+
+    std::thread::scope(|scope| {
+        let base = &base_proof;
+        let mut chain: Option<ChainState<'_>> = None;
+        let mut pending_tx: Option<(u64, Proof)> = None;
+
+        for (step, (chunk_index, txs)) in chunks.into_iter().enumerate() {
+            if let Some((chain_step, tx_proof)) = pending_tx.take() {
+                let previous_proof = chain.take().map(ChainState::wait);
+                let handle = std::thread::Builder::new()
+                    .name(format!("{path:?}-chain-step-{chain_step}"))
+                    .stack_size(PROVER_THREAD_STACK_BYTES)
+                    .spawn_scoped(scope, move || {
+                        chain_step_proof(
+                            path,
+                            chain_target,
+                            chain_data,
+                            chain_step,
+                            previous_proof.as_ref(),
+                            base,
+                            dummy_proof,
+                            &tx_proof,
+                        )
+                    })
+                    .expect("chain step pipeline thread must start");
+                chain = Some(ChainState::InFlight(handle));
+            }
+
+            let block_tx = BlockTx {
+                created_at,
+                state_metadata_hash,
+                old_jump: jump,
+                txs,
+            };
+            let tx_proof =
+                BlockTxCircuit::prove(tx_data, &block_tx, tx_target).unwrap_or_else(|error| {
+                    panic!("block transaction chunk #{chunk_index} proof failed: {error:?}")
+                });
+            jump = BlockTxWitness::from_public_inputs(&tx_proof.public_inputs).new_jump;
+            pending_tx = Some((step as u64, tx_proof));
+        }
+
+        if let Some((chain_step, tx_proof)) = pending_tx.take() {
+            let previous_proof = chain.take().map(ChainState::wait);
+            chain = Some(ChainState::Ready(chain_step_proof(
+                path,
+                chain_target,
+                chain_data,
+                chain_step,
+                previous_proof.as_ref(),
+                base,
+                dummy_proof,
+                &tx_proof,
+            )));
+        }
+        chain
+            .map(ChainState::wait)
+            .expect("transaction path must produce a chain proof")
+    })
+}
+
 pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     let pre_proof = BlockPreExecutionCircuit::prove(
         &circuits.pre_data,
@@ -33,168 +185,53 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     )
     .expect("block pre-execution proof failed");
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
-
-    let has_light_chunks = block.tx_chunks.iter().any(|txs| chunk_is_light(txs));
-    let has_heavy_chunks = block.tx_chunks.iter().any(|txs| !chunk_is_light(txs));
-    let heavy_base_proof = if has_heavy_chunks {
-        cyclic_base_witness(
-            &circuits.dummy_heavy_proof,
-            block.block_number,
-            block.created_at,
-            pre_output.new_state_root,
-            pre_output.new_validium_root,
-            block.old_account_delta_tree_root,
-        )
-    } else {
-        BlockTxChainCircuit::cyclic_base_proof(
-            &circuits.heavy_chain_data,
-            &circuits.dummy_heavy_chain_circuit,
-            block.block_number,
-            block.created_at,
-            pre_output.new_state_root,
-            pre_output.new_validium_root,
-            block.old_account_delta_tree_root,
-        )
-    };
-    let light_base_proof = if has_light_chunks {
-        cyclic_base_witness(
-            &circuits.dummy_light_proof,
-            block.block_number,
-            block.created_at,
-            pre_output.new_state_root,
-            pre_output.new_validium_root,
-            block.old_account_delta_tree_root,
-        )
-    } else {
-        BlockTxChainCircuit::cyclic_base_proof(
-            &circuits.light_chain_data,
-            &circuits.dummy_light_chain_circuit,
-            block.block_number,
-            block.created_at,
-            pre_output.new_state_root,
-            pre_output.new_validium_root,
-            block.old_account_delta_tree_root,
-        )
-    };
-
-    let mut heavy_jump =
-        JumpState::initial(pre_output.new_state_root, block.old_account_delta_tree_root);
-    let mut light_jump = heavy_jump;
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
-    let mut heavy_step = 0;
-    let mut light_step = 0;
     let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    let (light_chain_proof, heavy_chain_proof) = std::thread::scope(|scope| {
-        let chain_worker = std::thread::Builder::new()
-            .stack_size(PROVER_THREAD_STACK_BYTES)
-            .spawn_scoped(scope, move || {
-                let mut heavy_chain_proof: Option<Proof> = None;
-                let mut light_chain_proof: Option<Proof> = None;
-
-                while let Ok((is_light, chain_step, tx_proof)) = receiver.recv() {
-                    if is_light {
-                        let previous_proof = light_chain_proof
-                            .as_ref()
-                            .unwrap_or(&light_base_proof);
-                        light_chain_proof = Some(
-                            BlockTxChainCircuit::prove(
-                                &circuits.light_chain_target,
-                                &circuits.light_chain_data,
-                                chain_step,
-                                previous_proof,
-                                &circuits.dummy_light_proof,
-                                &tx_proof,
-                            )
-                            .unwrap_or_else(|error| {
-                                panic!(
-                                    "light block transaction chain step #{chain_step} failed: {error:?}"
-                                )
-                            }),
-                        );
-                    } else {
-                        let previous_proof = heavy_chain_proof
-                            .as_ref()
-                            .unwrap_or(&heavy_base_proof);
-                        heavy_chain_proof = Some(
-                            BlockTxChainCircuit::prove(
-                                &circuits.heavy_chain_target,
-                                &circuits.heavy_chain_data,
-                                chain_step,
-                                previous_proof,
-                                &circuits.dummy_heavy_proof,
-                                &tx_proof,
-                            )
-                            .unwrap_or_else(|error| {
-                                panic!(
-                                    "heavy block transaction chain step #{chain_step} failed: {error:?}"
-                                )
-                            }),
-                        );
-                    }
-                }
-
-                (
-                    light_chain_proof.unwrap_or(light_base_proof),
-                    heavy_chain_proof.unwrap_or(heavy_base_proof),
-                )
-            })
-            .expect("cannot spawn chain recursion worker");
-
-        for (chunk_index, txs) in tx_chunks.drain(..).enumerate() {
-            let is_light = chunk_is_light(&txs);
-            let chain_step = if is_light {
-                let step = light_step;
-                light_step += 1;
-                step
-            } else {
-                let step = heavy_step;
-                heavy_step += 1;
-                step
-            };
-            let block_tx = BlockTx {
-                created_at: block.created_at,
-                state_metadata_hash,
-                old_jump: if is_light { light_jump } else { heavy_jump },
-                txs,
-            };
-
-            let tx_proof = if is_light {
-                BlockTxCircuit::prove(
-                    &circuits.light_tx_data,
-                    &block_tx,
-                    &circuits.light_tx_target,
-                )
-            } else {
-                BlockTxCircuit::prove(
-                    &circuits.heavy_tx_data,
-                    &block_tx,
-                    &circuits.heavy_tx_target,
-                )
-            }
-            .unwrap_or_else(|error| {
-                panic!("block transaction chunk #{chunk_index} proof failed: {error:?}")
-            });
-
-            let tx_output = BlockTxWitness::from_public_inputs(&tx_proof.public_inputs);
-            if is_light {
-                light_jump = tx_output.new_jump;
-            } else {
-                heavy_jump = tx_output.new_jump;
-            }
-            sender
-                .send((is_light, chain_step, tx_proof))
-                .expect("chain recursion worker stopped");
+    let mut heavy_chunks: Vec<(usize, Vec<Tx<F>>)> = Vec::new();
+    let mut light_chunks: Vec<(usize, Vec<Tx<F>>)> = Vec::with_capacity(tx_chunks.len());
+    for (chunk_index, txs) in tx_chunks.drain(..).enumerate() {
+        if chunk_is_light(&txs) {
+            light_chunks.push((chunk_index, txs));
+        } else {
+            heavy_chunks.push((chunk_index, txs));
         }
-        drop(sender);
-
-        chain_worker
-            .join()
-            .expect("chain recursion worker panicked")
-    });
+    }
     block.tx_chunks = tx_chunks;
     block.tx_chunks.push(Vec::new());
+
+    let (light_chain_proof, heavy_chain_proof) = std::thread::scope(|scope| {
+        let heavy_handle = std::thread::Builder::new()
+            .name("heavy-tx-chain".into())
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, || {
+                prove_path(
+                    TxPath::Heavy,
+                    heavy_chunks,
+                    circuits,
+                    block.block_number,
+                    block.created_at,
+                    block.old_account_delta_tree_root,
+                    &pre_output,
+                    state_metadata_hash,
+                )
+            })
+            .expect("heavy transaction chain thread must start");
+        let light_chain_proof = prove_path(
+            TxPath::Light,
+            light_chunks,
+            circuits,
+            block.block_number,
+            block.created_at,
+            block.old_account_delta_tree_root,
+            &pre_output,
+            state_metadata_hash,
+        );
+        let heavy_chain_proof = heavy_handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (light_chain_proof, heavy_chain_proof)
+    });
 
     let (light_chain_input, heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);

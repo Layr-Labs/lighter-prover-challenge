@@ -24,7 +24,9 @@ inline ulong gl_mul(ulong a, ulong b) {
     if (reduced > low) {
         reduced -= GOLDILOCKS_EPSILON;
     }
-    return gl_add(reduced, high_low * GOLDILOCKS_EPSILON);
+    ulong addend = high_low * GOLDILOCKS_EPSILON;
+    ulong result = reduced + addend;
+    return result + (result < reduced) * GOLDILOCKS_EPSILON;
 }
 
 inline ulong gl_canonicalize(ulong value) {

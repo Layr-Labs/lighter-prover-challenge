@@ -11,7 +11,6 @@ use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
 use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::proof::ProofWithPublicInputs;
-use plonky2::recursion::dummy_circuit::dummy_circuit;
 
 pub type Proof = ProofWithPublicInputs<F, C, D>;
 
@@ -38,8 +37,6 @@ pub struct Circuits {
     pub light_chain_data: CircuitData<F, C, D>,
     pub block_target: BlockTarget,
     pub block_data: CircuitData<F, C, D>,
-    pub dummy_heavy_chain_circuit: CircuitData<F, C, D>,
-    pub dummy_light_chain_circuit: CircuitData<F, C, D>,
     pub dummy_heavy_proof: Proof,
     pub dummy_light_proof: Proof,
 }
@@ -48,7 +45,6 @@ struct PathCircuits {
     tx_data: CircuitData<F, C, D>,
     chain_target: BlockTxChainTarget,
     chain_data: CircuitData<F, C, D>,
-    dummy_chain_circuit: CircuitData<F, C, D>,
     dummy_proof: Proof,
 }
 
@@ -63,7 +59,6 @@ impl PathCircuits {
         let chain_target = chain.target;
         let chain_data = chain.builder.build::<C>();
 
-        let dummy_chain_circuit = dummy_circuit(&chain_data.common);
         let proof_bytes: &[u8] = match tx_mode {
             TX_HEAVY => include_bytes!("../dummy-heavy-chain-proof.bin"),
             TX_LIGHT => include_bytes!("../dummy-light-chain-proof.bin"),
@@ -77,7 +72,6 @@ impl PathCircuits {
             tx_data,
             chain_target,
             chain_data,
-            dummy_chain_circuit,
             dummy_proof,
         }
     }
@@ -121,8 +115,6 @@ impl Circuits {
             light_chain_data: light.chain_data,
             block_target,
             block_data,
-            dummy_heavy_chain_circuit: heavy.dummy_chain_circuit,
-            dummy_light_chain_circuit: light.dummy_chain_circuit,
             dummy_heavy_proof: heavy.dummy_proof,
             dummy_light_proof: light.dummy_proof,
         }
