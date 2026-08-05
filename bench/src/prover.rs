@@ -61,6 +61,132 @@ fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
     (light, heavy)
 }
 
+fn join_proof_paths<LightFn, HeavyFn, Light, Heavy>(
+    light: LightFn,
+    heavy: HeavyFn,
+) -> (Light, Heavy)
+where
+    LightFn: FnOnce() -> Light + Send,
+    HeavyFn: FnOnce() -> Heavy + Send,
+    Light: Send,
+    Heavy: Send,
+{
+    std::thread::scope(|scope| {
+        let light = scope.spawn(light);
+        let heavy = heavy();
+        (light.join().expect("light proof path panicked"), heavy)
+    })
+}
+
+fn run_pipeline<Items, Produced, Accumulator, Produce, Initialize, Consume>(
+    items: Items,
+    mut produce: Produce,
+    initialize: Initialize,
+    mut consume: Consume,
+) -> Accumulator
+where
+    Items: IntoIterator + Send,
+    Produced: Send,
+    Produce: FnMut(Items::Item) -> Produced + Send,
+    Initialize: FnOnce() -> Accumulator,
+    Consume: FnMut(Accumulator, Produced) -> Accumulator,
+{
+    std::thread::scope(|scope| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let producer = scope.spawn(move || {
+            for item in items {
+                if sender.send(produce(item)).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut accumulator = initialize();
+        for produced in receiver {
+            accumulator = consume(accumulator, produced);
+        }
+        producer.join().expect("proof pipeline producer panicked");
+        accumulator
+    })
+}
+
+fn prove_tx_path(
+    block: &Block<F>,
+    circuits: &Circuits,
+    pre_output: &BlockPreExecWitness<F>,
+    routes: &[ChunkRoute],
+    path: TxPath,
+) -> Proof {
+    let (tx_data, tx_target, chain_data, chain_target, dummy_chain_circuit, dummy_tx_proof) =
+        match path {
+            TxPath::Heavy => (
+                &circuits.heavy_tx_data,
+                &circuits.heavy_tx_target,
+                &circuits.heavy_chain_data,
+                &circuits.heavy_chain_target,
+                &circuits.dummy_heavy_chain_circuit,
+                &circuits.dummy_heavy_proof,
+            ),
+            TxPath::Light => (
+                &circuits.light_tx_data,
+                &circuits.light_tx_target,
+                &circuits.light_chain_data,
+                &circuits.light_chain_target,
+                &circuits.dummy_light_chain_circuit,
+                &circuits.dummy_light_proof,
+            ),
+        };
+    let mut jump = JumpState::initial(pre_output.new_state_root, block.old_account_delta_tree_root);
+    let state_metadata_hash = pre_output.new_state_metadata.hash();
+
+    run_pipeline(
+        routes.iter().copied().filter(|route| route.path == path),
+        |route| {
+            let block_tx = BlockTx {
+                created_at: block.created_at,
+                state_metadata_hash,
+                old_jump: jump,
+                txs: block.tx_chunks[route.chunk_index].clone(),
+            };
+            let tx_proof =
+                BlockTxCircuit::prove(tx_data, &block_tx, tx_target).unwrap_or_else(|error| {
+                    panic!(
+                        "{path:?} block transaction chunk #{} proof failed: {error:?}",
+                        route.chunk_index
+                    )
+                });
+            jump = BlockTxWitness::from_public_inputs(&tx_proof.public_inputs).new_jump;
+            (route, tx_proof)
+        },
+        || {
+            BlockTxChainCircuit::cyclic_base_proof(
+                chain_data,
+                dummy_chain_circuit,
+                block.block_number,
+                block.created_at,
+                pre_output.new_state_root,
+                pre_output.new_validium_root,
+                block.old_account_delta_tree_root,
+            )
+        },
+        |chain_proof, (route, tx_proof)| {
+            BlockTxChainCircuit::prove(
+                chain_target,
+                chain_data,
+                route.chain_step,
+                &chain_proof,
+                dummy_tx_proof,
+                &tx_proof,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{path:?} block transaction chain step #{} failed: {error:?}",
+                    route.chain_step
+                )
+            })
+        },
+    )
+}
+
 pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
     let pre_proof = BlockPreExecutionCircuit::prove(
         &circuits.pre_data,
@@ -69,96 +195,11 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
     )
     .expect("block pre-execution proof failed");
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
-
-    let mut heavy_chain_proof = BlockTxChainCircuit::cyclic_base_proof(
-        &circuits.heavy_chain_data,
-        &circuits.dummy_heavy_chain_circuit,
-        block.block_number,
-        block.created_at,
-        pre_output.new_state_root,
-        pre_output.new_validium_root,
-        block.old_account_delta_tree_root,
+    let routes = chunk_routes(block);
+    let (light_chain_proof, heavy_chain_proof) = join_proof_paths(
+        || prove_tx_path(block, circuits, &pre_output, &routes, TxPath::Light),
+        || prove_tx_path(block, circuits, &pre_output, &routes, TxPath::Heavy),
     );
-    let mut light_chain_proof = BlockTxChainCircuit::cyclic_base_proof(
-        &circuits.light_chain_data,
-        &circuits.dummy_light_chain_circuit,
-        block.block_number,
-        block.created_at,
-        pre_output.new_state_root,
-        pre_output.new_validium_root,
-        block.old_account_delta_tree_root,
-    );
-
-    let mut heavy_jump =
-        JumpState::initial(pre_output.new_state_root, block.old_account_delta_tree_root);
-    let mut light_jump = heavy_jump;
-    let state_metadata_hash = pre_output.new_state_metadata.hash();
-
-    for route in chunk_routes(block) {
-        let txs = &block.tx_chunks[route.chunk_index];
-        let is_light = route.path == TxPath::Light;
-        let block_tx = BlockTx {
-            created_at: block.created_at,
-            state_metadata_hash,
-            old_jump: if is_light { light_jump } else { heavy_jump },
-            txs: txs.clone(),
-        };
-
-        let tx_proof = if is_light {
-            BlockTxCircuit::prove(
-                &circuits.light_tx_data,
-                &block_tx,
-                &circuits.light_tx_target,
-            )
-        } else {
-            BlockTxCircuit::prove(
-                &circuits.heavy_tx_data,
-                &block_tx,
-                &circuits.heavy_tx_target,
-            )
-        }
-        .unwrap_or_else(|error| {
-            panic!(
-                "block transaction chunk #{} proof failed: {error:?}",
-                route.chunk_index
-            )
-        });
-
-        let tx_output = BlockTxWitness::from_public_inputs(&tx_proof.public_inputs);
-        if is_light {
-            light_jump = tx_output.new_jump;
-            light_chain_proof = BlockTxChainCircuit::prove(
-                &circuits.light_chain_target,
-                &circuits.light_chain_data,
-                route.chain_step,
-                &light_chain_proof,
-                &circuits.dummy_light_proof,
-                &tx_proof,
-            )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "light block transaction chain step #{} failed: {error:?}",
-                    route.chain_step
-                )
-            });
-        } else {
-            heavy_jump = tx_output.new_jump;
-            heavy_chain_proof = BlockTxChainCircuit::prove(
-                &circuits.heavy_chain_target,
-                &circuits.heavy_chain_data,
-                route.chain_step,
-                &heavy_chain_proof,
-                &circuits.dummy_heavy_proof,
-                &tx_proof,
-            )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "heavy block transaction chain step #{} failed: {error:?}",
-                    route.chain_step
-                )
-            });
-        }
-    }
 
     let (light_chain_input, heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
@@ -175,6 +216,10 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
     use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
 
     use super::*;
@@ -252,5 +297,63 @@ mod tests {
         let heavy = "heavy";
 
         assert_eq!(final_chain_inputs(&light, &heavy), (&light, &heavy));
+    }
+
+    #[test]
+    fn proof_paths_execute_concurrently_and_preserve_result_order() {
+        let ready = Arc::new(AtomicUsize::new(0));
+        let path = |name| {
+            let ready = Arc::clone(&ready);
+            move || {
+                ready.fetch_add(1, Ordering::SeqCst);
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while ready.load(Ordering::SeqCst) != 2 && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                (name, ready.load(Ordering::SeqCst) == 2)
+            }
+        };
+
+        let (light, heavy) = join_proof_paths(path("light"), path("heavy"));
+
+        assert_eq!(light, ("light", true));
+        assert_eq!(heavy, ("heavy", true));
+    }
+
+    #[test]
+    fn pipeline_overlaps_next_production_with_current_consumption() {
+        let state = Arc::new(AtomicUsize::new(0));
+        let producer_state = Arc::clone(&state);
+        let consumer_state = Arc::clone(&state);
+
+        let overlaps = run_pipeline(
+            0..2,
+            move |item| {
+                if item == 1 {
+                    producer_state.fetch_or(1, Ordering::SeqCst);
+                    let deadline = Instant::now() + Duration::from_secs(1);
+                    while producer_state.load(Ordering::SeqCst) != 3 && Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                }
+                (item, producer_state.load(Ordering::SeqCst) == 3)
+            },
+            Vec::new,
+            move |mut overlaps: Vec<bool>, (item, producer_overlapped)| {
+                if item == 0 {
+                    consumer_state.fetch_or(2, Ordering::SeqCst);
+                    let deadline = Instant::now() + Duration::from_secs(1);
+                    while consumer_state.load(Ordering::SeqCst) != 3 && Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                    overlaps.push(consumer_state.load(Ordering::SeqCst) == 3);
+                } else {
+                    overlaps.push(producer_overlapped);
+                }
+                overlaps
+            },
+        );
+
+        assert_eq!(overlaps, vec![true, true]);
     }
 }
