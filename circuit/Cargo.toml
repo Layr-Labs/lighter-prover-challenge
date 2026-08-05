@@ -28,7 +28,7 @@ num = { workspace = true }
 itertools = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
-plonky2 = { workspace = true, default-features = false }
+plonky2 = { workspace = true, default-features = true }
 lazy_static = { workspace = true }
 serde = { workspace = true }
 rayon = { workspace = true }

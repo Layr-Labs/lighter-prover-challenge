@@ -11,10 +11,12 @@ use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
 
 use crate::hash::hash_types::{HashOut, RichField};
-use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
+use crate::hash::poseidon2::config::{
+    EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64,
+};
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
-const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
+const MIN_GPU_PERMUTATIONS: usize = 1 << 14;
 
 struct MetalContext {
     device: Device,
@@ -26,7 +28,8 @@ struct MetalContext {
     output_buffer: Option<Buffer>,
 }
 
-static CONTEXT: LazyLock<Result<Mutex<MetalContext>, String>> = LazyLock::new(MetalContext::new);
+static CONTEXT: LazyLock<Result<Mutex<MetalContext>, String>> =
+    LazyLock::new(MetalContext::new);
 
 pub(crate) fn build_merkle_tree<F: RichField>(
     leaves: &[Vec<F>],
@@ -136,17 +139,20 @@ impl MetalContext {
         let input_bytes = input_len
             .checked_mul(size_of::<u64>())
             .ok_or("Metal leaf input size overflow")?;
-        if self.input_buffer.as_ref().map_or(true, |buffer| {
-            buffer.length() < input_bytes.max(size_of::<u64>()) as u64
-        }) {
+        if self
+            .input_buffer
+            .as_ref()
+            .map_or(true, |buffer| buffer.length() < input_bytes.max(size_of::<u64>()) as u64)
+        {
             self.input_buffer = Some(self.device.new_buffer(
                 input_bytes.max(size_of::<u64>()) as u64,
                 MTLResourceOptions::StorageModeShared,
             ));
         }
         let input_buffer = self.input_buffer.as_ref().unwrap();
-        let input =
-            unsafe { slice::from_raw_parts_mut(input_buffer.contents().cast::<u64>(), input_len) };
+        let input = unsafe {
+            slice::from_raw_parts_mut(input_buffer.contents().cast::<u64>(), input_len)
+        };
         if leaf_width != 0 {
             input
                 .par_chunks_exact_mut(leaf_width)
@@ -241,8 +247,9 @@ impl MetalContext {
             ));
         }
 
-        let nodes =
-            unsafe { slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len) };
+        let nodes = unsafe {
+            slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
+        };
         Ok(tree_from_levels(
             nodes,
             &level_offsets,
@@ -327,8 +334,20 @@ fn fill_subtree_layout<F: RichField>(
     let (left_root, left_digests) = left_half.split_last_mut().unwrap();
     let (right_root, right_digests) = right_half.split_first_mut().unwrap();
     let half = leaf_count / 2;
-    *left_root = fill_subtree_layout(left_digests, nodes, level_offsets, start_leaf, half);
-    *right_root = fill_subtree_layout(right_digests, nodes, level_offsets, start_leaf + half, half);
+    *left_root = fill_subtree_layout(
+        left_digests,
+        nodes,
+        level_offsets,
+        start_leaf,
+        half,
+    );
+    *right_root = fill_subtree_layout(
+        right_digests,
+        nodes,
+        level_offsets,
+        start_leaf + half,
+        half,
+    );
 
     let level = leaf_count.ilog2() as usize;
     read_node(nodes, level_offsets[level], start_leaf / leaf_count)
@@ -394,7 +413,10 @@ mod tests {
     fn cpu_tree(
         leaves: &[Vec<GoldilocksField>],
         cap_height: usize,
-    ) -> (Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>) {
+    ) -> (
+        Vec<HashOut<GoldilocksField>>,
+        Vec<HashOut<GoldilocksField>>,
+    ) {
         let cap_len = 1 << cap_height;
         let digest_len = 2 * (leaves.len() - cap_len);
         let mut digests = Vec::with_capacity(digest_len);
@@ -417,8 +439,14 @@ mod tests {
     }
 
     fn assert_tree_eq(
-        actual: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
-        expected: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
+        actual: &(
+            Vec<HashOut<GoldilocksField>>,
+            Vec<HashOut<GoldilocksField>>,
+        ),
+        expected: &(
+            Vec<HashOut<GoldilocksField>>,
+            Vec<HashOut<GoldilocksField>>,
+        ),
         width: usize,
         cap_height: usize,
     ) {
