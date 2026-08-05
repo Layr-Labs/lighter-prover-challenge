@@ -7,7 +7,6 @@ use circuit::block_pre_execution_constraints::{
 };
 use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, BlockTxChainTarget, Circuit as _};
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _};
-use circuit::builder::custom::cyclic_base_proof;
 use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
 use plonky2::plonk::circuit_data::CircuitData;
@@ -40,8 +39,6 @@ pub struct Circuits {
     pub block_data: CircuitData<F, C, D>,
     pub dummy_heavy_chain_circuit: CircuitData<F, C, D>,
     pub dummy_light_chain_circuit: CircuitData<F, C, D>,
-    pub dummy_heavy_proof: Proof,
-    pub dummy_light_proof: Proof,
 }
 
 struct PathCircuits {
@@ -50,11 +47,10 @@ struct PathCircuits {
     chain_target: BlockTxChainTarget,
     chain_data: CircuitData<F, C, D>,
     dummy_chain_circuit: CircuitData<F, C, D>,
-    dummy_proof: Proof,
 }
 
 impl PathCircuits {
-    fn build(tx_per_proof: usize, mode: u8, label: &str) -> Self {
+    fn build(tx_per_proof: usize, mode: u8, _label: &str) -> Self {
         let tx = BlockTxCircuit::define(CIRCUIT_CONFIG, tx_per_proof, CHAIN_ID, mode);
         let tx_target = tx.target;
         let tx_data = tx.builder.build::<C>();
@@ -64,14 +60,10 @@ impl PathCircuits {
         let chain_target = chain.target;
         let chain_data = chain.builder.build::<C>();
 
+        // The per-block cyclic base proof (a valid proof of this same dummy
+        // circuit) fills both step-zero witness roles, so no standalone
+        // all-zero dummy proof is needed.
         let dummy_chain_circuit = dummy_circuit(&chain_data.common);
-        let dummy_proof = cyclic_base_proof(
-            &chain_data.common,
-            &chain_data.verifier_only,
-            &dummy_chain_circuit,
-            [].into_iter().collect(),
-        )
-        .unwrap_or_else(|error| panic!("cannot construct {label} chain dummy proof: {error:?}"));
 
         Self {
             tx_target,
@@ -79,7 +71,6 @@ impl PathCircuits {
             chain_target,
             chain_data,
             dummy_chain_circuit,
-            dummy_proof,
         }
     }
 }
@@ -124,8 +115,6 @@ impl Circuits {
             block_data,
             dummy_heavy_chain_circuit: heavy.dummy_chain_circuit,
             dummy_light_chain_circuit: light.dummy_chain_circuit,
-            dummy_heavy_proof: heavy.dummy_proof,
-            dummy_light_proof: light.dummy_proof,
         }
     }
 }
