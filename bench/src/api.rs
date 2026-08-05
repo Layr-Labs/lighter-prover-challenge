@@ -40,6 +40,7 @@ pub struct Circuits {
     pub dummy_heavy_proof: Proof,
     pub dummy_light_proof: Proof,
 }
+
 struct PathCircuits {
     tx_target: BlockTxTarget,
     tx_data: CircuitData<F, C, D>,
@@ -91,7 +92,6 @@ impl Circuits {
                 )
             },
         );
-
         let block = BlockCircuit::define(
             CIRCUIT_CONFIG,
             &pre_data,
@@ -101,7 +101,6 @@ impl Circuits {
         );
         let block_target = block.target;
         let block_data = block.builder.build::<C>();
-
         Self {
             heavy_tx_target: heavy.tx_target,
             heavy_tx_data: heavy.tx_data,

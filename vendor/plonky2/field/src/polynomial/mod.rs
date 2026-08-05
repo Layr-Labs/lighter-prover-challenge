@@ -292,6 +292,7 @@ impl<F: Field> PolynomialCoeffs<F> {
         modified_poly.fft_with_options(zero_factor, root_table)
     }
 
+
     pub fn to_extension<const D: usize>(&self) -> PolynomialCoeffs<F::Extension>
     where
         F: Extendable<D>,
@@ -472,6 +473,7 @@ mod tests {
             }
         );
     }
+
 
     #[test]
     fn test_coset_fft() {
