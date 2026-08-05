@@ -35,7 +35,7 @@ use crate::gates::lookup::Lookup;
 use crate::gates::selectors::SelectorsInfo;
 use crate::hash::hash_types::{HashOutTarget, MerkleCapTarget, RichField};
 use crate::hash::merkle_proofs::{MerkleProof, MerkleProofTarget};
-use crate::hash::merkle_tree::{MerkleCap, MerkleTree};
+use crate::hash::merkle_tree::{LeafMatrix, MerkleCap, MerkleTree};
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::generator::WitnessGeneratorRef;
 use crate::iop::target::{BoolTarget, Target};
@@ -332,7 +332,7 @@ pub trait Read {
         let cap_height = self.read_usize()?;
         let cap = self.read_merkle_cap::<F, H>(cap_height)?;
         Ok(MerkleTree {
-            leaves,
+            leaves: LeafMatrix::from_rows(leaves),
             digests,
             cap,
         })

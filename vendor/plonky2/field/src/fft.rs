@@ -70,12 +70,36 @@ pub fn ifft_with_options<F: Field>(
     zero_factor: Option<usize>,
     root_table: Option<&FftRootTable<F>>,
 ) -> PolynomialCoeffs<F> {
+    ifft_inner(poly, zero_factor, root_table, false)
+}
+
+/// Like [`ifft_with_options`], but expects the evaluations to already be in bit-reversed order.
+pub fn ifft_with_options_bit_reversed_input<F: Field>(
+    poly: PolynomialValues<F>,
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+) -> PolynomialCoeffs<F> {
+    ifft_inner(poly, zero_factor, root_table, true)
+}
+
+fn ifft_inner<F: Field>(
+    poly: PolynomialValues<F>,
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+    bit_reversed_input: bool,
+) -> PolynomialCoeffs<F> {
     let n = poly.len();
     let lg_n = log2_strict(n);
     let n_inv = F::inverse_2exp(lg_n);
 
     let PolynomialValues { values: mut buffer } = poly;
-    fft_dispatch(&mut buffer, zero_factor, root_table);
+    if bit_reversed_input {
+        let computed_root_table = root_table.is_none().then(|| fft_root_table(buffer.len()));
+        let used_root_table = root_table.or(computed_root_table.as_ref()).unwrap();
+        fft_classic_bit_reversed_input(&mut buffer, zero_factor.unwrap_or(0), used_root_table);
+    } else {
+        fft_dispatch(&mut buffer, zero_factor, root_table);
+    }
 
     // We reverse all values except the first, and divide each by n.
     buffer[0] *= n_inv;
@@ -164,17 +188,17 @@ fn fft_classic_simd<P: PackedField>(
 /// definitely zero.
 pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &FftRootTable<F>) {
     reverse_index_bits_in_place(values);
+    fft_classic_bit_reversed_input(values, r, root_table);
+}
 
+/// Like [`fft_classic`], but expects `values` to already be in bit-reversed order, skipping the
+/// initial permutation. Used by callers that produce their evaluations in that order anyway.
+pub(crate) fn fft_classic_bit_reversed_input<F: Field>(
+    values: &mut [F],
+    r: usize,
+    root_table: &FftRootTable<F>,
+) {
     let n = values.len();
-    let lg_n = log2_strict(n);
-
-    if root_table.len() != lg_n {
-        panic!(
-            "Expected root table of length {}, but it was {}.",
-            lg_n,
-            root_table.len()
-        );
-    }
 
     // After reverse_index_bits, the only non-zero elements of values
     // are at indices i*2^r for i = 0..n/2^r.  The loop below copies
@@ -189,6 +213,69 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
         for i in 0..n {
             values[i] = values[i & mask];
         }
+    }
+
+    fft_classic_butterflies(values, r, root_table);
+}
+
+/// Computes the low-degree extension of `coeffs` over the coset `shift * H`, in natural point
+/// order.
+///
+/// This is the fused equivalent of `coeffs.lde(rate_bits).coset_fft_with_options(shift,
+/// Some(rate_bits), root_table)`. Done that way it costs two full `n << rate_bits` allocations, a
+/// coset scaling of which `1 - 2^-rate_bits` of the multiplies are against zero padding, an
+/// in-place bit reversal of the *extended* array, and a broadcast pass.
+///
+/// Instead, scale and bit-reverse only the `n` real coefficients — a small, cache-resident array —
+/// then emit the prepared input in one sequential pass: after bit reversal the non-zero entries
+/// land exactly at the multiples of `2^rate_bits`, and the first `rate_bits` rounds of the
+/// decimation-in-time network just repeat each of them across the following `2^rate_bits - 1`
+/// slots. Only the butterflies then remain.
+pub fn lde_coset_fft<F: Field>(
+    coeffs: &[F],
+    shift: F,
+    rate_bits: usize,
+    root_table: Option<&FftRootTable<F>>,
+) -> Vec<F> {
+    let n = coeffs.len();
+    let lde_len = n << rate_bits;
+    let rate = 1usize << rate_bits;
+
+    // Only the real coefficients need the coset scaling; the padding is zero. Bit-reverse this
+    // small, cache-resident array rather than the extended one, so the emit loop below reads and
+    // writes sequentially.
+    let mut scaled: Vec<F> = shift.powers().zip(coeffs).map(|(r, &c)| r * c).collect();
+    reverse_index_bits_in_place(&mut scaled);
+
+    let mut values = Vec::with_capacity(lde_len);
+    for value in scaled {
+        values.extend(core::iter::repeat_n(value, rate));
+    }
+    debug_assert_eq!(values.len(), lde_len);
+
+    let computed_root_table = root_table.is_none().then(|| fft_root_table(lde_len));
+    let used_root_table = root_table.or(computed_root_table.as_ref()).unwrap();
+    fft_classic_butterflies(&mut values, rate_bits, used_root_table);
+    values
+}
+
+/// The butterfly network of [`fft_classic`], with no input preparation at all: `values` must
+/// already be bit-reversed *and* have had the first `r` (zero-padding) rounds applied, i.e. each
+/// run of `2^r` entries already holds its repeated value.
+pub(crate) fn fft_classic_butterflies<F: Field>(
+    values: &mut [F],
+    r: usize,
+    root_table: &FftRootTable<F>,
+) {
+    let n = values.len();
+    let lg_n = log2_strict(n);
+
+    if root_table.len() != lg_n {
+        panic!(
+            "Expected root table of length {}, but it was {}.",
+            lg_n,
+            root_table.len()
+        );
     }
 
     let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);

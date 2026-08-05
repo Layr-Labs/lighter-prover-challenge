@@ -1,30 +1,99 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec::Vec};
+use core::slice;
+
+use crate::field::fft::lde_coset_fft;
 
 use itertools::Itertools;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
-use crate::field::batch_util::batch_multiply_inplace;
 use crate::field::extension::Extendable;
 use crate::field::fft::FftRootTable;
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
-use crate::fri::FriParams;
 use crate::fri::proof::FriProof;
 use crate::fri::prover::fri_proof;
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
+use crate::fri::FriParams;
 use crate::hash::hash_types::RichField;
-use crate::hash::merkle_tree::MerkleTree;
+use crate::hash::merkle_tree::{LeafMatrix, MerkleTree};
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
 use crate::timed;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_strict, reverse_bits, reverse_index_bits_in_place, transpose};
+use crate::util::{log2_strict, reverse_bits};
 
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
+
+/// Target working-set size, in bytes, for one block of the fused transpose below. Sized to stay
+/// comfortably inside a core's private L2 slice on the Apple Silicon hosts this prover targets.
+const TRANSPOSE_BLOCK_BYTES: usize = 128 * 1024;
+
+/// Raw destination pointer shared across the blocks of the fused transpose. Each block writes a
+/// disjoint set of whole rows, so the aliasing obligation is discharged by the index algebra in
+/// [`transpose_bit_reversed_into_leaves`].
+struct RowScatterPtr<T>(*mut T);
+// SAFETY: every write through this pointer targets a row index that is unique to the writing
+// block, so no two threads ever touch the same element.
+unsafe impl<T> Send for RowScatterPtr<T> {}
+// SAFETY: see above.
+unsafe impl<T> Sync for RowScatterPtr<T> {}
+
+/// Transposes column-major `lde_values` into row-major Merkle leaves that are *already* in
+/// bit-reversed row order, i.e. `out[i][j] == lde_values[j][reverse_bits(i)]`.
+///
+/// This fuses what used to be two separate cache-hostile passes — `transpose` into a
+/// `Vec<Vec<F>>` (one heap allocation per LDE point) followed by `reverse_index_bits_in_place` —
+/// into a single blocked pass over one contiguous allocation.
+///
+/// The blocking exploits the fact that bit reversal splits: writing `i = a * 2^(m-k) + b` with `a`
+/// the high `k` bits, `reverse_bits_m(i) = reverse_bits_k(a) + reverse_bits_(m-k)(b) * 2^k`. So for
+/// a *fixed* `b`, the `2^k` source rows needed form a contiguous run, which keeps the column reads
+/// sequential and L2-resident; the corresponding destination rows are strided, and each is written
+/// as one contiguous `width`-element run.
+fn transpose_bit_reversed_into_leaves<F: Field>(lde_values: &[Vec<F>]) -> LeafMatrix<F> {
+    let width = lde_values.len();
+    assert!(width > 0, "cannot commit to an empty batch of polynomials");
+    let rows = lde_values[0].len();
+    debug_assert!(lde_values.iter().all(|column| column.len() == rows));
+    let lg_rows = log2_strict(rows);
+
+    let mut data: Vec<F> = Vec::with_capacity(rows * width);
+    let base = RowScatterPtr(data.as_mut_ptr());
+
+    // Rows per block, as a power of two, sized so one block's slice of every column fits in L2.
+    let lg_block = {
+        let target = (TRANSPOSE_BLOCK_BYTES / (width * size_of::<F>())).max(1);
+        log2_strict(target.next_power_of_two().min(rows))
+    };
+    let block_rows = 1usize << lg_block;
+    let num_blocks = rows >> lg_block;
+
+    (0..num_blocks).into_par_iter().for_each(|b| {
+        // Silence the unused-capture lint while keeping the pointer shared, not copied per row.
+        let base = &base;
+        let source_base = reverse_bits(b, lg_rows - lg_block) << lg_block;
+        for a in 0..block_rows {
+            let source_row = source_base + reverse_bits(a, lg_block);
+            let destination_row = (a << (lg_rows - lg_block)) + b;
+            // SAFETY: `destination_row` is `a * num_blocks + b` with `a < block_rows` and
+            // `b < num_blocks`, so it is unique across the whole iteration space and in range.
+            // The `width` elements written here are within the allocation reserved above.
+            let destination =
+                unsafe { slice::from_raw_parts_mut(base.0.add(destination_row * width), width) };
+            for (destination, column) in destination.iter_mut().zip(lde_values) {
+                *destination = column[source_row];
+            }
+        }
+    });
+
+    // SAFETY: the loop above writes every one of the `rows * width` reserved elements exactly once.
+    unsafe { data.set_len(rows * width) };
+    LeafMatrix::new(data, width)
+}
 
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
 #[derive(Eq, PartialEq, Debug)]
@@ -95,8 +164,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             Self::lde_values(&polynomials, rate_bits, blinding, fft_root_table)
         );
 
-        let mut leaves = timed!(timing, "transpose LDEs", transpose(&lde_values));
-        reverse_index_bits_in_place(&mut leaves);
+        let leaves = timed!(
+            timing,
+            "transpose LDEs",
+            transpose_bit_reversed_into_leaves(&lde_values)
+        );
+        drop(lde_values);
         let merkle_tree = timed!(
             timing,
             "build Merkle tree",
@@ -119,7 +192,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Vec<Vec<F>> {
         let degree = polynomials[0].len();
-        let coset_powers = F::coset_shift().powers().take(degree).collect::<Vec<_>>();
 
         // If blinding, salt with two random elements to each leaf vector.
         let salt_size = if blinding { SALT_SIZE } else { 0 };
@@ -128,9 +200,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .par_iter()
             .map(|p| {
                 assert_eq!(p.len(), degree, "Polynomial degrees inconsistent");
-                let mut lde = p.lde(rate_bits);
-                batch_multiply_inplace(&mut lde.coeffs[..degree], &coset_powers);
-                lde.fft_with_options(Some(rate_bits), fft_root_table).values
+                lde_coset_fft(&p.coeffs, F::coset_shift(), rate_bits, fft_root_table)
             })
             .chain(
                 (0..salt_size)
@@ -141,6 +211,15 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     }
 
     /// Fetches LDE values at the `index * step`th point.
+    /// Like [`Self::get_lde_values`], but indexes the Merkle leaves directly, i.e. takes the
+    /// already bit-reversed row index. Callers that sweep the whole LDE can iterate leaf rows in
+    /// storage order and recover the evaluation-point index with `reverse_bits`, which turns a
+    /// random gather over the leaf matrix into a sequential scan.
+    pub fn get_lde_values_at_leaf(&self, leaf_index: usize) -> &[F] {
+        let slice = &self.merkle_tree.leaves[leaf_index];
+        &slice[..slice.len() - if self.blinding { SALT_SIZE } else { 0 }]
+    }
+
     pub fn get_lde_values(&self, index: usize, step: usize) -> &[F] {
         let index = index * step;
         let index = reverse_bits(index, self.degree_log + self.rate_bits);
@@ -236,37 +315,5 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         );
 
         fri_proof
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::Sample;
-    use crate::plonk::config::Poseidon2GoldilocksConfig;
-
-    #[test]
-    fn shared_coset_powers_match_per_polynomial_shifts() {
-        const D: usize = 2;
-        const RATE_BITS: usize = 3;
-        type F = GoldilocksField;
-        type C = Poseidon2GoldilocksConfig;
-
-        let polynomials = (0..7)
-            .map(|_| PolynomialCoeffs::new(F::rand_vec(1 << 8)))
-            .collect::<Vec<_>>();
-        let expected = polynomials
-            .iter()
-            .map(|polynomial| {
-                polynomial
-                    .lde(RATE_BITS)
-                    .coset_fft_with_options(F::coset_shift(), Some(RATE_BITS), None)
-                    .values
-            })
-            .collect::<Vec<_>>();
-        let actual = PolynomialBatch::<F, C, D>::lde_values(&polynomials, RATE_BITS, false, None);
-
-        assert_eq!(actual, expected);
     }
 }

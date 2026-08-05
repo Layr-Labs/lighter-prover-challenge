@@ -12,7 +12,7 @@ use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQuerySt
 use crate::fri::{FriConfig, FriParams};
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
-use crate::hash::merkle_tree::MerkleTree;
+use crate::hash::merkle_tree::{LeafMatrix, MerkleTree};
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
 use crate::plonk::plonk_common::reduce_with_powers;
@@ -96,12 +96,15 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         let arity = 1 << arity_bits;
 
         reverse_index_bits_in_place(&mut values.values);
-        let chunked_values = values
+        let chunked_values: Vec<Vec<F>> = values
             .values
             .par_chunks(arity)
             .map(|chunk: &[F::Extension]| flatten(chunk))
             .collect();
-        let tree = MerkleTree::<F, C::Hasher>::new(chunked_values, fri_params.config.cap_height);
+        let tree = MerkleTree::<F, C::Hasher>::new(
+            LeafMatrix::from_rows(chunked_values),
+            fri_params.config.cap_height,
+        );
 
         challenger.observe_cap(&tree.cap);
         trees.push(tree);

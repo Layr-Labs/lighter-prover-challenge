@@ -14,6 +14,10 @@ path = "src/bin/bench.rs"
 name = "prove"
 path = "src/bin/prove.rs"
 
+[[bin]]
+name = "profile"
+path = "src/bin/profile.rs"
+
 [features]
 default = ["parallel", "std"]
 parallel = ["plonky2/parallel"]
@@ -24,7 +28,7 @@ num = { workspace = true }
 itertools = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
-plonky2 = { workspace = true, default-features = false }
+plonky2 = { workspace = true, default-features = true }
 lazy_static = { workspace = true }
 serde = { workspace = true }
 rayon = { workspace = true }

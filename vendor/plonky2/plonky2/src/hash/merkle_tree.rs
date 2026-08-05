@@ -1,6 +1,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 use core::mem::MaybeUninit;
+use core::ops::Index;
 use core::slice;
 
 use plonky2_maybe_rayon::*;
@@ -42,10 +43,189 @@ impl<F: RichField, H: Hasher<F>> MerkleCap<F, H> {
     }
 }
 
+/// A row-major matrix of Merkle leaves stored in a single contiguous allocation.
+///
+/// The prover materializes one of these per polynomial commitment, with one row per LDE point and
+/// one column per committed polynomial. Storing the rows contiguously (rather than as a
+/// `Vec<Vec<F>>`) keeps the transposed LDE in a single allocation, lets the GPU backend consume the
+/// leaves as a flat `u64` buffer without a per-row gather, and makes `get_lde_values` a slice index
+/// into hot, sequentially laid out memory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeafMatrix<F> {
+    data: Vec<F>,
+    width: usize,
+    /// Tracked explicitly: a zero-width matrix still has a meaningful row count, which
+    /// `data.len() / width` cannot express.
+    rows: usize,
+}
+
+impl<F> Default for LeafMatrix<F> {
+    fn default() -> Self {
+        Self {
+            data: Vec::new(),
+            width: 0,
+            rows: 0,
+        }
+    }
+}
+
+impl<F> LeafMatrix<F> {
+    /// Wraps `data` as a `rows x width` row-major matrix, with `width > 0`.
+    pub fn new(data: Vec<F>, width: usize) -> Self {
+        assert!(width > 0, "use `with_rows` for a zero-width matrix");
+        debug_assert_eq!(data.len() % width, 0);
+        let rows = data.len() / width;
+        Self { data, width, rows }
+    }
+
+    /// Wraps `data` as a row-major matrix with an explicit row count.
+    pub fn with_rows(data: Vec<F>, width: usize, rows: usize) -> Self {
+        debug_assert_eq!(data.len(), rows * width);
+        Self { data, width, rows }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.rows
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub const fn width(&self) -> usize {
+        self.width
+    }
+
+    /// The backing row-major buffer.
+    pub fn as_flat(&self) -> &[F] {
+        &self.data
+    }
+
+    pub fn as_slice(&self) -> LeafSlice<'_, F> {
+        LeafSlice {
+            data: &self.data,
+            width: self.width,
+            rows: self.rows,
+        }
+    }
+
+    pub fn row(&self, index: usize) -> &[F] {
+        &self.data[index * self.width..(index + 1) * self.width]
+    }
+}
+
+impl<F: Clone> LeafMatrix<F> {
+    /// Builds a matrix from individual rows. Only used by tests and by callers outside the hot
+    /// commitment path; the prover builds the flat buffer directly.
+    pub fn from_rows(rows: Vec<Vec<F>>) -> Self {
+        Self::from_row_slices(&rows)
+    }
+
+    /// Like [`Self::from_rows`], but borrows the rows.
+    pub fn from_row_slices(rows: &[Vec<F>]) -> Self {
+        let width = rows.first().map_or(0, Vec::len);
+        debug_assert!(rows.iter().all(|row| row.len() == width));
+        let mut data = Vec::with_capacity(rows.len() * width);
+        for row in rows {
+            data.extend_from_slice(row);
+        }
+        Self {
+            data,
+            width,
+            rows: rows.len(),
+        }
+    }
+}
+
+impl<F> Index<usize> for LeafMatrix<F> {
+    type Output = [F];
+
+    fn index(&self, index: usize) -> &[F] {
+        self.row(index)
+    }
+}
+
+/// A borrowed view of a contiguous run of rows of a [`LeafMatrix`].
+#[derive(Copy, Clone, Debug)]
+pub struct LeafSlice<'a, F> {
+    data: &'a [F],
+    width: usize,
+    rows: usize,
+}
+
+impl<'a, F> LeafSlice<'a, F> {
+    pub const fn len(&self) -> usize {
+        self.rows
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub const fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn row(&self, index: usize) -> &'a [F] {
+        &self.data[index * self.width..(index + 1) * self.width]
+    }
+
+    pub fn split_at(&self, mid: usize) -> (Self, Self) {
+        let (left, right) = self.data.split_at(mid * self.width);
+        (
+            Self {
+                data: left,
+                width: self.width,
+                rows: mid,
+            },
+            Self {
+                data: right,
+                width: self.width,
+                rows: self.rows - mid,
+            },
+        )
+    }
+}
+
+impl<F> Index<usize> for LeafSlice<'_, F> {
+    type Output = [F];
+
+    fn index(&self, index: usize) -> &[F] {
+        self.row(index)
+    }
+}
+
+impl<'a, F: Send + Sync> LeafSlice<'a, F> {
+    /// Splits into `rows_per_chunk`-row chunks, in parallel. Mirrors `par_chunks_exact`.
+    pub fn par_chunks_exact(
+        &self,
+        rows_per_chunk: usize,
+    ) -> impl IndexedParallelIterator<Item = LeafSlice<'a, F>> {
+        let width = self.width;
+        let data: &'a [F] = self.data;
+        // With zero-width rows there is no backing data to split, so chunk the row count instead.
+        let stride = rows_per_chunk * width;
+        let chunks = if width == 0 {
+            self.rows / rows_per_chunk
+        } else {
+            data.len() / stride
+        };
+        (0..chunks).into_par_iter().map(move |chunk| LeafSlice {
+            data: if width == 0 {
+                &data[..0]
+            } else {
+                &data[chunk * stride..(chunk + 1) * stride]
+            },
+            width,
+            rows: rows_per_chunk,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MerkleTree<F: RichField, H: Hasher<F>> {
-    /// The data in the leaves of the Merkle tree.
-    pub leaves: Vec<Vec<F>>,
+    /// The data in the leaves of the Merkle tree, one row per leaf.
+    pub leaves: LeafMatrix<F>,
 
     /// The digests in the tree. Consists of `cap.len()` sub-trees, each corresponding to one
     /// element in `cap`. Each subtree is contiguous and located at
@@ -64,7 +244,7 @@ pub struct MerkleTree<F: RichField, H: Hasher<F>> {
 impl<F: RichField, H: Hasher<F>> Default for MerkleTree<F, H> {
     fn default() -> Self {
         Self {
-            leaves: Vec::new(),
+            leaves: LeafMatrix::default(),
             digests: Vec::new(),
             cap: MerkleCap::default(),
         }
@@ -85,7 +265,7 @@ pub(crate) fn capacity_up_to_mut<T>(v: &mut Vec<T>, len: usize) -> &mut [MaybeUn
 
 pub(crate) fn fill_subtree<F: RichField, H: Hasher<F>>(
     digests_buf: &mut [MaybeUninit<H::Hash>],
-    leaves: &[Vec<F>],
+    leaves: LeafSlice<'_, F>,
 ) -> H::Hash {
     assert_eq!(leaves.len(), digests_buf.len() / 2 + 1);
     if digests_buf.is_empty() {
@@ -115,7 +295,7 @@ pub(crate) fn fill_subtree<F: RichField, H: Hasher<F>>(
 pub(crate) fn fill_digests_buf<F: RichField, H: Hasher<F>>(
     digests_buf: &mut [MaybeUninit<H::Hash>],
     cap_buf: &mut [MaybeUninit<H::Hash>],
-    leaves: &[Vec<F>],
+    leaves: LeafSlice<'_, F>,
     cap_height: usize,
 ) {
     // Special case of a tree that's all cap. The usual case will panic because we'll try to split
@@ -125,9 +305,9 @@ pub(crate) fn fill_digests_buf<F: RichField, H: Hasher<F>>(
         debug_assert_eq!(cap_buf.len(), leaves.len());
         cap_buf
             .par_iter_mut()
-            .zip(leaves)
+            .zip(leaves.par_chunks_exact(1))
             .for_each(|(cap_buf, leaf)| {
-                cap_buf.write(H::hash_or_noop(leaf));
+                cap_buf.write(H::hash_or_noop(&leaf[0]));
             });
         return;
     }
@@ -135,7 +315,7 @@ pub(crate) fn fill_digests_buf<F: RichField, H: Hasher<F>>(
     let subtree_digests_len = digests_buf.len() >> cap_height;
     let subtree_leaves_len = leaves.len() >> cap_height;
     let digests_chunks = digests_buf.par_chunks_exact_mut(subtree_digests_len);
-    let leaves_chunks = leaves.par_chunks_exact(subtree_leaves_len);
+    let leaves_chunks = LeafSlice::par_chunks_exact(&leaves, subtree_leaves_len);
     assert_eq!(digests_chunks.len(), cap_buf.len());
     assert_eq!(digests_chunks.len(), leaves_chunks.len());
     digests_chunks.zip(cap_buf).zip(leaves_chunks).for_each(
@@ -190,7 +370,7 @@ pub(crate) fn merkle_tree_prove<F: RichField, H: Hasher<F>>(
 }
 
 impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
-    pub fn new(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
+    pub fn new(leaves: LeafMatrix<F>, cap_height: usize) -> Self {
         let log2_leaves_len = log2_strict(leaves.len());
         assert!(
             cap_height <= log2_leaves_len,
@@ -217,7 +397,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
 
         let digests_buf = capacity_up_to_mut(&mut digests, num_digests);
         let cap_buf = capacity_up_to_mut(&mut cap, len_cap);
-        fill_digests_buf::<F, H>(digests_buf, cap_buf, &leaves[..], cap_height);
+        fill_digests_buf::<F, H>(digests_buf, cap_buf, leaves.as_slice(), cap_height);
 
         unsafe {
             // SAFETY: `fill_digests_buf` and `cap` initialized the spare capacity up to
@@ -268,7 +448,7 @@ pub(crate) mod tests {
         leaves: Vec<Vec<F>>,
         cap_height: usize,
     ) -> Result<()> {
-        let tree = MerkleTree::<F, C::Hasher>::new(leaves.clone(), cap_height);
+        let tree = MerkleTree::<F, C::Hasher>::new(LeafMatrix::from_row_slices(&leaves), cap_height);
         for (i, leaf) in leaves.into_iter().enumerate() {
             let proof = tree.prove(i);
             verify_merkle_proof_to_cap(leaf, i, &tree.cap, &proof)?;
@@ -287,7 +467,7 @@ pub(crate) mod tests {
         let cap_height = log_n + 1; // Should panic if `cap_height > len_n`.
 
         let leaves = random_data::<F>(1 << log_n, 7);
-        let _ = MerkleTree::<F, <C as GenericConfig<D>>::Hasher>::new(leaves, cap_height);
+        let _ = MerkleTree::<F, <C as GenericConfig<D>>::Hasher>::new(LeafMatrix::from_rows(leaves), cap_height);
     }
 
     #[test]

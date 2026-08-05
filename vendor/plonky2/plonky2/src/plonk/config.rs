@@ -80,7 +80,7 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
     ///
     /// The first result uses [`crate::hash::merkle_tree::MerkleTree::digests`] layout.
     fn try_build_merkle_tree(
-        _leaves: &[Vec<F>],
+        _leaves: &crate::hash::merkle_tree::LeafMatrix<F>,
         _cap_height: usize,
     ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
         None

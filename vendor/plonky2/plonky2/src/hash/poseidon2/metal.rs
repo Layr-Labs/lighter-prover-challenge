@@ -11,10 +11,33 @@ use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
 
 use crate::hash::hash_types::{HashOut, RichField};
-use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
+use crate::hash::merkle_tree::LeafMatrix;
+use crate::hash::poseidon2::config::{
+    EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64,
+};
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
-const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
+
+/// Host page size, which is the alignment `newBufferWithBytesNoCopy` requires.
+fn page_size() -> usize {
+    // SAFETY: `getpagesize` takes no arguments and cannot fail.
+    static PAGE: LazyLock<usize> = LazyLock::new(|| unsafe { libc_getpagesize() as usize });
+    *PAGE
+}
+
+unsafe extern "C" {
+    #[link_name = "getpagesize"]
+    fn libc_getpagesize() -> i32;
+}
+/// Minimum number of Poseidon2 permutations before a tree is worth sending to the GPU.
+///
+/// The GPU path costs more than its kernel time: the context is a process-wide mutex, so a small
+/// tree both waits behind and delays whatever larger tree the other prover thread is running, and
+/// the digests come back level-major and have to be repacked into the interleaved subtree layout.
+/// Measured per-call breakdown showed the FRI commit-phase trees (8192 leaves x 32 columns, ~41k
+/// permutations) spending 9.5s on lock waits and 6.6s repacking across a run to save 0.31s of
+/// kernel time. Trees below this bound go through the CPU path instead.
+const MIN_GPU_PERMUTATIONS: usize = 1 << 18;
 
 struct MetalContext {
     device: Device,
@@ -26,16 +49,17 @@ struct MetalContext {
     output_buffer: Option<Buffer>,
 }
 
-static CONTEXT: LazyLock<Result<Mutex<MetalContext>, String>> = LazyLock::new(MetalContext::new);
+static CONTEXT: LazyLock<Result<Mutex<MetalContext>, String>> =
+    LazyLock::new(MetalContext::new);
 
 pub(crate) fn build_merkle_tree<F: RichField>(
-    leaves: &[Vec<F>],
+    leaves: &LeafMatrix<F>,
     cap_height: usize,
 ) -> Option<(Vec<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_count = leaves.len();
-    let leaf_width = leaves.first()?.len();
+    let leaf_width = leaves.width();
     if F::ORDER != 0xffff_ffff_0000_0001
-        || leaves.iter().any(|leaf| leaf.len() != leaf_width)
+        || leaf_count == 0
         || leaf_count > u32::MAX as usize
         || leaf_width > u32::MAX as usize
     {
@@ -122,13 +146,11 @@ impl MetalContext {
 
     fn build<F: RichField>(
         &mut self,
-        leaves: &[Vec<F>],
+        leaves: &LeafMatrix<F>,
         cap_height: usize,
     ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
         let leaf_count = leaves.len();
-        let leaf_width = leaves[0].len();
-        let cap_count = 1usize << cap_height;
-        let total_node_count = 2 * leaf_count - cap_count;
+        let leaf_width = leaves.width();
 
         let input_len = leaf_count
             .checked_mul(leaf_width)
@@ -136,27 +158,89 @@ impl MetalContext {
         let input_bytes = input_len
             .checked_mul(size_of::<u64>())
             .ok_or("Metal leaf input size overflow")?;
-        if self.input_buffer.as_ref().map_or(true, |buffer| {
-            buffer.length() < input_bytes.max(size_of::<u64>()) as u64
-        }) {
+
+        // Fast path: hand the GPU the leaf matrix in place. Apple Silicon is unified memory, so a
+        // no-copy buffer costs a mapping instead of a copy -- and for a chain-circuit wires
+        // commitment the staging copy is 570MB. It needs a page-aligned base and a page-multiple
+        // length; allocations this large come from mmap and satisfy both in practice, and the
+        // element layout must match what the shader reads.
+        let aliased_input = if F::REPR_IS_NONCANONICAL_U64 && size_of::<F>() == size_of::<u64>() {
+            let flat = leaves.as_flat();
+            debug_assert_eq!(flat.len(), input_len);
+            let address = flat.as_ptr() as usize;
+            let page = page_size();
+            (input_bytes != 0 && address % page == 0 && input_bytes % page == 0).then(|| {
+                self.device.new_buffer_with_bytes_no_copy(
+                    flat.as_ptr().cast::<c_void>(),
+                    input_bytes as u64,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
+            })
+        } else {
+            None
+        };
+
+        let input_buffer = match aliased_input {
+            Some(buffer) => buffer,
+            None => {
+                self.upload_leaves(leaves, input_len, input_bytes)?;
+                self.input_buffer.as_ref().unwrap().clone()
+            }
+        };
+
+        self.dispatch_and_collect(&input_buffer, leaf_count, leaf_width, cap_height)
+    }
+
+    fn upload_leaves<F: RichField>(
+        &mut self,
+        leaves: &LeafMatrix<F>,
+        input_len: usize,
+        input_bytes: usize,
+    ) -> Result<(), String> {
+        let leaf_width = leaves.width();
+        if self
+            .input_buffer
+            .as_ref()
+            .map_or(true, |buffer| buffer.length() < input_bytes.max(size_of::<u64>()) as u64)
+        {
             self.input_buffer = Some(self.device.new_buffer(
                 input_bytes.max(size_of::<u64>()) as u64,
                 MTLResourceOptions::StorageModeShared,
             ));
         }
         let input_buffer = self.input_buffer.as_ref().unwrap();
-        let input =
-            unsafe { slice::from_raw_parts_mut(input_buffer.contents().cast::<u64>(), input_len) };
+        let input = unsafe {
+            slice::from_raw_parts_mut(input_buffer.contents().cast::<u64>(), input_len)
+        };
         if leaf_width != 0 {
+            // The leaves are already row-major and contiguous, so this is a straight sequential
+            // widening copy rather than a gather over per-row allocations. For Goldilocks
+            // `to_noncanonical_u64` is the identity on the representation, so this lowers to a
+            // `memcpy`.
+            let flat = leaves.as_flat();
+            debug_assert_eq!(flat.len(), input_len);
             input
-                .par_chunks_exact_mut(leaf_width)
-                .zip(leaves.par_iter())
+                .par_chunks_mut(1 << 16)
+                .zip(flat.par_chunks(1 << 16))
                 .for_each(|(destination, source)| {
                     for (destination, value) in destination.iter_mut().zip(source) {
                         *destination = value.to_noncanonical_u64();
                     }
                 });
         }
+        Ok(())
+    }
+
+    fn dispatch_and_collect<F: RichField>(
+        &mut self,
+        input_buffer: &Buffer,
+        leaf_count: usize,
+        leaf_width: usize,
+        cap_height: usize,
+    ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
+        let cap_count = 1usize << cap_height;
+        let total_node_count = 2 * leaf_count - cap_count;
 
         let output_len = total_node_count
             .checked_mul(4)
@@ -241,8 +325,9 @@ impl MetalContext {
             ));
         }
 
-        let nodes =
-            unsafe { slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len) };
+        let nodes = unsafe {
+            slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
+        };
         Ok(tree_from_levels(
             nodes,
             &level_offsets,
@@ -327,8 +412,20 @@ fn fill_subtree_layout<F: RichField>(
     let (left_root, left_digests) = left_half.split_last_mut().unwrap();
     let (right_root, right_digests) = right_half.split_first_mut().unwrap();
     let half = leaf_count / 2;
-    *left_root = fill_subtree_layout(left_digests, nodes, level_offsets, start_leaf, half);
-    *right_root = fill_subtree_layout(right_digests, nodes, level_offsets, start_leaf + half, half);
+    *left_root = fill_subtree_layout(
+        left_digests,
+        nodes,
+        level_offsets,
+        start_leaf,
+        half,
+    );
+    *right_root = fill_subtree_layout(
+        right_digests,
+        nodes,
+        level_offsets,
+        start_leaf + half,
+        half,
+    );
 
     let level = leaf_count.ilog2() as usize;
     read_node(nodes, level_offsets[level], start_leaf / leaf_count)
@@ -377,6 +474,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
 
+            let leaf_matrix = LeafMatrix::from_row_slices(&leaves);
             for cap_height in [0, 3, 6] {
                 let mut context = CONTEXT
                     .as_ref()
@@ -384,7 +482,7 @@ mod tests {
                     .unwrap_or_else(|error| panic!("{error}"))
                     .lock()
                     .unwrap();
-                let gpu = autoreleasepool(|| context.build(&leaves, cap_height)).unwrap();
+                let gpu = autoreleasepool(|| context.build(&leaf_matrix, cap_height)).unwrap();
                 let cpu = cpu_tree(&leaves, cap_height);
                 assert_tree_eq(&gpu, &cpu, width, cap_height);
             }
@@ -394,7 +492,10 @@ mod tests {
     fn cpu_tree(
         leaves: &[Vec<GoldilocksField>],
         cap_height: usize,
-    ) -> (Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>) {
+    ) -> (
+        Vec<HashOut<GoldilocksField>>,
+        Vec<HashOut<GoldilocksField>>,
+    ) {
         let cap_len = 1 << cap_height;
         let digest_len = 2 * (leaves.len() - cap_len);
         let mut digests = Vec::with_capacity(digest_len);
@@ -403,10 +504,11 @@ mod tests {
             capacity_up_to_mut(&mut digests, digest_len);
         let cap_buffer: &mut [MaybeUninit<HashOut<GoldilocksField>>] =
             capacity_up_to_mut(&mut cap, cap_len);
+        let leaf_matrix = LeafMatrix::from_row_slices(leaves);
         fill_digests_buf::<GoldilocksField, Poseidon2Hash>(
             digest_buffer,
             cap_buffer,
-            leaves,
+            leaf_matrix.as_slice(),
             cap_height,
         );
         unsafe {
@@ -417,8 +519,14 @@ mod tests {
     }
 
     fn assert_tree_eq(
-        actual: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
-        expected: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
+        actual: &(
+            Vec<HashOut<GoldilocksField>>,
+            Vec<HashOut<GoldilocksField>>,
+        ),
+        expected: &(
+            Vec<HashOut<GoldilocksField>>,
+            Vec<HashOut<GoldilocksField>>,
+        ),
         width: usize,
         cap_height: usize,
     ) {

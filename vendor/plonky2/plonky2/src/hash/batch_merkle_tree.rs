@@ -8,7 +8,7 @@ use itertools::Itertools;
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::merkle_proofs::MerkleProof;
 use crate::hash::merkle_tree::{
-    capacity_up_to_mut, fill_digests_buf, merkle_tree_prove, MerkleCap,
+    capacity_up_to_mut, fill_digests_buf, merkle_tree_prove, LeafMatrix, MerkleCap,
 };
 use crate::plonk::config::{GenericHashOut, Hasher};
 use crate::util::log2_strict;
@@ -74,10 +74,11 @@ impl<F: RichField, H: Hasher<F>> BatchMerkleTree<F, H> {
                 // The bottom leaf layer
                 cap = Vec::with_capacity(next_cap_len);
                 let tmp_cap_buf = capacity_up_to_mut(&mut cap, next_cap_len);
+                let cur_leaves = LeafMatrix::from_row_slices(cur);
                 fill_digests_buf::<F, H>(
                     &mut digests_buf[digests_buf_pos..(digests_buf_pos + num_tmp_digests)],
                     tmp_cap_buf,
-                    &cur[..],
+                    cur_leaves.as_slice(),
                     next_cap_height,
                 );
             } else {
@@ -95,10 +96,11 @@ impl<F: RichField, H: Hasher<F>> BatchMerkleTree<F, H> {
                 cap.clear();
                 cap.reserve_exact(next_cap_len);
                 let tmp_cap_buf = capacity_up_to_mut(&mut cap, next_cap_len);
+                let new_leaves = LeafMatrix::from_rows(new_leaves);
                 fill_digests_buf::<F, H>(
                     &mut digests_buf[digests_buf_pos..(digests_buf_pos + num_tmp_digests)],
                     tmp_cap_buf,
-                    &new_leaves[..],
+                    new_leaves.as_slice(),
                     next_cap_height,
                 );
             }

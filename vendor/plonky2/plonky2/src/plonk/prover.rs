@@ -33,7 +33,7 @@ use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
 use crate::util::partial_products::{partial_products_and_z_gx, quotient_chunk_products};
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil, transpose};
+use crate::util::{log2_ceil, log2_strict, reverse_bits, transpose};
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -607,6 +607,15 @@ fn compute_all_lookup_polys<
 
 const BATCH_SIZE: usize = 32;
 
+/// Destination pointer for the quotient evaluations, shared across batches. Each batch writes the
+/// `num_challenges`-element slots belonging to its own leaf rows, which are disjoint by
+/// construction.
+struct QuotientScatterPtr<T>(*mut T);
+// SAFETY: batches write disjoint slots; see `compute_quotient_polys`.
+unsafe impl<T> Send for QuotientScatterPtr<T> {}
+// SAFETY: see above.
+unsafe impl<T> Sync for QuotientScatterPtr<T> {}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -634,9 +643,12 @@ fn compute_quotient_polys<
         If we need this in the future, we can precompute the larger LDE before computing the `PolynomialBatch`s."
     );
 
-    // We reuse the LDE computed in `PolynomialBatch` and extract every `step` points to get
-    // an LDE matching `max_filtered_constraint_degree`.
-    let step = 1 << (common_data.config.fri_config.rate_bits - quotient_degree_bits);
+    // We reuse the LDE computed in `PolynomialBatch` and extract every `step` points to get an LDE
+    // matching `max_filtered_constraint_degree`. Subsampling by `step` is folded into the leaf
+    // indexing below: for `step == 1 << s`, `reverse_bits(i * step, degree_log + rate_bits)`
+    // simplifies to `reverse_bits(i, degree_bits + quotient_degree_bits)`, so leaf rows
+    // `0..lde_size` are exactly the subsampled points.
+    //
     // When opening the `Z`s polys at the "next" point in Plonk, need to look at the point `next_step`
     // steps away since we work on an LDE of degree `max_filtered_constraint_degree`.
     let next_step = 1 << quotient_degree_bits;
@@ -682,20 +694,27 @@ fn compute_quotient_polys<
     let lut_re_poly_evals_refs: Vec<&[F]> =
         lut_re_poly_evals.iter().map(|v| v.as_slice()).collect();
 
-    let points_batches = points.par_chunks(BATCH_SIZE);
-    let num_batches = points.len().div_ceil(BATCH_SIZE);
+    // The committed LDEs are stored in bit-reversed row order, so sweeping evaluation points in
+    // natural order gathers leaf rows at random. Sweep leaf rows in storage order instead and
+    // recover each point index with `reverse_bits`: the wires and constants/sigmas reads, which
+    // dominate this loop's memory traffic, then become a sequential scan of the leaf matrices.
+    let lg_lde_size = log2_strict(lde_size);
+    let num_batches = lde_size.div_ceil(BATCH_SIZE);
 
-    let quotient_values: Vec<F> = points_batches
-        .enumerate()
-        .flat_map(|(batch_i, xs_batch)| {
-            // Each batch must be the same size, except the last one, which may be smaller.
-            debug_assert!(
-                xs_batch.len() == BATCH_SIZE
-                    || (batch_i == num_batches - 1 && xs_batch.len() <= BATCH_SIZE)
-            );
+    let mut quotient_values: Vec<F> = Vec::with_capacity(lde_size * num_challenges);
+    let quotient_values_ptr = QuotientScatterPtr(quotient_values.as_mut_ptr());
 
-            let indices_batch: Vec<usize> =
-                (BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + xs_batch.len()).collect();
+    (0..num_batches).into_par_iter().for_each(|batch_i| {
+        let quotient_values_ptr = &quotient_values_ptr;
+        let leaf_start = BATCH_SIZE * batch_i;
+        let batch_len = BATCH_SIZE.min(lde_size - leaf_start);
+
+        // Evaluation-point index for each leaf row in this batch.
+        let indices_batch: Vec<usize> = (leaf_start..leaf_start + batch_len)
+            .map(|leaf| reverse_bits(leaf, lg_lde_size))
+            .collect();
+        let xs_batch: Vec<F> = indices_batch.iter().map(|&i| points[i]).collect();
+        let xs_batch = &xs_batch[..];
 
             let mut shifted_xs_batch = Vec::with_capacity(xs_batch.len());
             let mut local_zs_batch = Vec::with_capacity(xs_batch.len());
@@ -710,19 +729,21 @@ fn compute_quotient_polys<
             let mut local_constants_batch_refs = Vec::with_capacity(xs_batch.len());
             let mut local_wires_batch_refs = Vec::with_capacity(xs_batch.len());
 
-            for (&i, &x) in indices_batch.iter().zip(xs_batch) {
+            for (batch_k, (&i, &x)) in indices_batch.iter().zip(xs_batch).enumerate() {
+                let leaf = leaf_start + batch_k;
                 let shifted_x = F::coset_shift() * x;
                 let i_next = (i + next_step) % lde_size;
+                let leaf_next = reverse_bits(i_next, lg_lde_size);
                 let local_constants_sigmas = prover_data
                     .constants_sigmas_commitment
-                    .get_lde_values(i, step);
+                    .get_lde_values_at_leaf(leaf);
                 let local_constants = &local_constants_sigmas[common_data.constants_range()];
                 let s_sigmas = &local_constants_sigmas[common_data.sigmas_range()];
-                let local_wires = wires_commitment.get_lde_values(i, step);
+                let local_wires = wires_commitment.get_lde_values_at_leaf(leaf);
                 let local_zs_partial_and_lookup =
-                    zs_partial_products_and_lookup_commitment.get_lde_values(i, step);
+                    zs_partial_products_and_lookup_commitment.get_lde_values_at_leaf(leaf);
                 let next_zs_partial_and_lookup =
-                    zs_partial_products_and_lookup_commitment.get_lde_values(i_next, step);
+                    zs_partial_products_and_lookup_commitment.get_lde_values_at_leaf(leaf_next);
 
                 let local_zs = &local_zs_partial_and_lookup[common_data.zs_range()];
 
@@ -797,20 +818,33 @@ fn compute_quotient_polys<
                 &lut_re_poly_evals_refs,
             );
 
-            for (&i, quotient_values) in indices_batch
+            for (&i, values) in indices_batch
                 .iter()
                 .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
             {
                 let denominator_inv = z_h_on_coset.eval_inverse(i);
-                quotient_values
-                    .iter_mut()
-                    .for_each(|v| *v *= denominator_inv);
+                values.iter_mut().for_each(|v| *v *= denominator_inv);
             }
-            quotient_values_batch
-        })
-        .collect();
+            // The results stay in leaf order, so this batch owns one contiguous run of the output
+            // and the write is sequential.
+            //
+            // SAFETY: batches partition `0..lde_size` into disjoint runs of leaf rows, so the
+            // destinations below never overlap and all lie within the reserved capacity.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    quotient_values_batch.as_ptr(),
+                    quotient_values_ptr.0.add(leaf_start * num_challenges),
+                    batch_len * num_challenges,
+                );
+            }
+    });
 
-    debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
+    // SAFETY: the loop above wrote every one of the `lde_size * num_challenges` reserved elements
+    // exactly once, since the batches partition the leaf rows `0..lde_size`.
+    unsafe { quotient_values.set_len(lde_size * num_challenges) };
+
+    // `quotient_values` is indexed by leaf row, i.e. the evaluations sit in bit-reversed point
+    // order, which is exactly what the interpolation below wants to consume.
     (0..num_challenges)
         .into_par_iter()
         .map(|challenge| {
@@ -821,6 +855,6 @@ fn compute_quotient_polys<
                     .collect(),
             )
         })
-        .map(|values| values.coset_ifft(F::coset_shift()))
+        .map(|values| values.coset_ifft_bit_reversed_input(F::coset_shift()))
         .collect()
 }

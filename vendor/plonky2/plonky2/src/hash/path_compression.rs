@@ -119,7 +119,7 @@ mod tests {
 
     use super::*;
     use crate::field::types::Sample;
-    use crate::hash::merkle_tree::MerkleTree;
+    use crate::hash::merkle_tree::{LeafMatrix, MerkleTree};
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     #[test]
@@ -130,7 +130,8 @@ mod tests {
         let h = 10;
         let cap_height = 3;
         let vs = (0..1 << h).map(|_| vec![F::rand()]).collect::<Vec<_>>();
-        let mt = MerkleTree::<F, <C as GenericConfig<D>>::Hasher>::new(vs.clone(), cap_height);
+        let mt =
+            MerkleTree::<F, <C as GenericConfig<D>>::Hasher>::new(LeafMatrix::from_row_slices(&vs), cap_height);
 
         let mut rng = OsRng;
         let k = rng.gen_range(1..=1 << h);
