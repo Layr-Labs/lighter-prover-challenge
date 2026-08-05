@@ -1,11 +1,11 @@
 use core::ffi::c_void;
 use core::mem::{size_of, size_of_val};
 use core::slice;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Condvar, LazyLock, Mutex};
 
 use metal::{
-    Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLCommandBufferStatus,
-    MTLResourceOptions, MTLSize, NSUInteger,
+    Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
+    MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSUInteger,
 };
 use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
@@ -17,28 +17,45 @@ use crate::hash::poseidon2::config::{
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 const MIN_GPU_PERMUTATIONS: usize = 1 << 14;
+/// Upper bound on concurrently in-flight GPU tree builds. Each set owns a
+/// high-water-mark input and output buffer, so the cap also bounds buffer
+/// memory. Three sets keep the GPU busy while one build stages input and
+/// another drains output.
+const MAX_BUFFER_SETS: usize = 3;
+/// Parallel staging copy granularity in u64 elements (4 MiB chunks).
+const STAGING_CHUNK: usize = 1 << 19;
 
-struct MetalContext {
+struct MetalShared {
     device: Device,
     queue: CommandQueue,
     leaf_pipeline: ComputePipelineState,
     parent_pipeline: ComputePipelineState,
     parameters: Buffer,
-    input_buffer: Option<Buffer>,
-    output_buffer: Option<Buffer>,
+    pool: Mutex<BufferPool>,
+    available: Condvar,
 }
 
-static CONTEXT: LazyLock<Result<Mutex<MetalContext>, String>> =
-    LazyLock::new(MetalContext::new);
+struct BufferSet {
+    input: Option<Buffer>,
+    output: Option<Buffer>,
+}
+
+struct BufferPool {
+    free: Vec<BufferSet>,
+    created: usize,
+}
+
+static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShared::new);
 
 pub(crate) fn build_merkle_tree<F: RichField>(
-    leaves: &[Vec<F>],
+    leaves: &[F],
+    leaf_width: usize,
+    leaf_count: usize,
     cap_height: usize,
 ) -> Option<(Vec<HashOut<F>>, Vec<HashOut<F>>)> {
-    let leaf_count = leaves.len();
-    let leaf_width = leaves.first()?.len();
     if F::ORDER != 0xffff_ffff_0000_0001
-        || leaves.iter().any(|leaf| leaf.len() != leaf_width)
+        || size_of::<F>() != size_of::<u64>()
+        || leaves.len() != leaf_count * leaf_width
         || leaf_count > u32::MAX as usize
         || leaf_width > u32::MAX as usize
     {
@@ -62,15 +79,8 @@ pub(crate) fn build_merkle_tree<F: RichField>(
             return None;
         }
     };
-    let mut context = match context.lock() {
-        Ok(context) => context,
-        Err(_) => {
-            log::warn!("Metal Poseidon2 context lock poisoned; using CPU Merkle hashing");
-            return None;
-        }
-    };
 
-    match autoreleasepool(|| context.build(leaves, cap_height)) {
+    match context.build(leaves, leaf_width, leaf_count, cap_height) {
         Ok(tree) => Some(tree),
         Err(error) => {
             log::warn!("Metal Poseidon2 failed; using CPU Merkle hashing: {error}");
@@ -79,8 +89,8 @@ pub(crate) fn build_merkle_tree<F: RichField>(
     }
 }
 
-impl MetalContext {
-    fn new() -> Result<Mutex<Self>, String> {
+impl MetalShared {
+    fn new() -> Result<Self, String> {
         autoreleasepool(|| {
             let device = Device::system_default().ok_or("no Metal device")?;
             let options = CompileOptions::new();
@@ -111,25 +121,55 @@ impl MetalContext {
                 MTLResourceOptions::StorageModeShared,
             );
 
-            Ok(Mutex::new(Self {
+            Ok(Self {
                 queue: device.new_command_queue(),
                 device,
                 leaf_pipeline,
                 parent_pipeline,
                 parameters,
-                input_buffer: None,
-                output_buffer: None,
-            }))
+                pool: Mutex::new(BufferPool {
+                    free: Vec::new(),
+                    created: 0,
+                }),
+                available: Condvar::new(),
+            })
         })
     }
 
+    fn acquire_set(&self) -> Result<BufferSet, String> {
+        let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
+        loop {
+            if let Some(set) = pool.free.pop() {
+                return Ok(set);
+            }
+            if pool.created < MAX_BUFFER_SETS {
+                pool.created += 1;
+                return Ok(BufferSet {
+                    input: None,
+                    output: None,
+                });
+            }
+            pool = self
+                .available
+                .wait(pool)
+                .map_err(|_| "buffer pool poisoned")?;
+        }
+    }
+
+    fn release_set(&self, set: BufferSet) {
+        if let Ok(mut pool) = self.pool.lock() {
+            pool.free.push(set);
+            self.available.notify_one();
+        }
+    }
+
     fn build<F: RichField>(
-        &mut self,
-        leaves: &[Vec<F>],
+        &self,
+        leaves: &[F],
+        leaf_width: usize,
+        leaf_count: usize,
         cap_height: usize,
     ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
-        let leaf_count = leaves.len();
-        let leaf_width = leaves[0].len();
         let cap_count = 1usize << cap_height;
         let total_node_count = 2 * leaf_count - cap_count;
 
@@ -139,106 +179,147 @@ impl MetalContext {
         let input_bytes = input_len
             .checked_mul(size_of::<u64>())
             .ok_or("Metal leaf input size overflow")?;
-        if self
-            .input_buffer
-            .as_ref()
-            .map_or(true, |buffer| buffer.length() < input_bytes.max(size_of::<u64>()) as u64)
-        {
-            self.input_buffer = Some(self.device.new_buffer(
-                input_bytes.max(size_of::<u64>()) as u64,
-                MTLResourceOptions::StorageModeShared,
-            ));
-        }
-        let input_buffer = self.input_buffer.as_ref().unwrap();
-        let input = unsafe {
-            slice::from_raw_parts_mut(input_buffer.contents().cast::<u64>(), input_len)
-        };
-        if leaf_width != 0 {
-            input
-                .par_chunks_exact_mut(leaf_width)
-                .zip(leaves.par_iter())
-                .for_each(|(destination, source)| {
-                    for (destination, value) in destination.iter_mut().zip(source) {
-                        *destination = value.to_noncanonical_u64();
-                    }
-                });
-        }
-
         let output_len = total_node_count
             .checked_mul(4)
             .ok_or("Metal Merkle output length overflow")?;
         let output_bytes = output_len
             .checked_mul(size_of::<u64>())
             .ok_or("Metal Merkle output size overflow")?;
-        if self
-            .output_buffer
+
+        let mut set = self.acquire_set()?;
+        let result = self.build_with_set(
+            &mut set,
+            leaves,
+            leaf_width,
+            leaf_count,
+            cap_height,
+            input_len,
+            input_bytes,
+            output_len,
+            output_bytes,
+        );
+        self.release_set(set);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_with_set<F: RichField>(
+        &self,
+        set: &mut BufferSet,
+        leaves: &[F],
+        leaf_width: usize,
+        leaf_count: usize,
+        cap_height: usize,
+        input_len: usize,
+        input_bytes: usize,
+        output_len: usize,
+        output_bytes: usize,
+    ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
+        let cap_count = 1usize << cap_height;
+
+        if set
+            .input
+            .as_ref()
+            .map_or(true, |buffer| buffer.length() < input_bytes.max(size_of::<u64>()) as u64)
+        {
+            set.input = Some(autoreleasepool(|| {
+                self.device.new_buffer(
+                    input_bytes.max(size_of::<u64>()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            }));
+        }
+        let input_buffer = set.input.as_ref().unwrap();
+        if leaf_width != 0 {
+            // `F` is guaranteed by the caller to be the 8-byte Goldilocks field, whose
+            // in-memory representation is its (possibly noncanonical) u64 value, so the
+            // staging copy is a plain parallel memcpy.
+            let source =
+                unsafe { slice::from_raw_parts(leaves.as_ptr().cast::<u64>(), input_len) };
+            let destination = unsafe {
+                slice::from_raw_parts_mut(input_buffer.contents().cast::<u64>(), input_len)
+            };
+            destination
+                .par_chunks_mut(STAGING_CHUNK)
+                .zip(source.par_chunks(STAGING_CHUNK))
+                .for_each(|(destination, source)| {
+                    destination.copy_from_slice(source);
+                });
+        }
+
+        if set
+            .output
             .as_ref()
             .map_or(true, |buffer| buffer.length() < output_bytes as u64)
         {
-            self.output_buffer = Some(
+            set.output = Some(autoreleasepool(|| {
                 self.device
-                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared),
-            );
+                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
+            }));
         }
-        let output_buffer = self.output_buffer.as_ref().unwrap();
-
-        let leaf_count_u32 = leaf_count as u32;
-        let leaf_width_u32 = leaf_width as u32;
-        let command_buffer = self.queue.new_command_buffer();
-        let leaf_encoder = command_buffer.new_compute_command_encoder();
-        leaf_encoder.set_compute_pipeline_state(&self.leaf_pipeline);
-        leaf_encoder.set_buffer(0, Some(&input_buffer), 0);
-        leaf_encoder.set_buffer(1, Some(&output_buffer), 0);
-        leaf_encoder.set_buffer(2, Some(&self.parameters), 0);
-        leaf_encoder.set_bytes(
-            3,
-            size_of::<u32>() as NSUInteger,
-            (&leaf_width_u32 as *const u32).cast::<c_void>(),
-        );
-        leaf_encoder.set_bytes(
-            4,
-            size_of::<u32>() as NSUInteger,
-            (&leaf_count_u32 as *const u32).cast::<c_void>(),
-        );
-        dispatch(&leaf_encoder, &self.leaf_pipeline, leaf_count);
-        leaf_encoder.end_encoding();
+        let output_buffer = set.output.as_ref().unwrap();
 
         let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
-        let mut level_offset = 0usize;
-        let mut child_count = leaf_count;
-        level_offsets.push(level_offset);
-        while child_count > cap_count {
-            let parent_count = child_count / 2;
-            let child_offset = level_offset;
-            level_offset += child_count * 4;
-            level_offsets.push(level_offset);
-
-            let parent_count_u32 = parent_count as u32;
-            let parent_encoder = command_buffer.new_compute_command_encoder();
-            parent_encoder.set_compute_pipeline_state(&self.parent_pipeline);
-            parent_encoder.set_buffer(
-                0,
-                Some(&output_buffer),
-                (child_offset * size_of::<u64>()) as NSUInteger,
-            );
-            parent_encoder.set_buffer(
-                1,
-                Some(&output_buffer),
-                (level_offset * size_of::<u64>()) as NSUInteger,
-            );
-            parent_encoder.set_buffer(2, Some(&self.parameters), 0);
-            parent_encoder.set_bytes(
+        let command_buffer = autoreleasepool(|| -> CommandBuffer {
+            let leaf_count_u32 = leaf_count as u32;
+            let leaf_width_u32 = leaf_width as u32;
+            let command_buffer = self.queue.new_command_buffer();
+            let leaf_encoder = command_buffer.new_compute_command_encoder();
+            leaf_encoder.set_compute_pipeline_state(&self.leaf_pipeline);
+            leaf_encoder.set_buffer(0, Some(input_buffer), 0);
+            leaf_encoder.set_buffer(1, Some(output_buffer), 0);
+            leaf_encoder.set_buffer(2, Some(&self.parameters), 0);
+            leaf_encoder.set_bytes(
                 3,
                 size_of::<u32>() as NSUInteger,
-                (&parent_count_u32 as *const u32).cast::<c_void>(),
+                (&leaf_width_u32 as *const u32).cast::<c_void>(),
             );
-            dispatch(&parent_encoder, &self.parent_pipeline, parent_count);
-            parent_encoder.end_encoding();
+            leaf_encoder.set_bytes(
+                4,
+                size_of::<u32>() as NSUInteger,
+                (&leaf_count_u32 as *const u32).cast::<c_void>(),
+            );
+            dispatch(leaf_encoder, &self.leaf_pipeline, leaf_count);
+            leaf_encoder.end_encoding();
 
-            child_count = parent_count;
-        }
+            let mut level_offset = 0usize;
+            let mut child_count = leaf_count;
+            level_offsets.push(level_offset);
+            while child_count > cap_count {
+                let parent_count = child_count / 2;
+                let child_offset = level_offset;
+                level_offset += child_count * 4;
+                level_offsets.push(level_offset);
 
-        command_buffer.commit();
+                let parent_count_u32 = parent_count as u32;
+                let parent_encoder = command_buffer.new_compute_command_encoder();
+                parent_encoder.set_compute_pipeline_state(&self.parent_pipeline);
+                parent_encoder.set_buffer(
+                    0,
+                    Some(output_buffer),
+                    (child_offset * size_of::<u64>()) as NSUInteger,
+                );
+                parent_encoder.set_buffer(
+                    1,
+                    Some(output_buffer),
+                    (level_offset * size_of::<u64>()) as NSUInteger,
+                );
+                parent_encoder.set_buffer(2, Some(&self.parameters), 0);
+                parent_encoder.set_bytes(
+                    3,
+                    size_of::<u32>() as NSUInteger,
+                    (&parent_count_u32 as *const u32).cast::<c_void>(),
+                );
+                dispatch(parent_encoder, &self.parent_pipeline, parent_count);
+                parent_encoder.end_encoding();
+
+                child_count = parent_count;
+            }
+
+            command_buffer.commit();
+            command_buffer.to_owned()
+        });
+
         command_buffer.wait_until_completed();
         if command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
@@ -395,15 +476,16 @@ mod tests {
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>();
+            let flat: Vec<GoldilocksField> =
+                leaves.iter().flat_map(|leaf| leaf.iter().copied()).collect();
 
             for cap_height in [0, 3, 6] {
-                let mut context = CONTEXT
+                let context = CONTEXT
                     .as_ref()
-                    .as_ref()
-                    .unwrap_or_else(|error| panic!("{error}"))
-                    .lock()
+                    .unwrap_or_else(|error| panic!("{error}"));
+                let gpu = context
+                    .build(&flat, width, leaves.len(), cap_height)
                     .unwrap();
-                let gpu = autoreleasepool(|| context.build(&leaves, cap_height)).unwrap();
                 let cpu = cpu_tree(&leaves, cap_height);
                 assert_tree_eq(&gpu, &cpu, width, cap_height);
             }

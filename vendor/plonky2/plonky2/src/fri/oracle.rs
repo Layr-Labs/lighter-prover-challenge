@@ -20,7 +20,7 @@ use crate::plonk::config::GenericConfig;
 use crate::timed;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_strict, reverse_bits, reverse_index_bits_in_place, transpose};
+use crate::util::{log2_strict, reverse_bits, transpose_to_bitrev_flat};
 
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
@@ -94,12 +94,17 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             Self::lde_values(&polynomials, rate_bits, blinding, fft_root_table)
         );
 
-        let mut leaves = timed!(timing, "transpose LDEs", transpose(&lde_values));
-        reverse_index_bits_in_place(&mut leaves);
+        let leaf_width = lde_values.len();
+        let leaves = timed!(
+            timing,
+            "transpose LDEs",
+            transpose_to_bitrev_flat(&lde_values)
+        );
+        drop(lde_values);
         let merkle_tree = timed!(
             timing,
             "build Merkle tree",
-            MerkleTree::new(leaves, cap_height)
+            MerkleTree::new_flat(leaves, leaf_width, cap_height)
         );
 
         Self {
@@ -142,7 +147,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     pub fn get_lde_values(&self, index: usize, step: usize) -> &[F] {
         let index = index * step;
         let index = reverse_bits(index, self.degree_log + self.rate_bits);
-        let slice = &self.merkle_tree.leaves[index];
+        let slice = self.merkle_tree.get(index);
         &slice[..slice.len() - if self.blinding { SALT_SIZE } else { 0 }]
     }
 
