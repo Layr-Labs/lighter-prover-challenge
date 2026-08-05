@@ -31,7 +31,7 @@ use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{eval_vanishing_poly_base_batch, get_lut_poly};
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
-use crate::util::partial_products::{partial_products_and_z_gx, quotient_chunk_products};
+use crate::util::partial_products::partial_products_and_z_gx;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_ceil, transpose};
 
@@ -424,12 +424,7 @@ fn wires_permutation_partial_products_and_zs<
                 })
                 .collect::<Vec<_>>();
             let denominator_invs = F::batch_multiplicative_inverse(&denominators);
-            let quotient_values = numerators
-                .zip(denominator_invs)
-                .map(|(num, den_inv)| num * den_inv)
-                .collect::<Vec<_>>();
-
-            quotient_chunk_products(&quotient_values, degree)
+            quotient_chunk_products_from_factors(numerators, denominator_invs, degree)
         })
         .collect::<Vec<_>>();
 
@@ -447,6 +442,30 @@ fn wires_permutation_partial_products_and_zs<
         .into_par_iter()
         .map(PolynomialValues::new)
         .collect()
+}
+
+fn quotient_chunk_products_from_factors<F: Field>(
+    numerators: impl ExactSizeIterator<Item = F>,
+    denominator_invs: Vec<F>,
+    max_degree: usize,
+) -> Vec<F> {
+    debug_assert!(max_degree > 1);
+    debug_assert_eq!(numerators.len(), denominator_invs.len());
+    assert!(!denominator_invs.is_empty());
+
+    let num_chunks = denominator_invs.len().div_ceil(max_degree);
+    numerators.zip(denominator_invs).enumerate().fold(
+        Vec::with_capacity(num_chunks),
+        |mut chunk_products, (i, (numerator, denominator_inv))| {
+            let quotient = numerator * denominator_inv;
+            if i % max_degree == 0 {
+                chunk_products.push(quotient);
+            } else {
+                *chunk_products.last_mut().unwrap() *= quotient;
+            }
+            chunk_products
+        },
+    )
 }
 
 /// Computes lookup polynomials for a given challenge.
@@ -694,8 +713,15 @@ fn compute_quotient_polys<
                     || (batch_i == num_batches - 1 && xs_batch.len() <= BATCH_SIZE)
             );
 
-            let indices_batch: Vec<usize> =
-                (BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + xs_batch.len()).collect();
+            // Stack-resident index strip: avoids a per-batch heap `Vec<usize>` of
+            // arithmetic indices while preserving the exact `indices_batch` slice
+            // shape consumed by `eval_vanishing_poly_base_batch`.
+            let index_start = BATCH_SIZE * batch_i;
+            let mut indices_arr = [0usize; BATCH_SIZE];
+            for (j, slot) in indices_arr[..xs_batch.len()].iter_mut().enumerate() {
+                *slot = index_start + j;
+            }
+            let indices_batch = &indices_arr[..xs_batch.len()];
 
             let mut shifted_xs_batch = Vec::with_capacity(xs_batch.len());
             let mut local_zs_batch = Vec::with_capacity(xs_batch.len());
@@ -823,4 +849,80 @@ fn compute_quotient_polys<
         })
         .map(|values| values.coset_ifft(F::coset_shift()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quotient_chunk_products_from_factors;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    fn raw_values(len: usize, salt: u64) -> Vec<GoldilocksField> {
+        (0..len)
+            .map(|i| {
+                GoldilocksField(
+                    (i as u64)
+                        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                        .wrapping_add(salt),
+                )
+            })
+            .collect()
+    }
+
+    fn reference_chunk_products(
+        numerators: &[GoldilocksField],
+        denominator_invs: &[GoldilocksField],
+        max_degree: usize,
+    ) -> Vec<GoldilocksField> {
+        numerators
+            .iter()
+            .copied()
+            .zip(denominator_invs.iter().copied())
+            .map(|(numerator, denominator_inv)| numerator * denominator_inv)
+            .collect::<Vec<_>>()
+            .chunks(max_degree)
+            .map(|chunk| chunk.iter().copied().product())
+            .collect()
+    }
+
+    #[test]
+    fn quotient_chunk_products_fold_matches_materialized_reference_raw() {
+        for max_degree in 2..=9 {
+            for len in 1..=40 {
+                let numerators = raw_values(len, u64::MAX - len as u64);
+                let denominator_invs = raw_values(len, 0xffff_ffff_0000_0001 ^ max_degree as u64);
+                let expected =
+                    reference_chunk_products(&numerators, &denominator_invs, max_degree);
+                let actual = quotient_chunk_products_from_factors(
+                    numerators.iter().copied(),
+                    denominator_invs,
+                    max_degree,
+                );
+
+                assert_eq!(
+                    actual.iter().map(|value| value.0).collect::<Vec<_>>(),
+                    expected.iter().map(|value| value.0).collect::<Vec<_>>(),
+                    "len={len}, max_degree={max_degree}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quotient_chunk_products_fold_preserves_non_divisible_tail() {
+        for (len, max_degree) in [(3, 2), (7, 3), (17, 4), (31, 8), (40, 9)] {
+            assert_ne!(len % max_degree, 0);
+            let numerators = raw_values(len, 0x1234_5678_9abc_def0);
+            let denominator_invs = raw_values(len, 0xfedc_ba98_7654_3210);
+            let expected =
+                reference_chunk_products(&numerators, &denominator_invs, max_degree);
+            let actual = quotient_chunk_products_from_factors(
+                numerators.iter().copied(),
+                denominator_invs,
+                max_degree,
+            );
+
+            assert_eq!(actual.len(), len.div_ceil(max_degree));
+            assert_eq!(actual.last().unwrap().0, expected.last().unwrap().0);
+        }
+    }
 }
