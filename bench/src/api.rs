@@ -35,10 +35,13 @@ pub struct Circuits {
     pub heavy_chain_data: CircuitData<F, C, D>,
     pub light_chain_target: BlockTxChainTarget,
     pub light_chain_data: CircuitData<F, C, D>,
-    pub block_target: BlockTarget,
-    pub block_data: CircuitData<F, C, D>,
     pub dummy_heavy_proof: Proof,
     pub dummy_light_proof: Proof,
+}
+
+pub(crate) struct FinalCircuit {
+    pub target: BlockTarget,
+    pub data: CircuitData<F, C, D>,
 }
 struct PathCircuits {
     tx_target: BlockTxTarget,
@@ -92,16 +95,6 @@ impl Circuits {
             },
         );
 
-        let block = BlockCircuit::define(
-            CIRCUIT_CONFIG,
-            &pre_data,
-            &light.chain_data,
-            &heavy.chain_data,
-            ON_CHAIN_OPERATIONS_LIMIT,
-        );
-        let block_target = block.target;
-        let block_data = block.builder.build::<C>();
-
         Self {
             heavy_tx_target: heavy.tx_target,
             heavy_tx_data: heavy.tx_data,
@@ -113,10 +106,22 @@ impl Circuits {
             heavy_chain_data: heavy.chain_data,
             light_chain_target: light.chain_target,
             light_chain_data: light.chain_data,
-            block_target,
-            block_data,
             dummy_heavy_proof: heavy.dummy_proof,
             dummy_light_proof: light.dummy_proof,
+        }
+    }
+
+    pub(crate) fn build_final(&self) -> FinalCircuit {
+        let block = BlockCircuit::define(
+            CIRCUIT_CONFIG,
+            &self.pre_data,
+            &self.light_chain_data,
+            &self.heavy_chain_data,
+            ON_CHAIN_OPERATIONS_LIMIT,
+        );
+        FinalCircuit {
+            target: block.target,
+            data: block.builder.build::<C>(),
         }
     }
 }

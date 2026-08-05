@@ -358,7 +358,12 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     block.tx_chunks = tx_chunks;
     block.tx_chunks.push(Vec::new());
 
-    let (light_chain_proof, heavy_chain_proof) = std::thread::scope(|scope| {
+    let (light_chain_proof, heavy_chain_proof, final_circuit) = std::thread::scope(|scope| {
+        let final_handle = std::thread::Builder::new()
+            .name("final-circuit-build".into())
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, || circuits.build_final())
+            .expect("final circuit build thread must start");
         let heavy_handle = std::thread::Builder::new()
             .name("heavy-tx-chain".into())
             .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -388,14 +393,17 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
         let heavy_chain_proof = heavy_handle
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        (light_chain_proof, heavy_chain_proof)
+        let final_circuit = final_handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (light_chain_proof, heavy_chain_proof, final_circuit)
     });
 
     let (light_chain_input, heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
     BlockCircuit::prove(
-        &circuits.block_target,
-        &circuits.block_data,
+        &final_circuit.target,
+        &final_circuit.data,
         &block,
         &pre_proof,
         light_chain_input,
