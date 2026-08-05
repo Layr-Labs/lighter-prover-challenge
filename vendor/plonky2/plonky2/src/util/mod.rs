@@ -30,6 +30,60 @@ pub fn transpose<T: Send + Sync + Copy>(matrix: &[Vec<T>]) -> Vec<Vec<T>> {
         .collect()
 }
 
+#[derive(Clone, Copy)]
+struct SendPtr<T>(*mut T);
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
+
+impl<T> SendPtr<T> {
+    fn get(self) -> *mut T {
+        self.0
+    }
+}
+
+/// Transposes a column-major matrix (`columns[j][i]`) into one flat row-major
+/// buffer whose row order is bit-reversed: output row `reverse_bits(i)` holds
+/// `columns[0][i], columns[1][i], ...`. The column length must be a power of two.
+///
+/// This fuses `transpose` + `reverse_index_bits_in_place` and produces a single
+/// contiguous allocation instead of one small `Vec` per row.
+pub fn transpose_to_bitrev_flat<T: Send + Sync + Copy>(columns: &[Vec<T>]) -> Vec<T> {
+    const BLOCK: usize = 64;
+
+    let width = columns.len();
+    let rows = columns[0].len();
+    debug_assert!(columns.iter().all(|column| column.len() == rows));
+    let log_rows = log2_strict(rows);
+
+    let mut flat: Vec<T> = Vec::with_capacity(width * rows);
+    let base = SendPtr(flat.as_mut_ptr());
+
+    let fill_rows = |range: core::ops::Range<usize>| {
+        for i in range {
+            let reversed = reverse_bits(i, log_rows);
+            // SAFETY: `i -> reversed` is a bijection on `0..rows`, so every output
+            // row is written by exactly one worker, and `reversed * width + width
+            // <= rows * width`, which is within the allocated capacity.
+            let row = unsafe { base.get().add(reversed * width) };
+            for (j, column) in columns.iter().enumerate() {
+                unsafe { row.add(j).write(*column.get_unchecked(i)) };
+            }
+        }
+    };
+
+    if rows >= BLOCK {
+        (0..rows / BLOCK)
+            .into_par_iter()
+            .for_each(|block| fill_rows(block * BLOCK..(block + 1) * BLOCK));
+    } else {
+        fill_rows(0..rows);
+    }
+
+    // SAFETY: every element in `0..width * rows` was initialized above.
+    unsafe { flat.set_len(width * rows) };
+    flat
+}
+
 pub(crate) const fn reverse_bits(n: usize, num_bits: usize) -> usize {
     // NB: The only reason we need overflowing_shr() here as opposed
     // to plain '>>' is to accommodate the case n == num_bits == 0,

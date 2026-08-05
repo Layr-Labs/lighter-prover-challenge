@@ -141,15 +141,23 @@ fn prove_tx_witness(
     tx_data: &CircuitData<F, C, D>,
     partition_witness: PartitionWitness<'_, F>,
 ) -> Proof {
+    let mut timing = TimingTree::new(
+        match path {
+            TxPath::Heavy => "HeavyTxProof",
+            TxPath::Light => "LightTxProof",
+        },
+        log::Level::Debug,
+    );
     let proof = prove_with_partition_witness::<F, C, D>(
         &tx_data.prover_only,
         &tx_data.common,
         partition_witness,
-        &mut TimingTree::default(),
+        &mut timing,
     )
     .unwrap_or_else(|error| {
         panic!("{path:?} block transaction chunk #{chunk_index} proof failed: {error:?}")
     });
+    timing.print();
     #[cfg(debug_assertions)]
     tx_data
         .verify(proof.clone())

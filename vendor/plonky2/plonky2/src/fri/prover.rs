@@ -235,7 +235,7 @@ fn fri_prover_query_round<
     let mut query_steps = Vec::new();
     let initial_proof = initial_merkle_trees
         .iter()
-        .map(|t| (t.get(x_index).to_vec(), t.prove(x_index)))
+        .map(|t| (t.leaf_vec(x_index), t.prove(x_index)))
         .collect::<Vec<_>>();
     for (i, tree) in trees.iter().enumerate() {
         let arity_bits = fri_params.reduction_arity_bits[i];
