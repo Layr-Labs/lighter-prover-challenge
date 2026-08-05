@@ -156,6 +156,16 @@ where
     ) -> serde_json::Result<Self> {
         let mut block: Self = serde_json::from_slice(data)?;
         let mut txs = std::mem::take(&mut block.txs);
+        // The tx circuit derives after-roots. Cache them from the next tx's old roots before
+        // chunking changes execution order; the trailing tx uses the block's final roots.
+        let mut next_state_root = block.new_state_root;
+        let mut next_delta_root = block.new_account_delta_tree_root;
+        for tx in txs.iter_mut().rev() {
+            tx.new_state_root = next_state_root;
+            tx.new_account_delta_tree_root = next_delta_root;
+            next_state_root = tx.old_state_root;
+            next_delta_root = tx.old_account_delta_tree_root;
+        }
         // The block's witness ends with a single empty tx (older witnesses may carry one
         // per circuit type), kept aside as the template for all padding.
         let mut empty_template: Option<Tx<F>> = None;

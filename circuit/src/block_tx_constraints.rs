@@ -822,3 +822,217 @@ impl BlockTxCircuit {
             });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use plonky2::hash::hash_types::{HashOut, HashOutTarget};
+    use plonky2::iop::target::Target;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    use super::*;
+    use crate::block_tx::JumpState;
+    use crate::types::config::CIRCUIT_CONFIG;
+
+    #[derive(Clone, Copy)]
+    struct StepTargets {
+        jump: JumpStateTarget,
+        tx_index: Target,
+        tx_type: Target,
+        tx_old_state_root: HashOutTarget,
+        tx_new_state_root: HashOutTarget,
+        tx_old_delta_root: HashOutTarget,
+        tx_new_delta_root: HashOutTarget,
+    }
+
+    fn random_hash(rng: &mut StdRng) -> HashOut<F> {
+        HashOut::from(core::array::from_fn(|_| F::from_canonical_u32(rng.r#gen())))
+    }
+
+    fn random_jump(
+        rng: &mut StdRng,
+        last_active_tx_index: F,
+        run_start_prev_index: F,
+    ) -> JumpState<F> {
+        JumpState {
+            last_active_tx_index,
+            prev_new_state_root: random_hash(rng),
+            prev_new_delta_root: random_hash(rng),
+            run_start_prev_index,
+            run_start_old_state_root: random_hash(rng),
+            run_start_old_delta_root: random_hash(rng),
+            coverage_hash: random_hash(rng),
+            claims_hash: random_hash(rng),
+            tx_count: F::from_canonical_u32(rng.gen_range(0..100)),
+        }
+    }
+
+    fn set_jump_target(pw: &mut PartialWitness<F>, target: JumpStateTarget, jump: JumpState<F>) {
+        pw.set_target(target.last_active_tx_index, jump.last_active_tx_index)
+            .unwrap();
+        pw.set_hash_target(target.prev_new_state_root, jump.prev_new_state_root)
+            .unwrap();
+        pw.set_hash_target(target.prev_new_delta_root, jump.prev_new_delta_root)
+            .unwrap();
+        pw.set_target(target.run_start_prev_index, jump.run_start_prev_index)
+            .unwrap();
+        pw.set_hash_target(
+            target.run_start_old_state_root,
+            jump.run_start_old_state_root,
+        )
+        .unwrap();
+        pw.set_hash_target(
+            target.run_start_old_delta_root,
+            jump.run_start_old_delta_root,
+        )
+        .unwrap();
+        pw.set_hash_target(target.coverage_hash, jump.coverage_hash)
+            .unwrap();
+        pw.set_hash_target(target.claims_hash, jump.claims_hash)
+            .unwrap();
+        pw.set_target(target.tx_count, jump.tx_count).unwrap();
+    }
+
+    #[test]
+    fn native_jump_step_matches_circuit() {
+        let mut builder = Builder::new(CIRCUIT_CONFIG);
+        let targets = StepTargets {
+            jump: JumpStateTarget::new(&mut builder),
+            tx_index: builder.add_virtual_target(),
+            tx_type: builder.add_virtual_target(),
+            tx_old_state_root: builder.add_virtual_hash(),
+            tx_new_state_root: builder.add_virtual_hash(),
+            tx_old_delta_root: builder.add_virtual_hash(),
+            tx_new_delta_root: builder.add_virtual_hash(),
+        };
+        let output = BlockTxCircuit::define_jump_step(
+            &mut builder,
+            targets.jump,
+            targets.tx_index,
+            targets.tx_type,
+            targets.tx_old_state_root,
+            targets.tx_new_state_root,
+            targets.tx_old_delta_root,
+            targets.tx_new_delta_root,
+        );
+        output.register_public_inputs(&mut builder);
+        builder.perform_registered_range_checks();
+        let data = builder.build::<C>();
+
+        let assert_step = |jump: JumpState<F>,
+                           tx_index: F,
+                           tx_type: F,
+                           tx_old_state_root: HashOut<F>,
+                           tx_new_state_root: HashOut<F>,
+                           tx_old_delta_root: HashOut<F>,
+                           tx_new_delta_root: HashOut<F>| {
+            let native = jump.step(
+                tx_index,
+                tx_type,
+                tx_old_state_root,
+                tx_new_state_root,
+                tx_old_delta_root,
+                tx_new_delta_root,
+            );
+            let mut pw = PartialWitness::new();
+            set_jump_target(&mut pw, targets.jump, jump);
+            pw.set_target(targets.tx_index, tx_index).unwrap();
+            pw.set_target(targets.tx_type, tx_type).unwrap();
+            pw.set_hash_target(targets.tx_old_state_root, tx_old_state_root)
+                .unwrap();
+            pw.set_hash_target(targets.tx_new_state_root, tx_new_state_root)
+                .unwrap();
+            pw.set_hash_target(targets.tx_old_delta_root, tx_old_delta_root)
+                .unwrap();
+            pw.set_hash_target(targets.tx_new_delta_root, tx_new_delta_root)
+                .unwrap();
+            let proof = data.prove(pw).unwrap();
+            data.verify(proof.clone()).unwrap();
+            assert_eq!(proof.public_inputs, native.to_vec());
+            native
+        };
+
+        let mut rng = StdRng::seed_from_u64(0x4a55_4d50);
+
+        let continuous = random_jump(&mut rng, F::from_canonical_u64(5), F::from_canonical_u64(2));
+        assert_step(
+            continuous,
+            F::from_canonical_u64(6),
+            F::from_canonical_u8(17),
+            continuous.prev_new_state_root,
+            random_hash(&mut rng),
+            continuous.prev_new_delta_root,
+            random_hash(&mut rng),
+        );
+
+        let jumping = random_jump(&mut rng, F::from_canonical_u64(4), F::from_canonical_u64(1));
+        assert_step(
+            jumping,
+            F::from_canonical_u64(8),
+            F::from_canonical_u8(23),
+            random_hash(&mut rng),
+            random_hash(&mut rng),
+            random_hash(&mut rng),
+            random_hash(&mut rng),
+        );
+
+        let run_empty = JumpState::initial(random_hash(&mut rng), random_hash(&mut rng));
+        assert_step(
+            run_empty,
+            F::from_canonical_u64(3),
+            F::from_canonical_u8(9),
+            random_hash(&mut rng),
+            random_hash(&mut rng),
+            random_hash(&mut rng),
+            random_hash(&mut rng),
+        );
+
+        let padding = random_jump(
+            &mut rng,
+            F::from_canonical_u64(11),
+            F::from_canonical_u64(7),
+        );
+        assert_step(
+            padding,
+            padding.last_active_tx_index,
+            F::ZERO,
+            random_hash(&mut rng),
+            random_hash(&mut rng),
+            random_hash(&mut rng),
+            random_hash(&mut rng),
+        );
+
+        let mut chained = JumpState::initial(random_hash(&mut rng), random_hash(&mut rng));
+        for tx_index in [0, 1, 4, 5, 9] {
+            let has_gap = F::from_canonical_u64(tx_index) != chained.last_active_tx_index + F::ONE;
+            let old_state_root = if has_gap {
+                random_hash(&mut rng)
+            } else {
+                chained.prev_new_state_root
+            };
+            let old_delta_root = if has_gap {
+                random_hash(&mut rng)
+            } else {
+                chained.prev_new_delta_root
+            };
+            chained = assert_step(
+                chained,
+                F::from_canonical_u64(tx_index),
+                F::from_canonical_u8(rng.gen_range(1..=u8::MAX)),
+                old_state_root,
+                random_hash(&mut rng),
+                old_delta_root,
+                random_hash(&mut rng),
+            );
+        }
+        assert_step(
+            chained,
+            chained.last_active_tx_index,
+            F::ZERO,
+            random_hash(&mut rng),
+            random_hash(&mut rng),
+            random_hash(&mut rng),
+            random_hash(&mut rng),
+        );
+    }
+}

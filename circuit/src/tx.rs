@@ -370,6 +370,10 @@ where
     #[serde(deserialize_with = "deserializers::hash_out")]
     pub old_account_delta_tree_root: HashOut<F>,
 
+    // Derived during block parsing from the globally subsequent tx.
+    #[serde(skip)]
+    pub new_account_delta_tree_root: HashOut<F>,
+
     #[serde(rename = "omdtr")]
     #[serde(deserialize_with = "deserializers::hash_out")]
     pub old_market_details_tree_root: HashOut<F>,
@@ -385,6 +389,10 @@ where
     #[serde(rename = "osr")]
     #[serde(deserialize_with = "deserializers::hash_out")]
     pub old_state_root: HashOut<F>,
+
+    // Derived during block parsing from the globally subsequent tx.
+    #[serde(skip)]
+    pub new_state_root: HashOut<F>,
 
     /*****************************/
     /*  STATE TREE MERKLE PROOFS */

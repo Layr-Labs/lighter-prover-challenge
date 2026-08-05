@@ -40,7 +40,12 @@ fn main() {
         PUBLIC_LIGHT_TX_COUNT,
     )
     .expect("invalid prover fixture");
-    let proof = prover::prove_block(&block, &Circuits::new());
+    let t_circuits = std::time::Instant::now();
+    let circuits = Circuits::new();
+    eprintln!("[t] Circuits::new: {:?}", t_circuits.elapsed());
+    let t_prove = std::time::Instant::now();
+    let proof = prover::prove_block(&block, &circuits);
+    eprintln!("[t] prove_block total: {:?}", t_prove.elapsed());
     bincode::serialize_into(
         BufWriter::with_capacity(
             PROOF_OUTPUT_BUFFER_BYTES,

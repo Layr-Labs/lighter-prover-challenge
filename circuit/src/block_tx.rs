@@ -5,7 +5,9 @@ use plonky2::field::extension::Extendable;
 use plonky2::field::types::Field;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget, RichField};
 use plonky2::iop::target::{BoolTarget, Target};
+use plonky2::plonk::config::Hasher;
 
+use crate::poseidon2::{Poseidon2, Poseidon2Hash};
 use crate::tx::Tx;
 use crate::types::approve_integrator::{
     APPROVE_INTEGRATOR_PUBLIC_INPUTS_LEN, ApproveIntegratorMessage, ApproveIntegratorMessageTarget,
@@ -53,6 +55,118 @@ where
             claims_hash: HashOut::ZERO,
             tx_count: F::ZERO,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn step(
+        &self,
+        tx_index: F,
+        tx_type: F,
+        tx_old_state_root: HashOut<F>,
+        tx_new_state_root: HashOut<F>,
+        tx_old_delta_root: HashOut<F>,
+        tx_new_delta_root: HashOut<F>,
+    ) -> Self
+    where
+        F: Poseidon2,
+    {
+        let is_padding = tx_index == self.last_active_tx_index;
+        let is_active = !is_padding;
+        debug_assert_eq!(tx_type == F::ZERO, is_padding);
+
+        let gap = tx_index - self.last_active_tx_index;
+        let effective_gap = if is_padding { F::ONE } else { gap };
+        let gap_minus_one = effective_gap - F::ONE;
+        debug_assert!(gap_minus_one.to_canonical_u64() < (1_u64 << 32));
+        let has_gap = gap_minus_one != F::ZERO;
+        let jumped = is_active && has_gap;
+
+        let continuous = is_active && !has_gap;
+        if continuous {
+            debug_assert_eq!(tx_old_state_root, self.prev_new_state_root);
+            debug_assert_eq!(tx_old_delta_root, self.prev_new_delta_root);
+        }
+
+        let run_empty = self.last_active_tx_index == self.run_start_prev_index;
+        let fold_coverage = jumped && !run_empty;
+        let mut coverage_record_in = vec![
+            self.run_start_prev_index,
+            self.last_active_tx_index + F::ONE,
+        ];
+        coverage_record_in.extend(self.run_start_old_state_root.elements);
+        coverage_record_in.extend(self.prev_new_state_root.elements);
+        coverage_record_in.extend(self.run_start_old_delta_root.elements);
+        coverage_record_in.extend(self.prev_new_delta_root.elements);
+        let coverage_record = Poseidon2Hash::hash_no_pad(&coverage_record_in);
+        let folded_coverage = Poseidon2Hash::two_to_one(self.coverage_hash, coverage_record);
+
+        let mut claim_record_in = vec![self.last_active_tx_index, tx_index];
+        claim_record_in.extend(self.prev_new_state_root.elements);
+        claim_record_in.extend(tx_old_state_root.elements);
+        claim_record_in.extend(self.prev_new_delta_root.elements);
+        claim_record_in.extend(tx_old_delta_root.elements);
+        let claim_record = Poseidon2Hash::hash_no_pad(&claim_record_in);
+        let folded_claims = Poseidon2Hash::two_to_one(self.claims_hash, claim_record);
+
+        Self {
+            last_active_tx_index: if is_active {
+                tx_index
+            } else {
+                self.last_active_tx_index
+            },
+            prev_new_state_root: if is_active {
+                tx_new_state_root
+            } else {
+                self.prev_new_state_root
+            },
+            prev_new_delta_root: if is_active {
+                tx_new_delta_root
+            } else {
+                self.prev_new_delta_root
+            },
+            run_start_prev_index: if jumped {
+                tx_index - F::ONE
+            } else {
+                self.run_start_prev_index
+            },
+            run_start_old_state_root: if jumped {
+                tx_old_state_root
+            } else {
+                self.run_start_old_state_root
+            },
+            run_start_old_delta_root: if jumped {
+                tx_old_delta_root
+            } else {
+                self.run_start_old_delta_root
+            },
+            coverage_hash: if fold_coverage {
+                folded_coverage
+            } else {
+                self.coverage_hash
+            },
+            claims_hash: if jumped {
+                folded_claims
+            } else {
+                self.claims_hash
+            },
+            tx_count: self.tx_count + F::from_bool(is_active),
+        }
+    }
+
+    pub fn step_chunk(&self, txs: &[Tx<F>]) -> Self
+    where
+        F: Poseidon2,
+    {
+        txs.iter().fold(*self, |jump, tx| {
+            jump.step(
+                F::from_canonical_u64(tx.tx_index),
+                F::from_canonical_u8(tx.tx_type),
+                tx.old_state_root,
+                tx.new_state_root,
+                tx.old_account_delta_tree_root,
+                tx.new_account_delta_tree_root,
+            )
+        })
     }
 
     pub fn from_public_inputs(pis: &[F]) -> Self {
