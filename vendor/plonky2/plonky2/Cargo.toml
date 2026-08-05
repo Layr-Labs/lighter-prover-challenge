@@ -47,6 +47,10 @@ p3-symmetric = { git = "https://github.com/Plonky3/Plonky3.git", rev = "eeb4e37b
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { version = "0.2", default-features = false, features = ["js"] }
 
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
+metal = "0.33.0"
+objc = "0.2.7"
+
 [dev-dependencies]
 criterion = { version = "0.5.1", default-features = false }
 env_logger = { version = "0.9.0", default-features = false }

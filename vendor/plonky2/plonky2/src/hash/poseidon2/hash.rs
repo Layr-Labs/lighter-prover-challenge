@@ -508,6 +508,14 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash {
         compress::<F, Self::Permutation>(left, right)
     }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn try_build_merkle_tree(
+        leaves: &[Vec<F>],
+        cap_height: usize,
+    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
+        super::metal::build_merkle_tree(leaves, cap_height)
+    }
 }
 
 impl Poseidon2Hash {

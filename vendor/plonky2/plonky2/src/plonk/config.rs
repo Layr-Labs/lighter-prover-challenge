@@ -75,6 +75,16 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
     }
 
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash;
+
+    /// Build the native Merkle digests and cap with a specialized backend, when available.
+    ///
+    /// The first result uses [`crate::hash::merkle_tree::MerkleTree::digests`] layout.
+    fn try_build_merkle_tree(
+        _leaves: &[Vec<F>],
+        _cap_height: usize,
+    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
+        None
+    }
 }
 
 /// Trait for algebraic hash functions, built from a permutation using the sponge construction.
