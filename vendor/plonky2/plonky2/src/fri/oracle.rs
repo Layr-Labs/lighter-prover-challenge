@@ -6,7 +6,7 @@ use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
 use crate::field::extension::Extendable;
-use crate::field::fft::FftRootTable;
+use crate::field::fft::{ifft_with_options, FftRootTable};
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::proof::FriProof;
@@ -65,7 +65,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let coeffs = timed!(
             timing,
             "IFFT",
-            values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
+            values
+                .into_par_iter()
+                .map(|v| ifft_with_options(v, None, fft_root_table))
+                .collect::<Vec<_>>()
         );
 
         Self::from_coeffs(
@@ -234,5 +237,52 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         );
 
         fri_proof
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::fft::fft_root_table;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    #[test]
+    fn larger_root_table_preserves_polynomial_batch() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let degree = 16;
+        let rate_bits = 3;
+        let values = (0..3)
+            .map(|polynomial| {
+                PolynomialValues::new(
+                    (0..degree)
+                        .map(|i| F::from_canonical_usize((polynomial + 1) * (i * i + 3 * i + 1)))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let root_table = fft_root_table::<F>(degree << rate_bits);
+
+        let expected = PolynomialBatch::<F, C, D>::from_values(
+            values.clone(),
+            rate_bits,
+            false,
+            2,
+            &mut TimingTree::default(),
+            None,
+        );
+        let actual = PolynomialBatch::<F, C, D>::from_values(
+            values,
+            rate_bits,
+            false,
+            2,
+            &mut TimingTree::default(),
+            Some(&root_table),
+        );
+
+        assert_eq!(actual, expected);
     }
 }

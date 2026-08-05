@@ -168,9 +168,9 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
     let n = values.len();
     let lg_n = log2_strict(n);
 
-    if root_table.len() != lg_n {
+    if root_table.len() < lg_n {
         panic!(
-            "Expected root table of length {}, but it was {}.",
+            "Expected root table of length at least {}, but it was {}.",
             lg_n,
             root_table.len()
         );
@@ -207,7 +207,7 @@ mod tests {
 
     use plonky2_util::{log2_ceil, log2_strict};
 
-    use crate::fft::{fft, fft_with_options, ifft};
+    use crate::fft::{fft, fft_root_table, fft_with_options, ifft, ifft_with_options};
     use crate::goldilocks_field::GoldilocksField;
     use crate::polynomial::{PolynomialCoeffs, PolynomialValues};
     use crate::types::Field;
@@ -246,6 +246,37 @@ mod tests {
                 fft_with_options(zero_tail, Some(r), None)
             );
         }
+    }
+
+    #[test]
+    fn larger_root_tables_preserve_prefixes_and_ifft_results() {
+        type F = GoldilocksField;
+
+        for lg_n in 1..=10 {
+            let n = 1 << lg_n;
+            let exact_table = fft_root_table::<F>(n);
+            let larger_table = fft_root_table::<F>(n << 3);
+            assert_eq!(exact_table.as_slice(), &larger_table[..lg_n]);
+
+            let values = PolynomialValues::new(
+                (0..n)
+                    .map(|i| F::from_canonical_usize(i * i + 5 * i + 3))
+                    .collect(),
+            );
+            assert_eq!(
+                ifft(values.clone()),
+                ifft_with_options(values, None, Some(&larger_table))
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Expected root table of length at least 3, but it was 2.")]
+    fn undersized_root_table_is_rejected() {
+        type F = GoldilocksField;
+        let undersized_table = fft_root_table::<F>(4);
+        let polynomial = PolynomialCoeffs::zero(8);
+        let _ = fft_with_options(polynomial, None, Some(&undersized_table));
     }
 
     fn evaluate_naive<F: Field>(coefficients: &PolynomialCoeffs<F>) -> PolynomialValues<F> {
