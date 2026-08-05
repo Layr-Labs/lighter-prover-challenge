@@ -42,12 +42,12 @@ pub trait Circuit<
     /// `target` can be used to assign partial witness in [`BlockTxCircuit::prove()`] function
     fn define(config: CircuitConfig, tx_limit: usize, chain_id: u32, mode: u8) -> Self;
     /// Fills partial witness for block target with given block data
-    fn generate_witness(block: &BlockTx<F>, target: &BlockTxTarget) -> Result<PartialWitness<F>>;
+    fn generate_witness(block: &BlockTx<'_, F>, target: &BlockTxTarget) -> Result<PartialWitness<F>>;
     /// Takes `circuit`, block witness and `target` defined in [`BlockTxCircuit::define()`] function
     /// and returns the (not-compressed) proof with public inputs
     fn prove(
         circuit: &CircuitData<F, C, D>,
-        block: &BlockTx<F>,
+        block: &BlockTx<'_, F>,
         bt: &BlockTxTarget,
     ) -> Result<ProofWithPublicInputs<F, C, D>>;
 }
@@ -174,7 +174,7 @@ impl Circuit<C, F, D> for BlockTxCircuit {
 
     fn prove(
         circuit: &CircuitData<F, C, D>,
-        block: &BlockTx<F>,
+        block: &BlockTx<'_, F>,
         target: &BlockTxTarget,
     ) -> Result<ProofWithPublicInputs<F, C, D>> {
         let mut timing = TimingTree::new("BlockTxCircuit::prove", Level::Debug);
@@ -192,7 +192,7 @@ impl Circuit<C, F, D> for BlockTxCircuit {
         Ok(proof)
     }
 
-    fn generate_witness(block: &BlockTx<F>, target: &BlockTxTarget) -> Result<PartialWitness<F>> {
+    fn generate_witness(block: &BlockTx<'_, F>, target: &BlockTxTarget) -> Result<PartialWitness<F>> {
         let mut pw = PartialWitness::new();
 
         pw.set_target(target.created_at, F::from_canonical_i64(block.created_at))?;

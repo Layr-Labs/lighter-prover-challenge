@@ -101,7 +101,7 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
             created_at: block.created_at,
             state_metadata_hash,
             old_jump: if is_light { light_jump } else { heavy_jump },
-            txs: txs.clone(),
+            txs,
         };
 
         let tx_proof = if is_light {
