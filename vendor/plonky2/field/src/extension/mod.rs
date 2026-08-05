@@ -129,9 +129,9 @@ pub fn flatten<F, const D: usize>(l: &[F::Extension]) -> Vec<F>
 where
     F: Field + Extendable<D>,
 {
-    l.iter()
-        .flat_map(|x| x.to_basefield_array().to_vec())
-        .collect()
+    let mut flattened = Vec::with_capacity(l.len() * D);
+    flattened.extend(l.iter().flat_map(|x| x.to_basefield_array()));
+    flattened
 }
 
 /// Batch every D-sized chunks into extension field elements.
@@ -141,6 +141,37 @@ where
 {
     debug_assert_eq!(l.len() % D, 0);
     l.chunks_exact(D)
-        .map(|c| F::Extension::from_basefield_array(c.to_vec().try_into().unwrap()))
+        .map(|c| F::Extension::from_basefield_array(c.try_into().unwrap()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::goldilocks_field::GoldilocksField;
+
+    fn check_flatten_round_trip<const D: usize>()
+    where
+        GoldilocksField: Extendable<D>,
+    {
+        let first = core::array::from_fn(|i| GoldilocksField::from_canonical_usize(i + 1));
+        let second = core::array::from_fn(|i| GoldilocksField::from_canonical_usize(2 * D - i));
+        let values = [
+            <GoldilocksField as Extendable<D>>::Extension::from_basefield_array(first),
+            <GoldilocksField as Extendable<D>>::Extension::from_basefield_array(second),
+        ];
+        let expected = first.into_iter().chain(second).collect::<Vec<_>>();
+
+        let flattened = flatten::<GoldilocksField, D>(&values);
+        assert_eq!(flattened, expected);
+        assert_eq!(unflatten::<GoldilocksField, D>(&flattened), values);
+    }
+
+    #[test]
+    fn flattening_preserves_extension_order_and_round_trips() {
+        check_flatten_round_trip::<1>();
+        check_flatten_round_trip::<2>();
+        check_flatten_round_trip::<4>();
+        check_flatten_round_trip::<5>();
+    }
 }
