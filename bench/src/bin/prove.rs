@@ -24,14 +24,8 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
-const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 fn main() {
-    rayon::ThreadPoolBuilder::new()
-        .stack_size(WORKER_STACK_BYTES)
-        .build_global()
-        .expect("cannot configure the global thread pool");
-
     let mut args = env::args().skip(1);
     let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
@@ -46,7 +40,7 @@ fn main() {
         PUBLIC_LIGHT_TX_COUNT,
     )
     .expect("invalid prover fixture");
-    let proof = prover::prove_block(block, &Circuits::new());
+    let proof = prover::prove_block(&block, &Circuits::new());
     bincode::serialize_into(
         BufWriter::with_capacity(
             PROOF_OUTPUT_BUFFER_BYTES,

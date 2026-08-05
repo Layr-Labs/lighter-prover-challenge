@@ -216,7 +216,7 @@ impl JumpStateTarget {
     }
 }
 
-pub struct BlockTx<F>
+pub struct BlockTx<'a, F>
 where
     F: Field + Extendable<5> + RichField,
 {
@@ -225,7 +225,7 @@ where
     pub state_metadata_hash: HashOut<F>,
     pub old_jump: JumpState<F>,
 
-    pub txs: Vec<Tx<F>>,
+    pub txs: &'a [Tx<F>],
 }
 
 #[derive(Debug, Clone)]
