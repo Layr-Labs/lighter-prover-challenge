@@ -335,7 +335,21 @@ fn prove_path(
     })
 }
 
-pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
+pub fn prove_block(block: Block<F>, circuits: &Circuits) -> Proof {
+    std::thread::scope(|scope| prove_block_scoped(block, circuits, scope))
+}
+
+fn prove_block_scoped<'scope>(
+    mut block: Block<F>,
+    circuits: &'scope Circuits,
+    scope: &'scope std::thread::Scope<'scope, '_>,
+) -> Proof {
+    let block_circuit_handle = std::thread::Builder::new()
+        .name("block-circuit-builder".into())
+        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .spawn_scoped(scope, || circuits.build_block_circuit())
+        .expect("block circuit builder thread must start");
+
     let pre_proof = BlockPreExecutionCircuit::prove(
         &circuits.pre_data,
         &BlockPreExec::from_block(&block),
@@ -393,9 +407,12 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
 
     let (light_chain_input, heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
+    let (block_target, block_data) = block_circuit_handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     BlockCircuit::prove(
-        &circuits.block_target,
-        &circuits.block_data,
+        &block_target,
+        &block_data,
         &block,
         &pre_proof,
         light_chain_input,
