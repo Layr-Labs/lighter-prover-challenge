@@ -164,6 +164,9 @@ pub(crate) fn eval_vanishing_poly<F: RichField + Extendable<D>, const D: usize>(
 }
 
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
+///
+/// Results are stored point-major: the challenges for point `k` occupy
+/// `result[k * num_challenges..(k + 1) * num_challenges]`.
 pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
     indices_batch: &[usize],
@@ -181,7 +184,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     alphas: &[F],
     z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
-) -> Vec<Vec<F>> {
+) -> Vec<F> {
     let has_lookup = common_data.num_lookup_polys != 0;
 
     let n = indices_batch.len();
@@ -229,7 +232,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         Vec::new()
     };
 
-    let mut res_batch: Vec<Vec<F>> = Vec::with_capacity(n);
+    let mut res_batch = vec![F::ZERO; n * num_challenges];
     for k in 0..n {
         let index = indices_batch[k];
         let x = xs_batch[k];
@@ -319,8 +322,12 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             .chain(vanishing_partial_products_terms.iter())
             .chain(vanishing_all_lookup_terms.iter())
             .chain(constraint_terms);
-        let res = plonk_common::reduce_with_powers_multi(vanishing_terms, alphas);
-        res_batch.push(res);
+        let res = &mut res_batch[k * num_challenges..(k + 1) * num_challenges];
+        for &term in vanishing_terms.rev() {
+            for (c, &alpha) in res.iter_mut().zip(alphas) {
+                *c = term.multiply_accumulate(*c, alpha);
+            }
+        }
 
         vanishing_z_1_terms.clear();
         vanishing_partial_products_terms.clear();

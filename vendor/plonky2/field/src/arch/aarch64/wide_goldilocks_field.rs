@@ -1,7 +1,8 @@
 use core::arch::asm;
+use core::fmt;
 use core::iter::{Product, Sum};
 use core::ops::{Add, AddAssign, Div, Mul, MulAssign, Neg, Sub, SubAssign};
-use core::{fmt, slice};
+use core::slice;
 
 use super::neon_goldilocks_field::NeonGoldilocksField;
 use crate::goldilocks_field::GoldilocksField;

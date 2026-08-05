@@ -7,7 +7,6 @@ use circuit::block_pre_execution_constraints::{
 };
 use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, BlockTxChainTarget, Circuit as _};
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _};
-use circuit::builder::custom::cyclic_base_proof;
 use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
 use plonky2::plonk::circuit_data::CircuitData;
@@ -24,6 +23,7 @@ pub const LIGHT_TX_MODE: u8 = TX_LIGHT;
 pub const ON_CHAIN_OPERATIONS_LIMIT: usize = 1;
 pub const PUBLIC_HEAVY_TX_COUNT: usize = 10;
 pub const PUBLIC_LIGHT_TX_COUNT: usize = 490;
+pub const PROVER_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 pub struct Circuits {
     pub heavy_tx_target: BlockTxTarget,
@@ -40,19 +40,21 @@ pub struct Circuits {
     pub block_data: CircuitData<F, C, D>,
     pub dummy_heavy_chain_circuit: CircuitData<F, C, D>,
     pub dummy_light_chain_circuit: CircuitData<F, C, D>,
+    pub dummy_heavy_proof: Proof,
+    pub dummy_light_proof: Proof,
 }
-
 struct PathCircuits {
     tx_target: BlockTxTarget,
     tx_data: CircuitData<F, C, D>,
     chain_target: BlockTxChainTarget,
     chain_data: CircuitData<F, C, D>,
     dummy_chain_circuit: CircuitData<F, C, D>,
+    dummy_proof: Proof,
 }
 
 impl PathCircuits {
-    fn build(tx_per_proof: usize, mode: u8, label: &str) -> Self {
-        let tx = BlockTxCircuit::define(CIRCUIT_CONFIG, tx_per_proof, CHAIN_ID, mode);
+    fn new(tx_per_proof: usize, tx_mode: u8) -> Self {
+        let tx = BlockTxCircuit::define(CIRCUIT_CONFIG, tx_per_proof, CHAIN_ID, tx_mode);
         let tx_target = tx.target;
         let tx_data = tx.builder.build::<C>();
 
@@ -61,12 +63,14 @@ impl PathCircuits {
         let chain_target = chain.target;
         let chain_data = chain.builder.build::<C>();
 
-        // The runtime cyclic base proof doubles as the dummy-slot witness for
-        // every chain recursion step, so no separate all-zero dummy proof is
-        // proven here (it was redundant work: both prove the same dummy
-        // circuit against the same verifier data).
-        let _ = label;
         let dummy_chain_circuit = dummy_circuit(&chain_data.common);
+        let proof_bytes: &[u8] = match tx_mode {
+            TX_HEAVY => include_bytes!("../dummy-heavy-chain-proof.bin"),
+            TX_LIGHT => include_bytes!("../dummy-light-chain-proof.bin"),
+            _ => panic!("unsupported block transaction mode {tx_mode}"),
+        };
+        let dummy_proof =
+            bincode::deserialize(proof_bytes).expect("embedded chain dummy proof is invalid");
 
         Self {
             tx_target,
@@ -74,22 +78,23 @@ impl PathCircuits {
             chain_target,
             chain_data,
             dummy_chain_circuit,
+            dummy_proof,
         }
     }
 }
 
 impl Circuits {
     pub fn new() -> Self {
-        let ((heavy, light), (pre_target, pre_data)) = rayon::join(
-            || {
-                rayon::join(
-                    || PathCircuits::build(HEAVY_TX_PER_PROOF, HEAVY_TX_MODE, "heavy"),
-                    || PathCircuits::build(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE, "light"),
-                )
-            },
+        let ((pre_target, pre_data), (heavy, light)) = rayon::join(
             || {
                 let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
                 (pre.target, pre.builder.build::<C>())
+            },
+            || {
+                rayon::join(
+                    || PathCircuits::new(HEAVY_TX_PER_PROOF, HEAVY_TX_MODE),
+                    || PathCircuits::new(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE),
+                )
             },
         );
 
@@ -118,6 +123,8 @@ impl Circuits {
             block_data,
             dummy_heavy_chain_circuit: heavy.dummy_chain_circuit,
             dummy_light_chain_circuit: light.dummy_chain_circuit,
+            dummy_heavy_proof: heavy.dummy_proof,
+            dummy_light_proof: light.dummy_proof,
         }
     }
 }
@@ -136,5 +143,13 @@ mod tests {
         assert_eq!(LIGHT_TX_PER_PROOF, 10);
         assert_eq!(LIGHT_TX_MODE, TX_LIGHT);
         assert_eq!(ON_CHAIN_OPERATIONS_LIMIT, 1);
+    }
+
+    #[test]
+    fn embedded_chain_dummy_proofs_deserialize() {
+        let _: Proof = bincode::deserialize(include_bytes!("../dummy-heavy-chain-proof.bin"))
+            .expect("embedded heavy dummy proof is invalid");
+        let _: Proof = bincode::deserialize(include_bytes!("../dummy-light-chain-proof.bin"))
+            .expect("embedded light dummy proof is invalid");
     }
 }
