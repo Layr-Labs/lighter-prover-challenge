@@ -10,7 +10,7 @@ use std::sync::Arc;
 use hashbrown::HashMap;
 use serde::{Serialize, Serializer};
 
-use crate::field::batch_util::batch_multiply_inplace;
+use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
 use crate::gates::selectors::UNUSED_SELECTOR;
@@ -164,7 +164,8 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         group_range: Range<usize>,
         num_selectors: usize,
         num_lookup_selectors: usize,
-    ) -> Vec<F> {
+        constraints_batch: &mut [F],
+    ) {
         let filters: Vec<_> = vars_batch
             .iter()
             .map(|vars| {
@@ -177,11 +178,14 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
             })
             .collect();
         vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
-        let mut res_batch = self.eval_unfiltered_base_batch(vars_batch);
-        for res_chunk in res_batch.chunks_exact_mut(filters.len()) {
-            batch_multiply_inplace(res_chunk, &filters);
+        let res_batch = self.eval_unfiltered_base_batch(vars_batch);
+        debug_assert!(res_batch.len() <= constraints_batch.len());
+        for (res_chunk, constraints_chunk) in res_batch
+            .chunks_exact(filters.len())
+            .zip(constraints_batch.chunks_exact_mut(filters.len()))
+        {
+            batch_multiply_add_inplace(constraints_chunk, res_chunk, &filters);
         }
-        res_batch
     }
 
     /// Adds this gate's filtered constraints into the `combined_gate_constraints` buffer.

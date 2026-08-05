@@ -44,6 +44,25 @@ pub fn batch_multiply_inplace<F: Field>(out: &mut [F], a: &[F]) {
     }
 }
 
+/// Elementwise multiply-add of two slices into an output slice.
+pub fn batch_multiply_add_inplace<F: Field>(out: &mut [F], a: &[F], b: &[F]) {
+    let n = out.len();
+    assert_eq!(n, a.len(), "all arrays must have the same length");
+    assert_eq!(n, b.len(), "all arrays must have the same length");
+
+    let (out_packed, out_leftovers) =
+        pack_slice_with_leftovers_mut::<<F as Packable>::Packing>(out);
+    let (a_packed, a_leftovers) = pack_slice_with_leftovers::<<F as Packable>::Packing>(a);
+    let (b_packed, b_leftovers) = pack_slice_with_leftovers::<<F as Packable>::Packing>(b);
+
+    for ((x_out, x_a), x_b) in out_packed.iter_mut().zip(a_packed).zip(b_packed) {
+        *x_out += *x_a * *x_b;
+    }
+    for ((x_out, x_a), x_b) in out_leftovers.iter_mut().zip(a_leftovers).zip(b_leftovers) {
+        *x_out += *x_a * *x_b;
+    }
+}
+
 /// Elementwise inplace addition of two slices of field elements.
 /// Implementation be faster than the trivial for loop.
 pub fn batch_add_inplace<F: Field>(out: &mut [F], a: &[F]) {
