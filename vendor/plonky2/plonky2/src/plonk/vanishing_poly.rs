@@ -209,6 +209,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     let constraint_terms_batch =
         evaluate_gate_constraints_base_batch::<F, D>(common_data, vars_batch);
     debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
+    let l_0_values = z_h_on_coset.eval_l_0_batch(indices_batch, xs_batch);
 
     let num_challenges = common_data.config.num_challenges;
     let num_routed_wires = common_data.config.num_routed_wires;
@@ -233,7 +234,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     let mut res_batch = vec![F::ZERO; n * num_challenges];
     for k in 0..n {
-        let index = indices_batch[k];
         let x = xs_batch[k];
         let vars = vars_batch.view(k);
 
@@ -260,7 +260,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
         let constraint_terms = PackedStridedView::new(&constraint_terms_batch, n, k);
 
-        let l_0_x = z_h_on_coset.eval_l_0(index, x);
+        let l_0_x = l_0_values[k];
         for i in 0..num_challenges {
             let z_x = local_zs[i];
             let z_gx = next_zs[i];

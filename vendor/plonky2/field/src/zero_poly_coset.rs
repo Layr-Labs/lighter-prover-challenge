@@ -59,4 +59,43 @@ impl<F: Field> ZeroPolyOnCoset<F> {
         // Could also precompute the inverses using Montgomery.
         self.eval(i) * (self.n * (x - F::ONE)).inverse()
     }
+
+    /// Returns `L_0(x)` for corresponding batches of evaluation indices and points.
+    pub fn eval_l_0_batch(&self, indices: &[usize], xs: &[F]) -> Vec<F> {
+        assert_eq!(indices.len(), xs.len());
+        let denominators = xs
+            .iter()
+            .map(|&x| self.n * (x - F::ONE))
+            .collect::<Vec<_>>();
+        let mut values = F::batch_multiplicative_inverse(&denominators);
+        for (value, &i) in values.iter_mut().zip(indices) {
+            *value *= self.eval(i);
+        }
+        values
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::goldilocks_field::GoldilocksField;
+
+    #[test]
+    fn batch_l_0_matches_scalar_evaluations() {
+        type F = GoldilocksField;
+        let zero_poly = ZeroPolyOnCoset::<F>::new(4, 3);
+        let points = F::two_adic_subgroup(7)
+            .into_iter()
+            .map(|x| F::coset_shift() * x)
+            .collect::<Vec<_>>();
+        let indices = (7..39).collect::<Vec<_>>();
+        let xs = indices.iter().map(|&i| points[i]).collect::<Vec<_>>();
+        let expected = indices
+            .iter()
+            .zip(&xs)
+            .map(|(&i, &x)| zero_poly.eval_l_0(i, x))
+            .collect::<Vec<_>>();
+
+        assert_eq!(zero_poly.eval_l_0_batch(&indices, &xs), expected);
+    }
 }
