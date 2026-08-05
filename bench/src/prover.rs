@@ -76,42 +76,50 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
             .name("chain-recursion".to_string())
             .stack_size(CHAIN_WORKER_STACK_BYTES)
             .spawn_scoped(scope, move || {
-                let mut heavy_chain_proof = heavy_base_proof;
-                let mut light_chain_proof = light_base_proof;
+                // The base proofs stay alive for the whole loop: each doubles
+                // as the previous-proof witness at step 0 and as the
+                // dummy-slot witness at every step (it is a valid proof of
+                // the same dummy circuit), so no separate dummy proof and no
+                // clone are needed.
+                let mut heavy_chain_proof: Option<Proof> = None;
+                let mut light_chain_proof: Option<Proof> = None;
 
                 for (is_light, chain_step, tx_proof) in recv {
                     if is_light {
-                        light_chain_proof = BlockTxChainCircuit::prove(
+                        light_chain_proof = Some(BlockTxChainCircuit::prove(
                             &circuits.light_chain_target,
                             &circuits.light_chain_data,
                             chain_step,
-                            &light_chain_proof,
-                            &circuits.dummy_light_proof,
+                            light_chain_proof.as_ref().unwrap_or(&light_base_proof),
+                            &light_base_proof,
                             &tx_proof,
                         )
                         .unwrap_or_else(|error| {
                             panic!(
                                 "light block transaction chain step #{chain_step} failed: {error:?}"
                             )
-                        });
+                        }));
                     } else {
-                        heavy_chain_proof = BlockTxChainCircuit::prove(
+                        heavy_chain_proof = Some(BlockTxChainCircuit::prove(
                             &circuits.heavy_chain_target,
                             &circuits.heavy_chain_data,
                             chain_step,
-                            &heavy_chain_proof,
-                            &circuits.dummy_heavy_proof,
+                            heavy_chain_proof.as_ref().unwrap_or(&heavy_base_proof),
+                            &heavy_base_proof,
                             &tx_proof,
                         )
                         .unwrap_or_else(|error| {
                             panic!(
                                 "heavy block transaction chain step #{chain_step} failed: {error:?}"
                             )
-                        });
+                        }));
                     }
                 }
 
-                (light_chain_proof, heavy_chain_proof)
+                (
+                    light_chain_proof.unwrap_or(light_base_proof),
+                    heavy_chain_proof.unwrap_or(heavy_base_proof),
+                )
             })
             .expect("cannot start chain recursion worker");
 

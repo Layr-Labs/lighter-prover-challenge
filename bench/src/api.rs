@@ -40,8 +40,6 @@ pub struct Circuits {
     pub block_data: CircuitData<F, C, D>,
     pub dummy_heavy_chain_circuit: CircuitData<F, C, D>,
     pub dummy_light_chain_circuit: CircuitData<F, C, D>,
-    pub dummy_heavy_proof: Proof,
-    pub dummy_light_proof: Proof,
 }
 
 struct PathCircuits {
@@ -50,7 +48,6 @@ struct PathCircuits {
     chain_target: BlockTxChainTarget,
     chain_data: CircuitData<F, C, D>,
     dummy_chain_circuit: CircuitData<F, C, D>,
-    dummy_proof: Proof,
 }
 
 impl PathCircuits {
@@ -64,14 +61,12 @@ impl PathCircuits {
         let chain_target = chain.target;
         let chain_data = chain.builder.build::<C>();
 
+        // The runtime cyclic base proof doubles as the dummy-slot witness for
+        // every chain recursion step, so no separate all-zero dummy proof is
+        // proven here (it was redundant work: both prove the same dummy
+        // circuit against the same verifier data).
+        let _ = label;
         let dummy_chain_circuit = dummy_circuit(&chain_data.common);
-        let dummy_proof = cyclic_base_proof(
-            &chain_data.common,
-            &chain_data.verifier_only,
-            &dummy_chain_circuit,
-            [].into_iter().collect(),
-        )
-        .unwrap_or_else(|error| panic!("cannot construct {label} chain dummy proof: {error:?}"));
 
         Self {
             tx_target,
@@ -79,7 +74,6 @@ impl PathCircuits {
             chain_target,
             chain_data,
             dummy_chain_circuit,
-            dummy_proof,
         }
     }
 }
@@ -124,8 +118,6 @@ impl Circuits {
             block_data,
             dummy_heavy_chain_circuit: heavy.dummy_chain_circuit,
             dummy_light_chain_circuit: light.dummy_chain_circuit,
-            dummy_heavy_proof: heavy.dummy_proof,
-            dummy_light_proof: light.dummy_proof,
         }
     }
 }
