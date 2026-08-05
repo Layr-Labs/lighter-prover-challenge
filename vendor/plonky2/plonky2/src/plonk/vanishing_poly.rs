@@ -238,9 +238,10 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         let x = xs_batch[k];
         let vars = vars_batch.view(k);
 
-        let lookup_selectors: Vec<F> = (0..common_data.num_lookup_selectors)
-            .map(|i| vars.local_constants[common_data.selectors_info.num_selectors() + i])
-            .collect();
+        let lookup_selectors_start = common_data.selectors_info.num_selectors();
+        let lookup_selectors = vars.local_constants.view(
+            lookup_selectors_start..lookup_selectors_start + common_data.num_lookup_selectors,
+        );
 
         let local_zs = local_zs_batch[k];
         let next_zs = next_zs_batch[k];
@@ -281,7 +282,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     vars,
                     cur_local_lookup_zs,
                     cur_next_lookup_zs,
-                    &lookup_selectors,
+                    lookup_selectors,
                     cur_deltas.try_into().unwrap(),
                     lut_re_poly_evals[i],
                 );
@@ -524,7 +525,7 @@ pub fn check_lookup_constraints_batch<F: RichField + Extendable<D>, const D: usi
     vars: EvaluationVarsBase<F>,
     local_lookup_zs: &[F],
     next_lookup_zs: &[F],
-    lookup_selectors: &[F],
+    lookup_selectors: PackedStridedView<'_, F>,
     deltas: &[F; 4],
     lut_re_poly_evals: &[F],
 ) -> Vec<F> {
