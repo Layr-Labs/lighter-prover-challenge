@@ -744,7 +744,7 @@ pub fn evaluate_gate_constraints_circuit<F: RichField + Extendable<D>, const D: 
         let selector_index = common_data.selectors_info.selector_indices[i];
         with_context!(
             builder,
-            &format!("evaluate {} constraints", gate.0.id()),
+            &format!("evaluate {} constraints", gate.id()),
             gate.0.eval_filtered_circuit(
                 builder,
                 vars,
