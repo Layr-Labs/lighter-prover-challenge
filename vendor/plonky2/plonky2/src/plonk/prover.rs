@@ -754,21 +754,26 @@ fn compute_quotient_polys<
                 s_sigmas_batch.push(s_sigmas);
             }
 
-            // NB (JN): I'm not sure how (in)efficient the below is. It needs measuring.
-            let mut local_constants_batch =
-                vec![F::ZERO; xs_batch.len() * local_constants_batch_refs[0].len()];
-            for i in 0..local_constants_batch_refs[0].len() {
-                for (j, constants) in local_constants_batch_refs.iter().enumerate() {
-                    local_constants_batch[i * xs_batch.len() + j] = constants[i];
-                }
+            // Build the SoA batch layout (per-column, all batch points contiguous) that
+            // `EvaluationVarsBaseBatch` expects, writing each element exactly once via `extend`.
+            // The previous `vec![F::ZERO; ..]` zero-filled the whole buffer and then overwrote
+            // every element (two full write passes); on a memory-bandwidth-bound host that
+            // double-write is pure waste. Output bytes are identical: column `col` occupies
+            // `[col*batch_n, (col+1)*batch_n)`, i.e. `out[col*batch_n + j] == refs[j][col]`,
+            // which is the layout `view(j)` / `PackedStridedView(stride=batch_n)` reads.
+            let batch_n = xs_batch.len();
+            let num_constants = local_constants_batch_refs[0].len();
+            let mut local_constants_batch = Vec::with_capacity(batch_n * num_constants);
+            for constants_col in 0..num_constants {
+                local_constants_batch
+                    .extend(local_constants_batch_refs.iter().map(|c| c[constants_col]));
             }
 
-            let mut local_wires_batch =
-                vec![F::ZERO; xs_batch.len() * local_wires_batch_refs[0].len()];
-            for i in 0..local_wires_batch_refs[0].len() {
-                for (j, wires) in local_wires_batch_refs.iter().enumerate() {
-                    local_wires_batch[i * xs_batch.len() + j] = wires[i];
-                }
+            let num_wires = local_wires_batch_refs[0].len();
+            let mut local_wires_batch = Vec::with_capacity(batch_n * num_wires);
+            for wires_col in 0..num_wires {
+                local_wires_batch
+                    .extend(local_wires_batch_refs.iter().map(|w| w[wires_col]));
             }
 
             let vars_batch = EvaluationVarsBaseBatch::new(
