@@ -199,16 +199,6 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             log2_leaves_len
         );
 
-        if let Some((digests, cap)) = H::try_build_merkle_tree(&leaves, cap_height) {
-            debug_assert_eq!(digests.len(), 2 * (leaves.len() - (1 << cap_height)));
-            debug_assert_eq!(cap.len(), 1 << cap_height);
-            return Self {
-                leaves,
-                digests,
-                cap: MerkleCap(cap),
-            };
-        }
-
         let num_digests = 2 * (leaves.len() - (1 << cap_height));
         let mut digests = Vec::with_capacity(num_digests);
 
