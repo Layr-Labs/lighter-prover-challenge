@@ -24,6 +24,8 @@ struct MetalContext {
     leaf_pipeline: ComputePipelineState,
     parent_pipeline: ComputePipelineState,
     parameters: Buffer,
+    input_buffer: Option<Buffer>,
+    output_buffer: Option<Buffer>,
 }
 
 static CONTEXT: LazyLock<Result<Mutex<MetalContext>, String>> =
@@ -60,7 +62,7 @@ pub(crate) fn build_merkle_tree<F: RichField>(
             return None;
         }
     };
-    let context = match context.lock() {
+    let mut context = match context.lock() {
         Ok(context) => context,
         Err(_) => {
             log::warn!("Metal Poseidon2 context lock poisoned; using CPU Merkle hashing");
@@ -115,12 +117,14 @@ impl MetalContext {
                 leaf_pipeline,
                 parent_pipeline,
                 parameters,
+                input_buffer: None,
+                output_buffer: None,
             }))
         })
     }
 
     fn build<F: RichField>(
-        &self,
+        &mut self,
         leaves: &[Vec<F>],
         cap_height: usize,
     ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
@@ -135,19 +139,26 @@ impl MetalContext {
         let input_bytes = input_len
             .checked_mul(size_of::<u64>())
             .ok_or("Metal leaf input size overflow")?;
-        let input_buffer = self.device.new_buffer(
-            input_bytes.max(size_of::<u64>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        if self
+            .input_buffer
+            .as_ref()
+            .map_or(true, |buffer| buffer.length() < input_bytes.max(size_of::<u64>()) as u64)
+        {
+            self.input_buffer = Some(self.device.new_buffer(
+                input_bytes.max(size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            ));
+        }
+        let input_buffer = self.input_buffer.as_ref().unwrap();
         let input = unsafe {
             slice::from_raw_parts_mut(input_buffer.contents().cast::<u64>(), input_len)
         };
         if leaf_width >= 32 {
             input
                 .par_chunks_exact_mut(leaf_width)
-                .zip(leaves.par_iter())
-                .for_each(|(destination, leaf)| {
-                    for (destination, value) in destination.iter_mut().zip(leaf) {
+                .zip(leaves)
+                .for_each(|(destination, source)| {
+                    for (destination, value) in destination.iter_mut().zip(source) {
                         *destination = value.to_noncanonical_u64();
                     }
                 });
@@ -163,10 +174,17 @@ impl MetalContext {
         let output_bytes = output_len
             .checked_mul(size_of::<u64>())
             .ok_or("Metal Merkle output size overflow")?;
-        let output_buffer = self.device.new_buffer(
-            output_bytes as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        if self
+            .output_buffer
+            .as_ref()
+            .map_or(true, |buffer| buffer.length() < output_bytes as u64)
+        {
+            self.output_buffer = Some(
+                self.device
+                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared),
+            );
+        }
+        let output_buffer = self.output_buffer.as_ref().unwrap();
 
         let leaf_count_u32 = leaf_count as u32;
         let leaf_width_u32 = leaf_width as u32;
@@ -375,7 +393,7 @@ mod tests {
                 .collect::<Vec<_>>();
 
             for cap_height in [0, 3, 6] {
-                let context = CONTEXT
+                let mut context = CONTEXT
                     .as_ref()
                     .as_ref()
                     .unwrap_or_else(|error| panic!("{error}"))

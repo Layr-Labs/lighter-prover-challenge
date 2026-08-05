@@ -164,7 +164,6 @@ kernel void poseidon2_hash_parents(
     const device ulong* input = children + (ulong)gid * 8;
     ulong state[12] = { 0 };
     for (uint i = 0; i < 8; ++i) {
-        // Every child was canonicalized when the previous leaf or parent kernel wrote it.
         state[i] = input[i];
     }
     poseidon2(state, parameters);

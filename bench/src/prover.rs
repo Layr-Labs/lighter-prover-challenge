@@ -12,9 +12,7 @@ use circuit::tx::Tx;
 use circuit::types::config::F;
 use circuit::types::constants::TX_LIGHT;
 
-use crate::api::{Circuits, Proof};
-
-const CHAIN_WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
+use crate::api::{Circuits, Proof, PROVER_THREAD_STACK_BYTES};
 
 fn chunk_is_light(txs: &[Tx<F>]) -> bool {
     txs.first()
@@ -36,7 +34,7 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     .expect("block pre-execution proof failed");
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
 
-    let (heavy_base_proof, light_base_proof) = rayon::join(
+    let (heavy_chain_proof, light_chain_proof) = rayon::join(
         || {
             BlockTxChainCircuit::cyclic_base_proof(
                 &circuits.heavy_chain_data,
@@ -69,17 +67,15 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     let mut heavy_step = 0;
     let mut light_step = 0;
     let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
-    let (send, recv) = std::sync::mpsc::sync_channel::<(bool, u64, Proof)>(1);
-
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let (light_chain_proof, heavy_chain_proof) = std::thread::scope(|scope| {
         let chain_worker = std::thread::Builder::new()
-            .name("chain-recursion".to_string())
-            .stack_size(CHAIN_WORKER_STACK_BYTES)
+            .stack_size(PROVER_THREAD_STACK_BYTES)
             .spawn_scoped(scope, move || {
-                let mut heavy_chain_proof = heavy_base_proof;
-                let mut light_chain_proof = light_base_proof;
+                let mut heavy_chain_proof = heavy_chain_proof;
+                let mut light_chain_proof = light_chain_proof;
 
-                for (is_light, chain_step, tx_proof) in recv {
+                while let Ok((is_light, chain_step, tx_proof)) = receiver.recv() {
                     if is_light {
                         light_chain_proof = BlockTxChainCircuit::prove(
                             &circuits.light_chain_target,
@@ -113,7 +109,7 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
 
                 (light_chain_proof, heavy_chain_proof)
             })
-            .expect("cannot start chain recursion worker");
+            .expect("cannot spawn chain recursion worker");
 
         for (chunk_index, txs) in tx_chunks.drain(..).enumerate() {
             let is_light = chunk_is_light(&txs);
@@ -156,11 +152,11 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
             } else {
                 heavy_jump = tx_output.new_jump;
             }
-
-            send.send((is_light, chain_step, tx_proof))
-                .expect("chain recursion worker stopped before the last chunk");
+            sender
+                .send((is_light, chain_step, tx_proof))
+                .expect("chain recursion worker stopped");
         }
-        drop(send);
+        drop(sender);
 
         chain_worker
             .join()

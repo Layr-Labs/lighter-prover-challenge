@@ -24,6 +24,7 @@ pub const LIGHT_TX_MODE: u8 = TX_LIGHT;
 pub const ON_CHAIN_OPERATIONS_LIMIT: usize = 1;
 pub const PUBLIC_HEAVY_TX_COUNT: usize = 10;
 pub const PUBLIC_LIGHT_TX_COUNT: usize = 490;
+pub const PROVER_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 pub struct Circuits {
     pub heavy_tx_target: BlockTxTarget,
@@ -43,7 +44,6 @@ pub struct Circuits {
     pub dummy_heavy_proof: Proof,
     pub dummy_light_proof: Proof,
 }
-
 struct PathCircuits {
     tx_target: BlockTxTarget,
     tx_data: CircuitData<F, C, D>,
@@ -54,8 +54,8 @@ struct PathCircuits {
 }
 
 impl PathCircuits {
-    fn build(tx_per_proof: usize, mode: u8, label: &str) -> Self {
-        let tx = BlockTxCircuit::define(CIRCUIT_CONFIG, tx_per_proof, CHAIN_ID, mode);
+    fn new(tx_per_proof: usize, tx_mode: u8) -> Self {
+        let tx = BlockTxCircuit::define(CIRCUIT_CONFIG, tx_per_proof, CHAIN_ID, tx_mode);
         let tx_target = tx.target;
         let tx_data = tx.builder.build::<C>();
 
@@ -71,7 +71,7 @@ impl PathCircuits {
             &dummy_chain_circuit,
             [].into_iter().collect(),
         )
-        .unwrap_or_else(|error| panic!("cannot construct {label} chain dummy proof: {error:?}"));
+        .expect("cannot construct chain dummy proof");
 
         Self {
             tx_target,
@@ -86,16 +86,16 @@ impl PathCircuits {
 
 impl Circuits {
     pub fn new() -> Self {
-        let ((heavy, light), (pre_target, pre_data)) = rayon::join(
-            || {
-                rayon::join(
-                    || PathCircuits::build(HEAVY_TX_PER_PROOF, HEAVY_TX_MODE, "heavy"),
-                    || PathCircuits::build(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE, "light"),
-                )
-            },
+        let ((pre_target, pre_data), (heavy, light)) = rayon::join(
             || {
                 let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
                 (pre.target, pre.builder.build::<C>())
+            },
+            || {
+                rayon::join(
+                    || PathCircuits::new(HEAVY_TX_PER_PROOF, HEAVY_TX_MODE),
+                    || PathCircuits::new(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE),
+                )
             },
         );
 
