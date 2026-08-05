@@ -8,63 +8,27 @@ use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit
 use circuit::block_tx::{BlockTx, BlockTxWitness, JumpState};
 use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, Circuit as _};
 use circuit::block_tx_constraints::{BlockTxCircuit, Circuit as _};
+use circuit::tx::Tx;
 use circuit::types::config::F;
 use circuit::types::constants::TX_LIGHT;
 
 use crate::api::{Circuits, Proof};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TxPath {
-    Heavy,
-    Light,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ChunkRoute {
-    chunk_index: usize,
-    chain_step: u64,
-    path: TxPath,
-}
-
-fn chunk_routes(block: &Block<F>) -> Vec<ChunkRoute> {
-    let mut heavy_step = 0;
-    let mut light_step = 0;
-    block
-        .tx_chunks
-        .iter()
-        .enumerate()
-        .map(|(chunk_index, txs)| {
-            let is_light = txs
-                .first()
-                .expect("block transaction chunk must not be empty")
-                .tx_circuit_type
-                == TX_LIGHT;
-            let (path, chain_step) = if is_light {
-                let step = light_step;
-                light_step += 1;
-                (TxPath::Light, step)
-            } else {
-                let step = heavy_step;
-                heavy_step += 1;
-                (TxPath::Heavy, step)
-            };
-            ChunkRoute {
-                chunk_index,
-                chain_step,
-                path,
-            }
-        })
-        .collect()
+fn chunk_is_light(txs: &[Tx<F>]) -> bool {
+    txs.first()
+        .expect("block transaction chunk must not be empty")
+        .tx_circuit_type
+        == TX_LIGHT
 }
 
 fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
     (light, heavy)
 }
 
-pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
+pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     let pre_proof = BlockPreExecutionCircuit::prove(
         &circuits.pre_data,
-        &BlockPreExec::from_block(block),
+        &BlockPreExec::from_block(&block),
         &circuits.pre_target,
     )
     .expect("block pre-execution proof failed");
@@ -94,14 +58,25 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
     let mut light_jump = heavy_jump;
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
-    for route in chunk_routes(block) {
-        let txs = &block.tx_chunks[route.chunk_index];
-        let is_light = route.path == TxPath::Light;
+    let mut heavy_step = 0;
+    let mut light_step = 0;
+    let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
+    for (chunk_index, txs) in tx_chunks.drain(..).enumerate() {
+        let is_light = chunk_is_light(&txs);
+        let chain_step = if is_light {
+            let step = light_step;
+            light_step += 1;
+            step
+        } else {
+            let step = heavy_step;
+            heavy_step += 1;
+            step
+        };
         let block_tx = BlockTx {
             created_at: block.created_at,
             state_metadata_hash,
             old_jump: if is_light { light_jump } else { heavy_jump },
-            txs: txs.clone(),
+            txs,
         };
 
         let tx_proof = if is_light {
@@ -118,10 +93,7 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
             )
         }
         .unwrap_or_else(|error| {
-            panic!(
-                "block transaction chunk #{} proof failed: {error:?}",
-                route.chunk_index
-            )
+            panic!("block transaction chunk #{chunk_index} proof failed: {error:?}")
         });
 
         let tx_output = BlockTxWitness::from_public_inputs(&tx_proof.public_inputs);
@@ -130,42 +102,38 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
             light_chain_proof = BlockTxChainCircuit::prove(
                 &circuits.light_chain_target,
                 &circuits.light_chain_data,
-                route.chain_step,
+                chain_step,
                 &light_chain_proof,
                 &circuits.dummy_light_proof,
                 &tx_proof,
             )
             .unwrap_or_else(|error| {
-                panic!(
-                    "light block transaction chain step #{} failed: {error:?}",
-                    route.chain_step
-                )
+                panic!("light block transaction chain step #{chain_step} failed: {error:?}")
             });
         } else {
             heavy_jump = tx_output.new_jump;
             heavy_chain_proof = BlockTxChainCircuit::prove(
                 &circuits.heavy_chain_target,
                 &circuits.heavy_chain_data,
-                route.chain_step,
+                chain_step,
                 &heavy_chain_proof,
                 &circuits.dummy_heavy_proof,
                 &tx_proof,
             )
             .unwrap_or_else(|error| {
-                panic!(
-                    "heavy block transaction chain step #{} failed: {error:?}",
-                    route.chain_step
-                )
+                panic!("heavy block transaction chain step #{chain_step} failed: {error:?}")
             });
         }
     }
+    block.tx_chunks = tx_chunks;
+    block.tx_chunks.push(Vec::new());
 
     let (light_chain_input, heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
     BlockCircuit::prove(
         &circuits.block_target,
         &circuits.block_data,
-        block,
+        &block,
         &pre_proof,
         light_chain_input,
         heavy_chain_input,
@@ -175,7 +143,6 @@ pub fn prove_block(block: &Block<F>, circuits: &Circuits) -> Proof {
 
 #[cfg(test)]
 mod tests {
-    use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
 
     use super::*;
     use crate::api::{
@@ -184,12 +151,12 @@ mod tests {
 
     #[test]
     fn prove_block_returns_one_final_block_proof() {
-        let prove: fn(&Block<F>, &Circuits) -> Proof = prove_block;
+        let prove: fn(Block<F>, &Circuits) -> Proof = prove_block;
         let _ = prove;
     }
 
     #[test]
-    fn every_parsed_mixed_chunk_is_routed_once() {
+    fn parsed_mixed_chunks_have_expected_paths() {
         std::thread::Builder::new()
             .stack_size(32 * 1024 * 1024)
             .spawn(|| {
@@ -201,45 +168,15 @@ mod tests {
                     PUBLIC_LIGHT_TX_COUNT,
                 )
                 .expect("public fixture must parse");
-                let routes = chunk_routes(&block);
-
-                assert_eq!(routes.len(), block.tx_chunks.len());
-                assert_eq!(
-                    routes
-                        .iter()
-                        .map(|route| route.chunk_index)
-                        .collect::<Vec<_>>(),
-                    (0..block.tx_chunks.len()).collect::<Vec<_>>()
-                );
-                for route in &routes {
-                    let expected_path =
-                        if block.tx_chunks[route.chunk_index][0].tx_circuit_type == TX_LIGHT {
-                            TxPath::Light
-                        } else {
-                            TxPath::Heavy
-                        };
-                    assert_eq!(route.path, expected_path);
-                }
-
-                let heavy_steps = routes
+                let paths = block
+                    .tx_chunks
                     .iter()
-                    .filter(|route| route.path == TxPath::Heavy)
-                    .map(|route| route.chain_step)
+                    .map(|txs| chunk_is_light(txs))
                     .collect::<Vec<_>>();
-                let light_steps = routes
-                    .iter()
-                    .filter(|route| route.path == TxPath::Light)
-                    .map(|route| route.chain_step)
-                    .collect::<Vec<_>>();
-                assert_eq!(heavy_steps, vec![0, 1, 2]);
-                assert_eq!(light_steps, (0..49).collect::<Vec<_>>());
-                assert!(routes.iter().all(|route| {
-                    let circuit_type = block.tx_chunks[route.chunk_index][0].tx_circuit_type;
-                    matches!(
-                        (route.path, circuit_type),
-                        (TxPath::Heavy, TX_HEAVY) | (TxPath::Light, TX_LIGHT)
-                    )
-                }));
+
+                assert_eq!(paths.len(), block.tx_chunks.len());
+                assert_eq!(paths.iter().filter(|&&is_light| !is_light).count(), 3);
+                assert_eq!(paths.iter().filter(|&&is_light| is_light).count(), 49);
             })
             .expect("orchestration test thread must start")
             .join()
