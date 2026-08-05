@@ -19,6 +19,7 @@ use core::ops::{Range, RangeFrom};
 use std::collections::BTreeMap;
 
 use anyhow::Result;
+use hashbrown::HashMap;
 use serde::Serialize;
 
 use super::circuit_builder::LookupWire;
@@ -52,6 +53,17 @@ use crate::util::serialization::{
     Buffer, GateSerializer, IoResult, Read, WitnessGeneratorSerializer, Write,
 };
 use crate::util::timing::TimingTree;
+
+pub(crate) fn build_lut_input_to_index(luts: &[LookupTable]) -> Vec<HashMap<u16, usize>> {
+    luts.iter()
+        .map(|lut| {
+            lut.iter()
+                .enumerate()
+                .map(|(index, (input, _))| (*input, index))
+                .collect()
+        })
+        .collect()
+}
 
 /// Configuration to be used when building a circuit. This defines the shape of the circuit
 /// as well as its targeted security level and sub-protocol (e.g. FRI) parameters.
@@ -391,6 +403,8 @@ pub struct ProverOnlyCircuitData<
     pub lookup_rows: Vec<LookupWire>,
     /// A vector of (looking_in, looking_out) pairs for each lookup table index.
     pub lut_to_lookups: Vec<Lookup>,
+    /// Immutable lookup input-to-table-index maps, precomputed once with the circuit.
+    pub lut_input_to_index: Vec<HashMap<u16, usize>>,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>

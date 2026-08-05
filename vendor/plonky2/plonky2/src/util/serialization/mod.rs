@@ -42,8 +42,8 @@ use crate::iop::target::{BoolTarget, Target};
 use crate::iop::wire::Wire;
 use crate::plonk::circuit_builder::LookupWire;
 use crate::plonk::circuit_data::{
-    CircuitConfig, CircuitData, CommonCircuitData, ProverCircuitData, ProverOnlyCircuitData,
-    VerifierCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
+    build_lut_input_to_index, CircuitConfig, CircuitData, CommonCircuitData, ProverCircuitData,
+    ProverOnlyCircuitData, VerifierCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
 };
 use crate::plonk::config::{GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::plonk_common::salt_size;
@@ -892,6 +892,7 @@ pub trait Read {
         for _ in 0..length {
             lut_to_lookups.push(self.read_target_lut()?);
         }
+        let lut_input_to_index = build_lut_input_to_index(&common_data.luts);
 
         Ok(ProverOnlyCircuitData {
             generators,
@@ -905,6 +906,7 @@ pub trait Read {
             circuit_digest,
             lookup_rows,
             lut_to_lookups,
+            lut_input_to_index,
         })
     }
 
@@ -1857,6 +1859,7 @@ pub trait Write {
             circuit_digest,
             lookup_rows,
             lut_to_lookups,
+            lut_input_to_index: _,
         } = prover_only_circuit_data;
 
         self.write_usize(generators.len())?;

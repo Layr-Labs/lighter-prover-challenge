@@ -42,8 +42,9 @@ use crate::iop::generator::{
 use crate::iop::target::{BoolTarget, Target};
 use crate::iop::wire::Wire;
 use crate::plonk::circuit_data::{
-    CircuitConfig, CircuitData, CommonCircuitData, MockCircuitData, ProverCircuitData,
-    ProverOnlyCircuitData, VerifierCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
+    build_lut_input_to_index, CircuitConfig, CircuitData, CommonCircuitData, MockCircuitData,
+    ProverCircuitData, ProverOnlyCircuitData, VerifierCircuitData, VerifierCircuitTarget,
+    VerifierOnlyCircuitData,
 };
 use crate::plonk::config::{AlgebraicHasher, GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::copy_constraint::CopyConstraint;
@@ -1335,6 +1336,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             }
         }
 
+        let lut_input_to_index = build_lut_input_to_index(&common.luts);
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,
             generator_indices_by_watches,
@@ -1347,6 +1349,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             circuit_digest,
             lookup_rows: self.lookup_rows.clone(),
             lut_to_lookups: self.lut_to_lookups.clone(),
+            lut_input_to_index,
         };
 
         let verifier_only = VerifierOnlyCircuitData::<C, D> {
