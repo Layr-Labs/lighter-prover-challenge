@@ -8,6 +8,7 @@ use metal::{
     MTLResourceOptions, MTLSize, NSUInteger,
 };
 use objc::rc::autoreleasepool;
+use plonky2_maybe_rayon::*;
 
 use crate::hash::hash_types::{HashOut, RichField};
 use crate::hash::poseidon2::config::{
@@ -141,8 +142,19 @@ impl MetalContext {
         let input = unsafe {
             slice::from_raw_parts_mut(input_buffer.contents().cast::<u64>(), input_len)
         };
-        for (destination, value) in input.iter_mut().zip(leaves.iter().flatten()) {
-            *destination = value.to_noncanonical_u64();
+        if leaf_width >= 32 {
+            input
+                .par_chunks_exact_mut(leaf_width)
+                .zip(leaves.par_iter())
+                .for_each(|(destination, leaf)| {
+                    for (destination, value) in destination.iter_mut().zip(leaf) {
+                        *destination = value.to_noncanonical_u64();
+                    }
+                });
+        } else {
+            for (destination, value) in input.iter_mut().zip(leaves.iter().flatten()) {
+                *destination = value.to_noncanonical_u64();
+            }
         }
 
         let output_len = total_node_count
