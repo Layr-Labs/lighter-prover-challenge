@@ -7,12 +7,13 @@ use log::Level;
 use plonky2::field::extension::Extendable;
 use plonky2::field::types::{Field, Field64};
 use plonky2::hash::hash_types::{HashOutTarget, NUM_HASH_OUT_ELTS, RichField};
+use plonky2::iop::generator::generate_partial_witness;
 use plonky2::iop::target::Target;
-use plonky2::iop::witness::{PartialWitness, WitnessWrite};
+use plonky2::iop::witness::{PartialWitness, PartitionWitness, WitnessWrite};
 use plonky2::plonk::circuit_data::{CircuitConfig, CircuitData};
 use plonky2::plonk::config::GenericConfig;
 use plonky2::plonk::proof::ProofWithPublicInputs;
-use plonky2::plonk::prover::prove;
+use plonky2::plonk::prover::{prove, prove_with_partition_witness};
 use plonky2::timed;
 use plonky2::util::timing::TimingTree;
 
@@ -237,6 +238,44 @@ impl Circuit<C, F, D> for BlockTxCircuit {
 }
 
 impl BlockTxCircuit {
+    /// Runs witness generation only. This is the cheap first phase of
+    /// [`Circuit::prove`]: it executes the circuit generators, which also
+    /// determines every public input (including `new_jump`) without paying for
+    /// polynomial commitments. The returned partition witness can be proved
+    /// later with [`Self::prove_from_partition_witness`]; splitting the phases
+    /// lets a caller chain jump states sequentially while proving chunks
+    /// concurrently, with no duplicated work and bit-identical proof inputs.
+    pub fn generate_partition_witness<'a>(
+        circuit: &'a CircuitData<F, C, D>,
+        block: &BlockTx<F>,
+        target: &BlockTxTarget,
+    ) -> Result<PartitionWitness<'a, F>> {
+        let inputs = <Self as Circuit<C, F, D>>::generate_witness(block, target)?;
+        generate_partial_witness(inputs, &circuit.prover_only, &circuit.common)
+    }
+
+    /// Completes a proof from a partition witness produced by
+    /// [`Self::generate_partition_witness`]. Equivalent to the second phase of
+    /// [`Circuit::prove`]; recursive parents validate the proof in release
+    /// builds, so the eager self-check stays debug-only exactly like `prove`.
+    pub fn prove_from_partition_witness(
+        circuit: &CircuitData<F, C, D>,
+        witness: PartitionWitness<'_, F>,
+    ) -> Result<ProofWithPublicInputs<F, C, D>> {
+        let mut timing =
+            TimingTree::new("BlockTxCircuit::prove_from_partition_witness", Level::Debug);
+        let proof = prove_with_partition_witness(
+            &circuit.prover_only,
+            &circuit.common,
+            witness,
+            &mut timing,
+        )?;
+        #[cfg(debug_assertions)]
+        timed!(timing, "verify", { circuit.verify(proof.clone())? });
+        timing.print();
+        Ok(proof)
+    }
+
     /// Initializes a new block virtual targets for the given number of transactions.
     pub fn new(config: CircuitConfig, tx_limit: usize) -> Self {
         let mut builder = Builder::new(config);
