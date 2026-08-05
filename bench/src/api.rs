@@ -14,6 +14,37 @@ use plonky2::plonk::proof::ProofWithPublicInputs;
 
 pub type Proof = ProofWithPublicInputs<F, C, D>;
 
+/// Env-gated stage timing for local profiling. The ranked sandbox clears the
+/// environment, so this is inert there by construction.
+pub struct StageTimer {
+    enabled: bool,
+    start: std::time::Instant,
+    last: std::time::Instant,
+}
+
+impl StageTimer {
+    pub fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            enabled: std::env::var_os("LIGHTER_STAGE_TIMING").is_some(),
+            start: now,
+            last: now,
+        }
+    }
+
+    pub fn mark(&mut self, label: &str) {
+        if self.enabled {
+            let now = std::time::Instant::now();
+            eprintln!(
+                "[stage] {label}: {:+.3}s (t={:.3}s)",
+                (now - self.last).as_secs_f64(),
+                (now - self.start).as_secs_f64()
+            );
+            self.last = now;
+        }
+    }
+}
+
 pub const CHAIN_ID: u32 = 304;
 pub const HEAVY_TX_PER_PROOF: usize = 4;
 pub const HEAVY_TX_MODE: u8 = TX_HEAVY;
@@ -79,6 +110,7 @@ impl PathCircuits {
 
 impl Circuits {
     pub fn new() -> Self {
+        let mut timer = StageTimer::new();
         let ((pre_target, pre_data), (heavy, light)) = rayon::join(
             || {
                 let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
@@ -92,6 +124,7 @@ impl Circuits {
             },
         );
 
+        timer.mark("build paths||pre");
         let block = BlockCircuit::define(
             CIRCUIT_CONFIG,
             &pre_data,
@@ -99,8 +132,10 @@ impl Circuits {
             &heavy.chain_data,
             ON_CHAIN_OPERATIONS_LIMIT,
         );
+        timer.mark("define block");
         let block_target = block.target;
         let block_data = block.builder.build::<C>();
+        timer.mark("build block");
 
         Self {
             heavy_tx_target: heavy.tx_target,

@@ -126,8 +126,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .par_iter()
             .map(|p| {
                 assert_eq!(p.len(), degree, "Polynomial degrees inconsistent");
-                p.lde(rate_bits)
-                    .coset_fft_with_options(F::coset_shift(), Some(rate_bits), fft_root_table)
+                // Fused LDE+coset-FFT: one output allocation per polynomial
+                // instead of two, bit-identical values (see `coset_lde_fft`).
+                p.coset_lde_fft(F::coset_shift(), rate_bits, fft_root_table)
                     .values
             })
             .chain(
