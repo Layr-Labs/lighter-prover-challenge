@@ -1,5 +1,5 @@
 pub mod config;
 pub mod hash;
 
-#[cfg(test)]
-pub mod p3;
+#[cfg(feature = "std")]
+pub(crate) mod p3;

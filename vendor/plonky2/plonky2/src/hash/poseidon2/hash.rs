@@ -17,15 +17,7 @@ use crate::plonk::config::{AlgebraicHasher, Hasher};
 pub trait Poseidon2: PrimeField64 {
     #[inline]
     fn poseidon2(input: [Self; WIDTH]) -> [Self; WIDTH] {
-        let mut state = input;
-
-        Self::external_linear_layer(&mut state);
-
-        Self::full_rounds(&mut state, 0);
-        Self::partial_rounds(&mut state);
-        Self::full_rounds(&mut state, ROUNDS_F_HALF);
-
-        state
+        poseidon2_reference(input)
     }
 
     #[inline]
@@ -344,6 +336,18 @@ fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
 
 impl Poseidon2 for F {
     #[inline]
+    fn poseidon2(input: [Self; WIDTH]) -> [Self; WIDTH] {
+        #[cfg(feature = "std")]
+        {
+            super::p3::p3_poseidon2_permute(input)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            poseidon2_reference(input)
+        }
+    }
+
+    #[inline]
     fn sbox_p(a: &Self) -> Self {
         let a2 = a.square();
         let a4 = a2.square();
@@ -493,6 +497,18 @@ fn sum_12<F: PrimeField64>(inputs: &[F]) -> F {
     F::from_noncanonical_u128_with_96_bits(tmp)
 }
 
+#[inline]
+fn poseidon2_reference<F: Poseidon2>(input: [F; WIDTH]) -> [F; WIDTH] {
+    let mut state = input;
+
+    F::external_linear_layer(&mut state);
+    F::full_rounds(&mut state, 0);
+    F::partial_rounds(&mut state);
+    F::full_rounds(&mut state, ROUNDS_F_HALF);
+
+    state
+}
+
 /// Poseidon2 hash function.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Poseidon2Hash;
@@ -604,6 +620,21 @@ mod test {
                 expected_output_f[i].to_canonical_u64(),
                 expected_output_f3[i].as_canonical_u64()
             );
+        }
+    }
+
+    #[test]
+    fn test_runtime_permuter_matches_reference_poseidon2() {
+        let mut rng = thread_rng();
+
+        for _ in 0..32 {
+            let input = core::array::from_fn(|_| F::from_noncanonical_u64(rng.next_u64()));
+            let expected = poseidon2_reference(input);
+            let actual = <F as Permuter>::permute(input);
+
+            for (expected, actual) in expected.into_iter().zip(actual) {
+                assert_eq!(expected.to_canonical_u64(), actual.to_canonical_u64());
+            }
         }
     }
 
