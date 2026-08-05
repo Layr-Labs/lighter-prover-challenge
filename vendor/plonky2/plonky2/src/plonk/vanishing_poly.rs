@@ -169,7 +169,7 @@ pub(crate) fn eval_vanishing_poly<F: RichField + Extendable<D>, const D: usize>(
 /// `result[k * num_challenges..(k + 1) * num_challenges]`.
 pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
-    indices_batch: &[usize],
+    start_index: usize,
     xs_batch: &[F],
     vars_batch: EvaluationVarsBaseBatch<F>,
     local_zs_batch: &[&[F]],
@@ -187,8 +187,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 ) -> Vec<F> {
     let has_lookup = common_data.num_lookup_polys != 0;
 
-    let n = indices_batch.len();
-    assert_eq!(xs_batch.len(), n);
+    let n = xs_batch.len();
     assert_eq!(vars_batch.len(), n);
     assert_eq!(local_zs_batch.len(), n);
     assert_eq!(next_zs_batch.len(), n);
@@ -234,7 +233,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     let mut res_batch = vec![F::ZERO; n * num_challenges];
     for k in 0..n {
-        let index = indices_batch[k];
+        let index = start_index + k;
         let x = xs_batch[k];
         let vars = vars_batch.view(k);
 

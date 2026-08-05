@@ -694,8 +694,7 @@ fn compute_quotient_polys<
                     || (batch_i == num_batches - 1 && xs_batch.len() <= BATCH_SIZE)
             );
 
-            let indices_batch: Vec<usize> =
-                (BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + xs_batch.len()).collect();
+            let batch_start = BATCH_SIZE * batch_i;
 
             let mut shifted_xs_batch = Vec::with_capacity(xs_batch.len());
             let mut local_zs_batch = Vec::with_capacity(xs_batch.len());
@@ -710,7 +709,8 @@ fn compute_quotient_polys<
             let mut local_constants_batch_refs = Vec::with_capacity(xs_batch.len());
             let mut local_wires_batch_refs = Vec::with_capacity(xs_batch.len());
 
-            for (&i, &x) in indices_batch.iter().zip(xs_batch) {
+            for (batch_offset, &x) in xs_batch.iter().enumerate() {
+                let i = batch_start + batch_offset;
                 let shifted_x = F::coset_shift() * x;
                 let i_next = (i + next_step) % lde_size;
                 let local_constants_sigmas = prover_data
@@ -780,7 +780,7 @@ fn compute_quotient_polys<
 
             let mut quotient_values_batch = eval_vanishing_poly_base_batch::<F, D>(
                 common_data,
-                &indices_batch,
+                batch_start,
                 &shifted_xs_batch,
                 vars_batch,
                 &local_zs_batch,
@@ -797,10 +797,11 @@ fn compute_quotient_polys<
                 &lut_re_poly_evals_refs,
             );
 
-            for (&i, quotient_values) in indices_batch
-                .iter()
-                .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
+            for (batch_offset, quotient_values) in quotient_values_batch
+                .chunks_exact_mut(num_challenges)
+                .enumerate()
             {
+                let i = batch_start + batch_offset;
                 let denominator_inv = z_h_on_coset.eval_inverse(i);
                 quotient_values
                     .iter_mut()
