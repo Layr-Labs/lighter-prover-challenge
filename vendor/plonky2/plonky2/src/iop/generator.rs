@@ -47,6 +47,20 @@ pub fn generate_partial_witness<
         witness.set_target(t, v)?;
     }
 
+    // Per-generator count of distinct watched representatives that are not yet populated. A count
+    // of zero means every watched representative has a value, which for a `SimpleGenerator` (whose
+    // watch list is its dependency list) is exactly the `contains_all(dependencies())` condition.
+    // This lets `SimpleGeneratorAdapter::run_with_ready_hint` skip the per-wakeup `dependencies()`
+    // allocation and witness scan. Counters are ephemeral per-witness state; nothing is serialized.
+    let mut unresolved_watches: Vec<usize> = vec![0; generators.len()];
+    for (&rep, watchers) in generator_indices_by_watches.iter() {
+        if witness.values[rep].is_none() {
+            for &watching_generator_idx in watchers {
+                unresolved_watches[watching_generator_idx] += 1;
+            }
+        }
+    }
+
     // Build a list of "pending" generators which are queued to be run. Initially, all generators
     // are queued.
     let mut pending_generator_indices: Vec<_> = (0..generators.len()).collect();
@@ -66,7 +80,9 @@ pub fn generate_partial_witness<
                 continue;
             }
 
-            let finished = generators[generator_idx].0.run(&witness, &mut buffer);
+            let ready_hint = unresolved_watches[generator_idx] == 0;
+            let finished =
+                generators[generator_idx].0.run_with_ready_hint(&witness, &mut buffer, ready_hint);
             if finished {
                 generator_is_expired[generator_idx] = true;
                 remaining_generators -= 1;
@@ -86,6 +102,11 @@ pub fn generate_partial_witness<
                 if let Some(watchers) = opt_watchers {
                     for &watching_generator_idx in watchers {
                         if !generator_is_expired[watching_generator_idx] {
+                            // This watched representative is now populated, so it no longer counts
+                            // as an unresolved dependency for the watching generator.
+                            if unresolved_watches[watching_generator_idx] > 0 {
+                                unresolved_watches[watching_generator_idx] -= 1;
+                            }
                             next_pending_generator_indices.push(watching_generator_idx);
                         }
                     }
@@ -117,6 +138,21 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
     /// flag is true, the generator will never be run again, otherwise it will be queued for another
     /// run next time a target in its watch list is populated.
     fn run(&self, witness: &PartitionWitness<F>, out_buffer: &mut GeneratedValues<F>) -> bool;
+
+    /// Like `run`, but receives a readiness hint: `true` means every distinct watched
+    /// representative is already populated (so, for a `SimpleGenerator`, all dependencies are
+    /// present). The default implementation ignores the hint and calls `run` unchanged, which
+    /// preserves arbitrary incremental/general generators that may emit partial outputs before all
+    /// watched targets are populated. `SimpleGeneratorAdapter` overrides this to skip the
+    /// per-wakeup `dependencies()` allocation and `contains_all` scan when the hint is false.
+    fn run_with_ready_hint(
+        &self,
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+        _ready_hint: bool,
+    ) -> bool {
+        self.run(witness, out_buffer)
+    }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()>;
 
@@ -256,6 +292,23 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
 
     fn run(&self, witness: &PartitionWitness<F>, out_buffer: &mut GeneratedValues<F>) -> bool {
         if witness.contains_all(&self.inner.dependencies()) {
+            self.inner.run_once(witness, out_buffer).is_ok()
+        } else {
+            false
+        }
+    }
+
+    /// When the scheduler's readiness hint is `true`, every distinct watched representative is
+    /// populated, which (by the `SimpleGenerator` contract) means all dependencies are present. Run
+    /// once directly, skipping the `dependencies()` allocation and `contains_all` scan. When the
+    /// hint is `false`, return unfinished without allocating or scanning at all.
+    fn run_with_ready_hint(
+        &self,
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+        ready_hint: bool,
+    ) -> bool {
+        if ready_hint {
             self.inner.run_once(witness, out_buffer).is_ok()
         } else {
             false
