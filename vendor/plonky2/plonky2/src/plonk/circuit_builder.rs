@@ -42,8 +42,9 @@ use crate::iop::generator::{
 use crate::iop::target::{BoolTarget, Target};
 use crate::iop::wire::Wire;
 use crate::plonk::circuit_data::{
-    CircuitConfig, CircuitData, CommonCircuitData, MockCircuitData, ProverCircuitData,
-    ProverOnlyCircuitData, VerifierCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
+    count_generator_watches, CircuitConfig, CircuitData, CommonCircuitData, MockCircuitData,
+    ProverCircuitData, ProverOnlyCircuitData, VerifierCircuitData, VerifierCircuitTarget,
+    VerifierOnlyCircuitData,
 };
 use crate::plonk::config::{AlgebraicHasher, GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::copy_constraint::CopyConstraint;
@@ -1279,6 +1280,8 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             indices.dedup();
             indices.shrink_to_fit();
         }
+        let generator_watch_counts =
+            count_generator_watches(self.generators.len(), &generator_indices_by_watches);
 
         let num_gate_constraints = gates
             .iter()
@@ -1338,6 +1341,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,
             generator_indices_by_watches,
+            generator_watch_counts,
             constants_sigmas_commitment,
             sigmas: transpose_poly_values(sigma_vecs),
             subgroup,

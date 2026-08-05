@@ -42,8 +42,8 @@ use crate::iop::target::{BoolTarget, Target};
 use crate::iop::wire::Wire;
 use crate::plonk::circuit_builder::LookupWire;
 use crate::plonk::circuit_data::{
-    CircuitConfig, CircuitData, CommonCircuitData, ProverCircuitData, ProverOnlyCircuitData,
-    VerifierCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
+    count_generator_watches, CircuitConfig, CircuitData, CommonCircuitData, ProverCircuitData,
+    ProverOnlyCircuitData, VerifierCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
 };
 use crate::plonk::config::{GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::plonk_common::salt_size;
@@ -845,6 +845,8 @@ pub trait Read {
             let k = self.read_usize()?;
             generator_indices_by_watches.insert(k, self.read_usize_vec()?);
         }
+        let generator_watch_counts =
+            count_generator_watches(generators.len(), &generator_indices_by_watches);
 
         let constants_sigmas_commitment = self.read_polynomial_batch()?;
         let sigmas_len = self.read_usize()?;
@@ -896,6 +898,7 @@ pub trait Read {
         Ok(ProverOnlyCircuitData {
             generators,
             generator_indices_by_watches,
+            generator_watch_counts,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
@@ -1848,6 +1851,7 @@ pub trait Write {
         let ProverOnlyCircuitData {
             generators,
             generator_indices_by_watches,
+            generator_watch_counts: _,
             constants_sigmas_commitment,
             sigmas,
             subgroup,

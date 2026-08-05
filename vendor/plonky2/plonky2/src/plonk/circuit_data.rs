@@ -371,6 +371,8 @@ pub struct ProverOnlyCircuitData<
     /// Generator indices (within the `Vec` above), indexed by the representative of each target
     /// they watch.
     pub generator_indices_by_watches: BTreeMap<usize, Vec<usize>>,
+    /// Number of distinct watched representatives for each generator.
+    pub generator_watch_counts: Vec<usize>,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.
@@ -391,6 +393,19 @@ pub struct ProverOnlyCircuitData<
     pub lookup_rows: Vec<LookupWire>,
     /// A vector of (looking_in, looking_out) pairs for each lookup table index.
     pub lut_to_lookups: Vec<Lookup>,
+}
+
+pub(crate) fn count_generator_watches(
+    generator_count: usize,
+    generator_indices_by_watches: &BTreeMap<usize, Vec<usize>>,
+) -> Vec<usize> {
+    let mut counts = vec![0; generator_count];
+    for watchers in generator_indices_by_watches.values() {
+        for &generator_idx in watchers {
+            counts[generator_idx] += 1;
+        }
+    }
+    counts
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
