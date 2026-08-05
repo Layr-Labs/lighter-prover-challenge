@@ -3336,6 +3336,8 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
     TxTargetWitness<F> for T
 {
     fn set_tx_target(&mut self, a: &TxTarget, b: &Tx<F>) -> Result<()> {
+        let is_light = b.tx_circuit_type == TX_LIGHT;
+
         self.set_target(a.tx_type, F::from_canonical_u8(b.tx_type))?;
         self.set_target(a.tx_index, F::from_canonical_u64(b.tx_index))?;
 
@@ -3548,15 +3550,32 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
         /*  State Tree Leaves  */
         /***********************/
         self.set_account_target(&a.accounts_before[0], &b.accounts_before[0])?;
-        self.set_account_target(&a.accounts_before[1], &b.accounts_before[1])?;
+        if is_light {
+            // The light circuit only consumes the owner account in slot 0. Account slot 1 is
+            // otherwise unused, but its safe margined-asset and pending-unlock targets still
+            // feed range-check generators and therefore need their common witness values.
+            AccountTargetWitness::_set_common_targets(
+                self,
+                &a.accounts_before[1],
+                &b.accounts_before[1],
+            )?;
+        } else {
+            self.set_account_target(&a.accounts_before[1], &b.accounts_before[1])?;
+        }
         self.set_fee_account_target(&a.accounts_before[2], &b.accounts_before[2])?;
         self.set_account_delta_target(&a.accounts_delta_before[0], &b.accounts_delta_before[0])?;
-        self.set_account_delta_target(&a.accounts_delta_before[1], &b.accounts_delta_before[1])?;
-        self.set_fee_account_delta_target(
-            &a.accounts_delta_before[2],
-            &b.accounts_delta_before[2],
-        )?;
-        for i in 0..NB_ACCOUNTS_PER_TX {
+        if !is_light {
+            self.set_account_delta_target(
+                &a.accounts_delta_before[1],
+                &b.accounts_delta_before[1],
+            )?;
+            self.set_fee_account_delta_target(
+                &a.accounts_delta_before[2],
+                &b.accounts_delta_before[2],
+            )?;
+        }
+        let populated_account_count = if is_light { 1 } else { NB_ACCOUNTS_PER_TX };
+        for i in 0..populated_account_count {
             for j in 0..NB_ASSETS_PER_TX {
                 self.set_account_asset_target(
                     &a.account_assets_before[i][j],
@@ -3580,7 +3599,7 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
         /*****************************/
         /*  State Tree Merkle Proofs */
         /*****************************/
-        for i in 0..NB_ACCOUNTS_PER_TX {
+        for i in 0..populated_account_count {
             for j in 0..ACCOUNT_MERKLE_LEVELS {
                 self.set_hash_target(
                     a.account_tree_merkle_proofs[i][j],
@@ -3588,28 +3607,30 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
                 )?;
             }
         }
-        for i in 0..NB_ACCOUNTS_PER_TX {
-            for j in 0..ACCOUNT_MERKLE_LEVELS {
-                self.set_hash_target(
-                    a.account_pub_data_tree_merkle_proofs[i][j],
-                    b.account_pub_data_tree_merkle_proofs[i][j],
-                )?;
+        if !is_light {
+            for i in 0..NB_ACCOUNTS_PER_TX {
+                for j in 0..ACCOUNT_MERKLE_LEVELS {
+                    self.set_hash_target(
+                        a.account_pub_data_tree_merkle_proofs[i][j],
+                        b.account_pub_data_tree_merkle_proofs[i][j],
+                    )?;
+                }
             }
-        }
-        for i in 0..NB_ACCOUNTS_PER_TX {
-            for j in 0..ACCOUNT_MERKLE_LEVELS {
-                self.set_hash_target(
-                    a.account_delta_tree_merkle_proofs[i][j],
-                    b.account_delta_tree_merkle_proofs[i][j],
-                )?;
+            for i in 0..NB_ACCOUNTS_PER_TX {
+                for j in 0..ACCOUNT_MERKLE_LEVELS {
+                    self.set_hash_target(
+                        a.account_delta_tree_merkle_proofs[i][j],
+                        b.account_delta_tree_merkle_proofs[i][j],
+                    )?;
+                }
             }
-        }
-        for i in 0..NB_ACCOUNTS_PER_TX - 1 {
-            for j in 0..POSITION_MERKLE_LEVELS {
-                self.set_hash_target(
-                    a.position_delta_merkle_proofs[i][j],
-                    b.position_delta_merkle_proofs[i][j],
-                )?;
+            for i in 0..NB_ACCOUNTS_PER_TX - 1 {
+                for j in 0..POSITION_MERKLE_LEVELS {
+                    self.set_hash_target(
+                        a.position_delta_merkle_proofs[i][j],
+                        b.position_delta_merkle_proofs[i][j],
+                    )?;
+                }
             }
         }
         for i in 0..API_KEY_MERKLE_LEVELS {
@@ -3626,21 +3647,23 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
                 )?;
             }
         }
-        for i in 0..NB_ACCOUNTS_PER_TX {
+        for i in 0..populated_account_count {
             for j in 0..NB_ASSETS_PER_TX {
                 for k in 0..ASSET_MERKLE_LEVELS {
                     self.set_hash_target(
                         a.asset_tree_merkle_proofs[i][j][k],
                         b.asset_tree_merkle_proofs[i][j][k],
                     )?;
-                    self.set_hash_target(
-                        a.public_asset_tree_merkle_proofs[i][j][k],
-                        b.public_asset_tree_merkle_proofs[i][j][k],
-                    )?;
-                    self.set_hash_target(
-                        a.asset_delta_tree_merkle_proofs[i][j][k],
-                        b.asset_delta_tree_merkle_proofs[i][j][k],
-                    )?;
+                    if !is_light {
+                        self.set_hash_target(
+                            a.public_asset_tree_merkle_proofs[i][j][k],
+                            b.public_asset_tree_merkle_proofs[i][j][k],
+                        )?;
+                        self.set_hash_target(
+                            a.asset_delta_tree_merkle_proofs[i][j][k],
+                            b.asset_delta_tree_merkle_proofs[i][j][k],
+                        )?;
+                    }
                 }
             }
         }
