@@ -5,13 +5,13 @@ pub mod generator_serialization;
 pub mod gate_serialization;
 
 #[cfg(not(feature = "std"))]
-use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 use core::convert::Infallible;
 use core::fmt::{Debug, Display, Formatter};
 use core::mem::size_of;
 use core::ops::Range;
 #[cfg(feature = "std")]
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 pub use gate_serialization::default::DefaultGateSerializer;
 pub use gate_serialization::GateSerializer;
@@ -840,7 +840,7 @@ pub trait Read {
             generators.push(self.read_generator(generator_serializer, common_data)?);
         }
         let map_len = self.read_usize()?;
-        let mut generator_indices_by_watches = BTreeMap::new();
+        let mut generator_indices_by_watches = hashbrown::HashMap::with_capacity(map_len);
         for _ in 0..map_len {
             let k = self.read_usize()?;
             generator_indices_by_watches.insert(k, self.read_usize_vec()?);
@@ -1865,7 +1865,9 @@ pub trait Write {
         }
 
         self.write_usize(generator_indices_by_watches.len())?;
-        for (k, v) in generator_indices_by_watches {
+        let mut sorted_watches: Vec<_> = generator_indices_by_watches.iter().collect();
+        sorted_watches.sort_unstable_by_key(|(k, _)| **k);
+        for (k, v) in sorted_watches {
             self.write_usize(*k)?;
             self.write_usize_vec(v)?;
         }

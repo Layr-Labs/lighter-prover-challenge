@@ -55,13 +55,21 @@ pub fn generate_partial_witness<
     let mut generator_is_expired = vec![false; generators.len()];
     let mut remaining_generators = generators.len();
 
+    // Whether a generator is already queued for the next round, so a generator
+    // watching several targets populated in one round runs once, not once per
+    // trigger. (Re-running an unfinished generator with an unchanged witness
+    // is pure waste; it reads the latest witness whenever it does run.)
+    let mut generator_is_queued = vec![true; generators.len()];
+
     let mut buffer = GeneratedValues::empty();
+    let mut new_target_reps = Vec::new();
 
     // Keep running generators until we fail to make progress.
     while !pending_generator_indices.is_empty() {
         let mut next_pending_generator_indices = Vec::new();
 
         for &generator_idx in &pending_generator_indices {
+            generator_is_queued[generator_idx] = false;
             if generator_is_expired[generator_idx] {
                 continue;
             }
@@ -74,18 +82,21 @@ pub fn generate_partial_witness<
 
             // Merge any generated values into our witness, and get a list of newly-populated
             // targets' representatives.
-            let mut new_target_reps = Vec::with_capacity(buffer.target_values.len());
+            new_target_reps.clear();
             for (t, v) in buffer.target_values.drain(..) {
                 let reps = witness.set_target_returning_rep(t, v)?;
                 new_target_reps.extend(reps);
             }
 
             // Enqueue unfinished generators that were watching one of the newly populated targets.
-            for watch in new_target_reps {
-                let opt_watchers = generator_indices_by_watches.get(&watch);
+            for watch in &new_target_reps {
+                let opt_watchers = generator_indices_by_watches.get(watch);
                 if let Some(watchers) = opt_watchers {
                     for &watching_generator_idx in watchers {
-                        if !generator_is_expired[watching_generator_idx] {
+                        if !generator_is_expired[watching_generator_idx]
+                            && !generator_is_queued[watching_generator_idx]
+                        {
+                            generator_is_queued[watching_generator_idx] = true;
                             next_pending_generator_indices.push(watching_generator_idx);
                         }
                     }

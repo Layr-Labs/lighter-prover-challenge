@@ -13,10 +13,8 @@
 //! This is useful to allow even small devices to verify plonky2 proofs.
 
 #[cfg(not(feature = "std"))]
-use alloc::{collections::BTreeMap, vec, vec::Vec};
+use alloc::{vec, vec::Vec};
 use core::ops::{Range, RangeFrom};
-#[cfg(feature = "std")]
-use std::collections::BTreeMap;
 
 use anyhow::Result;
 use serde::Serialize;
@@ -370,7 +368,12 @@ pub struct ProverOnlyCircuitData<
     pub generators: Vec<WitnessGeneratorRef<F, D>>,
     /// Generator indices (within the `Vec` above), indexed by the representative of each target
     /// they watch.
-    pub generator_indices_by_watches: BTreeMap<usize, Vec<usize>>,
+    /// Watched-representative -> generator indices. A hash map rather than an
+    /// ordered map: witness generation performs one lookup per newly populated
+    /// target representative (millions per proof), and this map is
+    /// prover-only state that never influences the transcript or verifier
+    /// data. Serialization writes it in sorted key order for determinism.
+    pub generator_indices_by_watches: hashbrown::HashMap<usize, Vec<usize>>,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.

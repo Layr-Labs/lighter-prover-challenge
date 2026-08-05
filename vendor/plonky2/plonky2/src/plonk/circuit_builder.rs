@@ -1,10 +1,10 @@
 //! Logic for building plonky2 circuits.
 
 #[cfg(not(feature = "std"))]
-use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 use core::cmp::max;
 #[cfg(feature = "std")]
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use hashbrown::{HashMap, HashSet};
 use itertools::Itertools;
@@ -1264,7 +1264,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         );
 
         // Index generator indices by their watched targets.
-        let mut generator_indices_by_watches = BTreeMap::new();
+        let mut generator_indices_by_watches = hashbrown::HashMap::new();
         for (i, generator) in self.generators.iter().enumerate() {
             for watch in generator.0.watch_list() {
                 let watch_index = forest.target_index(watch);

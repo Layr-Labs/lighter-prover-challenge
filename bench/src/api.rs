@@ -35,8 +35,6 @@ pub struct Circuits {
     pub heavy_chain_data: CircuitData<F, C, D>,
     pub light_chain_target: BlockTxChainTarget,
     pub light_chain_data: CircuitData<F, C, D>,
-    pub block_target: BlockTarget,
-    pub block_data: CircuitData<F, C, D>,
     pub dummy_heavy_proof: Proof,
     pub dummy_light_proof: Proof,
 }
@@ -92,16 +90,6 @@ impl Circuits {
             },
         );
 
-        let block = BlockCircuit::define(
-            CIRCUIT_CONFIG,
-            &pre_data,
-            &light.chain_data,
-            &heavy.chain_data,
-            ON_CHAIN_OPERATIONS_LIMIT,
-        );
-        let block_target = block.target;
-        let block_data = block.builder.build::<C>();
-
         Self {
             heavy_tx_target: heavy.tx_target,
             heavy_tx_data: heavy.tx_data,
@@ -113,11 +101,26 @@ impl Circuits {
             heavy_chain_data: heavy.chain_data,
             light_chain_target: light.chain_target,
             light_chain_data: light.chain_data,
-            block_target,
-            block_data,
             dummy_heavy_proof: heavy.dummy_proof,
             dummy_light_proof: light.dummy_proof,
         }
+    }
+
+    /// Builds the final block circuit. Split out of [`Circuits::new`] so the
+    /// prover can run it on a background thread concurrently with transaction
+    /// proving: it is the largest single build (~5 s of an ~7.4 s
+    /// construction phase on the official host class per submission
+    /// `31a75fe`'s measurements), and nothing consumes it until the final
+    /// block proof, which runs after both chain proofs complete.
+    pub fn build_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
+        let block = BlockCircuit::define(
+            CIRCUIT_CONFIG,
+            &self.pre_data,
+            &self.light_chain_data,
+            &self.heavy_chain_data,
+            ON_CHAIN_OPERATIONS_LIMIT,
+        );
+        (block.target, block.builder.build::<C>())
     }
 }
 
