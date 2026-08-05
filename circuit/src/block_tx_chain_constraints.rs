@@ -232,79 +232,6 @@ impl BlockTxChainCircuit {
             });
     }
 }
-fn cyclic_base_public_inputs(
-    block_number: u64,
-    created_at: i64,
-    new_state_root: HashOut<F>,
-    new_validium_root: HashOut<F>,
-    old_account_delta_tree_root: HashOut<F>,
-) -> HashMap<usize, F> {
-    let mut public_inputs = HashMap::new();
-    public_inputs.insert(0, F::from_canonical_u64(block_number));
-    public_inputs.insert(1, F::from_canonical_u64(created_at as u64));
-
-    for (i, elem) in [
-        new_validium_root,
-        new_state_root,
-        old_account_delta_tree_root,
-    ]
-    .iter()
-    .flat_map(|&hash| hash.elements)
-    .enumerate()
-    {
-        public_inputs.insert(2 + i, elem);
-    }
-
-    let jump_index = 14
-        + 4 // new_public_market_details_hash
-        + CHANGE_PK_PUBLIC_INPUTS_LEN
-        + TRANSFER_PUBLIC_INPUTS_LEN
-        + APPROVE_INTEGRATOR_PUBLIC_INPUTS_LEN
-        + 1
-        + ON_CHAIN_OPERATIONS_PUB_DATA_BYTES_SIZE
-        + 1
-        + MAX_PRIORITY_OPERATIONS_PUB_DATA_BYTES_PER_TX;
-    let initial_jump = JumpState::initial(new_state_root, old_account_delta_tree_root).to_vec();
-    for (i, elem) in initial_jump.iter().enumerate() {
-        public_inputs.insert(jump_index + i, *elem);
-    }
-
-    let initial_state_root_index = jump_index + JUMP_STATE_SIZE;
-    for (i, elem) in new_state_root
-        .elements
-        .iter()
-        .chain(old_account_delta_tree_root.elements.iter())
-        .enumerate()
-    {
-        public_inputs.insert(initial_state_root_index + i, *elem);
-    }
-    public_inputs
-}
-
-/// Creates the unverified previous-proof witness for recursion step zero from a valid dummy proof.
-///
-/// The caller must use `dummy_proof` as the separately verified dummy-slot witness. Only the
-/// previous proof's public inputs are read when `recursion_step == 0`; its proof data is unselected.
-pub fn cyclic_base_witness(
-    dummy_proof: &ProofWithPublicInputs<F, C, D>,
-    block_number: u64,
-    created_at: i64,
-    new_state_root: HashOut<F>,
-    new_validium_root: HashOut<F>,
-    old_account_delta_tree_root: HashOut<F>,
-) -> ProofWithPublicInputs<F, C, D> {
-    let mut proof = dummy_proof.clone();
-    for (index, value) in cyclic_base_public_inputs(
-        block_number,
-        created_at,
-        new_state_root,
-        new_validium_root,
-        old_account_delta_tree_root,
-    ) {
-        proof.public_inputs[index] = value;
-    }
-    proof
-}
 
 impl Circuit<C, F, D> for BlockTxChainCircuit {
     fn define(
@@ -560,13 +487,46 @@ impl Circuit<C, F, D> for BlockTxChainCircuit {
         new_validium_root: HashOut<F>,
         old_account_delta_tree_root: HashOut<F>,
     ) -> ProofWithPublicInputs<F, C, D> {
-        let nonzero_public_inputs = cyclic_base_public_inputs(
-            block_number,
-            created_at,
-            new_state_root,
+        let mut nonzero_public_inputs = HashMap::new();
+
+        nonzero_public_inputs.insert(0, F::from_canonical_u64(block_number));
+        nonzero_public_inputs.insert(1, F::from_canonical_u64(created_at as u64));
+
+        for (i, elem) in [
             new_validium_root,
+            new_state_root,
             old_account_delta_tree_root,
-        );
+        ]
+        .iter()
+        .flat_map(|&hash| hash.elements)
+        .enumerate()
+        {
+            nonzero_public_inputs.insert(2 + i, elem);
+        }
+
+        let jump_index = 14
+            + 4 // new_public_market_details_hash
+            + CHANGE_PK_PUBLIC_INPUTS_LEN
+            + TRANSFER_PUBLIC_INPUTS_LEN
+            + APPROVE_INTEGRATOR_PUBLIC_INPUTS_LEN
+            + 1
+            + ON_CHAIN_OPERATIONS_PUB_DATA_BYTES_SIZE
+            + 1
+            + MAX_PRIORITY_OPERATIONS_PUB_DATA_BYTES_PER_TX;
+        let initial_jump = JumpState::initial(new_state_root, old_account_delta_tree_root).to_vec();
+        for (i, elem) in initial_jump.iter().enumerate() {
+            nonzero_public_inputs.insert(jump_index + i, *elem);
+        }
+
+        let initial_state_root_index = jump_index + JUMP_STATE_SIZE;
+        for (i, elem) in new_state_root
+            .elements
+            .iter()
+            .chain(old_account_delta_tree_root.elements.iter())
+            .enumerate()
+        {
+            nonzero_public_inputs.insert(initial_state_root_index + i, *elem);
+        }
 
         cyclic_base_proof(
             &circuit_data.common,

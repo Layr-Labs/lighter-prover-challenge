@@ -139,15 +139,16 @@ impl MetalContext {
         let input_bytes = input_len
             .checked_mul(size_of::<u64>())
             .ok_or("Metal leaf input size overflow")?;
+        let input_buffer_bytes = input_bytes.max(size_of::<u64>()) as u64;
         if self
             .input_buffer
             .as_ref()
-            .map_or(true, |buffer| buffer.length() < input_bytes.max(size_of::<u64>()) as u64)
+            .map_or(true, |buffer| buffer.length() < input_buffer_bytes)
         {
-            self.input_buffer = Some(self.device.new_buffer(
-                input_bytes.max(size_of::<u64>()) as u64,
-                MTLResourceOptions::StorageModeShared,
-            ));
+            self.input_buffer = Some(
+                self.device
+                    .new_buffer(input_buffer_bytes, MTLResourceOptions::StorageModeShared),
+            );
         }
         let input_buffer = self.input_buffer.as_ref().unwrap();
         let input = unsafe {
@@ -155,10 +156,10 @@ impl MetalContext {
         };
         if leaf_width != 0 {
             input
-                .par_chunks_exact_mut(leaf_width)
+                .par_chunks_mut(leaf_width)
                 .zip(leaves.par_iter())
-                .for_each(|(destination, source)| {
-                    for (destination, value) in destination.iter_mut().zip(source) {
+                .for_each(|(destination, leaf)| {
+                    for (destination, value) in destination.iter_mut().zip(leaf) {
                         *destination = value.to_noncanonical_u64();
                     }
                 });
@@ -170,14 +171,15 @@ impl MetalContext {
         let output_bytes = output_len
             .checked_mul(size_of::<u64>())
             .ok_or("Metal Merkle output size overflow")?;
+        let output_buffer_bytes = output_bytes as u64;
         if self
             .output_buffer
             .as_ref()
-            .map_or(true, |buffer| buffer.length() < output_bytes as u64)
+            .map_or(true, |buffer| buffer.length() < output_buffer_bytes)
         {
             self.output_buffer = Some(
                 self.device
-                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared),
+                    .new_buffer(output_buffer_bytes, MTLResourceOptions::StorageModeShared),
             );
         }
         let output_buffer = self.output_buffer.as_ref().unwrap();
@@ -303,7 +305,7 @@ fn tree_from_levels<F: RichField>(
             });
     } else {
         digests
-            .par_chunks_exact_mut(subtree_digest_count)
+            .par_chunks_mut(subtree_digest_count)
             .zip(cap.par_iter_mut())
             .enumerate()
             .for_each(|(cap_index, (subtree_digests, root))| {

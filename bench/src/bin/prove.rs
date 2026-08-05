@@ -13,8 +13,7 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 
 use api::{
-    Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
-    PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
+    Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
 };
 use circuit::block::Block;
 use circuit::types::config::F;
@@ -25,12 +24,13 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 fn main() {
     rayon::ThreadPoolBuilder::new()
-        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .stack_size(WORKER_STACK_BYTES)
         .build_global()
-        .expect("cannot configure prover thread pool");
+        .expect("cannot configure the global thread pool");
 
     let mut args = env::args().skip(1);
     let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");

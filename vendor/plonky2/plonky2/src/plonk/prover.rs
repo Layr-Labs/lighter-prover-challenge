@@ -685,7 +685,7 @@ fn compute_quotient_polys<
     let points_batches = points.par_chunks(BATCH_SIZE);
     let num_batches = points.len().div_ceil(BATCH_SIZE);
 
-    let quotient_values: Vec<F> = points_batches
+    let quotient_values: Vec<Vec<F>> = points_batches
         .enumerate()
         .flat_map(|(batch_i, xs_batch)| {
             // Each batch must be the same size, except the last one, which may be smaller.
@@ -797,9 +797,7 @@ fn compute_quotient_polys<
                 &lut_re_poly_evals_refs,
             );
 
-            for (&i, quotient_values) in indices_batch
-                .iter()
-                .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
+            for (&i, quotient_values) in indices_batch.iter().zip(quotient_values_batch.iter_mut())
             {
                 let denominator_inv = z_h_on_coset.eval_inverse(i);
                 quotient_values
@@ -810,17 +808,9 @@ fn compute_quotient_polys<
         })
         .collect();
 
-    debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
-    (0..num_challenges)
+    transpose(&quotient_values)
         .into_par_iter()
-        .map(|challenge| {
-            PolynomialValues::new(
-                quotient_values
-                    .chunks_exact(num_challenges)
-                    .map(|point_values| point_values[challenge])
-                    .collect(),
-            )
-        })
+        .map(PolynomialValues::new)
         .map(|values| values.coset_ifft(F::coset_shift()))
         .collect()
 }
