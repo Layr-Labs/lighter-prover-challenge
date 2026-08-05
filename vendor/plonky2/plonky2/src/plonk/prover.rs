@@ -682,12 +682,18 @@ fn compute_quotient_polys<
     let lut_re_poly_evals_refs: Vec<&[F]> =
         lut_re_poly_evals.iter().map(|v| v.as_slice()).collect();
 
-    let points_batches = points.par_chunks(BATCH_SIZE);
     let num_batches = points.len().div_ceil(BATCH_SIZE);
 
-    let quotient_values: Vec<F> = points_batches
+    // Write each batch's quotient values directly into a single pre-allocated flat output.
+    // This avoids the previous `flat_map` + `ListVecConsumer` (`LinkedList<Vec>`) allocation
+    // and flatten churn that dominated this phase under profiling.
+    let mut quotient_values: Vec<F> = vec![F::ZERO; points.len() * num_challenges];
+    quotient_values
+        .par_chunks_mut(BATCH_SIZE * num_challenges)
         .enumerate()
-        .flat_map(|(batch_i, xs_batch)| {
+        .for_each(|(batch_i, out_slice)| {
+            let xs_batch: &[F] =
+                &points[BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + out_slice.len() / num_challenges];
             // Each batch must be the same size, except the last one, which may be smaller.
             debug_assert!(
                 xs_batch.len() == BATCH_SIZE
@@ -806,9 +812,8 @@ fn compute_quotient_polys<
                     .iter_mut()
                     .for_each(|v| *v *= denominator_inv);
             }
-            quotient_values_batch
-        })
-        .collect();
+            out_slice.copy_from_slice(&quotient_values_batch);
+        });
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
     (0..num_challenges)
