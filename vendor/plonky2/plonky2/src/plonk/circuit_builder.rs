@@ -1226,7 +1226,8 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let fft_root_table = fft_root_table(max_fft_points);
 
         let constants_sigmas_commitment = if commit_to_sigma {
-            let constants_sigmas_vecs = [constant_vecs, sigma_vecs.clone()].concat();
+            let mut constants_sigmas_vecs = constant_vecs;
+            constants_sigmas_vecs.extend(sigma_vecs.iter().cloned());
             PolynomialBatch::<F, C, D>::from_values(
                 constants_sigmas_vecs,
                 rate_bits,

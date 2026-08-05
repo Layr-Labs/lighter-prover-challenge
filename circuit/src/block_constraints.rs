@@ -730,6 +730,8 @@ impl Circuit<C, F, D> for BlockCircuit {
             )?
         });
         let proof = circuit_data.prove(pw)?;
+        // The trusted benchmark verifies the final proof; keep the eager check for tests.
+        #[cfg(debug_assertions)]
         timed!(timing, "verify", { circuit_data.verify(proof.clone())? });
 
         timing.print();

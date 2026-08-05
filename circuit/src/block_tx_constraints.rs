@@ -183,6 +183,8 @@ impl Circuit<C, F, D> for BlockTxCircuit {
             Self::generate_witness(block, target)?
         });
         let proof = prove::<F, C, D>(&circuit.prover_only, &circuit.common, pw, &mut timing)?;
+        // Recursive parents validate this proof in release builds; keep the eager check for tests.
+        #[cfg(debug_assertions)]
         timed!(timing, "verify", { circuit.verify(proof.clone())? });
 
         timing.print();

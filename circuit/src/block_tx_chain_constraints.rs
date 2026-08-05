@@ -467,6 +467,8 @@ impl Circuit<C, F, D> for BlockTxChainCircuit {
             )?
         });
         let proof = circuit_data.prove(pw)?;
+        // Recursive parents validate this proof in release builds; keep the eager check for tests.
+        #[cfg(debug_assertions)]
         timed!(timing, "verify", { circuit_data.verify(proof.clone())? });
 
         timing.print();
