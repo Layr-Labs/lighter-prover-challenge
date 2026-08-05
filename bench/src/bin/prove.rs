@@ -11,6 +11,7 @@ mod prover;
 use std::env;
 use std::fs::{self, File};
 use std::io::BufWriter;
+use std::time::Instant;
 
 use api::{
     Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
@@ -31,6 +32,7 @@ fn main() {
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
+    let t0 = Instant::now();
     let json = fs::read(fixture).expect("cannot read prover fixture");
     let block = Block::<F>::from_json_with_empty_txs(
         &json,
@@ -40,7 +42,17 @@ fn main() {
         PUBLIC_LIGHT_TX_COUNT,
     )
     .expect("invalid prover fixture");
-    let proof = prover::prove_block(&block, &Circuits::new());
+    eprintln!("[timing] parse fixture: {:?}", t0.elapsed());
+
+    let t1 = Instant::now();
+    let circuits = Circuits::new();
+    eprintln!("[timing] Circuits::new: {:?}", t1.elapsed());
+
+    let t2 = Instant::now();
+    let proof = prover::prove_block(&block, &circuits);
+    eprintln!("[timing] prove_block: {:?}", t2.elapsed());
+
+    let t3 = Instant::now();
     bincode::serialize_into(
         BufWriter::with_capacity(
             PROOF_OUTPUT_BUFFER_BYTES,
@@ -49,4 +61,6 @@ fn main() {
         &proof,
     )
     .expect("cannot write proof output");
+    eprintln!("[timing] serialize proof: {:?}", t3.elapsed());
+    eprintln!("[timing] total: {:?}", t0.elapsed());
 }
