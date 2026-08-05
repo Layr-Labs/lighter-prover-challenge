@@ -74,6 +74,17 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
         }
     }
 
+    /// `hash_or_noop` applied to four inputs at once.
+    ///
+    /// Merkle tree construction hashes millions of independent leaves, so an
+    /// implementation is free to interleave the four sponges and hide the
+    /// latency of its permutation's serial dependency chain. Each output
+    /// element must equal `hash_or_noop` of the corresponding input; the
+    /// default implementation simply calls it four times.
+    fn hash_or_noop_x4(inputs: [&[F]; 4]) -> [Self::Hash; 4] {
+        inputs.map(Self::hash_or_noop)
+    }
+
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash;
 
     /// Build the native Merkle digests and cap with a specialized backend, when available.

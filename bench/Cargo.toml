@@ -14,6 +14,19 @@ path = "src/bin/bench.rs"
 name = "prove"
 path = "src/bin/prove.rs"
 
+# Local profiling/A-B drivers only; `setup.sh` builds `--bin prove` and never these.
+[[bin]]
+name = "profile_prove"
+path = "src/bin/profile_prove.rs"
+
+[[bin]]
+name = "hashbench"
+path = "src/bin/hashbench.rs"
+
+[[bin]]
+name = "bench_chunk"
+path = "src/bin/bench_chunk.rs"
+
 [features]
 default = ["parallel", "std"]
 parallel = ["plonky2/parallel"]

@@ -124,8 +124,80 @@ impl Circuits {
 #[cfg(test)]
 mod tests {
     use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
+    use plonky2::field::types::Field;
+    use plonky2::plonk::config::{GenericConfig, Hasher as _};
 
     use super::*;
+
+    type BlockHasher = <C as GenericConfig<D>>::Hasher;
+
+    /// Guards the vendored hashing change: Merkle leaf hashing now goes through
+    /// `Hasher::hash_or_noop_x4`, which advances four Poseidon2 sponges in
+    /// lockstep, and the Metal backend uses it for the CPU share of a split leaf
+    /// level. Every output must equal the one-at-a-time result, otherwise every
+    /// Merkle cap changes, the Fiat-Shamir transcript changes, and the pinned
+    /// verifier rejects the proof.
+    #[test]
+    fn batched_leaf_hashing_matches_scalar() {
+        let value = |lane: u64, i: usize| F::from_canonical_u64(lane * 1_000_003 + i as u64 + 1);
+        // 136 is `num_wires`, the wires-oracle leaf width; 32 is the FRI
+        // commit-phase leaf width (arity 16 times extension degree 2); 20 and 16
+        // are the Zs/partial-products and quotient widths.
+        for len in [0usize, 1, 4, 5, 8, 16, 20, 32, 135, 136, 137] {
+            let lanes: Vec<Vec<F>> = (0..4)
+                .map(|lane| (0..len).map(|i| value(lane, i)).collect())
+                .collect();
+            let inputs: [&[F]; 4] = [&lanes[0], &lanes[1], &lanes[2], &lanes[3]];
+            let batched = BlockHasher::hash_or_noop_x4(inputs);
+            for lane in 0..4 {
+                assert_eq!(
+                    batched[lane],
+                    BlockHasher::hash_or_noop(inputs[lane]),
+                    "lane {lane} mismatch at len {len}"
+                );
+            }
+        }
+
+        // Unequal lengths must fall back rather than absorb the wrong number of
+        // chunks in some lane.
+        let wide: Vec<F> = (0..136).map(|i| value(9, i)).collect();
+        let narrow: Vec<F> = (0..40).map(|i| value(8, i)).collect();
+        let inputs: [&[F]; 4] = [&wide, &narrow, &wide, &narrow];
+        let batched = BlockHasher::hash_or_noop_x4(inputs);
+        for lane in 0..4 {
+            assert_eq!(batched[lane], BlockHasher::hash_or_noop(inputs[lane]));
+        }
+    }
+
+    /// A whole Merkle tree must have the same cap however its leaf level was
+    /// computed. This exercises the real `MerkleTree::new` entry point, so on a
+    /// Metal-capable host it also covers the GPU path and, for a large enough
+    /// tree, the CPU/GPU split.
+    #[test]
+    fn merkle_tree_cap_matches_scalar_leaf_hashing() {
+        use plonky2::hash::merkle_tree::MerkleTree;
+
+        let leaves: Vec<Vec<F>> = (0..64)
+            .map(|row: u64| {
+                (0..136)
+                    .map(|col: u64| F::from_canonical_u64(row * 977 + col * 31 + 1))
+                    .collect()
+            })
+            .collect();
+        let tree = MerkleTree::<F, BlockHasher>::new(leaves.clone(), 2);
+
+        let mut expected: Vec<_> = leaves
+            .iter()
+            .map(|leaf| BlockHasher::hash_or_noop(leaf))
+            .collect();
+        while expected.len() > 4 {
+            expected = expected
+                .chunks(2)
+                .map(|pair| BlockHasher::two_to_one(pair[0], pair[1]))
+                .collect();
+        }
+        assert_eq!(tree.cap.0, expected);
+    }
 
     #[test]
     fn production_mixed_circuit_parameters_are_fixed() {

@@ -83,6 +83,37 @@ pub(crate) fn capacity_up_to_mut<T>(v: &mut Vec<T>, len: usize) -> &mut [MaybeUn
     }
 }
 
+/// Leaves per rayon task in [`hash_leaves_into`]. Small enough that thousands of
+/// tasks are available for work stealing, large enough that per-task overhead is
+/// negligible next to the hashing itself.
+const LEAF_HASH_BLOCK: usize = 256;
+
+/// Hash `leaves` into `out`, four leaves at a time.
+///
+/// Leaf hashing dominates the cost of a Merkle tree: a tree over `n` leaves
+/// performs `n * ceil(leaf_len / RATE)` leaf permutations against only
+/// `n - cap` compressions. Batching four gives the hasher a chance to interleave
+/// four independent sponges via [`Hasher::hash_or_noop_x4`] and hide the latency
+/// of its permutation's serial dependency chain.
+pub fn hash_leaves_into<F: RichField, H: Hasher<F>>(leaves: &[Vec<F>], out: &mut [H::Hash]) {
+    assert_eq!(leaves.len(), out.len());
+    out.par_chunks_mut(LEAF_HASH_BLOCK)
+        .zip(leaves.par_chunks(LEAF_HASH_BLOCK))
+        .for_each(|(out, block)| {
+            let mut i = 0;
+            while i + 4 <= block.len() {
+                let batch =
+                    H::hash_or_noop_x4([&block[i], &block[i + 1], &block[i + 2], &block[i + 3]]);
+                out[i..i + 4].copy_from_slice(&batch);
+                i += 4;
+            }
+            while i < block.len() {
+                out[i] = H::hash_or_noop(&block[i]);
+                i += 1;
+            }
+        });
+}
+
 pub(crate) fn fill_subtree<F: RichField, H: Hasher<F>>(
     digests_buf: &mut [MaybeUninit<H::Hash>],
     leaves: &[Vec<F>],

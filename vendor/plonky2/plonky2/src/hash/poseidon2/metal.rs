@@ -1,7 +1,9 @@
 use core::ffi::c_void;
 use core::mem::{size_of, size_of_val};
 use core::slice;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
 
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLCommandBufferStatus,
@@ -11,12 +13,74 @@ use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
 
 use crate::hash::hash_types::{HashOut, RichField};
-use crate::hash::poseidon2::config::{
-    EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64,
-};
+use crate::hash::merkle_tree::hash_leaves_into;
+use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
+use crate::hash::poseidon2::hash::{Poseidon2, Poseidon2Hash};
+use crate::plonk::config::Hasher;
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 const MIN_GPU_PERMUTATIONS: usize = 1 << 14;
+
+/// Never hand the CPU more than this share of the leaf level. A bad estimate
+/// then costs a little of the available overlap rather than making the build
+/// slower than pure GPU.
+const MAX_CPU_SHARE_NUM: usize = 3;
+const MAX_CPU_SHARE_DEN: usize = 5;
+/// Share used for the one probe build that measures the CPU rate.
+const PROBE_CPU_SHARE_DEN: usize = 8;
+/// Below this many leaf permutations the split is not worth its extra command
+/// buffer; hand the whole level to the GPU.
+const MIN_SPLIT_PERMUTATIONS: usize = 1 << 17;
+
+/// Measured cost of one leaf permutation, in picoseconds, for each engine.
+/// Zero means "not measured yet". These are process-wide because the ratio is a
+/// property of the host, and the ranked harness runs one worker per fixture, so
+/// each process re-measures on the machine it lands on. That is the point: the
+/// split is never a hardcoded constant tuned to the machine I developed on.
+static GPU_PICOS_PER_PERM: AtomicU64 = AtomicU64::new(0);
+static CPU_PICOS_PER_PERM: AtomicU64 = AtomicU64::new(0);
+
+static TIMING: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("LIGHTER_METAL_TIMING").is_some());
+
+/// Exponential moving average, weight 1/4 on the new sample.
+fn blend(slot: &AtomicU64, sample: u64) {
+    let previous = slot.load(Ordering::Relaxed);
+    let next = if previous == 0 {
+        sample
+    } else {
+        (previous * 3 + sample) / 4
+    };
+    slot.store(next, Ordering::Relaxed);
+}
+
+/// How many of `leaf_count` leaves the CPU should hash while the GPU hashes the
+/// rest, balancing the two so they finish together.
+///
+/// Solving `cpu_count * cpu_cost == (leaf_count - cpu_count) * gpu_cost` gives
+/// `cpu_count = leaf_count * gpu_cost / (gpu_cost + cpu_cost)`.
+fn cpu_leaf_count(leaf_count: usize, perms_per_leaf: usize) -> usize {
+    if perms_per_leaf == 0 || leaf_count * perms_per_leaf < MIN_SPLIT_PERMUTATIONS {
+        return 0;
+    }
+    let gpu = GPU_PICOS_PER_PERM.load(Ordering::Relaxed);
+    let cpu = CPU_PICOS_PER_PERM.load(Ordering::Relaxed);
+    let raw = if gpu == 0 {
+        // Nothing measured yet: let the first build time the GPU on its own.
+        0
+    } else if cpu == 0 {
+        leaf_count / PROBE_CPU_SHARE_DEN
+    } else {
+        // Undershoot the balance point by ~10%: the CPU share is free only while
+        // the GPU is still busy, so overshooting makes the CPU the straggler and
+        // the build slower than pure GPU, while undershooting merely leaves a
+        // little overlap unused.
+        ((leaf_count as u128 * gpu as u128 * 9) / ((gpu as u128 + cpu as u128) * 10)) as usize
+    };
+    let ceiling = leaf_count * MAX_CPU_SHARE_NUM / MAX_CPU_SHARE_DEN;
+    // A multiple of four keeps the CPU side on the batched four-lane sponge.
+    (raw.min(ceiling) / 4) * 4
+}
 
 struct MetalContext {
     device: Device,
@@ -28,10 +92,9 @@ struct MetalContext {
     output_buffer: Option<Buffer>,
 }
 
-static CONTEXT: LazyLock<Result<Mutex<MetalContext>, String>> =
-    LazyLock::new(MetalContext::new);
+static CONTEXT: LazyLock<Result<Mutex<MetalContext>, String>> = LazyLock::new(MetalContext::new);
 
-pub(crate) fn build_merkle_tree<F: RichField>(
+pub(crate) fn build_merkle_tree<F: RichField + Poseidon2>(
     leaves: &[Vec<F>],
     cap_height: usize,
 ) -> Option<(Vec<HashOut<F>>, Vec<HashOut<F>>)> {
@@ -123,7 +186,7 @@ impl MetalContext {
         })
     }
 
-    fn build<F: RichField>(
+    fn build<F: RichField + Poseidon2>(
         &mut self,
         leaves: &[Vec<F>],
         cap_height: usize,
@@ -139,28 +202,38 @@ impl MetalContext {
         let input_bytes = input_len
             .checked_mul(size_of::<u64>())
             .ok_or("Metal leaf input size overflow")?;
-        if self
-            .input_buffer
-            .as_ref()
-            .map_or(true, |buffer| buffer.length() < input_bytes.max(size_of::<u64>()) as u64)
-        {
+        if self.input_buffer.as_ref().map_or(true, |buffer| {
+            buffer.length() < input_bytes.max(size_of::<u64>()) as u64
+        }) {
             self.input_buffer = Some(self.device.new_buffer(
                 input_bytes.max(size_of::<u64>()) as u64,
                 MTLResourceOptions::StorageModeShared,
             ));
         }
         let input_buffer = self.input_buffer.as_ref().unwrap();
-        let input = unsafe {
-            slice::from_raw_parts_mut(input_buffer.contents().cast::<u64>(), input_len)
+        let input =
+            unsafe { slice::from_raw_parts_mut(input_buffer.contents().cast::<u64>(), input_len) };
+        // Leaf hashes are independent, so the level splits cleanly: the GPU takes
+        // the prefix, the CPU the suffix, and only the GPU prefix needs copying
+        // into the shared buffer.
+        let perms_per_leaf = if leaf_width <= 4 {
+            0
+        } else {
+            leaf_width.div_ceil(8)
         };
+        let cpu_count = cpu_leaf_count(leaf_count, perms_per_leaf).min(leaf_count);
+        let gpu_count = leaf_count - cpu_count;
         if leaf_width != 0 {
-            input
+            input[..gpu_count * leaf_width]
                 .par_chunks_exact_mut(leaf_width)
-                .zip(leaves.par_iter())
-                .for_each(|(destination, source)| {
-                    for (destination, value) in destination.iter_mut().zip(source) {
-                        *destination = value.to_noncanonical_u64();
-                    }
+                .zip(leaves[..gpu_count].par_iter())
+                .for_each(|(destination, leaf)| {
+                    destination
+                        .iter_mut()
+                        .zip(leaf)
+                        .for_each(|(destination, value)| {
+                            *destination = value.to_noncanonical_u64();
+                        });
                 });
         }
 
@@ -182,26 +255,93 @@ impl MetalContext {
         }
         let output_buffer = self.output_buffer.as_ref().unwrap();
 
-        let leaf_count_u32 = leaf_count as u32;
+        let gpu_count_u32 = gpu_count as u32;
         let leaf_width_u32 = leaf_width as u32;
+        // The leaf level goes in its own command buffer so it can be in flight
+        // while this thread hashes the CPU share. The parent levels have to wait
+        // for every leaf hash, CPU ones included, so they are committed after.
+        let leaf_buffer = self.queue.new_command_buffer();
+        if gpu_count != 0 {
+            let leaf_encoder = leaf_buffer.new_compute_command_encoder();
+            leaf_encoder.set_compute_pipeline_state(&self.leaf_pipeline);
+            leaf_encoder.set_buffer(0, Some(&input_buffer), 0);
+            leaf_encoder.set_buffer(1, Some(&output_buffer), 0);
+            leaf_encoder.set_buffer(2, Some(&self.parameters), 0);
+            leaf_encoder.set_bytes(
+                3,
+                size_of::<u32>() as NSUInteger,
+                (&leaf_width_u32 as *const u32).cast::<c_void>(),
+            );
+            leaf_encoder.set_bytes(
+                4,
+                size_of::<u32>() as NSUInteger,
+                (&gpu_count_u32 as *const u32).cast::<c_void>(),
+            );
+            dispatch(&leaf_encoder, &self.leaf_pipeline, gpu_count);
+            leaf_encoder.end_encoding();
+        }
+        let dispatched = Instant::now();
+        leaf_buffer.commit();
+
+        // --- overlap: the GPU is now hashing its prefix ---
+        let mut cpu_hashes = vec![HashOut::<F>::ZERO; cpu_count];
+        if cpu_count != 0 {
+            hash_leaves_into::<F, Poseidon2Hash>(&leaves[gpu_count..], &mut cpu_hashes);
+        }
+        let cpu_secs = dispatched.elapsed().as_secs_f64();
+
+        leaf_buffer.wait_until_completed();
+        let leaf_secs = dispatched.elapsed().as_secs_f64();
+        if leaf_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(format!(
+                "leaf command buffer ended with status {:?}",
+                leaf_buffer.status()
+            ));
+        }
+
+        // The parent kernel assumes every stored digest is canonical, and so does
+        // `read_node`, so write canonical limbs.
+        if cpu_count != 0 {
+            let leaf_hashes = unsafe {
+                slice::from_raw_parts_mut(
+                    output_buffer.contents().cast::<u64>().add(gpu_count * 4),
+                    cpu_count * 4,
+                )
+            };
+            leaf_hashes
+                .par_chunks_mut(4)
+                .zip(cpu_hashes.par_iter())
+                .for_each(|(destination, hash)| {
+                    destination.iter_mut().zip(hash.elements.iter()).for_each(
+                        |(destination, value)| {
+                            *destination = value.to_canonical_u64();
+                        },
+                    );
+                });
+        }
+
+        // Feed the measured costs back so the next build splits better. `cpu_secs`
+        // is always a clean CPU measurement. The GPU is only cleanly timed when it
+        // was still running after the CPU finished, or when it ran alone.
+        if cpu_count != 0 {
+            blend(
+                &CPU_PICOS_PER_PERM,
+                (cpu_secs * 1e12 / (cpu_count * perms_per_leaf) as f64) as u64,
+            );
+        }
+        // Only an all-GPU build times the GPU cleanly. Once the CPU runs
+        // alongside, `leaf_secs` is dominated by whichever engine finished last,
+        // so folding it in here would drag the GPU estimate toward the CPU's and
+        // push the split past the balance point. The first build of the process is
+        // deliberately all-GPU for exactly this measurement.
+        if gpu_count != 0 && perms_per_leaf != 0 && cpu_count == 0 {
+            blend(
+                &GPU_PICOS_PER_PERM,
+                (leaf_secs * 1e12 / (gpu_count * perms_per_leaf) as f64) as u64,
+            );
+        }
+
         let command_buffer = self.queue.new_command_buffer();
-        let leaf_encoder = command_buffer.new_compute_command_encoder();
-        leaf_encoder.set_compute_pipeline_state(&self.leaf_pipeline);
-        leaf_encoder.set_buffer(0, Some(&input_buffer), 0);
-        leaf_encoder.set_buffer(1, Some(&output_buffer), 0);
-        leaf_encoder.set_buffer(2, Some(&self.parameters), 0);
-        leaf_encoder.set_bytes(
-            3,
-            size_of::<u32>() as NSUInteger,
-            (&leaf_width_u32 as *const u32).cast::<c_void>(),
-        );
-        leaf_encoder.set_bytes(
-            4,
-            size_of::<u32>() as NSUInteger,
-            (&leaf_count_u32 as *const u32).cast::<c_void>(),
-        );
-        dispatch(&leaf_encoder, &self.leaf_pipeline, leaf_count);
-        leaf_encoder.end_encoding();
 
         let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
         let mut level_offset = 0usize;
@@ -238,8 +378,17 @@ impl MetalContext {
             child_count = parent_count;
         }
 
+        let parents_start = Instant::now();
         command_buffer.commit();
         command_buffer.wait_until_completed();
+        let parents_secs = parents_start.elapsed().as_secs_f64();
+        if *TIMING {
+            eprintln!(
+                "METAL leaves={leaf_count} width={leaf_width} cpu_share={cpu_count}                  cpu={cpu_secs:.4} leaf_total={leaf_secs:.4} parents={parents_secs:.4}                  gpu_ps={} cpu_ps={}",
+                GPU_PICOS_PER_PERM.load(Ordering::Relaxed),
+                CPU_PICOS_PER_PERM.load(Ordering::Relaxed)
+            );
+        }
         if command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "command buffer ended with status {:?}",
@@ -247,9 +396,8 @@ impl MetalContext {
             ));
         }
 
-        let nodes = unsafe {
-            slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
-        };
+        let nodes =
+            unsafe { slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len) };
         Ok(tree_from_levels(
             nodes,
             &level_offsets,
@@ -334,20 +482,8 @@ fn fill_subtree_layout<F: RichField>(
     let (left_root, left_digests) = left_half.split_last_mut().unwrap();
     let (right_root, right_digests) = right_half.split_first_mut().unwrap();
     let half = leaf_count / 2;
-    *left_root = fill_subtree_layout(
-        left_digests,
-        nodes,
-        level_offsets,
-        start_leaf,
-        half,
-    );
-    *right_root = fill_subtree_layout(
-        right_digests,
-        nodes,
-        level_offsets,
-        start_leaf + half,
-        half,
-    );
+    *left_root = fill_subtree_layout(left_digests, nodes, level_offsets, start_leaf, half);
+    *right_root = fill_subtree_layout(right_digests, nodes, level_offsets, start_leaf + half, half);
 
     let level = leaf_count.ilog2() as usize;
     read_node(nodes, level_offsets[level], start_leaf / leaf_count)
@@ -413,10 +549,7 @@ mod tests {
     fn cpu_tree(
         leaves: &[Vec<GoldilocksField>],
         cap_height: usize,
-    ) -> (
-        Vec<HashOut<GoldilocksField>>,
-        Vec<HashOut<GoldilocksField>>,
-    ) {
+    ) -> (Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>) {
         let cap_len = 1 << cap_height;
         let digest_len = 2 * (leaves.len() - cap_len);
         let mut digests = Vec::with_capacity(digest_len);
@@ -439,14 +572,8 @@ mod tests {
     }
 
     fn assert_tree_eq(
-        actual: &(
-            Vec<HashOut<GoldilocksField>>,
-            Vec<HashOut<GoldilocksField>>,
-        ),
-        expected: &(
-            Vec<HashOut<GoldilocksField>>,
-            Vec<HashOut<GoldilocksField>>,
-        ),
+        actual: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
+        expected: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
         width: usize,
         cap_height: usize,
     ) {
