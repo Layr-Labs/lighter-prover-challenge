@@ -16,6 +16,18 @@ use plonky2::recursion::dummy_circuit::dummy_circuit;
 
 pub type Proof = ProofWithPublicInputs<F, C, D>;
 
+/// Stack size for circuit-building and proving threads; circuit definition
+/// recurses deeply enough that the 2 MiB spawn default is unsafe (repository
+/// tests already run on 32 MiB stacks).
+pub const PROVER_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Local A/B killswitch: `LIGHTER_SERIAL=1` restores the fully serial build
+/// and proving pipeline. The ranked sandbox clears the environment, so the
+/// submitted behavior is always the parallel default path.
+pub fn parallel_disabled() -> bool {
+    std::env::var_os("LIGHTER_SERIAL").is_some_and(|value| value != "0")
+}
+
 pub const CHAIN_ID: u32 = 304;
 pub const HEAVY_TX_PER_PROOF: usize = 4;
 pub const HEAVY_TX_MODE: u8 = TX_HEAVY;
@@ -44,8 +56,106 @@ pub struct Circuits {
     pub dummy_light_proof: Proof,
 }
 
+/// Everything derived from one tx circuit: the chain circuit built on top of
+/// it plus the dummy circuit and base proof the cyclic recursion needs.
+struct TxPathCircuits {
+    tx_target: BlockTxTarget,
+    tx_data: CircuitData<F, C, D>,
+    chain_target: BlockTxChainTarget,
+    chain_data: CircuitData<F, C, D>,
+    dummy_chain_circuit: CircuitData<F, C, D>,
+    dummy_proof: Proof,
+}
+
+fn build_tx_path(tx_per_proof: usize, mode: u8) -> TxPathCircuits {
+    let tx = BlockTxCircuit::define(CIRCUIT_CONFIG, tx_per_proof, CHAIN_ID, mode);
+    let tx_target = tx.target;
+    let tx_data = tx.builder.build::<C>();
+
+    let chain = BlockTxChainCircuit::define(CIRCUIT_CONFIG, &tx_data, ON_CHAIN_OPERATIONS_LIMIT);
+    let chain_target = chain.target;
+    let chain_data = chain.builder.build::<C>();
+
+    let dummy_chain_circuit = dummy_circuit(&chain_data.common);
+    let dummy_proof = cyclic_base_proof(
+        &chain_data.common,
+        &chain_data.verifier_only,
+        &dummy_chain_circuit,
+        [].into_iter().collect(),
+    )
+    .expect("cannot construct chain dummy proof");
+
+    TxPathCircuits {
+        tx_target,
+        tx_data,
+        chain_target,
+        chain_data,
+        dummy_chain_circuit,
+        dummy_proof,
+    }
+}
+
 impl Circuits {
     pub fn new() -> Self {
+        if parallel_disabled() {
+            return Self::new_serial();
+        }
+
+        let (heavy, light, (pre_target, pre_data)) = std::thread::scope(|scope| {
+            let spawn = |name: &str, tx_per_proof, mode| {
+                std::thread::Builder::new()
+                    .name(name.into())
+                    .stack_size(PROVER_THREAD_STACK_BYTES)
+                    .spawn_scoped(scope, move || build_tx_path(tx_per_proof, mode))
+                    .expect("circuit build thread must start")
+            };
+            let heavy_handle = spawn("heavy-circuits", HEAVY_TX_PER_PROOF, HEAVY_TX_MODE);
+            let light_handle = spawn("light-circuits", LIGHT_TX_PER_PROOF, LIGHT_TX_MODE);
+
+            let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
+            let pre_target = pre.target;
+            let pre_data = pre.builder.build::<C>();
+
+            let heavy = heavy_handle
+                .join()
+                .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+            let light = light_handle
+                .join()
+                .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+            (heavy, light, (pre_target, pre_data))
+        });
+
+        let block = BlockCircuit::define(
+            CIRCUIT_CONFIG,
+            &pre_data,
+            &light.chain_data,
+            &heavy.chain_data,
+            ON_CHAIN_OPERATIONS_LIMIT,
+        );
+        let block_target = block.target;
+        let block_data = block.builder.build::<C>();
+
+        Self {
+            heavy_tx_target: heavy.tx_target,
+            heavy_tx_data: heavy.tx_data,
+            light_tx_target: light.tx_target,
+            light_tx_data: light.tx_data,
+            pre_target,
+            pre_data,
+            heavy_chain_target: heavy.chain_target,
+            heavy_chain_data: heavy.chain_data,
+            light_chain_target: light.chain_target,
+            light_chain_data: light.chain_data,
+            block_target,
+            block_data,
+            dummy_heavy_chain_circuit: heavy.dummy_chain_circuit,
+            dummy_light_chain_circuit: light.dummy_chain_circuit,
+            dummy_heavy_proof: heavy.dummy_proof,
+            dummy_light_proof: light.dummy_proof,
+        }
+    }
+
+    fn new_serial() -> Self {
         let heavy_tx =
             BlockTxCircuit::define(CIRCUIT_CONFIG, HEAVY_TX_PER_PROOF, CHAIN_ID, HEAVY_TX_MODE);
         let heavy_tx_target = heavy_tx.target;
