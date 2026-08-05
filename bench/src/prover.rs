@@ -358,44 +358,53 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     block.tx_chunks = tx_chunks;
     block.tx_chunks.push(Vec::new());
 
-    let (light_chain_proof, heavy_chain_proof) = std::thread::scope(|scope| {
-        let heavy_handle = std::thread::Builder::new()
-            .name("heavy-tx-chain".into())
-            .stack_size(PROVER_THREAD_STACK_BYTES)
-            .spawn_scoped(scope, || {
-                prove_path(
-                    TxPath::Heavy,
-                    heavy_chunks,
-                    circuits,
-                    block.block_number,
-                    block.created_at,
-                    block.old_account_delta_tree_root,
-                    &pre_output,
-                    state_metadata_hash,
-                )
-            })
-            .expect("heavy transaction chain thread must start");
-        let light_chain_proof = prove_path(
-            TxPath::Light,
-            light_chunks,
-            circuits,
-            block.block_number,
-            block.created_at,
-            block.old_account_delta_tree_root,
-            &pre_output,
-            state_metadata_hash,
-        );
-        let heavy_chain_proof = heavy_handle
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        (light_chain_proof, heavy_chain_proof)
-    });
+    let ((block_target, block_data), light_chain_proof, heavy_chain_proof) =
+        std::thread::scope(|scope| {
+            let final_circuit_handle = std::thread::Builder::new()
+                .name("final-circuit-build".into())
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, || circuits.build_final())
+                .expect("final circuit build thread must start");
+            let heavy_handle = std::thread::Builder::new()
+                .name("heavy-tx-chain".into())
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, || {
+                    prove_path(
+                        TxPath::Heavy,
+                        heavy_chunks,
+                        circuits,
+                        block.block_number,
+                        block.created_at,
+                        block.old_account_delta_tree_root,
+                        &pre_output,
+                        state_metadata_hash,
+                    )
+                })
+                .expect("heavy transaction chain thread must start");
+            let light_chain_proof = prove_path(
+                TxPath::Light,
+                light_chunks,
+                circuits,
+                block.block_number,
+                block.created_at,
+                block.old_account_delta_tree_root,
+                &pre_output,
+                state_metadata_hash,
+            );
+            let heavy_chain_proof = heavy_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let final_circuit = final_circuit_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            (final_circuit, light_chain_proof, heavy_chain_proof)
+        });
 
     let (light_chain_input, heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
     BlockCircuit::prove(
-        &circuits.block_target,
-        &circuits.block_data,
+        &block_target,
+        &block_data,
         &block,
         &pre_proof,
         light_chain_input,

@@ -47,6 +47,18 @@ pub fn generate_partial_witness<
         witness.set_target(t, v)?;
     }
 
+    // Derive one readiness count per generator from the existing representative-keyed watcher
+    // index. This avoids rebuilding and rescanning dependency vectors on every simple-generator
+    // wakeup without adding state to serialized prover data.
+    let mut unresolved_watches = vec![0usize; generators.len()];
+    for (&watch, watchers) in generator_indices_by_watches {
+        if witness.values[watch].is_none() {
+            for &generator_idx in watchers {
+                unresolved_watches[generator_idx] += 1;
+            }
+        }
+    }
+
     // Build a list of "pending" generators which are queued to be run. Initially, all generators
     // are queued.
     let mut pending_generator_indices: Vec<_> = (0..generators.len()).collect();
@@ -66,7 +78,11 @@ pub fn generate_partial_witness<
                 continue;
             }
 
-            let finished = generators[generator_idx].0.run(&witness, &mut buffer);
+            let finished = generators[generator_idx].0.run_with_ready_hint(
+                &witness,
+                &mut buffer,
+                unresolved_watches[generator_idx] == 0,
+            );
             if finished {
                 generator_is_expired[generator_idx] = true;
                 remaining_generators -= 1;
@@ -86,6 +102,8 @@ pub fn generate_partial_witness<
                 if let Some(watchers) = opt_watchers {
                     for &watching_generator_idx in watchers {
                         if !generator_is_expired[watching_generator_idx] {
+                            debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
+                            unresolved_watches[watching_generator_idx] -= 1;
                             next_pending_generator_indices.push(watching_generator_idx);
                         }
                     }
@@ -117,6 +135,19 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
     /// flag is true, the generator will never be run again, otherwise it will be queued for another
     /// run next time a target in its watch list is populated.
     fn run(&self, witness: &PartitionWitness<F>, out_buffer: &mut GeneratedValues<F>) -> bool;
+
+    /// Scheduler entry point carrying a hint that every watched representative is populated.
+    /// General generators keep their existing behavior; one-shot adapters can use the hint to
+    /// avoid rediscovering readiness.
+    #[doc(hidden)]
+    fn run_with_ready_hint(
+        &self,
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+        _all_watches_populated: bool,
+    ) -> bool {
+        self.run(witness, out_buffer)
+    }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()>;
 
@@ -260,6 +291,15 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
         } else {
             false
         }
+    }
+
+    fn run_with_ready_hint(
+        &self,
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+        all_watches_populated: bool,
+    ) -> bool {
+        all_watches_populated && self.inner.run_once(witness, out_buffer).is_ok()
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
