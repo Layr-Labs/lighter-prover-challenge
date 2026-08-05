@@ -130,7 +130,7 @@ where
     F: Field + Extendable<D>,
 {
     l.iter()
-        .flat_map(|x| x.to_basefield_array().to_vec())
+        .flat_map(|x| x.to_basefield_array().into_iter())
         .collect()
 }
 
@@ -143,4 +143,48 @@ where
     l.chunks_exact(D)
         .map(|c| F::Extension::from_basefield_array(c.to_vec().try_into().unwrap()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::goldilocks_field::GoldilocksField;
+
+    #[test]
+    fn flatten_iterator_matches_materialized_reference_raw() {
+        type F = GoldilocksField;
+        type E = <F as Extendable<2>>::Extension;
+
+        for len in 0..=64 {
+            let values = (0..len)
+                .map(|i| {
+                    <E as FieldExtension<2>>::from_basefield_array([
+                        GoldilocksField(
+                            (i as u64)
+                                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                                .wrapping_add(u64::MAX - len as u64),
+                        ),
+                        GoldilocksField(
+                            (i as u64)
+                                .wrapping_mul(0xd1b5_4a32_d192_ed03)
+                                .wrapping_add(0xffff_ffff_0000_0001),
+                        ),
+                    ])
+                })
+                .collect::<Vec<E>>();
+            let expected: Vec<F> = values
+                .iter()
+                .flat_map(|value| {
+                    <E as FieldExtension<2>>::to_basefield_array(value).to_vec()
+                })
+                .collect();
+            let actual = flatten::<F, 2>(&values);
+
+            assert_eq!(
+                actual.iter().map(|value| value.0).collect::<Vec<_>>(),
+                expected.iter().map(|value| value.0).collect::<Vec<_>>(),
+                "len={len}",
+            );
+        }
+    }
 }

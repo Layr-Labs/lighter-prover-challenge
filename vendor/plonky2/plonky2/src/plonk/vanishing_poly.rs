@@ -221,6 +221,8 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     let mut vanishing_z_1_terms = Vec::with_capacity(num_challenges);
     // The terms checking the partial products.
     let mut vanishing_partial_products_terms = Vec::new();
+    let mut current_looked_combos = Vec::new();
+    let mut current_looking_combos = Vec::new();
 
     // The terms checking the lookup constraints.
     let mut vanishing_all_lookup_terms = if has_lookup {
@@ -238,9 +240,10 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         let x = xs_batch[k];
         let vars = vars_batch.view(k);
 
-        let lookup_selectors: Vec<F> = (0..common_data.num_lookup_selectors)
-            .map(|i| vars.local_constants[common_data.selectors_info.num_selectors() + i])
-            .collect();
+        let lookup_start = common_data.selectors_info.num_selectors();
+        let lookup_selectors = vars
+            .local_constants
+            .view(lookup_start..lookup_start + common_data.num_lookup_selectors);
 
         let local_zs = local_zs_batch[k];
         let next_zs = next_zs_batch[k];
@@ -276,16 +279,18 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 let cur_next_lookup_zs = &next_lookup_zs
                     [common_data.num_lookup_polys * i..common_data.num_lookup_polys * (i + 1)];
 
-                let lookup_constraints = check_lookup_constraints_batch(
+                check_lookup_constraints_batch(
                     common_data,
                     vars,
                     cur_local_lookup_zs,
                     cur_next_lookup_zs,
-                    &lookup_selectors,
+                    lookup_selectors,
                     cur_deltas.try_into().unwrap(),
                     lut_re_poly_evals[i],
+                    &mut vanishing_all_lookup_terms,
+                    &mut current_looked_combos,
+                    &mut current_looking_combos,
                 );
-                vanishing_all_lookup_terms.extend(lookup_constraints);
             }
 
             numerator_values.extend((0..num_routed_wires).map(|j| {
@@ -524,17 +529,18 @@ pub fn check_lookup_constraints_batch<F: RichField + Extendable<D>, const D: usi
     vars: EvaluationVarsBase<F>,
     local_lookup_zs: &[F],
     next_lookup_zs: &[F],
-    lookup_selectors: &[F],
+    lookup_selectors: impl core::ops::Index<usize, Output = F>,
     deltas: &[F; 4],
     lut_re_poly_evals: &[F],
-) -> Vec<F> {
+    constraints: &mut Vec<F>,
+    current_looked_combos: &mut Vec<F>,
+    current_looking_combos: &mut Vec<F>,
+) {
     let num_lu_slots = LookupGate::num_slots(&common_data.config);
     let num_lut_slots = LookupTableGate::num_slots(&common_data.config);
     let lu_degree = common_data.quotient_degree_factor - 1;
     let num_sldc_polys = local_lookup_zs.len() - 1;
     let lut_degree = num_lut_slots.div_ceil(num_sldc_polys);
-
-    let mut constraints = Vec::with_capacity(4 + common_data.luts.len() + 2 * num_sldc_polys);
 
     // RE is the first polynomial stored.
     let z_re = local_lookup_zs[0];
@@ -545,30 +551,19 @@ pub fn check_lookup_constraints_batch<F: RichField + Extendable<D>, const D: usi
     let z_gx_lookup_sldcs = &next_lookup_zs[1..num_sldc_polys + 1];
 
     // Compute all current looked and looking combos, i.e. the combos we need for the SLDC polynomials.
-    let current_looked_combos: Vec<F> = (0..num_lut_slots)
-        .map(|s| {
-            let input_wire = vars.local_wires[LookupTableGate::wire_ith_looked_inp(s)];
-            let output_wire = vars.local_wires[LookupTableGate::wire_ith_looked_out(s)];
-            input_wire + deltas[LookupChallenges::ChallengeA as usize] * output_wire
-        })
-        .collect();
+    current_looked_combos.clear();
+    current_looked_combos.extend((0..num_lut_slots).map(|s| {
+        let input_wire = vars.local_wires[LookupTableGate::wire_ith_looked_inp(s)];
+        let output_wire = vars.local_wires[LookupTableGate::wire_ith_looked_out(s)];
+        input_wire + deltas[LookupChallenges::ChallengeA as usize] * output_wire
+    }));
 
-    let current_looking_combos: Vec<F> = (0..num_lu_slots)
-        .map(|s| {
-            let input_wire = vars.local_wires[LookupGate::wire_ith_looking_inp(s)];
-            let output_wire = vars.local_wires[LookupGate::wire_ith_looking_out(s)];
-            input_wire + deltas[LookupChallenges::ChallengeA as usize] * output_wire
-        })
-        .collect();
-
-    // Compute all current lookup combos, i.e. the combos used to check that the LUT is correct.
-    let current_lookup_combos: Vec<F> = (0..num_lut_slots)
-        .map(|s| {
-            let input_wire = vars.local_wires[LookupTableGate::wire_ith_looked_inp(s)];
-            let output_wire = vars.local_wires[LookupTableGate::wire_ith_looked_out(s)];
-            input_wire + deltas[LookupChallenges::ChallengeB as usize] * output_wire
-        })
-        .collect();
+    current_looking_combos.clear();
+    current_looking_combos.extend((0..num_lu_slots).map(|s| {
+        let input_wire = vars.local_wires[LookupGate::wire_ith_looking_inp(s)];
+        let output_wire = vars.local_wires[LookupGate::wire_ith_looking_out(s)];
+        input_wire + deltas[LookupChallenges::ChallengeA as usize] * output_wire
+    }));
 
     // Check last LDC constraint.
     constraints.push(
@@ -593,8 +588,13 @@ pub fn check_lookup_constraints_batch<F: RichField + Extendable<D>, const D: usi
 
     // Check RE row transition constraint.
     let mut cur_sum = next_z_re;
-    for elt in &current_lookup_combos {
-        cur_sum = cur_sum * deltas[LookupChallenges::ChallengeDelta as usize] + *elt;
+    for s in 0..num_lut_slots {
+        let input_wire = vars.local_wires[LookupTableGate::wire_ith_looked_inp(s)];
+        let output_wire = vars.local_wires[LookupTableGate::wire_ith_looked_out(s)];
+        let lookup_combo =
+            input_wire + deltas[LookupChallenges::ChallengeB as usize] * output_wire;
+        cur_sum =
+            cur_sum * deltas[LookupChallenges::ChallengeDelta as usize] + lookup_combo;
     }
     let unfiltered_re_line = z_re - cur_sum;
 
@@ -667,7 +667,6 @@ pub fn check_lookup_constraints_batch<F: RichField + Extendable<D>, const D: usi
         constraints
             .push(lookup_selectors[LookupSelectors::TransLdc as usize] * unfiltered_ldc_transition);
     }
-    constraints
 }
 
 /// Evaluates all gate constraints.
@@ -1149,4 +1148,47 @@ pub fn check_lookup_constraints_circuit<F: RichField + Extendable<D>, const D: u
         ));
     }
     constraints
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    #[test]
+    fn lookup_selector_strided_view_matches_materialized_reference_raw() {
+        type F = GoldilocksField;
+
+        for batch_size in 1..=32 {
+            for num_gate_selectors in 0..=9 {
+                for num_lookup_selectors in 1..=12 {
+                    let num_selectors = num_gate_selectors + num_lookup_selectors;
+                    let constants = (0..num_selectors * batch_size)
+                        .map(|i| {
+                            GoldilocksField((i as u64)
+                                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                                .wrapping_add(u64::MAX - batch_size as u64))
+                        })
+                        .collect::<Vec<_>>();
+                    for point in 0..batch_size {
+                        let all_selectors: PackedStridedView<'_, F> =
+                            PackedStridedView::new(&constants, batch_size, point);
+                        let actual = all_selectors.view(
+                            num_gate_selectors..num_gate_selectors + num_lookup_selectors,
+                        );
+                        let expected = (0..num_lookup_selectors)
+                            .map(|i| all_selectors[num_gate_selectors + i])
+                            .collect::<Vec<_>>();
+
+                        assert_eq!(actual.len(), expected.len());
+                        assert_eq!(
+                            actual.iter().map(|value| value.0).collect::<Vec<_>>(),
+                            expected.iter().map(|value| value.0).collect::<Vec<_>>(),
+                            "batch={batch_size}, gates={num_gate_selectors}, lookups={num_lookup_selectors}, point={point}",
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

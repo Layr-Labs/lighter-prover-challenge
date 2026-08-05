@@ -162,11 +162,35 @@ fn fft_classic_simd<P: PackedField>(
 /// The parameter r signifies that the first 1/2^r of the entries of
 /// input may be non-zero, but the last 1 - 1/2^r entries are
 /// definitely zero.
-pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &FftRootTable<F>) {
-    reverse_index_bits_in_place(values);
+fn reverse_index_bits_and_expand_zero_tail<T: Copy>(values: &mut [T], r: usize, lg_n: usize) {
+    if r > 0 && r <= lg_n {
+        let active_len = values.len() >> r;
+        let block_len = 1 << r;
 
+        // For every active index i, rev_lg_n(i) = rev_(lg_n-r)(i) << r because its
+        // top r bits are zero. Bit-reverse only that active prefix, then expand it
+        // backwards so no unread prefix element can be overwritten.
+        reverse_index_bits_in_place(&mut values[..active_len]);
+        for i in (0..active_len).rev() {
+            let value = values[i];
+            values[i * block_len..(i + 1) * block_len].fill(value);
+        }
+    } else {
+        // Preserve the original path for r == 0 and invalid hints.
+        reverse_index_bits_in_place(values);
+        if r > 0 {
+            let mask = !((1 << r) - 1);
+            for i in 0..values.len() {
+                values[i] = values[i & mask];
+            }
+        }
+    }
+}
+
+pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &FftRootTable<F>) {
     let n = values.len();
     let lg_n = log2_strict(n);
+    reverse_index_bits_and_expand_zero_tail(values, r, lg_n);
 
     if root_table.len() != lg_n {
         panic!(
@@ -174,21 +198,6 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
             lg_n,
             root_table.len()
         );
-    }
-
-    // After reverse_index_bits, the only non-zero elements of values
-    // are at indices i*2^r for i = 0..n/2^r.  The loop below copies
-    // the value at i*2^r to the positions [i*2^r + 1, i*2^r + 2, ...,
-    // (i+1)*2^r - 1]; i.e. it replaces the 2^r - 1 zeros following
-    // element i*2^r with the value at i*2^r.  This corresponds to the
-    // first r rounds of the FFT when there are 2^r zeros at the end
-    // of the original input.
-    if r > 0 {
-        // if r == 0 then this loop is a noop.
-        let mask = !((1 << r) - 1);
-        for i in 0..n {
-            values[i] = values[i & mask];
-        }
     }
 
     let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
@@ -205,10 +214,13 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
 mod tests {
     use alloc::vec::Vec;
 
-    use plonky2_util::{log2_ceil, log2_strict};
+    use plonky2_util::{log2_ceil, log2_strict, reverse_index_bits_in_place};
 
-    use crate::fft::{fft, fft_with_options, ifft};
+    use super::{fft_classic, fft_classic_simd, reverse_index_bits_and_expand_zero_tail};
+    use crate::fft::{fft, fft_root_table, fft_with_options, ifft, FftRootTable};
     use crate::goldilocks_field::GoldilocksField;
+    use crate::packable::Packable;
+    use crate::packed::PackedField;
     use crate::polynomial::{PolynomialCoeffs, PolynomialValues};
     use crate::types::Field;
 
@@ -245,6 +257,113 @@ mod tests {
                 fft(zero_tail.clone()),
                 fft_with_options(zero_tail, Some(r), None)
             );
+        }
+    }
+
+    fn full_bit_reversal_reference<T: Copy>(values: &mut [T], r: usize) {
+        reverse_index_bits_in_place(values);
+        if r > 0 {
+            let mask = !((1 << r) - 1);
+            for i in 0..values.len() {
+                values[i] = values[i & mask];
+            }
+        }
+    }
+
+    fn fft_classic_full_bit_reversal_reference<F: Field>(
+        values: &mut [F],
+        r: usize,
+        root_table: &FftRootTable<F>,
+    ) {
+        full_bit_reversal_reference(values, r);
+        let lg_n = log2_strict(values.len());
+        let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
+        if lg_n <= lg_packed_width {
+            fft_classic_simd::<F>(values, r, lg_n, root_table);
+        } else {
+            fft_classic_simd::<<F as Packable>::Packing>(values, r, lg_n, root_table);
+        }
+    }
+
+    fn deterministic_goldilocks_values(len: usize) -> Vec<GoldilocksField> {
+        (0..len)
+            .map(|i| {
+                GoldilocksField::from_noncanonical_u64(
+                    (i as u64)
+                        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                        .rotate_left((i % 64) as u32)
+                        .wrapping_add(0xffff_ffff_0000_0000),
+                )
+            })
+            .collect()
+    }
+
+    fn raw_goldilocks(values: &[GoldilocksField]) -> Vec<u64> {
+        values.iter().map(|value| value.0).collect()
+    }
+
+    #[test]
+    fn sparse_bit_reversal_preparation_matches_full_path_raw() {
+        type F = GoldilocksField;
+
+        for log_n in 1..=15 {
+            let len = 1 << log_n;
+            for r in 1..=log_n.min(5) {
+                let mut input = deterministic_goldilocks_values(len >> r);
+                input.resize(len, F::ZERO);
+
+                let mut expected = input.clone();
+                full_bit_reversal_reference(&mut expected, r);
+                let mut actual = input;
+                reverse_index_bits_and_expand_zero_tail(&mut actual, r, log_n);
+
+                assert_eq!(
+                    raw_goldilocks(&actual),
+                    raw_goldilocks(&expected),
+                    "prepared buffer mismatch at log_n={log_n}, r={r}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_bit_reversal_fft_matches_full_path_raw_across_shifts() {
+        type F = GoldilocksField;
+
+        let shifts = [
+            F::ZERO,
+            F::ONE,
+            F::from_canonical_u64(7),
+            F::MULTIPLICATIVE_GROUP_GENERATOR,
+            GoldilocksField(u64::MAX),
+        ];
+        for log_n in [1, 2, 5, 8, 12, 13, 14, 15] {
+            let len = 1 << log_n;
+            let root_table = fft_root_table::<F>(len);
+            for r in 1..=log_n.min(5) {
+                let active = deterministic_goldilocks_values(len >> r);
+                for shift in shifts {
+                    let mut twisted = Vec::with_capacity(len);
+                    twisted.extend(
+                        shift
+                            .powers()
+                            .zip(&active)
+                            .map(|(power, &coefficient)| power * coefficient),
+                    );
+                    twisted.resize(len, F::ZERO);
+
+                    let mut expected = twisted.clone();
+                    fft_classic_full_bit_reversal_reference(&mut expected, r, &root_table);
+                    let mut actual = twisted;
+                    fft_classic(&mut actual, r, &root_table);
+
+                    assert_eq!(
+                        raw_goldilocks(&actual),
+                        raw_goldilocks(&expected),
+                        "FFT mismatch at log_n={log_n}, r={r}, shift={shift:?}"
+                    );
+                }
+            }
         }
     }
 

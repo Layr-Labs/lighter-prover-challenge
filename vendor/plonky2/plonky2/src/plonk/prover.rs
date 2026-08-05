@@ -31,7 +31,7 @@ use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{eval_vanishing_poly_base_batch, get_lut_poly};
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
-use crate::util::partial_products::{partial_products_and_z_gx, quotient_chunk_products};
+use crate::util::partial_products::partial_products_and_z_gx;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_ceil, transpose};
 
@@ -424,12 +424,7 @@ fn wires_permutation_partial_products_and_zs<
                 })
                 .collect::<Vec<_>>();
             let denominator_invs = F::batch_multiplicative_inverse(&denominators);
-            let quotient_values = numerators
-                .zip(denominator_invs)
-                .map(|(num, den_inv)| num * den_inv)
-                .collect::<Vec<_>>();
-
-            quotient_chunk_products(&quotient_values, degree)
+            quotient_chunk_products_from_factors(numerators, denominator_invs, degree)
         })
         .collect::<Vec<_>>();
 
@@ -447,6 +442,30 @@ fn wires_permutation_partial_products_and_zs<
         .into_par_iter()
         .map(PolynomialValues::new)
         .collect()
+}
+
+fn quotient_chunk_products_from_factors<F: Field>(
+    numerators: impl ExactSizeIterator<Item = F>,
+    denominator_invs: Vec<F>,
+    max_degree: usize,
+) -> Vec<F> {
+    debug_assert!(max_degree > 1);
+    debug_assert_eq!(numerators.len(), denominator_invs.len());
+    assert!(!denominator_invs.is_empty());
+
+    let num_chunks = denominator_invs.len().div_ceil(max_degree);
+    numerators.zip(denominator_invs).enumerate().fold(
+        Vec::with_capacity(num_chunks),
+        |mut chunk_products, (i, (numerator, denominator_inv))| {
+            let quotient = numerator * denominator_inv;
+            if i % max_degree == 0 {
+                chunk_products.push(quotient);
+            } else {
+                *chunk_products.last_mut().unwrap() *= quotient;
+            }
+            chunk_products
+        },
+    )
 }
 
 /// Computes lookup polynomials for a given challenge.
@@ -694,23 +713,26 @@ fn compute_quotient_polys<
                     || (batch_i == num_batches - 1 && xs_batch.len() <= BATCH_SIZE)
             );
 
-            let indices_batch: Vec<usize> =
-                (BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + xs_batch.len()).collect();
+            let batch_len = xs_batch.len();
+            let batch_start = BATCH_SIZE * batch_i;
+            let indices_batch_storage: [usize; BATCH_SIZE] =
+                core::array::from_fn(|k| batch_start + k);
+            let indices_batch = &indices_batch_storage[..batch_len];
 
-            let mut shifted_xs_batch = Vec::with_capacity(xs_batch.len());
-            let mut local_zs_batch = Vec::with_capacity(xs_batch.len());
-            let mut next_zs_batch = Vec::with_capacity(xs_batch.len());
+            let mut shifted_xs_batch = [F::ZERO; BATCH_SIZE];
+            let mut local_zs_batch: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
+            let mut next_zs_batch: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
 
-            let mut local_lookup_batch = Vec::with_capacity(xs_batch.len());
-            let mut next_lookup_batch = Vec::with_capacity(xs_batch.len());
+            let mut local_lookup_batch: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
+            let mut next_lookup_batch: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
 
-            let mut partial_products_batch = Vec::with_capacity(xs_batch.len());
-            let mut s_sigmas_batch = Vec::with_capacity(xs_batch.len());
+            let mut partial_products_batch: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
+            let mut s_sigmas_batch: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
 
-            let mut local_constants_batch_refs = Vec::with_capacity(xs_batch.len());
-            let mut local_wires_batch_refs = Vec::with_capacity(xs_batch.len());
+            let mut local_constants_batch_refs: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
+            let mut local_wires_batch_refs: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
 
-            for (&i, &x) in indices_batch.iter().zip(xs_batch) {
+            for (k, (&i, &x)) in indices_batch.iter().zip(xs_batch).enumerate() {
                 let shifted_x = F::coset_shift() * x;
                 let i_next = (i + next_step) % lde_size;
                 let local_constants_sigmas = prover_data
@@ -737,42 +759,44 @@ fn compute_quotient_polys<
                     let next_lookup_zs = &next_zs_partial_and_lookup[common_data.lookup_range()];
                     debug_assert_eq!(local_lookup_zs.len(), common_data.num_all_lookup_polys());
 
-                    local_lookup_batch.push(local_lookup_zs);
-                    next_lookup_batch.push(next_lookup_zs);
+                    local_lookup_batch[k] = local_lookup_zs;
+                    next_lookup_batch[k] = next_lookup_zs;
                 }
 
                 debug_assert_eq!(local_wires.len(), common_data.config.num_wires);
                 debug_assert_eq!(local_zs.len(), num_challenges);
 
-                local_constants_batch_refs.push(local_constants);
-                local_wires_batch_refs.push(local_wires);
+                local_constants_batch_refs[k] = local_constants;
+                local_wires_batch_refs[k] = local_wires;
 
-                shifted_xs_batch.push(shifted_x);
-                local_zs_batch.push(local_zs);
-                next_zs_batch.push(next_zs);
-                partial_products_batch.push(partial_products);
-                s_sigmas_batch.push(s_sigmas);
+                shifted_xs_batch[k] = shifted_x;
+                local_zs_batch[k] = local_zs;
+                next_zs_batch[k] = next_zs;
+                partial_products_batch[k] = partial_products;
+                s_sigmas_batch[k] = s_sigmas;
             }
 
             // NB (JN): I'm not sure how (in)efficient the below is. It needs measuring.
-            let mut local_constants_batch =
-                vec![F::ZERO; xs_batch.len() * local_constants_batch_refs[0].len()];
+            let local_constants_batch_len = batch_len * local_constants_batch_refs[0].len();
+            let local_wires_batch_len = batch_len * local_wires_batch_refs[0].len();
+            let mut local_values_batch =
+                vec![F::ZERO; local_constants_batch_len + local_wires_batch_len];
+            let (local_constants_batch, local_wires_batch) =
+                local_values_batch.split_at_mut(local_constants_batch_len);
             for i in 0..local_constants_batch_refs[0].len() {
-                for (j, constants) in local_constants_batch_refs.iter().enumerate() {
-                    local_constants_batch[i * xs_batch.len() + j] = constants[i];
+                for (j, constants) in local_constants_batch_refs[..batch_len].iter().enumerate() {
+                    local_constants_batch[i * batch_len + j] = constants[i];
                 }
             }
 
-            let mut local_wires_batch =
-                vec![F::ZERO; xs_batch.len() * local_wires_batch_refs[0].len()];
             for i in 0..local_wires_batch_refs[0].len() {
-                for (j, wires) in local_wires_batch_refs.iter().enumerate() {
-                    local_wires_batch[i * xs_batch.len() + j] = wires[i];
+                for (j, wires) in local_wires_batch_refs[..batch_len].iter().enumerate() {
+                    local_wires_batch[i * batch_len + j] = wires[i];
                 }
             }
 
             let vars_batch = EvaluationVarsBaseBatch::new(
-                xs_batch.len(),
+                batch_len,
                 &local_constants_batch,
                 &local_wires_batch,
                 public_inputs_hash,
@@ -780,15 +804,23 @@ fn compute_quotient_polys<
 
             let mut quotient_values_batch = eval_vanishing_poly_base_batch::<F, D>(
                 common_data,
-                &indices_batch,
-                &shifted_xs_batch,
+                indices_batch,
+                &shifted_xs_batch[..batch_len],
                 vars_batch,
-                &local_zs_batch,
-                &next_zs_batch,
-                &local_lookup_batch,
-                &next_lookup_batch,
-                &partial_products_batch,
-                &s_sigmas_batch,
+                &local_zs_batch[..batch_len],
+                &next_zs_batch[..batch_len],
+                if has_lookup {
+                    &local_lookup_batch[..batch_len]
+                } else {
+                    &[]
+                },
+                if has_lookup {
+                    &next_lookup_batch[..batch_len]
+                } else {
+                    &[]
+                },
+                &partial_products_batch[..batch_len],
+                &s_sigmas_batch[..batch_len],
                 betas,
                 gammas,
                 deltas,
@@ -823,4 +855,80 @@ fn compute_quotient_polys<
         })
         .map(|values| values.coset_ifft(F::coset_shift()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quotient_chunk_products_from_factors;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    fn raw_values(len: usize, salt: u64) -> Vec<GoldilocksField> {
+        (0..len)
+            .map(|i| {
+                GoldilocksField(
+                    (i as u64)
+                        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                        .wrapping_add(salt),
+                )
+            })
+            .collect()
+    }
+
+    fn reference_chunk_products(
+        numerators: &[GoldilocksField],
+        denominator_invs: &[GoldilocksField],
+        max_degree: usize,
+    ) -> Vec<GoldilocksField> {
+        numerators
+            .iter()
+            .copied()
+            .zip(denominator_invs.iter().copied())
+            .map(|(numerator, denominator_inv)| numerator * denominator_inv)
+            .collect::<Vec<_>>()
+            .chunks(max_degree)
+            .map(|chunk| chunk.iter().copied().product())
+            .collect()
+    }
+
+    #[test]
+    fn quotient_chunk_products_fold_matches_materialized_reference_raw() {
+        for max_degree in 2..=9 {
+            for len in 1..=40 {
+                let numerators = raw_values(len, u64::MAX - len as u64);
+                let denominator_invs = raw_values(len, 0xffff_ffff_0000_0001 ^ max_degree as u64);
+                let expected =
+                    reference_chunk_products(&numerators, &denominator_invs, max_degree);
+                let actual = quotient_chunk_products_from_factors(
+                    numerators.iter().copied(),
+                    denominator_invs,
+                    max_degree,
+                );
+
+                assert_eq!(
+                    actual.iter().map(|value| value.0).collect::<Vec<_>>(),
+                    expected.iter().map(|value| value.0).collect::<Vec<_>>(),
+                    "len={len}, max_degree={max_degree}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quotient_chunk_products_fold_preserves_non_divisible_tail() {
+        for (len, max_degree) in [(3, 2), (7, 3), (17, 4), (31, 8), (40, 9)] {
+            assert_ne!(len % max_degree, 0);
+            let numerators = raw_values(len, 0x1234_5678_9abc_def0);
+            let denominator_invs = raw_values(len, 0xfedc_ba98_7654_3210);
+            let expected =
+                reference_chunk_products(&numerators, &denominator_invs, max_degree);
+            let actual = quotient_chunk_products_from_factors(
+                numerators.iter().copied(),
+                denominator_invs,
+                max_degree,
+            );
+
+            assert_eq!(actual.len(), len.div_ceil(max_degree));
+            assert_eq!(actual.last().unwrap().0, expected.last().unwrap().0);
+        }
+    }
 }
