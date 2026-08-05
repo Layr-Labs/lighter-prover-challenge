@@ -283,12 +283,39 @@ impl<F: Field> PolynomialCoeffs<F> {
         zero_factor: Option<usize>,
         root_table: Option<&FftRootTable<F>>,
     ) -> PolynomialValues<F> {
-        let modified_poly: Self = shift
-            .powers()
-            .zip(&self.coeffs)
-            .map(|(r, &c)| r * c)
-            .collect::<Vec<_>>()
-            .into();
+        let modified_coeffs = match zero_factor {
+            None | Some(0) => shift
+                .powers()
+                .zip(&self.coeffs)
+                .map(|(power, &coefficient)| power * coefficient)
+                .collect(),
+            Some(r) if r <= self.log_len() => {
+                let active_len = self.len() >> r;
+                debug_assert!(self.coeffs[active_len..].iter().all(F::is_zero));
+
+                // `zero_factor` guarantees that the remaining coefficients are zero. Avoid both
+                // advancing the serial power chain and multiplying those known-zero coefficients.
+                // Keeping the original iterator over the active prefix preserves its arithmetic
+                // order and non-canonical representations exactly.
+                let mut coeffs = Vec::with_capacity(self.len());
+                coeffs.extend(
+                    shift
+                        .powers()
+                        .zip(&self.coeffs[..active_len])
+                        .map(|(power, &coefficient)| power * coefficient),
+                );
+                coeffs.resize(self.len(), F::ZERO);
+                coeffs
+            }
+            // Preserve the old behavior for an invalid hint instead of making this optimization
+            // add a new failure mode. `fft_with_options` remains responsible for interpreting it.
+            Some(_) => shift
+                .powers()
+                .zip(&self.coeffs)
+                .map(|(power, &coefficient)| power * coefficient)
+                .collect(),
+        };
+        let modified_poly: Self = modified_coeffs.into();
         modified_poly.fft_with_options(zero_factor, root_table)
     }
 
@@ -492,6 +519,145 @@ mod tests {
 
         let ifft_coeffs = PolynomialValues::new(coset_evals).coset_ifft(shift);
         assert_eq!(poly, ifft_coeffs);
+    }
+
+    fn reference_coset_fft_with_options(
+        poly: &PolynomialCoeffs<GoldilocksField>,
+        shift: GoldilocksField,
+        zero_factor: Option<usize>,
+        root_table: Option<&FftRootTable<GoldilocksField>>,
+    ) -> PolynomialValues<GoldilocksField> {
+        let modified_poly = PolynomialCoeffs::new(
+            shift
+                .powers()
+                .zip(&poly.coeffs)
+                .map(|(power, &coefficient)| power * coefficient)
+                .collect(),
+        );
+        modified_poly.fft_with_options(zero_factor, root_table)
+    }
+
+    fn assert_raw_goldilocks_eq(
+        actual: &PolynomialValues<GoldilocksField>,
+        expected: &PolynomialValues<GoldilocksField>,
+    ) {
+        assert_eq!(
+            actual.values.iter().map(|value| value.0).collect::<Vec<_>>(),
+            expected
+                .values
+                .iter()
+                .map(|value| value.0)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn deterministic_coefficients(len: usize) -> Vec<GoldilocksField> {
+        (0..len)
+            .map(|i| {
+                GoldilocksField::from_noncanonical_u64(
+                    (i as u64)
+                        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                        .rotate_left((i % 64) as u32)
+                        .wrapping_add(0xffff_ffff_0000_0000),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn coset_fft_sparse_twist_matches_full_twist_raw_representations() {
+        type F = GoldilocksField;
+
+        let shifts = [
+            F::ZERO,
+            F::ONE,
+            F::from_canonical_u64(7),
+            F::coset_shift(),
+            F::MULTIPLICATIVE_GROUP_GENERATOR,
+        ];
+        for log_len in 0..=10 {
+            let len = 1 << log_len;
+            let root_table = crate::fft::fft_root_table(len);
+            for r in 0..=log_len.min(5) {
+                let active_len = len >> r;
+                let mut coefficients = deterministic_coefficients(active_len);
+                coefficients.resize(len, F::ZERO);
+                let poly = PolynomialCoeffs::new(coefficients);
+
+                for shift in shifts {
+                    for roots in [None, Some(&root_table)] {
+                        let actual = poly.coset_fft_with_options(shift, Some(r), roots);
+                        let expected =
+                            reference_coset_fft_with_options(&poly, shift, Some(r), roots);
+                        assert_raw_goldilocks_eq(&actual, &expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coset_fft_zero_factor_three_matches_full_twist_at_ranked_rate() {
+        type F = GoldilocksField;
+
+        const RATE_BITS: usize = 3;
+        let len = 1 << 12;
+        let mut coefficients = deterministic_coefficients(len >> RATE_BITS);
+        coefficients.resize(len, F::ZERO);
+        let poly = PolynomialCoeffs::new(coefficients);
+        let shift = F::coset_shift();
+
+        let actual = poly.coset_fft_with_options(shift, Some(RATE_BITS), None);
+        let expected = reference_coset_fft_with_options(&poly, shift, Some(RATE_BITS), None);
+        assert_raw_goldilocks_eq(&actual, &expected);
+    }
+
+    #[test]
+    fn coset_fft_none_and_zero_factor_zero_keep_full_twist_behavior() {
+        type F = GoldilocksField;
+
+        let poly = PolynomialCoeffs::new(deterministic_coefficients(256));
+        for shift in [
+            F::ZERO,
+            F::ONE,
+            F::from_canonical_u64(7),
+            GoldilocksField(u64::MAX),
+        ] {
+            for zero_factor in [None, Some(0)] {
+                let actual = poly.coset_fft_with_options(shift, zero_factor, None);
+                let expected =
+                    reference_coset_fft_with_options(&poly, shift, zero_factor, None);
+                assert_raw_goldilocks_eq(&actual, &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn coset_fft_accepts_maximum_zero_factor() {
+        type F = GoldilocksField;
+
+        let mut coefficients = vec![F::from_canonical_u64(11)];
+        coefficients.resize(64, F::ZERO);
+        let poly = PolynomialCoeffs::new(coefficients);
+        let actual = poly.coset_fft_with_options(F::from_canonical_u64(7), Some(6), None);
+        let expected = reference_coset_fft_with_options(
+            &poly,
+            F::from_canonical_u64(7),
+            Some(6),
+            None,
+        );
+        assert_raw_goldilocks_eq(&actual, &expected);
+    }
+
+    #[test]
+    fn coset_fft_preserves_old_behavior_for_invalid_zero_factor_hint() {
+        type F = GoldilocksField;
+
+        let poly = PolynomialCoeffs::new(deterministic_coefficients(64));
+        let shift = F::from_canonical_u64(7);
+        let actual = poly.coset_fft_with_options(shift, Some(7), None);
+        let expected = reference_coset_fft_with_options(&poly, shift, Some(7), None);
+        assert_raw_goldilocks_eq(&actual, &expected);
     }
 
     #[test]
