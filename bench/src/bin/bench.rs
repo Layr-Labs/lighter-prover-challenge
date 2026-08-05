@@ -171,7 +171,7 @@ fn main() {
             created_at,
             state_metadata_hash: state_metadata.hash(),
             old_jump: if is_light { light_jump } else { heavy_jump },
-            txs: tx.to_vec(),
+            txs: tx,
         };
 
         let tx_dt = Instant::now();

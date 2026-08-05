@@ -7,7 +7,6 @@ use circuit::block_pre_execution_constraints::{
 };
 use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, BlockTxChainTarget, Circuit as _};
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _};
-use circuit::builder::custom::cyclic_base_proof;
 use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
 use plonky2::plonk::circuit_data::CircuitData;
@@ -40,35 +39,71 @@ pub struct Circuits {
     pub block_data: CircuitData<F, C, D>,
     pub dummy_heavy_chain_circuit: CircuitData<F, C, D>,
     pub dummy_light_chain_circuit: CircuitData<F, C, D>,
-    pub dummy_heavy_proof: Proof,
-    pub dummy_light_proof: Proof,
 }
 
 impl Circuits {
     pub fn new() -> Self {
-        let heavy_tx =
-            BlockTxCircuit::define(CIRCUIT_CONFIG, HEAVY_TX_PER_PROOF, CHAIN_ID, HEAVY_TX_MODE);
-        let heavy_tx_target = heavy_tx.target;
-        let heavy_tx_data = heavy_tx.builder.build::<C>();
+        let (heavy, light, pre) = std::thread::scope(|scope| {
+            let heavy = scope.spawn(|| {
+                let circuit = BlockTxCircuit::define(
+                    CIRCUIT_CONFIG,
+                    HEAVY_TX_PER_PROOF,
+                    CHAIN_ID,
+                    HEAVY_TX_MODE,
+                );
+                (circuit.target, circuit.builder.build::<C>())
+            });
+            let light = scope.spawn(|| {
+                let circuit = BlockTxCircuit::define(
+                    CIRCUIT_CONFIG,
+                    LIGHT_TX_PER_PROOF,
+                    CHAIN_ID,
+                    LIGHT_TX_MODE,
+                );
+                (circuit.target, circuit.builder.build::<C>())
+            });
+            let pre = scope.spawn(|| {
+                let circuit = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
+                (circuit.target, circuit.builder.build::<C>())
+            });
+            (
+                heavy
+                    .join()
+                    .expect("heavy transaction circuit build failed"),
+                light
+                    .join()
+                    .expect("light transaction circuit build failed"),
+                pre.join().expect("pre-execution circuit build failed"),
+            )
+        });
+        let (heavy_tx_target, heavy_tx_data) = heavy;
+        let (light_tx_target, light_tx_data) = light;
+        let (pre_target, pre_data) = pre;
 
-        let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
-        let pre_target = pre.target;
-        let pre_data = pre.builder.build::<C>();
-
-        let light_tx =
-            BlockTxCircuit::define(CIRCUIT_CONFIG, LIGHT_TX_PER_PROOF, CHAIN_ID, LIGHT_TX_MODE);
-        let light_tx_target = light_tx.target;
-        let light_tx_data = light_tx.builder.build::<C>();
-
-        let heavy_chain =
-            BlockTxChainCircuit::define(CIRCUIT_CONFIG, &heavy_tx_data, ON_CHAIN_OPERATIONS_LIMIT);
-        let heavy_chain_target = heavy_chain.target;
-        let heavy_chain_data = heavy_chain.builder.build::<C>();
-
-        let light_chain =
-            BlockTxChainCircuit::define(CIRCUIT_CONFIG, &light_tx_data, ON_CHAIN_OPERATIONS_LIMIT);
-        let light_chain_target = light_chain.target;
-        let light_chain_data = light_chain.builder.build::<C>();
+        let (heavy_chain, light_chain) = std::thread::scope(|scope| {
+            let heavy = scope.spawn(|| {
+                let circuit = BlockTxChainCircuit::define(
+                    CIRCUIT_CONFIG,
+                    &heavy_tx_data,
+                    ON_CHAIN_OPERATIONS_LIMIT,
+                );
+                (circuit.target, circuit.builder.build::<C>())
+            });
+            let light = scope.spawn(|| {
+                let circuit = BlockTxChainCircuit::define(
+                    CIRCUIT_CONFIG,
+                    &light_tx_data,
+                    ON_CHAIN_OPERATIONS_LIMIT,
+                );
+                (circuit.target, circuit.builder.build::<C>())
+            });
+            (
+                heavy.join().expect("heavy chain circuit build failed"),
+                light.join().expect("light chain circuit build failed"),
+            )
+        });
+        let (heavy_chain_target, heavy_chain_data) = heavy_chain;
+        let (light_chain_target, light_chain_data) = light_chain;
 
         let block = BlockCircuit::define(
             CIRCUIT_CONFIG,
@@ -80,22 +115,14 @@ impl Circuits {
         let block_target = block.target;
         let block_data = block.builder.build::<C>();
 
-        let dummy_heavy_chain_circuit = dummy_circuit(&heavy_chain_data.common);
-        let dummy_light_chain_circuit = dummy_circuit(&light_chain_data.common);
-        let dummy_heavy_proof = cyclic_base_proof(
-            &heavy_chain_data.common,
-            &heavy_chain_data.verifier_only,
-            &dummy_heavy_chain_circuit,
-            [].into_iter().collect(),
-        )
-        .expect("cannot construct heavy chain dummy proof");
-        let dummy_light_proof = cyclic_base_proof(
-            &light_chain_data.common,
-            &light_chain_data.verifier_only,
-            &dummy_light_chain_circuit,
-            [].into_iter().collect(),
-        )
-        .expect("cannot construct light chain dummy proof");
+        let (dummy_heavy_chain_circuit, dummy_light_chain_circuit) = std::thread::scope(|scope| {
+            let heavy = scope.spawn(|| dummy_circuit(&heavy_chain_data.common));
+            let light = scope.spawn(|| dummy_circuit(&light_chain_data.common));
+            (
+                heavy.join().expect("heavy dummy circuit build failed"),
+                light.join().expect("light dummy circuit build failed"),
+            )
+        });
 
         Self {
             heavy_tx_target,
@@ -112,8 +139,6 @@ impl Circuits {
             block_data,
             dummy_heavy_chain_circuit,
             dummy_light_chain_circuit,
-            dummy_heavy_proof,
-            dummy_light_proof,
         }
     }
 }
