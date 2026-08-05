@@ -134,8 +134,8 @@ impl<F: Field> PolynomialCoeffs<F> {
 
 #[cfg(test)]
 mod tests {
-    use rand::rngs::OsRng;
     use rand::Rng;
+    use rand::rngs::OsRng;
 
     use crate::extension::quartic::QuarticExtension;
     use crate::goldilocks_field::GoldilocksField;
