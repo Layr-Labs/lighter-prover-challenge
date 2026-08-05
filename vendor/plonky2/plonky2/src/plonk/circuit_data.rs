@@ -371,6 +371,11 @@ pub struct ProverOnlyCircuitData<
     /// Generator indices (within the `Vec` above), indexed by the representative of each target
     /// they watch.
     pub generator_indices_by_watches: BTreeMap<usize, Vec<usize>>,
+    /// Number of distinct representative targets watched by each generator.
+    ///
+    /// This is derived from `generator_indices_by_watches` when circuit data is built or
+    /// deserialized, so it does not change the serialized prover-data format.
+    pub generator_watch_counts: Vec<usize>,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.

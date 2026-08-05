@@ -845,6 +845,12 @@ pub trait Read {
             let k = self.read_usize()?;
             generator_indices_by_watches.insert(k, self.read_usize_vec()?);
         }
+        let mut generator_watch_counts = vec![0usize; generators.len()];
+        for indices in generator_indices_by_watches.values() {
+            for &generator_idx in indices {
+                generator_watch_counts[generator_idx] += 1;
+            }
+        }
 
         let constants_sigmas_commitment = self.read_polynomial_batch()?;
         let sigmas_len = self.read_usize()?;
@@ -896,6 +902,7 @@ pub trait Read {
         Ok(ProverOnlyCircuitData {
             generators,
             generator_indices_by_watches,
+            generator_watch_counts,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
@@ -1848,6 +1855,7 @@ pub trait Write {
         let ProverOnlyCircuitData {
             generators,
             generator_indices_by_watches,
+            generator_watch_counts: _,
             constants_sigmas_commitment,
             sigmas,
             subgroup,

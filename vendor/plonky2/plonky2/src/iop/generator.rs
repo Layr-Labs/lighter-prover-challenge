@@ -43,8 +43,19 @@ pub fn generate_partial_witness<
         &prover_data.representative_map,
     );
 
+    // These totals are derived once while circuit data is built (and reconstructed when prover
+    // data is deserialized). Starting from them avoids rescanning every watcher edge for every
+    // proof; only representatives first populated by the partial witness need to be subtracted.
+    let mut unresolved_watches = prover_data.generator_watch_counts.clone();
     for (t, v) in inputs.target_values.into_iter() {
-        witness.set_target(t, v)?;
+        if let Some(watch) = witness.set_target_returning_rep(t, v)? {
+            if let Some(watchers) = generator_indices_by_watches.get(&watch) {
+                for &generator_idx in watchers {
+                    debug_assert_ne!(unresolved_watches[generator_idx], 0);
+                    unresolved_watches[generator_idx] -= 1;
+                }
+            }
+        }
     }
 
     // Build a list of "pending" generators which are queued to be run. Initially, all generators
@@ -66,7 +77,11 @@ pub fn generate_partial_witness<
                 continue;
             }
 
-            let finished = generators[generator_idx].0.run(&witness, &mut buffer);
+            let finished = generators[generator_idx].0.run_with_ready_hint(
+                &witness,
+                &mut buffer,
+                unresolved_watches[generator_idx] == 0,
+            );
             if finished {
                 generator_is_expired[generator_idx] = true;
                 remaining_generators -= 1;
@@ -86,6 +101,8 @@ pub fn generate_partial_witness<
                 if let Some(watchers) = opt_watchers {
                     for &watching_generator_idx in watchers {
                         if !generator_is_expired[watching_generator_idx] {
+                            debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
+                            unresolved_watches[watching_generator_idx] -= 1;
                             next_pending_generator_indices.push(watching_generator_idx);
                         }
                     }
@@ -117,6 +134,21 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
     /// flag is true, the generator will never be run again, otherwise it will be queued for another
     /// run next time a target in its watch list is populated.
     fn run(&self, witness: &PartitionWitness<F>, out_buffer: &mut GeneratedValues<F>) -> bool;
+
+    /// Scheduler entry point carrying a hint that every watched representative is populated.
+    ///
+    /// General generators may produce values before all watches are populated, so the default
+    /// implementation preserves their existing [`Self::run`] behavior. Generators which require
+    /// every watch can override this to avoid rediscovering readiness.
+    #[doc(hidden)]
+    fn run_with_ready_hint(
+        &self,
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+        _all_watches_populated: bool,
+    ) -> bool {
+        self.run(witness, out_buffer)
+    }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()>;
 
@@ -260,6 +292,15 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
         } else {
             false
         }
+    }
+
+    fn run_with_ready_hint(
+        &self,
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+        all_watches_populated: bool,
+    ) -> bool {
+        all_watches_populated && self.inner.run_once(witness, out_buffer).is_ok()
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
@@ -439,5 +480,219 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D> for Con
             wire_index,
             constant,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+    use crate::util::serialization::{DefaultGateSerializer, DefaultGeneratorSerializer};
+
+    const D: usize = 2;
+    type F = GoldilocksField;
+    type C = PoseidonGoldilocksConfig;
+
+    #[derive(Debug)]
+    struct CountingSimpleGenerator {
+        dependencies: Vec<Target>,
+        output: Target,
+        dependency_calls: Arc<AtomicUsize>,
+        run_calls: Arc<AtomicUsize>,
+    }
+
+    impl SimpleGenerator<F, D> for CountingSimpleGenerator {
+        fn id(&self) -> String {
+            "CountingSimpleGenerator".to_string()
+        }
+
+        fn dependencies(&self) -> Vec<Target> {
+            self.dependency_calls.fetch_add(1, Ordering::Relaxed);
+            self.dependencies.clone()
+        }
+
+        fn run_once(
+            &self,
+            witness: &PartitionWitness<F>,
+            out_buffer: &mut GeneratedValues<F>,
+        ) -> Result<()> {
+            self.run_calls.fetch_add(1, Ordering::Relaxed);
+            let value = self
+                .dependencies
+                .iter()
+                .map(|&target| witness.get_target(target))
+                .sum();
+            out_buffer.set_target(self.output, value)
+        }
+
+        fn serialize(
+            &self,
+            _dst: &mut Vec<u8>,
+            _common_data: &CommonCircuitData<F, D>,
+        ) -> IoResult<()> {
+            unreachable!("test generator is never serialized")
+        }
+
+        fn deserialize(
+            _src: &mut Buffer,
+            _common_data: &CommonCircuitData<F, D>,
+        ) -> IoResult<Self> {
+            unreachable!("test generator is never deserialized")
+        }
+    }
+
+    #[derive(Debug)]
+    struct IncrementalGenerator {
+        trigger: Target,
+        early_output: Target,
+        final_output: Target,
+        run_calls: Arc<AtomicUsize>,
+    }
+
+    impl WitnessGenerator<F, D> for IncrementalGenerator {
+        fn id(&self) -> String {
+            "IncrementalGenerator".to_string()
+        }
+
+        fn watch_list(&self) -> Vec<Target> {
+            vec![self.trigger]
+        }
+
+        fn run(&self, witness: &PartitionWitness<F>, out_buffer: &mut GeneratedValues<F>) -> bool {
+            self.run_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(value) = witness.try_get_target(self.trigger) {
+                out_buffer.set_target(self.final_output, value).unwrap();
+                true
+            } else {
+                out_buffer
+                    .set_target(self.early_output, F::from_canonical_u64(7))
+                    .unwrap();
+                false
+            }
+        }
+
+        fn serialize(
+            &self,
+            _dst: &mut Vec<u8>,
+            _common_data: &CommonCircuitData<F, D>,
+        ) -> IoResult<()> {
+            unreachable!("test generator is never serialized")
+        }
+
+        fn deserialize(
+            _src: &mut Buffer,
+            _common_data: &CommonCircuitData<F, D>,
+        ) -> IoResult<Self> {
+            unreachable!("test generator is never deserialized")
+        }
+    }
+
+    #[test]
+    fn simple_generator_uses_representative_readiness_without_rescanning_dependencies() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let initial = builder.add_virtual_target();
+        let first = builder.constant(F::from_canonical_u64(3));
+        let first_alias = builder.add_virtual_target();
+        builder.connect(first, first_alias);
+        let second = builder.add_virtual_target();
+        let output = builder.add_virtual_target();
+        let dependency_calls = Arc::new(AtomicUsize::new(0));
+        let run_calls = Arc::new(AtomicUsize::new(0));
+
+        builder.add_simple_generator(CountingSimpleGenerator {
+            dependencies: vec![initial, initial, first, first_alias, second, second],
+            output,
+            dependency_calls: Arc::clone(&dependency_calls),
+            run_calls: Arc::clone(&run_calls),
+        });
+        builder.generate_copy(first, second);
+        builder.register_public_input(output);
+
+        let circuit = builder.build::<C>();
+        let dependency_calls_after_build = dependency_calls.load(Ordering::Relaxed);
+        let mut inputs = PartialWitness::new();
+        inputs
+            .set_target(initial, F::from_canonical_u64(5))
+            .unwrap();
+        let witness =
+            generate_partial_witness(inputs, &circuit.prover_only, &circuit.common).unwrap();
+
+        assert_eq!(witness.get_target(output), F::from_canonical_u64(22));
+        assert_eq!(run_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            dependency_calls.load(Ordering::Relaxed),
+            dependency_calls_after_build
+        );
+    }
+
+    #[test]
+    fn readiness_hint_preserves_incremental_witness_generator_fallback() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let trigger = builder.constant(F::from_canonical_u64(11));
+        let early_output = builder.add_virtual_target();
+        let final_output = builder.add_virtual_target();
+        let run_calls = Arc::new(AtomicUsize::new(0));
+
+        builder.add_generators(vec![WitnessGeneratorRef::new(IncrementalGenerator {
+            trigger,
+            early_output,
+            final_output,
+            run_calls: Arc::clone(&run_calls),
+        })]);
+        builder.register_public_inputs(&[early_output, final_output]);
+
+        let circuit = builder.build::<C>();
+        let witness =
+            generate_partial_witness(PartialWitness::new(), &circuit.prover_only, &circuit.common)
+                .unwrap();
+
+        assert_eq!(witness.get_target(early_output), F::from_canonical_u64(7));
+        assert_eq!(witness.get_target(final_output), F::from_canonical_u64(11));
+        assert_eq!(run_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn derived_generator_watch_counts_round_trip_without_changing_serialized_bytes() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let input = builder.add_virtual_target();
+        let output = builder.add_virtual_target();
+        builder.generate_copy(input, output);
+        builder.register_public_input(output);
+
+        let circuit = builder.build::<C>();
+        let expected_counts = circuit.prover_only.generator_watch_counts.clone();
+        let gate_serializer = DefaultGateSerializer;
+        let generator_serializer = DefaultGeneratorSerializer::<C, D>::default();
+        let bytes = circuit
+            .to_bytes(&gate_serializer, &generator_serializer)
+            .unwrap();
+        let restored = CircuitData::<F, C, D>::from_bytes(
+            &bytes,
+            &gate_serializer,
+            &generator_serializer,
+        )
+        .unwrap();
+
+        assert_eq!(restored.prover_only.generator_watch_counts, expected_counts);
+        assert_eq!(
+            restored
+                .to_bytes(&gate_serializer, &generator_serializer)
+                .unwrap(),
+            bytes
+        );
+
+        let mut inputs = PartialWitness::new();
+        inputs
+            .set_target(input, F::from_canonical_u64(19))
+            .unwrap();
+        let witness =
+            generate_partial_witness(inputs, &restored.prover_only, &restored.common).unwrap();
+        assert_eq!(witness.get_target(output), F::from_canonical_u64(19));
     }
 }
