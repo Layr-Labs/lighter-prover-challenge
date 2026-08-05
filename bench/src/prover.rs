@@ -28,6 +28,10 @@ enum TxPath {
     Light,
 }
 
+const LIGHT_TX_PROOF_WINDOW: usize = 2;
+// Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
+const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
+
 fn chunk_is_light(txs: &[Tx<F>]) -> bool {
     txs.first()
         .expect("block transaction chunk must not be empty")
@@ -213,6 +217,7 @@ fn prove_path(
         let base = &base_proof;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
+        let mut in_flight = std::collections::VecDeque::new();
         let mut current_step = 0u64;
 
         loop {
@@ -261,10 +266,22 @@ fn prove_path(
                 (chunk_index, witness)
             });
 
-            let tx_proof = proof_handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            pending_tx = Some((current_step, tx_proof));
+            in_flight.push_back((current_step, proof_handle));
+            let max_in_flight =
+                if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
+                    LIGHT_TX_PROOF_WINDOW
+                } else {
+                    1
+                };
+            if in_flight.len() >= max_in_flight {
+                let (proof_step, proof_handle) = in_flight
+                    .pop_front()
+                    .expect("transaction proof window must not be empty");
+                let tx_proof = proof_handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                pending_tx = Some((proof_step, tx_proof));
+            }
             current_step += 1;
 
             match next_witness {
@@ -277,6 +294,29 @@ fn prove_path(
         }
 
         if let Some((chain_step, tx_proof)) = pending_tx.take() {
+            let previous_proof = chain.take().map(ChainState::wait);
+            let handle = std::thread::Builder::new()
+                .name(format!("{path:?}-chain-step-{chain_step}"))
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    chain_step_proof(
+                        path,
+                        chain_target,
+                        chain_data,
+                        chain_step,
+                        previous_proof.as_ref(),
+                        base,
+                        dummy_proof,
+                        &tx_proof,
+                    )
+                })
+                .expect("chain step pipeline thread must start");
+            chain = Some(ChainState::InFlight(handle));
+        }
+        while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
+            let tx_proof = proof_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             let previous_proof = chain.take().map(ChainState::wait);
             chain = Some(ChainState::Ready(chain_step_proof(
                 path,
