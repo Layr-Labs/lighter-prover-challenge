@@ -19,7 +19,9 @@ use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
 use plonky2::plonk::plonk_common::{reduce_with_powers, reduce_with_powers_ext_circuit};
-use plonky2::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBase};
+use plonky2::plonk::vars::{
+    EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch,
+};
 use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
 
 use crate::builder::Builder;
@@ -294,6 +296,59 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
         }
 
         constraints
+    }
+
+    fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
+        let n = vars_base.len();
+        let wires = vars_base.local_wires;
+        let num_aux = self.aux_limbs_per_input();
+        let base = F::from_canonical_usize(Self::BASE);
+        let three = F::from_canonical_usize(3);
+        let mut res = vec![F::ZERO; n * self.num_constraints()];
+        let mut chunks = res.chunks_exact_mut(n);
+
+        for i in 0..self.num_ops {
+            let input = &wires[self.wire_ith_input(i) * n..][..n];
+            let top = self.wire_ith_input_jth_aux_limb(i, num_aux - 1);
+
+            // computed_sum - input, with the sum accumulated per point by
+            // Horner over the limb columns from most to least significant.
+            let out = chunks.next().unwrap();
+            out.copy_from_slice(&wires[top * n..][..n]);
+            for j in (0..num_aux - 1).rev() {
+                let limb = &wires[self.wire_ith_input_jth_aux_limb(i, j) * n..][..n];
+                for p in 0..n {
+                    out[p] = out[p] * base + limb[p];
+                }
+            }
+            for p in 0..n {
+                out[p] -= input[p];
+            }
+
+            // Range products. For a full base-4 limb,
+            // x(x-1)(x-2)(x-3) = y(y+2) with y = x(x-3); for a half-range
+            // final limb (odd bit size), x(x-1).
+            for j in 0..num_aux {
+                let limb = &wires[self.wire_ith_input_jth_aux_limb(i, j) * n..][..n];
+                let half_range = j == num_aux - 1 && self.bit_size % 2 == 1;
+                let out = chunks.next().unwrap();
+                if half_range {
+                    debug_assert_eq!(Self::BASE / 2, 2);
+                    for p in 0..n {
+                        let x = limb[p];
+                        out[p] = x * (x - F::ONE);
+                    }
+                } else {
+                    debug_assert_eq!(Self::BASE, 4);
+                    for p in 0..n {
+                        let x = limb[p];
+                        let y = x * (x - three);
+                        out[p] = y * (y + F::TWO);
+                    }
+                }
+            }
+        }
+        res
     }
 
     fn eval_unfiltered_base_one(
@@ -592,4 +647,61 @@ mod tests {
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
         26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48
     );
+
+    // `test_eval_fns` only checks a batch of one point, which cannot catch
+    // column-indexing mistakes in the batched evaluation. Compare the batched
+    // path against per-point `eval_unfiltered` across a multi-point batch.
+    #[test]
+    fn base_batch_matches_eval_unfiltered_across_batch() {
+        use plonky2::field::extension::FieldExtension;
+        use plonky2::hash::hash_types::HashOut;
+        use plonky2::plonk::vars::EvaluationVarsBaseBatch;
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+
+        let mut rng = rand::thread_rng();
+        for bit_size in [15, 16, 32, 48] {
+            let gate = RangeCheckGate::<F, D>::new_from_config(
+                &CircuitConfig::standard_recursion_config(),
+                bit_size,
+            );
+            let n = 32;
+            let num_wires = gate.num_wires();
+            // Column-major wires: wire w for point p at [w * n + p].
+            let wires_batch: Vec<F> = (0..num_wires * n)
+                .map(|_| F::from_canonical_u64(rng.gen_range(0..GoldilocksField::ORDER)))
+                .collect();
+            let public_inputs_hash = HashOut::<F>::ZERO;
+            let vars_batch =
+                EvaluationVarsBaseBatch::new(n, &[], &wires_batch, &public_inputs_hash);
+            let batch_out = gate.eval_unfiltered_base_batch(vars_batch);
+            assert_eq!(batch_out.len(), n * gate.num_constraints());
+
+            for p in 0..n {
+                let wires_one: Vec<<F as Extendable<D>>::Extension> = (0..num_wires)
+                    .map(|w| {
+                        <<F as Extendable<D>>::Extension as FieldExtension<D>>::from_basefield(
+                            wires_batch[w * n + p],
+                        )
+                    })
+                    .collect();
+                let vars_one = EvaluationVars::<F, D> {
+                    local_constants: &[],
+                    local_wires: &wires_one,
+                    public_inputs_hash: &public_inputs_hash,
+                };
+                let expected = gate.eval_unfiltered(vars_one);
+                for (j, expected_j) in expected.iter().enumerate() {
+                    assert_eq!(
+                        <<F as Extendable<D>>::Extension as FieldExtension<D>>::from_basefield(
+                            batch_out[j * n + p]
+                        ),
+                        *expected_j,
+                        "bit_size {bit_size}, point {p}, constraint {j}"
+                    );
+                }
+            }
+        }
+    }
 }
