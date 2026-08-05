@@ -1046,7 +1046,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
                 .iter()
                 .filter(|inst| inst.gate_ref == gate)
                 .count();
-            debug!("- {} instances of {}", count, gate.0.id());
+            debug!("- {} instances of {}", count, gate.id());
         }
     }
 
@@ -1192,7 +1192,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let quotient_degree_factor = self.config.max_quotient_degree_factor;
         let mut gates = self.gates.iter().cloned().collect::<Vec<_>>();
         // Gates need to be sorted by their degrees (and ID to make the ordering deterministic) to compute the selector polynomials.
-        gates.sort_unstable_by_key(|g| (g.0.degree(), g.0.id()));
+        gates.sort_unstable_by(|a, b| {
+            a.0.degree()
+                .cmp(&b.0.degree())
+                .then_with(|| a.id().cmp(b.id()))
+        });
         let (mut constant_vecs, selectors_info) =
             selector_polynomials(&gates, &self.gate_instances, quotient_degree_factor + 1);
 

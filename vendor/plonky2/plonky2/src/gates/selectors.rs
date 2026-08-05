@@ -119,7 +119,7 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     let num_gates = gates.len();
     let max_gate_degree = gates.last().expect("No gates?").0.degree();
 
-    let index = |id| gates.iter().position(|g| g.0.id() == id).unwrap();
+    let index = |id| gates.iter().position(|g| g.id() == id).unwrap();
 
     // Special case if we can use only one selector polynomial.
     if max_gate_degree + num_gates - 1 <= max_degree {
@@ -130,7 +130,7 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
             vec![PolynomialValues::new(
                 instances
                     .iter()
-                    .map(|g| F::from_canonical_usize(index(g.gate_ref.0.id())))
+                    .map(|g| F::from_canonical_usize(index(g.gate_ref.id())))
                     .collect(),
             )],
             SelectorsInfo {
@@ -143,7 +143,7 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     if max_gate_degree >= max_degree {
         panic!(
             "{} has too high degree. Consider increasing `quotient_degree_factor`.",
-            gates.last().unwrap().0.id()
+            gates.last().unwrap().id()
         );
     }
 
@@ -170,7 +170,7 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     let mut polynomials = vec![PolynomialValues::zero(n); groups.len()];
     for (j, g) in instances.iter().enumerate() {
         let GateInstance { gate_ref, .. } = g;
-        let i = index(gate_ref.0.id());
+        let i = index(gate_ref.id());
         let gr = group(i);
         for g in 0..groups.len() {
             polynomials[g].values[j] = if g == gr {
