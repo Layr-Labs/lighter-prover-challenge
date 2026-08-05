@@ -43,59 +43,124 @@ pub struct Circuits {
     pub dummy_heavy_proof: Proof,
     pub dummy_light_proof: Proof,
 }
+const CIRCUIT_BUILD_STACK_BYTES: usize = 32 * 1024 * 1024;
+
+fn join_circuit_builds<Left, Right, LeftFn, RightFn>(left: LeftFn, right: RightFn) -> (Left, Right)
+where
+    Left: Send,
+    Right: Send,
+    LeftFn: FnOnce() -> Left,
+    RightFn: FnOnce() -> Right + Send,
+{
+    std::thread::scope(|scope| {
+        let right = std::thread::Builder::new()
+            .stack_size(CIRCUIT_BUILD_STACK_BYTES)
+            .spawn_scoped(scope, right)
+            .expect("cannot spawn parallel circuit build");
+        let left = left();
+        let right = right.join().expect("parallel circuit build panicked");
+        (left, right)
+    })
+}
 
 impl Circuits {
     pub fn new() -> Self {
-        let heavy_tx =
-            BlockTxCircuit::define(CIRCUIT_CONFIG, HEAVY_TX_PER_PROOF, CHAIN_ID, HEAVY_TX_MODE);
-        let heavy_tx_target = heavy_tx.target;
-        let heavy_tx_data = heavy_tx.builder.build::<C>();
-
-        let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
-        let pre_target = pre.target;
-        let pre_data = pre.builder.build::<C>();
-
-        let light_tx =
-            BlockTxCircuit::define(CIRCUIT_CONFIG, LIGHT_TX_PER_PROOF, CHAIN_ID, LIGHT_TX_MODE);
-        let light_tx_target = light_tx.target;
-        let light_tx_data = light_tx.builder.build::<C>();
-
-        let heavy_chain =
-            BlockTxChainCircuit::define(CIRCUIT_CONFIG, &heavy_tx_data, ON_CHAIN_OPERATIONS_LIMIT);
-        let heavy_chain_target = heavy_chain.target;
-        let heavy_chain_data = heavy_chain.builder.build::<C>();
-
-        let light_chain =
-            BlockTxChainCircuit::define(CIRCUIT_CONFIG, &light_tx_data, ON_CHAIN_OPERATIONS_LIMIT);
-        let light_chain_target = light_chain.target;
-        let light_chain_data = light_chain.builder.build::<C>();
-
-        let block = BlockCircuit::define(
-            CIRCUIT_CONFIG,
-            &pre_data,
-            &light_chain_data,
-            &heavy_chain_data,
-            ON_CHAIN_OPERATIONS_LIMIT,
+        let (
+            (heavy_tx_target, heavy_tx_data),
+            ((pre_target, pre_data), (light_tx_target, light_tx_data)),
+        ) = join_circuit_builds(
+            || {
+                let circuit = BlockTxCircuit::define(
+                    CIRCUIT_CONFIG,
+                    HEAVY_TX_PER_PROOF,
+                    CHAIN_ID,
+                    HEAVY_TX_MODE,
+                );
+                (circuit.target, circuit.builder.build::<C>())
+            },
+            || {
+                join_circuit_builds(
+                    || {
+                        let circuit = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
+                        (circuit.target, circuit.builder.build::<C>())
+                    },
+                    || {
+                        let circuit = BlockTxCircuit::define(
+                            CIRCUIT_CONFIG,
+                            LIGHT_TX_PER_PROOF,
+                            CHAIN_ID,
+                            LIGHT_TX_MODE,
+                        );
+                        (circuit.target, circuit.builder.build::<C>())
+                    },
+                )
+            },
         );
-        let block_target = block.target;
-        let block_data = block.builder.build::<C>();
 
-        let dummy_heavy_chain_circuit = dummy_circuit(&heavy_chain_data.common);
-        let dummy_light_chain_circuit = dummy_circuit(&light_chain_data.common);
-        let dummy_heavy_proof = cyclic_base_proof(
-            &heavy_chain_data.common,
-            &heavy_chain_data.verifier_only,
-            &dummy_heavy_chain_circuit,
-            [].into_iter().collect(),
-        )
-        .expect("cannot construct heavy chain dummy proof");
-        let dummy_light_proof = cyclic_base_proof(
-            &light_chain_data.common,
-            &light_chain_data.verifier_only,
-            &dummy_light_chain_circuit,
-            [].into_iter().collect(),
-        )
-        .expect("cannot construct light chain dummy proof");
+        let ((heavy_chain_target, heavy_chain_data), (light_chain_target, light_chain_data)) =
+            join_circuit_builds(
+                || {
+                    let circuit = BlockTxChainCircuit::define(
+                        CIRCUIT_CONFIG,
+                        &heavy_tx_data,
+                        ON_CHAIN_OPERATIONS_LIMIT,
+                    );
+                    (circuit.target, circuit.builder.build::<C>())
+                },
+                || {
+                    let circuit = BlockTxChainCircuit::define(
+                        CIRCUIT_CONFIG,
+                        &light_tx_data,
+                        ON_CHAIN_OPERATIONS_LIMIT,
+                    );
+                    (circuit.target, circuit.builder.build::<C>())
+                },
+            );
+
+        let (
+            (block_target, block_data),
+            (
+                (dummy_heavy_chain_circuit, dummy_heavy_proof),
+                (dummy_light_chain_circuit, dummy_light_proof),
+            ),
+        ) = join_circuit_builds(
+            || {
+                let circuit = BlockCircuit::define(
+                    CIRCUIT_CONFIG,
+                    &pre_data,
+                    &light_chain_data,
+                    &heavy_chain_data,
+                    ON_CHAIN_OPERATIONS_LIMIT,
+                );
+                (circuit.target, circuit.builder.build::<C>())
+            },
+            || {
+                join_circuit_builds(
+                    || {
+                        let circuit = dummy_circuit(&heavy_chain_data.common);
+                        let proof = cyclic_base_proof(
+                            &heavy_chain_data.common,
+                            &heavy_chain_data.verifier_only,
+                            &circuit,
+                            [].into_iter().collect(),
+                        )
+                        .expect("cannot construct heavy chain dummy proof");
+                        (circuit, proof)
+                    },
+                    || {
+                        let circuit = dummy_circuit(&light_chain_data.common);
+                        let proof = cyclic_base_proof(
+                            &light_chain_data.common,
+                            &light_chain_data.verifier_only,
+                            &circuit,
+                            [].into_iter().collect(),
+                        )
+                        .expect("cannot construct light chain dummy proof");
+                        (circuit, proof)
+                    },
+                )
+            },
+        );
 
         Self {
             heavy_tx_target,
