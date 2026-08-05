@@ -31,7 +31,7 @@ use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{eval_vanishing_poly_base_batch, get_lut_poly};
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
-use crate::util::partial_products::{partial_products_and_z_gx, quotient_chunk_products};
+use crate::util::partial_products::partial_products_and_z_gx;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_ceil, transpose};
 
@@ -424,12 +424,20 @@ fn wires_permutation_partial_products_and_zs<
                 })
                 .collect::<Vec<_>>();
             let denominator_invs = F::batch_multiplicative_inverse(&denominators);
-            let quotient_values = numerators
-                .zip(denominator_invs)
-                .map(|(num, den_inv)| num * den_inv)
-                .collect::<Vec<_>>();
-
-            quotient_chunk_products(&quotient_values, degree)
+            let mut chunk_products = Vec::with_capacity(num_prods + 1);
+            let mut chunk_product = F::ONE;
+            for (j, (numerator, denominator_inv)) in numerators.zip(denominator_invs).enumerate() {
+                chunk_product *= numerator * denominator_inv;
+                if (j + 1) % degree == 0 {
+                    chunk_products.push(chunk_product);
+                    chunk_product = F::ONE;
+                }
+            }
+            if common_data.config.num_routed_wires % degree != 0 {
+                chunk_products.push(chunk_product);
+            }
+            debug_assert_eq!(chunk_products.len(), num_prods + 1);
+            chunk_products
         })
         .collect::<Vec<_>>();
 
@@ -694,8 +702,9 @@ fn compute_quotient_polys<
                     || (batch_i == num_batches - 1 && xs_batch.len() <= BATCH_SIZE)
             );
 
-            let indices_batch: Vec<usize> =
-                (BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + xs_batch.len()).collect();
+            let indices_storage: [usize; BATCH_SIZE] =
+                core::array::from_fn(|offset| BATCH_SIZE * batch_i + offset);
+            let indices_batch = &indices_storage[..xs_batch.len()];
 
             let mut shifted_xs_batch = Vec::with_capacity(xs_batch.len());
             let mut local_zs_batch = Vec::with_capacity(xs_batch.len());
@@ -780,7 +789,7 @@ fn compute_quotient_polys<
 
             let mut quotient_values_batch = eval_vanishing_poly_base_batch::<F, D>(
                 common_data,
-                &indices_batch,
+                indices_batch,
                 &shifted_xs_batch,
                 vars_batch,
                 &local_zs_batch,
