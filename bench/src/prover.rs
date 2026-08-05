@@ -336,29 +336,39 @@ fn prove_path(
 }
 
 pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
-    let pre_proof = BlockPreExecutionCircuit::prove(
-        &circuits.pre_data,
-        &BlockPreExec::from_block(&block),
-        &circuits.pre_target,
-    )
-    .expect("block pre-execution proof failed");
-    let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
-    let state_metadata_hash = pre_output.new_state_metadata.hash();
+    // Open the scoped region before pre-execution so the deferred final block
+    // circuit build overlaps the pre-execution proof as well as both tx paths.
+    // The block circuit depends only on immutable Circuits chain/pre data, not
+    // on the pre-execution proof bytes.
+    std::thread::scope(|scope| {
+        let block_circuit_handle = std::thread::Builder::new()
+            .name("block-circuit-build".into())
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, || circuits.build_block_circuit())
+            .expect("block circuit build thread must start");
 
-    let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
-    let mut heavy_chunks: Vec<(usize, Vec<Tx<F>>)> = Vec::new();
-    let mut light_chunks: Vec<(usize, Vec<Tx<F>>)> = Vec::with_capacity(tx_chunks.len());
-    for (chunk_index, txs) in tx_chunks.drain(..).enumerate() {
-        if chunk_is_light(&txs) {
-            light_chunks.push((chunk_index, txs));
-        } else {
-            heavy_chunks.push((chunk_index, txs));
+        let pre_proof = BlockPreExecutionCircuit::prove(
+            &circuits.pre_data,
+            &BlockPreExec::from_block(&block),
+            &circuits.pre_target,
+        )
+        .expect("block pre-execution proof failed");
+        let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
+        let state_metadata_hash = pre_output.new_state_metadata.hash();
+
+        let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
+        let mut heavy_chunks: Vec<(usize, Vec<Tx<F>>)> = Vec::new();
+        let mut light_chunks: Vec<(usize, Vec<Tx<F>>)> = Vec::with_capacity(tx_chunks.len());
+        for (chunk_index, txs) in tx_chunks.drain(..).enumerate() {
+            if chunk_is_light(&txs) {
+                light_chunks.push((chunk_index, txs));
+            } else {
+                heavy_chunks.push((chunk_index, txs));
+            }
         }
-    }
-    block.tx_chunks = tx_chunks;
-    block.tx_chunks.push(Vec::new());
+        block.tx_chunks = tx_chunks;
+        block.tx_chunks.push(Vec::new());
 
-    let (light_chain_proof, heavy_chain_proof) = std::thread::scope(|scope| {
         let heavy_handle = std::thread::Builder::new()
             .name("heavy-tx-chain".into())
             .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -388,20 +398,22 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
         let heavy_chain_proof = heavy_handle
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        (light_chain_proof, heavy_chain_proof)
-    });
+        let (block_target, block_data) = block_circuit_handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 
-    let (light_chain_input, heavy_chain_input) =
-        final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
-    BlockCircuit::prove(
-        &circuits.block_target,
-        &circuits.block_data,
-        &block,
-        &pre_proof,
-        light_chain_input,
-        heavy_chain_input,
-    )
-    .expect("final block proof failed")
+        let (light_chain_input, heavy_chain_input) =
+            final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
+        BlockCircuit::prove(
+            &block_target,
+            &block_data,
+            &block,
+            &pre_proof,
+            light_chain_input,
+            heavy_chain_input,
+        )
+        .expect("final block proof failed")
+    })
 }
 
 #[cfg(test)]
