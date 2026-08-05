@@ -38,7 +38,6 @@ pub struct Circuits {
     pub dummy_heavy_proof: Proof,
     pub dummy_light_proof: Proof,
 }
-
 struct PathCircuits {
     tx_target: BlockTxTarget,
     tx_data: CircuitData<F, C, D>,
@@ -90,6 +89,7 @@ impl Circuits {
                 )
             },
         );
+
         Self {
             heavy_tx_target: heavy.tx_target,
             heavy_tx_data: heavy.tx_data,
@@ -106,9 +106,6 @@ impl Circuits {
         }
     }
 
-    /// Builds the final block circuit, which depends on the pre-execution and
-    /// both chain circuits but is only needed for the final proof. Callers run
-    /// this concurrently with transaction/chain proving.
     pub fn build_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
         let block = BlockCircuit::define(
             CIRCUIT_CONFIG,

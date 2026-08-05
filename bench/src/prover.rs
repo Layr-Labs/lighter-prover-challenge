@@ -360,10 +360,7 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
 
     let (light_chain_proof, heavy_chain_proof, block_target, block_data) =
         std::thread::scope(|scope| {
-            // The final block circuit depends only on already-built circuit data
-            // and is not needed until the final proof, so it builds concurrently
-            // with the entire transaction/chain proving pipeline.
-            let block_circuit_handle = std::thread::Builder::new()
+            let block_build_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, || circuits.build_block_circuit())
@@ -397,7 +394,7 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
             let heavy_chain_proof = heavy_handle
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            let (block_target, block_data) = block_circuit_handle
+            let (block_target, block_data) = block_build_handle
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             (
