@@ -141,8 +141,21 @@ kernel void poseidon2_hash_leaves(
     ulong state[12] = { 0 };
     for (uint offset = 0; offset < leaf_width; offset += 8) {
         uint chunk_size = min(8u, leaf_width - offset);
-        for (uint i = 0; i < chunk_size; ++i) {
-            state[i] = gl_canonicalize(input[offset + i]);
+        // Absorb with a compile-time trip count so every index into `state` is a
+        // constant. A runtime bound here makes the compiler give up on keeping
+        // the array in registers and spill it to thread-local memory, which is
+        // why this kernel ran ~30% slower per permutation than the parent kernel
+        // (which already absorbs with a constant bound of 8).
+        //
+        // Elements at or past chunk_size must retain the previous permutation's
+        // output rather than being zeroed, so the store is predicated. The load
+        // index is clamped so the unconditional load never runs off the buffer;
+        // leaf_width > 4 here, so leaf_width - 1 is in range.
+        for (uint i = 0; i < 8; ++i) {
+            ulong value = gl_canonicalize(input[min(offset + i, leaf_width - 1)]);
+            if (i < chunk_size) {
+                state[i] = value;
+            }
         }
         poseidon2(state, parameters);
     }
