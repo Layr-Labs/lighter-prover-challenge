@@ -138,74 +138,6 @@ fn fft_classic_simd<P: PackedField>(
 }
 
 #[inline(always)]
-fn fft_classic_simd_single_layer<P: PackedField>(
-    packed_values: &mut [P],
-    lg_half_m: usize,
-    lg_packed_width: usize,
-    root_table: &FftRootTable<P::Scalar>,
-) {
-    let lg_m = lg_half_m + 1;
-    let m = 1 << lg_m; // Subarray size (in field elements).
-    let packed_m = m >> lg_packed_width; // Subarray size (in vectors).
-    let half_packed_m = packed_m / 2;
-    debug_assert!(half_packed_m != 0);
-
-    // Omega values for this iteration, as a slice of vectors.
-    let omega_table = P::pack_slice(&root_table[lg_half_m]);
-    for k in (0..packed_values.len()).step_by(packed_m) {
-        for j in 0..half_packed_m {
-            let omega = omega_table[j];
-            let t = omega * packed_values[k + half_packed_m + j];
-            let u = packed_values[k + j];
-            packed_values[k + j] = u + t;
-            packed_values[k + half_packed_m + j] = u - t;
-        }
-    }
-}
-
-/// Two consecutive stages fused into one radix-4-style traversal: the exact
-/// same butterflies with the exact same `root_table` twiddles, but each
-/// quarter-block element is loaded and stored once per stage *pair* instead
-/// of once per stage, halving whole-array memory passes for these layers.
-#[inline(always)]
-fn fft_classic_simd_fused_two_layers<P: PackedField>(
-    packed_values: &mut [P],
-    lg_half_m: usize,
-    lg_packed_width: usize,
-    root_table: &FftRootTable<P::Scalar>,
-) {
-    // Quarter size in vectors for the size-2^(lg_half_m + 2) fused block.
-    let q = (1usize << lg_half_m) >> lg_packed_width;
-    debug_assert!(q != 0);
-    let stage1_omegas = P::pack_slice(&root_table[lg_half_m]);
-    let stage2_omegas = P::pack_slice(&root_table[lg_half_m + 1]);
-
-    for k in (0..packed_values.len()).step_by(4 * q) {
-        for j in 0..q {
-            let w1 = stage1_omegas[j];
-            let a = packed_values[k + j];
-            let b = packed_values[k + q + j];
-            let c = packed_values[k + 2 * q + j];
-            let d = packed_values[k + 3 * q + j];
-
-            // First stage: butterflies within [a,b] and within [c,d].
-            let t = w1 * b;
-            let (ab0, ab1) = (a + t, a - t);
-            let t = w1 * d;
-            let (cd0, cd1) = (c + t, c - t);
-
-            // Second stage: butterflies pairing positions j and j + 2q.
-            let t = stage2_omegas[j] * cd0;
-            packed_values[k + j] = ab0 + t;
-            packed_values[k + 2 * q + j] = ab0 - t;
-            let t = stage2_omegas[q + j] * cd1;
-            packed_values[k + q + j] = ab1 + t;
-            packed_values[k + 3 * q + j] = ab1 - t;
-        }
-    }
-}
-
-#[inline(always)]
 fn fft_classic_simd_layers<P: PackedField>(
     packed_values: &mut [P],
     start: usize,
@@ -213,20 +145,24 @@ fn fft_classic_simd_layers<P: PackedField>(
     root_table: &FftRootTable<P::Scalar>,
 ) {
     let lg_packed_width = log2_strict(P::WIDTH);
-    let mut lg_half_m = start;
-    // Odd stage count: run the first stage unfused so the remainder pairs up.
-    if (end - start) % 2 == 1 {
-        fft_classic_simd_single_layer(packed_values, lg_half_m, lg_packed_width, root_table);
-        lg_half_m += 1;
-    }
-    while lg_half_m < end {
-        fft_classic_simd_fused_two_layers(
-            packed_values,
-            lg_half_m,
-            lg_packed_width,
-            root_table,
-        );
-        lg_half_m += 2;
+    for lg_half_m in start..end {
+        let lg_m = lg_half_m + 1;
+        let m = 1 << lg_m; // Subarray size (in field elements).
+        let packed_m = m >> lg_packed_width; // Subarray size (in vectors).
+        let half_packed_m = packed_m / 2;
+        debug_assert!(half_packed_m != 0);
+
+        // Omega values for this iteration, as a slice of vectors.
+        let omega_table = P::pack_slice(&root_table[lg_half_m]);
+        for k in (0..packed_values.len()).step_by(packed_m) {
+            for j in 0..half_packed_m {
+                let omega = omega_table[j];
+                let t = omega * packed_values[k + half_packed_m + j];
+                let u = packed_values[k + j];
+                packed_values[k + j] = u + t;
+                packed_values[k + half_packed_m + j] = u - t;
+            }
+        }
     }
 }
 

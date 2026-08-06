@@ -21,7 +21,11 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// (6654d43) ranked-validated this raised value inside its composition; my
 /// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
 /// window and is treated as contaminated evidence.
-const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
+// Measured CPU/GPU crossover on M-series (cap_height 4, equal-output check):
+// the GPU path wins ~2x from ~262k permutations and is at parity by ~131k
+// (e.g. 2^17-leaf width-8 trees: CPU 14.9 ms vs GPU 7.8 ms). The previous
+// 1 << 19 gate left every tree below 524k permutations on the CPU.
+const MIN_GPU_PERMUTATIONS: usize = 1 << 17;
 /// Upper bound on concurrently in-flight GPU tree builds. One set serializes
 /// GPU tree builds exactly like the promoted base's global context mutex: a
 /// 3-set experiment measured 13-18% faster locally but scored -21.6% on the
