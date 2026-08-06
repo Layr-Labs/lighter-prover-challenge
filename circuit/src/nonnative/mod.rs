@@ -30,6 +30,7 @@ use crate::uint::u32::gadgets::arithmetic_u32::{CircuitBuilderU32, U32Target};
 use crate::uint::u32::serialization::{ReadU32, WriteU32};
 use crate::uint::u32::witness::GeneratedValuesU32;
 use crate::utils::ceil_div_usize;
+pub mod limbs;
 pub mod split_nonnative;
 
 #[derive(Clone, Debug, Default)]
@@ -665,6 +666,24 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
+        // Allocation-free fast path for the fixed secp256k1 moduli; computes
+        // the same integers as the BigUint path below (bit-identical witness).
+        if let Some(m) = limbs::fixed_modulus_for_field::<FF>() {
+            if let (Some(a), Some(b)) = (
+                limbs::try_read_u256(witness, &self.a.value),
+                limbs::try_read_u256(witness, &self.b.value),
+            ) {
+                let out = limbs::add_generator_math(m, &a, &b);
+                limbs::set_limb_digits_target(
+                    out_buffer,
+                    &self.sum.value,
+                    &limbs::u256_digits(&out.sum),
+                )?;
+                out_buffer.set_bool_target(self.overflow, out.overflow)?;
+                return Ok(());
+            }
+        }
+
         let a = FF::from_noncanonical_biguint(witness.get_biguint_target(self.a.value.clone()));
         let b = FF::from_noncanonical_biguint(witness.get_biguint_target(self.b.value.clone()));
         let a_biguint = a.to_canonical_biguint();
@@ -898,6 +917,23 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
+        // Allocation-free fast path for the fixed secp256k1 moduli.
+        if let Some(m) = limbs::fixed_modulus_for_field::<FF>() {
+            if let (Some(a), Some(b)) = (
+                limbs::try_read_u256(witness, &self.a.value),
+                limbs::try_read_u256(witness, &self.b.value),
+            ) {
+                let out = limbs::sub_generator_math(m, &a, &b);
+                limbs::set_limb_digits_target(
+                    out_buffer,
+                    &self.diff.value,
+                    &limbs::u256_digits(&out.diff),
+                )?;
+                out_buffer.set_bool_target(self.overflow, out.overflow)?;
+                return Ok(());
+            }
+        }
+
         let a = FF::from_noncanonical_biguint(witness.get_biguint_target(self.a.value.clone()));
         let b = FF::from_noncanonical_biguint(witness.get_biguint_target(self.b.value.clone()));
         let a_biguint = a.to_canonical_biguint();
@@ -1016,6 +1052,27 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
+        // Allocation-free fast path for the fixed secp256k1 moduli.
+        if let Some(m) = limbs::fixed_modulus_for_field::<FF>() {
+            if let (Some(a), Some(b)) = (
+                limbs::try_read_u256(witness, &self.a.value),
+                limbs::try_read_u256(witness, &self.b.value),
+            ) {
+                let out = limbs::mul_generator_math(m, &a, &b);
+                limbs::set_limb_digits_target(
+                    out_buffer,
+                    &self.prod.value,
+                    &limbs::u256_digits(&out.prod),
+                )?;
+                limbs::set_limb_digits_target(
+                    out_buffer,
+                    &self.overflow,
+                    &limbs::u256_digits(&out.overflow),
+                )?;
+                return Ok(());
+            }
+        }
+
         let a = FF::from_noncanonical_biguint(witness.get_biguint_target(self.a.value.clone()));
         let b = FF::from_noncanonical_biguint(witness.get_biguint_target(self.b.value.clone()));
         let a_biguint = a.to_canonical_biguint();
@@ -1146,6 +1203,33 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
+        // Allocation-free fast path for the fixed secp256k1 moduli.
+        if let Some(m) = limbs::fixed_modulus_for_field::<FF>() {
+            if let (Some(a), Some(b), Some(d)) = (
+                limbs::try_read_u256(witness, &self.a.value),
+                limbs::try_read_u256(witness, &self.b.value),
+                limbs::try_read_u256(witness, &self.d.value),
+            ) {
+                let Some(out) = limbs::mul_div_generator_math(m, &a, &b, &d) else {
+                    return Err(anyhow::anyhow!(
+                        "Division by zero in NonNativeMulDivGenerator"
+                    ));
+                };
+                limbs::set_limb_digits_target(
+                    out_buffer,
+                    &self.result.value,
+                    &limbs::u256_digits(&out.result),
+                )?;
+                limbs::set_limb_digits_target(
+                    out_buffer,
+                    &self.overflow,
+                    &limbs::u256_digits(&out.overflow),
+                )?;
+                out_buffer.set_bool_target(self.add_to_lhs, out.add_to_lhs)?;
+                return Ok(());
+            }
+        }
+
         let a = FF::from_noncanonical_biguint(witness.get_biguint_target(self.a.value.clone()));
         let b = FF::from_noncanonical_biguint(witness.get_biguint_target(self.b.value.clone()));
         let d = FF::from_noncanonical_biguint(witness.get_biguint_target(self.d.value.clone()));
@@ -1306,6 +1390,35 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
+        // Allocation-free fast path for the fixed secp256k1 moduli. Replaces
+        // the Fermat-exponentiation inverse (hundreds of BigUint modmuls per
+        // run) with a stack-limb binary extended Euclid computing the same
+        // unique inverse.
+        if let Some(m) = limbs::fixed_modulus_for_field::<FF>() {
+            if let Some(x) = limbs::try_read_u256(witness, &self.x.value) {
+                match limbs::inverse_generator_math(m, &x) {
+                    None => {
+                        let zero = limbs::u256_digits(&[0u64; 4]);
+                        limbs::set_limb_digits_target(out_buffer, &self.div, &zero)?;
+                        limbs::set_limb_digits_target(out_buffer, &self.inv, &zero)?;
+                    }
+                    Some(out) => {
+                        limbs::set_limb_digits_target(
+                            out_buffer,
+                            &self.div,
+                            &limbs::u256_digits(&out.div),
+                        )?;
+                        limbs::set_limb_digits_target(
+                            out_buffer,
+                            &self.inv,
+                            &limbs::u256_digits(&out.inv),
+                        )?;
+                    }
+                }
+                return Ok(());
+            }
+        }
+
         let x = FF::from_noncanonical_biguint(witness.get_biguint_target(self.x.value.clone()));
         let inv = x.try_inverse();
         if inv.is_none() {
@@ -1412,6 +1525,37 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
+        // Allocation-free fast path for the fixed secp256k1 moduli (this is
+        // the slope computation of every curve add/double in scalar muls).
+        if let Some(m) = limbs::fixed_modulus_for_field::<FF>() {
+            if let (Some(a), Some(b)) = (
+                limbs::try_read_u256(witness, &self.a.value),
+                limbs::try_read_u256(witness, &self.b.value),
+            ) {
+                match limbs::division_generator_math(m, &a, &b) {
+                    None => {
+                        let zero = limbs::u256_digits(&[0u64; 4]);
+                        limbs::set_limb_digits_target(out_buffer, &self.div.value, &zero)?;
+                        limbs::set_limb_digits_target(out_buffer, &self.overflow, &zero)?;
+                    }
+                    Some(out) => {
+                        out_buffer.set_bool_target(self.add_to_a, out.add_to_a)?;
+                        limbs::set_limb_digits_target(
+                            out_buffer,
+                            &self.div.value,
+                            &limbs::u256_digits(&out.div),
+                        )?;
+                        limbs::set_limb_digits_target(
+                            out_buffer,
+                            &self.overflow,
+                            &limbs::u256_digits(&out.overflow),
+                        )?;
+                    }
+                }
+                return Ok(());
+            }
+        }
+
         let b = witness.get_biguint_target(self.b.value.clone());
         let b_inv = FF::from_noncanonical_biguint(b.clone()).try_inverse();
         if b_inv.is_none() {
