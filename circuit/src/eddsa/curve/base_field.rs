@@ -29,13 +29,32 @@ impl Legendre<F> for QuinticExtension<F> {
         let xr_ext = *self * frob1_times_frob2 * frob2_frob1_times_frob2;
         let xr: F = <QuinticExtension<F> as FieldExtension<5>>::to_basefield_array(&xr_ext)[0];
 
-        let xr_31 = xr.exp_power_of_2(31);
-        let xr_63 = xr_31.exp_power_of_2(32);
-
-        // only way `xr_31` can be zero is if `xr` is zero, in which case `self` is zero, in which case we want to return zero.
-        let xr_31_inv_or_zero = xr_31.inverse_or_zero();
-        xr_63 * xr_31_inv_or_zero
+        goldilocks_legendre(xr)
     }
+}
+
+/// Evaluates the Goldilocks quadratic character `xr^((p - 1) / 2)` for
+/// `p = 2^64 - 2^32 + 1` with a direct fixed addition chain.
+///
+/// For nonzero `xr`, the previous tail `xr^(2^63) * inverse(xr^(2^31))` equals
+/// `xr^(2^63 - 2^31) = xr^((p - 1) / 2)`; zero maps to zero under both
+/// formulas. Since `(p - 1) / 2 = (2^32 - 1) * 2^31`, the chain first builds
+/// `xr^(2^32 - 1)` and then performs 31 final squarings: 62 squarings plus 8
+/// multiplies in total, with no inversion, replacing 125 squarings, 9
+/// multiplies, and a full Fermat inversion chain.
+#[inline]
+pub(crate) fn goldilocks_legendre(xr: F) -> F {
+    // tK denotes xr^(2^K - 1).
+    let t2 = xr.square() * xr;
+    let t3 = t2.square() * xr;
+    let t6 = t3.exp_power_of_2(3) * t3;
+    let t12 = t6.exp_power_of_2(6) * t6;
+    let t24 = t12.exp_power_of_2(12) * t12;
+    let t30 = t24.exp_power_of_2(6) * t6;
+    let t31 = t30.square() * xr;
+    let t32 = t31.square() * xr;
+    // xr^((2^32 - 1) * 2^31) = xr^((p - 1) / 2).
+    t32.exp_power_of_2(31)
 }
 
 pub trait SquareRoot: Sized {
@@ -129,11 +148,88 @@ pub(crate) fn sqrt_quintic_ext_goldilocks(x: QuinticExtension<F>) -> Option<Quin
 
 #[cfg(test)]
 mod tests {
-    use plonky2::field::types::Sample;
+    use plonky2::field::types::{Field64, PrimeField64, Sample};
     use rand::thread_rng;
 
     use super::*;
     use crate::eddsa::curve::test_utils::gfp5_random_non_square;
+
+    /// The exact pre-optimization Legendre tail: `xr^(2^63) * inverse(xr^(2^31))`,
+    /// kept as the reference for the differential test below.
+    fn legacy_goldilocks_legendre(xr: F) -> F {
+        let xr_31 = xr.exp_power_of_2(31);
+        let xr_63 = xr_31.exp_power_of_2(32);
+
+        // only way `xr_31` can be zero is if `xr` is zero, in which case `self` is zero, in which case we want to return zero.
+        let xr_31_inv_or_zero = xr_31.inverse_or_zero();
+        xr_63 * xr_31_inv_or_zero
+    }
+
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    #[test]
+    fn test_goldilocks_legendre_chain_matches_legacy_expression() {
+        let check = |raw: u64| {
+            let xr = F::from_noncanonical_u64(raw);
+            let expected = legacy_goldilocks_legendre(xr);
+            let got = goldilocks_legendre(xr);
+            assert_eq!(
+                got.to_canonical_u64(),
+                expected.to_canonical_u64(),
+                "canonical mismatch for raw input {raw:#x}"
+            );
+            if xr.to_canonical_u64() != 0 {
+                // Raw (pre-canonicalization) u64 equality for every nonzero
+                // input. For a *noncanonical encoding of zero* (raw >= ORDER)
+                // the legacy tail returns the literal `F::ZERO` constant (raw
+                // 0) via `inverse_or_zero`, while the chain propagates
+                // `reduce128`'s noncanonical zero (raw ORDER): the identical
+                // field value under this field's canonical `PartialEq`, which
+                // is all any `legendre()` consumer compares. Canonical
+                // equality is asserted above for those inputs.
+                assert_eq!(got.0, expected.0, "raw u64 mismatch for raw input {raw:#x}");
+            }
+        };
+
+        // Edge inputs, including every interesting boundary around the modulus
+        // and the u64 range.
+        for raw in [
+            0,
+            1,
+            2,
+            3,
+            (1u64 << 31) - 1,
+            1u64 << 31,
+            (1u64 << 32) - 1,
+            1u64 << 32,
+            (1u64 << 32) + 1,
+            (1u64 << 63) - 1,
+            1u64 << 63,
+            F::ORDER - 2,
+            F::ORDER - 1,
+        ] {
+            check(raw);
+        }
+
+        // Noncanonical representations: every raw value in [ORDER, u64::MAX]
+        // encodes a small field element noncanonically.
+        for k in 0..1_000u64 {
+            check(F::ORDER + k);
+            check(u64::MAX - k);
+        }
+
+        // 10,000 deterministic full-width u64 inputs.
+        let mut state = 0x0123_4567_89AB_CDEFu64;
+        for _ in 0..10_000 {
+            check(splitmix64(&mut state));
+        }
+    }
 
     #[test]
     fn test_legendre() {

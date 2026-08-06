@@ -8,6 +8,7 @@ use plonky2_maybe_rayon::*;
 
 use crate::field::extension::{unflatten, Extendable, FieldExtension};
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
+use crate::fri::oracle::coset_fft_zero_tail;
 use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQueryStep};
 use crate::fri::{FriConfig, FriParams};
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
@@ -135,8 +136,13 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // Chunk-wise folding preserves the zero tail: the coefficient vector
         // keeps `1/2^rate_bits` support every round (asserted by the
         // truncation below), so the FFT's zero-run shortcut always applies.
-        values = coeffs.coset_fft_with_options(
+        // The coefficients from `live_chunks` on are the zeros the `resize`
+        // above just wrote, and `shift^i * 0 == 0`, so the coset scaling is
+        // dead work over that tail: scale only the folded prefix.
+        values = coset_fft_zero_tail(
+            &coeffs,
             shift.into(),
+            live_chunks,
             Some(fri_params.config.rate_bits),
             None,
         )
