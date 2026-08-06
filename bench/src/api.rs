@@ -39,16 +39,16 @@ pub struct Circuits {
     pub dummy_light_proof: Proof,
 }
 
-struct PathCircuits {
-    tx_target: BlockTxTarget,
-    tx_data: CircuitData<F, C, D>,
-    chain_target: BlockTxChainTarget,
-    chain_data: CircuitData<F, C, D>,
-    dummy_proof: Proof,
+pub(crate) struct PathCircuits {
+    pub(crate) tx_target: BlockTxTarget,
+    pub(crate) tx_data: CircuitData<F, C, D>,
+    pub(crate) chain_target: BlockTxChainTarget,
+    pub(crate) chain_data: CircuitData<F, C, D>,
+    pub(crate) dummy_proof: Proof,
 }
 
 impl PathCircuits {
-    fn new(tx_per_proof: usize, tx_mode: u8) -> Self {
+    pub(crate) fn new(tx_per_proof: usize, tx_mode: u8) -> Self {
         let tx = BlockTxCircuit::define(CIRCUIT_CONFIG, tx_per_proof, CHAIN_ID, tx_mode);
         let tx_target = tx.target;
         let tx_data = tx.builder.build::<C>();
