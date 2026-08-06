@@ -920,6 +920,7 @@ pub unsafe fn mds_layer(state: &[GoldilocksField; WIDTH]) -> [GoldilocksField; W
 #[unroll::unroll_for_loops]
 pub unsafe fn vector_add(a: &[u64; WIDTH], b: &[u64; WIDTH]) -> [u64; WIDTH] {
     let mut res = [0u64; WIDTH];
+    let epsilon = vdupq_n_u64(0xffffffff);
     // Process 2 elements at a time using NEON
     for i in (0..WIDTH).step_by(2) {
         let a_vec = vld1q_u64(a[i..].as_ptr());
@@ -932,7 +933,6 @@ pub unsafe fn vector_add(a: &[u64; WIDTH], b: &[u64; WIDTH]) -> [u64; WIDTH] {
         let overflow_mask = vcltq_u64(sum, a_vec);
 
         // Add EPSILON (0xffffffff) where overflow occurred
-        let epsilon = vdupq_n_u64(0xffffffff);
         let adjustment = vandq_u64(overflow_mask, epsilon);
         let result = vaddq_u64(sum, adjustment);
 
