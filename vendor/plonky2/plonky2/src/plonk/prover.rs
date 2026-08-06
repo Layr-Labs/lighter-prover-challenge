@@ -446,7 +446,7 @@ fn wires_permutation_partial_products_and_zs<
     // Montgomery-trick batch inversion per 64 points instead of one per
     // point. Field inverses are unique, so every quotient value is identical
     // to the per-point version.
-    const INV_BATCH: usize = 128;
+    const INV_BATCH: usize = 256;
     let all_quotient_chunk_products = subgroup
         .par_chunks(INV_BATCH)
         .enumerate()
