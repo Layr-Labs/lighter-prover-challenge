@@ -71,8 +71,7 @@ pub trait Poseidon2: PrimeField64 {
             b[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
             a[0] = Self::sbox_p(&a[0]);
             b[0] = Self::sbox_p(&b[0]);
-            Self::internal_linear_layer(a);
-            Self::internal_linear_layer(b);
+            Self::internal_linear_layer_x2(a, b);
         }
     }
 
@@ -143,10 +142,7 @@ pub trait Poseidon2: PrimeField64 {
             b[0] = Self::sbox_p(&b[0]);
             c[0] = Self::sbox_p(&c[0]);
             d[0] = Self::sbox_p(&d[0]);
-            Self::internal_linear_layer(a);
-            Self::internal_linear_layer(b);
-            Self::internal_linear_layer(c);
-            Self::internal_linear_layer(d);
+            Self::internal_linear_layer_x4(a, b, c, d);
         }
     }
 
@@ -216,6 +212,39 @@ pub trait Poseidon2: PrimeField64 {
         for i in 0..WIDTH {
             state[i] =
                 sum.multiply_accumulate(state[i], Self::from_canonical_u64(MATRIX_DIAG_12_U64[i]));
+        }
+    }
+
+    #[inline]
+    #[unroll::unroll_for_loops]
+    fn internal_linear_layer_x2(a: &mut [Self; WIDTH], b: &mut [Self; WIDTH]) {
+        let sum_a = sum_12(a);
+        let sum_b = sum_12(b);
+        for i in 0..WIDTH {
+            let diagonal = Self::from_canonical_u64(MATRIX_DIAG_12_U64[i]);
+            a[i] = sum_a.multiply_accumulate(a[i], diagonal);
+            b[i] = sum_b.multiply_accumulate(b[i], diagonal);
+        }
+    }
+
+    #[inline]
+    #[unroll::unroll_for_loops]
+    fn internal_linear_layer_x4(
+        a: &mut [Self; WIDTH],
+        b: &mut [Self; WIDTH],
+        c: &mut [Self; WIDTH],
+        d: &mut [Self; WIDTH],
+    ) {
+        let sum_a = sum_12(a);
+        let sum_b = sum_12(b);
+        let sum_c = sum_12(c);
+        let sum_d = sum_12(d);
+        for i in 0..WIDTH {
+            let diagonal = Self::from_canonical_u64(MATRIX_DIAG_12_U64[i]);
+            a[i] = sum_a.multiply_accumulate(a[i], diagonal);
+            b[i] = sum_b.multiply_accumulate(b[i], diagonal);
+            c[i] = sum_c.multiply_accumulate(c[i], diagonal);
+            d[i] = sum_d.multiply_accumulate(d[i], diagonal);
         }
     }
 
