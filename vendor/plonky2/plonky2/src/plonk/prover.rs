@@ -701,8 +701,6 @@ fn compute_quotient_polys<
 
     let num_wires = common_data.config.num_wires;
     let zs_row_width = zs_partial_products_and_lookup_commitment.lde_row_width();
-    let num_routed_wires = common_data.config.num_routed_wires;
-
     let mut quotient_values = vec![F::ZERO; points.len() * num_challenges];
     quotient_values
         .par_chunks_mut(BATCH_SIZE * num_challenges)
@@ -779,41 +777,6 @@ fn compute_quotient_polys<
                 );
 
                 let indices_batch = &scratch.indices;
-                let local_zs_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.zs_local_flat[k * zs_row_width..][common_data.zs_range()])
-                    .collect();
-                let next_zs_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.zs_next_flat[k * zs_row_width..][common_data.zs_range()])
-                    .collect();
-                let partial_products_batch: Vec<&[F]> = (0..n)
-                    .map(|k| {
-                        &scratch.zs_local_flat[k * zs_row_width..]
-                            [common_data.partial_products_range()]
-                    })
-                    .collect();
-                let s_sigmas_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires])
-                    .collect();
-                let (local_lookup_batch, next_lookup_batch): (Vec<&[F]>, Vec<&[F]>) = if has_lookup
-                {
-                    (
-                        (0..n)
-                            .map(|k| {
-                                &scratch.zs_local_flat[k * zs_row_width..]
-                                    [common_data.lookup_range()]
-                            })
-                            .collect(),
-                        (0..n)
-                            .map(|k| {
-                                &scratch.zs_next_flat[k * zs_row_width..]
-                                    [common_data.lookup_range()]
-                            })
-                            .collect(),
-                    )
-                } else {
-                    (Vec::new(), Vec::new())
-                };
-
                 let vars_batch = EvaluationVarsBaseBatch::new(
                     n,
                     &scratch.local_constants,
@@ -827,12 +790,10 @@ fn compute_quotient_polys<
                     indices_batch,
                     &scratch.shifted_xs,
                     vars_batch,
-                    &local_zs_batch,
-                    &next_zs_batch,
-                    &local_lookup_batch,
-                    &next_lookup_batch,
-                    &partial_products_batch,
-                    &s_sigmas_batch,
+                    &scratch.zs_local_flat,
+                    &scratch.zs_next_flat,
+                    zs_row_width,
+                    &scratch.s_sigmas_flat,
                     betas,
                     gammas,
                     deltas,
