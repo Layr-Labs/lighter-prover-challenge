@@ -31,13 +31,6 @@ pub trait GenericHashOut<F: RichField>:
     fn from_bytes(bytes: &[u8]) -> Self;
 
     fn to_vec(&self) -> Vec<F>;
-
-    /// Visit the hash's field elements in `to_vec` order without requiring an
-    /// allocation. The default preserves `to_vec` exactly; element-backed
-    /// hashes override it to iterate their storage directly.
-    fn for_each_element(&self, f: impl FnMut(F)) {
-        self.to_vec().into_iter().for_each(f);
-    }
 }
 
 /// Trait for hash functions.
@@ -115,6 +108,13 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
         y1: Self::Hash,
     ) -> (Self::Hash, Self::Hash) {
         (Self::two_to_one(x0, y0), Self::two_to_one(x1, y1))
+    }
+
+    /// Four independent `two_to_one` compressions, allowing implementations
+    /// to interleave them. Must return exactly the four individual
+    /// `Self::two_to_one` results, in order.
+    fn two_to_one_quad(inputs: [(Self::Hash, Self::Hash); 4]) -> [Self::Hash; 4] {
+        inputs.map(|(x, y)| Self::two_to_one(x, y))
     }
 
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash;
