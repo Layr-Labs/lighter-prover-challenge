@@ -90,9 +90,25 @@ pub fn ifft_with_options<F: Field>(
     PolynomialCoeffs { coeffs: buffer }
 }
 
+/// Cache-block exponent for an element type: keep values plus the largest local twiddle row within
+/// Apple Silicon's 128 KiB L1D. Both 2^13 base-field and 2^12 quadratic-extension blocks use about
+/// 96 KiB.
+///
+/// It serves two purposes, which coincide because both are set by the same private L1D: it is the
+/// block size of the zero-padded LDE path, and it is the subarray size above which an FFT layer no
+/// longer fits in L1 and therefore costs a full streaming pass over the buffer.
+#[inline(always)]
+const fn lg_cache_block_n<F>() -> usize {
+    match core::mem::size_of::<F>() {
+        0..=8 => 13,
+        9..=16 => 12,
+        _ => 11,
+    }
+}
+
 /// Generic FFT implementation that works with both scalar and packed inputs.
 #[unroll_for_loops]
-fn fft_classic_simd<P: PackedField>(
+fn fft_classic_simd<P: PackedField, const RADIX4: bool>(
     values: &mut [P::Scalar],
     r: usize,
     lg_n: usize,
@@ -134,18 +150,79 @@ fn fft_classic_simd<P: PackedField>(
 
     // We've already done the first lg_packed_width (if they were required) iterations.
     let s = max(r, lg_packed_width);
-    fft_classic_simd_layers(packed_values, s, lg_n, root_table);
+    fft_classic_simd_layers::<P, RADIX4>(packed_values, s, lg_n, root_table);
 }
 
+/// Run FFT layers `start..end` (exactly, never more or fewer) over `packed_values`.
+///
+/// Layers whose subarray reaches `lg_cache_block_n` elements no longer fit in L1, so each one is a
+/// separate streaming pass over the whole slice. When `RADIX4` is set, such layers are fused in
+/// pairs: a single radix-4 pass performs two radix-2 layers, halving the number of passes over the
+/// working set. Smaller layers are left as radix-2 — they are compute-bound rather than
+/// traffic-bound (notes/07 §6 measured the fused inner loop *slower* there), and in the
+/// cache-blocked LDE path the entire block is L1-resident anyway.
+///
+/// Twiddle indexing for a fused pair `(L, L + 1)`, with `h = 2^L` and a subarray of `4h` elements
+/// split into quarters `A, B, C, D`:
+/// * layer `L` combines `(A, B)` and `(C, D)`, both with `ω_{2h}^j = root_table[L][j]`;
+/// * layer `L + 1` combines `(A', C')` with `ω_{4h}^j = root_table[L + 1][j]` and `(B', D')` with
+///   `ω_{4h}^{h + j} = root_table[L + 1][h + j]`.
+///
+/// So the existing per-layer rows are used unchanged; the only derived access is reading row
+/// `L + 1` at the two offsets `j` and `h + j`, which in packed units are `j` and `packed_h + j`
+/// (`h` is a multiple of `P::WIDTH` because `start >= log2(P::WIDTH)` at every call site).
 #[inline(always)]
-fn fft_classic_simd_layers<P: PackedField>(
+fn fft_classic_simd_layers<P: PackedField, const RADIX4: bool>(
     packed_values: &mut [P],
     start: usize,
     end: usize,
     root_table: &FftRootTable<P::Scalar>,
 ) {
     let lg_packed_width = log2_strict(P::WIDTH);
-    for lg_half_m in start..end {
+    let lg_min_fused_m = lg_cache_block_n::<P::Scalar>();
+
+    let mut lg_half_m = start;
+    while lg_half_m < end {
+        // A fused pass consumes layers `lg_half_m` and `lg_half_m + 1`; an odd tail simply falls
+        // through to the radix-2 arm, so `start..end` is covered exactly either way.
+        if RADIX4 && lg_half_m + 1 < end && lg_half_m + 1 >= lg_min_fused_m {
+            let packed_quarter_m = (1usize << lg_half_m) >> lg_packed_width; // `h`, in vectors.
+            let packed_m = packed_quarter_m * 4; // Subarray size (in vectors).
+            debug_assert!(packed_quarter_m != 0);
+
+            let omega_lo = P::pack_slice(&root_table[lg_half_m]);
+            let omega_hi = P::pack_slice(&root_table[lg_half_m + 1]);
+            for k in (0..packed_values.len()).step_by(packed_m) {
+                for j in 0..packed_quarter_m {
+                    let omega_ab = omega_lo[j];
+                    let omega_ac = omega_hi[j];
+                    let omega_bd = omega_hi[packed_quarter_m + j];
+
+                    let a = packed_values[k + j];
+                    let b = packed_values[k + packed_quarter_m + j];
+                    let c = packed_values[k + 2 * packed_quarter_m + j];
+                    let d = packed_values[k + 3 * packed_quarter_m + j];
+
+                    // Layer `lg_half_m`.
+                    let t = omega_ab * b;
+                    let (a, b) = (a + t, a - t);
+                    let t = omega_ab * d;
+                    let (c, d) = (c + t, c - t);
+
+                    // Layer `lg_half_m + 1`.
+                    let t = omega_ac * c;
+                    packed_values[k + j] = a + t;
+                    packed_values[k + 2 * packed_quarter_m + j] = a - t;
+                    let t = omega_bd * d;
+                    packed_values[k + packed_quarter_m + j] = b + t;
+                    packed_values[k + 3 * packed_quarter_m + j] = b - t;
+                }
+            }
+
+            lg_half_m += 2;
+            continue;
+        }
+
         let lg_m = lg_half_m + 1;
         let m = 1 << lg_m; // Subarray size (in field elements).
         let packed_m = m >> lg_packed_width; // Subarray size (in vectors).
@@ -163,6 +240,8 @@ fn fft_classic_simd_layers<P: PackedField>(
                 packed_values[k + half_packed_m + j] = u - t;
             }
         }
+
+        lg_half_m += 1;
     }
 }
 
@@ -213,7 +292,7 @@ fn fft_zero_padded_first_layer<P: PackedField>(
     fft_zero_padded_first_layer_block(packed_values, 0, nonzero_len, 0, packed_repeat, omega_table);
 }
 
-fn fft_zero_padded_cache_blocks<P: PackedField>(
+fn fft_zero_padded_cache_blocks<P: PackedField, const RADIX4: bool>(
     values: &mut [P::Scalar],
     r: usize,
     lg_block_n: usize,
@@ -241,7 +320,7 @@ fn fft_zero_padded_cache_blocks<P: PackedField>(
             packed_repeat,
             omega_table,
         );
-        fft_classic_simd_layers(
+        fft_classic_simd_layers::<P, RADIX4>(
             &mut packed_values[destination..destination + packed_block_len],
             r + 1,
             lg_block_n,
@@ -251,7 +330,7 @@ fn fft_zero_padded_cache_blocks<P: PackedField>(
 }
 
 #[inline(never)]
-fn prepare_zero_padded_fft<F: Field>(
+fn prepare_zero_padded_fft<F: Field, const RADIX4: bool>(
     values: &mut [F],
     r: usize,
     lg_n: usize,
@@ -269,15 +348,9 @@ fn prepare_zero_padded_fft<F: Field>(
     reverse_index_bits_in_place(&mut values[..nonzero_len]);
 
     if r >= lg_packed_width && r < lg_n {
-        // Keep values plus the largest local twiddle row within Apple Silicon's 128 KiB L1D.
-        // Both 2^13 base-field and 2^12 quadratic-extension blocks use about 96 KiB.
-        let lg_block_n = match core::mem::size_of::<F>() {
-            0..=8 => 13,
-            9..=16 => 12,
-            _ => 11,
-        };
+        let lg_block_n = lg_cache_block_n::<F>();
         if r + 1 < lg_block_n && lg_block_n <= lg_n {
-            fft_zero_padded_cache_blocks::<<F as Packable>::Packing>(
+            fft_zero_padded_cache_blocks::<<F as Packable>::Packing, RADIX4>(
                 values, r, lg_block_n, root_table,
             );
             lg_block_n
@@ -303,6 +376,19 @@ fn prepare_zero_padded_fft<F: Field>(
 /// input may be non-zero, but the last 1 - 1/2^r entries are
 /// definitely zero.
 pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &FftRootTable<F>) {
+    fft_classic_with_radix4::<F, true>(values, r, root_table);
+}
+
+/// `fft_classic` with the radix-4 layer fusion switchable.
+///
+/// `RADIX4 = false` reproduces the pure radix-2 layer schedule over an otherwise identical
+/// pipeline (same bit-reversal, same zero-padded expansion, same cache blocking, same resume
+/// layer), which is what the differential tests compare against.
+fn fft_classic_with_radix4<F: Field, const RADIX4: bool>(
+    values: &mut [F],
+    r: usize,
+    root_table: &FftRootTable<F>,
+) {
     let n = values.len();
     let lg_n = log2_strict(n);
 
@@ -319,15 +405,15 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
         reverse_index_bits_in_place(values);
         0
     } else {
-        prepare_zero_padded_fft(values, r, lg_n, lg_packed_width, root_table)
+        prepare_zero_padded_fft::<F, RADIX4>(values, r, lg_n, lg_packed_width, root_table)
     };
 
     if lg_n <= lg_packed_width {
         // Need the slice to be at least the width of two packed vectors for the vectorized version
         // to work. Do this tiny problem in scalar.
-        fft_classic_simd::<F>(values, first_layer, lg_n, root_table);
+        fft_classic_simd::<F, RADIX4>(values, first_layer, lg_n, root_table);
     } else {
-        fft_classic_simd::<<F as Packable>::Packing>(values, first_layer, lg_n, root_table);
+        fft_classic_simd::<<F as Packable>::Packing, RADIX4>(values, first_layer, lg_n, root_table);
     }
 }
 
@@ -340,7 +426,10 @@ mod tests {
     use unroll::unroll_for_loops;
 
     use crate::extension::quadratic::QuadraticExtension;
-    use crate::fft::{FftRootTable, fft, fft_classic, fft_root_table, fft_with_options, ifft};
+    use crate::fft::{
+        FftRootTable, fft, fft_classic, fft_classic_with_radix4, fft_root_table, fft_with_options,
+        ifft,
+    };
     use crate::goldilocks_field::GoldilocksField;
     use crate::packable::Packable;
     use crate::packed::PackedField;
@@ -633,4 +722,116 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    /// Raw limbs, not canonical values: `PartialEq for GoldilocksField` compares
+    /// `to_canonical_u64`, so `assert_eq!` would tolerate a representation that differs in the
+    /// noncanonical range. The radix-4 schedule performs exactly the same field operations on
+    /// exactly the same operands, so it must agree limb for limb.
+    fn raw_limbs(values: &[GoldilocksField]) -> Vec<u64> {
+        values.iter().map(|value| value.0).collect()
+    }
+
+    fn raw_limbs_ext(values: &[QuadraticExtension<GoldilocksField>]) -> Vec<u64> {
+        values
+            .iter()
+            .flat_map(|value| [value.0[0].0, value.0[1].0])
+            .collect()
+    }
+
+    fn zero_padded_input(lg_n: usize, r: usize) -> Vec<GoldilocksField> {
+        let n = 1 << lg_n;
+        let nonzero_len = n >> r;
+        deterministic_values(nonzero_len)
+            .into_iter()
+            .chain(core::iter::repeat_n(GoldilocksField::ZERO, n - nonzero_len))
+            .collect()
+    }
+
+    /// The load-bearing gate for radix-4: the fused schedule must be bit-identical to the radix-2
+    /// schedule it replaces, over every shape the prover reaches.
+    ///
+    /// The sweep crosses all four branches of the layer schedule: `r = 0` (dense, layers
+    /// `lg_packed_width..lg_n` in a single call, so both fused and unfused layers appear and the
+    /// layer count is odd for odd `lg_n`), `r = 3` with `lg_n >= 13` (cache-blocked: block-local
+    /// layers plus the global tail), `r = 3` with `lg_n < 13` (the fused-first-layer branch), and
+    /// `r = 1` (below `lg_packed_width` is impossible for `r >= 2`, so `r = 1` exercises the
+    /// fill-expansion `else` branch).
+    #[test]
+    fn radix4_is_bit_identical_to_radix2() {
+        type F = GoldilocksField;
+
+        for lg_n in 4..=17usize {
+            let roots = fft_root_table::<F>(1 << lg_n);
+            for r in 0..=3usize {
+                let padded = zero_padded_input(lg_n, r);
+                let mut radix2 = padded.clone();
+                let mut radix4 = padded;
+                fft_classic_with_radix4::<F, false>(&mut radix2, r, &roots);
+                fft_classic_with_radix4::<F, true>(&mut radix4, r, &roots);
+                assert_eq!(
+                    raw_limbs(&radix4),
+                    raw_limbs(&radix2),
+                    "radix-4 differs from radix-2 at lg_n = {lg_n}, r = {r}"
+                );
+            }
+        }
+    }
+
+    /// The two shapes the prover actually runs: 2^19 leaf LDE and 2^17 chain LDE, both at
+    /// `rate_bits = 3`. Release-only because a 2^19 FFT in an unoptimized build is slow.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn radix4_is_bit_identical_at_prove_sizes() {
+        type F = GoldilocksField;
+
+        for lg_n in [17usize, 18, 19] {
+            let roots = fft_root_table::<F>(1 << lg_n);
+            for r in [0usize, 3] {
+                let padded = zero_padded_input(lg_n, r);
+                let mut radix2 = padded.clone();
+                let mut radix4 = padded;
+                fft_classic_with_radix4::<F, false>(&mut radix2, r, &roots);
+                fft_classic_with_radix4::<F, true>(&mut radix4, r, &roots);
+                assert_eq!(
+                    raw_limbs(&radix4),
+                    raw_limbs(&radix2),
+                    "radix-4 differs from radix-2 at prove size lg_n = {lg_n}, r = {r}"
+                );
+            }
+        }
+    }
+
+    /// Same gate for the quadratic extension, whose 16-byte elements select the 2^12 cache block
+    /// and therefore a different fusion threshold. `lg_n = 14, 15` leave two and three global
+    /// layers respectively, so both the even and the odd tail are covered.
+    #[test]
+    fn radix4_extension_is_bit_identical_to_radix2() {
+        type F = GoldilocksField;
+        type FE = QuadraticExtension<F>;
+
+        for lg_n in [13usize, 14, 15] {
+            let n = 1 << lg_n;
+            let roots = fft_root_table::<FE>(n);
+            for r in [0usize, 3] {
+                let nonzero_len = n >> r;
+                let padded = (0..nonzero_len)
+                    .map(|i| {
+                        QuadraticExtension([
+                            deterministic_value(i),
+                            deterministic_value(i + nonzero_len),
+                        ])
+                    })
+                    .chain(core::iter::repeat_n(FE::ZERO, n - nonzero_len))
+                    .collect::<Vec<_>>();
+                let mut radix2 = padded.clone();
+                let mut radix4 = padded;
+                fft_classic_with_radix4::<FE, false>(&mut radix2, r, &roots);
+                fft_classic_with_radix4::<FE, true>(&mut radix4, r, &roots);
+                assert_eq!(
+                    raw_limbs_ext(&radix4),
+                    raw_limbs_ext(&radix2),
+                    "radix-4 extension mismatch at lg_n = {lg_n}, r = {r}"
+                );
+            }
+        }
+    }
 }
