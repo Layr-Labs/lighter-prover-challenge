@@ -96,10 +96,15 @@ unsafe fn sub_with_wraparound_lsr32(a: u64, b: u64) -> u64 {
         None => {
             // Super rare. Better off branching.
             branch_hint();
-            let res_wrapped = a.wrapping_sub(b_hi);
-            res_wrapped - EPSILON
+            sub_with_wraparound_lsr32_cold(a, b_hi)
         }
     }
+}
+
+#[cold]
+#[inline(never)]
+fn sub_with_wraparound_lsr32_cold(a: u64, b_hi: u64) -> u64 {
+    a.wrapping_sub(b_hi) - EPSILON
 }
 
 /// Multiplication of the low word (i.e., x as u32) by EPSILON.
