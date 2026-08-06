@@ -2,16 +2,19 @@
 use alloc::{format, vec, vec::Vec};
 use core::cmp::min;
 
+use plonky2_field::packable::Packable;
+use plonky2_field::packed::PackedField;
 use plonky2_field::polynomial::PolynomialCoeffs;
 
 use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
+use crate::field::batch_util::batch_multiply_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
-use crate::gates::selectors::LookupSelectors;
+use crate::gates::selectors::{LookupSelectors, UNUSED_SELECTOR};
 use crate::hash::hash_types::RichField;
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::Target;
@@ -174,6 +177,7 @@ pub(crate) struct VanishingScratch<F> {
     pub vanishing_all_lookup_terms: Vec<F>,
     pub lookup_selectors: Vec<F>,
     pub constraint_terms_batch: Vec<F>,
+    pub gate_filters: Vec<F>,
 }
 
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
@@ -228,6 +232,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         common_data,
         vars_batch,
         &mut scratch.constraint_terms_batch,
+        &mut scratch.gate_filters,
     );
     let constraint_terms_batch = &scratch.constraint_terms_batch;
     debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
@@ -720,6 +725,72 @@ pub fn evaluate_gate_constraints<F: RichField + Extendable<D>, const D: usize>(
     }
     constraints
 }
+/// Multiplies each lane by `row - selector_values[lane]`, using the field's native packing.
+fn multiply_selector_factor<F: Field>(values: &mut [F], selector_values: &[F], row: usize) {
+    debug_assert_eq!(values.len(), selector_values.len());
+    let packed_width = <F as Packable>::Packing::WIDTH;
+    let packed_len = values.len() / packed_width * packed_width;
+    let (values_packed, values_tail) = values.split_at_mut(packed_len);
+    let (selectors_packed, selectors_tail) = selector_values.split_at(packed_len);
+    let values_packed = <F as Packable>::Packing::pack_slice_mut(values_packed);
+    let selectors_packed = <F as Packable>::Packing::pack_slice(selectors_packed);
+    let row = F::from_canonical_usize(row);
+
+    for (value, &selector) in values_packed.iter_mut().zip(selectors_packed) {
+        *value *= <F as Packable>::Packing::from(row) - selector;
+    }
+    for (value, &selector) in values_tail.iter_mut().zip(selectors_tail) {
+        *value *= row - selector;
+    }
+}
+
+/// Computes every gate selector in linear rather than quadratic work per selector group.
+///
+/// For a group `a..b`, gate `j`'s selector is
+/// `product(i - s for i in a..b if i != j)`, with the unused-selector factor when there is more
+/// than one selector polynomial. Prefix and suffix products share those factors across gates.
+fn fill_gate_filters<F: Field>(
+    groups: &[core::ops::Range<usize>],
+    local_constants: &[F],
+    batch_size: usize,
+    buffer: &mut Vec<F>,
+) {
+    let num_gates = groups.last().map_or(0, |group| group.end);
+    debug_assert_eq!(groups.first().map_or(0, |group| group.start), 0);
+    debug_assert!(groups.windows(2).all(|pair| pair[0].end == pair[1].start));
+    debug_assert!(local_constants.len() >= groups.len() * batch_size);
+
+    buffer.resize((num_gates + 2) * batch_size, F::ZERO);
+    let (filters, scratch) = buffer.split_at_mut(num_gates * batch_size);
+    let (prefix, suffix) = scratch.split_at_mut(batch_size);
+    let multiple_selectors = groups.len() > 1;
+    let unused_selector = F::from_canonical_usize(UNUSED_SELECTOR);
+
+    for (selector_index, group) in groups.iter().enumerate() {
+        let selector_values =
+            &local_constants[selector_index * batch_size..(selector_index + 1) * batch_size];
+        if multiple_selectors {
+            for (value, &selector) in prefix.iter_mut().zip(selector_values) {
+                *value = unused_selector - selector;
+            }
+        } else {
+            prefix.fill(F::ONE);
+        }
+        suffix.fill(F::ONE);
+
+        for row in group.clone() {
+            filters[row * batch_size..(row + 1) * batch_size].copy_from_slice(prefix);
+            multiply_selector_factor(prefix, selector_values, row);
+        }
+        for row in group.clone().rev() {
+            batch_multiply_inplace(
+                &mut filters[row * batch_size..(row + 1) * batch_size],
+                suffix,
+            );
+            multiply_selector_factor(suffix, selector_values, row);
+        }
+    }
+}
 
 /// Evaluate all gate constraints in the base field.
 ///
@@ -731,7 +802,13 @@ pub fn evaluate_gate_constraints_base_batch<F: RichField + Extendable<D>, const 
     vars_batch: EvaluationVarsBaseBatch<F>,
 ) -> Vec<F> {
     let mut constraints_batch = Vec::new();
-    evaluate_gate_constraints_base_batch_into::<F, D>(common_data, vars_batch, &mut constraints_batch);
+    let mut gate_filters = Vec::new();
+    evaluate_gate_constraints_base_batch_into::<F, D>(
+        common_data,
+        vars_batch,
+        &mut constraints_batch,
+        &mut gate_filters,
+    );
     constraints_batch
 }
 
@@ -740,21 +817,28 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
     common_data: &CommonCircuitData<F, D>,
     vars_batch: EvaluationVarsBaseBatch<F>,
     constraints_batch: &mut Vec<F>,
+    gate_filters: &mut Vec<F>,
 ) {
+    let batch_size = vars_batch.len();
     constraints_batch.clear();
-    constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
+    constraints_batch.resize(common_data.num_gate_constraints * batch_size, F::ZERO);
+    fill_gate_filters(
+        &common_data.selectors_info.groups,
+        vars_batch.local_constants,
+        batch_size,
+        gate_filters,
+    );
+    let filters_len = common_data.gates.len() * batch_size;
     for (i, gate) in common_data.gates.iter().enumerate() {
-        let selector_index = common_data.selectors_info.selector_indices[i];
         gate.0.eval_filtered_base_batch(
             vars_batch,
-            i,
-            selector_index,
-            common_data.selectors_info.groups[selector_index].clone(),
+            &gate_filters[i * batch_size..(i + 1) * batch_size],
             common_data.selectors_info.num_selectors(),
             common_data.num_lookup_selectors,
             constraints_batch,
         );
     }
+    debug_assert!(gate_filters.len() >= filters_len);
 }
 
 pub fn evaluate_gate_constraints_circuit<F: RichField + Extendable<D>, const D: usize>(
@@ -1172,4 +1256,40 @@ pub fn check_lookup_constraints_circuit<F: RichField + Extendable<D>, const D: u
         ));
     }
     constraints
+}
+
+#[cfg(test)]
+mod tests {
+    use plonky2_field::goldilocks_field::GoldilocksField;
+
+    use super::*;
+
+    #[test]
+    fn shared_gate_filters_match_the_selector_polynomial() {
+        type F = GoldilocksField;
+        const BATCH_SIZE: usize = 7;
+
+        for groups in [vec![0..5], vec![0..3, 3..5]] {
+            let local_constants = (0..groups.len() * BATCH_SIZE)
+                .map(|i| F::from_canonical_usize(17 + 3 * i))
+                .collect::<Vec<_>>();
+            let mut buffer = Vec::new();
+            fill_gate_filters(&groups, &local_constants, BATCH_SIZE, &mut buffer);
+
+            for (selector_index, group) in groups.iter().enumerate() {
+                for row in group.clone() {
+                    for point in 0..BATCH_SIZE {
+                        let selector = local_constants[selector_index * BATCH_SIZE + point];
+                        let expected = group
+                            .clone()
+                            .filter(|&other| other != row)
+                            .chain((groups.len() > 1).then_some(UNUSED_SELECTOR))
+                            .map(|other| F::from_canonical_usize(other) - selector)
+                            .product::<F>();
+                        assert_eq!(buffer[row * BATCH_SIZE + point], expected);
+                    }
+                }
+            }
+        }
+    }
 }
