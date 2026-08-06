@@ -131,6 +131,18 @@ pub trait Read {
         Ok(u32::from_le_bytes(buf))
     }
 
+    /// Reads a vector of `u32` values from `self`.
+    #[inline]
+    fn read_u32_vec(&mut self) -> IoResult<Vec<u32>> {
+        let len = self.read_usize()?;
+        let mut res = Vec::with_capacity(len);
+        for _ in 0..len {
+            res.push(self.read_u32()?);
+        }
+
+        Ok(res)
+    }
+
     /// Reads a `usize` value from `self`.
     #[inline]
     fn read_usize(&mut self) -> IoResult<usize> {
@@ -870,7 +882,7 @@ pub trait Read {
 
         let public_inputs = self.read_target_vec()?;
 
-        let representative_map = self.read_usize_vec()?;
+        let representative_map = self.read_u32_vec()?;
 
         let is_some = self.read_bool()?;
         let fft_root_table = match is_some {
@@ -1243,6 +1255,17 @@ pub trait Write {
     #[inline]
     fn write_u32(&mut self, x: u32) -> IoResult<()> {
         self.write_all(&x.to_le_bytes())
+    }
+
+    /// Writes a vector of `u32` values to `self`.
+    #[inline]
+    fn write_u32_vec(&mut self, v: &[u32]) -> IoResult<()> {
+        self.write_usize(v.len())?;
+        for &elem in v {
+            self.write_u32(elem)?;
+        }
+
+        Ok(())
     }
 
     /// Writes a word `x` to `self.`
@@ -1891,7 +1914,7 @@ pub trait Write {
         self.write_usize(subgroup.len())?;
         self.write_field_vec(subgroup)?;
         self.write_target_vec(public_inputs)?;
-        self.write_usize_vec(representative_map)?;
+        self.write_u32_vec(representative_map)?;
 
         match fft_root_table {
             Some(table) => {
