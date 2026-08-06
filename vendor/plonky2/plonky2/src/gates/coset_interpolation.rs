@@ -550,8 +550,10 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
 
         let get_local_ext = |wire_range: Range<usize>| {
             debug_assert_eq!(wire_range.len(), D);
-            let values = wire_range.map(get_local_wire).collect::<Vec<_>>();
-            let arr = values.try_into().unwrap();
+            let mut arr = [F::ZERO; D];
+            for (k, column) in wire_range.enumerate() {
+                arr[k] = get_local_wire(column);
+            }
             F::Extension::from_basefield_array(arr)
         };
 
@@ -566,9 +568,11 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         )?;
 
         let domain = &self.interpolation_domain;
-        let values = (0..self.gate.num_points())
-            .map(|i| get_local_ext(self.gate.wires_value(i)))
-            .collect::<Vec<_>>();
+        let num_points = self.gate.num_points();
+        let mut values = Vec::with_capacity(num_points);
+        for i in 0..num_points {
+            values.push(get_local_ext(self.gate.wires_value(i)));
+        }
         let weights = &self.gate.barycentric_weights;
 
         let (mut computed_eval, mut computed_prod) = partial_interpolate(

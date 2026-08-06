@@ -23,6 +23,14 @@ use circuit::types::config::F;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// Short-lived prove worker: disable dirty/muzzy page decay (reclaim is pure
+// overhead; the process exits after each fixture). jemalloc reads the
+// null-terminated C string pointed to by `_rjem_malloc_conf` at init.
+#[cfg(not(target_env = "msvc"))]
+#[used]
+#[unsafe(no_mangle)]
+static mut _rjem_malloc_conf: *const u8 = b"dirty_decay_ms:0,muzzy_decay_ms:0\0".as_ptr();
+
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 

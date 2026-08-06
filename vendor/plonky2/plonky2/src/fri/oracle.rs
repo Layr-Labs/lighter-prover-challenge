@@ -202,7 +202,17 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 let lde_len = degree << rate_bits;
                 let mut buffer = Vec::with_capacity(lde_len);
                 buffer.extend_from_slice(&p.coeffs);
-                buffer.resize(lde_len, F::ZERO);
+                // Tail past `degree` is unread until prepare_zero_padded_fft
+                // writes it; skip the dead F::ZERO fill when rate_bits > 0.
+                if rate_bits > 0 {
+                    // SAFETY: POD field elements; FFT zero-pad path writes
+                    // every slot past the live prefix before any read.
+                    unsafe {
+                        buffer.set_len(lde_len);
+                    }
+                } else {
+                    buffer.resize(lde_len, F::ZERO);
+                }
                 batch_multiply_inplace(&mut buffer[..degree], &coset_powers);
                 PolynomialCoeffs::new(buffer)
                     .fft_with_options(Some(rate_bits), fft_root_table)
@@ -247,7 +257,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let start = col_range.start;
         let w = col_range.len();
         out.clear();
-        out.resize(n * w, F::ZERO);
+        // Every match arm fully overwrites the n*w slots; skip dead zero-fill.
+        out.reserve(n * w);
+        // SAFETY: POD field elements; every destination index is written
+        // exactly once by the gather loops below before any consumer reads.
+        unsafe {
+            out.set_len(n * w);
+        }
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
                 for (ci, c) in col_range.enumerate() {
@@ -373,19 +389,21 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         }
 
         // `final_poly` is dead after this point, so pad it in place instead of
-        // the clone-then-resize that `lde(&self)` performs.
+        // the clone-then-resize that `lde(&self)` performs. The pad must be
+        // real zeros because `fri_proof` serializes this coefficient vector;
+        // only the *scaling* multiplies on the zero tail are deleted via
+        // coset_fft_zero_tail.
         let mut lde_final_poly = final_poly;
+        let rate_bits = fri_params.config.rate_bits;
         lde_final_poly
             .coeffs
-            .resize(lde_final_poly.len() << fri_params.config.rate_bits, F::Extension::ZERO);
+            .resize(lde_final_poly.len() << rate_bits, F::Extension::ZERO);
         let lde_final_values = timed!(
             timing,
             &format!("perform final FFT {}", lde_final_poly.len()),
-            // The top (1 - 1/2^rate_bits) of the padded coefficients are zero,
-            // so the FFT's zero-run shortcut applies.
-            lde_final_poly.coset_fft_with_options(
+            lde_final_poly.coset_fft_zero_tail(
                 F::coset_shift().into(),
-                Some(fri_params.config.rate_bits),
+                rate_bits,
                 None,
             )
         );

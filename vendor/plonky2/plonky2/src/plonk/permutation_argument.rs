@@ -6,7 +6,6 @@ use plonky2_maybe_rayon::*;
 use crate::field::polynomial::PolynomialValues;
 use crate::field::types::Field;
 use crate::iop::target::Target;
-use crate::iop::wire::Wire;
 
 /// Disjoint Set Forest data-structure following <https://en.wikipedia.org/wiki/Disjoint-set_data_structure>.
 pub struct Forest {
@@ -39,10 +38,20 @@ impl Forest {
     }
 
     /// Add a new partition with a single member.
+    #[allow(dead_code)] // retained for tests / incremental construction; build uses `add_all_targets`
     pub fn add(&mut self, t: Target) {
         let index = self.parents.len();
         debug_assert_eq!(self.target_index(t), index);
         self.parents.push(index);
+    }
+
+    /// Bulk-init singleton partitions for a dense wire×row prefix plus virtual targets.
+    /// Equivalent to calling `add` in the same order the circuit builder uses
+    /// (row-major wires, then virtuals 0..num_virtual_targets).
+    pub fn add_all_targets(&mut self, num_virtual_targets: usize) {
+        debug_assert!(self.parents.is_empty());
+        let n = self.num_wires * self.degree + num_virtual_targets;
+        self.parents.extend(0..n);
     }
 
     /// Path compression method, see <https://en.wikipedia.org/wiki/Disjoint-set_data_structure#Finding_set_representatives>.
@@ -78,24 +87,58 @@ impl Forest {
     }
 
     /// Compress all paths. After calling this, every `parent` value will point to the node's
-    /// representative.
+    /// representative. Bit-identical to sequential `find(i)` for every index: the final
+    /// parents array maps each node to its set root. A short serial path-halving prepass
+    /// collapses deep chains so the parallel root-find walks are short; roots are unique
+    /// so concurrent reads of the parents array are race-free.
     pub(crate) fn compress_paths(&mut self) {
-        for i in 0..self.parents.len() {
-            self.find(i);
+        let n = self.parents.len();
+        if n == 0 {
+            return;
         }
+
+        // Path-halving rounds: parents[i] := parents[parents[i]]. Each round roughly
+        // halves remaining depth. Three rounds turn even degenerate n-long chains into
+        // O(log n) walks before the parallel flatten.
+        for _ in 0..3 {
+            for i in 0..n {
+                let p = self.parents[i];
+                // SAFETY of index: every parent pointer is always a valid index into
+                // parents (union-find invariant maintained by add/merge).
+                self.parents[i] = self.parents[p];
+            }
+        }
+
+        let parents = &self.parents;
+        let reps: Vec<usize> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mut x = i;
+                while parents[x] != x {
+                    x = parents[x];
+                }
+                x
+            })
+            .collect();
+        self.parents = reps;
     }
 
     /// Assumes `compress_paths` has already been called.
     pub fn wire_partition(&mut self) -> WirePartition {
-        let mut sigma = vec![0u32; self.degree * self.num_routed_wires];
+        let degree = self.degree;
+        let num_routed = self.num_routed_wires;
+        let num_wires = self.num_wires;
+        let mut sigma = vec![0u32; degree * num_routed];
         let mut first = vec![u32::MAX; self.parents.len()];
         let mut last = vec![u32::MAX; self.parents.len()];
 
-        for row in 0..self.degree {
-            for column in 0..self.num_routed_wires {
-                let t = Target::Wire(Wire { row, column });
-                let parent = self.parents[self.target_index(t)];
-                let index = (column * self.degree + row) as u32;
+        // Row-major scan order is load-bearing for bit-identical circular successor
+        // chains (same as the flat-array sigma rewrite). Keep sequential.
+        for row in 0..degree {
+            let row_base = row * num_wires;
+            for column in 0..num_routed {
+                let parent = self.parents[row_base + column];
+                let index = (column * degree + row) as u32;
                 if first[parent] == u32::MAX {
                     first[parent] = index;
                 } else {
