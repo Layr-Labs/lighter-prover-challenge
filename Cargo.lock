@@ -141,6 +141,7 @@ dependencies = [
  "hex",
  "itertools 0.13.0",
  "lazy_static",
+ "libc",
  "log",
  "num",
  "num_cpus",

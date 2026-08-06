@@ -42,6 +42,7 @@ clap_derive = { workspace = true }
 tiny-keccak =  { workspace = true }
 paste = { workspace = true }
 circuit = { path = "../circuit", default-features = true }
+libc = "0.2"
 
 [dev-dependencies]
 flate2 = "1.0"

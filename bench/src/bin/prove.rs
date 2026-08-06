@@ -23,6 +23,15 @@ use circuit::types::config::F;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// Proof buffers are GB-scale and reallocated per proof (~104 proofs per block).
+// Never decaying dirty pages keeps them resident, so successive proofs reuse
+// warm pages instead of re-faulting them. Compiled in because the ranked
+// sandbox clears the environment, so MALLOC_CONF cannot reach the worker.
+#[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
+
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
@@ -39,21 +48,29 @@ fn main() {
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
     let json = fs::read(fixture).expect("cannot read prover fixture");
-    let block = Block::<F>::from_json_with_empty_txs(
-        &json,
-        HEAVY_TX_PER_PROOF,
-        LIGHT_TX_PER_PROOF,
-        PUBLIC_HEAVY_TX_COUNT,
-        PUBLIC_LIGHT_TX_COUNT,
-    )
+    let block = prover::timed_section("startup.parse_fixture", || {
+        Block::<F>::from_json_with_empty_txs(
+            &json,
+            HEAVY_TX_PER_PROOF,
+            LIGHT_TX_PER_PROOF,
+            PUBLIC_HEAVY_TX_COUNT,
+            PUBLIC_LIGHT_TX_COUNT,
+        )
+    })
     .expect("invalid prover fixture");
-    let proof = prover::prove_block(block, &Circuits::new());
-    bincode::serialize_into(
-        BufWriter::with_capacity(
-            PROOF_OUTPUT_BUFFER_BYTES,
-            File::create(output).expect("cannot create proof output"),
-        ),
-        &proof,
-    )
+    let circuits = prover::timed_section("startup.build_circuits", Circuits::new);
+    let proof = prover::timed_section("prove_block.total", || {
+        prover::prove_block(block, &circuits)
+    });
+    prover::timed_section("output.serialize", || {
+        bincode::serialize_into(
+            BufWriter::with_capacity(
+                PROOF_OUTPUT_BUFFER_BYTES,
+                File::create(output).expect("cannot create proof output"),
+            ),
+            &proof,
+        )
+    })
     .expect("cannot write proof output");
+    prover::print_pipeline_stats();
 }
