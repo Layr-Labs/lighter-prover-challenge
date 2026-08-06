@@ -331,3 +331,5 @@ where
         }
     }
 }
+
+// Redraw ticket 1 for stack-on-frontier4: identical mechanism set; Yukon dedupes identical archives, so a redraw requires a nominal delta. Disclosed in the submission note.
