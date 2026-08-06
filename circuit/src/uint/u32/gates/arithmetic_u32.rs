@@ -212,8 +212,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32ArithmeticG
             // combined_output - computed_output.
             let out = chunks.next().unwrap();
             for p in 0..n {
-                let computed = multiplicand_0[p] * multiplicand_1[p] + addend[p];
-                out[p] = output_high[p] * base32 + output_low[p] - computed;
+                let computed =
+                    addend[p].multiply_accumulate(multiplicand_0[p], multiplicand_1[p]);
+                out[p] = output_low[p].multiply_accumulate(output_high[p], base32) - computed;
             }
 
             // Limb range products (base-4: x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3))
@@ -236,7 +237,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32ArithmeticG
                     &mut combined_high
                 };
                 for p in 0..n {
-                    combined[p] = combined[p] * limb_base + limb[p];
+                    combined[p] = limb[p].multiply_accumulate(combined[p], limb_base);
                 }
             }
             let out = chunks.next().unwrap();

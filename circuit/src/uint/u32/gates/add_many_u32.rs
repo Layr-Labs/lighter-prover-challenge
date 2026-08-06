@@ -185,7 +185,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32AddManyGate
                 }
             }
             for p in 0..n {
-                out[p] = output_carry[p] * base32 + output_result[p] - out[p];
+                out[p] = output_result[p].multiply_accumulate(output_carry[p], base32) - out[p];
             }
 
             // Limb range products (base-4: x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3))
@@ -208,7 +208,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32AddManyGate
                     &mut combined_carry
                 };
                 for p in 0..n {
-                    combined[p] = combined[p] * base_limb + limb[p];
+                    combined[p] = limb[p].multiply_accumulate(combined[p], base_limb);
                 }
             }
 

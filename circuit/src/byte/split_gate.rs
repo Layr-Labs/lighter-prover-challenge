@@ -168,7 +168,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
                 for k in (0..3).rev() {
                     let limb = &wires[(chunk_start + k) * n..][..n];
                     for p in 0..n {
-                        out[p] = out[p] * four + limb[p];
+                        out[p] = limb[p].multiply_accumulate(out[p], four);
                     }
                 }
                 let byte_col = &wires[byte_wire * n..][..n];
@@ -183,7 +183,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
             for byte_wire in (bytes.start..bytes.end - 1).rev() {
                 let col = &wires[byte_wire * n..][..n];
                 for p in 0..n {
-                    out[p] = out[p] * base + col[p];
+                    out[p] = col[p].multiply_accumulate(out[p], base);
                 }
             }
             let sum_col = &wires[self.i_th_sum(i) * n..][..n];

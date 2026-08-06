@@ -173,7 +173,8 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U48Subtraction
             let out = chunks.next().unwrap();
             for p in 0..n {
                 let result_initial = input_x[p] - input_y[p] - input_borrow[p];
-                out[p] = output_result[p] - (result_initial + base * output_borrow[p]);
+                out[p] = output_result[p]
+                    - result_initial.multiply_accumulate(base, output_borrow[p]);
             }
 
             // Limb range products (base-4: x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3))
@@ -190,7 +191,8 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U48Subtraction
                     out[p] = y * (y + F::TWO);
                 }
                 for p in 0..n {
-                    combined_limbs[p] = combined_limbs[p] * limb_base + limb[p];
+                    combined_limbs[p] =
+                        limb[p].multiply_accumulate(combined_limbs[p], limb_base);
                 }
             }
             let out = chunks.next().unwrap();
