@@ -39,7 +39,7 @@ use crate::gates::selectors::SelectorsInfo;
 use crate::hash::hash_types::{HashOutTarget, MerkleCapTarget, RichField};
 use crate::hash::merkle_tree::MerkleCap;
 use crate::iop::ext_target::ExtensionTarget;
-use crate::iop::generator::{generate_partial_witness, WitnessGeneratorRef};
+use crate::iop::generator::{WitnessGeneratorRef, generate_partial_witness};
 use crate::iop::target::Target;
 use crate::iop::witness::{PartialWitness, PartitionWitness};
 use crate::plonk::circuit_builder::CircuitBuilder;
@@ -371,6 +371,10 @@ pub struct ProverOnlyCircuitData<
     /// Generator indices (within the `Vec` above), indexed by the representative of each target
     /// they watch.
     pub generator_indices_by_watches: BTreeMap<usize, Vec<usize>>,
+    /// The number of distinct watched representatives per generator; witness generation starts
+    /// its unresolved-watch counters from these instead of rescanning the watcher index. Not
+    /// serialized: reconstructed from `generator_indices_by_watches` on deserialization.
+    pub generator_watch_counts: Vec<usize>,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.
