@@ -14,7 +14,7 @@ use crate::fri::prover::{fri_proof_of_work, FriCommitedTrees};
 use crate::fri::FriParams;
 use crate::hash::batch_merkle_tree::BatchMerkleTree;
 use crate::hash::hash_types::RichField;
-use crate::hash::merkle_tree::MerkleTree;
+use crate::hash::merkle_tree::{LeafMatrix, MerkleTree};
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
 use crate::plonk::plonk_common::reduce_with_powers;
@@ -103,8 +103,12 @@ pub(crate) fn batch_fri_committed_trees<
         let arity = 1 << arity_bits;
 
         reverse_index_bits_in_place(&mut final_values.values);
-        let chunked_values = final_values.values.par_chunks(arity).map(flatten).collect();
-        let tree = MerkleTree::<F, C::Hasher>::new(chunked_values, fri_params.config.cap_height);
+        let chunked_values: Vec<Vec<F>> =
+            final_values.values.par_chunks(arity).map(flatten).collect();
+        let tree = MerkleTree::<F, C::Hasher>::new(
+            LeafMatrix::from_rows(chunked_values),
+            fri_params.config.cap_height,
+        );
 
         challenger.observe_cap(&tree.cap);
         trees.push(tree);

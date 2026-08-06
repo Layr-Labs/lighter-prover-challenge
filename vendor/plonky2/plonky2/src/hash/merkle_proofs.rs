@@ -319,7 +319,7 @@ mod tests {
 
     use super::*;
     use crate::field::types::Field;
-    use crate::hash::merkle_tree::MerkleTree;
+    use crate::hash::merkle_tree::{LeafMatrix, MerkleTree};
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
@@ -342,7 +342,8 @@ mod tests {
         let n = 1 << log_n;
         let cap_height = 1;
         let leaves = random_data::<F>(n, 7);
-        let tree = MerkleTree::<F, <C as GenericConfig<D>>::Hasher>::new(leaves, cap_height);
+        let tree =
+            MerkleTree::<F, <C as GenericConfig<D>>::Hasher>::new(LeafMatrix::from_rows(leaves), cap_height);
         let i: usize = OsRng.gen_range(0..n);
         let proof = tree.prove(i);
 
@@ -359,10 +360,9 @@ mod tests {
         let i_c = builder.constant(F::from_canonical_usize(i));
         let i_bits = builder.split_le(i_c, log_n);
 
-        let leaf = tree.leaf_vec(i);
-        let data = builder.add_virtual_targets(leaf.len());
+        let data = builder.add_virtual_targets(tree.leaves[i].len());
         for j in 0..data.len() {
-            pw.set_target(data[j], leaf[j])?;
+            pw.set_target(data[j], tree.leaves[i][j])?;
         }
 
         builder.verify_merkle_proof_to_cap::<<C as GenericConfig<D>>::InnerHasher>(

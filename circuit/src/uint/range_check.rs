@@ -8,10 +8,8 @@ use std::collections::HashSet;
 use anyhow::Result;
 use log::warn;
 use plonky2::field::extension::Extendable;
-use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
 use plonky2::gates::gate::Gate;
-use plonky2::gates::packed_util::PackedEvaluableBase;
 use plonky2::gates::util::StridedConstraintConsumer;
 use plonky2::hash::hash_types::RichField;
 use plonky2::iop::ext_target::ExtensionTarget;
@@ -21,10 +19,7 @@ use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
 use plonky2::plonk::plonk_common::{reduce_with_powers, reduce_with_powers_ext_circuit};
-use plonky2::plonk::vars::{
-    EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch,
-    EvaluationVarsBasePacked,
-};
+use plonky2::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBase};
 use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
 
 use crate::builder::Builder;
@@ -335,10 +330,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
         }
     }
 
-    fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        self.eval_unfiltered_base_batch_packed(vars_base)
-    }
-
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,
@@ -420,53 +411,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
     // 1 for checking the each sum of aux limbs, plus a range check for each aux limb.
     fn num_constraints(&self) -> usize {
         self.num_ops * (1 + self.aux_limbs_per_input())
-    }
-}
-
-impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
-    for RangeCheckGate<F, D>
-{
-    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
-        &self,
-        vars: EvaluationVarsBasePacked<P>,
-        mut yield_constr: StridedConstraintConsumer<P>,
-    ) {
-        // BASE == 4: multiplying the Horner accumulator by 4 is two doublings,
-        // and the degree-4 range product l(l-1)(l-2)(l-3) factors exactly as
-        // u(u+2) with u = l^2 - 3l. Both are field-exact re-associations, so
-        // every emitted constraint value is identical to the scalar path's.
-        debug_assert_eq!(Self::BASE, 4);
-        let two = F::TWO;
-        let aux_count = self.aux_limbs_per_input();
-        let last_is_half = self.bit_size % 2 == 1;
-
-        for i in 0..self.num_ops {
-            let input_limb = vars.local_wires[self.wire_ith_input(i)];
-
-            // reduce_with_powers folds high-to-low: sum = sum * BASE + limb.
-            let mut computed_sum = P::ZEROS;
-            for j in (0..aux_count).rev() {
-                let limb = vars.local_wires[self.wire_ith_input_jth_aux_limb(i, j)];
-                let doubled = computed_sum + computed_sum;
-                computed_sum = doubled + doubled + limb;
-            }
-            yield_constr.one(computed_sum - input_limb);
-
-            for j in 0..aux_count - 1 {
-                let limb = vars.local_wires[self.wire_ith_input_jth_aux_limb(i, j)];
-                let u = limb * limb - (limb + limb + limb);
-                yield_constr.one(u * (u + two));
-            }
-
-            let last = vars.local_wires[self.wire_ith_input_jth_aux_limb(i, aux_count - 1)];
-            if last_is_half {
-                // Product over (0..2): l(l-1).
-                yield_constr.one(last * last - last);
-            } else {
-                let u = last * last - (last + last + last);
-                yield_constr.one(u * (u + two));
-            }
-        }
     }
 }
 

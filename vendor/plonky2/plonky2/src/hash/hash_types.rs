@@ -14,9 +14,22 @@ use crate::iop::target::Target;
 use crate::plonk::config::GenericHashOut;
 
 /// A prime order field with the features we need to use it as a base field in our argument system.
-pub trait RichField: PrimeField64 + Poseidon + Poseidon2 {}
+pub trait RichField: PrimeField64 + Poseidon + Poseidon2 {
+    /// Whether the in-memory representation of `Self` is exactly the value returned by
+    /// [`PrimeField64::to_noncanonical_u64`], i.e. `Self` is a `#[repr(transparent)]` newtype over
+    /// that `u64`.
+    ///
+    /// When this holds, a `&[Self]` can be reinterpreted as a `&[u64]` of the same length, which
+    /// lets the GPU Merkle backend read a leaf matrix in place instead of copying it into a
+    /// staging buffer. Defaults to `false` so any future field must opt in deliberately.
+    const REPR_IS_NONCANONICAL_U64: bool = false;
+}
 
-impl RichField for GoldilocksField {}
+impl RichField for GoldilocksField {
+    // `GoldilocksField` is `#[repr(transparent)]` over its `u64`, and `to_noncanonical_u64` returns
+    // that `u64` unchanged.
+    const REPR_IS_NONCANONICAL_U64: bool = true;
+}
 
 pub const NUM_HASH_OUT_ELTS: usize = 4;
 

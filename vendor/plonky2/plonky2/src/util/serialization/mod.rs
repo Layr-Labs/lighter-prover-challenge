@@ -35,7 +35,7 @@ use crate::gates::lookup::Lookup;
 use crate::gates::selectors::SelectorsInfo;
 use crate::hash::hash_types::{HashOutTarget, MerkleCapTarget, RichField};
 use crate::hash::merkle_proofs::{MerkleProof, MerkleProofTarget};
-use crate::hash::merkle_tree::{MerkleCap, MerkleLeaves, MerkleTree};
+use crate::hash::merkle_tree::{LeafMatrix, MerkleCap, MerkleTree};
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::generator::WitnessGeneratorRef;
 use crate::iop::target::{BoolTarget, Target};
@@ -320,18 +320,11 @@ pub trait Read {
         F: RichField,
         H: Hasher<F>,
     {
-        let num_leaves = self.read_usize()?;
-        let mut leaves = Vec::new();
-        let mut leaf_width = 0;
-        for i in 0..num_leaves {
+        let leaves_len = self.read_usize()?;
+        let mut leaves = Vec::with_capacity(leaves_len);
+        for _ in 0..leaves_len {
             let leaf_len = self.read_usize()?;
-            if i == 0 {
-                leaf_width = leaf_len;
-                leaves.reserve_exact(num_leaves * leaf_width);
-            } else if leaf_len != leaf_width {
-                return Err(IoError);
-            }
-            leaves.extend(self.read_field_vec::<F>(leaf_len)?);
+            leaves.push(self.read_field_vec(leaf_len)?);
         }
 
         let digests_len = self.read_usize()?;
@@ -339,11 +332,7 @@ pub trait Read {
         let cap_height = self.read_usize()?;
         let cap = self.read_merkle_cap::<F, H>(cap_height)?;
         Ok(MerkleTree {
-            leaves: MerkleLeaves::Rows {
-                data: leaves,
-                width: leaf_width,
-            },
-            num_leaves,
+            leaves: LeafMatrix::from_rows(leaves),
             digests,
             cap,
         })
@@ -1432,11 +1421,10 @@ pub trait Write {
         F: RichField,
         H: Hasher<F>,
     {
-        self.write_usize(tree.num_leaves)?;
-        for i in 0..tree.num_leaves {
-            let leaf = tree.leaf_vec(i);
-            self.write_usize(leaf.len())?;
-            self.write_field_vec(&leaf)?;
+        self.write_usize(tree.leaves.len())?;
+        for i in 0..tree.leaves.len() {
+            self.write_usize(tree.leaves[i].len())?;
+            self.write_field_vec(&tree.leaves[i])?;
         }
         self.write_hash_vec::<F, H>(&tree.digests)?;
         self.write_usize(tree.cap.height())?;

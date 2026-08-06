@@ -12,7 +12,7 @@ use plonky2_util::log2_strict;
 use serde::{Deserialize, Serialize};
 
 use crate::extension::{Extendable, FieldExtension};
-use crate::fft::{FftRootTable, fft, fft_with_options, ifft};
+use crate::fft::{FftRootTable, fft, fft_with_options, ifft, ifft_with_options_bit_reversed_input};
 use crate::types::Field;
 
 /// A polynomial in point-value form.
@@ -57,6 +57,20 @@ impl<F: Field> PolynomialValues<F> {
 
     pub fn ifft(self) -> PolynomialCoeffs<F> {
         ifft(self)
+    }
+
+    /// Like [`Self::coset_ifft`], but expects `self` to hold the coset evaluations in bit-reversed
+    /// point order, which lets the transform skip its initial bit-reversal permutation.
+    pub fn coset_ifft_bit_reversed_input(self, shift: F) -> PolynomialCoeffs<F> {
+        let mut shifted_coeffs = ifft_with_options_bit_reversed_input(self, None, None);
+        shifted_coeffs
+            .coeffs
+            .iter_mut()
+            .zip(shift.inverse().powers())
+            .for_each(|(c, r)| {
+                *c *= r;
+            });
+        shifted_coeffs
     }
 
     /// Returns the polynomial whose evaluation on the coset `shift*H` is `self`.
