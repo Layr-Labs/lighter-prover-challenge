@@ -170,10 +170,17 @@ pub(crate) fn eval_vanishing_poly<F: RichField + Extendable<D>, const D: usize>(
 pub(crate) struct VanishingScratch<F> {
     pub numerator_values: Vec<F>,
     pub denominator_values: Vec<F>,
+    pub l_0_values: Vec<F>,
     pub vanishing_z_1_terms: Vec<F>,
     pub vanishing_partial_products_terms: Vec<F>,
     pub vanishing_all_lookup_terms: Vec<F>,
     pub lookup_selectors: Vec<F>,
+    /// Column-major `[Z(x) | partial products | Z(gx)]` values for the no-lookup path.
+    /// This used to be allocated once per quotient batch; retaining it here makes the
+    /// allocation once per Rayon worker instead.
+    pub accumulator_columns: Vec<F>,
+    /// Selector filters, reused across gates and quotient batches.
+    pub gate_filter_values: Vec<F>,
     pub constraint_terms_batch: Vec<F>,
 }
 
@@ -246,10 +253,11 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     let num_gate_constraints = common_data.num_gate_constraints;
 
-    evaluate_gate_constraints_base_batch_into::<F, D>(
+    evaluate_gate_constraints_base_batch_into_with_scratch::<F, D>(
         common_data,
         vars_batch,
         &mut scratch.constraint_terms_batch,
+        &mut scratch.gate_filter_values,
     );
     let constraint_terms_batch = &scratch.constraint_terms_batch;
     debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
@@ -264,6 +272,15 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     let numerator_values = &mut scratch.numerator_values;
     let denominator_values = &mut scratch.denominator_values;
     numerator_values.clear();
+    denominator_values.clear();
+    debug_assert!(indices_batch.windows(2).all(|pair| pair[1] == pair[0] + 1));
+    z_h_on_coset.eval_l_0_batch_contiguous_into(
+        indices_batch.first().copied().unwrap_or(0),
+        xs_batch,
+        denominator_values,
+        &mut scratch.l_0_values,
+    );
+    let l_0_values = &scratch.l_0_values;
     denominator_values.clear();
 
     // The L_0(x) (Z(x) - 1) vanishing terms.
@@ -300,15 +317,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         term_rows.clear();
         term_rows.resize(num_rows * n, F::ZERO);
 
-        let l_0_xs = &mut scratch.vanishing_z_1_terms;
-        l_0_xs.clear();
-        l_0_xs.extend(
-            indices_batch
-                .iter()
-                .zip(xs_batch)
-                .map(|(&index, &x)| z_h_on_coset.eval_l_0(index, x)),
-        );
-
         let num_prod = &mut scratch.numerator_values;
         let den_prod = &mut scratch.denominator_values;
 
@@ -329,7 +337,9 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         // transpose into contiguous columns kills the per-point double
         // dereferences in the accumulator-selection loop below.
         let acc_cols_len = num_challenges * (num_prods + 2) * n;
-        let mut acc_cols = vec![F::ZERO; acc_cols_len];
+        let acc_cols = &mut scratch.accumulator_columns;
+        acc_cols.clear();
+        acc_cols.resize(acc_cols_len, F::ZERO);
         let acc_stride = (num_prods + 2) * n;
         for k in 0..n {
             let local_zs = local_zs_batch[k];
@@ -352,7 +362,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             let z_col = &acc_cols[i * acc_stride..][..n];
             let z1_row = &mut term_rows[i * n..][..n];
             for k in 0..n {
-                z1_row[k] = l_0_xs[k] * z_col[k].sub_one();
+                z1_row[k] = l_0_values[k] * z_col[k].sub_one();
             }
 
             for c in 0..num_chunks {
@@ -374,8 +384,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     }
                 }
 
-                let row =
-                    &mut term_rows[(num_challenges + i * num_chunks + c) * n..][..n];
+                let row = &mut term_rows[(num_challenges + i * num_chunks + c) * n..][..n];
                 // The accumulator chain per challenge is laid out as columns
                 // [Z(x) | partials 0..num_prods | Z(gx)], so chunk c reads
                 // column c as prev and column c+1 as next — contiguously.
@@ -399,15 +408,14 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         }
 
         term_rows.clear();
-        l_0_xs.clear();
         num_prod.clear();
         den_prod.clear();
         scratch.lookup_selectors.clear();
+        acc_cols.clear();
         return;
     }
 
     for k in 0..n {
-        let index = indices_batch[k];
         let x = xs_batch[k];
         let vars = vars_batch.view(k);
 
@@ -435,7 +443,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         let partial_products = partial_products_batch[k];
         let s_sigmas = s_sigmas_batch[k];
 
-        let l_0_x = z_h_on_coset.eval_l_0(index, x);
+        let l_0_x = l_0_values[k];
         for i in 0..num_challenges {
             let z_x = local_zs[i];
             let z_gx = next_zs[i];
@@ -885,7 +893,11 @@ pub fn evaluate_gate_constraints_base_batch<F: RichField + Extendable<D>, const 
     vars_batch: EvaluationVarsBaseBatch<F>,
 ) -> Vec<F> {
     let mut constraints_batch = Vec::new();
-    evaluate_gate_constraints_base_batch_into::<F, D>(common_data, vars_batch, &mut constraints_batch);
+    evaluate_gate_constraints_base_batch_into::<F, D>(
+        common_data,
+        vars_batch,
+        &mut constraints_batch,
+    );
     constraints_batch
 }
 
@@ -895,17 +907,38 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
     vars_batch: EvaluationVarsBaseBatch<F>,
     constraints_batch: &mut Vec<F>,
 ) {
+    let mut filter_scratch = Vec::new();
+    evaluate_gate_constraints_base_batch_into_with_scratch::<F, D>(
+        common_data,
+        vars_batch,
+        constraints_batch,
+        &mut filter_scratch,
+    );
+}
+
+/// Worker-scratch form used by quotient evaluation. In addition to the output buffer, this retains
+/// the selector-filter allocation across every gate and quotient batch handled by the worker.
+fn evaluate_gate_constraints_base_batch_into_with_scratch<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    vars_batch: EvaluationVarsBaseBatch<F>,
+    constraints_batch: &mut Vec<F>,
+    filter_scratch: &mut Vec<F>,
+) {
     constraints_batch.clear();
     constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
     for (i, gate) in common_data.gates.iter().enumerate() {
         let selector_index = common_data.selectors_info.selector_indices[i];
-        gate.0.eval_filtered_base_batch(
+        gate.0.eval_filtered_base_batch_with_scratch(
             vars_batch,
             i,
             selector_index,
             common_data.selectors_info.groups[selector_index].clone(),
             common_data.selectors_info.num_selectors(),
             common_data.num_lookup_selectors,
+            filter_scratch,
             constraints_batch,
         );
     }

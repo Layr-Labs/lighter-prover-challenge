@@ -32,9 +32,8 @@ use crate::plonk::vanishing_poly::{
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
-use crate::util::partial_products::quotient_chunk_products;
+use crate::util::log2_ceil;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil};
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -265,6 +264,11 @@ where
     let lookup_polys =
         compute_all_lookup_polys(&witness, &deltas, prover_data, common_data, has_lookup);
 
+    // Partial products and optional lookup polynomials are the final consumers of the full witness.
+    // Release its routed columns before allocating the Z commitment, quotient values, and FRI
+    // buffers instead of retaining up to `num_routed_wires * degree` dead field elements.
+    drop(witness);
+
     if has_lookup {
         zs_partial_products.extend(lookup_polys);
     }
@@ -422,6 +426,65 @@ fn all_wires_permutation_partial_products<
         .collect()
 }
 
+/// Accumulate numerator and denominator products for each permutation chunk. Individual wire
+/// quotients are never observed by the permutation argument, so form the observable products
+/// before the one batched inversion.
+fn permutation_chunk_product_pairs<F: Field>(
+    terms: impl IntoIterator<Item = (F, F)>,
+    chunk_size: usize,
+    numerator_products: &mut [F],
+    denominator_products: &mut [F],
+) {
+    debug_assert!(chunk_size > 1);
+    assert_eq!(numerator_products.len(), denominator_products.len());
+
+    let mut terms = terms.into_iter();
+    let eight_wide_terms = numerator_products.len() * 8;
+    if chunk_size == 8 && terms.size_hint() == (eight_wide_terms, Some(eight_wide_terms)) {
+        for (numerator_product, denominator_product) in numerator_products
+            .iter_mut()
+            .zip(denominator_products.iter_mut())
+        {
+            let [
+                (n0, d0),
+                (n1, d1),
+                (n2, d2),
+                (n3, d3),
+                (n4, d4),
+                (n5, d5),
+                (n6, d6),
+                (n7, d7),
+            ] = core::array::from_fn(|_| {
+                terms
+                    .next()
+                    .expect("exact-size permutation iterator ended early")
+            });
+            *numerator_product = ((n0 * n1) * (n2 * n3)) * ((n4 * n5) * (n6 * n7));
+            *denominator_product = ((d0 * d1) * (d2 * d3)) * ((d4 * d5) * (d6 * d7));
+        }
+        debug_assert!(terms.next().is_none());
+        return;
+    }
+
+    let mut num_chunks = 0;
+    for (j, (numerator, denominator)) in terms.enumerate() {
+        if j % chunk_size == 0 {
+            assert!(
+                num_chunks < numerator_products.len(),
+                "chunk-product scratch space is too small"
+            );
+            numerator_products[num_chunks] = numerator;
+            denominator_products[num_chunks] = denominator;
+            num_chunks += 1;
+        } else {
+            numerator_products[num_chunks - 1] *= numerator;
+            denominator_products[num_chunks - 1] *= denominator;
+        }
+    }
+    assert!(num_chunks != 0, "permutation needs at least one routed wire");
+    assert_eq!(num_chunks, numerator_products.len());
+}
+
 /// Compute the partial products used in the `Z` polynomial.
 /// Returns the polynomials interpolating `partial_products(f / g)`
 /// where `f, g` are the products in the definition of `Z`: `Z(g^i) = f / g`.
@@ -442,61 +505,74 @@ fn wires_permutation_partial_products_and_zs<
     let num_prods = common_data.num_partial_products;
     debug_assert_eq!(beta_k_is.len(), common_data.config.num_routed_wires);
     let num_routed_wires = common_data.config.num_routed_wires;
-    // Group the denominator inversions across many subgroup points: one
-    // Montgomery-trick batch inversion per 64 points instead of one per
-    // point. Field inverses are unique, so every quotient value is identical
-    // to the per-point version.
+    // Only each chunk's product of wire ratios is observable. Form its numerator and denominator
+    // products first, reducing the batched inversion width from routed wires to chunks, then write
+    // the resulting ratios directly into the retained flat point/chunk layout.
     const INV_BATCH: usize = 128;
-    let all_quotient_chunk_products = subgroup
-        .par_chunks(INV_BATCH)
+    let num_chunks = num_prods + 1;
+    debug_assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
+    let mut all_quotient_chunk_products = vec![F::ZERO; subgroup.len() * num_chunks];
+    all_quotient_chunk_products
+        .par_chunks_mut(INV_BATCH * num_chunks)
+        .zip(subgroup.par_chunks(INV_BATCH))
         .enumerate()
-        .map_init(
-            // One denominator scratch buffer per worker thread.
-            || vec![F::ZERO; num_routed_wires * INV_BATCH],
-            |denominators, (chunk_idx, xs)| {
+        .for_each_init(
+            || {
+                (
+                    vec![F::ZERO; num_chunks * INV_BATCH],
+                    vec![F::ZERO; num_chunks * INV_BATCH],
+                    Vec::with_capacity(num_chunks * INV_BATCH),
+                )
+            },
+            |(numerator_products, denominator_products, inverse_products),
+             (chunk_idx, (products, xs))| {
                 let base = chunk_idx * INV_BATCH;
-                let denoms = &mut denominators[..xs.len() * num_routed_wires];
-                for t in 0..xs.len() {
+                let product_count = xs.len() * num_chunks;
+                debug_assert_eq!(products.len(), product_count);
+                for (t, &x) in xs.iter().enumerate() {
                     let i = base + t;
                     let s_sigmas = &prover_data.sigmas[i];
-                    for j in 0..num_routed_wires {
+                    let terms = (0..num_routed_wires).map(|j| {
                         let wire_value = witness.get_wire(i, j);
-                        denoms[t * num_routed_wires + j] = wire_value + beta * s_sigmas[j] + gamma;
-                    }
+                        let numerator = wire_value + beta_k_is[j] * x + gamma;
+                        let denominator = wire_value + beta * s_sigmas[j] + gamma;
+                        (numerator, denominator)
+                    });
+                    let start = t * num_chunks;
+                    let end = start + num_chunks;
+                    permutation_chunk_product_pairs(
+                        terms,
+                        degree,
+                        &mut numerator_products[start..end],
+                        &mut denominator_products[start..end],
+                    );
                 }
-                let mut quotient_values = F::batch_multiplicative_inverse(denoms);
-                xs.iter()
-                    .enumerate()
-                    .map(|(t, &x)| {
-                        let i = base + t;
-                        let point_quotients =
-                            &mut quotient_values[t * num_routed_wires..(t + 1) * num_routed_wires];
-                        // Multiply the numerators into the inverse buffer in
-                        // place; the per-point numerator Vecs are gone.
-                        for (j, quotient_value) in point_quotients.iter_mut().enumerate() {
-                            let wire_value = witness.get_wire(i, j);
-                            let numerator = wire_value + beta_k_is[j] * x + gamma;
-                            *quotient_value *= numerator;
-                        }
-                        quotient_chunk_products(point_quotients, degree)
-                    })
-                    .collect::<Vec<_>>()
+
+                F::batch_multiplicative_inverse_into(
+                    &denominator_products[..product_count],
+                    inverse_products,
+                );
+                for ((product, &denominator_inverse), &numerator_product) in products
+                    .iter_mut()
+                    .zip(inverse_products.iter())
+                    .zip(numerator_products.iter())
+                {
+                    *product = numerator_product * denominator_inverse;
+                }
             },
-        )
-        .flatten()
-        .collect::<Vec<_>>();
+        );
 
     // Accumulate the sequential Z chain directly into the column-major output
     // polynomials, deleting the per-point row Vec, the row-major intermediate,
     // and the whole-phase transpose. Values and their order are identical: for
     // each point, column k receives the k-th running product, and the last
     // column receives the previous Z(x) exactly as the swap-based version did.
-    let n_points = all_quotient_chunk_products.len();
-    let mut columns: Vec<Vec<F>> = (0..num_prods + 1)
+    let n_points = subgroup.len();
+    let mut columns: Vec<Vec<F>> = (0..num_chunks)
         .map(|_| Vec::with_capacity(n_points))
         .collect();
     let mut z_x = F::ONE;
-    for quotient_chunk_products in all_quotient_chunk_products {
+    for quotient_chunk_products in all_quotient_chunk_products.chunks_exact(num_chunks) {
         let mut acc = z_x;
         for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
             acc *= quotient_chunk_product;
@@ -512,6 +588,66 @@ fn wires_permutation_partial_products_and_zs<
     }
 
     columns.into_iter().map(PolynomialValues::new).collect()
+}
+
+#[cfg(test)]
+mod permutation_chunk_product_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::PrimeField64;
+
+    #[test]
+    fn chunk_products_before_inversion_match_individual_wire_ratios() {
+        type F = GoldilocksField;
+        for canonical in [true, false] {
+            for width in [1usize, 7, 8, 9, 79, 80, 81] {
+                for chunk_size in [2usize, 3, 8, 128] {
+                    let make = |seed: u64, i: usize| {
+                        let value = seed.wrapping_add((i as u64 + 1) * 0x9e37_79b9);
+                        if canonical {
+                            F::from_canonical_u64(value)
+                        } else {
+                            F::from_noncanonical_u64(u64::MAX - value)
+                        }
+                    };
+                    let numerators = (0..width).map(|i| make(0x1111, i)).collect::<Vec<_>>();
+                    let denominators = (0..width).map(|i| make(0x2222, i)).collect::<Vec<_>>();
+
+                    let mut wire_ratios = F::batch_multiplicative_inverse(&denominators);
+                    for (ratio, &numerator) in wire_ratios.iter_mut().zip(&numerators) {
+                        *ratio *= numerator;
+                    }
+                    let expected = wire_ratios
+                        .chunks(chunk_size)
+                        .map(|chunk| chunk.iter().copied().product::<F>())
+                        .collect::<Vec<_>>();
+
+                    let num_chunks = width.div_ceil(chunk_size);
+                    let mut numerator_products = vec![F::ZERO; num_chunks];
+                    let mut denominator_products = vec![F::ZERO; num_chunks];
+                    permutation_chunk_product_pairs(
+                        numerators.iter().copied().zip(denominators.iter().copied()),
+                        chunk_size,
+                        &mut numerator_products,
+                        &mut denominator_products,
+                    );
+                    let mut actual = F::batch_multiplicative_inverse(&denominator_products);
+                    for (ratio, numerator) in actual.iter_mut().zip(numerator_products) {
+                        *ratio *= numerator;
+                    }
+
+                    assert_eq!(actual, expected, "width={width}, chunk={chunk_size}");
+                    assert_eq!(
+                        actual.iter().map(|x| x.to_noncanonical_u64()).collect::<Vec<_>>(),
+                        expected.iter().map(|x| x.to_noncanonical_u64()).collect::<Vec<_>>(),
+                        "raw width={width}, chunk={chunk_size}"
+                    );
+                }
+            }
+        }
+    }
+
+
 }
 
 /// Computes lookup polynomials for a given challenge.
@@ -707,8 +843,19 @@ fn compute_quotient_polys<
     // steps away since we work on an LDE of degree `max_filtered_constraint_degree`.
     let next_step = 1 << quotient_degree_bits;
 
-    let points = F::two_adic_subgroup(common_data.degree_bits() + quotient_degree_bits);
-    let lde_size = points.len();
+    let log_lde = common_data.degree_bits() + quotient_degree_bits;
+    let lde_size = 1 << log_lde;
+    let half_lde_size = lde_size / 2;
+    // The retained FFT table's row for this domain stores its first half in the same order as
+    // `two_adic_subgroup`; the second half is its field negation. Fresh circuit data always has
+    // this row. Keep the allocation fallback for older/deserialized prover data without it.
+    let quotient_half_roots = prover_data
+        .fft_root_table
+        .as_ref()
+        .and_then(|table| log_lde.checked_sub(1).and_then(|row| table.get(row)))
+        .filter(|row| half_lde_size != 0 && row.len() >= half_lde_size);
+    let quotient_points_fallback =
+        quotient_half_roots.is_none().then(|| F::two_adic_subgroup(log_lde));
 
     let z_h_on_coset = ZeroPolyOnCoset::new(common_data.degree_bits(), quotient_degree_bits);
 
@@ -748,8 +895,7 @@ fn compute_quotient_polys<
     let lut_re_poly_evals_refs: Vec<&[F]> =
         lut_re_poly_evals.iter().map(|v| v.as_slice()).collect();
 
-    let points_batches = points.par_chunks(BATCH_SIZE);
-    let num_batches = points.len().div_ceil(BATCH_SIZE);
+    let num_batches = lde_size.div_ceil(BATCH_SIZE);
 
     struct QuotientScratch<F: RichField> {
         indices: Vec<usize>,
@@ -767,10 +913,9 @@ fn compute_quotient_polys<
     let zs_row_width = zs_partial_products_and_lookup_commitment.lde_row_width();
     let num_routed_wires = common_data.config.num_routed_wires;
 
-    let mut quotient_values = vec![F::ZERO; points.len() * num_challenges];
+    let mut quotient_values = vec![F::ZERO; lde_size * num_challenges];
     quotient_values
         .par_chunks_mut(BATCH_SIZE * num_challenges)
-        .zip(points_batches)
         .enumerate()
         .for_each_init(
             || QuotientScratch::<F> {
@@ -784,14 +929,13 @@ fn compute_quotient_polys<
                 zs_next_flat: Vec::new(),
                 vanishing: VanishingScratch::default(),
             },
-            |scratch, (batch_i, (quotient_values_batch, xs_batch))| {
+            |scratch, (batch_i, quotient_values_batch)| {
                 // Each batch must be the same size, except the last one, which may be smaller.
+                let n = quotient_values_batch.len() / num_challenges;
                 debug_assert!(
-                    xs_batch.len() == BATCH_SIZE
-                        || (batch_i == num_batches - 1 && xs_batch.len() <= BATCH_SIZE)
+                    n == BATCH_SIZE || (batch_i == num_batches - 1 && n <= BATCH_SIZE)
                 );
 
-                let n = xs_batch.len();
                 scratch.indices.clear();
                 scratch
                     .indices
@@ -802,9 +946,20 @@ fn compute_quotient_polys<
                     .extend(scratch.indices.iter().map(|&i| (i + next_step) % lde_size));
 
                 scratch.shifted_xs.clear();
-                scratch
-                    .shifted_xs
-                    .extend(xs_batch.iter().map(|&x| F::coset_shift() * x));
+                scratch.shifted_xs.extend(scratch.indices.iter().map(|&i| {
+                    let x = if let Some(half_roots) = quotient_half_roots {
+                        if i < half_lde_size {
+                            half_roots[i]
+                        } else {
+                            -half_roots[i - half_lde_size]
+                        }
+                    } else {
+                        quotient_points_fallback
+                            .as_ref()
+                            .expect("quotient domain fallback must exist")[i]
+                    };
+                    F::coset_shift() * x
+                }));
 
                 prover_data.constants_sigmas_commitment.fill_lde_batch(
                     &scratch.indices,
@@ -856,7 +1011,9 @@ fn compute_quotient_polys<
                     })
                     .collect();
                 let s_sigmas_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires])
+                    .map(|k| {
+                        &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires]
+                    })
                     .collect();
                 let (local_lookup_batch, next_lookup_batch): (Vec<&[F]>, Vec<&[F]>) = if has_lookup
                 {
@@ -920,7 +1077,7 @@ fn compute_quotient_polys<
             },
         );
 
-    debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
+    debug_assert_eq!(quotient_values.len(), lde_size * num_challenges);
     (0..num_challenges)
         .into_par_iter()
         .map(|challenge| {

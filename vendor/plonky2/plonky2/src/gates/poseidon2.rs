@@ -533,14 +533,22 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> SimpleGenerator<F
         let swap_value = witness.get_wire(local_wire(Poseidon2Gate::<F, D>::WIRE_SWAP));
         debug_assert!(swap_value == F::ZERO || swap_value == F::ONE);
 
-        for i in 0..4 {
-            let delta_i = swap_value * (state[i + 4] - state[i]);
-            out_buffer.set_wire(local_wire(Poseidon2Gate::<F, D>::wire_delta(i)), delta_i)?;
-        }
-
-        if swap_value == F::ONE {
+        if swap_value == F::ZERO {
             for i in 0..4 {
+                out_buffer.set_wire(local_wire(Poseidon2Gate::<F, D>::wire_delta(i)), F::ZERO)?;
+            }
+        } else if swap_value == F::ONE {
+            for i in 0..4 {
+                let delta_i = state[i + 4] - state[i];
+                out_buffer.set_wire(local_wire(Poseidon2Gate::<F, D>::wire_delta(i)), delta_i)?;
                 state.swap(i, 4 + i);
+            }
+        } else {
+            // Preserve the generic generator's behavior for malformed non-Boolean
+            // witnesses in release builds; valid circuit witnesses take the two fast paths.
+            for i in 0..4 {
+                let delta_i = swap_value * (state[i + 4] - state[i]);
+                out_buffer.set_wire(local_wire(Poseidon2Gate::<F, D>::wire_delta(i)), delta_i)?;
             }
         }
 
@@ -661,38 +669,59 @@ mod tests {
 
         let permutation_inputs = (0..WIDTH).map(F::from_canonical_usize).collect::<Vec<_>>();
 
-        let mut inputs = PartialWitness::new();
-        inputs
-            .set_wire(
-                Wire {
-                    row,
-                    column: Gate::WIRE_SWAP,
-                },
-                F::ZERO,
-            )
-            .unwrap();
-        for i in 0..WIDTH {
+        for swap_value in [F::ZERO, F::ONE] {
+            let mut inputs = PartialWitness::new();
             inputs
                 .set_wire(
                     Wire {
                         row,
-                        column: Gate::wire_input(i),
+                        column: Gate::WIRE_SWAP,
                     },
-                    permutation_inputs[i],
+                    swap_value,
                 )
                 .unwrap();
-        }
+            for i in 0..WIDTH {
+                inputs
+                    .set_wire(
+                        Wire {
+                            row,
+                            column: Gate::wire_input(i),
+                        },
+                        permutation_inputs[i],
+                    )
+                    .unwrap();
+            }
 
-        let witness =
-            generate_partial_witness(inputs, &circuit.prover_only, &circuit.common).unwrap();
+            let witness =
+                generate_partial_witness(inputs, &circuit.prover_only, &circuit.common).unwrap();
 
-        let expected_outputs: [F; WIDTH] = F::poseidon2(permutation_inputs.try_into().unwrap());
-        for i in 0..WIDTH {
-            let out = witness.get_wire(Wire {
-                row: 0,
-                column: Gate::wire_output(i),
-            });
-            assert_eq!(out, expected_outputs[i]);
+            let mut expected_inputs: [F; WIDTH] = permutation_inputs.clone().try_into().unwrap();
+            for i in 0..4 {
+                let expected_delta = if swap_value == F::ZERO {
+                    F::ZERO
+                } else {
+                    expected_inputs[i + 4] - expected_inputs[i]
+                };
+                assert_eq!(
+                    witness.get_wire(Wire {
+                        row,
+                        column: Gate::wire_delta(i),
+                    }),
+                    expected_delta
+                );
+                if swap_value == F::ONE {
+                    expected_inputs.swap(i, i + 4);
+                }
+            }
+
+            let expected_outputs: [F; WIDTH] = F::poseidon2(expected_inputs);
+            for i in 0..WIDTH {
+                let out = witness.get_wire(Wire {
+                    row,
+                    column: Gate::wire_output(i),
+                });
+                assert_eq!(out, expected_outputs[i]);
+            }
         }
     }
 

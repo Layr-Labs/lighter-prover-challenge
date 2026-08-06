@@ -17,9 +17,12 @@ pub mod serialization;
 pub mod strided_view;
 pub mod timing;
 
-pub(crate) fn transpose_poly_values<F: Field>(polys: Vec<PolynomialValues<F>>) -> Vec<Vec<F>> {
-    let poly_values = polys.into_iter().map(|p| p.values).collect::<Vec<_>>();
-    transpose(&poly_values)
+pub(crate) fn transpose_poly_values<F: Field>(polys: &[PolynomialValues<F>]) -> Vec<Vec<F>> {
+    let len = polys[0].len();
+    (0..len)
+        .into_par_iter()
+        .map(|i| polys.iter().map(|poly| poly.values[i]).collect())
+        .collect()
 }
 
 pub fn transpose<T: Send + Sync + Copy>(matrix: &[Vec<T>]) -> Vec<Vec<T>> {

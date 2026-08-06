@@ -370,9 +370,9 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
     let n = values.len();
     let lg_n = log2_strict(n);
 
-    if root_table.len() != lg_n {
+    if root_table.len() < lg_n {
         panic!(
-            "Expected root table of length {}, but it was {}.",
+            "Expected a root table of length at least {}, but it was {}.",
             lg_n,
             root_table.len()
         );
@@ -404,7 +404,10 @@ mod tests {
     use unroll::unroll_for_loops;
 
     use crate::extension::quadratic::QuadraticExtension;
-    use crate::fft::{FftRootTable, fft, fft_classic, fft_root_table, fft_with_options, ifft};
+    use crate::fft::{
+        FftRootTable, fft, fft_classic, fft_root_table, fft_with_options, ifft,
+        ifft_with_options,
+    };
     use crate::goldilocks_field::GoldilocksField;
     use crate::packable::Packable;
     use crate::packed::PackedField;
@@ -429,7 +432,11 @@ mod tests {
         let points = fft(coefficients.clone());
         assert_eq!(points, evaluate_naive(&coefficients));
 
+        let larger_root_table = fft_root_table::<F>(1 << 12);
+        let interpolated_with_larger_roots =
+            ifft_with_options(points.clone(), None, Some(&larger_root_table));
         let interpolated_coefficients = ifft(points);
+        assert_eq!(interpolated_with_larger_roots, interpolated_coefficients);
         for i in 0..degree {
             assert_eq!(interpolated_coefficients.coeffs[i], coefficients.coeffs[i]);
         }

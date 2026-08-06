@@ -1,4 +1,3 @@
-use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display};
 use core::hash::Hash;
@@ -131,6 +130,13 @@ pub trait Field:
     }
 
     fn batch_multiplicative_inverse(x: &[Self]) -> Vec<Self> {
+        let mut buf = Vec::with_capacity(x.len());
+        Self::batch_multiplicative_inverse_into(x, &mut buf);
+        buf
+    }
+
+    /// Like [`Field::batch_multiplicative_inverse`], but reuses the caller's output buffer.
+    fn batch_multiplicative_inverse_into(x: &[Self], buf: &mut Vec<Self>) {
         // This is Montgomery's trick. At a high level, we invert the product of the given field
         // elements, then derive the individual inverses from that via multiplication.
 
@@ -145,23 +151,28 @@ pub trait Field:
         // modification if it is changed. I tried to make it more generic, but Rust's const
         // generics are not yet good enough.
 
+        buf.clear();
+
         // Handle special cases. Paradoxically, below is repetitive but concise.
         // The branches should be very predictable.
         let n = x.len();
         if n == 0 {
-            return Vec::new();
+            return;
         } else if n == 1 {
-            return vec![x[0].inverse()];
+            buf.push(x[0].inverse());
+            return;
         } else if n == 2 {
             let x01 = x[0] * x[1];
             let x01inv = x01.inverse();
-            return vec![x01inv * x[1], x01inv * x[0]];
+            buf.extend([x01inv * x[1], x01inv * x[0]]);
+            return;
         } else if n == 3 {
             let x01 = x[0] * x[1];
             let x012 = x01 * x[2];
             let x012inv = x012.inverse();
             let x01inv = x012inv * x[2];
-            return vec![x01inv * x[1], x01inv * x[0], x012inv * x01];
+            buf.extend([x01inv * x[1], x01inv * x[0], x012inv * x01]);
+            return;
         }
         debug_assert!(n >= WIDTH);
 
@@ -175,7 +186,7 @@ pub trait Field:
         // ].
         // If n is not a multiple of WIDTH, the result is truncated from the end. For example,
         // for n == 5, we get [x[0], x[1], x[2], x[3], x[0] * x[4]].
-        let mut buf: Vec<Self> = Vec::with_capacity(n);
+        buf.reserve(n);
         // cumul_prod holds the last WIDTH elements of buf. This is redundant, but it's how we
         // convince LLVM to keep the values in the registers.
         let mut cumul_prod: [Self; WIDTH] = x[..WIDTH].try_into().unwrap();
@@ -218,8 +229,6 @@ pub trait Field:
             // Sanity check only.
             debug_assert_eq!(bi * xi, Self::ONE);
         }
-
-        buf
     }
 
     /// Compute the inverse of 2^exp in this field.

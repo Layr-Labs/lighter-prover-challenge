@@ -391,17 +391,12 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
 
         let num_limbs = U32SubtractionGate::<F, D>::num_limbs();
         let limb_base = 1 << U32SubtractionGate::<F, D>::limb_bits();
-        let output_limbs: Vec<_> = (0..num_limbs)
-            .scan(output_result_u64, |acc, _| {
-                let tmp = *acc % limb_base;
-                *acc /= limb_base;
-                Some(F::from_canonical_u64(tmp))
-            })
-            .collect();
-
+        let mut remaining = output_result_u64;
         for j in 0..num_limbs {
+            let limb = F::from_canonical_u64(remaining % limb_base);
+            remaining /= limb_base;
             let wire = local_wire(self.gate.wire_ith_output_jth_limb(self.i, j));
-            out_buffer.set_wire(wire, output_limbs[j])?;
+            out_buffer.set_wire(wire, limb)?;
         }
 
         Ok(())

@@ -1220,6 +1220,10 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             "generate sigma polynomials",
             self.sigma_vecs(&k_is, &subgroup)
         );
+        // The prover retains sigmas row-major while the commitment consumes them column-major.
+        // Form the retained copy first so the original column allocations can be moved into the
+        // commitment rather than cloned in full and discarded after a second transpose copy.
+        let sigmas = transpose_poly_values(&sigma_vecs);
 
         // Precompute FFT roots.
         let max_fft_points = 1 << (degree_bits + max(rate_bits, log2_ceil(quotient_degree_factor)));
@@ -1227,7 +1231,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
 
         let constants_sigmas_commitment = if commit_to_sigma {
             let mut constants_sigmas_vecs = constant_vecs;
-            constants_sigmas_vecs.extend(sigma_vecs.iter().cloned());
+            constants_sigmas_vecs.extend(sigma_vecs);
             PolynomialBatch::<F, C, D>::from_values(
                 constants_sigmas_vecs,
                 rate_bits,
@@ -1339,7 +1343,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             generators: self.generators,
             generator_indices_by_watches,
             constants_sigmas_commitment,
-            sigmas: transpose_poly_values(sigma_vecs),
+            sigmas,
             subgroup,
             public_inputs: self.public_inputs,
             representative_map: forest.parents,

@@ -8,7 +8,7 @@ use alloc::{
 use core::fmt::Debug;
 use core::marker::PhantomData;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use plonky2_maybe_rayon::*;
 
 use crate::field::extension::Extendable;
@@ -237,24 +237,22 @@ fn run_generator_worklist<
                 *remaining_generators -= 1;
             }
 
-            // Merge any generated values into our witness, and get a list of newly-populated
-            // targets' representatives.
-            let mut new_target_reps = Vec::with_capacity(buffer.target_values.len());
+            // Merge each generated value and immediately enqueue unfinished generators watching
+            // its newly populated representative. The next round does not begin until this entire
+            // pending round has been processed, so this preserves the former representative and
+            // watcher order while avoiding one temporary allocation per generator invocation.
             for (t, v) in buffer.target_values.drain(..) {
-                let reps = witness.set_target_returning_rep(t, v)?;
-                new_target_reps.extend(reps);
-            }
-
-            // Enqueue unfinished generators that were watching one of the newly populated targets.
-            for watch in new_target_reps {
-                let opt_watchers = generator_indices_by_watches.get(&watch);
-                if let Some(watchers) = opt_watchers {
-                    for &watching_generator_idx in watchers {
-                        if !generator_is_expired[watching_generator_idx] {
-                            debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                            unresolved_watches[watching_generator_idx] -= 1;
-                            next_pending_generator_indices.push(watching_generator_idx);
-                        }
+                let Some(watch) = witness.set_target_returning_rep(t, v)? else {
+                    continue;
+                };
+                let Some(watchers) = generator_indices_by_watches.get(&watch) else {
+                    continue;
+                };
+                for &watching_generator_idx in watchers {
+                    if !generator_is_expired[watching_generator_idx] {
+                        debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
+                        unresolved_watches[watching_generator_idx] -= 1;
+                        next_pending_generator_indices.push(watching_generator_idx);
                     }
                 }
             }
@@ -781,8 +779,8 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D> for Con
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
