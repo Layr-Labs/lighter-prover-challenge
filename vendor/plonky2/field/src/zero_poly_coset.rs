@@ -4,7 +4,7 @@ use crate::packed::PackedField;
 use crate::types::Field;
 
 /// Precomputations of the evaluation of `Z_H(X) = X^n - 1` on a coset `gK` with `H <= K`.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct ZeroPolyOnCoset<F: Field> {
     /// `n = |H|`.
     n: F,
@@ -58,5 +58,48 @@ impl<F: Field> ZeroPolyOnCoset<F> {
     pub fn eval_l_0(&self, i: usize, x: F) -> F {
         // Could also precompute the inverses using Montgomery.
         self.eval(i) * (self.n * (x - F::ONE)).inverse()
+    }
+
+    /// Evaluates `L_0` over an entire coset using one batched field inversion.
+    pub fn l_0_evals(&self, xs: &[F]) -> Vec<F> {
+        let denominators = xs
+            .iter()
+            .map(|&x| self.n * (x - F::ONE))
+            .collect::<Vec<_>>();
+        let denominator_inverses = F::batch_multiplicative_inverse(&denominators);
+
+        denominator_inverses
+            .into_iter()
+            .enumerate()
+            .map(|(i, denominator_inverse)| self.eval(i) * denominator_inverse)
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::goldilocks_field::GoldilocksField;
+    use crate::types::Field;
+    use crate::zero_poly_coset::ZeroPolyOnCoset;
+
+    #[test]
+    fn batched_l_0_evals_match_definition() {
+        type F = GoldilocksField;
+        const N_LOG: usize = 5;
+        const RATE_BITS: usize = 3;
+
+        let points = F::two_adic_subgroup(N_LOG + RATE_BITS)
+            .into_iter()
+            .map(|x| F::coset_shift() * x)
+            .collect::<Vec<_>>();
+        let zero_poly = ZeroPolyOnCoset::<F>::new(N_LOG, RATE_BITS);
+        let actual = zero_poly.l_0_evals(&points);
+        let n = F::from_canonical_usize(1 << N_LOG);
+        let expected = points
+            .iter()
+            .map(|&x| (x.exp_power_of_2(N_LOG) - F::ONE) * (n * (x - F::ONE)).inverse())
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
     }
 }

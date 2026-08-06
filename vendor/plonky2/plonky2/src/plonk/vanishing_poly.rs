@@ -8,7 +8,6 @@ use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
-use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
 use crate::gates::selectors::LookupSelectors;
@@ -21,7 +20,7 @@ use crate::plonk::plonk_common;
 use crate::plonk::plonk_common::eval_l_0_circuit;
 use crate::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBaseBatch};
 use crate::util::partial_products::{
-    check_partial_products, check_partial_products_circuit, check_partial_products_into,
+    check_partial_products, check_partial_products_circuit, check_permutation_partial_products_into,
 };
 use crate::util::reducing::ReducingFactorTarget;
 use crate::with_context;
@@ -168,8 +167,6 @@ pub(crate) fn eval_vanishing_poly<F: RichField + Extendable<D>, const D: usize>(
 /// once per 32-point batch.
 #[derive(Default)]
 pub(crate) struct VanishingScratch<F> {
-    pub numerator_values: Vec<F>,
-    pub denominator_values: Vec<F>,
     pub vanishing_z_1_terms: Vec<F>,
     pub vanishing_partial_products_terms: Vec<F>,
     pub vanishing_all_lookup_terms: Vec<F>,
@@ -205,8 +202,8 @@ fn reduce_gate_constraints_base_batch<F: Field>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
-    indices_batch: &[usize],
     xs_batch: &[F],
+    l_0_batch: &[F],
     vars_batch: EvaluationVarsBaseBatch<F>,
     local_zs_batch: &[&[F]],
     next_zs_batch: &[&[F]],
@@ -219,15 +216,14 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     beta_k_is: &[F],
     deltas: &[F],
     alphas: &[F],
-    z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
     scratch: &mut VanishingScratch<F>,
     res_out: &mut [F],
 ) {
     let has_lookup = common_data.num_lookup_polys != 0;
 
-    let n = indices_batch.len();
-    assert_eq!(xs_batch.len(), n);
+    let n = xs_batch.len();
+    assert_eq!(l_0_batch.len(), n);
     assert_eq!(vars_batch.len(), n);
     assert_eq!(local_zs_batch.len(), n);
     assert_eq!(next_zs_batch.len(), n);
@@ -261,11 +257,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
     reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out);
 
-    let numerator_values = &mut scratch.numerator_values;
-    let denominator_values = &mut scratch.denominator_values;
-    numerator_values.clear();
-    denominator_values.clear();
-
     // The L_0(x) (Z(x) - 1) vanishing terms.
     let vanishing_z_1_terms = &mut scratch.vanishing_z_1_terms;
     // The terms checking the partial products.
@@ -277,137 +268,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     vanishing_all_lookup_terms.clear();
 
     debug_assert_eq!(res_out.len(), n * num_challenges);
-
-    // Column-major evaluation of the permutation-argument terms when the
-    // circuit has no lookups. Per point this performs exactly the same field
-    // operations, in the same order, as the per-point loop below; it only
-    // reads each wire and sigma column contiguously across the batch instead
-    // of through per-point strided views. Term rows are laid out in the same
-    // order the per-point loop pushes terms, and the final alpha reduction
-    // consumes them in the same reversed order, so `res_out` is
-    // value-identical.
-    if !has_lookup {
-        let wires = vars_batch.local_wires;
-        let chunk_size = max_degree;
-        let num_chunks = num_routed_wires.div_ceil(chunk_size);
-        debug_assert_eq!(num_chunks, num_prods + 1);
-        // The per-point loop chains ALL z_1 terms (i ascending) before ALL
-        // partial-product terms (i-major, chunk-minor); the row layout must
-        // match exactly so each term meets the same alpha power.
-        let num_rows = num_challenges * (1 + num_chunks);
-
-        let term_rows = &mut scratch.vanishing_partial_products_terms;
-        term_rows.clear();
-        term_rows.resize(num_rows * n, F::ZERO);
-
-        let l_0_xs = &mut scratch.vanishing_z_1_terms;
-        l_0_xs.clear();
-        l_0_xs.extend(
-            indices_batch
-                .iter()
-                .zip(xs_batch)
-                .map(|(&index, &x)| z_h_on_coset.eval_l_0(index, x)),
-        );
-
-        let num_prod = &mut scratch.numerator_values;
-        let den_prod = &mut scratch.denominator_values;
-
-        // Hoist the per-point sigma rows into contiguous columns so the
-        // chunk-product loops read them with unit stride. Values unchanged;
-        // each sigma is read once per challenge, so the transpose pays for
-        // itself with the standard two challenges.
-        let sigma_cols = &mut scratch.lookup_selectors;
-        sigma_cols.clear();
-        sigma_cols.resize(num_routed_wires * n, F::ZERO);
-        for (k, s_sigmas) in s_sigmas_batch.iter().enumerate() {
-            for (j, &s) in s_sigmas.iter().take(num_routed_wires).enumerate() {
-                sigma_cols[j * n + k] = s;
-            }
-        }
-
-        // Same treatment for the per-point Z and partial-product slices: one
-        // transpose into contiguous columns kills the per-point double
-        // dereferences in the accumulator-selection loop below.
-        let acc_cols_len = num_challenges * (num_prods + 2) * n;
-        let mut acc_cols = vec![F::ZERO; acc_cols_len];
-        let acc_stride = (num_prods + 2) * n;
-        for k in 0..n {
-            let local_zs = local_zs_batch[k];
-            let next_zs = next_zs_batch[k];
-            let partial_products = partial_products_batch[k];
-            for i in 0..num_challenges {
-                let base = i * acc_stride;
-                acc_cols[base + k] = local_zs[i];
-                for (c, &p) in partial_products[i * num_prods..(i + 1) * num_prods]
-                    .iter()
-                    .enumerate()
-                {
-                    acc_cols[base + (c + 1) * n + k] = p;
-                }
-                acc_cols[base + (num_prods + 1) * n + k] = next_zs[i];
-            }
-        }
-
-        for i in 0..num_challenges {
-            let z_col = &acc_cols[i * acc_stride..][..n];
-            let z1_row = &mut term_rows[i * n..][..n];
-            for k in 0..n {
-                z1_row[k] = l_0_xs[k] * z_col[k].sub_one();
-            }
-
-            for c in 0..num_chunks {
-                let j_range = c * chunk_size..((c + 1) * chunk_size).min(num_routed_wires);
-
-                num_prod.clear();
-                num_prod.resize(n, F::ONE);
-                den_prod.clear();
-                den_prod.resize(n, F::ONE);
-                for j in j_range {
-                    let wire_col = &wires[j * n..][..n];
-                    let sigma_col = &sigma_cols[j * n..][..n];
-                    let beta_k_i = beta_k_is[i * num_routed_wires + j];
-                    let beta = betas[i];
-                    let gamma = gammas[i];
-                    for k in 0..n {
-                        num_prod[k] *= wire_col[k] + beta_k_i * xs_batch[k] + gamma;
-                        den_prod[k] *= wire_col[k] + beta * sigma_col[k] + gamma;
-                    }
-                }
-
-                let row =
-                    &mut term_rows[(num_challenges + i * num_chunks + c) * n..][..n];
-                // The accumulator chain per challenge is laid out as columns
-                // [Z(x) | partials 0..num_prods | Z(gx)], so chunk c reads
-                // column c as prev and column c+1 as next — contiguously.
-                let prev_col = &acc_cols[i * acc_stride + c * n..][..n];
-                let next_col = &acc_cols[i * acc_stride + (c + 1) * n..][..n];
-                for k in 0..n {
-                    row[k] = prev_col[k] * num_prod[k] - next_col[k] * den_prod[k];
-                }
-            }
-        }
-
-        // Same reversed-order Horner reduction as the per-point loop.
-        for t in (0..num_rows).rev() {
-            let row = &term_rows[t * n..][..n];
-            for k in 0..n {
-                let res = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
-                for (c, &alpha) in res.iter_mut().zip(alphas) {
-                    *c = row[k].multiply_accumulate(*c, alpha);
-                }
-            }
-        }
-
-        term_rows.clear();
-        l_0_xs.clear();
-        num_prod.clear();
-        den_prod.clear();
-        scratch.lookup_selectors.clear();
-        return;
-    }
-
     for k in 0..n {
-        let index = indices_batch[k];
         let x = xs_batch[k];
         let vars = vars_batch.view(k);
 
@@ -435,7 +296,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         let partial_products = partial_products_batch[k];
         let s_sigmas = s_sigmas_batch[k];
 
-        let l_0_x = z_h_on_coset.eval_l_0(index, x);
+        let l_0_x = l_0_batch[k];
         for i in 0..num_challenges {
             let z_x = local_zs[i];
             let z_gx = next_zs[i];
@@ -462,35 +323,25 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 vanishing_all_lookup_terms.extend(lookup_constraints);
             }
 
-            numerator_values.extend((0..num_routed_wires).map(|j| {
-                let wire_value = vars.local_wires[j];
-                let beta_k_i = beta_k_is[i * num_routed_wires + j];
-                wire_value + beta_k_i * x + gammas[i]
-            }));
-            denominator_values.extend((0..num_routed_wires).map(|j| {
-                let wire_value = vars.local_wires[j];
-                let s_sigma = s_sigmas[j];
-                wire_value + betas[i] * s_sigma + gammas[i]
-            }));
-
             // The partial products considered for this iteration of `i`.
             let current_partial_products = &partial_products[i * num_prods..(i + 1) * num_prods];
-            // Check the numerator partial products, appending the terms directly to the
-            // worker-local scratch vector instead of collecting a fresh ten-element `Vec`
-            // per point and challenge. Not cleared between challenges: challenge `i + 1`
-            // must append after challenge `i` for the same point.
-            check_partial_products_into(
-                numerator_values,
-                denominator_values,
+            let current_beta_k_is = &beta_k_is[i * num_routed_wires..(i + 1) * num_routed_wires];
+            // Build each numerator/denominator chunk product directly from the wire and
+            // sigma evaluations, avoiding two materialized routed-wire arrays.
+            check_permutation_partial_products_into(
+                num_routed_wires,
+                |j| vars.local_wires[j],
+                s_sigmas,
+                current_beta_k_is,
+                betas[i],
+                gammas[i],
+                x,
                 current_partial_products,
                 z_x,
                 z_gx,
                 max_degree,
                 vanishing_partial_products_terms,
             );
-
-            numerator_values.clear();
-            denominator_values.clear();
         }
 
         let vanishing_terms = vanishing_z_1_terms
