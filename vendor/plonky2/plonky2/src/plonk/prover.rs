@@ -3,6 +3,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
 use core::cmp::min;
+use core::mem::swap;
 
 use anyhow::{ensure, Result};
 use hashbrown::HashMap;
@@ -32,9 +33,9 @@ use crate::plonk::vanishing_poly::{
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
-use crate::util::partial_products::quotient_chunk_products;
+use crate::util::partial_products::{partial_products_and_z_gx, quotient_chunk_products};
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil};
+use crate::util::{log2_ceil, transpose};
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -201,14 +202,6 @@ where
 
     let betas = challenger.get_n_challenges(num_challenges);
     let gammas = challenger.get_n_challenges(num_challenges);
-    // The quotient numerator uses `beta_i * (k_j * x)` for every routed wire
-    // and quotient point. Reassociate this finite-field product once per
-    // challenge and wire; the resulting coefficient is reused across all
-    // quotient batches.
-    let beta_k_is: Vec<F> = betas
-        .iter()
-        .flat_map(|&beta| common_data.k_is.iter().map(move |&k_i| beta * k_i))
-        .collect();
 
     let deltas = if has_lookup {
         let mut delts = Vec::with_capacity(2 * num_challenges);
@@ -229,14 +222,7 @@ where
     let mut partial_products_and_zs = timed!(
         timing,
         "compute partial products",
-        all_wires_permutation_partial_products(
-            &witness,
-            &betas,
-            &beta_k_is,
-            &gammas,
-            prover_data,
-            common_data,
-        )
+        all_wires_permutation_partial_products(&witness, &betas, &gammas, prover_data, common_data)
     );
 
     // Z is expected at the front of our batch; see `zs_range` and `partial_products_range`.
@@ -285,7 +271,6 @@ where
             &partial_products_zs_and_lookup_commitment,
             &betas,
             &gammas,
-            &beta_k_is,
             &deltas,
             &alphas,
         )
@@ -387,21 +372,15 @@ fn all_wires_permutation_partial_products<
 >(
     witness: &MatrixWitness<F>,
     betas: &[F],
-    beta_k_is: &[F],
     gammas: &[F],
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
 ) -> Vec<Vec<PolynomialValues<F>>> {
-    let num_challenges = common_data.config.num_challenges;
-    let num_routed_wires = common_data.config.num_routed_wires;
-    debug_assert_eq!(betas.len(), num_challenges);
-    debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
     (0..common_data.config.num_challenges)
         .map(|i| {
             wires_permutation_partial_products_and_zs(
                 witness,
                 betas[i],
-                &beta_k_is[i * num_routed_wires..(i + 1) * num_routed_wires],
                 gammas[i],
                 prover_data,
                 common_data,
@@ -420,69 +399,56 @@ fn wires_permutation_partial_products_and_zs<
 >(
     witness: &MatrixWitness<F>,
     beta: F,
-    beta_k_is: &[F],
     gamma: F,
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
 ) -> Vec<PolynomialValues<F>> {
     let degree = common_data.quotient_degree_factor;
     let subgroup = &prover_data.subgroup;
+    let k_is = &common_data.k_is;
     let num_prods = common_data.num_partial_products;
-    debug_assert_eq!(beta_k_is.len(), common_data.config.num_routed_wires);
-    let num_routed_wires = common_data.config.num_routed_wires;
     let all_quotient_chunk_products = subgroup
         .par_iter()
         .enumerate()
-        .map_init(
-            // One denominator scratch buffer per worker thread instead of a
-            // fresh Vec per subgroup point.
-            || vec![F::ZERO; num_routed_wires],
-            |denominators, (i, &x)| {
-                let s_sigmas = &prover_data.sigmas[i];
-                for (j, denominator) in denominators.iter_mut().enumerate() {
+        .map(|(i, &x)| {
+            let s_sigmas = &prover_data.sigmas[i];
+            let numerators = (0..common_data.config.num_routed_wires).map(|j| {
+                let wire_value = witness.get_wire(i, j);
+                let k_i = k_is[j];
+                let s_id = k_i * x;
+                wire_value + beta * s_id + gamma
+            });
+            let denominators = (0..common_data.config.num_routed_wires)
+                .map(|j| {
                     let wire_value = witness.get_wire(i, j);
-                    *denominator = wire_value + beta * s_sigmas[j] + gamma;
-                }
-                let mut quotient_values = F::batch_multiplicative_inverse(denominators);
-                // Multiply the numerators into the inverse buffer in place;
-                // the per-point numerator and quotient Vecs are gone.
-                for (j, quotient_value) in quotient_values.iter_mut().enumerate() {
-                    let wire_value = witness.get_wire(i, j);
-                    let numerator = wire_value + beta_k_is[j] * x + gamma;
-                    *quotient_value *= numerator;
-                }
+                    let s_sigma = s_sigmas[j];
+                    wire_value + beta * s_sigma + gamma
+                })
+                .collect::<Vec<_>>();
+            let denominator_invs = F::batch_multiplicative_inverse(&denominators);
+            let quotient_values = numerators
+                .zip(denominator_invs)
+                .map(|(num, den_inv)| num * den_inv)
+                .collect::<Vec<_>>();
 
-                quotient_chunk_products(&quotient_values, degree)
-            },
-        )
+            quotient_chunk_products(&quotient_values, degree)
+        })
         .collect::<Vec<_>>();
 
-    // Accumulate the sequential Z chain directly into the column-major output
-    // polynomials, deleting the per-point row Vec, the row-major intermediate,
-    // and the whole-phase transpose. Values and their order are identical: for
-    // each point, column k receives the k-th running product, and the last
-    // column receives the previous Z(x) exactly as the swap-based version did.
-    let n_points = all_quotient_chunk_products.len();
-    let mut columns: Vec<Vec<F>> = (0..num_prods + 1)
-        .map(|_| Vec::with_capacity(n_points))
-        .collect();
     let mut z_x = F::ONE;
+    let mut all_partial_products_and_zs = Vec::with_capacity(all_quotient_chunk_products.len());
     for quotient_chunk_products in all_quotient_chunk_products {
-        let mut acc = z_x;
-        for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
-            acc *= quotient_chunk_product;
-            if k == num_prods {
-                // The last term is Z(gx), but we store Z(x) in its place,
-                // otherwise Z would end up shifted.
-                columns[k].push(z_x);
-                z_x = acc;
-            } else {
-                columns[k].push(acc);
-            }
-        }
+        let mut partial_products_and_z_gx =
+            partial_products_and_z_gx(z_x, &quotient_chunk_products);
+        // The last term is Z(gx), but we replace it with Z(x), otherwise Z would end up shifted.
+        swap(&mut z_x, &mut partial_products_and_z_gx[num_prods]);
+        all_partial_products_and_zs.push(partial_products_and_z_gx);
     }
 
-    columns.into_iter().map(PolynomialValues::new).collect()
+    transpose(&all_partial_products_and_zs)
+        .into_par_iter()
+        .map(PolynomialValues::new)
+        .collect()
 }
 
 /// Computes lookup polynomials for a given challenge.
@@ -656,7 +622,6 @@ fn compute_quotient_polys<
     zs_partial_products_and_lookup_commitment: &'a PolynomialBatch<F, C, D>,
     betas: &[F],
     gammas: &[F],
-    beta_k_is: &[F],
     deltas: &[F],
     alphas: &[F],
 ) -> Vec<PolynomialCoeffs<F>> {
@@ -814,41 +779,6 @@ fn compute_quotient_polys<
                 );
 
                 let indices_batch = &scratch.indices;
-                let local_zs_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.zs_local_flat[k * zs_row_width..][common_data.zs_range()])
-                    .collect();
-                let next_zs_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.zs_next_flat[k * zs_row_width..][common_data.zs_range()])
-                    .collect();
-                let partial_products_batch: Vec<&[F]> = (0..n)
-                    .map(|k| {
-                        &scratch.zs_local_flat[k * zs_row_width..]
-                            [common_data.partial_products_range()]
-                    })
-                    .collect();
-                let s_sigmas_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires])
-                    .collect();
-                let (local_lookup_batch, next_lookup_batch): (Vec<&[F]>, Vec<&[F]>) = if has_lookup
-                {
-                    (
-                        (0..n)
-                            .map(|k| {
-                                &scratch.zs_local_flat[k * zs_row_width..]
-                                    [common_data.lookup_range()]
-                            })
-                            .collect(),
-                        (0..n)
-                            .map(|k| {
-                                &scratch.zs_next_flat[k * zs_row_width..]
-                                    [common_data.lookup_range()]
-                            })
-                            .collect(),
-                    )
-                } else {
-                    (Vec::new(), Vec::new())
-                };
-
                 let vars_batch = EvaluationVarsBaseBatch::new(
                     n,
                     &scratch.local_constants,
@@ -862,15 +792,13 @@ fn compute_quotient_polys<
                     indices_batch,
                     &scratch.shifted_xs,
                     vars_batch,
-                    &local_zs_batch,
-                    &next_zs_batch,
-                    &local_lookup_batch,
-                    &next_lookup_batch,
-                    &partial_products_batch,
-                    &s_sigmas_batch,
+                    &scratch.zs_local_flat,
+                    &scratch.zs_next_flat,
+                    &scratch.s_sigmas_flat,
+                    zs_row_width,
+                    num_routed_wires,
                     betas,
                     gammas,
-                    beta_k_is,
                     deltas,
                     alphas,
                     &z_h_on_coset,
