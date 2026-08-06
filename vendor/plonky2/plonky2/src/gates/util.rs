@@ -13,6 +13,15 @@ pub struct StridedConstraintConsumer<'a, P: PackedField> {
     start: *mut P::Scalar,
     end: *mut P::Scalar,
     stride: usize,
+    /// `None` stores each constraint, overwriting the destination. `Some(f)`
+    /// folds it in as `dest += f * constraint`, which lets a caller accumulate
+    /// filtered constraints straight into the shared quotient buffer instead of
+    /// materializing the full `batch_size * num_constraints` matrix first.
+    ///
+    /// The selector filter is constant for a given evaluation point, so it
+    /// lives here rather than being reapplied per constraint, and the mode is
+    /// fixed for the consumer's whole lifetime.
+    filter: Option<P>,
     _phantom: PhantomData<&'a mut [P::Scalar]>,
 }
 
@@ -35,17 +44,44 @@ impl<'a, P: PackedField> StridedConstraintConsumer<'a, P> {
             start,
             end,
             stride,
+            filter: None,
             _phantom: PhantomData,
         }
     }
 
+    /// Like [`Self::new`], but each emitted constraint is folded into the
+    /// destination as `dest += filter * constraint` instead of overwriting it.
+    ///
+    /// The destination must already be initialized (it is the shared quotient
+    /// accumulator, which the caller zeroes once per batch), and `stride` /
+    /// `offset` mean exactly what they do for [`Self::new`], so the emission
+    /// order and layout a gate produces are unchanged.
+    pub fn new_accumulating(
+        buffer: &'a mut [P::Scalar],
+        stride: usize,
+        offset: usize,
+        filter: P,
+    ) -> Self {
+        let mut this = Self::new(buffer, stride, offset);
+        this.filter = Some(filter);
+        this
+    }
+
     /// Emit one constraint.
+    #[inline]
     pub fn one(&mut self, constraint: P) {
         if !core::ptr::eq(self.start, self.end) {
             // # Safety
-            // The checks in `new` guarantee that this points to valid space.
+            // The checks in `new` guarantee that this points to valid space. In
+            // the accumulating mode we also read the slot first, which is sound
+            // because `new_accumulating`'s contract requires an initialized
+            // destination.
             unsafe {
-                *self.start.cast() = constraint;
+                let slot = self.start.cast::<P>();
+                match self.filter {
+                    None => *slot = constraint,
+                    Some(filter) => *slot = *slot + filter * constraint,
+                }
             }
             // See the comment in `new`. `wrapping_add` is needed to avoid UB if we've just
             // exhausted our buffer (and hence we're setting `self.start` to point past the end).
