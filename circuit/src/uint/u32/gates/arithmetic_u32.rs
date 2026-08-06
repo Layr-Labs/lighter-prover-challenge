@@ -11,6 +11,7 @@
 use core::marker::PhantomData;
 
 use anyhow::Result;
+use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
@@ -249,6 +250,105 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32ArithmeticG
             }
         }
         res
+    }
+
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
+
+        let wires = vars_base.local_wires;
+        let three = F::from_canonical_usize(3);
+        let limb_base = F::from_canonical_u64(1u64 << Self::limb_bits());
+        let base32 = F::from_canonical_u64(1 << 32u64);
+        let u32_max = F::from_canonical_u32(u32::MAX);
+        let midpoint = Self::num_limbs() / 2;
+        let mut scratch = vec![F::ZERO; n];
+        let mut combined_low = vec![F::ZERO; n];
+        let mut combined_high = vec![F::ZERO; n];
+        let mut constraint_index = 0;
+
+        for i in 0..self.num_ops {
+            let multiplicand_0 = &wires[self.wire_ith_multiplicand_0(i) * n..][..n];
+            let multiplicand_1 = &wires[self.wire_ith_multiplicand_1(i) * n..][..n];
+            let addend = &wires[self.wire_ith_addend(i) * n..][..n];
+            let output_low = &wires[self.wire_ith_output_low_half(i) * n..][..n];
+            let output_high = &wires[self.wire_ith_output_high_half(i) * n..][..n];
+            let inverse = &wires[self.wire_ith_inverse(i) * n..][..n];
+
+            // Canonicity: (inverse * (u32::MAX - output_high) - 1) * output_low.
+            for p in 0..n {
+                let diff = u32_max - output_high[p];
+                let hi_not_max = inverse[p] * diff - F::ONE;
+                scratch[p] = hi_not_max * output_low[p];
+            }
+            let combined =
+                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
+            batch_multiply_add_inplace(combined, &scratch, filters);
+            constraint_index += 1;
+
+            // combined_output - computed_output.
+            for p in 0..n {
+                let computed = multiplicand_0[p] * multiplicand_1[p] + addend[p];
+                scratch[p] = output_high[p] * base32 + output_low[p] - computed;
+            }
+            let combined =
+                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
+            batch_multiply_add_inplace(combined, &scratch, filters);
+            constraint_index += 1;
+
+            // Limb range products (base-4: x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3))
+            // in the same descending order as `eval_unfiltered`, accumulating
+            // the low/high recompositions along the way.
+            combined_low.fill(F::ZERO);
+            combined_high.fill(F::ZERO);
+            for j in (0..Self::num_limbs()).rev() {
+                let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
+                debug_assert_eq!(1 << Self::limb_bits(), 4);
+                for p in 0..n {
+                    let x = limb[p];
+                    let y = x * (x - three);
+                    scratch[p] = y * (y + F::TWO);
+                }
+                let combined = &mut combined_gate_constraints
+                    [constraint_index * n..(constraint_index + 1) * n];
+                batch_multiply_add_inplace(combined, &scratch, filters);
+                constraint_index += 1;
+                let combined = if j < midpoint {
+                    &mut combined_low
+                } else {
+                    &mut combined_high
+                };
+                for p in 0..n {
+                    combined[p] = combined[p] * limb_base + limb[p];
+                }
+            }
+            for p in 0..n {
+                scratch[p] = combined_low[p] - output_low[p];
+            }
+            let combined =
+                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
+            batch_multiply_add_inplace(combined, &scratch, filters);
+            constraint_index += 1;
+
+            for p in 0..n {
+                scratch[p] = combined_high[p] - output_high[p];
+            }
+            let combined =
+                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
+            batch_multiply_add_inplace(combined, &scratch, filters);
+            constraint_index += 1;
+        }
+
+        debug_assert_eq!(
+            constraint_index,
+            <Self as Gate<F, D>>::num_constraints(self)
+        );
     }
 
     fn eval_unfiltered_circuit(
@@ -533,10 +633,13 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
 #[cfg(test)]
 mod batch_tests {
     use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::hash::hash_types::HashOut;
     use plonky2::plonk::circuit_data::CircuitConfig;
+    use plonky2::plonk::vars::EvaluationVarsBaseBatch;
 
     use super::*;
     use crate::gate_batch_testing::assert_base_batch_matches_eval_unfiltered;
+    use crate::types::config::CIRCUIT_CONFIG;
 
     #[test]
     fn base_batch_matches_eval_unfiltered_across_batch() {
@@ -544,5 +647,44 @@ mod batch_tests {
             &CircuitConfig::standard_recursion_config(),
         );
         assert_base_batch_matches_eval_unfiltered(&gate);
+    }
+
+    #[test]
+    fn direct_filtered_accumulation_matches_materialized_batch() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+
+        for config in [CircuitConfig::standard_recursion_config(), CIRCUIT_CONFIG] {
+            let gate = U32ArithmeticGate::<F, D>::new_from_config(&config);
+            for n in [1, 3, 4, 11, 31, 32] {
+                let wires = (0..gate.num_wires() * n)
+                    .map(|i| F::from_canonical_usize(3 * i + 5))
+                    .collect::<Vec<_>>();
+                let constants = Vec::new();
+                let hash = HashOut::ZERO;
+                let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+                let filters = (0..n)
+                    .map(|i| F::from_canonical_usize(2 * i + 1))
+                    .collect::<Vec<_>>();
+                let num_constraints =
+                    <U32ArithmeticGate<F, D> as Gate<F, D>>::num_constraints(&gate);
+                let initial = (0..num_constraints * n)
+                    .map(|i| F::from_canonical_usize(i + 7))
+                    .collect::<Vec<_>>();
+
+                let mut expected = initial.clone();
+                let materialized = gate.eval_unfiltered_base_batch(vars);
+                for (acc, constraints) in expected
+                    .chunks_exact_mut(n)
+                    .zip(materialized.chunks_exact(n))
+                {
+                    batch_multiply_add_inplace(acc, constraints, &filters);
+                }
+
+                let mut actual = initial;
+                gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+                assert_eq!(actual, expected, "n {n}");
+            }
+        }
     }
 }
