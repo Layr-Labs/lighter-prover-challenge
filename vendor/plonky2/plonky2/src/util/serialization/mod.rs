@@ -43,7 +43,7 @@ use crate::iop::wire::Wire;
 use crate::plonk::circuit_builder::LookupWire;
 use crate::plonk::circuit_data::{
     CircuitConfig, CircuitData, CommonCircuitData, ProverCircuitData, ProverOnlyCircuitData,
-    VerifierCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
+    QuotientDomain, VerifierCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
 };
 use crate::plonk::config::{GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::plonk_common::salt_size;
@@ -885,6 +885,10 @@ pub trait Read {
             }
             false => None,
         };
+        let quotient_domain = QuotientDomain::new(
+            common_data.degree_bits(),
+            common_data.quotient_degree_factor,
+        );
 
         let circuit_digest = self.read_hash::<F, <C as GenericConfig<D>>::Hasher>()?;
 
@@ -913,6 +917,7 @@ pub trait Read {
             public_inputs,
             representative_map,
             fft_root_table,
+            quotient_domain,
             circuit_digest,
             lookup_rows,
             lut_to_lookups,
@@ -1866,6 +1871,7 @@ pub trait Write {
             public_inputs,
             representative_map,
             fft_root_table,
+            quotient_domain: _,
             circuit_digest,
             lookup_rows,
             lut_to_lookups,

@@ -12,7 +12,6 @@ use super::circuit_builder::{LookupChallenges, LookupWire};
 use crate::field::extension::Extendable;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
-use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::fri::oracle::{BatchLayout, PolynomialBatch};
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
@@ -690,10 +689,9 @@ fn compute_quotient_polys<
     // steps away since we work on an LDE of degree `max_filtered_constraint_degree`.
     let next_step = 1 << quotient_degree_bits;
 
-    let points = F::two_adic_subgroup(common_data.degree_bits() + quotient_degree_bits);
+    let quotient_domain = &prover_data.quotient_domain;
+    let points = &quotient_domain.coset_points;
     let lde_size = points.len();
-
-    let z_h_on_coset = ZeroPolyOnCoset::new(common_data.degree_bits(), quotient_degree_bits);
 
     // Precompute the lookup table evals on the challenges in delta
     // These values are used to produce the final RE constraints for each lut,
@@ -731,13 +729,14 @@ fn compute_quotient_polys<
     let lut_re_poly_evals_refs: Vec<&[F]> =
         lut_re_poly_evals.iter().map(|v| v.as_slice()).collect();
 
-    let points_batches = points.par_chunks(BATCH_SIZE);
+    let domain_batches = points
+        .par_chunks(BATCH_SIZE)
+        .zip(quotient_domain.l_0_evals.par_chunks(BATCH_SIZE));
     let num_batches = points.len().div_ceil(BATCH_SIZE);
 
     struct QuotientScratch<F: RichField> {
         indices: Vec<usize>,
         indices_next: Vec<usize>,
-        shifted_xs: Vec<F>,
         local_constants: Vec<F>,
         local_wires: Vec<F>,
         s_sigmas_flat: Vec<F>,
@@ -753,13 +752,12 @@ fn compute_quotient_polys<
     let mut quotient_values = vec![F::ZERO; points.len() * num_challenges];
     quotient_values
         .par_chunks_mut(BATCH_SIZE * num_challenges)
-        .zip(points_batches)
+        .zip(domain_batches)
         .enumerate()
         .for_each_init(
             || QuotientScratch::<F> {
                 indices: Vec::with_capacity(BATCH_SIZE),
                 indices_next: Vec::with_capacity(BATCH_SIZE),
-                shifted_xs: Vec::with_capacity(BATCH_SIZE),
                 local_constants: Vec::new(),
                 local_wires: Vec::new(),
                 s_sigmas_flat: Vec::new(),
@@ -767,7 +765,7 @@ fn compute_quotient_polys<
                 zs_next_flat: Vec::new(),
                 vanishing: VanishingScratch::default(),
             },
-            |scratch, (batch_i, (quotient_values_batch, xs_batch))| {
+            |scratch, (batch_i, (quotient_values_batch, (xs_batch, l_0_batch)))| {
                 // Each batch must be the same size, except the last one, which may be smaller.
                 debug_assert!(
                     xs_batch.len() == BATCH_SIZE
@@ -783,11 +781,6 @@ fn compute_quotient_polys<
                 scratch
                     .indices_next
                     .extend(scratch.indices.iter().map(|&i| (i + next_step) % lde_size));
-
-                scratch.shifted_xs.clear();
-                scratch
-                    .shifted_xs
-                    .extend(xs_batch.iter().map(|&x| F::coset_shift() * x));
 
                 prover_data.constants_sigmas_commitment.fill_lde_batch(
                     &scratch.indices,
@@ -871,8 +864,8 @@ fn compute_quotient_polys<
                 let quotient_values_batch = &mut quotient_values_batch[..n * num_challenges];
                 eval_vanishing_poly_base_batch::<F, D>(
                     common_data,
-                    indices_batch,
-                    &scratch.shifted_xs,
+                    xs_batch,
+                    l_0_batch,
                     vars_batch,
                     &local_zs_batch,
                     &next_zs_batch,
@@ -885,7 +878,6 @@ fn compute_quotient_polys<
                     beta_k_is,
                     deltas,
                     alphas,
-                    &z_h_on_coset,
                     &lut_re_poly_evals_refs,
                     &mut scratch.vanishing,
                     quotient_values_batch,
@@ -895,7 +887,7 @@ fn compute_quotient_polys<
                     .iter()
                     .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
                 {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    let denominator_inv = quotient_domain.zero_poly.eval_inverse(i);
                     quotient_values
                         .iter_mut()
                         .for_each(|v| *v *= denominator_inv);
