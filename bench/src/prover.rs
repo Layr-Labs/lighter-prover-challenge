@@ -30,7 +30,22 @@ enum TxPath {
     Light,
 }
 
-const LIGHT_TX_PROOF_WINDOW: usize = 2;
+// Number of light transaction proofs allowed in flight at once.
+//
+// Phase instrumentation of `prove_block` shows the two transaction paths are very unevenly
+// sized: on the 500-tx fixture the heavy path retires at ~11 s while the light path runs to
+// ~75 s. So for ~85% of the pipeline the light path is the only producer of work, and a window
+// of 2 leaves the machine partly idle whenever a single tx proof's internal rayon parallelism
+// cannot fill 10 cores (the serial head and tail of each proof: witness generation, the FRI
+// commit phase's low-degree tail, and the final Merkle cap levels).
+//
+// Widening to 4 overlaps those serial regions across proofs. Measured on the 500-tx fixture over
+// 16 alternating samples per arm, min-of-N (contention only ever adds time, so the minimum is
+// the robust estimator on a loaded host): window 4 is +1.25% on the minimum and +1.06% on the
+// mean of the best five. The effect has an interior optimum rather than being monotone, which is
+// what a real scheduling win looks like: window 6 measured -1.42%, because too many concurrent
+// proofs oversubscribe the 8 performance cores and inflate peak memory.
+const LIGHT_TX_PROOF_WINDOW: usize = 4;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
