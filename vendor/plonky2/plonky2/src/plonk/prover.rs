@@ -479,6 +479,27 @@ fn wires_permutation_partial_products_and_zs<
 /// partial polynomials according to `max_quotient_degree_factor`.
 /// As another optimization, Sum and LDC polynomials are shared (in so called partial SLDC polynomials), and the last value
 /// of the last partial polynomial is Sum(end) - LDC(end). If the lookup argument is valid, then it must be equal to 0.
+fn batch_inverse_differences_into<F: Field, I: IntoIterator<Item = F>>(
+    alpha: F,
+    combos: I,
+    inverse_inputs: &mut Vec<F>,
+    inverses: &mut Vec<F>,
+) {
+    inverse_inputs.clear();
+    inverse_inputs.extend(combos.into_iter().map(|combo| alpha - combo));
+    F::batch_multiplicative_inverse_into(inverse_inputs, inverses);
+}
+
+fn fold_lookup_combos<F: Field, I: IntoIterator<Item = F>>(
+    initial: F,
+    delta: F,
+    combos: I,
+) -> F {
+    combos
+        .into_iter()
+        .fold(initial, |acc, combo| acc * delta + combo)
+}
+
 fn compute_lookup_polys<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -501,6 +522,9 @@ fn compute_lookup_polys<
     for _ in 0..num_partial_lookups + 1 {
         final_poly_vecs.push(PolynomialValues::<F>::new(vec![F::ZERO; degree]));
     }
+    let max_lookup_slots = num_lu_slots.max(num_lut_slots);
+    let mut inverse_inputs = Vec::with_capacity(max_lookup_slots);
+    let mut combo_inverses = Vec::with_capacity(max_lookup_slots);
 
     for LookupWire {
         last_lu_gate: last_lu_row,
@@ -510,38 +534,30 @@ fn compute_lookup_polys<
     {
         // Set values for partial Sums and RE.
         for row in (last_lut_row..(first_lut_row + 1)).rev() {
-            // Get combos for Sum.
-            let looked_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| {
+            batch_inverse_differences_into(
+                deltas[LookupChallenges::ChallengeAlpha as usize],
+                (0..num_lut_slots).map(|s| {
                     let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
                     let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
 
                     looked_inp + deltas[LookupChallenges::ChallengeA as usize] * looked_out
-                })
-                .collect();
-            // Get (alpha - combo).
-            let minus_looked_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| deltas[LookupChallenges::ChallengeAlpha as usize] - looked_combos[s])
-                .collect();
-            // Get 1/(alpha - combo).
-            let looked_combo_inverses = F::batch_multiplicative_inverse(&minus_looked_combos);
+                }),
+                &mut inverse_inputs,
+                &mut combo_inverses,
+            );
 
-            // Get lookup combos, used to check the well formation of the LUT.
-            let lookup_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| {
+            // Compute next row's first value of RE.
+            // If `row == first_lut_row`, then `final_poly_vecs[0].values[row + 1] == 0`.
+            let new_re = fold_lookup_combos(
+                final_poly_vecs[0].values[row + 1],
+                deltas[LookupChallenges::ChallengeDelta as usize],
+                (0..num_lut_slots).map(|s| {
                     let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
                     let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
 
                     looked_inp + deltas[LookupChallenges::ChallengeB as usize] * looked_out
-                })
-                .collect();
-
-            // Compute next row's first value of RE.
-            // If `row == first_lut_row`, then `final_poly_vecs[0].values[row + 1] == 0`.
-            let mut new_re = final_poly_vecs[0].values[row + 1];
-            for elt in &lookup_combos {
-                new_re = new_re * deltas[LookupChallenges::ChallengeDelta as usize] + *elt
-            }
+                }),
+            );
             final_poly_vecs[0].values[row] = new_re;
 
             for slot in 0..num_partial_lookups {
@@ -555,7 +571,7 @@ fn compute_lookup_polys<
                     ..min((slot + 1) * max_lookup_table_degree, num_lut_slots))
                     .fold(prev, |acc, s| {
                         acc + witness.get_wire(row, LookupTableGate::wire_ith_multiplicity(s))
-                            * looked_combo_inverses[s]
+                            * combo_inverses[s]
                     });
                 final_poly_vecs[slot + 1].values[row] = sum;
             }
@@ -563,21 +579,17 @@ fn compute_lookup_polys<
 
         // Set values for partial LDCs.
         for row in (last_lu_row..last_lut_row).rev() {
-            // Get looking combos.
-            let looking_combos: Vec<F> = (0..num_lu_slots)
-                .map(|s| {
+            batch_inverse_differences_into(
+                deltas[LookupChallenges::ChallengeAlpha as usize],
+                (0..num_lu_slots).map(|s| {
                     let looking_in = witness.get_wire(row, LookupGate::wire_ith_looking_inp(s));
                     let looking_out = witness.get_wire(row, LookupGate::wire_ith_looking_out(s));
 
                     looking_in + deltas[LookupChallenges::ChallengeA as usize] * looking_out
-                })
-                .collect();
-            // Get (alpha - combo).
-            let minus_looking_combos: Vec<F> = (0..num_lu_slots)
-                .map(|s| deltas[LookupChallenges::ChallengeAlpha as usize] - looking_combos[s])
-                .collect();
-            // Get 1 / (alpha - combo).
-            let looking_combo_inverses = F::batch_multiplicative_inverse(&minus_looking_combos);
+                }),
+                &mut inverse_inputs,
+                &mut combo_inverses,
+            );
 
             for slot in 0..num_partial_lookups {
                 let prev = if slot == 0 {
@@ -588,7 +600,7 @@ fn compute_lookup_polys<
                 };
                 let sum = (slot * max_lookup_degree
                     ..min((slot + 1) * max_lookup_degree, num_lu_slots))
-                    .fold(F::ZERO, |acc, s| acc + looking_combo_inverses[s]);
+                    .fold(F::ZERO, |acc, s| acc + combo_inverses[s]);
                 final_poly_vecs[slot + 1].values[row] = prev - sum;
             }
         }
@@ -891,4 +903,83 @@ fn compute_quotient_polys<
         })
         .map(|values| values.coset_ifft(F::coset_shift()))
         .collect()
+}
+
+#[cfg(test)]
+mod lookup_reuse_tests {
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    use super::*;
+
+    #[test]
+    fn reused_lookup_scratch_matches_materialized_reference_raw() {
+        let challenge_a = GoldilocksField::from_canonical_u64(17);
+        let challenge_b = GoldilocksField::from_canonical_u64(29);
+        let alpha = GoldilocksField::from_canonical_u64(1_000_000_007);
+        let delta = GoldilocksField::from_canonical_u64(41);
+        let mut inverse_inputs = vec![GoldilocksField::ONE; 97];
+        let mut inverses = vec![GoldilocksField::TWO; 113];
+
+        for (row, slots) in [26, 40, 1, 40, 26].into_iter().enumerate() {
+            let inputs = (0..slots)
+                .map(|slot| GoldilocksField::from_canonical_usize(row * 101 + slot + 1))
+                .collect::<Vec<_>>();
+            let outputs = (0..slots)
+                .map(|slot| GoldilocksField::from_canonical_usize(row * 211 + 2 * slot + 3))
+                .collect::<Vec<_>>();
+            let combos_a = inputs
+                .iter()
+                .copied()
+                .zip(outputs.iter().copied())
+                .map(|(input, output)| input + challenge_a * output)
+                .collect::<Vec<_>>();
+            let differences = combos_a
+                .iter()
+                .copied()
+                .map(|combo| alpha - combo)
+                .collect::<Vec<_>>();
+            let expected_inverses =
+                GoldilocksField::batch_multiplicative_inverse(&differences);
+            batch_inverse_differences_into(
+                alpha,
+                inputs
+                    .iter()
+                    .copied()
+                    .zip(outputs.iter().copied())
+                    .map(|(input, output)| input + challenge_a * output),
+                &mut inverse_inputs,
+                &mut inverses,
+            );
+            assert_eq!(
+                inverses.iter().map(|value| value.0).collect::<Vec<_>>(),
+                expected_inverses
+                    .iter()
+                    .map(|value| value.0)
+                    .collect::<Vec<_>>(),
+                "row={row}, slots={slots}",
+            );
+
+            let combos_b = inputs
+                .iter()
+                .copied()
+                .zip(outputs.iter().copied())
+                .map(|(input, output)| input + challenge_b * output)
+                .collect::<Vec<_>>();
+            let initial = GoldilocksField::from_canonical_usize(row + 1);
+            let mut expected_re = initial;
+            for &combo in &combos_b {
+                expected_re = expected_re * delta + combo;
+            }
+            let actual_re = fold_lookup_combos(
+                initial,
+                delta,
+                inputs
+                    .iter()
+                    .copied()
+                    .zip(outputs.iter().copied())
+                    .map(|(input, output)| input + challenge_b * output),
+            );
+            assert_eq!(actual_re.0, expected_re.0, "row={row}, slots={slots}");
+        }
+    }
 }
