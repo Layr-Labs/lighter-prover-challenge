@@ -9,6 +9,7 @@ use anyhow::Result;
 use log::warn;
 use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
+use plonky2::field::packable::Packable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
 use plonky2::gates::gate::Gate;
@@ -33,6 +34,66 @@ use crate::byte::split::CircuitBuilderByteSplit;
 use crate::utils::ceil_div_usize;
 
 const CUSTOM_GATE_SIZES: &[usize] = &[16, 32, 48];
+
+fn packed_horner_step<F: Field>(out: &mut [F], scalar: F, add: &[F]) {
+    assert_eq!(out.len(), add.len());
+    let split = out.len() - out.len() % <F as Packable>::Packing::WIDTH;
+    let (out_packable, out_leftovers) = out.split_at_mut(split);
+    let (add_packable, add_leftovers) = add.split_at(split);
+    let out_packed = <F as Packable>::Packing::pack_slice_mut(out_packable);
+    let add_packed = <F as Packable>::Packing::pack_slice(add_packable);
+
+    for (value, &addend) in out_packed.iter_mut().zip(add_packed) {
+        *value = *value * scalar + addend;
+    }
+    for (value, &addend) in out_leftovers.iter_mut().zip(add_leftovers) {
+        *value = *value * scalar + addend;
+    }
+}
+
+fn packed_subtract_inplace<F: Field>(out: &mut [F], subtrahend: &[F]) {
+    assert_eq!(out.len(), subtrahend.len());
+    let split = out.len() - out.len() % <F as Packable>::Packing::WIDTH;
+    let (out_packable, out_leftovers) = out.split_at_mut(split);
+    let (sub_packable, sub_leftovers) = subtrahend.split_at(split);
+    let out_packed = <F as Packable>::Packing::pack_slice_mut(out_packable);
+    let sub_packed = <F as Packable>::Packing::pack_slice(sub_packable);
+
+    for (value, &subtrahend) in out_packed.iter_mut().zip(sub_packed) {
+        *value = *value - subtrahend;
+    }
+    for (value, &subtrahend) in out_leftovers.iter_mut().zip(sub_leftovers) {
+        *value -= subtrahend;
+    }
+}
+
+fn packed_range_constraint<F: Field>(out: &mut [F], limb: &[F], binary: bool) {
+    assert_eq!(out.len(), limb.len());
+    let split = out.len() - out.len() % <F as Packable>::Packing::WIDTH;
+    let (out_packable, out_leftovers) = out.split_at_mut(split);
+    let (limb_packable, limb_leftovers) = limb.split_at(split);
+    let out_packed = <F as Packable>::Packing::pack_slice_mut(out_packable);
+    let limb_packed = <F as Packable>::Packing::pack_slice(limb_packable);
+
+    if binary {
+        for (value, &x) in out_packed.iter_mut().zip(limb_packed) {
+            *value = x * (x - F::ONE);
+        }
+        for (value, &x) in out_leftovers.iter_mut().zip(limb_leftovers) {
+            *value = x * (x - F::ONE);
+        }
+    } else {
+        let three = F::from_canonical_usize(3);
+        for (value, &x) in out_packed.iter_mut().zip(limb_packed) {
+            let y = x * (x - three);
+            *value = y * (y + F::TWO);
+        }
+        for (value, &x) in out_leftovers.iter_mut().zip(limb_leftovers) {
+            let y = x * (x - three);
+            *value = y * (y + F::TWO);
+        }
+    }
+}
 lazy_static! {
     pub static ref CUSTOM_GATE_SIZES_SET: HashSet<usize> = {
         let mut set = HashSet::new();
@@ -353,7 +414,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
         let wires = vars_base.local_wires;
         let num_aux = self.aux_limbs_per_input();
         let base = F::from_canonical_usize(Self::BASE);
-        let three = F::from_canonical_usize(3);
         let mut scratch = vec![F::ZERO; n];
         let mut constraint_index = 0;
 
@@ -364,13 +424,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
             scratch.copy_from_slice(&wires[top * n..][..n]);
             for j in (0..num_aux - 1).rev() {
                 let limb = &wires[self.wire_ith_input_jth_aux_limb(i, j) * n..][..n];
-                for p in 0..n {
-                    scratch[p] = scratch[p] * base + limb[p];
-                }
+                packed_horner_step(&mut scratch, base, limb);
             }
-            for p in 0..n {
-                scratch[p] -= input[p];
-            }
+            packed_subtract_inplace(&mut scratch, input);
             let combined =
                 &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
             batch_multiply_add_inplace(combined, &scratch, filters);
@@ -378,18 +434,8 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
 
             for j in 0..num_aux {
                 let limb = &wires[self.wire_ith_input_jth_aux_limb(i, j) * n..][..n];
-                if j == num_aux - 1 && self.bit_size % 2 == 1 {
-                    for p in 0..n {
-                        let x = limb[p];
-                        scratch[p] = x * (x - F::ONE);
-                    }
-                } else {
-                    for p in 0..n {
-                        let x = limb[p];
-                        let y = x * (x - three);
-                        scratch[p] = y * (y + F::TWO);
-                    }
-                }
+                let binary = j == num_aux - 1 && self.bit_size % 2 == 1;
+                packed_range_constraint(&mut scratch, limb, binary);
                 let combined = &mut combined_gate_constraints
                     [constraint_index * n..(constraint_index + 1) * n];
                 batch_multiply_add_inplace(combined, &scratch, filters);
