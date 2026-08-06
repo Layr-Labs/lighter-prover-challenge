@@ -5,6 +5,7 @@ use core::ops::Range;
 
 use anyhow::Result;
 use itertools::Itertools;
+use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
@@ -192,6 +193,83 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
             }
         }
         res
+    }
+
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        debug_assert!(
+            <Self as Gate<F, D>>::num_constraints(self) * n <= combined_gate_constraints.len()
+        );
+
+        let wires = vars_base.local_wires;
+        let three = F::from_canonical_usize(3);
+        let four = F::from_canonical_usize(4);
+        let base = F::from_canonical_usize(256);
+        let mut scratch = vec![F::ZERO; n];
+        let mut constraint_index = 0;
+        let mut accumulate = |values: &[F]| {
+            let start = constraint_index * n;
+            batch_multiply_add_inplace(
+                &mut combined_gate_constraints[start..start + n],
+                values,
+                filters,
+            );
+            constraint_index += 1;
+        };
+
+        for i in 0..self.num_ops {
+            let aux = self.i_th_aux_limbs(i);
+            for limb_wire in aux.clone() {
+                let col = &wires[limb_wire * n..][..n];
+                for p in 0..n {
+                    let x = col[p];
+                    let y = x * (x - three);
+                    scratch[p] = y * (y + F::TWO);
+                }
+                accumulate(&scratch);
+            }
+
+            let bytes = self.i_th_limbs(i);
+            for (byte_index, byte_wire) in bytes.clone().enumerate() {
+                let chunk_start = aux.start + 4 * byte_index;
+                scratch.copy_from_slice(&wires[(chunk_start + 3) * n..][..n]);
+                for k in (0..3).rev() {
+                    let limb = &wires[(chunk_start + k) * n..][..n];
+                    for p in 0..n {
+                        scratch[p] = scratch[p] * four + limb[p];
+                    }
+                }
+                let byte_col = &wires[byte_wire * n..][..n];
+                for p in 0..n {
+                    scratch[p] -= byte_col[p];
+                }
+                accumulate(&scratch);
+            }
+
+            scratch.copy_from_slice(&wires[(bytes.end - 1) * n..][..n]);
+            for byte_wire in (bytes.start..bytes.end - 1).rev() {
+                let col = &wires[byte_wire * n..][..n];
+                for p in 0..n {
+                    scratch[p] = scratch[p] * base + col[p];
+                }
+            }
+            let sum_col = &wires[self.i_th_sum(i) * n..][..n];
+            for p in 0..n {
+                scratch[p] -= sum_col[p];
+            }
+            accumulate(&scratch);
+        }
+
+        debug_assert_eq!(
+            constraint_index,
+            <Self as Gate<F, D>>::num_constraints(self)
+        );
     }
 
     fn eval_unfiltered_circuit(
@@ -448,6 +526,21 @@ mod tests {
                 &gate, vars_batch,
             );
             assert_eq!(batch_out.len(), n * num_constraints);
+            let filters: Vec<F> = (0..n)
+                .map(|_| F::from_canonical_u64(rng.gen_range(0..GoldilocksField::ORDER)))
+                .collect();
+            let mut accumulated = vec![F::ZERO; n * num_constraints];
+            <ByteDecompositionGate as Gate<F, D>>::eval_unfiltered_base_batch_accumulate(
+                &gate,
+                vars_batch,
+                &filters,
+                &mut accumulated,
+            );
+            for j in 0..num_constraints {
+                for p in 0..n {
+                    assert_eq!(accumulated[j * n + p], batch_out[j * n + p] * filters[p]);
+                }
+            }
 
             for p in 0..n {
                 let wires_one: Vec<<F as Extendable<D>>::Extension> = (0..num_wires)

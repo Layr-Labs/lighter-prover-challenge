@@ -11,6 +11,7 @@
 use core::marker::PhantomData;
 
 use anyhow::Result;
+use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
@@ -249,6 +250,89 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32ArithmeticG
             }
         }
         res
+    }
+
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        let wires = vars_base.local_wires;
+        let three = F::from_canonical_usize(3);
+        let limb_base = F::from_canonical_u64(1u64 << Self::limb_bits());
+        let base32 = F::from_canonical_u64(1 << 32u64);
+        let u32_max = F::from_canonical_u32(u32::MAX);
+        let midpoint = Self::num_limbs() / 2;
+        let mut scratch = vec![F::ZERO; n];
+        let mut combined_low = vec![F::ZERO; n];
+        let mut combined_high = vec![F::ZERO; n];
+        let mut constraint_index = 0;
+        let mut accumulate = |values: &[F]| {
+            let start = constraint_index * n;
+            batch_multiply_add_inplace(
+                &mut combined_gate_constraints[start..start + n],
+                values,
+                filters,
+            );
+            constraint_index += 1;
+        };
+
+        for i in 0..self.num_ops {
+            let multiplicand_0 = &wires[self.wire_ith_multiplicand_0(i) * n..][..n];
+            let multiplicand_1 = &wires[self.wire_ith_multiplicand_1(i) * n..][..n];
+            let addend = &wires[self.wire_ith_addend(i) * n..][..n];
+            let output_low = &wires[self.wire_ith_output_low_half(i) * n..][..n];
+            let output_high = &wires[self.wire_ith_output_high_half(i) * n..][..n];
+            let inverse = &wires[self.wire_ith_inverse(i) * n..][..n];
+
+            for p in 0..n {
+                let diff = u32_max - output_high[p];
+                let hi_not_max = inverse[p] * diff - F::ONE;
+                scratch[p] = hi_not_max * output_low[p];
+            }
+            accumulate(&scratch);
+
+            for p in 0..n {
+                let computed = multiplicand_0[p] * multiplicand_1[p] + addend[p];
+                scratch[p] = output_high[p] * base32 + output_low[p] - computed;
+            }
+            accumulate(&scratch);
+
+            combined_low.fill(F::ZERO);
+            combined_high.fill(F::ZERO);
+            for j in (0..Self::num_limbs()).rev() {
+                let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
+                let combined = if j < midpoint {
+                    &mut combined_low
+                } else {
+                    &mut combined_high
+                };
+                debug_assert_eq!(1 << Self::limb_bits(), 4);
+                for p in 0..n {
+                    let x = limb[p];
+                    let y = x * (x - three);
+                    scratch[p] = y * (y + F::TWO);
+                    combined[p] = combined[p] * limb_base + x;
+                }
+                accumulate(&scratch);
+            }
+            for p in 0..n {
+                scratch[p] = combined_low[p] - output_low[p];
+            }
+            accumulate(&scratch);
+            for p in 0..n {
+                scratch[p] = combined_high[p] - output_high[p];
+            }
+            accumulate(&scratch);
+        }
+
+        debug_assert_eq!(
+            constraint_index,
+            <Self as Gate<F, D>>::num_constraints(self)
+        );
     }
 
     fn eval_unfiltered_circuit(

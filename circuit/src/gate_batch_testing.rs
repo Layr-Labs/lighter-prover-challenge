@@ -67,6 +67,21 @@ where
         EvaluationVarsBaseBatch::new(n, &constants_batch, &wires_batch, &public_inputs_hash);
     let batch_out = gate.eval_unfiltered_base_batch(vars_batch);
     assert_eq!(batch_out.len(), n * num_constraints);
+    let filters = (0..n)
+        .map(|i| F::from_canonical_usize(i * 13 + 7))
+        .collect::<Vec<_>>();
+    let mut accumulated = vec![F::ZERO; n * num_constraints];
+    gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut accumulated);
+    for j in 0..num_constraints {
+        for p in 0..n {
+            assert_eq!(
+                accumulated[j * n + p],
+                batch_out[j * n + p] * filters[p],
+                "gate {}, point {p}, accumulated constraint {j}",
+                gate.id()
+            );
+        }
+    }
 
     for p in 0..n {
         let to_ext = |value: F| {

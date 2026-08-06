@@ -11,6 +11,7 @@
 use core::marker::PhantomData;
 
 use anyhow::Result;
+use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
@@ -204,6 +205,72 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U48Subtraction
             }
         }
         res
+    }
+
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        let wires = vars_base.local_wires;
+        let three = F::from_canonical_usize(3);
+        let limb_base = F::from_canonical_u64(1u64 << Self::limb_bits());
+        let base = F::from_canonical_u64(1 << 48u64);
+        let mut scratch = vec![F::ZERO; n];
+        let mut combined_limbs = vec![F::ZERO; n];
+        let mut constraint_index = 0;
+        let mut accumulate = |values: &[F]| {
+            let start = constraint_index * n;
+            batch_multiply_add_inplace(
+                &mut combined_gate_constraints[start..start + n],
+                values,
+                filters,
+            );
+            constraint_index += 1;
+        };
+
+        for i in 0..self.num_ops {
+            let input_x = &wires[self.wire_ith_input_x(i) * n..][..n];
+            let input_y = &wires[self.wire_ith_input_y(i) * n..][..n];
+            let input_borrow = &wires[self.wire_ith_input_borrow(i) * n..][..n];
+            let output_result = &wires[self.wire_ith_output_result(i) * n..][..n];
+            let output_borrow = &wires[self.wire_ith_output_borrow(i) * n..][..n];
+
+            for p in 0..n {
+                let result_initial = input_x[p] - input_y[p] - input_borrow[p];
+                scratch[p] = output_result[p] - (result_initial + base * output_borrow[p]);
+            }
+            accumulate(&scratch);
+
+            combined_limbs.fill(F::ZERO);
+            for j in (0..Self::num_limbs()).rev() {
+                let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
+                debug_assert_eq!(1 << Self::limb_bits(), 4);
+                for p in 0..n {
+                    let x = limb[p];
+                    let y = x * (x - three);
+                    scratch[p] = y * (y + F::TWO);
+                    combined_limbs[p] = combined_limbs[p] * limb_base + x;
+                }
+                accumulate(&scratch);
+            }
+            for p in 0..n {
+                scratch[p] = combined_limbs[p] - output_result[p];
+            }
+            accumulate(&scratch);
+            for p in 0..n {
+                scratch[p] = output_borrow[p] * (F::ONE - output_borrow[p]);
+            }
+            accumulate(&scratch);
+        }
+
+        debug_assert_eq!(
+            constraint_index,
+            <Self as Gate<F, D>>::num_constraints(self)
+        );
     }
 
     fn eval_unfiltered_circuit(
