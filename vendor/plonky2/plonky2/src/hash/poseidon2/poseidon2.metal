@@ -168,7 +168,19 @@ inline ulong sum_state(thread const ulong state[12]) {
         carries += next < sum;
         sum = next;
     }
-    return gl_add(sum, (ulong)carries * GOLDILOCKS_EPSILON);
+
+    // Each wrapped 2^64 contributes epsilon modulo the Goldilocks prime.
+    // Fold the small carry count directly into 32-bit limbs instead of forming
+    // carries * epsilon with a 64-bit multiply and passing it through gl_add.
+    uint lo = (uint)sum;
+    uint hi = (uint)(sum >> 32);
+    uint old_lo = lo;
+    lo -= carries;
+    uint high_add = carries - (uint)(old_lo < carries);
+    uint old_hi = hi;
+    hi += high_add;
+    add_epsilon_u32(lo, hi, (uint)(hi < old_hi));
+    return ((ulong)hi << 32) | (ulong)lo;
 }
 
 inline void internal_linear_layer(thread ulong state[12], constant ulong* diagonal) {
