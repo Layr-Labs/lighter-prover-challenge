@@ -84,6 +84,55 @@ pub(crate) fn check_partial_products_into<F: Field>(
     );
 }
 
+/// Builds permutation numerator and denominator chunk products directly from the
+/// wire and sigma evaluations, then appends their partial-product checks to `out`.
+/// Both products preserve the original routed-wire multiplication order independently.
+/// Interleaving their instructions changes scheduling only; neither fold depends on the other.
+/// Partial-product accumulator selection is unchanged at every chunk boundary.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn check_permutation_partial_products_into<F: Field>(
+    num_wires: usize,
+    mut local_wire: impl FnMut(usize) -> F,
+    s_sigmas: &[F],
+    beta_k_is: &[F],
+    beta: F,
+    gamma: F,
+    x: F,
+    partials: &[F],
+    z_x: F,
+    z_gx: F,
+    max_degree: usize,
+    out: &mut Vec<F>,
+) {
+    debug_assert!(max_degree > 1);
+    debug_assert!(num_wires > 0);
+    debug_assert_eq!(s_sigmas.len(), num_wires);
+    debug_assert_eq!(beta_k_is.len(), num_wires);
+
+    let num_chunks = num_wires.div_ceil(max_degree);
+    debug_assert_eq!(partials.len(), num_chunks - 1);
+    for chunk_index in 0..num_chunks {
+        let start = chunk_index * max_degree;
+        let end = (start + max_degree).min(num_wires);
+        let mut numerator_product = F::ONE;
+        let mut denominator_product = F::ONE;
+        for j in start..end {
+            let wire_value = local_wire(j);
+            numerator_product *= wire_value + beta_k_is[j] * x + gamma;
+            denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
+        }
+
+        let prev_acc = if chunk_index == 0 {
+            z_x
+        } else {
+            partials[chunk_index - 1]
+        };
+        let next_acc = partials.get(chunk_index).copied().unwrap_or(z_gx);
+        out.push(prev_acc * numerator_product - next_acc * denominator_product);
+    }
+}
+
 /// Checks the relationship between each pair of partial product accumulators. In particular, this
 /// sequence of accumulators starts with `Z(x)`, then contains each partial product polynomials
 /// `p_i(x)`, and finally `Z(g x)`. See the partial products section of the Plonky2 paper.
@@ -350,5 +399,60 @@ mod tests {
             raw(&small[1..]),
             raw(&expected_terms[..len.div_ceil(max_degree)])
         );
+    }
+
+    #[test]
+    fn test_check_permutation_partial_products_into_matches_legacy() {
+        type F = GoldilocksField;
+
+        for &(len, max_degree) in &[(8usize, 2usize), (7, 3)] {
+            let local_wires = noncanonical_vec(len, 41);
+            let s_sigmas = noncanonical_vec(len, 42);
+            let beta_k_is = noncanonical_vec(len, 43);
+            let beta = F::from_noncanonical_u64(u64::MAX - 44);
+            let gamma = F::from_noncanonical_u64(u64::MAX - 45);
+            let x = F::from_noncanonical_u64(u64::MAX - 46);
+            let partials = noncanonical_vec(len.div_ceil(max_degree) - 1, 47);
+            let z_x = F::from_noncanonical_u64(u64::MAX - 48);
+            let z_gx = F::from_noncanonical_u64(u64::MAX - 49);
+
+            let numerators = (0..len)
+                .map(|j| local_wires[j] + beta_k_is[j] * x + gamma)
+                .collect::<Vec<_>>();
+            let denominators = (0..len)
+                .map(|j| local_wires[j] + beta * s_sigmas[j] + gamma)
+                .collect::<Vec<_>>();
+            let expected = check_partial_products_legacy(
+                &numerators,
+                &denominators,
+                &partials,
+                z_x,
+                z_gx,
+                max_degree,
+            );
+
+            let sentinel = F::from_noncanonical_u64(u64::MAX - 50);
+            let mut actual = vec![sentinel];
+            check_permutation_partial_products_into(
+                len,
+                |j| local_wires[j],
+                &s_sigmas,
+                &beta_k_is,
+                beta,
+                gamma,
+                x,
+                &partials,
+                z_x,
+                z_gx,
+                max_degree,
+                &mut actual,
+            );
+
+            assert_eq!(
+                actual[0].to_noncanonical_u64(),
+                sentinel.to_noncanonical_u64()
+            );
+            assert_eq!(raw(&actual[1..]), raw(&expected));
+        }
     }
 }

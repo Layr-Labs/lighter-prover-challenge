@@ -43,7 +43,8 @@ use crate::iop::target::{BoolTarget, Target};
 use crate::iop::wire::Wire;
 use crate::plonk::circuit_data::{
     CircuitConfig, CircuitData, CommonCircuitData, MockCircuitData, ProverCircuitData,
-    ProverOnlyCircuitData, VerifierCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
+    ProverOnlyCircuitData, QuotientDomain, VerifierCircuitData, VerifierCircuitTarget,
+    VerifierOnlyCircuitData,
 };
 use crate::plonk::config::{AlgebraicHasher, GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::copy_constraint::CopyConstraint;
@@ -1224,6 +1225,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // Precompute FFT roots.
         let max_fft_points = 1 << (degree_bits + max(rate_bits, log2_ceil(quotient_degree_factor)));
         let fft_root_table = fft_root_table(max_fft_points);
+        let quotient_domain = QuotientDomain::new(degree_bits, quotient_degree_factor);
 
         let constants_sigmas_commitment = if commit_to_sigma {
             let mut constants_sigmas_vecs = constant_vecs;
@@ -1344,6 +1346,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             public_inputs: self.public_inputs,
             representative_map: forest.parents,
             fft_root_table: Some(fft_root_table),
+            quotient_domain,
             circuit_digest,
             lookup_rows: self.lookup_rows.clone(),
             lut_to_lookups: self.lut_to_lookups.clone(),

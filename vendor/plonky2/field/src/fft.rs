@@ -36,10 +36,10 @@ pub fn fft_root_table<F: Field>(n: usize) -> FftRootTable<F> {
 fn fft_dispatch<F: Field>(
     input: &mut [F],
     zero_factor: Option<usize>,
-    root_table: Option<&FftRootTable<F>>,
+    root_table: Option<&[Vec<F>]>,
 ) {
     let computed_root_table = root_table.is_none().then(|| fft_root_table(input.len()));
-    let used_root_table = root_table.or(computed_root_table.as_ref()).unwrap();
+    let used_root_table = root_table.or(computed_root_table.as_deref()).unwrap();
 
     fft_classic(input, zero_factor.unwrap_or(0), used_root_table);
 }
@@ -56,7 +56,11 @@ pub fn fft_with_options<F: Field>(
     root_table: Option<&FftRootTable<F>>,
 ) -> PolynomialValues<F> {
     let PolynomialCoeffs { coeffs: mut buffer } = poly;
-    fft_dispatch(&mut buffer, zero_factor, root_table);
+    fft_dispatch(
+        &mut buffer,
+        zero_factor,
+        root_table.map(FftRootTable::as_slice),
+    );
     PolynomialValues::new(buffer)
 }
 
@@ -68,7 +72,7 @@ pub fn ifft<F: Field>(poly: PolynomialValues<F>) -> PolynomialCoeffs<F> {
 pub fn ifft_with_options<F: Field>(
     poly: PolynomialValues<F>,
     zero_factor: Option<usize>,
-    root_table: Option<&FftRootTable<F>>,
+    root_table: Option<&[Vec<F>]>,
 ) -> PolynomialCoeffs<F> {
     let n = poly.len();
     let lg_n = log2_strict(n);
@@ -96,7 +100,7 @@ fn fft_classic_simd<P: PackedField>(
     values: &mut [P::Scalar],
     r: usize,
     lg_n: usize,
-    root_table: &FftRootTable<P::Scalar>,
+    root_table: &[Vec<P::Scalar>],
 ) {
     let lg_packed_width = log2_strict(P::WIDTH); // 0 when P is a scalar.
     let packed_values = P::pack_slice_mut(values);
@@ -142,7 +146,7 @@ fn fft_classic_simd_single_layer<P: PackedField>(
     packed_values: &mut [P],
     lg_half_m: usize,
     lg_packed_width: usize,
-    root_table: &FftRootTable<P::Scalar>,
+    root_table: &[Vec<P::Scalar>],
 ) {
     let lg_m = lg_half_m + 1;
     let m = 1 << lg_m; // Subarray size (in field elements).
@@ -172,7 +176,7 @@ fn fft_classic_simd_fused_two_layers<P: PackedField>(
     packed_values: &mut [P],
     lg_half_m: usize,
     lg_packed_width: usize,
-    root_table: &FftRootTable<P::Scalar>,
+    root_table: &[Vec<P::Scalar>],
 ) {
     // Quarter size in vectors for the size-2^(lg_half_m + 2) fused block.
     let q = (1usize << lg_half_m) >> lg_packed_width;
@@ -210,7 +214,7 @@ fn fft_classic_simd_layers<P: PackedField>(
     packed_values: &mut [P],
     start: usize,
     end: usize,
-    root_table: &FftRootTable<P::Scalar>,
+    root_table: &[Vec<P::Scalar>],
 ) {
     let lg_packed_width = log2_strict(P::WIDTH);
     let mut lg_half_m = start;
@@ -265,7 +269,7 @@ fn fft_zero_padded_first_layer_block<P: PackedField>(
 fn fft_zero_padded_first_layer<P: PackedField>(
     values: &mut [P::Scalar],
     r: usize,
-    root_table: &FftRootTable<P::Scalar>,
+    root_table: &[Vec<P::Scalar>],
 ) {
     let repeat = 1 << r;
     let nonzero_len = values.len() >> r;
@@ -281,7 +285,7 @@ fn fft_zero_padded_cache_blocks<P: PackedField>(
     values: &mut [P::Scalar],
     r: usize,
     lg_block_n: usize,
-    root_table: &FftRootTable<P::Scalar>,
+    root_table: &[Vec<P::Scalar>],
 ) {
     let repeat = 1 << r;
     let block_len = 1 << lg_block_n;
@@ -320,7 +324,7 @@ fn prepare_zero_padded_fft<F: Field>(
     r: usize,
     lg_n: usize,
     lg_packed_width: usize,
-    root_table: &FftRootTable<F>,
+    root_table: &[Vec<F>],
 ) -> usize {
     debug_assert!(r > 0 && r <= lg_n);
 
@@ -366,7 +370,7 @@ fn prepare_zero_padded_fft<F: Field>(
 /// The parameter r signifies that the first 1/2^r of the entries of
 /// input may be non-zero, but the last 1 - 1/2^r entries are
 /// definitely zero.
-pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &FftRootTable<F>) {
+pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &[Vec<F>]) {
     let n = values.len();
     let lg_n = log2_strict(n);
 
@@ -404,7 +408,9 @@ mod tests {
     use unroll::unroll_for_loops;
 
     use crate::extension::quadratic::QuadraticExtension;
-    use crate::fft::{FftRootTable, fft, fft_classic, fft_root_table, fft_with_options, ifft};
+    use crate::fft::{
+        fft, fft_classic, fft_root_table, fft_with_options, ifft, ifft_with_options, FftRootTable,
+    };
     use crate::goldilocks_field::GoldilocksField;
     use crate::packable::Packable;
     use crate::packed::PackedField;
@@ -445,6 +451,20 @@ mod tests {
                 fft_with_options(zero_tail, Some(r), None)
             );
         }
+    }
+
+    #[test]
+    fn ifft_accepts_prefix_of_larger_root_table() {
+        let values = deterministic_values(1 << 8);
+        let large_root_table = fft_root_table::<GoldilocksField>(1 << 12);
+        let expected = ifft(PolynomialValues::new(values.clone()));
+        let actual = ifft_with_options(
+            PolynomialValues::new(values),
+            None,
+            Some(&large_root_table[..8]),
+        );
+
+        assert_eq!(actual, expected);
     }
 
     fn evaluate_naive<F: Field>(coefficients: &PolynomialCoeffs<F>) -> PolynomialValues<F> {
