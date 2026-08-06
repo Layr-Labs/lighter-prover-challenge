@@ -85,10 +85,6 @@ where
 }
 
 impl<F: RichField> GenericHashOut<F> for HashOut<F> {
-    fn for_each_element(&self, f: impl FnMut(F)) {
-        self.elements.into_iter().for_each(f);
-    }
-
     fn to_bytes(&self) -> Vec<u8> {
         self.elements
             .into_iter()
@@ -110,6 +106,12 @@ impl<F: RichField> GenericHashOut<F> for HashOut<F> {
 
     fn to_vec(&self) -> Vec<F> {
         self.elements.to_vec()
+    }
+
+    fn for_each_element(&self, mut f: impl FnMut(F)) {
+        for &element in &self.elements {
+            f(element);
+        }
     }
 }
 
