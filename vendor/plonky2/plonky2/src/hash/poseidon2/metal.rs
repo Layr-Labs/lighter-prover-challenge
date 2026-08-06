@@ -30,7 +30,13 @@ const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
 /// the default 1<<19 cutoff) hash on an otherwise idle GPU. The global cutoff
 /// stays untouched for the pipelined phases, where lowering it is the
 /// documented priority-inversion regression.
-const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 18;
+// Measured head-to-head (equal-output asserted, warm runs, cap height 4):
+// the GPU wins ~2x already at 262,128 permutations (2^17-leaf width-8 trees:
+// CPU 14.9 ms vs GPU 7.8 ms) — the chain-step quotient/FRI commitment shape,
+// which sits 16 permutations BELOW the 1 << 18 gate and was still hashing on
+// the CPU during the exclusive phases. 1 << 17 captures it; the measured
+// GPU/CPU break-even is ~131k permutations.
+const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 17;
 /// Upper bound on concurrently in-flight GPU tree builds. One set serializes
 /// GPU tree builds exactly like the promoted base's global context mutex: a
 /// 3-set experiment measured 13-18% faster locally but scored -21.6% on the
