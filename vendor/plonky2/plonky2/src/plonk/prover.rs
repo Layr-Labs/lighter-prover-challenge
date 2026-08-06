@@ -728,10 +728,9 @@ fn compute_quotient_polys<
                 );
 
                 let n = xs_batch.len();
+                let index_start = BATCH_SIZE * batch_i;
                 scratch.indices.clear();
-                scratch
-                    .indices
-                    .extend(BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n);
+                scratch.indices.extend(index_start..index_start + n);
                 scratch.indices_next.clear();
                 scratch
                     .indices_next
@@ -742,29 +741,33 @@ fn compute_quotient_polys<
                     .shifted_xs
                     .extend(xs_batch.iter().map(|&x| F::coset_shift() * x));
 
-                prover_data.constants_sigmas_commitment.fill_lde_batch(
-                    &scratch.indices,
+                prover_data.constants_sigmas_commitment.fill_lde_range(
+                    index_start,
+                    n,
                     step,
                     common_data.constants_range(),
                     BatchLayout::PolyMajor,
                     &mut scratch.local_constants,
                 );
-                prover_data.constants_sigmas_commitment.fill_lde_batch(
-                    &scratch.indices,
+                prover_data.constants_sigmas_commitment.fill_lde_range(
+                    index_start,
+                    n,
                     step,
                     common_data.sigmas_range(),
                     BatchLayout::PointMajor,
                     &mut scratch.s_sigmas_flat,
                 );
-                wires_commitment.fill_lde_batch(
-                    &scratch.indices,
+                wires_commitment.fill_lde_range(
+                    index_start,
+                    n,
                     step,
                     0..num_wires,
                     BatchLayout::PolyMajor,
                     &mut scratch.local_wires,
                 );
-                zs_partial_products_and_lookup_commitment.fill_lde_batch(
-                    &scratch.indices,
+                zs_partial_products_and_lookup_commitment.fill_lde_range(
+                    index_start,
+                    n,
                     step,
                     0..zs_row_width,
                     BatchLayout::PointMajor,
