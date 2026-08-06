@@ -1971,7 +1971,7 @@ kernel void goldilocks_mul_bench_native(
         let mut rng = StdRng::seed_from_u64(0x4e54_5432);
         for (log_degree, rate_bits, cols) in [(6, 3, 5usize), (8, 3, 3), (7, 2, 9)] {
             let degree = 1usize << log_degree;
-            let lde_size = degree << rate_bits;
+            let extended_size = degree << rate_bits;
             let coeffs: Vec<Vec<GoldilocksField>> = (0..cols)
                 .map(|_| {
                     (0..degree)
@@ -2007,7 +2007,7 @@ kernel void goldilocks_mul_bench_native(
 
                 for j in 0..cols {
                     let gpu = gpu_columns.col(j);
-                    for i in 0..lde_size {
+                    for i in 0..extended_size {
                         assert_eq!(
                             gpu[i].to_canonical_u64(),
                             cpu_columns[j][i].to_canonical_u64(),
