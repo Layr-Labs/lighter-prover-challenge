@@ -132,6 +132,7 @@ fn run_generator_worklist<
 
     let parallel_rounds = parallel_rounds_enabled();
     let mut buffer = GeneratedValues::empty();
+    let mut new_target_reps = Vec::new();
 
     // Keep running generators until we fail to make progress.
     while !pending_generator_indices.is_empty() {
@@ -239,14 +240,15 @@ fn run_generator_worklist<
 
             // Merge any generated values into our witness, and get a list of newly-populated
             // targets' representatives.
-            let mut new_target_reps = Vec::with_capacity(buffer.target_values.len());
+            new_target_reps.clear();
+            new_target_reps.reserve(buffer.target_values.len());
             for (t, v) in buffer.target_values.drain(..) {
                 let reps = witness.set_target_returning_rep(t, v)?;
                 new_target_reps.extend(reps);
             }
 
             // Enqueue unfinished generators that were watching one of the newly populated targets.
-            for watch in new_target_reps {
+            for watch in new_target_reps.drain(..) {
                 let opt_watchers = generator_indices_by_watches.get(&watch);
                 if let Some(watchers) = opt_watchers {
                     for &watching_generator_idx in watchers {
