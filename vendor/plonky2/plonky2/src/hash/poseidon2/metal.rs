@@ -196,6 +196,12 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     serial_critical_shape || leaf_permutations + parent_permutations >= min_permutations
 }
 
+/// Initializes the lazily-built shared context (including runtime shader
+/// compilation) so later tree builds find it ready.
+pub(crate) fn warm_context() {
+    let _ = shared_context();
+}
+
 fn shared_context() -> Option<&'static MetalShared> {
     match &*CONTEXT {
         Ok(context) => Some(context),

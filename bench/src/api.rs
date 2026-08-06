@@ -106,6 +106,31 @@ impl Circuits {
         }
     }
 
+    /// Starts building every block circuit, returning as soon as the
+    /// pre-execution circuit is ready while the transaction/chain circuits
+    /// keep building on their own threads. This lets the caller prove
+    /// pre-execution (and parse the fixture) during the longer path builds
+    /// instead of waiting for the full set.
+    pub fn start() -> StagedCircuits {
+        let heavy = std::thread::Builder::new()
+            .name("heavy-circuits-build".into())
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(|| PathCircuits::new(HEAVY_TX_PER_PROOF, HEAVY_TX_MODE))
+            .expect("heavy circuit build thread must start");
+        let light = std::thread::Builder::new()
+            .name("light-circuits-build".into())
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(|| PathCircuits::new(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE))
+            .expect("light circuit build thread must start");
+        let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
+        StagedCircuits {
+            pre_target: pre.target,
+            pre_data: pre.builder.build::<C>(),
+            heavy,
+            light,
+        }
+    }
+
     /// Builds the final block circuit, which depends on the pre-execution and
     /// both chain circuits but is only needed for the final proof. Callers run
     /// this concurrently with transaction/chain proving.
@@ -118,6 +143,47 @@ impl Circuits {
             ON_CHAIN_OPERATIONS_LIMIT,
         );
         (block.target, block.builder.build::<C>())
+    }
+}
+
+/// A circuit build with the pre-execution circuit ready and the
+/// transaction/chain circuits still in flight.
+pub struct StagedCircuits {
+    pre_target: BlockPreExecutionTarget,
+    pre_data: CircuitData<F, C, D>,
+    heavy: std::thread::JoinHandle<PathCircuits>,
+    light: std::thread::JoinHandle<PathCircuits>,
+}
+
+impl StagedCircuits {
+    pub fn pre(&self) -> (&BlockPreExecutionTarget, &CircuitData<F, C, D>) {
+        (&self.pre_target, &self.pre_data)
+    }
+
+    /// Waits for the remaining circuit builds and assembles the full set.
+    pub fn finish(self) -> Circuits {
+        let heavy = self
+            .heavy
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        let light = self
+            .light
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        Circuits {
+            heavy_tx_target: heavy.tx_target,
+            heavy_tx_data: heavy.tx_data,
+            light_tx_target: light.tx_target,
+            light_tx_data: light.tx_data,
+            pre_target: self.pre_target,
+            pre_data: self.pre_data,
+            heavy_chain_target: heavy.chain_target,
+            heavy_chain_data: heavy.chain_data,
+            light_chain_target: light.chain_target,
+            light_chain_data: light.chain_data,
+            dummy_heavy_proof: heavy.dummy_proof,
+            dummy_light_proof: light.dummy_proof,
+        }
     }
 }
 

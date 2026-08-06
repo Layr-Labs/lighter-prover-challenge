@@ -362,18 +362,29 @@ fn prove_path(
     })
 }
 
-pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
-    // The pre-execution proof runs strictly before any other proving work, so
-    // the serialized GPU stream is otherwise idle: route its mid-size column
-    // trees to the GPU for just this phase.
+/// Proves the pre-execution circuit. Runs strictly before any other proving
+/// work, so the serialized GPU stream is otherwise idle: route its mid-size
+/// column trees to the GPU for just this phase. Split out so callers can prove
+/// it while the transaction/chain circuits are still building.
+pub fn prove_pre_execution(
+    block: &Block<F>,
+    pre_target: &circuit::block_pre_execution_constraints::BlockPreExecutionTarget,
+    pre_data: &CircuitData<F, C, D>,
+) -> Proof {
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-    let pre_proof = BlockPreExecutionCircuit::prove(
-        &circuits.pre_data,
-        &BlockPreExec::from_block(&block),
-        &circuits.pre_target,
-    )
-    .expect("block pre-execution proof failed");
+    let pre_proof =
+        BlockPreExecutionCircuit::prove(pre_data, &BlockPreExec::from_block(block), pre_target)
+            .expect("block pre-execution proof failed");
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+    pre_proof
+}
+
+pub fn prove_block(block: Block<F>, circuits: &Circuits) -> Proof {
+    let pre_proof = prove_pre_execution(&block, &circuits.pre_target, &circuits.pre_data);
+    prove_block_with_pre(block, circuits, pre_proof)
+}
+
+pub fn prove_block_with_pre(mut block: Block<F>, circuits: &Circuits, pre_proof: Proof) -> Proof {
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
