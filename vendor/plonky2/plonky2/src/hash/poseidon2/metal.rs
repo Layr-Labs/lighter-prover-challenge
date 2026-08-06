@@ -1266,17 +1266,24 @@ fn set_u32(encoder: &metal::ComputeCommandEncoderRef, index: u64, value: u32) {
     );
 }
 
+/// Largest multiple of the pipeline's SIMD-group width that fits the driver-reported,
+/// register-budget-aware threadgroup maximum. Every kernel in `poseidon2.metal` reads only
+/// `thread_position_in_grid` (no threadgroup memory, barriers, SIMD-cooperative ops, or
+/// atomics), so threadgroup width is pure scheduling: wider groups keep more SIMD groups
+/// resident to hide the serial `mulhi`/`gl_mul` latency chains.
+fn dispatch_group_width(pipeline: &ComputePipelineState) -> NSUInteger {
+    let execution_width = pipeline.thread_execution_width();
+    let max_group = pipeline.max_total_threads_per_threadgroup();
+    ((max_group / execution_width) * execution_width).max(execution_width)
+}
+
 fn dispatch2d(
     encoder: &metal::ComputeCommandEncoderRef,
     pipeline: &ComputePipelineState,
     width: usize,
     height: usize,
 ) {
-    let execution_width = pipeline.thread_execution_width();
-    let group_width = pipeline
-        .max_total_threads_per_threadgroup()
-        .min(64)
-        .max(execution_width);
+    let group_width = dispatch_group_width(pipeline);
     encoder.dispatch_threads(
         MTLSize {
             width: width as NSUInteger,
@@ -1296,11 +1303,7 @@ fn dispatch(
     pipeline: &ComputePipelineState,
     thread_count: usize,
 ) {
-    let execution_width = pipeline.thread_execution_width();
-    let group_width = pipeline
-        .max_total_threads_per_threadgroup()
-        .min(64)
-        .max(execution_width);
+    let group_width = dispatch_group_width(pipeline);
     encoder.dispatch_threads(
         MTLSize {
             width: thread_count as NSUInteger,
