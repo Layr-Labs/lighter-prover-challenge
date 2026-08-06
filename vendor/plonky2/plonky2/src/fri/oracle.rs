@@ -7,7 +7,7 @@ use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::batch_multiply_inplace;
 use crate::field::extension::Extendable;
-use crate::field::fft::FftRootTable;
+use crate::field::fft::{FftRootTable, fft_in_place_with_options};
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
@@ -15,7 +15,7 @@ use crate::fri::proof::FriProof;
 use crate::fri::prover::fri_proof;
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
 use crate::hash::hash_types::RichField;
-use crate::hash::merkle_tree::{MerkleLeaves, MerkleTree};
+use crate::hash::merkle_tree::{ColumnStore, MerkleLeaves, MerkleTree};
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::{GenericConfig, Hasher};
 use crate::timed;
@@ -159,6 +159,40 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             }
         }
 
+        let lde_len = degree << rate_bits;
+        let salt_size = if blinding { SALT_SIZE } else { 0 };
+        if let Some(mut columns) = C::Hasher::try_allocate_merkle_tree_columns(
+            polynomials.len() + salt_size,
+            lde_len,
+            cap_height,
+        ) {
+            let initialized = timed!(
+                timing,
+                "FFT + blinding",
+                Self::fill_lde_column_store(
+                    &mut columns,
+                    &polynomials,
+                    rate_bits,
+                    blinding,
+                    fft_root_table,
+                )
+            );
+            if initialized {
+                let merkle_tree = timed!(
+                    timing,
+                    "build Merkle tree",
+                    MerkleTree::new_column_store(columns, cap_height)
+                );
+                return Self {
+                    polynomials,
+                    merkle_tree,
+                    degree_log: log2_strict(degree),
+                    rate_bits,
+                    blinding,
+                };
+            }
+        }
+
         let lde_values = timed!(
             timing,
             "FFT + blinding",
@@ -214,6 +248,47 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     .map(|_| F::rand_vec(degree << rate_bits)),
             )
             .collect()
+    }
+
+    fn fill_lde_column_store(
+        columns: &mut ColumnStore<F>,
+        polynomials: &[PolynomialCoeffs<F>],
+        rate_bits: usize,
+        blinding: bool,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> bool {
+        let degree = polynomials[0].len();
+        let lde_len = degree << rate_bits;
+        let coset_powers = F::coset_shift().powers().take(degree).collect::<Vec<_>>();
+        let salt_size = if blinding { SALT_SIZE } else { 0 };
+        let Some(mut destinations) = columns.columns_mut() else {
+            return false;
+        };
+        assert_eq!(destinations.len(), polynomials.len() + salt_size);
+        assert!(destinations.iter().all(|column| column.len() == lde_len));
+        let salt_destinations = destinations.split_off(polynomials.len());
+
+        destinations
+            .into_par_iter()
+            .zip(polynomials.par_iter())
+            .for_each(|(destination, polynomial)| {
+                assert_eq!(
+                    polynomial.len(),
+                    degree,
+                    "Polynomial degrees inconsistent"
+                );
+                destination[..degree].copy_from_slice(&polynomial.coeffs);
+                destination[degree..].fill(F::ZERO);
+                batch_multiply_inplace(&mut destination[..degree], &coset_powers);
+                fft_in_place_with_options(destination, Some(rate_bits), fft_root_table);
+            });
+
+        salt_destinations
+            .into_par_iter()
+            .for_each(|destination| {
+                destination.copy_from_slice(&F::rand_vec(lde_len));
+            });
+        true
     }
 
     /// The number of value columns in this oracle, excluding any salt columns.
@@ -426,5 +501,22 @@ mod tests {
         let actual = PolynomialBatch::<F, C, D>::lde_values(&polynomials, RATE_BITS, false, None);
 
         assert_eq!(actual, expected);
+
+        let lde_len = (1 << 8) << RATE_BITS;
+        let mut in_place = ColumnStore::Owned(
+            (0..polynomials.len())
+                .map(|_| vec![F::ZERO; lde_len])
+                .collect(),
+        );
+        assert!(
+            PolynomialBatch::<F, C, D>::fill_lde_column_store(
+                &mut in_place,
+                &polynomials,
+                RATE_BITS,
+                false,
+                None,
+            )
+        );
+        assert_eq!(in_place, ColumnStore::Owned(expected));
     }
 }

@@ -4,22 +4,88 @@ using namespace metal;
 constant ulong GOLDILOCKS_PRIME = 0xffffffff00000001UL;
 constant ulong GOLDILOCKS_EPSILON = 0xffffffffUL;
 
+inline void add_epsilon_u32(thread uint& lo, thread uint& hi, uint active) {
+    uint old0 = lo;
+    lo -= active;
+    uint old1 = hi;
+    hi += active & (uint)(old0 != 0);
+    uint overflow = active & (uint)(hi < old1);
+    old0 = lo;
+    lo -= overflow;
+    hi += overflow & (uint)(old0 != 0);
+}
+
+inline void sub_epsilon_u32(thread uint& lo, thread uint& hi, uint active) {
+    uint old0 = lo;
+    lo += active;
+    uint old1 = hi;
+    hi -= active & (uint)(old0 != 0xffffffffU);
+    uint underflow = active & (uint)(hi > old1);
+    old0 = lo;
+    lo += underflow;
+    hi -= underflow & (uint)(old0 != 0xffffffffU);
+}
+
 inline ulong gl_add(ulong a, ulong b) {
+#if defined(POSEIDON2_NATIVE_ARITHMETIC_REFERENCE)
     ulong sum = a + b;
     ulong carry = sum < a;
     sum += carry * GOLDILOCKS_EPSILON;
     ulong carry2 = (carry != 0UL) && (sum < GOLDILOCKS_EPSILON);
     return sum + carry2 * GOLDILOCKS_EPSILON;
+#else
+    uint a0 = (uint)a;
+    uint a1 = (uint)(a >> 32);
+    uint b0 = (uint)b;
+    uint b1 = (uint)(b >> 32);
+    uint r0 = a0 + b0;
+    uint carry0 = (uint)(r0 < a0);
+    uint r1 = a1 + b1;
+    uint carry1 = (uint)(r1 < a1);
+    uint next = r1 + carry0;
+    carry1 += (uint)(next < r1);
+    r1 = next;
+    add_epsilon_u32(r0, r1, carry1);
+    return ((ulong)r1 << 32) | (ulong)r0;
+#endif
 }
 
+inline ulong gl_sub(ulong a, ulong b) {
+#if defined(POSEIDON2_NATIVE_ARITHMETIC_REFERENCE)
+    ulong diff = a - b;
+    ulong under = diff > a;
+    diff -= under * GOLDILOCKS_EPSILON;
+    ulong under2 = (under != 0UL) && (diff > (~0UL - GOLDILOCKS_EPSILON));
+    return diff - under2 * GOLDILOCKS_EPSILON;
+#else
+    uint a0 = (uint)a;
+    uint a1 = (uint)(a >> 32);
+    uint b0 = (uint)b;
+    uint b1 = (uint)(b >> 32);
+    uint r0 = a0 - b0;
+    uint borrow0 = (uint)(r0 > a0);
+    uint r1 = a1 - b1;
+    uint under = (uint)(r1 > a1);
+    uint next = r1 - borrow0;
+    under += (uint)(next > r1);
+    r1 = next;
+    sub_epsilon_u32(r0, r1, under);
+    return ((ulong)r1 << 32) | (ulong)r0;
+#endif
+}
+
+// Goldilocks multiplication with 32-bit reduction after the native product.
+// If low = l0 + l1*B and high = h0 + h1*B for B = 2^32, then
+//   low + high*B^2 = (l0 - h0 - h1) + (l1 + h0)*B  (mod p).
+// Normalizing those two signed base-B coefficients only needs uint
+// add/subtract/carry operations; the only ulong multiplies left are the
+// product's low and high halves.
 inline ulong gl_mul(ulong a, ulong b) {
+#if defined(POSEIDON2_NATIVE_ARITHMETIC_REFERENCE)
     ulong low = a * b;
     ulong high = metal::mulhi(a, b);
     ulong high_high = high >> 32;
     ulong high_low = high & GOLDILOCKS_EPSILON;
-
-    // Since 2^64 = 2^32 - 1 and 2^32(2^32 - 1) = -1 modulo p,
-    // low + high * 2^64 reduces to low - high_high + high_low * (2^32 - 1).
     ulong reduced = low - high_high;
     if (reduced > low) {
         reduced -= GOLDILOCKS_EPSILON;
@@ -27,18 +93,35 @@ inline ulong gl_mul(ulong a, ulong b) {
     ulong addend = high_low * GOLDILOCKS_EPSILON;
     ulong result = reduced + addend;
     return result + (result < reduced) * GOLDILOCKS_EPSILON;
+#else
+    ulong low = a * b;
+    ulong high = metal::mulhi(a, b);
+    uint l0 = (uint)low;
+    uint l1 = (uint)(low >> 32);
+    uint h0 = (uint)high;
+    uint h1 = (uint)(high >> 32);
+
+    uint r0 = l0 - h0;
+    uint borrow = (uint)(r0 > l0);
+    uint next = r0 - h1;
+    borrow += (uint)(next > r0);
+    r0 = next;
+
+    uint r1 = l1 + h0;
+    uint carry = (uint)(r1 < l1);
+    next = r1 - borrow;
+    uint under = (uint)(next > r1);
+    r1 = next;
+
+    int top = (int)carry - (int)under;
+    add_epsilon_u32(r0, r1, (uint)(top > 0));
+    sub_epsilon_u32(r0, r1, (uint)(top < 0));
+    return ((ulong)r1 << 32) | (ulong)r0;
+#endif
 }
 
 inline ulong gl_canonicalize(ulong value) {
     return value >= GOLDILOCKS_PRIME ? value - GOLDILOCKS_PRIME : value;
-}
-
-inline ulong gl_sub(ulong a, ulong b) {
-    ulong diff = a - b;
-    ulong under = diff > a;
-    diff -= under * GOLDILOCKS_EPSILON;
-    ulong under2 = (under != 0UL) && (diff > (~0UL - GOLDILOCKS_EPSILON));
-    return diff - under2 * GOLDILOCKS_EPSILON;
 }
 
 inline ulong pow7(ulong value) {

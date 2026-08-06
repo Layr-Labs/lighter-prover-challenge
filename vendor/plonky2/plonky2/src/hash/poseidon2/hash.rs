@@ -528,6 +528,31 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn try_allocate_merkle_tree_columns(
+        num_columns: usize,
+        num_rows: usize,
+        cap_height: usize,
+    ) -> Option<crate::hash::merkle_tree::ColumnStore<F>> {
+        super::metal::allocate_columns(num_columns, num_rows, cap_height)
+            .map(crate::hash::merkle_tree::ColumnStore::Shared)
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn try_build_merkle_tree_column_store(
+        columns: &crate::hash::merkle_tree::ColumnStore<F>,
+        cap_height: usize,
+    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
+        match columns {
+            crate::hash::merkle_tree::ColumnStore::Owned(columns) => {
+                super::metal::build_merkle_tree_columns(columns, cap_height)
+            }
+            crate::hash::merkle_tree::ColumnStore::Shared(columns) => {
+                super::metal::build_merkle_tree_shared(columns, cap_height)
+            }
+        }
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     fn try_build_commitment_from_coeffs(
         coeff_columns: &[&[F]],
         rate_bits: usize,

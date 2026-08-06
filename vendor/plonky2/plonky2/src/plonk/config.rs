@@ -100,6 +100,33 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
         None
     }
 
+    /// Allocates retained column-major leaf storage suitable for a specialized
+    /// Merkle backend. The caller may compute the columns directly in this
+    /// storage before passing it to [`Hasher::try_build_merkle_tree_column_store`].
+    fn try_allocate_merkle_tree_columns(
+        _num_columns: usize,
+        _num_rows: usize,
+        _cap_height: usize,
+    ) -> Option<crate::hash::merkle_tree::ColumnStore<F>> {
+        None
+    }
+
+    /// Like [`Hasher::try_build_merkle_tree_columns`], but accepts retained
+    /// column storage allocated by
+    /// [`Hasher::try_allocate_merkle_tree_columns`].
+    fn try_build_merkle_tree_column_store(
+        columns: &crate::hash::merkle_tree::ColumnStore<F>,
+        cap_height: usize,
+    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
+        match columns {
+            crate::hash::merkle_tree::ColumnStore::Owned(columns) => {
+                Self::try_build_merkle_tree_columns(columns, cap_height)
+            }
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            crate::hash::merkle_tree::ColumnStore::Shared(_) => None,
+        }
+    }
+
     /// Computes the coset LDE of the given coefficient columns and the Merkle
     /// tree over the resulting leaves in one fused backend pass, when a
     /// specialized backend is available. Returns the retained LDE column
