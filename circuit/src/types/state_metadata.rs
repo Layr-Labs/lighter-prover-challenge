@@ -73,8 +73,7 @@ impl StateMetadata {
     }
 }
 
-#[derive(Debug, Clone)]
-
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StateMetadataTarget {
     pub last_funding_round_timestamp: Target,
     pub last_oracle_price_timestamp: Target,

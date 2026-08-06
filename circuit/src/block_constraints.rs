@@ -18,6 +18,7 @@ use plonky2::plonk::proof::{
 use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::timed;
 use plonky2::util::timing::TimingTree;
+use serde_with::serde_as;
 
 use crate::bigint::big_u16::CircuitBuilderBigIntU16;
 use crate::bigint::biguint::CircuitBuilderBiguint;
@@ -97,7 +98,8 @@ pub struct BlockCircuit {
     pub target: BlockTarget,
 }
 
-#[derive(Debug)]
+#[serde_as]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct BlockTarget {
     pub pre_exec_proof: ProofWithPublicInputsTarget<D>, // proof of pre execution beginning of the block
     pub light_tx_chain_proof: ProofWithPublicInputsTarget<D>, // proof of light tx chain execution
@@ -106,6 +108,7 @@ pub struct BlockTarget {
     pub block: BlockWitnessTarget, // Public block witness
 
     // Private witness: raw public market details after the block.
+    #[serde_as(as = "[_; POSITION_LIST_SIZE]")]
     pub new_market_risk_details_partial: [MarketRiskDetailsTarget; POSITION_LIST_SIZE],
 }
 

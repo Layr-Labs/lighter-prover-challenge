@@ -77,7 +77,7 @@ pub struct L1UpdateMarketTx {
     pub order_quote_limit: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct L1UpdateMarketTxTarget {
     pub market_index: Target,
     pub market_type: Target,

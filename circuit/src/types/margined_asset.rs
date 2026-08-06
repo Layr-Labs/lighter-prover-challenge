@@ -108,7 +108,7 @@ impl MarginedAsset {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MarginedAssetTarget {
     pub asset_index: Target,
     pub loan_to_value: Target,

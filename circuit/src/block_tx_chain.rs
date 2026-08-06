@@ -7,6 +7,7 @@ use plonky2::field::extension::Extendable;
 use plonky2::field::types::Field;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget, RichField};
 use plonky2::iop::target::Target;
+use serde_with::serde_as;
 
 use crate::block_tx::{JUMP_STATE_SIZE, JumpState, JumpStateTarget};
 use crate::types::approve_integrator::{
@@ -191,7 +192,8 @@ where
     }
 }
 
-#[derive(Debug)]
+#[serde_as]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 /// In circuit represantion of [`crate::block::BlockTxChainWitness`]
 pub struct BlockTxChainWitnessTarget {
     pub block_number: Target,
@@ -212,6 +214,7 @@ pub struct BlockTxChainWitnessTarget {
     pub on_chain_operations_pub_data: Vec<[U8Target; ON_CHAIN_OPERATIONS_PUB_DATA_BYTES_SIZE]>,
 
     pub priority_operations_count: Target,
+    #[serde_as(as = "[_; MAX_PRIORITY_OPERATIONS_PUB_DATA_BYTES_PER_TX]")]
     pub priority_operations_pub_data: [U8Target; MAX_PRIORITY_OPERATIONS_PUB_DATA_BYTES_PER_TX],
 
     pub new_public_market_details_hash: HashOutTarget,

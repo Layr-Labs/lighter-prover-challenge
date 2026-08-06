@@ -17,6 +17,59 @@ use crate::plonk::circuit_builder::CircuitBuilder;
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct ExtensionTarget<const D: usize>(pub [Target; D]);
 
+// Manual impls: serde's array support is limited to lengths 0..=32, which
+// excludes const-generic `[Target; D]`. Encodes as a D-tuple, matching the
+// wire format of a fixed-size array.
+impl<const D: usize> serde::Serialize for ExtensionTarget<D> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeTuple;
+        let mut tuple = serializer.serialize_tuple(D)?;
+        for target in &self.0 {
+            tuple.serialize_element(target)?;
+        }
+        tuple.end()
+    }
+}
+
+impl<'de, const D: usize> serde::Deserialize<'de> for ExtensionTarget<D> {
+    fn deserialize<De>(deserializer: De) -> Result<Self, De::Error>
+    where
+        De: serde::Deserializer<'de>,
+    {
+        struct TupleVisitor<const D: usize>;
+
+        impl<'de, const D: usize> serde::de::Visitor<'de> for TupleVisitor<D> {
+            type Value = ExtensionTarget<D>;
+
+            fn expecting(&self, formatter: &mut core::fmt::Formatter) -> core::fmt::Result {
+                write!(formatter, "an array of {D} targets")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut targets = Vec::with_capacity(D);
+                for index in 0..D {
+                    let target = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
+                    targets.push(target);
+                }
+                targets
+                    .try_into()
+                    .map(ExtensionTarget)
+                    .map_err(|_| serde::de::Error::custom("extension target length mismatch"))
+            }
+        }
+
+        deserializer.deserialize_tuple(D, TupleVisitor::<D>)
+    }
+}
+
 impl<const D: usize> Default for ExtensionTarget<D> {
     fn default() -> Self {
         Self([Target::default(); D])
