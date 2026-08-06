@@ -313,16 +313,14 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 vanishing_all_lookup_terms.extend(lookup_constraints);
             }
 
-            numerator_values.extend((0..num_routed_wires).map(|j| {
+            for j in 0..num_routed_wires {
                 let wire_value = vars.local_wires[j];
+                let wire_plus_gamma = wire_value + gammas[i];
                 let beta_k_i = beta_k_is[i * num_routed_wires + j];
-                wire_value + beta_k_i * x + gammas[i]
-            }));
-            denominator_values.extend((0..num_routed_wires).map(|j| {
-                let wire_value = vars.local_wires[j];
                 let s_sigma = s_sigmas[j];
-                wire_value + betas[i] * s_sigma + gammas[i]
-            }));
+                numerator_values.push(wire_plus_gamma + beta_k_i * x);
+                denominator_values.push(wire_plus_gamma + betas[i] * s_sigma);
+            }
 
             // The partial products considered for this iteration of `i`.
             let current_partial_products = &partial_products[i * num_prods..(i + 1) * num_prods];
