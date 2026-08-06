@@ -175,6 +175,8 @@ pub(crate) struct VanishingScratch<F> {
     pub vanishing_all_lookup_terms: Vec<F>,
     pub lookup_selectors: Vec<F>,
     pub constraint_terms_batch: Vec<F>,
+    pub l_0_denominators: Vec<F>,
+    pub l_0_values: Vec<F>,
 }
 
 fn reduce_gate_constraints_base_batch<F: Field>(
@@ -261,6 +263,16 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
     reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out);
 
+    // One Montgomery batch inversion for every point's `L_0(x)` denominator instead of one
+    // field inversion per point; both the fast path and the lookup fallback below read the
+    // same point-indexed values the scalar `eval_l_0` calls used to produce.
+    z_h_on_coset.eval_l_0_batch_into(
+        indices_batch,
+        xs_batch,
+        &mut scratch.l_0_denominators,
+        &mut scratch.l_0_values,
+    );
+
     let numerator_values = &mut scratch.numerator_values;
     let denominator_values = &mut scratch.denominator_values;
     numerator_values.clear();
@@ -300,14 +312,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         term_rows.clear();
         term_rows.resize(num_rows * n, F::ZERO);
 
-        let l_0_xs = &mut scratch.vanishing_z_1_terms;
-        l_0_xs.clear();
-        l_0_xs.extend(
-            indices_batch
-                .iter()
-                .zip(xs_batch)
-                .map(|(&index, &x)| z_h_on_coset.eval_l_0(index, x)),
-        );
+        let l_0_xs = &scratch.l_0_values;
 
         let num_prod = &mut scratch.numerator_values;
         let den_prod = &mut scratch.denominator_values;
@@ -399,7 +404,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         }
 
         term_rows.clear();
-        l_0_xs.clear();
         num_prod.clear();
         den_prod.clear();
         scratch.lookup_selectors.clear();
@@ -407,7 +411,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     }
 
     for k in 0..n {
-        let index = indices_batch[k];
         let x = xs_batch[k];
         let vars = vars_batch.view(k);
 
@@ -435,7 +438,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         let partial_products = partial_products_batch[k];
         let s_sigmas = s_sigmas_batch[k];
 
-        let l_0_x = z_h_on_coset.eval_l_0(index, x);
+        let l_0_x = scratch.l_0_values[k];
         for i in 0..num_challenges {
             let z_x = local_zs[i];
             let z_gx = next_zs[i];

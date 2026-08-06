@@ -59,4 +59,76 @@ impl<F: Field> ZeroPolyOnCoset<F> {
         // Could also precompute the inverses using Montgomery.
         self.eval(i) * (self.n * (x - F::ONE)).inverse()
     }
+
+    /// Batched [`Self::eval_l_0`]: computes `L_0(x_k)` for aligned `indices`/`xs` using a single
+    /// Montgomery batch inversion for all denominators `n * (x_k - 1)` instead of one inversion
+    /// per point. `denominators` and `out` are caller-owned scratch; both retain capacity across
+    /// calls. On return `out[k] == self.eval_l_0(indices[k], xs[k])` exactly: the batch inversion
+    /// produces the same individual inverse each scalar call computes, and the final product
+    /// multiplies the same precomputed `Z_H` evaluation.
+    pub fn eval_l_0_batch_into(
+        &self,
+        indices: &[usize],
+        xs: &[F],
+        denominators: &mut Vec<F>,
+        out: &mut Vec<F>,
+    ) {
+        debug_assert_eq!(indices.len(), xs.len());
+        denominators.clear();
+        denominators.extend(xs.iter().map(|&x| self.n * (x - F::ONE)));
+        F::batch_multiplicative_inverse_into(denominators, out);
+        for (value, &i) in out.iter_mut().zip(indices) {
+            *value *= self.eval(i);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use super::ZeroPolyOnCoset;
+    use crate::goldilocks_field::GoldilocksField as F;
+    use crate::types::{Field, PrimeField64, Sample};
+
+    /// The batched helper must reproduce the scalar `eval_l_0` bit for bit, for every batch
+    /// length including the 0/1/2/3 special cases of the Montgomery batch inversion, and the
+    /// caller-owned buffers must be reusable across calls without affecting results.
+    #[test]
+    fn eval_l_0_batch_matches_scalar() {
+        let n_log = 5;
+        let rate_bits = 3;
+        let zero_poly = ZeroPolyOnCoset::<F>::new(n_log, rate_bits);
+        let subgroup = F::two_adic_subgroup(n_log + rate_bits);
+
+        let mut denominators = Vec::new();
+        let mut batched = Vec::new();
+        for batch_len in [0usize, 1, 2, 3, 4, 5, 31, 32] {
+            let indices: Vec<usize> = (0..batch_len).map(|k| (k * 7 + 3) % subgroup.len()).collect();
+            // Quotient-domain points are coset elements g * w^i; use the same form here so the
+            // denominators are guaranteed nonzero, as in production.
+            let xs: Vec<F> = indices
+                .iter()
+                .map(|&i| F::coset_shift() * subgroup[i])
+                .collect();
+            zero_poly.eval_l_0_batch_into(&indices, &xs, &mut denominators, &mut batched);
+            assert_eq!(batched.len(), batch_len);
+            for k in 0..batch_len {
+                let scalar = zero_poly.eval_l_0(indices[k], xs[k]);
+                assert_eq!(
+                    batched[k].to_canonical_u64(),
+                    scalar.to_canonical_u64(),
+                    "batch length {batch_len}, point {k}"
+                );
+            }
+        }
+
+        // Random nonzero inputs through the reusable-buffer inverse as well.
+        let random: Vec<F> = (0..40).map(|_| F::rand()).filter(|x| !x.is_zero()).collect();
+        let mut out = Vec::new();
+        F::batch_multiplicative_inverse_into(&random, &mut out);
+        for (inv, x) in out.iter().zip(&random) {
+            assert_eq!(*inv * *x, F::ONE);
+        }
+    }
 }
