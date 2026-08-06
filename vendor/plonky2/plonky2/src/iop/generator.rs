@@ -88,23 +88,18 @@ pub fn generate_partial_witness<
                 remaining_generators -= 1;
             }
 
-            // Merge any generated values into our witness, and get a list of newly-populated
-            // targets' representatives.
-            let mut new_target_reps = Vec::with_capacity(buffer.target_values.len());
+            // Merge generated values and notify watchers immediately. Watchers are still queued
+            // for the next wave, so this preserves scheduling order while avoiding a temporary
+            // heap allocation for every generator invocation.
             for (t, v) in buffer.target_values.drain(..) {
-                let reps = witness.set_target_returning_rep(t, v)?;
-                new_target_reps.extend(reps);
-            }
-
-            // Enqueue unfinished generators that were watching one of the newly populated targets.
-            for watch in new_target_reps {
-                let opt_watchers = generator_indices_by_watches.get(&watch);
-                if let Some(watchers) = opt_watchers {
-                    for &watching_generator_idx in watchers {
-                        if !generator_is_expired[watching_generator_idx] {
-                            debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                            unresolved_watches[watching_generator_idx] -= 1;
-                            next_pending_generator_indices.push(watching_generator_idx);
+                if let Some(watch) = witness.set_target_returning_rep(t, v)? {
+                    if let Some(watchers) = generator_indices_by_watches.get(&watch) {
+                        for &watching_generator_idx in watchers {
+                            if !generator_is_expired[watching_generator_idx] {
+                                debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
+                                unresolved_watches[watching_generator_idx] -= 1;
+                                next_pending_generator_indices.push(watching_generator_idx);
+                            }
                         }
                     }
                 }
