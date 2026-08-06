@@ -40,4 +40,59 @@ pub trait PackedEvaluableBase<F: RichField + Extendable<D>, const D: usize>: Gat
         }
         res
     }
+
+    /// Evaluates the batch straight into the shared filtered accumulator.
+    ///
+    /// This is [`Self::eval_unfiltered_base_batch_packed`] with the destination
+    /// changed: instead of writing the full `batch_size * num_constraints`
+    /// matrix and having the caller read it back through a multiply-add pass,
+    /// each constraint is folded in as `acc += filter * constraint` at the
+    /// moment it is produced. The matrix, its allocation, its zero
+    /// initialization, its write traffic, its read-back, and its free all
+    /// disappear.
+    ///
+    /// Emission order, stride, offsets, packing boundaries, and the leftover
+    /// tail are identical to the storing version, so every gate's constraint
+    /// order and accumulator indexing are unchanged.
+    fn eval_unfiltered_base_batch_packed_accumulate(
+        &self,
+        vars_batch: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        type Packing<F> = <F as Packable>::Packing;
+        let batch_size = vars_batch.len();
+        debug_assert_eq!(filters.len(), batch_size);
+
+        let (vars_packed_iter, vars_leftovers_iter) = vars_batch.pack::<Packing<F>>();
+        let leftovers_start = batch_size - vars_leftovers_iter.len();
+
+        for (i, vars_packed) in vars_packed_iter.enumerate() {
+            let offset = Packing::<F>::WIDTH * i;
+            // One packed filter covers the `WIDTH` points this block evaluates,
+            // matching the packed store the consumer performs.
+            let filter = Packing::<F>::from_slice(&filters[offset..offset + Packing::<F>::WIDTH]);
+            self.eval_unfiltered_base_packed(
+                vars_packed,
+                StridedConstraintConsumer::new_accumulating(
+                    combined_gate_constraints,
+                    batch_size,
+                    offset,
+                    *filter,
+                ),
+            );
+        }
+        for (i, vars_leftovers) in vars_leftovers_iter.enumerate() {
+            let offset = leftovers_start + i;
+            self.eval_unfiltered_base_packed(
+                vars_leftovers,
+                StridedConstraintConsumer::new_accumulating(
+                    combined_gate_constraints,
+                    batch_size,
+                    offset,
+                    F::from(filters[offset]),
+                ),
+            );
+        }
+    }
 }
