@@ -3,6 +3,7 @@ use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::any::Any;
 use core::fmt::{Debug, Error, Formatter};
 use core::hash::{Hash, Hasher};
+use core::mem::MaybeUninit;
 use core::ops::Range;
 #[cfg(feature = "std")]
 use std::sync::Arc;
@@ -24,6 +25,81 @@ use crate::plonk::vars::{
     EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch,
 };
 use crate::util::serialization::{Buffer, IoResult};
+
+/// Accumulates point-major constraint rows while tracking the initialized row
+/// prefix of an uninitialized destination.
+#[derive(Debug)]
+pub struct BaseBatchConstraintConsumer<'a, F: Field> {
+    output: &'a mut [MaybeUninit<F>],
+    batch_size: usize,
+    initialized_rows: usize,
+    current_gate_rows: Option<usize>,
+    next_row: usize,
+}
+
+impl<'a, F: Field> BaseBatchConstraintConsumer<'a, F> {
+    pub fn new(output: &'a mut [MaybeUninit<F>], batch_size: usize) -> Self {
+        assert!(batch_size > 0, "constraint batch size must be positive");
+        assert_eq!(output.len() % batch_size, 0);
+        Self {
+            output,
+            batch_size,
+            initialized_rows: 0,
+            current_gate_rows: None,
+            next_row: 0,
+        }
+    }
+
+    pub fn begin_gate(&mut self, num_constraints: usize) {
+        assert!(
+            self.current_gate_rows.is_none(),
+            "previous gate is unfinished"
+        );
+        assert!(num_constraints <= self.output.len() / self.batch_size);
+        self.current_gate_rows = Some(num_constraints);
+        self.next_row = 0;
+    }
+
+    pub fn accumulate_row(&mut self, values: &[F], filters: &[F]) {
+        let gate_rows = self.current_gate_rows.expect("gate was not started");
+        assert!(
+            self.next_row < gate_rows,
+            "gate emitted too many constraints"
+        );
+        assert_eq!(values.len(), self.batch_size);
+        assert_eq!(filters.len(), self.batch_size);
+
+        let row_start = self.next_row * self.batch_size;
+        let output_row = &mut self.output[row_start..row_start + self.batch_size];
+        if self.next_row < self.initialized_rows {
+            let output_row = unsafe {
+                // SAFETY: A completed earlier gate initialized every point in
+                // each row below `initialized_rows`. This slice covers exactly
+                // one such row and never includes the uninitialized suffix.
+                core::slice::from_raw_parts_mut(
+                    output_row.as_mut_ptr().cast::<F>(),
+                    self.batch_size,
+                )
+            };
+            batch_multiply_add_inplace(output_row, values, filters);
+        } else {
+            for ((output, &value), &filter) in output_row.iter_mut().zip(values).zip(filters) {
+                output.write(value * filter);
+            }
+        }
+        self.next_row += 1;
+    }
+
+    pub fn finish_gate(&mut self) {
+        let gate_rows = self.current_gate_rows.take().expect("gate was not started");
+        assert_eq!(self.next_row, gate_rows, "gate emitted too few constraints");
+        self.initialized_rows = self.initialized_rows.max(gate_rows);
+    }
+
+    pub fn initialized_rows(&self) -> usize {
+        self.initialized_rows
+    }
+}
 
 /// A custom gate.
 ///
@@ -123,16 +199,13 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         &self,
         vars_base: EvaluationVarsBaseBatch<F>,
         filters: &[F],
-        combined_gate_constraints: &mut [F],
+        constraint_consumer: &mut BaseBatchConstraintConsumer<F>,
     ) {
         let batch_size = vars_base.len();
         assert_eq!(filters.len(), batch_size);
         let res_batch = self.eval_unfiltered_base_batch(vars_base);
-        for (combined, res) in combined_gate_constraints
-            .chunks_exact_mut(batch_size)
-            .zip(res_batch.chunks_exact(batch_size))
-        {
-            batch_multiply_add_inplace(combined, res, filters);
+        for res in res_batch.chunks_exact(batch_size) {
+            constraint_consumer.accumulate_row(res, filters);
         }
     }
 
@@ -182,10 +255,9 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         group_range: Range<usize>,
         num_selectors: usize,
         num_lookup_selectors: usize,
-        combined_gate_constraints: &mut [F],
+        constraint_consumer: &mut BaseBatchConstraintConsumer<F>,
     ) {
-        let batch_size = vars_batch.len();
-        debug_assert!(self.num_constraints() * batch_size <= combined_gate_constraints.len());
+        constraint_consumer.begin_gate(self.num_constraints());
         let filters: Vec<_> = vars_batch
             .iter()
             .map(|vars| {
@@ -198,7 +270,8 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
             })
             .collect();
         vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
-        self.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, combined_gate_constraints);
+        self.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, constraint_consumer);
+        constraint_consumer.finish_gate();
     }
 
     /// Adds this gate's filtered constraints into the `combined_gate_constraints` buffer.
@@ -372,4 +445,72 @@ fn compute_filter_circuit<F: RichField + Extendable<D>, const D: usize>(
         })
         .collect::<Vec<_>>();
     builder.mul_many_extension(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use core::mem::MaybeUninit;
+
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::{Field64, PrimeField64};
+
+    #[test]
+    fn base_batch_constraint_consumer_matches_zero_initialized_accumulation_raw() {
+        type F = GoldilocksField;
+
+        for batch_size in [5usize, 32] {
+            let gate_widths = [2usize, 1, 4, 3];
+            let max_width = *gate_widths.iter().max().unwrap();
+            let mut expected = vec![F::ZERO; max_width * batch_size];
+            let mut actual = core::iter::repeat_with(MaybeUninit::uninit)
+                .take(max_width * batch_size)
+                .collect::<Vec<_>>();
+            let mut consumer = BaseBatchConstraintConsumer::new(&mut actual, batch_size);
+
+            for (gate_i, &gate_width) in gate_widths.iter().enumerate() {
+                let filters = (0..batch_size)
+                    .map(|point_i| {
+                        GoldilocksField(F::ORDER + 1 + (gate_i * batch_size + point_i) as u64)
+                    })
+                    .collect::<Vec<_>>();
+                consumer.begin_gate(gate_width);
+                for row_i in 0..gate_width {
+                    let values = (0..batch_size)
+                        .map(|point_i| {
+                            GoldilocksField(
+                                u64::MAX
+                                    - (gate_i * max_width * batch_size
+                                        + row_i * batch_size
+                                        + point_i) as u64,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    batch_multiply_add_inplace(
+                        &mut expected[row_i * batch_size..(row_i + 1) * batch_size],
+                        &values,
+                        &filters,
+                    );
+                    consumer.accumulate_row(&values, &filters);
+                }
+                consumer.finish_gate();
+            }
+
+            assert_eq!(consumer.initialized_rows(), max_width);
+            drop(consumer);
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| unsafe {
+                        // SAFETY: The synthetic gate sequence reaches every row.
+                        value.assume_init_ref().to_noncanonical_u64()
+                    })
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }

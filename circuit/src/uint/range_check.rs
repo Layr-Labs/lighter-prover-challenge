@@ -7,11 +7,10 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 use log::warn;
-use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
-use plonky2::gates::gate::Gate;
+use plonky2::gates::gate::{BaseBatchConstraintConsumer, Gate};
 use plonky2::gates::packed_util::PackedEvaluableBase;
 use plonky2::gates::util::StridedConstraintConsumer;
 use plonky2::hash::hash_types::RichField;
@@ -344,11 +343,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
         &self,
         vars_base: EvaluationVarsBaseBatch<F>,
         filters: &[F],
-        combined_gate_constraints: &mut [F],
+        constraint_consumer: &mut BaseBatchConstraintConsumer<F>,
     ) {
         let n = vars_base.len();
         assert_eq!(filters.len(), n);
-        assert!(combined_gate_constraints.len() >= self.num_constraints() * n);
 
         let wires = vars_base.local_wires;
         let num_aux = self.aux_limbs_per_input();
@@ -371,9 +369,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
             for p in 0..n {
                 scratch[p] -= input[p];
             }
-            let combined =
-                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
-            batch_multiply_add_inplace(combined, &scratch, filters);
+            constraint_consumer.accumulate_row(&scratch, filters);
             constraint_index += 1;
 
             for j in 0..num_aux {
@@ -390,9 +386,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
                         scratch[p] = y * (y + F::TWO);
                     }
                 }
-                let combined = &mut combined_gate_constraints
-                    [constraint_index * n..(constraint_index + 1) * n];
-                batch_multiply_add_inplace(combined, &scratch, filters);
+                constraint_consumer.accumulate_row(&scratch, filters);
                 constraint_index += 1;
             }
         }
@@ -591,12 +585,16 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
 
 #[cfg(test)]
 mod tests {
+    use core::mem::MaybeUninit;
+
     use anyhow::Result;
     use paste::paste;
+    use plonky2::field::batch_util::batch_multiply_add_inplace;
     use plonky2::field::goldilocks_field::GoldilocksField;
     use plonky2::field::types::Field;
     #[allow(unused_imports)]
     use plonky2::field::types::Field64;
+    use plonky2::gates::gate::{BaseBatchConstraintConsumer, Gate};
     use plonky2::gates::gate_testing::{test_eval_fns, test_low_degree};
     use plonky2::hash::hash_types::HashOut;
     use plonky2::iop::target::Target;
@@ -613,30 +611,52 @@ mod tests {
         const N: usize = 11;
         type F = GoldilocksField;
 
-        let gate = RangeCheckGate::<F, D>::new_from_config(
-            &CircuitConfig::standard_recursion_config(),
-            47,
-        );
-        let wires = (0..gate.num_wires() * N)
-            .map(|i| F::from_canonical_usize(3 * i + 5))
-            .collect::<Vec<_>>();
-        let constants = Vec::new();
-        let hash = HashOut::ZERO;
-        let vars = EvaluationVarsBaseBatch::new(N, &constants, &wires, &hash);
-        let filters = (0..N)
-            .map(|i| F::from_canonical_usize(2 * i + 1))
-            .collect::<Vec<_>>();
-        let mut expected = vec![F::ZERO; gate.num_constraints() * N];
-        let materialized = gate.eval_unfiltered_base_batch(vars);
-        for (acc, constraints) in expected
-            .chunks_exact_mut(N)
-            .zip(materialized.chunks_exact(N))
-        {
-            batch_multiply_add_inplace(acc, constraints, &filters);
+        for bit_size in [47, 32] {
+            let gate = RangeCheckGate::<F, D>::new_from_config(
+                &crate::types::config::CIRCUIT_CONFIG,
+                bit_size,
+            );
+            if bit_size == 32 {
+                assert_eq!(gate.num_constraints(), 136);
+            }
+            let wires = (0..gate.num_wires() * N)
+                .map(|i| F::from_canonical_usize(3 * i + 5))
+                .collect::<Vec<_>>();
+            let constants = Vec::new();
+            let hash = HashOut::ZERO;
+            let vars = EvaluationVarsBaseBatch::new(N, &constants, &wires, &hash);
+            let filters = (0..N)
+                .map(|i| F::from_canonical_usize(2 * i + 1))
+                .collect::<Vec<_>>();
+            let mut expected = vec![F::ZERO; gate.num_constraints() * N];
+            let materialized = gate.eval_unfiltered_base_batch(vars);
+            for (acc, constraints) in expected
+                .chunks_exact_mut(N)
+                .zip(materialized.chunks_exact(N))
+            {
+                batch_multiply_add_inplace(acc, constraints, &filters);
+            }
+
+            let mut actual = core::iter::repeat_with(MaybeUninit::uninit)
+                .take(expected.len())
+                .collect::<Vec<_>>();
+            let mut consumer = BaseBatchConstraintConsumer::new(&mut actual, N);
+            consumer.begin_gate(gate.num_constraints());
+            gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut consumer);
+            consumer.finish_gate();
+            assert_eq!(consumer.initialized_rows(), gate.num_constraints());
+            drop(consumer);
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| unsafe {
+                        // SAFETY: The gate emitted exactly its declared row count.
+                        *value.assume_init_ref()
+                    })
+                    .collect::<Vec<_>>(),
+                expected
+            );
         }
-        let mut actual = vec![F::ZERO; expected.len()];
-        gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
-        assert_eq!(actual, expected);
     }
 
     macro_rules! generate_low_degree_tests {

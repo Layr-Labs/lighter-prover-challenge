@@ -9,6 +9,7 @@ use super::vars::EvaluationVarsBase;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
+use crate::gates::gate::BaseBatchConstraintConsumer;
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
 use crate::gates::selectors::LookupSelectors;
@@ -24,6 +25,36 @@ use crate::util::partial_products::{check_partial_products, check_partial_produc
 use crate::util::reducing::ReducingFactorTarget;
 use crate::util::strided_view::PackedStridedView;
 use crate::with_context;
+
+fn initialize_gate_constraint_buffer<F: Field>(
+    output: &mut Vec<F>,
+    num_rows: usize,
+    batch_size: usize,
+    evaluate: impl FnOnce(&mut BaseBatchConstraintConsumer<F>),
+) {
+    let output_len = num_rows
+        .checked_mul(batch_size)
+        .expect("gate constraint output length overflow");
+    output.clear();
+    output.reserve(output_len);
+    {
+        let spare = &mut output.spare_capacity_mut()[..output_len];
+        let mut consumer = BaseBatchConstraintConsumer::new(spare, batch_size);
+        evaluate(&mut consumer);
+        assert_eq!(
+            consumer.initialized_rows(),
+            num_rows,
+            "gate constraints did not initialize every row"
+        );
+    }
+    unsafe {
+        // SAFETY: The consumer can advance its initialized frontier only after
+        // every point in every newly reached row has been written. Reaching
+        // `num_rows` therefore initializes the complete spare-capacity slice.
+        // The spare borrow has ended; any panic above leaves the vector empty.
+        output.set_len(output_len);
+    }
+}
 
 /// Get the polynomial associated to a lookup table with current challenges.
 pub(crate) fn get_lut_poly<F: RichField + Extendable<D>, const D: usize>(
@@ -538,6 +569,113 @@ pub fn check_lookup_constraints<F: RichField + Extendable<D>, const D: usize>(
     constraints
 }
 
+#[cfg(test)]
+mod tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use super::*;
+    use crate::field::batch_util::batch_multiply_add_inplace;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::{Field64, PrimeField64};
+
+    #[test]
+    fn gate_constraint_buffer_publication_keeps_length_zero_on_panic() {
+        type F = GoldilocksField;
+
+        let mut output = vec![F::ONE, F::TWO];
+        let values = [F::from_canonical_u64(3), F::from_canonical_u64(5)];
+        let filters = [F::from_canonical_u64(7), F::from_canonical_u64(11)];
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            initialize_gate_constraint_buffer(&mut output, 2, 2, |consumer| {
+                consumer.begin_gate(2);
+                consumer.accumulate_row(&values, &filters);
+                panic!("stop after partially initializing a gate");
+            });
+        }));
+
+        assert!(result.is_err());
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn gate_constraint_buffer_initializes_later_wider_gates_raw_and_reuses_capacity() {
+        type F = GoldilocksField;
+
+        let batch_size = 5usize;
+        let gate_widths = [1usize, 4, 2];
+        let num_rows = 4usize;
+        let gates = gate_widths
+            .iter()
+            .enumerate()
+            .map(|(gate_i, &width)| {
+                let filters = (0..batch_size)
+                    .map(|point_i| {
+                        GoldilocksField(F::ORDER + 1 + (gate_i * batch_size + point_i) as u64)
+                    })
+                    .collect::<Vec<_>>();
+                let rows = (0..width)
+                    .map(|row_i| {
+                        (0..batch_size)
+                            .map(|point_i| {
+                                GoldilocksField(
+                                    u64::MAX
+                                        - (gate_i * num_rows * batch_size
+                                            + row_i * batch_size
+                                            + point_i)
+                                            as u64,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                (width, filters, rows)
+            })
+            .collect::<Vec<_>>();
+
+        let mut expected = vec![F::ZERO; num_rows * batch_size];
+        for (_, filters, rows) in &gates {
+            for (row_i, values) in rows.iter().enumerate() {
+                batch_multiply_add_inplace(
+                    &mut expected[row_i * batch_size..(row_i + 1) * batch_size],
+                    values,
+                    filters,
+                );
+            }
+        }
+
+        for initial_capacity in [1, expected.len() + 8] {
+            let mut output = Vec::with_capacity(initial_capacity);
+            output.push(F::ONE);
+            let original_capacity = output.capacity();
+            initialize_gate_constraint_buffer(&mut output, num_rows, batch_size, |consumer| {
+                for (width, filters, rows) in &gates {
+                    consumer.begin_gate(*width);
+                    for values in rows {
+                        consumer.accumulate_row(values, filters);
+                    }
+                    consumer.finish_gate();
+                }
+            });
+
+            if initial_capacity < expected.len() {
+                assert!(output.capacity() > original_capacity);
+            } else {
+                assert_eq!(output.capacity(), original_capacity);
+            }
+            assert_eq!(
+                output
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
 /// Same as `check_lookup_constraints`, but for the base field case.
 pub fn check_lookup_constraints_batch<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
@@ -731,7 +869,11 @@ pub fn evaluate_gate_constraints_base_batch<F: RichField + Extendable<D>, const 
     vars_batch: EvaluationVarsBaseBatch<F>,
 ) -> Vec<F> {
     let mut constraints_batch = Vec::new();
-    evaluate_gate_constraints_base_batch_into::<F, D>(common_data, vars_batch, &mut constraints_batch);
+    evaluate_gate_constraints_base_batch_into::<F, D>(
+        common_data,
+        vars_batch,
+        &mut constraints_batch,
+    );
     constraints_batch
 }
 
@@ -741,20 +883,25 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
     vars_batch: EvaluationVarsBaseBatch<F>,
     constraints_batch: &mut Vec<F>,
 ) {
-    constraints_batch.clear();
-    constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
-    for (i, gate) in common_data.gates.iter().enumerate() {
-        let selector_index = common_data.selectors_info.selector_indices[i];
-        gate.0.eval_filtered_base_batch(
-            vars_batch,
-            i,
-            selector_index,
-            common_data.selectors_info.groups[selector_index].clone(),
-            common_data.selectors_info.num_selectors(),
-            common_data.num_lookup_selectors,
-            constraints_batch,
-        );
-    }
+    initialize_gate_constraint_buffer(
+        constraints_batch,
+        common_data.num_gate_constraints,
+        vars_batch.len(),
+        |constraint_consumer| {
+            for (i, gate) in common_data.gates.iter().enumerate() {
+                let selector_index = common_data.selectors_info.selector_indices[i];
+                gate.0.eval_filtered_base_batch(
+                    vars_batch,
+                    i,
+                    selector_index,
+                    common_data.selectors_info.groups[selector_index].clone(),
+                    common_data.selectors_info.num_selectors(),
+                    common_data.num_lookup_selectors,
+                    constraint_consumer,
+                );
+            }
+        },
+    );
 }
 
 pub fn evaluate_gate_constraints_circuit<F: RichField + Extendable<D>, const D: usize>(
