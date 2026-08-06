@@ -4,9 +4,11 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 #![deny(missing_debug_implementations)]
 #![feature(specialization)]
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
 
 extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
 
 pub(crate) mod arch;
 
