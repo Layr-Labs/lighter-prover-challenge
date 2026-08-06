@@ -202,7 +202,21 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 let lde_len = degree << rate_bits;
                 let mut buffer = Vec::with_capacity(lde_len);
                 buffer.extend_from_slice(&p.coeffs);
-                buffer.resize(lde_len, F::ZERO);
+                if rate_bits == 0 {
+                    buffer.resize(lde_len, F::ZERO);
+                } else {
+                    // With a nonzero zero-factor, `prepare_zero_padded_fft`
+                    // writes every element past the live prefix before any
+                    // read (its expansion runs back-to-front for exactly this
+                    // reason), so zero-initializing the seven-eighths tail is
+                    // a dead memset. Field elements are plain-old-data, so
+                    // exposing the uninitialized tail that is only ever
+                    // written first is sound.
+                    #[allow(clippy::uninit_vec)]
+                    unsafe {
+                        buffer.set_len(lde_len);
+                    }
+                }
                 batch_multiply_inplace(&mut buffer[..degree], &coset_powers);
                 PolynomialCoeffs::new(buffer)
                     .fft_with_options(Some(rate_bits), fft_root_table)
@@ -247,7 +261,16 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let start = col_range.start;
         let w = col_range.len();
         out.clear();
-        out.resize(n * w, F::ZERO);
+        out.reserve(n * w);
+        // Every arm below writes all `n * w` elements (PolyMajor covers each
+        // `ci * n + k`, PointMajor each `k * w + ci`, over the full grid), so
+        // zero-initializing the reused scratch on every call is a dead memset.
+        // Field elements are plain-old-data, so exposing the uninitialized
+        // buffer that is fully written before any read is sound.
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            out.set_len(n * w);
+        }
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
                 for (ci, c) in col_range.enumerate() {
