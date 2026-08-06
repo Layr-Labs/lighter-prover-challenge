@@ -99,6 +99,53 @@ impl Mul for QuinticExtension<GoldilocksField> {
     }
 }
 
+impl Frobenius<5> for QuinticExtension<GoldilocksField> {
+    fn repeated_frobenius(&self, count: usize) -> Self {
+        // The code below assumes DTH_ROOT = W^((p - 1)/5) = 1041288259238279555,
+        // which has multiplicative order 5.
+        const_assert!(
+            <GoldilocksField as Extendable<5>>::DTH_ROOT.0 == 1041288259238279555u64
+        );
+
+        // FROB_COEFFS[c - 1][i - 1] = DTH_ROOT^(c * i mod 5), the coefficient of
+        // limb i under the c-fold Frobenius automorphism.
+        const FROB_COEFFS: [[GoldilocksField; 4]; 4] = [
+            [
+                GoldilocksField(1041288259238279555),
+                GoldilocksField(15820824984080659046),
+                GoldilocksField(211587555138949697),
+                GoldilocksField(1373043270956696022),
+            ],
+            [
+                GoldilocksField(15820824984080659046),
+                GoldilocksField(1373043270956696022),
+                GoldilocksField(1041288259238279555),
+                GoldilocksField(211587555138949697),
+            ],
+            [
+                GoldilocksField(211587555138949697),
+                GoldilocksField(1041288259238279555),
+                GoldilocksField(1373043270956696022),
+                GoldilocksField(15820824984080659046),
+            ],
+            [
+                GoldilocksField(1373043270956696022),
+                GoldilocksField(211587555138949697),
+                GoldilocksField(15820824984080659046),
+                GoldilocksField(1041288259238279555),
+            ],
+        ];
+
+        let count = count % 5;
+        if count == 0 {
+            return *self;
+        }
+        let z = &FROB_COEFFS[count - 1];
+        let Self([a0, a1, a2, a3, a4]) = *self;
+        Self([a0, a1 * z[0], a2 * z[1], a3 * z[2], a4 * z[3]])
+    }
+}
+
 /*
  * The functions extD_add_prods[0-4] are helper functions for
  * computing products for extensions of degree D over the Goldilocks
@@ -487,4 +534,100 @@ pub(crate) fn ext5_mul(a: [u64; 5], b: [u64; 5]) -> [GoldilocksField; 5] {
     let c3 = ext5_add_prods3(&a, &b);
     let c4 = ext5_add_prods4(&a, &b);
     [c0, c1, c2, c3, c4]
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::extension::quintic::QuinticExtension;
+    use crate::extension::{Extendable, Frobenius};
+    use crate::goldilocks_field::GoldilocksField;
+    use crate::types::{Field, Field64, PrimeField64};
+
+    type GF = GoldilocksField;
+    type QE = QuinticExtension<GoldilocksField>;
+
+    /// The generic `Frobenius::repeated_frobenius` default implementation
+    /// (from `extension/mod.rs`), reconstructed as the reference oracle.
+    fn generic_repeated_frobenius(x: QE, count: usize) -> QE {
+        if count == 0 {
+            return x;
+        } else if count >= 5 {
+            return generic_repeated_frobenius(x, count % 5);
+        }
+        let arr = x.0;
+
+        let mut z0 = <GF as Extendable<5>>::DTH_ROOT;
+        for _ in 1..count {
+            z0 *= <GF as Extendable<5>>::DTH_ROOT;
+        }
+
+        let mut res = [GF::ZERO; 5];
+        for (i, z) in z0.powers().take(5).enumerate() {
+            res[i] = arr[i] * z;
+        }
+
+        QuinticExtension(res)
+    }
+
+    #[test]
+    fn quintic_frobenius_specialization_matches_generic() {
+        let check = |x: QE| {
+            for count in 0..=12 {
+                let expected = generic_repeated_frobenius(x, count);
+                let actual = x.repeated_frobenius(count);
+                for j in 0..5 {
+                    assert_eq!(
+                        actual.0[j].to_canonical_u64(),
+                        expected.0[j].to_canonical_u64(),
+                        "limb {j} mismatch for count {count}, x={x:?}"
+                    );
+                }
+                // `frobenius` is defined in terms of `repeated_frobenius`.
+                if count == 1 {
+                    let frob = x.frobenius();
+                    for j in 0..5 {
+                        assert_eq!(
+                            frob.0[j].to_canonical_u64(),
+                            expected.0[j].to_canonical_u64()
+                        );
+                    }
+                }
+            }
+        };
+
+        // Edge cases: 0, 1, 2, -1, scaled basis vectors, a low-order element
+        // and non-canonical representations.
+        let p = GF::ORDER;
+        check(QE::ZERO);
+        check(QE::ONE);
+        check(QE::TWO);
+        check(QE::NEG_ONE);
+        check(QuinticExtension([
+            <GF as Extendable<5>>::DTH_ROOT,
+            GF::ZERO,
+            GF::ZERO,
+            GF::ZERO,
+            GF::ZERO,
+        ]));
+        for j in 0..5 {
+            for v in [1, p - 1, p, u64::MAX] {
+                let mut limbs = [GF::ZERO; 5];
+                limbs[j] = GoldilocksField(v);
+                check(QuinticExtension(limbs));
+            }
+        }
+
+        // Randomized differential over the full u64 (non-canonical included) range.
+        let mut state = 0xB7E1_5162_8AED_2A6Au64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..2000 {
+            let limbs = core::array::from_fn(|_| GoldilocksField(next()));
+            check(QuinticExtension(limbs));
+        }
+    }
 }

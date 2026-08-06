@@ -25,7 +25,30 @@ impl<F: Extendable<5>> OEF<5> for QuinticExtension<F> {
     const DTH_ROOT: F = F::DTH_ROOT;
 }
 
-impl<F: Extendable<5>> Frobenius<5> for QuinticExtension<F> {}
+impl<F: Extendable<5>> Frobenius<5> for QuinticExtension<F> {
+    default fn repeated_frobenius(&self, count: usize) -> Self {
+        if count == 0 {
+            return *self;
+        } else if count >= 5 {
+            // x |-> x^(p^5) is the identity, so x^(p^count) == x^(p^(count % 5))
+            return self.repeated_frobenius(count % 5);
+        }
+        let arr = self.0;
+
+        // z0 = DTH_ROOT^count = W^(k * count) where k = floor((p^5-1)/5)
+        let mut z0 = F::DTH_ROOT;
+        for _ in 1..count {
+            z0 *= F::DTH_ROOT;
+        }
+
+        let mut res = [F::ZERO; 5];
+        for (i, z) in z0.powers().take(5).enumerate() {
+            res[i] = arr[i] * z;
+        }
+
+        Self(res)
+    }
+}
 
 impl<F: Extendable<5>> FieldExtension<5> for QuinticExtension<F> {
     type BaseField = F;
