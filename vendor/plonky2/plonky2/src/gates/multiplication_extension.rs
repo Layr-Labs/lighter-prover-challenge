@@ -8,7 +8,7 @@ use core::ops::Range;
 
 use anyhow::Result;
 
-use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::extension::{Extendable, FieldExtension, OEF};
 use crate::gates::gate::Gate;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -18,7 +18,9 @@ use crate::iop::target::Target;
 use crate::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use crate::plonk::circuit_builder::CircuitBuilder;
 use crate::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
-use crate::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBase};
+use crate::plonk::vars::{
+    EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch,
+};
 use crate::util::serialization::{Buffer, IoResult, Read, Write};
 
 /// A gate which can perform a weighted multiplication, i.e. `result = c0.x.y` on [`ExtensionTarget`].
@@ -98,6 +100,45 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for MulExtensionGa
 
             yield_constr.many((output - computed_output).to_basefield_array());
         }
+    }
+
+    fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
+        let n = vars_base.len();
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        let const_0 = &vars_base.local_constants[..n];
+        // `X^D - W` is the irreducible polynomial defining the extension, so
+        // limb k of the product is
+        //   sum_{i+j=k} a_i b_j + W * sum_{i+j=k+D} a_i b_j.
+        let w = <<F as Extendable<D>>::Extension as OEF<D>>::W;
+        let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
+        let mut chunks = res.chunks_exact_mut(n);
+
+        for i in 0..self.num_ops {
+            let m0_start = Self::wires_ith_multiplicand_0(i).start;
+            let m1_start = Self::wires_ith_multiplicand_1(i).start;
+            let out_start = Self::wires_ith_output(i).start;
+            let a: [&[F]; D] = core::array::from_fn(|d| col(m0_start + d));
+            let b: [&[F]; D] = core::array::from_fn(|d| col(m1_start + d));
+
+            for k in 0..D {
+                let output = col(out_start + k);
+                let out = chunks.next().unwrap();
+                for p in 0..n {
+                    let mut computed = F::ZERO;
+                    for j in 0..=k {
+                        computed += a[j][p] * b[k - j][p];
+                    }
+                    let mut high = F::ZERO;
+                    for j in k + 1..D {
+                        high += a[j][p] * b[k + D - j][p];
+                    }
+                    computed += w * high;
+                    out[p] = output[p] - const_0[p] * computed;
+                }
+            }
+        }
+        res
     }
 
     fn eval_unfiltered_circuit(
