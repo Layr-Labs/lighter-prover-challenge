@@ -187,7 +187,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Vec<Vec<F>> {
         let degree = polynomials[0].len();
-        let coset_powers = F::coset_shift().powers().take(degree).collect::<Vec<_>>();
+        // Process-global cached coset-shift power table (bit-identical to
+        // computing it here): the three commitments per proof share one table
+        // per degree instead of each rebuilding the serial power chain.
+        let coset_powers = crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
 
         // If blinding, salt with two random elements to each leaf vector.
         let salt_size = if blinding { SALT_SIZE } else { 0 };
@@ -246,7 +249,19 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let n = indices.len();
         let start = col_range.start;
         let w = col_range.len();
-        out.clear();
+        // `out` is per-worker scratch reused across the quotient batches, so it
+        // already has the right length for all but the last (short) batch. Every
+        // arm below writes all `n * w` cells before any is read:
+        //   - Columns/PolyMajor: `ci` covers `0..w`, `k` covers `0..n`, writing
+        //     each `ci * n + k` exactly once;
+        //   - Columns/PointMajor: the same loop nest writes each `k * w + ci`;
+        //   - Rows/PointMajor: each `k` copies a full `w`-element row into
+        //     `out[k * w..(k + 1) * w]`;
+        //   - Rows/PolyMajor: each `k` writes `ci * n + k` for every `ci` in
+        //     `0..w` (`row.len() == w`).
+        // So the zero-fill of a correctly sized buffer is a dead store: adjust
+        // the length only (`resize` is a no-op when it already matches, and
+        // still zero-initializes any newly created or grown scratch).
         out.resize(n * w, F::ZERO);
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
@@ -375,16 +390,21 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // `final_poly` is dead after this point, so pad it in place instead of
         // the clone-then-resize that `lde(&self)` performs.
         let mut lde_final_poly = final_poly;
+        let live_coeffs = lde_final_poly.len();
         lde_final_poly
             .coeffs
-            .resize(lde_final_poly.len() << fri_params.config.rate_bits, F::Extension::ZERO);
+            .resize(live_coeffs << fri_params.config.rate_bits, F::Extension::ZERO);
         let lde_final_values = timed!(
             timing,
             &format!("perform final FFT {}", lde_final_poly.len()),
-            // The top (1 - 1/2^rate_bits) of the padded coefficients are zero,
-            // so the FFT's zero-run shortcut applies.
-            lde_final_poly.coset_fft_with_options(
+            // The top (1 - 1/2^rate_bits) of the padded coefficients are the
+            // zeros written by the `resize` just above, so the FFT's zero-run
+            // shortcut applies and the coset scaling over that tail is a
+            // multiply-by-zero: scale only the `live_coeffs` prefix.
+            coset_fft_zero_tail(
+                &lde_final_poly,
                 F::coset_shift().into(),
+                live_coeffs,
                 Some(fri_params.config.rate_bits),
                 None,
             )
@@ -406,6 +426,39 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 
         fri_proof
     }
+}
+
+/// `coeffs.coset_fft_with_options(shift, zero_factor, root_table)` for a
+/// coefficient vector whose entries from index `live` on are *known to be
+/// zero* — the caller must have written those zeros itself (or otherwise hold a
+/// proof of them), since the result is only equal to the classic path under
+/// that precondition.
+///
+/// The classic path materializes `shift^i * c_i` for all `coeffs.len()`
+/// coefficients. Where `c_i` is zero the product is zero, so this scales only
+/// the live prefix and fills the tail with the very zeros the classic path
+/// would have computed there; the FFT input is therefore element-wise
+/// identical. With `rate_bits = 3` that deletes 7/8 of the extension-field
+/// multiplies *and* 7/8 of the serial `powers()` chain, at one memset.
+pub(crate) fn coset_fft_zero_tail<F: Field>(
+    coeffs: &PolynomialCoeffs<F>,
+    shift: F,
+    live: usize,
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+) -> PolynomialValues<F> {
+    let len = coeffs.len();
+    debug_assert!(live <= len);
+    debug_assert!(coeffs.coeffs[live..].iter().all(F::is_zero));
+    let mut scaled = Vec::with_capacity(len);
+    scaled.extend(
+        shift
+            .powers()
+            .zip(&coeffs.coeffs[..live])
+            .map(|(r, &c)| r * c),
+    );
+    scaled.resize(len, F::ZERO);
+    PolynomialCoeffs::new(scaled).fft_with_options(zero_factor, root_table)
 }
 
 /// Folds one batch's quotient `(p(X) - p(z))/(X - z)` into the running FRI
@@ -481,6 +534,46 @@ mod tests {
         let actual = PolynomialBatch::<F, C, D>::lde_values(&polynomials, RATE_BITS, false, None);
 
         assert_eq!(actual, expected);
+    }
+
+    /// The zero-tail coset FFT must be value-identical to the classic
+    /// full-length coset scaling for every polynomial whose coefficients from
+    /// `live` on are zero — the precondition both call sites establish by
+    /// writing those zeros themselves. Covers `live` exactly at the zero-run
+    /// boundary (`n >> rate_bits`, the production case), `live` below it
+    /// (extra zeros), and `live == n` (no tail at all), over both the base
+    /// field and the quadratic extension actually used by FRI.
+    #[test]
+    fn coset_fft_zero_tail_matches_classic() {
+        fn check<F: Field + Sample>() {
+            for lg_n in [1usize, 2, 4, 6, 9] {
+                let n = 1usize << lg_n;
+                for rate_bits in 1..=3usize.min(lg_n) {
+                    let support = n >> rate_bits;
+                    for live in [support, support / 2, support.saturating_sub(1)] {
+                        let mut coeffs = F::rand_vec(live);
+                        coeffs.resize(n, F::ZERO);
+                        let poly = PolynomialCoeffs::new(coeffs);
+                        let shift = F::rand();
+                        let expected =
+                            poly.coset_fft_with_options(shift, Some(rate_bits), None);
+                        let actual =
+                            coset_fft_zero_tail(&poly, shift, live, Some(rate_bits), None);
+                        assert_eq!(actual.values, expected.values);
+                    }
+                }
+                // `rate_bits = 0` is the degenerate no-tail case.
+                let poly = PolynomialCoeffs::new(F::rand_vec(n));
+                let shift = F::rand();
+                assert_eq!(
+                    coset_fft_zero_tail(&poly, shift, n, None, None).values,
+                    poly.coset_fft_with_options(shift, None, None).values
+                );
+            }
+        }
+
+        check::<GoldilocksField>();
+        check::<<GoldilocksField as Extendable<2>>::Extension>();
     }
 
     /// The fused quotient accumulation must be bit-identical (raw u64

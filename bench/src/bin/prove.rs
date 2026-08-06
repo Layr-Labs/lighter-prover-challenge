@@ -23,6 +23,21 @@ use circuit::types::config::F;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// Disable jemalloc's dirty/muzzy page decay for this short-lived single-shot
+// prover: retained pages are never madvised away between commitment phases, so
+// the allocator stops paying the recurring purge/refault churn.
+//
+// ABI note: jemalloc reads `const char *malloc_conf` (prefixed `_rjem_` in
+// tikv-jemalloc-sys), i.e. a pointer-sized slot holding the address of a
+// NUL-terminated string. `&[u8; 36]` is a thin pointer to the NUL-terminated
+// bytes, which matches that ABI exactly. Exporting the bare byte array itself
+// (no indirection) or omitting the trailing NUL would make jemalloc read the
+// string bytes as a pointer and crash. This is a default: the environment and
+// /etc/malloc.conf can still override it.
+#[cfg(not(target_env = "msvc"))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
+
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
