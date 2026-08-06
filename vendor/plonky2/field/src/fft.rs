@@ -118,7 +118,7 @@ fn fft_classic_simd<P: PackedField>(
             // Set omega to root_table[lg_half_m][0..half_m] but repeated.
             let mut omega = P::default();
             for (j, omega_j) in omega.as_slice_mut().iter_mut().enumerate() {
-                *omega_j = root_table[lg_half_m][j % half_m];
+                *omega_j = root_table[lg_half_m][j & (half_m - 1)];
             }
 
             for k in (0..packed_n).step_by(2) {
