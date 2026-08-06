@@ -355,7 +355,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
         let base = F::from_canonical_usize(Self::BASE);
         let three = F::from_canonical_usize(3);
         let mut scratch = vec![F::ZERO; n];
-        let mut constraint_index = 0;
+        let mut constraint_row = 0;
 
         for i in 0..self.num_ops {
             let input = &wires[self.wire_ith_input(i) * n..][..n];
@@ -372,9 +372,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
                 scratch[p] -= input[p];
             }
             let combined =
-                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
+                &mut combined_gate_constraints[constraint_row * n..(constraint_row + 1) * n];
             batch_multiply_add_inplace(combined, &scratch, filters);
-            constraint_index += 1;
+            constraint_row += 1;
 
             for j in 0..num_aux {
                 let limb = &wires[self.wire_ith_input_jth_aux_limb(i, j) * n..][..n];
@@ -391,13 +391,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
                     }
                 }
                 let combined = &mut combined_gate_constraints
-                    [constraint_index * n..(constraint_index + 1) * n];
+                    [constraint_row * n..(constraint_row + 1) * n];
                 batch_multiply_add_inplace(combined, &scratch, filters);
-                constraint_index += 1;
+                constraint_row += 1;
             }
         }
 
-        debug_assert_eq!(constraint_index, self.num_constraints());
+        debug_assert_eq!(constraint_row, self.num_constraints());
     }
 
     fn eval_unfiltered_circuit(
