@@ -202,10 +202,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 let lde_len = degree << rate_bits;
                 let mut buffer = Vec::with_capacity(lde_len);
                 buffer.extend_from_slice(&p.coeffs);
-                buffer.resize(lde_len, F::ZERO);
                 batch_multiply_inplace(&mut buffer[..degree], &coset_powers);
                 PolynomialCoeffs::new(buffer)
-                    .fft_with_options(Some(rate_bits), fft_root_table)
+                    .fft_zero_extended_with_options(rate_bits, fft_root_table)
                     .values
             })
             .chain(

@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 use core::cmp::{max, min};
+use core::slice;
 
 use plonky2_util::{log2_strict, reverse_index_bits_in_place};
 use unroll::unroll_for_loops;
@@ -57,6 +58,56 @@ pub fn fft_with_options<F: Field>(
 ) -> PolynomialValues<F> {
     let PolynomialCoeffs { coeffs: mut buffer } = poly;
     fft_dispatch(&mut buffer, zero_factor, root_table);
+    PolynomialValues::new(buffer)
+}
+
+/// FFT a coefficient vector whose missing suffix is known to be zero, without first writing that
+/// zero suffix. The cache-block preparation initializes every destination before it is exposed as
+/// `F`; unsupported shapes fall back to the ordinary zero-padded path.
+pub fn fft_zero_extended_with_options<F: Field>(
+    poly: PolynomialCoeffs<F>,
+    rate_bits: usize,
+    root_table: Option<&FftRootTable<F>>,
+) -> PolynomialValues<F> {
+    assert!(rate_bits > 0);
+    let PolynomialCoeffs { coeffs: mut buffer } = poly;
+    let nonzero_len = buffer.len();
+    let n = nonzero_len << rate_bits;
+    let lg_n = log2_strict(n);
+    let computed_root_table = root_table.is_none().then(|| fft_root_table(n));
+    let used_root_table = root_table.or(computed_root_table.as_ref()).unwrap();
+    assert_eq!(used_root_table.len(), lg_n);
+
+    let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
+    let cache_block = (rate_bits >= lg_packed_width && rate_bits < lg_n)
+        .then(|| zero_padded_cache_block_log::<F>(rate_bits, lg_n))
+        .flatten();
+    if let Some(lg_block_n) = cache_block {
+        buffer.reserve_exact(n - nonzero_len);
+        reverse_index_bits_in_place(&mut buffer);
+        unsafe {
+            // SAFETY: the helper writes the entire reserved suffix, block by block, before
+            // extending the vector length. It retains the same reverse expansion order as the
+            // initialized zero-tail implementation, so no unread prefix coefficient is clobbered.
+            fft_zero_padded_cache_blocks_uninit::<<F as Packable>::Packing>(
+                &mut buffer,
+                n,
+                rate_bits,
+                lg_block_n,
+                used_root_table,
+            );
+        }
+        fft_classic_simd::<<F as Packable>::Packing>(
+            &mut buffer,
+            lg_block_n,
+            lg_n,
+            used_root_table,
+        );
+    } else {
+        buffer.resize(n, F::ZERO);
+        fft_classic(&mut buffer, rate_bits, used_root_table);
+    }
+
     PolynomialValues::new(buffer)
 }
 
@@ -314,6 +365,72 @@ fn fft_zero_padded_cache_blocks<P: PackedField>(
     }
 }
 
+/// Cache-block zero-tail preparation for a vector whose initialized length is only the live
+/// coefficient prefix. Each destination block is fully written before a slice reference to it is
+/// created. The vector length is extended only after every block has been initialized.
+unsafe fn fft_zero_padded_cache_blocks_uninit<P: PackedField>(
+    values: &mut Vec<P::Scalar>,
+    final_len: usize,
+    r: usize,
+    lg_block_n: usize,
+    root_table: &FftRootTable<P::Scalar>,
+) {
+    let repeat = 1 << r;
+    let block_len = 1 << lg_block_n;
+    let nonzero_per_block = block_len >> r;
+    let packed_repeat = repeat / P::WIDTH;
+    let packed_block_len = block_len / P::WIDTH;
+    let num_blocks = final_len / block_len;
+    let nonzero_len = values.len();
+    debug_assert_eq!(nonzero_len * repeat, final_len);
+    debug_assert!(values.capacity() >= final_len);
+
+    let values_ptr = values.as_mut_ptr();
+    let packed_ptr = values_ptr.cast::<P>();
+    let omega_table = P::pack_slice(&root_table[r]);
+
+    for block in (0..num_blocks).rev() {
+        let source_start = block * nonzero_per_block;
+        let destination = block * packed_block_len;
+        for pair in (0..nonzero_per_block / 2).rev() {
+            let source = source_start + pair * 2;
+            let u = unsafe { *values_ptr.add(source) };
+            let v = unsafe { *values_ptr.add(source + 1) };
+            let u = P::from(u);
+            let v = P::from(v);
+            let pair_destination = destination + pair * 2 * packed_repeat;
+
+            for j in 0..packed_repeat {
+                let t = omega_table[j] * v;
+                unsafe {
+                    packed_ptr.add(pair_destination + j).write(u + t);
+                    packed_ptr
+                        .add(pair_destination + packed_repeat + j)
+                        .write(u - t);
+                }
+            }
+        }
+
+        let block_values = unsafe {
+            slice::from_raw_parts_mut(values_ptr.add(block * block_len), block_len)
+        };
+        let packed_block = P::pack_slice_mut(block_values);
+        fft_classic_simd_layers(packed_block, r + 1, lg_block_n, root_table);
+    }
+
+    unsafe { values.set_len(final_len) };
+}
+
+#[inline]
+fn zero_padded_cache_block_log<F: Field>(r: usize, lg_n: usize) -> Option<usize> {
+    let lg_block_n = match core::mem::size_of::<F>() {
+        0..=8 => 13,
+        9..=16 => 12,
+        _ => 11,
+    };
+    (r + 1 < lg_block_n && lg_block_n <= lg_n).then_some(lg_block_n)
+}
+
 #[inline(never)]
 fn prepare_zero_padded_fft<F: Field>(
     values: &mut [F],
@@ -335,12 +452,7 @@ fn prepare_zero_padded_fft<F: Field>(
     if r >= lg_packed_width && r < lg_n {
         // Keep values plus the largest local twiddle row within Apple Silicon's 128 KiB L1D.
         // Both 2^13 base-field and 2^12 quadratic-extension blocks use about 96 KiB.
-        let lg_block_n = match core::mem::size_of::<F>() {
-            0..=8 => 13,
-            9..=16 => 12,
-            _ => 11,
-        };
-        if r + 1 < lg_block_n && lg_block_n <= lg_n {
+        if let Some(lg_block_n) = zero_padded_cache_block_log::<F>(r, lg_n) {
             fft_zero_padded_cache_blocks::<<F as Packable>::Packing>(
                 values, r, lg_block_n, root_table,
             );
@@ -404,7 +516,10 @@ mod tests {
     use unroll::unroll_for_loops;
 
     use crate::extension::quadratic::QuadraticExtension;
-    use crate::fft::{FftRootTable, fft, fft_classic, fft_root_table, fft_with_options, ifft};
+    use crate::fft::{
+        FftRootTable, fft, fft_classic, fft_root_table, fft_with_options,
+        fft_zero_extended_with_options, ifft,
+    };
     use crate::goldilocks_field::GoldilocksField;
     use crate::packable::Packable;
     use crate::packed::PackedField;
@@ -655,6 +770,14 @@ mod tests {
             assert_eq!(
                 actual, expected_full,
                 "zero-padded FFT mismatch for 2^{base_lg_n} -> 2^{lg_n}"
+            );
+
+            let uninitialized_tail = PolynomialCoeffs::new(deterministic_values(nonzero_len));
+            let actual_without_zero_fill =
+                fft_zero_extended_with_options(uninitialized_tail, r, Some(&roots)).values;
+            assert_eq!(
+                actual_without_zero_fill, expected_full,
+                "zero-fill-free FFT mismatch for 2^{base_lg_n} -> 2^{lg_n}"
             );
 
             let mut expected_coset = padded
