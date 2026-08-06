@@ -135,7 +135,38 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for Exponentiation
     }
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        self.eval_unfiltered_base_batch_packed(vars_base)
+        let n = vars_base.len();
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        let mut res = vec![F::ZERO; n * self.num_constraints()];
+        let mut chunks = res.chunks_exact_mut(n);
+
+        let base = col(self.wire_base());
+        for i in 0..self.num_power_bits {
+            // power_bits is in LE order, but we accumulate in BE order.
+            let cur_bit = col(self.wire_power_bit(self.num_power_bits - i - 1));
+            let intermediate_value = col(self.wire_intermediate_value(i));
+            let out = chunks.next().unwrap();
+            if i == 0 {
+                for p in 0..n {
+                    out[p] = (cur_bit[p] * base[p] + (F::ONE - cur_bit[p])) - intermediate_value[p];
+                }
+            } else {
+                let prev = col(self.wire_intermediate_value(i - 1));
+                for p in 0..n {
+                    out[p] = prev[p].square() * (cur_bit[p] * base[p] + (F::ONE - cur_bit[p]))
+                        - intermediate_value[p];
+                }
+            }
+        }
+
+        let output = col(self.wire_output());
+        let last = col(self.wire_intermediate_value(self.num_power_bits - 1));
+        let out = chunks.next().unwrap();
+        for p in 0..n {
+            out[p] = output[p] - last[p];
+        }
+        res
     }
 
     fn eval_unfiltered_circuit(

@@ -26,6 +26,7 @@ use super::biguint::{
 use super::comparison::CircuitBuilderBiguintSubtractiveComparison;
 use crate::bigint::bigint::{BigIntTarget, CircuitBuilderBigInt, SignTarget};
 use crate::builder::Builder;
+use crate::nonnative::limbs;
 use crate::uint::u32::gadgets::arithmetic_u32::U32Target;
 
 pub trait CircuitBuilderBiguintDivRem<F: RichField + Extendable<D>, const D: usize> {
@@ -194,6 +195,25 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
+        // Allocation-free fast path: dividends up to 512 bits divided by a
+        // normalized (top bit set) 256-bit divisor, which covers the common
+        // reductions modulo the secp256k1 field orders. Computes the exact
+        // same quotient/remainder digits as `BigUint::div_rem`.
+        if let (Some(a), Some(b)) = (
+            limbs::try_read_u512(witness, &self.a),
+            limbs::try_read_u256(witness, &self.b),
+        ) {
+            if b[3] >> 63 == 1 {
+                let (q, r) = limbs::div_rem_512_by_256(&a, &b);
+                limbs::set_limb_digits_target(out_buffer, &self.div, &limbs::u320_digits(&q))?;
+                return limbs::set_limb_digits_target(
+                    out_buffer,
+                    &self.rem,
+                    &limbs::u256_digits(&r),
+                );
+            }
+        }
+
         let a = witness.get_biguint_target(self.a.clone());
         let b = witness.get_biguint_target(self.b.clone());
 
