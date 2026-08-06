@@ -195,11 +195,24 @@ fn reduce_gate_constraints_base_batch<F: Field>(
     }
 }
 
+#[inline(always)]
+fn scale_quotient_point<F: Field>(
+    z_h_on_coset: &ZeroPolyOnCoset<F>,
+    index: usize,
+    point_values: &mut [F],
+) {
+    let denominator_inv = z_h_on_coset.eval_inverse(index);
+    point_values
+        .iter_mut()
+        .for_each(|value| *value *= denominator_inv);
+}
+
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
 ///
 /// Results are stored point-major: the challenges for point `k` occupy
 /// `res_out[k * num_challenges..(k + 1) * num_challenges]`. `res_out` must be
-/// zero-initialized by the caller.
+/// zero-initialized by the caller. Each result is divided by `Z_H` at that
+/// point's coset index.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
@@ -369,10 +382,50 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 *c = term.multiply_accumulate(*c, alpha);
             }
         }
+        scale_quotient_point(z_h_on_coset, index, res);
 
         vanishing_z_1_terms.clear();
         vanishing_partial_products_terms.clear();
         vanishing_all_lookup_terms.clear();
+    }
+}
+
+#[cfg(test)]
+mod quotient_scaling_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::PrimeField64;
+
+    #[test]
+    fn point_major_scaling_matches_the_separate_reference_pass() {
+        type F = GoldilocksField;
+
+        let z_h_on_coset = ZeroPolyOnCoset::<F>::new(4, 3);
+        let indices = [0, 3, 9];
+        let mut expected = [
+            F::from_canonical_u64(5),
+            F::from_canonical_u64(7),
+            F::from_canonical_u64(11),
+            F::from_canonical_u64(13),
+            F::from_canonical_u64(17),
+            F::from_canonical_u64(19),
+        ];
+        let mut actual = expected;
+
+        for (&index, point_values) in indices.iter().zip(expected.chunks_exact_mut(2)) {
+            let denominator_inv = z_h_on_coset.eval_inverse(index);
+            point_values
+                .iter_mut()
+                .for_each(|value| *value *= denominator_inv);
+        }
+        for (&index, point_values) in indices.iter().zip(actual.chunks_exact_mut(2)) {
+            scale_quotient_point(&z_h_on_coset, index, point_values);
+        }
+
+        assert_eq!(
+            actual.map(|value| value.to_noncanonical_u64()),
+            expected.map(|value| value.to_noncanonical_u64())
+        );
     }
 }
 

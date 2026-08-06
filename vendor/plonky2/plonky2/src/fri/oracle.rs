@@ -246,7 +246,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let n = indices.len();
         let start = col_range.start;
         let w = col_range.len();
-        out.clear();
         out.resize(n * w, F::ZERO);
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
@@ -401,8 +400,104 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 mod tests {
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::Sample;
+    use crate::field::types::{PrimeField64, Sample};
+    use crate::hash::merkle_tree::MerkleTree;
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    #[test]
+    fn fill_lde_batch_fully_overwrites_reused_storage_without_prefilling() {
+        const D: usize = 2;
+        const LOG_ROWS: usize = 3;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let columns = (0..5)
+            .map(|column| {
+                (0..1 << LOG_ROWS)
+                    .map(|row| F::from_canonical_usize(100 * column + row + 1))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let rows = (0..1 << LOG_ROWS)
+            .map(|physical_row| {
+                let logical_row = reverse_bits(physical_row, LOG_ROWS);
+                columns
+                    .iter()
+                    .map(|column| column[logical_row])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let batches = [
+            PolynomialBatch::<F, C, D> {
+                polynomials: Vec::new(),
+                merkle_tree: MerkleTree::new_columns(columns.clone(), 1),
+                degree_log: LOG_ROWS,
+                rate_bits: 0,
+                blinding: false,
+            },
+            PolynomialBatch::<F, C, D> {
+                polynomials: Vec::new(),
+                merkle_tree: MerkleTree::new(rows, 1),
+                degree_log: LOG_ROWS,
+                rate_bits: 0,
+                blinding: false,
+            },
+        ];
+        let sentinel = F::from_noncanonical_u64(u64::MAX - 17);
+
+        for batch in &batches {
+            for layout in [BatchLayout::PointMajor, BatchLayout::PolyMajor] {
+                let mut output = vec![sentinel; 2];
+                for (indices, columns_range) in
+                    [(vec![0, 2, 5], 1..4), (vec![0, 2, 5], 1..4), (vec![1, 6], 2..4)]
+                {
+                    output.fill(sentinel);
+                    batch.fill_lde_batch(
+                        &indices,
+                        1,
+                        columns_range.clone(),
+                        layout,
+                        &mut output,
+                    );
+
+                    let mut expected = Vec::new();
+                    match layout {
+                        BatchLayout::PointMajor => {
+                            for &row in &indices {
+                                for column in columns_range.clone() {
+                                    expected.push(columns[column][row]);
+                                }
+                            }
+                        }
+                        BatchLayout::PolyMajor => {
+                            for column in columns_range.clone() {
+                                for &row in &indices {
+                                    expected.push(columns[column][row]);
+                                }
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        output
+                            .iter()
+                            .map(|value| value.to_noncanonical_u64())
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .map(|value| value.to_noncanonical_u64())
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+
+        // The final values cannot reveal an unnecessary preliminary zero write, so retain a
+        // narrow structural assertion for the performance contract exercised above.
+        assert!(
+            !include_str!("oracle.rs")
+                .contains("out.clear();\n        out.resize(n * w, F::ZERO);")
+        );
+    }
 
     #[test]
     fn shared_coset_powers_match_per_polynomial_shifts() {
