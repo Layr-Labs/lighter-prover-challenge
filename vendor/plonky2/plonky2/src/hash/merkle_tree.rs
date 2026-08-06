@@ -248,6 +248,38 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
             return H::two_to_one(left_digest, right_digest);
         }
 
+        // Keep leaf permutations at the accepted four-state boundary, but pair
+        // the two independent four-leaf roots before computing the final root.
+        if num_leaves == 8 {
+            let leaf = |i| &leaves[i * leaf_width..(i + 1) * leaf_width];
+            let (h0, h1, h2, h3) =
+                H::hash_or_noop_quad(leaf(0), leaf(1), leaf(2), leaf(3));
+            digests_buf[0].write(h0);
+            digests_buf[1].write(h1);
+            digests_buf[4].write(h2);
+            digests_buf[5].write(h3);
+
+            let (p0, p1) = H::two_to_one_pair(h0, h1, h2, h3);
+            digests_buf[2].write(p0);
+            digests_buf[3].write(p1);
+
+            let (h4, h5, h6, h7) =
+                H::hash_or_noop_quad(leaf(4), leaf(5), leaf(6), leaf(7));
+            digests_buf[8].write(h4);
+            digests_buf[9].write(h5);
+            digests_buf[12].write(h6);
+            digests_buf[13].write(h7);
+
+            let (p2, p3) = H::two_to_one_pair(h4, h5, h6, h7);
+            digests_buf[10].write(p2);
+            digests_buf[11].write(p3);
+
+            let (left_digest, right_digest) = H::two_to_one_pair(p0, p1, p2, p3);
+            digests_buf[6].write(left_digest);
+            digests_buf[7].write(right_digest);
+            return H::two_to_one(left_digest, right_digest);
+        }
+
         // Rayon task creation dominates the tiny subtrees near the leaves. Keep
         // enough parallelism at the upper levels, then recurse synchronously.
         let (left_digest, right_digest) = if num_leaves > 16 {
@@ -547,15 +579,111 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
     use anyhow::Result;
 
     use super::*;
     use crate::field::extension::Extendable;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::PrimeField64;
+    use crate::hash::hash_types::HashOut;
     use crate::hash::merkle_proofs::verify_merkle_proof_to_cap;
+    use crate::hash::poseidon2::hash::{Poseidon2Hash, Poseidon2Permutation};
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
+
+    static PAIR_COMPRESSIONS: AtomicUsize = AtomicUsize::new(0);
+    static SCALAR_COMPRESSIONS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    struct CountingPoseidon2Hash;
+
+    impl Hasher<GoldilocksField> for CountingPoseidon2Hash {
+        const HASH_SIZE: usize = <Poseidon2Hash as Hasher<GoldilocksField>>::HASH_SIZE;
+        type Hash = HashOut<GoldilocksField>;
+        type Permutation = Poseidon2Permutation<GoldilocksField>;
+
+        fn hash_no_pad(input: &[GoldilocksField]) -> Self::Hash {
+            <Poseidon2Hash as Hasher<GoldilocksField>>::hash_no_pad(input)
+        }
+
+        fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash {
+            SCALAR_COMPRESSIONS.fetch_add(1, Ordering::Relaxed);
+            <Poseidon2Hash as Hasher<GoldilocksField>>::two_to_one(left, right)
+        }
+
+        fn two_to_one_pair(
+            x0: Self::Hash,
+            y0: Self::Hash,
+            x1: Self::Hash,
+            y1: Self::Hash,
+        ) -> (Self::Hash, Self::Hash) {
+            PAIR_COMPRESSIONS.fetch_add(1, Ordering::Relaxed);
+            <Poseidon2Hash as Hasher<GoldilocksField>>::two_to_one_pair(x0, y0, x1, y1)
+        }
+    }
 
     pub(crate) fn random_data<F: RichField>(n: usize, k: usize) -> Vec<Vec<F>> {
         (0..n).map(|_| F::rand_vec(k)).collect()
+    }
+
+    #[test]
+    fn eight_leaf_flat_tree_pairs_level_two_and_matches_legacy_layout() {
+        type F = GoldilocksField;
+        const NUM_LEAVES: usize = 8;
+        const NUM_DIGESTS: usize = 2 * (NUM_LEAVES - 1);
+
+        for width in [1, 4, 5, 8, 9, 17, 87] {
+            let leaves = random_data::<F>(NUM_LEAVES, width);
+            let flat = leaves.iter().flatten().copied().collect::<Vec<_>>();
+
+            let mut expected_digests = Vec::with_capacity(NUM_DIGESTS);
+            let expected_root = fill_subtree::<F, Poseidon2Hash>(
+                capacity_up_to_mut(&mut expected_digests, NUM_DIGESTS),
+                &leaves,
+            );
+            unsafe { expected_digests.set_len(NUM_DIGESTS) };
+
+            PAIR_COMPRESSIONS.store(0, Ordering::Relaxed);
+            SCALAR_COMPRESSIONS.store(0, Ordering::Relaxed);
+            let mut actual_digests = Vec::with_capacity(NUM_DIGESTS);
+            let actual_root = fill_subtree_flat::<F, CountingPoseidon2Hash>(
+                capacity_up_to_mut(&mut actual_digests, NUM_DIGESTS),
+                &flat,
+                width,
+                NUM_LEAVES,
+            );
+            unsafe { actual_digests.set_len(NUM_DIGESTS) };
+
+            assert_eq!(
+                actual_root.elements.map(|value| value.to_noncanonical_u64()),
+                expected_root.elements.map(|value| value.to_noncanonical_u64()),
+                "root mismatch at width {width}"
+            );
+            assert_eq!(
+                actual_digests
+                    .iter()
+                    .flat_map(|digest| {
+                        digest
+                            .elements
+                            .iter()
+                            .map(|value| value.to_noncanonical_u64())
+                    })
+                    .collect::<Vec<_>>(),
+                expected_digests
+                    .iter()
+                    .flat_map(|digest| {
+                        digest
+                            .elements
+                            .iter()
+                            .map(|value| value.to_noncanonical_u64())
+                    })
+                    .collect::<Vec<_>>(),
+                "digest layout mismatch at width {width}"
+            );
+            assert_eq!(PAIR_COMPRESSIONS.load(Ordering::Relaxed), 3);
+            assert_eq!(SCALAR_COMPRESSIONS.load(Ordering::Relaxed), 1);
+        }
     }
 
     fn verify_all_leaves<
