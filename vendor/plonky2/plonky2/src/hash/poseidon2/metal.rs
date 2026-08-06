@@ -30,7 +30,7 @@ const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
 /// the default 1<<19 cutoff) hash on an otherwise idle GPU. The global cutoff
 /// stays untouched for the pipelined phases, where lowering it is the
 /// documented priority-inversion regression.
-const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 18;
+const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 17;
 /// Upper bound on concurrently in-flight GPU tree builds. One set serializes
 /// GPU tree builds exactly like the promoted base's global context mutex: a
 /// 3-set experiment measured 13-18% faster locally but scored -21.6% on the
