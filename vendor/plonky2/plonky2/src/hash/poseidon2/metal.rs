@@ -21,7 +21,10 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// (6654d43) ranked-validated this raised value inside its composition; my
 /// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
 /// window and is treated as contaminated evidence.
-const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
+// (1 << 19) excluded the 131072-leaf width-20 zs/partial-products commitment
+// by exactly 16 permutations (3*131072 leaf perms + 131056 parents = 524272).
+// Admit that one tree; everything previously on the CPU stays on the CPU.
+const MIN_GPU_PERMUTATIONS: usize = (1 << 19) - 16;
 /// Upper bound on concurrently in-flight GPU tree builds. One set serializes
 /// GPU tree builds exactly like the promoted base's global context mutex: a
 /// 3-set experiment measured 13-18% faster locally but scored -21.6% on the
