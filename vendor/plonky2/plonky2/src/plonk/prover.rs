@@ -643,6 +643,25 @@ fn compute_all_lookup_polys<
 
 const BATCH_SIZE: usize = 32;
 
+fn fill_point_row_views<'data, 'storage, T>(
+    flat: &'data [T],
+    row_width: usize,
+    columns: core::ops::Range<usize>,
+    row_count: usize,
+    storage: &'storage mut [&'data [T]; BATCH_SIZE],
+) -> &'storage [&'data [T]] {
+    debug_assert!(row_count <= BATCH_SIZE);
+    debug_assert!(columns.end <= row_width);
+    debug_assert_eq!(flat.len(), row_count * row_width);
+
+    for (row, view) in storage[..row_count].iter_mut().enumerate() {
+        let row_start = row * row_width;
+        *view = &flat[row_start + columns.start..row_start + columns.end];
+    }
+
+    &storage[..row_count]
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -814,39 +833,59 @@ fn compute_quotient_polys<
                 );
 
                 let indices_batch = &scratch.indices;
-                let local_zs_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.zs_local_flat[k * zs_row_width..][common_data.zs_range()])
-                    .collect();
-                let next_zs_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.zs_next_flat[k * zs_row_width..][common_data.zs_range()])
-                    .collect();
-                let partial_products_batch: Vec<&[F]> = (0..n)
-                    .map(|k| {
-                        &scratch.zs_local_flat[k * zs_row_width..]
-                            [common_data.partial_products_range()]
-                    })
-                    .collect();
-                let s_sigmas_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires])
-                    .collect();
-                let (local_lookup_batch, next_lookup_batch): (Vec<&[F]>, Vec<&[F]>) = if has_lookup
-                {
+                let mut local_zs_storage: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
+                let local_zs_batch = fill_point_row_views(
+                    &scratch.zs_local_flat,
+                    zs_row_width,
+                    common_data.zs_range(),
+                    n,
+                    &mut local_zs_storage,
+                );
+                let mut next_zs_storage: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
+                let next_zs_batch = fill_point_row_views(
+                    &scratch.zs_next_flat,
+                    zs_row_width,
+                    common_data.zs_range(),
+                    n,
+                    &mut next_zs_storage,
+                );
+                let mut partial_products_storage: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
+                let partial_products_batch = fill_point_row_views(
+                    &scratch.zs_local_flat,
+                    zs_row_width,
+                    common_data.partial_products_range(),
+                    n,
+                    &mut partial_products_storage,
+                );
+                let mut s_sigmas_storage: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
+                let s_sigmas_batch = fill_point_row_views(
+                    &scratch.s_sigmas_flat,
+                    num_routed_wires,
+                    0..num_routed_wires,
+                    n,
+                    &mut s_sigmas_storage,
+                );
+                let mut local_lookup_storage: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
+                let mut next_lookup_storage: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
+                let (local_lookup_batch, next_lookup_batch): (&[&[F]], &[&[F]]) = if has_lookup {
                     (
-                        (0..n)
-                            .map(|k| {
-                                &scratch.zs_local_flat[k * zs_row_width..]
-                                    [common_data.lookup_range()]
-                            })
-                            .collect(),
-                        (0..n)
-                            .map(|k| {
-                                &scratch.zs_next_flat[k * zs_row_width..]
-                                    [common_data.lookup_range()]
-                            })
-                            .collect(),
+                        fill_point_row_views(
+                            &scratch.zs_local_flat,
+                            zs_row_width,
+                            common_data.lookup_range().start..zs_row_width,
+                            n,
+                            &mut local_lookup_storage,
+                        ),
+                        fill_point_row_views(
+                            &scratch.zs_next_flat,
+                            zs_row_width,
+                            common_data.lookup_range().start..zs_row_width,
+                            n,
+                            &mut next_lookup_storage,
+                        ),
                     )
                 } else {
-                    (Vec::new(), Vec::new())
+                    (&[], &[])
                 };
 
                 let vars_batch = EvaluationVarsBaseBatch::new(
@@ -862,12 +901,12 @@ fn compute_quotient_polys<
                     indices_batch,
                     &scratch.shifted_xs,
                     vars_batch,
-                    &local_zs_batch,
-                    &next_zs_batch,
-                    &local_lookup_batch,
-                    &next_lookup_batch,
-                    &partial_products_batch,
-                    &s_sigmas_batch,
+                    local_zs_batch,
+                    next_zs_batch,
+                    local_lookup_batch,
+                    next_lookup_batch,
+                    partial_products_batch,
+                    s_sigmas_batch,
                     betas,
                     gammas,
                     beta_k_is,
@@ -904,4 +943,28 @@ fn compute_quotient_polys<
         })
         .map(|values| values.coset_ifft(F::coset_shift()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fill_point_row_views, BATCH_SIZE};
+
+    #[test]
+    fn point_row_views_fill_only_the_requested_prefix_and_range() {
+        let flat: Vec<u32> = (0..24).collect();
+        let mut storage: [&[u32]; BATCH_SIZE] = [&[]; BATCH_SIZE];
+
+        let views = fill_point_row_views(&flat, 6, 2..5, 4, &mut storage);
+
+        assert_eq!(
+            views,
+            &[
+                &[2, 3, 4][..],
+                &[8, 9, 10][..],
+                &[14, 15, 16][..],
+                &[20, 21, 22][..],
+            ]
+        );
+        assert!(storage[4].is_empty());
+    }
 }
