@@ -394,24 +394,45 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     }
 
     pub fn full_witness(self) -> MatrixWitness<F> {
-        // Redraw ticket 5.
-        // Single fused pass. Cell (column j, row i) is
-        // `values[representative_map[i * num_wires + j]]` or zero — the same
-        // lookup `try_get_target(Target::Wire { row: i, column: j })` resolved
-        // to, with `Target::index`'s `row * num_wires + column` inlined as a
-        // running cursor. This deletes the full zero-prefill pass over the
-        // matrix and the per-cell Target construction and index arithmetic of
-        // the second pass, while reading `representative_map` sequentially.
-        let mut wire_values: Vec<Vec<F>> = (0..self.num_wires)
-            .map(|_| Vec::with_capacity(self.degree))
+        let num_wires = self.num_wires;
+        let degree = self.degree;
+        let mut wire_values: Vec<Vec<F>> = (0..num_wires)
+            .map(|_| Vec::with_capacity(degree))
             .collect();
-        let mut wire_index = 0;
-        for _ in 0..self.degree {
+        let num_chunks = 16.min(degree.max(1));
+        let chunk_rows = degree.div_ceil(num_chunks);
+        {
+            let mut segments: Vec<Vec<&mut [core::mem::MaybeUninit<F>]>> = (0..num_chunks)
+                .map(|_| Vec::with_capacity(num_wires))
+                .collect();
             for column in wire_values.iter_mut() {
-                // Unset slots hold `F::ZERO` in the dense `values` vector, so this is exactly
-                // the old `values[rep].unwrap_or(F::ZERO)` without touching the bitmap.
-                column.push(self.values[self.representative_map[wire_index]]);
-                wire_index += 1;
+                let mut rest = crate::hash::merkle_tree::capacity_up_to_mut(column, degree);
+                for chunk_columns in segments.iter_mut() {
+                    let take = chunk_rows.min(rest.len());
+                    let (head, tail) = rest.split_at_mut(take);
+                    chunk_columns.push(head);
+                    rest = tail;
+                }
+            }
+            use plonky2_maybe_rayon::*;
+            segments
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(chunk, columns)| {
+                    let rows = columns.first().map_or(0, |column| column.len());
+                    let mut wire_index = chunk * chunk_rows * num_wires;
+                    for row in 0..rows {
+                        for column in columns.iter_mut() {
+                            column[row].write(self.values[self.representative_map[wire_index]]);
+                            wire_index += 1;
+                        }
+                    }
+                });
+        }
+        for column in wire_values.iter_mut() {
+            // SAFETY: the disjoint row segments initialized every allocated slot exactly once.
+            unsafe {
+                column.set_len(degree);
             }
         }
 
