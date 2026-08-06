@@ -117,8 +117,12 @@ fn fft_classic_simd<P: PackedField>(
 
             // Set omega to root_table[lg_half_m][0..half_m] but repeated.
             let mut omega = P::default();
-            for (j, omega_j) in omega.as_slice_mut().iter_mut().enumerate() {
-                *omega_j = root_table[lg_half_m][j % half_m];
+            // The first packed stages repeat a short root-table prefix across lanes.
+            // Copy whole chunks instead of doing a modulo/mask per lane; this also
+            // gives the compiler a fixed-size memcpy for the common WIDTH=4/8 paths.
+            let pattern = &root_table[lg_half_m][..half_m];
+            for chunk in omega.as_slice_mut().chunks_exact_mut(half_m) {
+                chunk.copy_from_slice(pattern);
             }
 
             for k in (0..packed_n).step_by(2) {
