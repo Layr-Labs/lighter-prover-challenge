@@ -20,7 +20,9 @@ use crate::plonk::circuit_data::CommonCircuitData;
 use crate::plonk::plonk_common;
 use crate::plonk::plonk_common::eval_l_0_circuit;
 use crate::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBaseBatch};
-use crate::util::partial_products::{check_partial_products, check_partial_products_circuit};
+use crate::util::partial_products::{
+    append_partial_product_checks, check_partial_products, check_partial_products_circuit,
+};
 use crate::util::reducing::ReducingFactorTarget;
 use crate::with_context;
 
@@ -195,6 +197,18 @@ fn reduce_gate_constraints_base_batch<F: Field>(
     }
 }
 
+#[inline(always)]
+fn point_major_row<F>(
+    flat: &[F],
+    row_width: usize,
+    point: usize,
+    columns: core::ops::Range<usize>,
+) -> &[F] {
+    debug_assert!(columns.end <= row_width);
+    let row_start = point * row_width;
+    &flat[row_start + columns.start..row_start + columns.end]
+}
+
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
 ///
 /// Results are stored point-major: the challenges for point `k` occupy
@@ -206,12 +220,14 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     indices_batch: &[usize],
     xs_batch: &[F],
     vars_batch: EvaluationVarsBaseBatch<F>,
-    local_zs_batch: &[&[F]],
-    next_zs_batch: &[&[F]],
-    local_lookup_zs_batch: &[&[F]],
-    next_lookup_zs_batch: &[&[F]],
-    partial_products_batch: &[&[F]],
-    s_sigmas_batch: &[&[F]],
+    zs_local_flat: &[F],
+    zs_next_flat: &[F],
+    zs_row_width: usize,
+    zs_range: core::ops::Range<usize>,
+    partial_products_range: core::ops::Range<usize>,
+    lookup_range: core::ops::Range<usize>,
+    s_sigmas_flat: &[F],
+    s_sigmas_row_width: usize,
     betas: &[F],
     gammas: &[F],
     beta_k_is: &[F],
@@ -227,17 +243,9 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     let n = indices_batch.len();
     assert_eq!(xs_batch.len(), n);
     assert_eq!(vars_batch.len(), n);
-    assert_eq!(local_zs_batch.len(), n);
-    assert_eq!(next_zs_batch.len(), n);
-    if has_lookup {
-        assert_eq!(local_lookup_zs_batch.len(), n);
-        assert_eq!(next_lookup_zs_batch.len(), n);
-    } else {
-        assert_eq!(local_lookup_zs_batch.len(), 0);
-        assert_eq!(next_lookup_zs_batch.len(), 0);
-    }
-    assert_eq!(partial_products_batch.len(), n);
-    assert_eq!(s_sigmas_batch.len(), n);
+    assert_eq!(zs_local_flat.len(), n * zs_row_width);
+    assert_eq!(zs_next_flat.len(), n * zs_row_width);
+    assert_eq!(s_sigmas_flat.len(), n * s_sigmas_row_width);
 
     let max_degree = common_data.quotient_degree_factor;
     let num_prods = common_data.num_partial_products;
@@ -254,6 +262,17 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     let num_challenges = common_data.config.num_challenges;
     let num_routed_wires = common_data.config.num_routed_wires;
+    debug_assert_eq!(zs_range.len(), num_challenges);
+    debug_assert_eq!(partial_products_range.len(), num_challenges * num_prods);
+    debug_assert_eq!(
+        lookup_range.len(),
+        if has_lookup {
+            num_challenges * common_data.num_lookup_polys
+        } else {
+            0
+        }
+    );
+    debug_assert_eq!(s_sigmas_row_width, num_routed_wires);
     debug_assert_eq!(betas.len(), num_challenges);
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
@@ -287,22 +306,24 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 .map(|i| vars.local_constants[common_data.selectors_info.num_selectors() + i]),
         );
 
-        let local_zs = local_zs_batch[k];
-        let next_zs = next_zs_batch[k];
-        let local_lookup_zs = if has_lookup {
-            local_lookup_zs_batch[k]
-        } else {
-            &[]
-        };
-
-        let next_lookup_zs = if has_lookup {
-            next_lookup_zs_batch[k]
-        } else {
-            &[]
-        };
-
-        let partial_products = partial_products_batch[k];
-        let s_sigmas = s_sigmas_batch[k];
+        let local_zs = point_major_row(zs_local_flat, zs_row_width, k, zs_range.clone());
+        let next_zs = point_major_row(zs_next_flat, zs_row_width, k, zs_range.clone());
+        let local_lookup_zs =
+            point_major_row(zs_local_flat, zs_row_width, k, lookup_range.clone());
+        let next_lookup_zs =
+            point_major_row(zs_next_flat, zs_row_width, k, lookup_range.clone());
+        let partial_products = point_major_row(
+            zs_local_flat,
+            zs_row_width,
+            k,
+            partial_products_range.clone(),
+        );
+        let s_sigmas = point_major_row(
+            s_sigmas_flat,
+            s_sigmas_row_width,
+            k,
+            0..s_sigmas_row_width,
+        );
 
         let l_0_x = z_h_on_coset.eval_l_0(index, x);
         for i in 0..num_challenges {
@@ -345,15 +366,15 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             // The partial products considered for this iteration of `i`.
             let current_partial_products = &partial_products[i * num_prods..(i + 1) * num_prods];
             // Check the numerator partial products.
-            let partial_product_checks = check_partial_products(
+            append_partial_product_checks(
                 &numerator_values,
                 &denominator_values,
                 current_partial_products,
                 z_x,
                 z_gx,
                 max_degree,
+                vanishing_partial_products_terms,
             );
-            vanishing_partial_products_terms.extend(partial_product_checks);
 
             numerator_values.clear();
             denominator_values.clear();
@@ -986,8 +1007,49 @@ pub(crate) fn eval_vanishing_poly_circuit<F: RichField + Extendable<D>, const D:
 #[cfg(test)]
 mod tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
+    use plonky2_field::types::PrimeField64;
 
     use super::*;
+
+    #[test]
+    fn flat_point_rows_match_legacy_descriptors_raw() {
+        type F = GoldilocksField;
+
+        for n in [1, 11, 31, 32] {
+            for (row_width, ranges) in [
+                (20, vec![0..2, 2..20, 20..20]),
+                (34, vec![0..2, 2..20, 20..34]),
+                (80, vec![0..80]),
+            ] {
+                let flat = (0..n * row_width)
+                    .map(|i| F::from_noncanonical_u64(u64::MAX - 13 * i as u64 - 5))
+                    .collect::<Vec<_>>();
+
+                for columns in ranges {
+                    let expected = (0..n)
+                        .map(|point| {
+                            &flat[point * row_width..(point + 1) * row_width][columns.clone()]
+                        })
+                        .collect::<Vec<_>>();
+                    let actual = (0..n)
+                        .map(|point| point_major_row(&flat, row_width, point, columns.clone()))
+                        .collect::<Vec<_>>();
+
+                    assert_eq!(
+                        actual
+                            .iter()
+                            .flat_map(|row| row.iter().map(|value| value.to_noncanonical_u64()))
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .flat_map(|row| row.iter().map(|value| value.to_noncanonical_u64()))
+                            .collect::<Vec<_>>(),
+                        "n {n}, row width {row_width}, columns {columns:?}",
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn constraint_major_reduction_preserves_pointwise_horner_order() {

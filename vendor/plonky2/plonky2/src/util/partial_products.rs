@@ -75,6 +75,33 @@ pub(crate) fn check_partial_products<F: Field>(
         .collect()
 }
 
+pub(crate) fn append_partial_product_checks<F: Field>(
+    numerators: &[F],
+    denominators: &[F],
+    partials: &[F],
+    z_x: F,
+    z_gx: F,
+    max_degree: usize,
+    output: &mut Vec<F>,
+) {
+    debug_assert!(max_degree > 1);
+    let product_accs = iter::once(&z_x)
+        .chain(partials.iter())
+        .chain(iter::once(&z_gx));
+    let chunk_size = max_degree;
+    output.extend(
+        numerators
+            .chunks(chunk_size)
+            .zip_eq(denominators.chunks(chunk_size))
+            .zip_eq(product_accs.tuple_windows())
+            .map(|((nume_chunk, deno_chunk), (&prev_acc, &next_acc))| {
+                let num_chunk_product = nume_chunk.iter().copied().product();
+                let den_chunk_product = deno_chunk.iter().copied().product();
+                prev_acc * num_chunk_product - next_acc * den_chunk_product
+            }),
+    );
+}
+
 /// Checks the relationship between each pair of partial product accumulators. In particular, this
 /// sequence of accumulators starts with `Z(x)`, then contains each partial product polynomials
 /// `p_i(x)`, and finally `Z(g x)`. See the partial products section of the Plonky2 paper.
@@ -113,6 +140,73 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::PrimeField64;
+
+    #[test]
+    fn append_partial_product_checks_matches_allocating_reference_raw() {
+        type F = GoldilocksField;
+
+        for (width, max_degree) in [(5usize, 2usize), (8, 3), (13, 4), (17, 8), (80, 8)] {
+            let numerators = (0..width)
+                .map(|i| F::from_noncanonical_u64(u64::MAX - 19 * i as u64))
+                .collect::<Vec<_>>();
+            let denominators = (0..width)
+                .map(|i| F::from_noncanonical_u64(u64::MAX - 23 * i as u64 - 7))
+                .collect::<Vec<_>>();
+            let num_chunks = width.div_ceil(max_degree);
+            let partials = (0..num_chunks - 1)
+                .map(|i| F::from_noncanonical_u64(u64::MAX - 29 * i as u64 - 11))
+                .collect::<Vec<_>>();
+            let z_x = F::from_noncanonical_u64(u64::MAX - 101);
+            let z_gx = F::from_noncanonical_u64(u64::MAX - 103);
+
+            let prefix = F::from_noncanonical_u64(u64::MAX - 107);
+            let reference = check_partial_products(
+                &numerators,
+                &denominators,
+                &partials,
+                z_x,
+                z_gx,
+                max_degree,
+            );
+            let mut expected = vec![prefix];
+            expected.extend(reference.iter().copied());
+            expected.extend(reference.iter().copied());
+
+            let mut actual = Vec::with_capacity(expected.len() + 8);
+            actual.push(prefix);
+            append_partial_product_checks(
+                &numerators,
+                &denominators,
+                &partials,
+                z_x,
+                z_gx,
+                max_degree,
+                &mut actual,
+            );
+            append_partial_product_checks(
+                &numerators,
+                &denominators,
+                &partials,
+                z_x,
+                z_gx,
+                max_degree,
+                &mut actual,
+            );
+
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>(),
+                "width {width}, max_degree {max_degree}",
+            );
+        }
+    }
 
     #[test]
     fn test_partial_products() {
