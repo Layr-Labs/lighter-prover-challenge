@@ -169,6 +169,7 @@ pub(crate) fn eval_vanishing_poly<F: RichField + Extendable<D>, const D: usize>(
 pub(crate) struct VanishingScratch<F> {
     pub numerator_values: Vec<F>,
     pub denominator_values: Vec<F>,
+    pub l_0_values: Vec<F>,
     pub vanishing_z_1_terms: Vec<F>,
     pub vanishing_partial_products_terms: Vec<F>,
     pub vanishing_all_lookup_terms: Vec<F>,
@@ -239,10 +240,20 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
 
+    z_h_on_coset.eval_l_0_batch_into(
+        indices_batch,
+        xs_batch,
+        &mut scratch.numerator_values,
+        &mut scratch.denominator_values,
+        &mut scratch.l_0_values,
+    );
+    debug_assert_eq!(scratch.l_0_values.len(), n);
+
     let numerator_values = &mut scratch.numerator_values;
     let denominator_values = &mut scratch.denominator_values;
     numerator_values.clear();
     denominator_values.clear();
+    let l_0_values = &scratch.l_0_values;
 
     // The L_0(x) (Z(x) - 1) vanishing terms.
     let vanishing_z_1_terms = &mut scratch.vanishing_z_1_terms;
@@ -256,7 +267,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     debug_assert_eq!(res_out.len(), n * num_challenges);
     for k in 0..n {
-        let index = indices_batch[k];
         let x = xs_batch[k];
         let vars = vars_batch.view(k);
 
@@ -286,7 +296,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
         let constraint_terms = PackedStridedView::new(constraint_terms_batch, n, k);
 
-        let l_0_x = z_h_on_coset.eval_l_0(index, x);
+        let l_0_x = l_0_values[k];
         for i in 0..num_challenges {
             let z_x = local_zs[i];
             let z_gx = next_zs[i];
