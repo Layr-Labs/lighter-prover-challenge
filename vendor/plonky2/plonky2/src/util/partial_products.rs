@@ -57,22 +57,46 @@ pub(crate) fn check_partial_products<F: Field>(
     z_gx: F,
     max_degree: usize,
 ) -> Vec<F> {
+    let mut result = Vec::with_capacity(numerators.len().div_ceil(max_degree));
+    check_partial_products_into(
+        numerators,
+        denominators,
+        partials,
+        z_x,
+        z_gx,
+        max_degree,
+        &mut result,
+    );
+    result
+}
+
+/// Appends the partial-product checks directly to a caller-owned buffer.
+pub(crate) fn check_partial_products_into<F: Field>(
+    numerators: &[F],
+    denominators: &[F],
+    partials: &[F],
+    z_x: F,
+    z_gx: F,
+    max_degree: usize,
+    out: &mut Vec<F>,
+) {
     debug_assert!(max_degree > 1);
     let product_accs = iter::once(&z_x)
         .chain(partials.iter())
         .chain(iter::once(&z_gx));
     let chunk_size = max_degree;
-    numerators
-        .chunks(chunk_size)
-        .zip_eq(denominators.chunks(chunk_size))
-        .zip_eq(product_accs.tuple_windows())
-        .map(|((nume_chunk, deno_chunk), (&prev_acc, &next_acc))| {
-            let num_chunk_product = nume_chunk.iter().copied().product();
-            let den_chunk_product = deno_chunk.iter().copied().product();
-            // Assert that next_acc * deno_product = prev_acc * nume_product.
-            prev_acc * num_chunk_product - next_acc * den_chunk_product
-        })
-        .collect()
+    out.extend(
+        numerators
+            .chunks(chunk_size)
+            .zip_eq(denominators.chunks(chunk_size))
+            .zip_eq(product_accs.tuple_windows())
+            .map(|((nume_chunk, deno_chunk), (&prev_acc, &next_acc))| {
+                let num_chunk_product = nume_chunk.iter().copied().product();
+                let den_chunk_product = deno_chunk.iter().copied().product();
+                // Assert that next_acc * deno_product = prev_acc * nume_product.
+                prev_acc * num_chunk_product - next_acc * den_chunk_product
+            }),
+    );
 }
 
 /// Checks the relationship between each pair of partial product accumulators. In particular, this
@@ -143,6 +167,40 @@ mod tests {
         assert!(check_partial_products(&v, &denominators, pps, z_x, z_gx, 3)
             .iter()
             .all(|x| x.is_zero()));
+    }
+
+    #[test]
+    fn test_partial_products_into_appends_partial_final_chunk() {
+        type F = GoldilocksField;
+        let numerators = field_vec::<F>(&[1, 2, 3, 4, 5]);
+        let denominators = vec![F::ONE; numerators.len()];
+        let z_x = F::ONE;
+        let z_gx = F::from_canonical_u64(120);
+        let partials = field_vec::<F>(&[6]);
+        let expected = check_partial_products(
+            &numerators,
+            &denominators,
+            &partials,
+            z_x,
+            z_gx,
+            3,
+        );
+        let prefix = F::from_canonical_u64(99);
+        let mut actual = vec![prefix];
+
+        check_partial_products_into(
+            &numerators,
+            &denominators,
+            &partials,
+            z_x,
+            z_gx,
+            3,
+            &mut actual,
+        );
+
+        assert_eq!(actual[0], prefix);
+        assert_eq!(&actual[1..], expected.as_slice());
+        assert!(actual[1..].iter().all(Field::is_zero));
     }
 
     fn field_vec<F: Field>(xs: &[usize]) -> Vec<F> {
