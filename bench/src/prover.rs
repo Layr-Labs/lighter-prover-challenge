@@ -224,7 +224,6 @@ fn prove_path(
             if let Some((chain_step, tx_proof)) = pending_tx.take() {
                 let previous_proof = chain.take().map(ChainState::wait);
                 let handle = std::thread::Builder::new()
-                    .name(format!("{path:?}-chain-step-{chain_step}"))
                     .stack_size(PROVER_THREAD_STACK_BYTES)
                     .spawn_scoped(scope, move || {
                         chain_step_proof(
@@ -244,7 +243,6 @@ fn prove_path(
 
             let witness = current_witness;
             let proof_handle = std::thread::Builder::new()
-                .name(format!("{path:?}-tx-proof-{current_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
                     prove_tx_witness(path, current_chunk_index, tx_data, witness)
