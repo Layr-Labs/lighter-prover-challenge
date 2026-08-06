@@ -40,4 +40,48 @@ pub trait PackedEvaluableBase<F: RichField + Extendable<D>, const D: usize>: Gat
         }
         res
     }
+
+    /// Evaluates, filters, and adds an entire batch without materializing a constraint matrix.
+    fn eval_unfiltered_base_batch_packed_accumulate(
+        &self,
+        vars_batch: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let batch_size = vars_batch.len();
+        let required_len = batch_size * self.num_constraints();
+        assert_eq!(filters.len(), batch_size);
+        assert!(combined_gate_constraints.len() >= required_len);
+        let combined_gate_constraints = &mut combined_gate_constraints[..required_len];
+
+        let (vars_packed_iter, vars_leftovers_iter) = vars_batch.pack::<<F as Packable>::Packing>();
+        let leftovers_start = batch_size - vars_leftovers_iter.len();
+        for (i, vars_packed) in vars_packed_iter.enumerate() {
+            let offset = <F as Packable>::Packing::WIDTH * i;
+            let filter = *<F as Packable>::Packing::from_slice(
+                &filters[offset..offset + <F as Packable>::Packing::WIDTH],
+            );
+            self.eval_unfiltered_base_packed(
+                vars_packed,
+                StridedConstraintConsumer::new_accumulating(
+                    combined_gate_constraints,
+                    batch_size,
+                    offset,
+                    filter,
+                ),
+            );
+        }
+        for (i, vars_leftovers) in vars_leftovers_iter.enumerate() {
+            let offset = leftovers_start + i;
+            self.eval_unfiltered_base_packed(
+                vars_leftovers,
+                StridedConstraintConsumer::new_accumulating(
+                    combined_gate_constraints,
+                    batch_size,
+                    offset,
+                    filters[offset],
+                ),
+            );
+        }
+    }
 }

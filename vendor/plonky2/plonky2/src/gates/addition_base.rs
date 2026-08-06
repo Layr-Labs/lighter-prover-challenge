@@ -97,6 +97,19 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for AdditionGate {
         self.eval_unfiltered_base_batch_packed(vars_base)
     }
 
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        self.eval_unfiltered_base_batch_packed_accumulate(
+            vars_base,
+            filters,
+            combined_gate_constraints,
+        )
+    }
+
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,
@@ -243,11 +256,17 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
 mod tests {
     use anyhow::Result;
 
+    use crate::field::batch_util::batch_multiply_add_inplace;
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::Field;
     use crate::gates::addition_base::AdditionGate;
+    use crate::gates::gate::Gate;
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
+    use crate::gates::packed_util::PackedEvaluableBase;
+    use crate::hash::hash_types::HashOut;
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
+    use crate::plonk::vars::EvaluationVarsBaseBatch;
 
     #[test]
     fn low_degree() {
@@ -262,5 +281,50 @@ mod tests {
         type F = <C as GenericConfig<D>>::F;
         let gate = AdditionGate::new_from_config(&CircuitConfig::standard_recursion_config());
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    #[test]
+    fn packed_accumulation_matches_materialized_rows_with_leftovers() {
+        const D: usize = 2;
+        const N: usize = 11;
+        type F = GoldilocksField;
+
+        let gate = AdditionGate { num_ops: 2 };
+        let num_constants = <AdditionGate as Gate<F, D>>::num_constants(&gate);
+        let num_wires = <AdditionGate as Gate<F, D>>::num_wires(&gate);
+        let num_constraints = <AdditionGate as Gate<F, D>>::num_constraints(&gate);
+        let constants = (0..num_constants * N)
+            .map(|i| F::from_canonical_usize(3 * i + 2))
+            .collect::<Vec<_>>();
+        let wires = (0..num_wires * N)
+            .map(|i| F::from_canonical_usize(5 * i + 7))
+            .collect::<Vec<_>>();
+        let filters = (0..N)
+            .map(|i| F::from_canonical_usize(7 * i + 11))
+            .collect::<Vec<_>>();
+        let public_inputs_hash = HashOut::<F>::ZERO;
+        let vars = EvaluationVarsBaseBatch::new(N, &constants, &wires, &public_inputs_hash);
+
+        let materialized = <AdditionGate as Gate<F, D>>::eval_unfiltered_base_batch(&gate, vars);
+        let mut expected = (0..num_constraints * N)
+            .map(|i| F::from_canonical_usize(13 * i + 17))
+            .collect::<Vec<_>>();
+        for (combined, constraint) in expected
+            .chunks_exact_mut(N)
+            .zip(materialized.chunks_exact(N))
+        {
+            batch_multiply_add_inplace(combined, constraint, &filters);
+        }
+
+        let mut actual = (0..num_constraints * N)
+            .map(|i| F::from_canonical_usize(13 * i + 17))
+            .collect::<Vec<_>>();
+        <AdditionGate as PackedEvaluableBase<F, D>>::eval_unfiltered_base_batch_packed_accumulate(
+            &gate,
+            vars,
+            &filters,
+            &mut actual,
+        );
+        assert_eq!(actual, expected);
     }
 }

@@ -13,11 +13,31 @@ pub struct StridedConstraintConsumer<'a, P: PackedField> {
     start: *mut P::Scalar,
     end: *mut P::Scalar,
     stride: usize,
+    filter: Option<P>,
     _phantom: PhantomData<&'a mut [P::Scalar]>,
 }
 
 impl<'a, P: PackedField> StridedConstraintConsumer<'a, P> {
     pub fn new(buffer: &'a mut [P::Scalar], stride: usize, offset: usize) -> Self {
+        Self::new_with_filter(buffer, stride, offset, None)
+    }
+
+    /// Adds each emitted constraint to `buffer` after multiplying by `filter`.
+    pub fn new_accumulating(
+        buffer: &'a mut [P::Scalar],
+        stride: usize,
+        offset: usize,
+        filter: P,
+    ) -> Self {
+        Self::new_with_filter(buffer, stride, offset, Some(filter))
+    }
+
+    fn new_with_filter(
+        buffer: &'a mut [P::Scalar],
+        stride: usize,
+        offset: usize,
+        filter: Option<P>,
+    ) -> Self {
         assert!(stride >= P::WIDTH);
         assert!(offset < stride);
         assert_eq!(buffer.len() % stride, 0);
@@ -35,6 +55,7 @@ impl<'a, P: PackedField> StridedConstraintConsumer<'a, P> {
             start,
             end,
             stride,
+            filter,
             _phantom: PhantomData,
         }
     }
@@ -45,7 +66,11 @@ impl<'a, P: PackedField> StridedConstraintConsumer<'a, P> {
             // # Safety
             // The checks in `new` guarantee that this points to valid space.
             unsafe {
-                *self.start.cast() = constraint;
+                let destination = self.start.cast::<P>();
+                *destination = match self.filter {
+                    Some(filter) => (*destination).multiply_accumulate(constraint, filter),
+                    None => constraint,
+                };
             }
             // See the comment in `new`. `wrapping_add` is needed to avoid UB if we've just
             // exhausted our buffer (and hence we're setting `self.start` to point past the end).

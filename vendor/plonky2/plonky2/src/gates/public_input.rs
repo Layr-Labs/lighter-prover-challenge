@@ -64,6 +64,19 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for PublicInputGat
         self.eval_unfiltered_base_batch_packed(vars_base)
     }
 
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        self.eval_unfiltered_base_batch_packed_accumulate(
+            vars_base,
+            filters,
+            combined_gate_constraints,
+        )
+    }
+
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,
