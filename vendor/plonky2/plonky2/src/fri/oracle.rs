@@ -366,7 +366,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             final_poly += quotient;
         }
 
-        let lde_final_poly = final_poly.lde(fri_params.config.rate_bits);
+        // `final_poly` is dead after this point, so pad it in place instead of
+        // the clone-then-resize that `lde(&self)` performs.
+        let mut lde_final_poly = final_poly;
+        lde_final_poly
+            .coeffs
+            .resize(lde_final_poly.len() << fri_params.config.rate_bits, F::Extension::ZERO);
         let lde_final_values = timed!(
             timing,
             &format!("perform final FFT {}", lde_final_poly.len()),
