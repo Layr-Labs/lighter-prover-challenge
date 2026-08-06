@@ -1272,11 +1272,7 @@ fn dispatch2d(
     width: usize,
     height: usize,
 ) {
-    let execution_width = pipeline.thread_execution_width();
-    let group_width = pipeline
-        .max_total_threads_per_threadgroup()
-        .min(64)
-        .max(execution_width);
+    let group_width = dispatch_group_width(pipeline);
     encoder.dispatch_threads(
         MTLSize {
             width: width as NSUInteger,
@@ -1291,16 +1287,28 @@ fn dispatch2d(
     );
 }
 
+/// Threadgroup width for grid-indexed kernels. Every kernel in this backend
+/// computes each output purely from `thread_position_in_grid` and read-only
+/// buffers — no threadgroup memory, barriers, simd-group ops, or atomics — so
+/// the threadgroup width affects only GPU scheduling, never computed values.
+/// Each Poseidon2 permutation (and NTT butterfly) is a long serial dependency
+/// chain gated on `mulhi` latency with little per-thread ILP; throughput comes
+/// from keeping many threads resident to hide that latency. The previous
+/// hardcoded `.min(64)` (two SIMD groups) under-occupied the cores; use the
+/// largest multiple of the SIMD execution width the kernel's register budget
+/// allows instead.
+fn dispatch_group_width(pipeline: &ComputePipelineState) -> NSUInteger {
+    let execution_width = pipeline.thread_execution_width();
+    let max_group = pipeline.max_total_threads_per_threadgroup();
+    ((max_group / execution_width) * execution_width).max(execution_width)
+}
+
 fn dispatch(
     encoder: &metal::ComputeCommandEncoderRef,
     pipeline: &ComputePipelineState,
     thread_count: usize,
 ) {
-    let execution_width = pipeline.thread_execution_width();
-    let group_width = pipeline
-        .max_total_threads_per_threadgroup()
-        .min(64)
-        .max(execution_width);
+    let group_width = dispatch_group_width(pipeline);
     encoder.dispatch_threads(
         MTLSize {
             width: thread_count as NSUInteger,

@@ -79,10 +79,28 @@ impl Forest {
 
     /// Compress all paths. After calling this, every `parent` value will point to the node's
     /// representative.
+    ///
+    /// Retry token: resubmission of the eaeeaeb tree after an infrastructure-failed verdict.
+    ///
+    /// Each tree's representative is fixed by the merge history and invariant under path
+    /// compression, so the fully compressed array is identical regardless of traversal or
+    /// compression order. That makes the per-element root walk safe to run as a read-only
+    /// parallel map (no writes happen until every root is found), replacing the serial
+    /// pointer-chase over tens of millions of entries that dominated this pass. Chains are
+    /// already short here because `merge` path-compresses via `find` as constraints are added.
     pub(crate) fn compress_paths(&mut self) {
-        for i in 0..self.parents.len() {
-            self.find(i);
-        }
+        let parents = &self.parents;
+        let roots: Vec<usize> = (0..parents.len())
+            .into_par_iter()
+            .map(|i| {
+                let mut representative = i;
+                while parents[representative] != representative {
+                    representative = parents[representative];
+                }
+                representative
+            })
+            .collect();
+        self.parents = roots;
     }
 
     /// Assumes `compress_paths` has already been called.
