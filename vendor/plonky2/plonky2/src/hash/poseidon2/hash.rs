@@ -706,29 +706,6 @@ pub(crate) fn compress_pair<F: RichField + Poseidon2>(
     )
 }
 
-/// Four independent `compress` calls with their permutations interleaved via
-/// `poseidon2_x4`. Each output is bit-identical to `compress` on that pair.
-pub(crate) fn compress_quad<F: RichField + Poseidon2>(
-    inputs: [(HashOut<F>, HashOut<F>); 4],
-) -> [HashOut<F>; 4] {
-    let load = |(x, y): (HashOut<F>, HashOut<F>)| {
-        let mut state = [F::ZERO; WIDTH];
-        state[..NUM_HASH_OUT_ELTS].copy_from_slice(&x.elements);
-        state[NUM_HASH_OUT_ELTS..2 * NUM_HASH_OUT_ELTS].copy_from_slice(&y.elements);
-        state
-    };
-    let (a, b, c, d) = F::poseidon2_x4(
-        load(inputs[0]),
-        load(inputs[1]),
-        load(inputs[2]),
-        load(inputs[3]),
-    );
-    let out = |state: [F; WIDTH]| HashOut {
-        elements: state[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
-    };
-    [out(a), out(b), out(c), out(d)]
-}
-
 /// Poseidon2 hash function.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Poseidon2Hash;
@@ -785,10 +762,6 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
         y1: Self::Hash,
     ) -> (Self::Hash, Self::Hash) {
         compress_pair::<F>(x0, y0, x1, y1)
-    }
-
-    fn two_to_one_quad(inputs: [(Self::Hash, Self::Hash); 4]) -> [Self::Hash; 4] {
-        compress_quad::<F>(inputs)
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]

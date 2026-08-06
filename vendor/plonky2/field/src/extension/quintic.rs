@@ -14,6 +14,37 @@ use crate::types::{Field, Sample};
 #[serde(bound = "")]
 pub struct QuinticExtension<F: Extendable<5>>(pub [F; 5]);
 
+pub(crate) trait QuinticInverse: Sized {
+    fn try_inverse_quintic(&self) -> Option<Self>;
+}
+
+impl<F: Extendable<5>> QuinticInverse for QuinticExtension<F> {
+    // Algorithm 11.3.4 in Handbook of Elliptic and Hyperelliptic Curve Cryptography.
+    #[inline]
+    default fn try_inverse_quintic(&self) -> Option<Self> {
+        if self.is_zero() {
+            return None;
+        }
+
+        // Writing 'a' for self:
+        let d = self.frobenius(); // d = a^p
+        let e = d * d.frobenius(); // e = a^(p + p^2)
+        let f = e * e.repeated_frobenius(2); // f = a^(p + p^2 + p^3 + p^4)
+
+        // f contains a^(r-1) and a^r is in the base field.
+        debug_assert!(FieldExtension::<5>::is_in_basefield(&(*self * f)));
+
+        // g = a^r is in the base field, so only compute that
+        // coefficient rather than the full product. The equation is
+        // extracted from Mul::mul(...) below.
+        let Self([a0, a1, a2, a3, a4]) = *self;
+        let Self([b0, b1, b2, b3, b4]) = f;
+        let g = a0 * b0 + <Self as OEF<5>>::W * (a1 * b4 + a2 * b3 + a3 * b2 + a4 * b1);
+
+        Some(FieldExtension::<5>::scalar_mul(&f, g.inverse()))
+    }
+}
+
 impl<F: Extendable<5>> Default for QuinticExtension<F> {
     fn default() -> Self {
         Self::ZERO
@@ -114,28 +145,9 @@ impl<F: Extendable<5>> Field for QuinticExtension<F> {
         F::characteristic()
     }
 
-    // Algorithm 11.3.4 in Handbook of Elliptic and Hyperelliptic Curve Cryptography.
+    #[inline]
     fn try_inverse(&self) -> Option<Self> {
-        if self.is_zero() {
-            return None;
-        }
-
-        // Writing 'a' for self:
-        let d = self.frobenius(); // d = a^p
-        let e = d * d.frobenius(); // e = a^(p + p^2)
-        let f = e * e.repeated_frobenius(2); // f = a^(p + p^2 + p^3 + p^4)
-
-        // f contains a^(r-1) and a^r is in the base field.
-        debug_assert!(FieldExtension::<5>::is_in_basefield(&(*self * f)));
-
-        // g = a^r is in the base field, so only compute that
-        // coefficient rather than the full product. The equation is
-        // extracted from Mul::mul(...) below.
-        let Self([a0, a1, a2, a3, a4]) = *self;
-        let Self([b0, b1, b2, b3, b4]) = f;
-        let g = a0 * b0 + <Self as OEF<5>>::W * (a1 * b4 + a2 * b3 + a3 * b2 + a4 * b1);
-
-        Some(FieldExtension::<5>::scalar_mul(&f, g.inverse()))
+        <Self as QuinticInverse>::try_inverse_quintic(self)
     }
 
     fn from_noncanonical_biguint(n: BigUint) -> Self {

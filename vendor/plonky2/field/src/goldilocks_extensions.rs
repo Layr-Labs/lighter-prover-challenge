@@ -4,7 +4,7 @@ use static_assertions::const_assert;
 
 use crate::extension::quadratic::QuadraticExtension;
 use crate::extension::quartic::QuarticExtension;
-use crate::extension::quintic::QuinticExtension;
+use crate::extension::quintic::{QuinticExtension, QuinticInverse};
 use crate::extension::{Extendable, Frobenius};
 use crate::goldilocks_field::{reduce160, GoldilocksField};
 use crate::types::Field;
@@ -146,6 +146,29 @@ impl Frobenius<5> for QuinticExtension<GoldilocksField> {
     }
 }
 
+impl QuinticInverse for QuinticExtension<GoldilocksField> {
+    #[inline(always)]
+    fn try_inverse_quintic(&self) -> Option<Self> {
+        if self.is_zero() {
+            return None;
+        }
+
+        let Self([a0, a1, a2, a3, a4]) = *self;
+        let a = [a0.0, a1.0, a2.0, a3.0, a4.0];
+        let b = ext5_adjugate(a);
+        let norm = ext5_add_prods0(&a, &[b[0].0, b[1].0, b[2].0, b[3].0, b[4].0]);
+        let inv_norm = norm.try_inverse()?;
+
+        Some(Self([
+            b[0] * inv_norm,
+            b[1] * inv_norm,
+            b[2] * inv_norm,
+            b[3] * inv_norm,
+            b[4] * inv_norm,
+        ]))
+    }
+}
+
 /*
  * The functions extD_add_prods[0-4] are helper functions for
  * computing products for extensions of degree D over the Goldilocks
@@ -159,6 +182,185 @@ impl Frobenius<5> for QuinticExtension<GoldilocksField> {
 const fn u160_times_3(x: u128, y: u32) -> (u128, u32) {
     let (s, cy) = x.overflowing_add(x << 1);
     (s, 3 * y + (x >> 127) as u32 + cy as u32)
+}
+
+/// Unsigned 160-bit accumulator seeded with 16*p^2. The seed is zero modulo p
+/// and is larger than the negative part of every expression below.
+struct AdjugateAccumulator {
+    lo: u128,
+    hi: u32,
+}
+
+impl AdjugateAccumulator {
+    #[inline(always)]
+    fn new() -> Self {
+        const P: u128 = 0xffff_ffff_0000_0001;
+        const P2: u128 = P * P;
+        Self {
+            lo: P2 << 4,
+            hi: (P2 >> 124) as u32,
+        }
+    }
+
+    #[inline(always)]
+    fn scaled_value(p: u128, scale: u32) -> (u128, u32) {
+        match scale {
+            1 => (p, 0),
+            3 => u160_times_3(p, 0),
+            _ => unreachable!(),
+        }
+    }
+
+    #[inline(always)]
+    fn add_product(&mut self, x: u64, y: u64, scale: u32) {
+        self.add_value((x as u128) * (y as u128), scale);
+    }
+
+    #[inline(always)]
+    fn add_value(&mut self, value: u128, scale: u32) {
+        let (lo, hi) = Self::scaled_value(value, scale);
+        let (sum, carry) = self.lo.overflowing_add(lo);
+        self.lo = sum;
+        self.hi += hi + carry as u32;
+    }
+
+    #[inline(always)]
+    fn sub_product(&mut self, x: u64, y: u64, scale: u32) {
+        self.sub_value((x as u128) * (y as u128), scale);
+    }
+
+    #[inline(always)]
+    fn sub_value(&mut self, value: u128, scale: u32) {
+        let (lo, hi) = Self::scaled_value(value, scale);
+        let (difference, borrow) = self.lo.overflowing_sub(lo);
+        self.lo = difference;
+        self.hi -= hi + borrow as u32;
+    }
+
+    #[inline(always)]
+    fn scale3(self) -> Self {
+        let (lo, hi) = u160_times_3(self.lo, self.hi);
+        Self { lo, hi }
+    }
+
+    #[inline(always)]
+    fn add_accumulator(&mut self, rhs: Self) {
+        let (sum, carry) = self.lo.overflowing_add(rhs.lo);
+        self.lo = sum;
+        self.hi += rhs.hi + carry as u32;
+    }
+
+    #[inline(always)]
+    fn reduce(self) -> GoldilocksField {
+        // The largest accumulator is below 81*p^2, well within reduce160's bound.
+        unsafe { reduce160(self.lo, self.hi) }
+    }
+}
+
+#[inline(always)]
+fn adjugate_minor(
+    positive: u128,
+    positive_scale: u32,
+    negative: u128,
+    negative_scale: u32,
+) -> GoldilocksField {
+    let mut acc = AdjugateAccumulator::new();
+    acc.add_value(positive, positive_scale);
+    acc.sub_value(negative, negative_scale);
+    acc.reduce()
+}
+
+/// Compute the adjugate of multiplication by `a` in GF(p)[X]/(X^5 - 3).
+///
+/// Splitting the four-row cofactor matrix into two pairs of rows yields ten
+/// shared 2x2 minors. The other ten minors are signed/scaled copies. Each
+/// cofactor is then a factored Plücker expansion. This takes 15 base products
+/// and 10 reductions for the minors, then 25 products and 5 reductions for the
+/// adjugate.
+#[inline(always)]
+fn ext5_adjugate(a: [u64; 5]) -> [GoldilocksField; 5] {
+    let [a0, a1, a2, a3, a4] = a;
+    let product = |x: u64, y: u64| (x as u128) * (y as u128);
+
+    let q02 = product(a0, a2);
+    let n01 = adjugate_minor(product(a1, a1), 1, q02, 1);
+    let n24 = adjugate_minor(product(a3, a4), 3, q02, 1);
+
+    let q24 = product(a2, a4);
+    let n02 = adjugate_minor(product(a0, a1), 1, q24, 3);
+    let n34 = adjugate_minor(product(a3, a3), 1, q24, 1);
+
+    let q14 = product(a1, a4);
+    let n03 = adjugate_minor(q14, 1, product(a2, a3), 1);
+    let n12 = adjugate_minor(product(a0, a0), 1, q14, 3);
+
+    let q13 = product(a1, a3);
+    let n04 = adjugate_minor(q13, 1, product(a2, a2), 1);
+    let n13 = adjugate_minor(product(a0, a4), 1, q13, 1);
+
+    let q03 = product(a0, a3);
+    let n14 = adjugate_minor(q03, 1, product(a1, a2), 1);
+    let n23 = adjugate_minor(product(a4, a4), 3, q03, 1);
+
+    let [n01, n02, n03, n04, n12, n13, n14, n23, n24, n34] = [
+        n01.0, n02.0, n03.0, n04.0, n12.0, n13.0, n14.0, n23.0, n24.0, n34.0,
+    ];
+    let n01_plus_n24 = (GoldilocksField(n01) + GoldilocksField(n24)).0;
+    let n02_plus_3n34 = (GoldilocksField(n02) + GoldilocksField(n34).triple()).0;
+    let n13_minus_n04 = (GoldilocksField(n13) - GoldilocksField(n04)).0;
+
+    let mut b0 = AdjugateAccumulator::new();
+    b0.add_product(n12, n12, 1);
+    let mut b0_scaled = AdjugateAccumulator::new();
+    b0_scaled.add_product(n14, n01_plus_n24, 1);
+    b0_scaled.sub_product(n02, n13, 1);
+    b0_scaled.sub_product(n04, n34, 3);
+    b0_scaled.sub_product(n23, n24, 1);
+    b0.add_accumulator(b0_scaled.scale3());
+
+    let mut b1 = AdjugateAccumulator::new();
+    b1.sub_product(n02, n12, 1);
+    let mut b1_scaled = AdjugateAccumulator::new();
+    b1_scaled.sub_product(n01, n04, 1);
+    b1_scaled.add_product(n03, n02_plus_3n34, 1);
+    b1_scaled.sub_product(n13, n24, 1);
+    b1_scaled.add_product(n23, n23, 1);
+    b1.add_accumulator(b1_scaled.scale3());
+
+    let mut b2 = AdjugateAccumulator::new();
+    b2.add_product(n01, n12, 1);
+    let mut b2_scaled = AdjugateAccumulator::new();
+    b2_scaled.add_product(n03, n24, 1);
+    b2_scaled.add_product(n14, n13_minus_n04, 1);
+    b2_scaled.sub_product(n13, n23, 1);
+    b2_scaled.add_product(n34, n34, 3);
+    b2.add_accumulator(b2_scaled.scale3());
+
+    let mut b3 = AdjugateAccumulator::new();
+    b3.sub_product(n02, n01_plus_n24, 1);
+    b3.add_product(n12, n23, 1);
+    let mut b3_scaled = AdjugateAccumulator::new();
+    b3_scaled.sub_product(n03, n14, 1);
+    b3_scaled.add_product(n04, n04, 1);
+    b3_scaled.sub_product(n24, n34, 1);
+    b3.add_accumulator(b3_scaled.scale3());
+
+    let mut b4 = AdjugateAccumulator::new();
+    b4.add_product(n01, n01, 1);
+    b4.add_product(n02, n14, 1);
+    b4.sub_product(n12, n13, 1);
+    let mut b4_scaled = AdjugateAccumulator::new();
+    b4_scaled.add_product(n03, n13_minus_n04, 1);
+    b4_scaled.add_product(n23, n34, 1);
+    b4.add_accumulator(b4_scaled.scale3());
+
+    [
+        b0.reduce(),
+        b1.reduce(),
+        b2.reduce(),
+        b3.reduce(),
+        b4.reduce(),
+    ]
 }
 
 /// Return `a`, `b` such that `a + b*2^128 = 7*(x + y*2^128)` with `a < 2^128` and `b < 2^32`.
@@ -539,7 +741,7 @@ pub(crate) fn ext5_mul(a: [u64; 5], b: [u64; 5]) -> [GoldilocksField; 5] {
 #[cfg(test)]
 mod tests {
     use crate::extension::quintic::QuinticExtension;
-    use crate::extension::{Extendable, Frobenius};
+    use crate::extension::{Extendable, FieldExtension, Frobenius};
     use crate::goldilocks_field::GoldilocksField;
     use crate::types::{Field, Field64, PrimeField64};
 
@@ -567,6 +769,21 @@ mod tests {
         }
 
         QuinticExtension(res)
+    }
+
+    /// The previous generic `QuinticExtension::try_inverse` implementation.
+    fn frobenius_inverse_reference(x: QE) -> Option<QE> {
+        if x.is_zero() {
+            return None;
+        }
+
+        let d = x.frobenius();
+        let e = d * d.frobenius();
+        let f = e * e.repeated_frobenius(2);
+        let QuinticExtension([a0, a1, a2, a3, a4]) = x;
+        let QuinticExtension([b0, b1, b2, b3, b4]) = f;
+        let norm = a0 * b0 + <GF as Extendable<5>>::W * (a1 * b4 + a2 * b3 + a3 * b2 + a4 * b1);
+        Some(FieldExtension::<5>::scalar_mul(&f, norm.inverse()))
     }
 
     #[test]
@@ -628,6 +845,80 @@ mod tests {
         for _ in 0..2000 {
             let limbs = core::array::from_fn(|_| GoldilocksField(next()));
             check(QuinticExtension(limbs));
+        }
+    }
+
+    #[test]
+    fn quintic_inverse_matches_frobenius_reference_million_cases() {
+        let check = |x: QE| {
+            assert_eq!(x.try_inverse(), frobenius_inverse_reference(x), "x={x:?}");
+        };
+
+        let p = GF::ORDER;
+        for x in [QE::ZERO, QE::ONE, QE::TWO, QE::NEG_ONE] {
+            check(x);
+        }
+        for limb in 0..5 {
+            for value in [0, 1, 2, p - 1, p, p + 1, u64::MAX] {
+                let mut x = [GF::ZERO; 5];
+                x[limb] = GoldilocksField(value);
+                check(QuinticExtension(x));
+            }
+        }
+        for value in [0, 1, p - 1, p, u64::MAX] {
+            check(QuinticExtension([GoldilocksField(value); 5]));
+        }
+
+        // Exercise canonical and non-canonical limbs across the full u64 range.
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for case in 0..1_000_000 {
+            let x = QuinticExtension(core::array::from_fn(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                GoldilocksField(state)
+            }));
+            assert_eq!(
+                x.try_inverse(),
+                frobenius_inverse_reference(x),
+                "differential case {case}, x={x:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quintic_inverse_law_and_zero_handling() {
+        let p = GF::ORDER;
+        assert_eq!(QE::ZERO.try_inverse(), None);
+        assert_eq!(
+            QuinticExtension([GoldilocksField(p); 5]).try_inverse(),
+            None
+        );
+
+        let check_nonzero = |x: QE| {
+            let inverse = x.try_inverse().expect("nonzero element must invert");
+            assert_eq!(x * inverse, QE::ONE);
+            assert_eq!(inverse * x, QE::ONE);
+        };
+        for limb in 0..5 {
+            for value in [1, 2, p - 1, p + 1, u64::MAX] {
+                let mut x = [GF::ZERO; 5];
+                x[limb] = GoldilocksField(value);
+                check_nonzero(QuinticExtension(x));
+            }
+        }
+
+        let mut state = 0x1319_8a2e_0370_7344u64;
+        for _ in 0..10_000 {
+            let x = QuinticExtension(core::array::from_fn(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                GoldilocksField(state)
+            }));
+            if !x.is_zero() {
+                check_nonzero(x);
+            }
         }
     }
 }
