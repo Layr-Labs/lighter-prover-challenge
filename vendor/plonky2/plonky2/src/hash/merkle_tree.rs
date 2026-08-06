@@ -223,10 +223,19 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
         let half = num_leaves / 2;
         let (left_leaves, right_leaves) = leaves.split_at(half * leaf_width);
 
-        let (left_digest, right_digest) = plonky2_maybe_rayon::join(
-            || fill_subtree_flat::<F, H>(left_digests_buf, left_leaves, leaf_width, half),
-            || fill_subtree_flat::<F, H>(right_digests_buf, right_leaves, leaf_width, half),
-        );
+        // Below 32 leaves, Rayon scheduling costs more than the remaining
+        // hashing work. Finish that small subtree on the current worker.
+        let (left_digest, right_digest) = if num_leaves > 32 {
+            plonky2_maybe_rayon::join(
+                || fill_subtree_flat::<F, H>(left_digests_buf, left_leaves, leaf_width, half),
+                || fill_subtree_flat::<F, H>(right_digests_buf, right_leaves, leaf_width, half),
+            )
+        } else {
+            (
+                fill_subtree_flat::<F, H>(left_digests_buf, left_leaves, leaf_width, half),
+                fill_subtree_flat::<F, H>(right_digests_buf, right_leaves, leaf_width, half),
+            )
+        };
 
         left_digest_mem.write(left_digest);
         right_digest_mem.write(right_digest);
