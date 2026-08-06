@@ -31,7 +31,7 @@ pub(crate) fn compress_merkle_proofs<F: RichField, H: Hasher<F>>(
     // For each proof collect all the unknown proof elements.
     for (&i, p) in indices.iter().zip(proofs) {
         let mut compressed_proof = MerkleProof {
-            siblings: Vec::new(),
+            siblings: Vec::with_capacity(p.siblings.len()),
         };
         let mut index = i + num_leaves;
         for &sibling in &p.siblings {
