@@ -9,6 +9,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use hashbrown::{HashMap, HashSet};
 use itertools::Itertools;
 use log::{debug, info, warn, Level};
+use plonky2_maybe_rayon::*;
 #[cfg(feature = "timing")]
 use web_time::Instant;
 
@@ -53,7 +54,7 @@ use crate::timed;
 use crate::util::context_tree::ContextTree;
 use crate::util::partial_products::num_partial_products;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil, log2_strict, transpose, transpose_poly_values};
+use crate::util::{log2_ceil, log2_strict, transpose_poly_values};
 
 /// Number of random coins needed for lookups (for each challenge).
 /// A coin is a randomly sampled extension field element from the verifier,
@@ -979,20 +980,21 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .map(|g| g.0.num_constants())
             .max()
             .unwrap();
-        transpose(
-            &self
-                .gate_instances
-                .iter()
-                .map(|g| {
-                    let mut consts = g.constants.clone();
-                    consts.resize(max_constants, F::ZERO);
-                    consts
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_iter()
-        .map(PolynomialValues::new)
-        .collect()
+        let instances = &self.gate_instances;
+        // Column `c`, row `j` is instance `j`'s `c`-th constant, zero-padded.
+        // Rows are processed in parallel per column; ordering is preserved by
+        // `IndexedParallelIterator`, so the values are identical to the old
+        // per-row clone + transpose, without allocating a `Vec` per row.
+        (0..max_constants)
+            .map(|c| {
+                PolynomialValues::new(
+                    instances
+                        .par_iter()
+                        .map(|g| g.constants.get(c).copied().unwrap_or(F::ZERO))
+                        .collect(),
+                )
+            })
+            .collect()
     }
 
     fn sigma_vecs(&self, k_is: &[F], subgroup: &[F]) -> (Vec<PolynomialValues<F>>, Forest) {
@@ -1391,5 +1393,230 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // TODO: Can skip parts of this.
         let circuit_data = self.build::<C>();
         circuit_data.verifier_data()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::gates::selectors::{SelectorsInfo, UNUSED_SELECTOR};
+    use crate::util::transpose;
+
+    type F = GoldilocksField;
+    const D: usize = 2;
+
+    /// Old serial selector construction, kept for differential comparison:
+    /// linear-scan gate lookup plus a serial per-row fill loop.
+    fn selector_polynomials_serial<F_: RichField + Extendable<D>>(
+        gates: &[GateRef<F_, D>],
+        instances: &[GateInstance<F_, D>],
+        max_degree: usize,
+    ) -> (Vec<PolynomialValues<F_>>, SelectorsInfo) {
+        let n = instances.len();
+        let num_gates = gates.len();
+        let max_gate_degree = gates.last().expect("No gates?").0.degree();
+
+        let index = |id| gates.iter().position(|g| g.0.id() == id).unwrap();
+
+        // Special case if we can use only one selector polynomial.
+        if max_gate_degree + num_gates - 1 <= max_degree {
+            #[allow(clippy::single_range_in_vec_init)]
+            return (
+                vec![PolynomialValues::new(
+                    instances
+                        .iter()
+                        .map(|g| F_::from_canonical_usize(index(g.gate_ref.0.id())))
+                        .collect(),
+                )],
+                SelectorsInfo {
+                    selector_indices: vec![0; num_gates],
+                    groups: vec![0..num_gates],
+                },
+            );
+        }
+
+        if max_gate_degree >= max_degree {
+            panic!(
+                "{} has too high degree. Consider increasing `quotient_degree_factor`.",
+                gates.last().unwrap().0.id()
+            );
+        }
+
+        // Greedily construct the groups.
+        let mut groups = Vec::new();
+        let mut start = 0;
+        while start < num_gates {
+            let mut size = 0;
+            while (start + size < gates.len()) && (size + gates[start + size].0.degree() < max_degree)
+            {
+                size += 1;
+            }
+            groups.push(start..start + size);
+            start += size;
+        }
+
+        let group = |i| groups.iter().position(|range| range.contains(&i)).unwrap();
+
+        // `selector_indices[i] = j` iff the `i`-th gate uses the `j`-th selector polynomial.
+        let selector_indices = (0..num_gates).map(group).collect();
+
+        // Placeholder value to indicate that a gate doesn't use a selector polynomial.
+        let unused = F_::from_canonical_usize(UNUSED_SELECTOR);
+
+        let mut polynomials = vec![PolynomialValues::zero(n); groups.len()];
+        for (j, g) in instances.iter().enumerate() {
+            let GateInstance { gate_ref, .. } = g;
+            let i = index(gate_ref.0.id());
+            let gr = group(i);
+            for g in 0..groups.len() {
+                polynomials[g].values[j] = if g == gr {
+                    F_::from_canonical_usize(i)
+                } else {
+                    unused
+                };
+            }
+        }
+
+        (
+            polynomials,
+            SelectorsInfo {
+                selector_indices,
+                groups,
+            },
+        )
+    }
+
+    /// Old serial constant polynomial construction (per-row clone + resize +
+    /// transpose), kept for differential comparison.
+    fn constant_polys_serial<F_: RichField + Extendable<D>>(
+        builder: &CircuitBuilder<F_, D>,
+    ) -> Vec<PolynomialValues<F_>> {
+        let max_constants = builder
+            .gates
+            .iter()
+            .map(|g| g.0.num_constants())
+            .max()
+            .unwrap();
+        transpose(
+            &builder
+                .gate_instances
+                .iter()
+                .map(|g| {
+                    let mut consts = g.constants.clone();
+                    consts.resize(max_constants, F_::ZERO);
+                    consts
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(PolynomialValues::new)
+        .collect()
+    }
+
+    /// Sigma generation with the OLD serial `compress_paths` loop, kept for
+    /// differential comparison. Everything else is shared with the production
+    /// path.
+    fn sigma_vecs_serial<F_: RichField + Extendable<D>>(
+        builder: &CircuitBuilder<F_, D>,
+        k_is: &[F_],
+        subgroup: &[F_],
+    ) -> (Vec<PolynomialValues<F_>>, Vec<usize>) {
+        let degree = builder.gate_instances.len();
+        let degree_log = log2_strict(degree);
+        let config = &builder.config;
+        let mut forest = Forest::new(
+            config.num_wires,
+            config.num_routed_wires,
+            degree,
+            builder.virtual_target_index,
+        );
+        for gate in 0..degree {
+            for input in 0..config.num_wires {
+                forest.add(Target::Wire(Wire {
+                    row: gate,
+                    column: input,
+                }));
+            }
+        }
+        for index in 0..builder.virtual_target_index {
+            forest.add(Target::VirtualTarget { index });
+        }
+        for &CopyConstraint { pair: (a, b), .. } in &builder.copy_constraints {
+            forest.merge(a, b);
+        }
+        // OLD serial path compression.
+        for i in 0..forest.parents.len() {
+            forest.find(i);
+        }
+        let wire_partition = forest.wire_partition();
+        let sigma = wire_partition.get_sigma_polys(degree_log, k_is, subgroup);
+        (sigma, forest.parents)
+    }
+
+    /// Builds a circuit with several gate types (ConstantGate, ArithmeticGate,
+    /// RangeCheckGate at multiple widths) plus a nontrivial set of copy
+    /// constraints, then asserts the new selector/constant/sigma construction
+    /// is bit-identical to the old serial implementations.
+    #[test]
+    fn differential_construction_matches_serial() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+
+        // Several gate types and a few hundred gates with copy constraints.
+        let mut acc = builder.constant(F::from_canonical_u64(7));
+        for i in 1..220u64 {
+            let x = builder.constant(F::from_canonical_u64(i));
+            acc = builder.mul(acc, x);
+            acc = builder.add(acc, x);
+            builder.range_check(x, 8);
+            builder.range_check(acc, 32);
+            let _split = builder.split_le(x, 8);
+        }
+
+        // Mirror the production build flow: pad to a power-of-two degree.
+        builder.blind_and_pad();
+        let degree = builder.gate_instances.len();
+        let degree_log = log2_strict(degree);
+
+        // --- Selector polynomials: new vs old serial ---
+        let mut gates = builder.gates.iter().cloned().collect::<Vec<_>>();
+        gates.sort_unstable_by_key(|g| (g.0.degree(), g.0.id()));
+        let max_degree = builder.config.max_quotient_degree_factor + 1;
+        let (polys_new, info_new) =
+            selector_polynomials(&gates, &builder.gate_instances, max_degree);
+        let (polys_old, info_old) =
+            selector_polynomials_serial(&gates, &builder.gate_instances, max_degree);
+        assert_eq!(info_old, info_new, "SelectorsInfo mismatch");
+        assert_eq!(polys_old.len(), polys_new.len(), "selector count mismatch");
+        for (o, n) in polys_old.iter().zip(&polys_new) {
+            assert_eq!(o.values, n.values, "selector polynomial mismatch");
+        }
+
+        // --- Constant polynomials: new vs old serial ---
+        let consts_new = builder.constant_polys();
+        let consts_old = constant_polys_serial(&builder);
+        assert_eq!(
+            consts_old.len(),
+            consts_new.len(),
+            "constant poly count mismatch"
+        );
+        for (o, n) in consts_old.iter().zip(&consts_new) {
+            assert_eq!(o.values, n.values, "constant polynomial mismatch");
+        }
+
+        // --- Sigma: new (parallel compress) vs old (serial compress) ---
+        let k_is = get_unique_coset_shifts(degree, builder.config.num_routed_wires);
+        let subgroup = F::two_adic_subgroup(degree_log);
+        let (sigma_new, forest_new) = builder.sigma_vecs(&k_is, &subgroup);
+        let (sigma_old, parents_old) = sigma_vecs_serial(&builder, &k_is, &subgroup);
+        assert_eq!(
+            forest_new.parents, parents_old,
+            "representative map mismatch"
+        );
+        assert_eq!(sigma_new.len(), sigma_old.len(), "sigma count mismatch");
+        for (o, n) in sigma_old.iter().zip(&sigma_new) {
+            assert_eq!(o.values, n.values, "sigma polynomial mismatch");
+        }
     }
 }

@@ -183,6 +183,19 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
     )> {
         None
     }
+
+    /// Computes the coset LDE of the given base-field coefficient columns (one
+    /// column per extension limb) on a specialized backend, when available.
+    /// Returns the retained natural-order LDE columns; `None` falls back to
+    /// the CPU FFT. Used to offload the FRI final-polynomial LDE, whose
+    /// values only feed the first FRI fold tree and are never re-derived by
+    /// the verifier.
+    fn try_lde_from_coeffs(
+        _coeff_columns: &[&[F]],
+        _rate_bits: usize,
+    ) -> Option<crate::hash::merkle_tree::ColumnStore<F>> {
+        None
+    }
 }
 
 /// Trait for algebraic hash functions, built from a permutation using the sponge construction.

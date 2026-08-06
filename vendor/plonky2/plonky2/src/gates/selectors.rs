@@ -2,6 +2,8 @@
 use alloc::{vec, vec::Vec};
 use core::ops::Range;
 
+use hashbrown::HashMap;
+use plonky2_maybe_rayon::*;
 use serde::Serialize;
 
 use crate::field::extension::Extendable;
@@ -9,6 +11,7 @@ use crate::field::polynomial::PolynomialValues;
 use crate::gates::gate::{GateInstance, GateRef};
 use crate::hash::hash_types::RichField;
 use crate::plonk::circuit_builder::LookupWire;
+use crate::util::SendPtr;
 
 /// Placeholder value to indicate that a gate doesn't use a selector polynomial.
 pub(crate) const UNUSED_SELECTOR: usize = u32::MAX as usize;
@@ -119,7 +122,22 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     let num_gates = gates.len();
     let max_gate_degree = gates.last().expect("No gates?").0.degree();
 
-    let index = |id| gates.iter().position(|g| g.0.id() == id).unwrap();
+    // Map each gate type (unique by id in `gates`, since `CircuitBuilder`
+    // stores them in a `HashSet` keyed by id) to its position in the
+    // degree-sorted slice. This reproduces the old linear scan `index`
+    // exactly, but allocates one `String` per gate type instead of one
+    // `String` per gate per row.
+    let id_to_index: HashMap<String, usize> = gates
+        .iter()
+        .enumerate()
+        .map(|(i, g)| (g.0.id(), i))
+        .collect();
+    // The gate-type index of every row, computed once up front so the hot
+    // fill loops below never allocate.
+    let gate_index_of_row: Vec<usize> = instances
+        .iter()
+        .map(|inst| id_to_index[&inst.gate_ref.0.id()])
+        .collect();
 
     // Special case if we can use only one selector polynomial.
     if max_gate_degree + num_gates - 1 <= max_degree {
@@ -128,9 +146,9 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
         #[allow(clippy::single_range_in_vec_init)]
         return (
             vec![PolynomialValues::new(
-                instances
-                    .iter()
-                    .map(|g| F::from_canonical_usize(index(g.gate_ref.0.id())))
+                gate_index_of_row
+                    .par_iter()
+                    .map(|&i| F::from_canonical_usize(i))
                     .collect(),
             )],
             SelectorsInfo {
@@ -166,20 +184,29 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
 
     // Placeholder value to indicate that a gate doesn't use a selector polynomial.
     let unused = F::from_canonical_usize(UNUSED_SELECTOR);
+    let num_groups = groups.len();
 
-    let mut polynomials = vec![PolynomialValues::zero(n); groups.len()];
-    for (j, g) in instances.iter().enumerate() {
-        let GateInstance { gate_ref, .. } = g;
-        let i = index(gate_ref.0.id());
+    // Fill every selector polynomial in one flat, column-major buffer:
+    // `flat[g * n + j]` is row `j` of the `g`-th selector polynomial. Rows
+    // are processed in parallel; each row writes disjoint addresses, so the
+    // result is identical to the serial per-row loop.
+    let mut flat = vec![unused; num_groups * n];
+    let base = SendPtr(flat.as_mut_ptr());
+    gate_index_of_row.par_iter().enumerate().for_each(|(j, &i)| {
         let gr = group(i);
-        for g in 0..groups.len() {
-            polynomials[g].values[j] = if g == gr {
-                F::from_canonical_usize(i)
-            } else {
-                unused
-            };
+        let val = F::from_canonical_usize(i);
+        for g in 0..num_groups {
+            // SAFETY: row `j` is handled by a single worker, so each address
+            // `g * n + j` is written exactly once, and it is always in
+            // `0..num_groups * n`.
+            unsafe {
+                *base.get().add(g * n + j) = if g == gr { val } else { unused };
+            }
         }
-    }
+    });
+    let polynomials = (0..num_groups)
+        .map(|g| PolynomialValues::new(flat[g * n..(g + 1) * n].to_vec()))
+        .collect();
 
     (
         polynomials,

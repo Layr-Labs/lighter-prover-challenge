@@ -30,13 +30,15 @@ pub fn transpose<T: Send + Sync + Copy>(matrix: &[Vec<T>]) -> Vec<Vec<T>> {
         .collect()
 }
 
+/// Wrapper making a raw pointer `Send + Sync` so a flat buffer can be filled
+/// from a rayon closure. Each write site must write a disjoint location.
 #[derive(Clone, Copy)]
-struct SendPtr<T>(*mut T);
+pub(crate) struct SendPtr<T>(pub(crate) *mut T);
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 
 impl<T> SendPtr<T> {
-    fn get(self) -> *mut T {
+    pub(crate) fn get(self) -> *mut T {
         self.0
     }
 }

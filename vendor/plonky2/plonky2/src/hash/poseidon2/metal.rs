@@ -348,6 +348,46 @@ pub(crate) fn build_commitment_from_values<F: RichField>(
     }
 }
 
+/// Computes the coset LDE of every coefficient column on the GPU without
+/// building a Merkle tree, returning the retained CPU-visible natural-order
+/// LDE columns. `None` falls back to the CPU FFT.
+pub(crate) fn lde_from_coeffs<F: RichField>(
+    coeff_columns: &[&[F]],
+    rate_bits: usize,
+) -> Option<MetalColumns<F>> {
+    let cols = coeff_columns.len();
+    let degree = coeff_columns.first().map_or(0, |column| column.len());
+    if F::ORDER != 0xffff_ffff_0000_0001
+        || size_of::<F>() != size_of::<u64>()
+        || cols == 0
+        || degree == 0
+        || !degree.is_power_of_two()
+        || coeff_columns.iter().any(|column| column.len() != degree)
+        || rate_bits == 0
+    {
+        return None;
+    }
+    let lde_size = degree << rate_bits;
+    if lde_size > u32::MAX as usize
+        || cols > u32::MAX as usize
+        // Phase-aware routing identical to the tree builders: only borrow the
+        // serialized GPU stream when the cost is worthwhile, so the NTT never
+        // queues behind pipelined tree builds on the critical path.
+        || !gpu_worthwhile(cols, lde_size, 4)
+    {
+        return None;
+    }
+
+    let context = shared_context()?;
+    match context.lde_from_coeffs(coeff_columns, degree, rate_bits) {
+        Ok(columns) => Some(columns),
+        Err(error) => {
+            log::warn!("Metal NTT LDE failed; using CPU FFT: {error}");
+            None
+        }
+    }
+}
+
 /// Where the leaf field elements come from and how they are laid out.
 enum LeafSource<'a, F> {
     /// Flat row-major rows, already in tree-leaf order.
@@ -1049,6 +1089,135 @@ impl MetalShared {
             slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
         };
         Ok(tree_from_levels(nodes, &level_offsets, lde_size, cap_height))
+    }
+
+    /// NTT-only variant of [`Self::build_from_coeffs_with_set`]: runs the
+    /// coset-LDE prepare and butterfly stages but skips leaf and parent
+    /// hashing, returning the natural-order LDE columns. The values are only
+    /// ever fed back into CPU-side consumers (the FRI fold gather), so no
+    /// tree output is produced.
+    fn lde_from_coeffs<F: RichField>(
+        &self,
+        coeff_columns: &[&[F]],
+        degree: usize,
+        rate_bits: usize,
+    ) -> Result<MetalColumns<F>, String> {
+        let cols = coeff_columns.len();
+        let lde_size = degree << rate_bits;
+        let log_lde = lde_size.ilog2();
+
+        let coeff_len = degree
+            .checked_mul(cols)
+            .ok_or("NTT coefficient length overflow")?;
+        let coeff_bytes = coeff_len
+            .checked_mul(size_of::<u64>())
+            .ok_or("NTT coefficient size overflow")?;
+        let column_len = lde_size
+            .checked_mul(cols)
+            .ok_or("NTT column length overflow")?;
+        let column_bytes = column_len
+            .checked_mul(size_of::<u64>())
+            .ok_or("NTT column size overflow")?;
+
+        let (roots_buffer, roots_offsets) = self.roots_for(log_lde)?;
+        let shift_buffer = self.shift_powers_for(degree)?;
+
+        // The LDE columns outlive this call as the FRI fold's leaf source, so
+        // they get their own buffer rather than a pooled one.
+        let column_buffer = autoreleasepool(|| {
+            self.device
+                .new_buffer(column_bytes as u64, MTLResourceOptions::StorageModeShared)
+        });
+
+        let mut set = self.acquire_set()?;
+        let result = (|| -> Result<(), String> {
+            if set
+                .input
+                .as_ref()
+                .map_or(true, |buffer| buffer.length() < coeff_bytes as u64)
+            {
+                set.input = Some(autoreleasepool(|| {
+                    self.device
+                        .new_buffer(coeff_bytes as u64, MTLResourceOptions::StorageModeShared)
+                }));
+            }
+            let input_buffer = set.input.as_ref().unwrap();
+            {
+                let destination = unsafe {
+                    slice::from_raw_parts_mut(input_buffer.contents().cast::<u64>(), coeff_len)
+                };
+                destination
+                    .par_chunks_mut(degree)
+                    .zip(coeff_columns.par_iter())
+                    .for_each(|(destination, column)| {
+                        let source = unsafe {
+                            slice::from_raw_parts(column.as_ptr().cast::<u64>(), degree)
+                        };
+                        destination.copy_from_slice(source);
+                    });
+            }
+
+            let command_buffer = autoreleasepool(|| -> CommandBuffer {
+                let degree_u32 = degree as u32;
+                let lde_size_u32 = lde_size as u32;
+                let log_degree_u32 = degree.ilog2();
+                let rate_bits_u32 = rate_bits as u32;
+                let command_buffer = self.queue.new_command_buffer();
+
+                let prepare = command_buffer.new_compute_command_encoder();
+                prepare.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+                prepare.set_buffer(0, Some(input_buffer), 0);
+                prepare.set_buffer(1, Some(&shift_buffer), 0);
+                prepare.set_buffer(2, Some(&column_buffer), 0);
+                set_u32(prepare, 3, degree_u32);
+                set_u32(prepare, 4, lde_size_u32);
+                set_u32(prepare, 5, log_degree_u32);
+                set_u32(prepare, 6, rate_bits_u32);
+                dispatch2d(prepare, &self.ntt_prepare_pipeline, lde_size, cols);
+                prepare.end_encoding();
+
+                for stage in rate_bits as u32..log_lde {
+                    let stage_encoder = command_buffer.new_compute_command_encoder();
+                    stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
+                    stage_encoder.set_buffer(0, Some(&column_buffer), 0);
+                    stage_encoder.set_buffer(
+                        1,
+                        Some(&roots_buffer),
+                        (roots_offsets[stage as usize] * size_of::<u64>()) as NSUInteger,
+                    );
+                    set_u32(stage_encoder, 2, lde_size_u32);
+                    set_u32(stage_encoder, 3, stage);
+                    set_u32(
+                        stage_encoder,
+                        4,
+                        u32::from(stage == log_lde - 1),
+                    );
+                    dispatch2d(stage_encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
+                    stage_encoder.end_encoding();
+                }
+
+                command_buffer.commit();
+                command_buffer.to_owned()
+            });
+
+            command_buffer.wait_until_completed();
+            if command_buffer.status() != MTLCommandBufferStatus::Completed {
+                return Err(format!(
+                    "command buffer ended with status {:?}",
+                    command_buffer.status()
+                ));
+            }
+            Ok(())
+        })();
+        self.release_set(set);
+        result?;
+
+        Ok(MetalColumns {
+            buffer: column_buffer,
+            rows: lde_size,
+            cols,
+            _phantom: PhantomData,
+        })
     }
 
     fn build<F: RichField>(

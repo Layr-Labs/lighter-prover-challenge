@@ -329,10 +329,16 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         let constants_sigmas_eval = eval_commitment(zeta, constants_sigmas_commitment);
 
         // `zs_partial_products_lookup_eval` contains the permutation argument polynomials as well as lookup polynomials.
-        let zs_partial_products_lookup_eval =
-            eval_commitment(zeta, zs_partial_products_lookup_commitment);
-        let zs_partial_products_lookup_next_eval =
-            eval_commitment(g * zeta, zs_partial_products_lookup_commitment);
+        // The same coefficient set is opened at both `zeta` and `g * zeta`; evaluate the two points
+        // in a single fused coefficient traversal (two Horner accumulators per polynomial) so each
+        // coefficient is read from memory only once.
+        let g_zeta = g * zeta;
+        let (zs_partial_products_lookup_eval, zs_partial_products_lookup_next_eval): (Vec<_>, Vec<_>) =
+            zs_partial_products_lookup_commitment
+                .polynomials
+                .par_iter()
+                .map(|p| p.eval_two(zeta, g_zeta))
+                .unzip();
         let quotient_polys = eval_commitment(zeta, quotient_polys_commitment);
 
         Self {

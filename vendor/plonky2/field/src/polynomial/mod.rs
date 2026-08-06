@@ -159,6 +159,34 @@ impl<F: Field> PolynomialCoeffs<F> {
             .fold(F::ZERO, |acc, &c| acc * x + c)
     }
 
+    /// Evaluate the polynomial at two extension points `x` and `y` in a single
+    /// pass over the coefficients, using two independent reverse-Horner
+    /// accumulators. Each base coefficient is embedded into the extension
+    /// field exactly once and consumed by both chains, halving the memory
+    /// traffic of two separate `to_extension().eval(..)` passes.
+    ///
+    /// This is bit-identical to `(self.to_extension().eval(x),
+    /// self.to_extension().eval(y))`: each chain performs exactly the same
+    /// `acc * point + embedded_coeff` operations, in the same order, on the
+    /// same inputs; only the interleaving differs.
+    pub fn eval_two<const D: usize>(
+        &self,
+        x: F::Extension,
+        y: F::Extension,
+    ) -> (F::Extension, F::Extension)
+    where
+        F: Extendable<D>,
+    {
+        let mut acc_x = F::Extension::ZERO;
+        let mut acc_y = F::Extension::ZERO;
+        for &c in self.coeffs.iter().rev() {
+            let c_ext = F::Extension::from_basefield(c);
+            acc_x = acc_x * x + c_ext;
+            acc_y = acc_y * y + c_ext;
+        }
+        (acc_x, acc_y)
+    }
+
     /// Evaluate the polynomial at a point given its powers. The first power is the point itself, not 1.
     pub fn eval_with_powers(&self, powers: &[F]) -> F {
         debug_assert_eq!(self.coeffs.len(), powers.len() + 1);
@@ -663,5 +691,24 @@ mod tests {
             PolynomialCoeffs::<F>::new(vec![F::ZERO]),
             PolynomialCoeffs::new(vec![F::ONE, F::ZERO])
         );
+    }
+
+    #[test]
+    fn eval_two_matches_two_separate_evals() {
+        type F = GoldilocksField;
+        type E = crate::extension::quadratic::QuadraticExtension<F>;
+        // Lengths include the boundary cases: empty, constant, short, and sizes
+        // representative of the production chunk/quotient polynomials.
+        let lengths = [0usize, 1, 2, 31, 256, 4096];
+        for &len in &lengths {
+            for _ in 0..20 {
+                let poly = PolynomialCoeffs::new(F::rand_vec(len));
+                let zeta: E = E::rand();
+                let g: E = E::rand();
+                let expected = (poly.to_extension::<2>().eval(zeta), poly.to_extension::<2>().eval(g * zeta));
+                let actual = poly.eval_two::<2>(zeta, g * zeta);
+                assert_eq!(actual, expected, "length {len}");
+            }
+        }
     }
 }

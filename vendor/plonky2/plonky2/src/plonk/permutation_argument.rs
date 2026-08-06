@@ -80,9 +80,37 @@ impl Forest {
     /// Compress all paths. After calling this, every `parent` value will point to the node's
     /// representative.
     pub(crate) fn compress_paths(&mut self) {
-        for i in 0..self.parents.len() {
-            self.find(i);
+        const MIN_PARALLEL: usize = 1 << 15;
+
+        if self.parents.len() < MIN_PARALLEL {
+            for i in 0..self.parents.len() {
+                self.find(i);
+            }
+            return;
         }
+
+        // Two-pass parallel path compression. Pass 1 computes every node's
+        // representative with pure reads; pass 2 installs all representatives.
+        // No merges happen here, so representatives are invariant under
+        // compression: each node's root is exactly what the serial loop's
+        // `find(i)` would return, and pass 2 writes each element from exactly
+        // one iteration, so the final `parents` vector is identical to the
+        // serial result.
+        let roots: Vec<usize> = (0..self.parents.len())
+            .into_par_iter()
+            .map(|i| {
+                let parents = &self.parents;
+                let mut rep = i;
+                while parents[rep] != rep {
+                    rep = parents[rep];
+                }
+                rep
+            })
+            .collect();
+        self.parents
+            .par_iter_mut()
+            .zip(roots)
+            .for_each(|(parent, root)| *parent = root);
     }
 
     /// Assumes `compress_paths` has already been called.

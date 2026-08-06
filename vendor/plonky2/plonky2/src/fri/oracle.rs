@@ -6,13 +6,13 @@ use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::batch_multiply_inplace;
-use crate::field::extension::Extendable;
+use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::fft::FftRootTable;
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
 use crate::fri::proof::FriProof;
-use crate::fri::prover::fri_proof;
+use crate::fri::prover::{FriLdeSource, fri_proof};
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::{MerkleLeaves, MerkleTree};
@@ -373,21 +373,49 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         }
 
         // `final_poly` is dead after this point, so pad it in place instead of
-        // the clone-then-resize that `lde(&self)` performs.
-        let mut lde_final_poly = final_poly;
-        lde_final_poly
-            .coeffs
-            .resize(lde_final_poly.len() << fri_params.config.rate_bits, F::Extension::ZERO);
-        let lde_final_values = timed!(
+        // the clone-then-resize that `lde(&self)` performs. When a specialized
+        // backend (Metal) can compute the coset LDE from the coefficient
+        // columns, the large final FFT leaves the serial CPU path; otherwise
+        // fall back to the CPU FFT (whose zero-run shortcut applies to the
+        // padded tail).
+        //
+        // The LDE values only feed the first FRI fold tree's leaf buffer:
+        // they are prover-internal (the verifier never re-derives them), and
+        // the backend computes bit-identical values to the CPU FFT, so the
+        // committed caps, query leaves, and hence the proof bytes are
+        // unchanged.
+        let (lde_final_poly, lde_final_values) = timed!(
             timing,
-            &format!("perform final FFT {}", lde_final_poly.len()),
-            // The top (1 - 1/2^rate_bits) of the padded coefficients are zero,
-            // so the FFT's zero-run shortcut applies.
-            lde_final_poly.coset_fft_with_options(
-                F::coset_shift().into(),
-                Some(fri_params.config.rate_bits),
-                None,
-            )
+            &format!("perform final FFT {}", final_poly.len() << fri_params.config.rate_bits),
+            {
+                let mut lde_final_poly = final_poly;
+                lde_final_poly
+                    .coeffs
+                    .resize(lde_final_poly.len() << fri_params.config.rate_bits, F::Extension::ZERO);
+                // Only the `1/2^rate_bits` live prefix is sent to the backend;
+                // the zero tail is implicit in the LDE replication.
+                let nonzero = lde_final_poly.len() >> fri_params.config.rate_bits;
+                let mut coeff_columns: Vec<Vec<F>> =
+                    vec![Vec::with_capacity(nonzero); D];
+                for c in &lde_final_poly.coeffs[..nonzero] {
+                    let arr = c.to_basefield_array();
+                    for (b, elt) in arr.into_iter().enumerate() {
+                        coeff_columns[b].push(elt);
+                    }
+                }
+                let coeff_refs: Vec<&[F]> =
+                    coeff_columns.iter().map(|column| column.as_slice()).collect();
+                let values =
+                    match C::Hasher::try_lde_from_coeffs(&coeff_refs, fri_params.config.rate_bits) {
+                        Some(columns) => FriLdeSource::Columns(columns),
+                        None => FriLdeSource::Owned(lde_final_poly.coset_fft_with_options(
+                            F::coset_shift().into(),
+                            Some(fri_params.config.rate_bits),
+                            None,
+                        )),
+                    };
+                (lde_final_poly, values)
+            }
         );
 
         let fri_proof = fri_proof::<F, C, D>(
