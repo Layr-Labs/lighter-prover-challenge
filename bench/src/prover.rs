@@ -32,8 +32,9 @@ const LIGHT_TX_PROOF_WINDOW: usize = 2;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
-fn chunk_is_light(txs: &[Tx<F>]) -> bool {
-    txs.first()
+fn chunk_is_light(chunk_txs: &[Tx<F>]) -> bool {
+    chunk_txs
+        .first()
         .expect("block transaction chunk must not be empty")
         .tx_circuit_type
         == TX_LIGHT
