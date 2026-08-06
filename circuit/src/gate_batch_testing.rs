@@ -27,6 +27,12 @@ mod vendored_gate_tests {
     }
 
     #[test]
+    fn poseidon2_accumulate_matches_eval_unfiltered_across_batch() {
+        let gate = Poseidon2Gate::<GoldilocksField, 2>::new();
+        assert_accumulate_matches_eval_unfiltered(&gate);
+    }
+
+    #[test]
     fn random_access_base_batch_matches_eval_unfiltered_across_batch() {
         use plonky2::gates::random_access::RandomAccessGate;
         use plonky2::plonk::circuit_data::CircuitConfig;
@@ -125,6 +131,7 @@ mod accumulate_microbench {
     use plonky2::field::batch_util::batch_multiply_add_inplace;
     use plonky2::gates::arithmetic_extension::ArithmeticExtensionGate;
     use plonky2::gates::multiplication_extension::MulExtensionGate;
+    use plonky2::gates::poseidon2::Poseidon2Gate;
     use plonky2::gates::random_access::RandomAccessGate;
     use plonky2::gates::reducing::ReducingGate;
     use plonky2::gates::reducing_extension::ReducingExtensionGate;
@@ -185,6 +192,7 @@ mod accumulate_microbench {
     #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
     fn accumulate_microbench() {
         const ITERS: usize = 20_000;
+        bench_gate(&Poseidon2Gate::<GoldilocksField, 2>::new(), ITERS);
         bench_gate(&ReducingGate::<2>::new(44), ITERS);
         bench_gate(&ReducingExtensionGate::<2>::new(33), ITERS);
         bench_gate(&ArithmeticExtensionGate::<2> { num_ops: 10 }, ITERS);
