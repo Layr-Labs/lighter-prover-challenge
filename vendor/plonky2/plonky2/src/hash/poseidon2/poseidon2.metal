@@ -13,10 +13,26 @@ inline ulong gl_add(ulong a, ulong b) {
 }
 
 inline ulong gl_mul(ulong a, ulong b) {
-    ulong low = a * b;
-    ulong high = metal::mulhi(a, b);
-    ulong high_high = high >> 32;
-    ulong high_low = high & GOLDILOCKS_EPSILON;
+    uint a_low = (uint)a;
+    uint a_high = (uint)(a >> 32);
+    uint b_low = (uint)b;
+    uint b_high = (uint)(b >> 32);
+
+    uint p00_low = a_low * b_low;
+    uint p00_high = metal::mulhi(a_low, b_low);
+    uint p01_low = a_low * b_high;
+    uint p01_high = metal::mulhi(a_low, b_high);
+    uint p10_low = a_high * b_low;
+    uint p10_high = metal::mulhi(a_high, b_low);
+    uint p11_low = a_high * b_high;
+    uint p11_high = metal::mulhi(a_high, b_high);
+
+    ulong middle = (ulong)p00_high + (ulong)p01_low + (ulong)p10_low;
+    uint product_limb_1 = (uint)middle;
+    ulong upper = (middle >> 32) + (ulong)p01_high + (ulong)p10_high + (ulong)p11_low;
+    ulong high_low = (ulong)(uint)upper;
+    ulong high_high = (ulong)(p11_high + (uint)(upper >> 32));
+    ulong low = (ulong)p00_low | ((ulong)product_limb_1 << 32);
 
     // Since 2^64 = 2^32 - 1 and 2^32(2^32 - 1) = -1 modulo p,
     // low + high * 2^64 reduces to low - high_high + high_low * (2^32 - 1).
@@ -24,7 +40,7 @@ inline ulong gl_mul(ulong a, ulong b) {
     if (reduced > low) {
         reduced -= GOLDILOCKS_EPSILON;
     }
-    ulong addend = high_low * GOLDILOCKS_EPSILON;
+    ulong addend = (high_low << 32) - high_low;
     ulong result = reduced + addend;
     return result + (result < reduced) * GOLDILOCKS_EPSILON;
 }
