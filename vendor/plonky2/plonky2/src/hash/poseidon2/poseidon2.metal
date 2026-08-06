@@ -161,14 +161,29 @@ inline void external_linear_layer(thread ulong state[12]) {
 }
 
 inline ulong sum_state(thread const ulong state[12]) {
-    ulong sum = 0;
+    uint lo = 0;
+    uint hi = 0;
     uint carries = 0;
     for (uint i = 0; i < 12; ++i) {
-        ulong next = sum + state[i];
-        carries += next < sum;
-        sum = next;
+        uint value_lo = (uint)state[i];
+        uint value_hi = (uint)(state[i] >> 32);
+        uint next = lo + value_lo;
+        uint carry = (uint)(next < lo);
+        lo = next;
+        next = hi + value_hi;
+        carries += (uint)(next < hi);
+        hi = next;
+        next = hi + carry;
+        carries += (uint)(next < hi);
+        hi = next;
     }
-    return gl_add(sum, (ulong)carries * GOLDILOCKS_EPSILON);
+    // Fold carries * (2^32 - 1) without returning to 64-bit arithmetic.
+    uint old_lo = lo;
+    lo -= carries;
+    uint old_hi = hi;
+    hi += carries - (uint)(old_lo < carries);
+    add_epsilon_u32(lo, hi, (uint)(hi < old_hi));
+    return ((ulong)hi << 32) | (ulong)lo;
 }
 
 inline void internal_linear_layer(thread ulong state[12], constant ulong* diagonal) {
