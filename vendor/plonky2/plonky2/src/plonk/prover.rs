@@ -410,12 +410,6 @@ fn wires_permutation_partial_products_and_zs<
         .enumerate()
         .map(|(i, &x)| {
             let s_sigmas = &prover_data.sigmas[i];
-            let numerators = (0..common_data.config.num_routed_wires).map(|j| {
-                let wire_value = witness.get_wire(i, j);
-                let k_i = k_is[j];
-                let s_id = k_i * x;
-                wire_value + beta * s_id + gamma
-            });
             let denominators = (0..common_data.config.num_routed_wires)
                 .map(|j| {
                     let wire_value = witness.get_wire(i, j);
@@ -423,11 +417,12 @@ fn wires_permutation_partial_products_and_zs<
                     wire_value + beta * s_sigma + gamma
                 })
                 .collect::<Vec<_>>();
-            let denominator_invs = F::batch_multiplicative_inverse(&denominators);
-            let quotient_values = numerators
-                .zip(denominator_invs)
-                .map(|(num, den_inv)| num * den_inv)
-                .collect::<Vec<_>>();
+            let mut quotient_values = F::batch_multiplicative_inverse(&denominators);
+            for (j, quotient) in quotient_values.iter_mut().enumerate() {
+                let wire_value = witness.get_wire(i, j);
+                let s_id = k_is[j] * x;
+                *quotient *= wire_value + beta * s_id + gamma;
+            }
 
             quotient_chunk_products(&quotient_values, degree)
         })
