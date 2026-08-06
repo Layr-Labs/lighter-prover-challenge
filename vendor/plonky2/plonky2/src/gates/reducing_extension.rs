@@ -270,17 +270,14 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D> for Red
 
         let alpha = local_extension(ReducingExtensionGate::<D>::wires_alpha());
         let old_acc = local_extension(ReducingExtensionGate::<D>::wires_old_acc());
-        let coeffs = (0..self.gate.num_coeffs)
-            .map(|i| local_extension(ReducingExtensionGate::<D>::wires_coeff(i)))
-            .collect::<Vec<_>>();
-        let accs = (0..self.gate.num_coeffs)
-            .map(|i| ExtensionTarget::from_range(self.row, self.gate.wires_accs(i)))
-            .collect::<Vec<_>>();
 
         let mut acc = old_acc;
         for i in 0..self.gate.num_coeffs {
-            let computed_acc = acc * alpha + coeffs[i];
-            out_buffer.set_extension_target(accs[i], computed_acc)?;
+            let coeff = local_extension(ReducingExtensionGate::<D>::wires_coeff(i));
+            let computed_acc = acc * alpha + coeff;
+            let acc_target =
+                ExtensionTarget::from_range(self.row, self.gate.wires_accs(i));
+            out_buffer.set_extension_target(acc_target, computed_acc)?;
             acc = computed_acc;
         }
 

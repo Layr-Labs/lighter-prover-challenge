@@ -292,6 +292,41 @@ impl<F: Field> PolynomialCoeffs<F> {
         modified_poly.fft_with_options(zero_factor, root_table)
     }
 
+    /// Coset FFT when the caller guarantees that only the first
+    /// `len >> rate_bits` coefficients may be nonzero (the standard
+    /// FRI zero-tail invariant). Scales only that live prefix by
+    /// `shift^i`, then relies on the FFT's zero-padded path. Bit-identical
+    /// to [`Self::coset_fft_with_options`]`(shift, Some(rate_bits), …)`
+    /// when the tail is zero; saves `(1 - 1/2^rate_bits)` of the scale
+    /// multiplies and one full-length intermediate allocation.
+    pub fn coset_fft_zero_tail(
+        &self,
+        shift: F,
+        rate_bits: usize,
+        root_table: Option<&FftRootTable<F>>,
+    ) -> PolynomialValues<F> {
+        let n = self.coeffs.len();
+        if rate_bits == 0 {
+            return self.coset_fft_with_options(shift, Some(0), root_table);
+        }
+        let live = n >> rate_bits;
+        debug_assert!(live > 0);
+        // Only the live prefix is read. Callers may leave the tail uninit
+        // (padded via set_len) provided the FFT zero-pad path overwrites it
+        // before any read — which prepare_zero_padded_fft does.
+
+        let mut scaled = Vec::with_capacity(n);
+        for (r, &c) in shift.powers().zip(self.coeffs[..live].iter()) {
+            scaled.push(r * c);
+        }
+        // SAFETY: F is a POD field element; the FFT zero-pad path writes every
+        // slot past `live` before any read (prepare_zero_padded_fft).
+        unsafe {
+            scaled.set_len(n);
+        }
+        PolynomialCoeffs::new(scaled).fft_with_options(Some(rate_bits), root_table)
+    }
+
     pub fn to_extension<const D: usize>(&self) -> PolynomialCoeffs<F::Extension>
     where
         F: Extendable<D>,
@@ -492,6 +527,31 @@ mod tests {
 
         let ifft_coeffs = PolynomialValues::new(coset_evals).coset_ifft(shift);
         assert_eq!(poly, ifft_coeffs);
+    }
+
+    #[test]
+    fn test_coset_fft_zero_tail_matches_classic() {
+        type F = GoldilocksField;
+
+        for lg_n in [1usize, 2, 4, 6, 9] {
+            for rate_bits in 0..=3usize {
+                if rate_bits > lg_n {
+                    continue;
+                }
+                let n = 1 << lg_n;
+                let live = n >> rate_bits;
+                let mut coeffs = F::rand_vec(live);
+                coeffs.resize(n, F::ZERO);
+                let poly = PolynomialCoeffs::new(coeffs);
+                let shift = F::rand();
+                let classic = poly.coset_fft_with_options(shift, Some(rate_bits), None);
+                let zero_tail = poly.coset_fft_zero_tail(shift, rate_bits, None);
+                assert_eq!(
+                    classic.values, zero_tail.values,
+                    "mismatch lg_n={lg_n} rate_bits={rate_bits}"
+                );
+            }
+        }
     }
 
     #[test]

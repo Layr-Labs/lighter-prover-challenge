@@ -53,7 +53,7 @@ use crate::timed;
 use crate::util::context_tree::ContextTree;
 use crate::util::partial_products::num_partial_products;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil, log2_strict, transpose, transpose_poly_values};
+use crate::util::{log2_ceil, log2_strict, transpose_poly_values};
 
 /// Number of random coins needed for lookups (for each challenge).
 /// A coin is a randomly sampled extension field element from the verifier,
@@ -979,20 +979,19 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .map(|g| g.0.num_constants())
             .max()
             .unwrap();
-        transpose(
-            &self
-                .gate_instances
-                .iter()
-                .map(|g| {
-                    let mut consts = g.constants.clone();
-                    consts.resize(max_constants, F::ZERO);
-                    consts
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_iter()
-        .map(PolynomialValues::new)
-        .collect()
+        let degree = self.gate_instances.len();
+        // Column-major fill: one zeroed column per constant index, then write
+        // each gate's constants in place. Avoids per-row clone+resize+transpose
+        // of intermediate row-major vectors. Unset limbs stay F::ZERO.
+        let mut cols: Vec<Vec<F>> = (0..max_constants)
+            .map(|_| vec![F::ZERO; degree])
+            .collect();
+        for (row, g) in self.gate_instances.iter().enumerate() {
+            for (c, &val) in g.constants.iter().enumerate() {
+                cols[c][row] = val;
+            }
+        }
+        cols.into_iter().map(PolynomialValues::new).collect()
     }
 
     fn sigma_vecs(&self, k_is: &[F], subgroup: &[F]) -> (Vec<PolynomialValues<F>>, Forest) {
@@ -1006,18 +1005,9 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             self.virtual_target_index,
         );
 
-        for gate in 0..degree {
-            for input in 0..config.num_wires {
-                forest.add(Target::Wire(Wire {
-                    row: gate,
-                    column: input,
-                }));
-            }
-        }
-
-        for index in 0..self.virtual_target_index {
-            forest.add(Target::VirtualTarget { index });
-        }
+        // Dense bulk init: same index order as the old nested add loops
+        // (row-major wires, then virtual targets 0..N).
+        forest.add_all_targets(self.virtual_target_index);
 
         for &CopyConstraint { pair: (a, b), .. } in &self.copy_constraints {
             forest.merge(a, b);

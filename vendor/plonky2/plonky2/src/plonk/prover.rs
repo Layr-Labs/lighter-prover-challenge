@@ -443,10 +443,11 @@ fn wires_permutation_partial_products_and_zs<
     debug_assert_eq!(beta_k_is.len(), common_data.config.num_routed_wires);
     let num_routed_wires = common_data.config.num_routed_wires;
     // Group the denominator inversions across many subgroup points: one
-    // Montgomery-trick batch inversion per 64 points instead of one per
-    // point. Field inverses are unique, so every quotient value is identical
-    // to the per-point version.
-    const INV_BATCH: usize = 128;
+    // Montgomery-trick batch inversion per batch instead of one per point.
+    // Field inverses are unique, so every quotient value is identical to the
+    // per-point version. Raised 128 → 256: halves the number of actual field
+    // inversions while the 80×256 scratch still fits comfortably in L1.
+    const INV_BATCH: usize = 256;
     let all_quotient_chunk_products = subgroup
         .par_chunks(INV_BATCH)
         .enumerate()
