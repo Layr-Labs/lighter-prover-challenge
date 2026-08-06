@@ -78,11 +78,42 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
 
     /// Build the native Merkle digests and cap with a specialized backend, when available.
     ///
-    /// The first result uses [`crate::hash::merkle_tree::MerkleTree::digests`] layout.
+    /// `leaves` is one flat row-major buffer holding `num_leaves` leaves of `leaf_width`
+    /// field elements each. The first result uses
+    /// [`crate::hash::merkle_tree::MerkleTree::digests`] layout.
     fn try_build_merkle_tree(
-        _leaves: &[Vec<F>],
+        _leaves: &[F],
+        _leaf_width: usize,
+        _num_leaves: usize,
         _cap_height: usize,
     ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
+        None
+    }
+
+    /// Like [`Hasher::try_build_merkle_tree`], but the leaves arrive as
+    /// natural-order poly-major columns: tree leaf `i` is
+    /// `columns[j][reverse_bits(i, log2(num_leaves))]`.
+    fn try_build_merkle_tree_columns(
+        _columns: &[Vec<F>],
+        _cap_height: usize,
+    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
+        None
+    }
+
+    /// Computes the coset LDE of the given coefficient columns and the Merkle
+    /// tree over the resulting leaves in one fused backend pass, when a
+    /// specialized backend is available. Returns the retained LDE column
+    /// storage plus digests and cap in
+    /// [`crate::hash::merkle_tree::MerkleTree::digests`] layout.
+    fn try_build_commitment_from_coeffs(
+        _coeff_columns: &[&[F]],
+        _rate_bits: usize,
+        _cap_height: usize,
+    ) -> Option<(
+        crate::hash::merkle_tree::ColumnStore<F>,
+        Vec<Self::Hash>,
+        Vec<Self::Hash>,
+    )> {
         None
     }
 }
