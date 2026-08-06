@@ -643,6 +643,46 @@ fn compute_all_lookup_polys<
 
 const BATCH_SIZE: usize = 32;
 
+fn shifted_quotient_batch_starts<F: Field>(
+    domain_bits: usize,
+    batch_size: usize,
+) -> (F, Vec<F>) {
+    assert!(batch_size > 0, "quotient batch size must be nonzero");
+    let domain_size = 1usize << domain_bits;
+    let num_batches = domain_size.div_ceil(batch_size);
+    let point_step = F::primitive_root_of_unity(domain_bits);
+    let batch_step = point_step.exp_u64(batch_size as u64);
+
+    let mut starts = Vec::with_capacity(num_batches);
+    let mut start = F::coset_shift();
+    starts.push(start);
+    for _ in 1..num_batches {
+        start *= batch_step;
+        starts.push(start);
+    }
+    (point_step, starts)
+}
+
+fn fill_shifted_quotient_batch<F: Field>(
+    batch_start: F,
+    point_step: F,
+    batch_len: usize,
+    out: &mut Vec<F>,
+) {
+    out.clear();
+    out.reserve(batch_len);
+    if batch_len == 0 {
+        return;
+    }
+
+    let mut point = batch_start;
+    out.push(point);
+    for _ in 1..batch_len {
+        point *= point_step;
+        out.push(point);
+    }
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -678,8 +718,10 @@ fn compute_quotient_polys<
     // steps away since we work on an LDE of degree `max_filtered_constraint_degree`.
     let next_step = 1 << quotient_degree_bits;
 
-    let points = F::two_adic_subgroup(common_data.degree_bits() + quotient_degree_bits);
-    let lde_size = points.len();
+    let quotient_domain_bits = common_data.degree_bits() + quotient_degree_bits;
+    let lde_size = 1usize << quotient_domain_bits;
+    let (point_step, shifted_batch_starts) =
+        shifted_quotient_batch_starts::<F>(quotient_domain_bits, BATCH_SIZE);
 
     let z_h_on_coset = ZeroPolyOnCoset::new(common_data.degree_bits(), quotient_degree_bits);
 
@@ -719,8 +761,7 @@ fn compute_quotient_polys<
     let lut_re_poly_evals_refs: Vec<&[F]> =
         lut_re_poly_evals.iter().map(|v| v.as_slice()).collect();
 
-    let points_batches = points.par_chunks(BATCH_SIZE);
-    let num_batches = points.len().div_ceil(BATCH_SIZE);
+    let num_batches = shifted_batch_starts.len();
 
     struct QuotientScratch<F: RichField> {
         indices: Vec<usize>,
@@ -738,10 +779,10 @@ fn compute_quotient_polys<
     let zs_row_width = zs_partial_products_and_lookup_commitment.lde_row_width();
     let num_routed_wires = common_data.config.num_routed_wires;
 
-    let mut quotient_values = vec![F::ZERO; points.len() * num_challenges];
+    let mut quotient_values = vec![F::ZERO; lde_size * num_challenges];
     quotient_values
         .par_chunks_mut(BATCH_SIZE * num_challenges)
-        .zip(points_batches)
+        .zip(shifted_batch_starts.into_par_iter())
         .enumerate()
         .for_each_init(
             || QuotientScratch::<F> {
@@ -755,14 +796,13 @@ fn compute_quotient_polys<
                 zs_next_flat: Vec::new(),
                 vanishing: VanishingScratch::default(),
             },
-            |scratch, (batch_i, (quotient_values_batch, xs_batch))| {
+            |scratch, (batch_i, (quotient_values_batch, shifted_batch_start))| {
                 // Each batch must be the same size, except the last one, which may be smaller.
+                let n = quotient_values_batch.len() / num_challenges;
                 debug_assert!(
-                    xs_batch.len() == BATCH_SIZE
-                        || (batch_i == num_batches - 1 && xs_batch.len() <= BATCH_SIZE)
+                    n == BATCH_SIZE || (batch_i == num_batches - 1 && n <= BATCH_SIZE)
                 );
 
-                let n = xs_batch.len();
                 scratch.indices.clear();
                 scratch
                     .indices
@@ -772,10 +812,12 @@ fn compute_quotient_polys<
                     .indices_next
                     .extend(scratch.indices.iter().map(|&i| (i + next_step) % lde_size));
 
-                scratch.shifted_xs.clear();
-                scratch
-                    .shifted_xs
-                    .extend(xs_batch.iter().map(|&x| F::coset_shift() * x));
+                fill_shifted_quotient_batch(
+                    shifted_batch_start,
+                    point_step,
+                    n,
+                    &mut scratch.shifted_xs,
+                );
 
                 prover_data.constants_sigmas_commitment.fill_lde_batch(
                     &scratch.indices,
@@ -891,7 +933,7 @@ fn compute_quotient_polys<
             },
         );
 
-    debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
+    debug_assert_eq!(quotient_values.len(), lde_size * num_challenges);
     (0..num_challenges)
         .into_par_iter()
         .map(|challenge| {
@@ -904,4 +946,48 @@ fn compute_quotient_polys<
         })
         .map(|values| values.coset_ifft(F::coset_shift()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    type F = GoldilocksField;
+
+    fn assert_batched_shifted_domain_matches_reference(domain_bits: usize, batch_size: usize) {
+        let domain_size = 1usize << domain_bits;
+        let (point_step, batch_starts) =
+            shifted_quotient_batch_starts::<F>(domain_bits, batch_size);
+        assert_eq!(batch_starts.len(), domain_size.div_ceil(batch_size));
+
+        let mut actual = Vec::with_capacity(domain_size);
+        let mut batch = vec![F::NEG_ONE; batch_size + 3];
+        for (batch_index, &batch_start) in batch_starts.iter().enumerate() {
+            let offset = batch_index * batch_size;
+            let batch_len = batch_size.min(domain_size - offset);
+            fill_shifted_quotient_batch(batch_start, point_step, batch_len, &mut batch);
+            actual.extend_from_slice(&batch);
+        }
+
+        let expected = F::two_adic_subgroup(domain_bits)
+            .into_iter()
+            .map(|point| F::coset_shift() * point)
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn batched_shifted_quotient_points_match_small_and_partial_domains() {
+        for (domain_bits, batch_size) in [(0, 32), (3, 32), (4, 6), (6, 10)] {
+            assert_batched_shifted_domain_matches_reference(domain_bits, batch_size);
+        }
+    }
+
+    #[test]
+    fn batched_shifted_quotient_points_match_production_domains() {
+        for domain_bits in [17, 19, 21] {
+            assert_batched_shifted_domain_matches_reference(domain_bits, BATCH_SIZE);
+        }
+    }
 }

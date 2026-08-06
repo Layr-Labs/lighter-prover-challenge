@@ -151,6 +151,18 @@ pub trait Read {
         Ok(res)
     }
 
+    /// Reads `u32` values using the legacy `usize` vector encoding.
+    #[inline]
+    fn read_usize_encoded_u32_vec(&mut self) -> IoResult<Vec<u32>> {
+        let len = self.read_usize()?;
+        let mut res = Vec::with_capacity(len);
+        for _ in 0..len {
+            res.push(u32::try_from(self.read_usize()?).map_err(|_| IoError)?);
+        }
+
+        Ok(res)
+    }
+
     /// Reads a element from the field `F` with size less than `2^64` from `self.`
     #[inline]
     fn read_field<F>(&mut self) -> IoResult<F>
@@ -870,7 +882,7 @@ pub trait Read {
 
         let public_inputs = self.read_target_vec()?;
 
-        let representative_map = self.read_usize_vec()?;
+        let representative_map = self.read_usize_encoded_u32_vec()?;
 
         let is_some = self.read_bool()?;
         let fft_root_table = match is_some {
@@ -1257,6 +1269,17 @@ pub trait Write {
         self.write_usize(v.len())?;
         for &elem in v.iter() {
             self.write_usize(elem)?;
+        }
+
+        Ok(())
+    }
+
+    /// Writes `u32` values using the legacy `usize` vector encoding.
+    #[inline]
+    fn write_usize_encoded_u32_vec(&mut self, v: &[u32]) -> IoResult<()> {
+        self.write_usize(v.len())?;
+        for &elem in v {
+            self.write_usize(elem as usize)?;
         }
 
         Ok(())
@@ -1891,7 +1914,7 @@ pub trait Write {
         self.write_usize(subgroup.len())?;
         self.write_field_vec(subgroup)?;
         self.write_target_vec(public_inputs)?;
-        self.write_usize_vec(representative_map)?;
+        self.write_usize_encoded_u32_vec(representative_map)?;
 
         match fft_root_table {
             Some(table) => {
@@ -2245,5 +2268,37 @@ impl Read for Buffer<'_> {
         common_data: &CommonCircuitData<F, D>,
     ) -> IoResult<WitnessGeneratorRef<F, D>> {
         generator_serializer.read_generator(self, common_data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_indices_keep_legacy_usize_vector_encoding() {
+        let compact = [0, 1, u32::MAX];
+        let legacy = compact.iter().map(|&x| x as usize).collect::<Vec<_>>();
+        let mut expected = Vec::new();
+        expected.write_usize_vec(&legacy).unwrap();
+
+        let mut actual = Vec::new();
+        actual.write_usize_encoded_u32_vec(&compact).unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            Buffer::new(&expected).read_usize_encoded_u32_vec().unwrap(),
+            compact
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn compact_index_decoder_rejects_values_above_u32_max() {
+        let mut bytes = Vec::new();
+        bytes.write_usize(1).unwrap();
+        bytes.write_usize(u32::MAX as usize + 1).unwrap();
+
+        assert!(Buffer::new(&bytes).read_usize_encoded_u32_vec().is_err());
     }
 }

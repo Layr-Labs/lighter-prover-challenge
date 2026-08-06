@@ -381,7 +381,7 @@ pub struct ProverOnlyCircuitData<
     pub public_inputs: Vec<Target>,
     /// A map from each `Target`'s index to the index of its representative in the disjoint-set
     /// forest.
-    pub representative_map: Vec<usize>,
+    pub representative_map: Vec<u32>,
     /// Pre-computed roots for faster FFT.
     pub fft_root_table: Option<FftRootTable<F>>,
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to
@@ -701,4 +701,69 @@ pub struct VerifierCircuitTarget {
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to
     /// seed Fiat-Shamir.
     pub circuit_digest: HashOutTarget,
+}
+
+#[cfg(test)]
+mod tests {
+    use core::mem::{size_of, size_of_val};
+
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::iop::witness::WitnessWrite;
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+    use crate::util::serialization::{DefaultGateSerializer, DefaultGeneratorSerializer};
+
+    #[test]
+    fn prover_only_uses_four_byte_representative_indices() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type C = PoseidonGoldilocksConfig;
+
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let input = builder.add_virtual_target();
+        builder.register_public_input(input);
+        let circuit = builder.build::<C>();
+
+        assert_eq!(
+            size_of_val(circuit.prover_only.representative_map.as_slice()),
+            circuit.prover_only.representative_map.len() * size_of::<u32>()
+        );
+    }
+
+    #[test]
+    fn compact_representative_map_roundtrips_and_proves() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type C = PoseidonGoldilocksConfig;
+
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let input = builder.add_virtual_target();
+        let square = builder.square(input);
+        builder.register_public_input(square);
+        let circuit = builder.build::<C>();
+        let gate_serializer = DefaultGateSerializer;
+        let generator_serializer = DefaultGeneratorSerializer::<C, D>::default();
+        let encoded = circuit
+            .to_bytes(&gate_serializer, &generator_serializer)
+            .unwrap();
+
+        let decoded = CircuitData::<F, C, D>::from_bytes(
+            &encoded,
+            &gate_serializer,
+            &generator_serializer,
+        )
+        .unwrap();
+        assert_eq!(
+            decoded
+                .to_bytes(&gate_serializer, &generator_serializer)
+                .unwrap(),
+            encoded
+        );
+        let mut witness = PartialWitness::new();
+        witness.set_target(input, F::from_canonical_u64(7)).unwrap();
+        let proof = decoded.prove(witness).unwrap();
+        assert_eq!(proof.public_inputs, vec![F::from_canonical_u64(49)]);
+        decoded.verify(proof).unwrap();
+    }
 }

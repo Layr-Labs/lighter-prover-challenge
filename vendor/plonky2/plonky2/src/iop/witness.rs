@@ -332,13 +332,13 @@ impl<F: Field> Witness<F> for PartialWitness<F> {
 #[derive(Clone, Debug)]
 pub struct PartitionWitness<'a, F: Field> {
     pub values: Vec<Option<F>>,
-    pub representative_map: &'a [usize],
+    pub representative_map: &'a [u32],
     pub num_wires: usize,
     pub degree: usize,
 }
 
 impl<'a, F: Field> PartitionWitness<'a, F> {
-    pub fn new(num_wires: usize, degree: usize, representative_map: &'a [usize]) -> Self {
+    pub fn new(num_wires: usize, degree: usize, representative_map: &'a [u32]) -> Self {
         Self {
             values: vec![None; representative_map.len()],
             representative_map,
@@ -350,7 +350,7 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     /// Set a `Target`. On success, returns the representative index of the newly-set target. If the
     /// target was already set, returns `None`.
     pub fn set_target_returning_rep(&mut self, target: Target, value: F) -> Result<Option<usize>> {
-        let rep_index = self.representative_map[self.target_index(target)];
+        let rep_index = self.representative_map[self.target_index(target)] as usize;
         let rep_value = &mut self.values[rep_index];
         if let Some(old_value) = *rep_value {
             if value != old_value {
@@ -389,7 +389,7 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         for _ in 0..self.degree {
             for column in wire_values.iter_mut() {
                 column.push(
-                    self.values[self.representative_map[wire_index]].unwrap_or(F::ZERO),
+                    self.values[self.representative_map[wire_index] as usize].unwrap_or(F::ZERO),
                 );
                 wire_index += 1;
             }
@@ -407,7 +407,7 @@ impl<F: Field> WitnessWrite<F> for PartitionWitness<'_, F> {
 
 impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
     fn try_get_target(&self, target: Target) -> Option<F> {
-        let rep_index = self.representative_map[self.target_index(target)];
+        let rep_index = self.representative_map[self.target_index(target)] as usize;
         self.values[rep_index]
     }
 }
