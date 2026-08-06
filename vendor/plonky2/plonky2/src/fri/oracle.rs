@@ -247,41 +247,55 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let start = col_range.start;
         let w = col_range.len();
         out.clear();
-        out.resize(n * w, F::ZERO);
-        match &self.merkle_tree.leaves {
-            MerkleLeaves::Columns { columns, .. } => {
-                for (ci, c) in col_range.enumerate() {
-                    let column = columns.col(c);
-                    match layout {
-                        BatchLayout::PolyMajor => {
-                            let destination = &mut out[ci * n..(ci + 1) * n];
-                            for (k, &i) in indices.iter().enumerate() {
-                                destination[k] = column[i * step];
+        let output_len = n.checked_mul(w).expect("LDE batch output length overflow");
+        out.reserve(output_len);
+        {
+            let spare = &mut out.spare_capacity_mut()[..output_len];
+            match &self.merkle_tree.leaves {
+                MerkleLeaves::Columns { columns, .. } => {
+                    for (ci, c) in col_range.enumerate() {
+                        let column = columns.col(c);
+                        match layout {
+                            BatchLayout::PolyMajor => {
+                                let destination = &mut spare[ci * n..(ci + 1) * n];
+                                for (k, &i) in indices.iter().enumerate() {
+                                    destination[k].write(column[i * step]);
+                                }
+                            }
+                            BatchLayout::PointMajor => {
+                                for (k, &i) in indices.iter().enumerate() {
+                                    spare[k * w + ci].write(column[i * step]);
+                                }
                             }
                         }
-                        BatchLayout::PointMajor => {
-                            for (k, &i) in indices.iter().enumerate() {
-                                out[k * w + ci] = column[i * step];
+                    }
+                }
+                MerkleLeaves::Rows { .. } => {
+                    for (k, &i) in indices.iter().enumerate() {
+                        let row = &self.get_lde_values(i, step)[start..start + w];
+                        match layout {
+                            BatchLayout::PointMajor => {
+                                let destination = &mut spare[k * w..(k + 1) * w];
+                                for (destination, &value) in destination.iter_mut().zip(row) {
+                                    destination.write(value);
+                                }
+                            }
+                            BatchLayout::PolyMajor => {
+                                for (ci, &value) in row.iter().enumerate() {
+                                    spare[ci * n + k].write(value);
+                                }
                             }
                         }
                     }
                 }
             }
-            MerkleLeaves::Rows { .. } => {
-                for (k, &i) in indices.iter().enumerate() {
-                    let row = &self.get_lde_values(i, step)[start..start + w];
-                    match layout {
-                        BatchLayout::PointMajor => {
-                            out[k * w..(k + 1) * w].copy_from_slice(row);
-                        }
-                        BatchLayout::PolyMajor => {
-                            for (ci, &value) in row.iter().enumerate() {
-                                out[ci * n + k] = value;
-                            }
-                        }
-                    }
-                }
-            }
+        }
+
+        unsafe {
+            // SAFETY: Each match arm initializes every element of `spare`: either column-major
+            // `(ci * n + k)` or point-major `(k * w + ci)` indexes enumerate `0..output_len`
+            // exactly once. The zero-length cases initialize the empty range vacuously.
+            out.set_len(output_len);
         }
     }
 
@@ -399,10 +413,139 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::Sample;
+    use crate::field::types::{Field64, PrimeField64, Sample};
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    const TEST_D: usize = 2;
+    type TestF = GoldilocksField;
+    type TestC = Poseidon2GoldilocksConfig;
+
+    #[test]
+    fn batch_fill_matches_legacy_for_all_storage_and_layouts() {
+        let index_cases = [vec![], vec![1], vec![0, 1, 2, 3]];
+        let range_cases = [0..0, 1..3, 0..4];
+
+        for batch in test_batches() {
+            for layout in [BatchLayout::PointMajor, BatchLayout::PolyMajor] {
+                for indices in &index_cases {
+                    for col_range in &range_cases {
+                        let mut expected = Vec::with_capacity(128);
+                        expected.extend([field(900), field(901)]);
+                        legacy_fill_lde_batch(
+                            &batch,
+                            indices,
+                            2,
+                            col_range.clone(),
+                            layout,
+                            &mut expected,
+                        );
+
+                        let mut actual = Vec::with_capacity(128);
+                        actual.extend([field(800), field(801), field(802)]);
+                        let original_capacity = actual.capacity();
+                        batch.fill_lde_batch(
+                            indices,
+                            2,
+                            col_range.clone(),
+                            layout,
+                            &mut actual,
+                        );
+
+                        assert_eq!(actual.capacity(), original_capacity);
+                        assert_eq!(actual.len(), indices.len() * col_range.len());
+                        assert_eq!(actual, expected);
+                        assert_eq!(
+                            actual
+                                .iter()
+                                .map(|value| value.to_noncanonical_u64())
+                                .collect::<Vec<_>>(),
+                            expected
+                                .iter()
+                                .map(|value| value.to_noncanonical_u64())
+                                .collect::<Vec<_>>()
+                        );
+
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batch_fill_reallocates_from_insufficient_capacity() {
+        let indices = [0, 1, 2, 3];
+
+        for batch in test_batches() {
+            for layout in [BatchLayout::PointMajor, BatchLayout::PolyMajor] {
+                let mut expected = Vec::new();
+                legacy_fill_lde_batch(&batch, &indices, 2, 0..4, layout, &mut expected);
+
+                let mut actual = vec![field(600)];
+                actual.shrink_to_fit();
+                let original_capacity = actual.capacity();
+                batch.fill_lde_batch(&indices, 2, 0..4, layout, &mut actual);
+
+                assert!(actual.capacity() > original_capacity);
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn batch_fill_clears_output_before_length_overflow() {
+        let batch = test_batches().remove(0);
+        let mut output = vec![field(500), field(501)];
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            batch.fill_lde_batch(
+                &[0, 1],
+                1,
+                0..usize::MAX,
+                BatchLayout::PointMajor,
+                &mut output,
+            );
+        }));
+
+        assert!(result.is_err());
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn batch_fill_keeps_output_empty_after_partial_initialization_panic() {
+        let mut batches = test_batches().into_iter();
+        let columns = batches.next().unwrap();
+        let rows = batches.next().unwrap();
+
+        let mut column_output = vec![field(400)];
+        let column_result = catch_unwind(AssertUnwindSafe(|| {
+            columns.fill_lde_batch(
+                &[0, 8],
+                1,
+                0..2,
+                BatchLayout::PolyMajor,
+                &mut column_output,
+            );
+        }));
+        assert!(column_result.is_err());
+        assert!(column_output.is_empty());
+
+        let mut row_output = vec![field(300)];
+        let row_result = catch_unwind(AssertUnwindSafe(|| {
+            rows.fill_lde_batch(
+                &[0, usize::MAX],
+                2,
+                0..2,
+                BatchLayout::PointMajor,
+                &mut row_output,
+            );
+        }));
+        assert!(row_result.is_err());
+        assert!(row_output.is_empty());
+    }
 
     #[test]
     fn shared_coset_powers_match_per_polynomial_shifts() {
@@ -426,5 +569,92 @@ mod tests {
         let actual = PolynomialBatch::<F, C, D>::lde_values(&polynomials, RATE_BITS, false, None);
 
         assert_eq!(actual, expected);
+    }
+
+    fn test_batches() -> Vec<PolynomialBatch<TestF, TestC, TEST_D>> {
+        let columns = (0..4)
+            .map(|column| {
+                (0..8)
+                    .map(|row| GoldilocksField(TestF::ORDER + (column * 8 + row + 1) as u64))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let rows = (0..8)
+            .map(|leaf_index| {
+                let row = reverse_bits(leaf_index, 3);
+                columns.iter().map(|column| column[row]).collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        vec![
+            PolynomialBatch {
+                polynomials: Vec::new(),
+                merkle_tree: MerkleTree::new_columns(columns, 0),
+                degree_log: 3,
+                rate_bits: 0,
+                blinding: false,
+            },
+            PolynomialBatch {
+                polynomials: Vec::new(),
+                merkle_tree: MerkleTree::new(rows, 0),
+                degree_log: 3,
+                rate_bits: 0,
+                blinding: false,
+            },
+        ]
+    }
+
+    fn legacy_fill_lde_batch(
+        batch: &PolynomialBatch<TestF, TestC, TEST_D>,
+        indices: &[usize],
+        step: usize,
+        col_range: core::ops::Range<usize>,
+        layout: BatchLayout,
+        out: &mut Vec<TestF>,
+    ) {
+        let n = indices.len();
+        let start = col_range.start;
+        let width = col_range.len();
+        out.clear();
+        out.resize(n * width, TestF::ZERO);
+        match &batch.merkle_tree.leaves {
+            MerkleLeaves::Columns { columns, .. } => {
+                for (column_index, column) in col_range.enumerate() {
+                    let source = columns.col(column);
+                    match layout {
+                        BatchLayout::PolyMajor => {
+                            let destination = &mut out[column_index * n..(column_index + 1) * n];
+                            for (point, &index) in indices.iter().enumerate() {
+                                destination[point] = source[index * step];
+                            }
+                        }
+                        BatchLayout::PointMajor => {
+                            for (point, &index) in indices.iter().enumerate() {
+                                out[point * width + column_index] = source[index * step];
+                            }
+                        }
+                    }
+                }
+            }
+            MerkleLeaves::Rows { .. } => {
+                for (point, &index) in indices.iter().enumerate() {
+                    let row = &batch.get_lde_values(index, step)[start..start + width];
+                    match layout {
+                        BatchLayout::PointMajor => {
+                            out[point * width..(point + 1) * width].copy_from_slice(row);
+                        }
+                        BatchLayout::PolyMajor => {
+                            for (column, &value) in row.iter().enumerate() {
+                                out[column * n + point] = value;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn field(value: usize) -> GoldilocksField {
+        GoldilocksField::from_canonical_usize(value)
     }
 }
