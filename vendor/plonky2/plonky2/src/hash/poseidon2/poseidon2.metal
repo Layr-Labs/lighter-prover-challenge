@@ -171,10 +171,55 @@ inline ulong sum_state(thread const ulong state[12]) {
     return gl_add(sum, (ulong)carries * GOLDILOCKS_EPSILON);
 }
 
+// Fused `a * b + c` with a single Goldilocks reduction.
+//
+// `gl_add(c, gl_mul(a, b))` reduces twice: once to bring the 128-bit product
+// back into the field, then again after adding `c`. The reduction below already
+// accepts an arbitrary `(low, high)` pair, so folding `c` into the product
+// before reducing is exact and removes one entire reduction sequence per
+// operation. The internal linear layer runs 12 of these per round over 22
+// rounds, so this deletes 264 reduction sequences per permutation.
+//
+// `high` is at most `(2^32-1)^2 = 2^64 - 2^33 + 1`, so the carry out of
+// `low + c` cannot overflow it.
+inline ulong gl_mul_add(ulong a, ulong b, ulong c) {
+#if defined(POSEIDON2_NATIVE_ARITHMETIC_REFERENCE)
+    return gl_add(c, gl_mul(a, b));
+#else
+    ulong low = a * b;
+    ulong high = metal::mulhi(a, b);
+    ulong s = low + c;
+    high += (ulong)(s < low);
+    low = s;
+
+    uint l0 = (uint)low;
+    uint l1 = (uint)(low >> 32);
+    uint h0 = (uint)high;
+    uint h1 = (uint)(high >> 32);
+
+    uint r0 = l0 - h0;
+    uint borrow = (uint)(r0 > l0);
+    uint next = r0 - h1;
+    borrow += (uint)(next > r0);
+    r0 = next;
+
+    uint r1 = l1 + h0;
+    uint carry = (uint)(r1 < l1);
+    next = r1 - borrow;
+    uint under = (uint)(next > r1);
+    r1 = next;
+
+    int top = (int)carry - (int)under;
+    add_epsilon_u32(r0, r1, (uint)(top > 0));
+    sub_epsilon_u32(r0, r1, (uint)(top < 0));
+    return ((ulong)r1 << 32) | (ulong)r0;
+#endif
+}
+
 inline void internal_linear_layer(thread ulong state[12], constant ulong* diagonal) {
     ulong sum = sum_state(state);
     for (uint i = 0; i < 12; ++i) {
-        state[i] = gl_add(sum, gl_mul(state[i], diagonal[i]));
+        state[i] = gl_mul_add(state[i], diagonal[i], sum);
     }
 }
 

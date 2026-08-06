@@ -274,7 +274,83 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for UninterleaveTo
     }
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        self.eval_unfiltered_base_batch_packed(vars_base)
+        debug_assert_eq!(Self::B, 2);
+        let n = vars_base.len();
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        let four = F::from_canonical_usize(Self::B * Self::B);
+        let base32 = F::from_canonical_u64(1 << 32u64);
+        let u32_max = F::from_canonical_u32(u32::MAX);
+        let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
+        let mut chunks = res.chunks_exact_mut(n);
+        let mut output_high = vec![F::ZERO; n];
+        let mut output_low = vec![F::ZERO; n];
+
+        for i in 0..self.num_ops {
+            let bits = self.wires_ith_bit_decomposition(i);
+            let half = Self::NUM_BITS / 2;
+
+            // The first (big-endian) 32 bits combine to the high u32, the
+            // last 32 to the low u32 (base 2, Horner from the most
+            // significant bit).
+            output_high.copy_from_slice(col(bits.start));
+            for w in bits.start + 1..bits.start + half {
+                let bit = col(w);
+                for p in 0..n {
+                    output_high[p] = output_high[p].double() + bit[p];
+                }
+            }
+            output_low.copy_from_slice(col(bits.start + half));
+            for w in bits.start + half + 1..bits.end {
+                let bit = col(w);
+                for p in 0..n {
+                    output_low[p] = output_low[p].double() + bit[p];
+                }
+            }
+
+            // Check canonicity of combined_output = output_high * 2^32 + output_low
+            let inverse = col(self.wire_ith_inverse(i));
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                // Zero iff the high limb is not `u32::MAX` or the low limb is zero.
+                out[p] = (inverse[p] * (u32_max - output_high[p]) - F::ONE) * output_low[p];
+            }
+            let x_interleaved = col(self.wire_ith_x_interleaved(i));
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                out[p] = (output_high[p] * base32 + output_low[p]) - x_interleaved[p];
+            }
+
+            // Check 2: the even-index bits combine to x_evens, the odd-index
+            // bits to x_odds (base 4, Horner from the most significant bit).
+            for (first_bit, wire_target) in [
+                (bits.start, self.wire_ith_x_evens(i)),
+                (bits.start + 1, self.wire_ith_x_odds(i)),
+            ] {
+                let out = chunks.next().unwrap();
+                out.copy_from_slice(col(first_bit));
+                for j in 1..half {
+                    let bit = col(first_bit + 2 * j);
+                    for p in 0..n {
+                        out[p] = out[p] * four + bit[p];
+                    }
+                }
+                let target = col(wire_target);
+                for p in 0..n {
+                    out[p] -= target[p];
+                }
+            }
+
+            // Check 3: range check the bits: b(b-1).
+            for w in bits {
+                let bit = col(w);
+                let out = chunks.next().unwrap();
+                for p in 0..n {
+                    out[p] = bit[p] * (bit[p] - F::ONE);
+                }
+            }
+        }
+        res
     }
 
     fn generators(&self, row: usize, _local_constants: &[F]) -> Vec<WitnessGeneratorRef<F, D>> {
@@ -523,5 +599,19 @@ mod tests {
         type C = PoseidonGoldilocksConfig;
         type F = <C as GenericConfig<D>>::F;
         test_eval_fns::<F, C, _, D>(UninterleaveToB32Gate { num_ops: 2 })
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use crate::gate_batch_testing::assert_base_batch_matches_eval_unfiltered;
+
+    #[test]
+    fn base_batch_matches_eval_unfiltered_across_batch() {
+        for num_ops in [1, 2] {
+            let gate = UninterleaveToB32Gate { num_ops };
+            assert_base_batch_matches_eval_unfiltered(&gate);
+        }
     }
 }

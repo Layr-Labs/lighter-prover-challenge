@@ -129,7 +129,47 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for QuinticMultipl
     }
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        self.eval_unfiltered_base_batch_packed(vars_base)
+        let n = vars_base.len();
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        let const_3 = F::from_canonical_u64(3);
+        let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
+        let mut chunks = res.chunks_exact_mut(n);
+
+        for i in 0..self.num_ops {
+            let a: [&[F]; 5] =
+                core::array::from_fn(|j| col(self.wire_ith_multiplicand_jth_limb_0(i, j)));
+            let b: [&[F]; 5] =
+                core::array::from_fn(|j| col(self.wire_ith_multiplicand_jth_limb_1(i, j)));
+            let c: [&[F]; 5] = core::array::from_fn(|j| col(self.wire_ith_output_jth_limb(i, j)));
+            let rows: [&mut [F]; 5] = [
+                chunks.next().unwrap(),
+                chunks.next().unwrap(),
+                chunks.next().unwrap(),
+                chunks.next().unwrap(),
+                chunks.next().unwrap(),
+            ];
+
+            for p in 0..n {
+                let mut d = [F::ZERO; 9];
+                for j in 0..5 {
+                    for k in 0..5 {
+                        d[j + k] += a[j][p] * b[k][p];
+                    }
+                }
+
+                // Reduction u^5 = 3
+                for k in 0..5 {
+                    let term = if k + 5 <= 8 {
+                        d[k] + const_3 * d[k + 5]
+                    } else {
+                        d[k]
+                    };
+                    rows[k][p] = term - c[k][p];
+                }
+            }
+        }
+        res
     }
 
     fn eval_unfiltered_circuit(
@@ -409,5 +449,20 @@ mod tests {
         let gate =
             QuinticMultiplicationGate::new_from_config(&CircuitConfig::standard_recursion_config());
         test_eval_fns::<F, C, _, D>(gate)
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use crate::eddsa::gates::mul_quintic_ext_base::QuinticMultiplicationGate;
+    use crate::gate_batch_testing::assert_base_batch_matches_eval_unfiltered;
+    use crate::plonky2::plonk::circuit_data::CircuitConfig;
+
+    #[test]
+    fn base_batch_matches_eval_unfiltered_across_batch() {
+        let gate =
+            QuinticMultiplicationGate::new_from_config(&CircuitConfig::standard_recursion_config());
+        assert_base_batch_matches_eval_unfiltered(&gate);
+        assert_base_batch_matches_eval_unfiltered(&QuinticMultiplicationGate { num_ops: 1 });
     }
 }

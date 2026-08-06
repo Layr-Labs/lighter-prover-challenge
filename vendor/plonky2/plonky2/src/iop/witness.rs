@@ -369,6 +369,31 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         }
     }
 
+    /// Compare-and-set the value slot `slot`, which must be `target`'s representative slot
+    /// (`target` is only used for error reporting). Preserves the exact write-once semantics
+    /// of [`Self::set_target_returning_rep`]: an empty slot is filled, an equal value is a
+    /// no-op, and a conflicting value is an error with the same message. Used by
+    /// recorded-schedule replays, which resolve representative slots ahead of time; see
+    /// [`crate::iop::topo_schedule`].
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(crate) fn set_slot_checked(&mut self, slot: usize, target: Target, value: F) -> Result<()> {
+        let rep_value = &mut self.values[slot];
+        if let Some(old_value) = *rep_value {
+            if value != old_value {
+                return Err(anyhow!(
+                    "Partition containing {:?} was set twice with different values: {} != {}",
+                    target,
+                    old_value,
+                    value
+                ));
+            }
+        } else {
+            *rep_value = Some(value);
+        }
+        Ok(())
+    }
+
     pub(crate) fn target_index(&self, target: Target) -> usize {
         target.index(self.num_wires, self.degree)
     }

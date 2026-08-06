@@ -39,6 +39,49 @@ mod vendored_gate_tests {
             assert_base_batch_matches_eval_unfiltered(&gate);
         }
     }
+
+    #[test]
+    fn exponentiation_base_batch_matches_eval_unfiltered_across_batch() {
+        use plonky2::gates::exponentiation::ExponentiationGate;
+
+        for num_power_bits in [1, 5, 17, 54] {
+            let gate = ExponentiationGate::<GoldilocksField, 2>::new(num_power_bits);
+            assert_base_batch_matches_eval_unfiltered(&gate);
+        }
+    }
+
+    #[test]
+    fn base_sum_base_batch_matches_eval_unfiltered_across_batch() {
+        use plonky2::gates::base_sum::BaseSumGate;
+
+        // Covers the factored base-4 and base-2 range products plus the
+        // generic product path (base 6).
+        assert_base_batch_matches_eval_unfiltered(&BaseSumGate::<2>::new(63));
+        assert_base_batch_matches_eval_unfiltered(&BaseSumGate::<2>::new(1));
+        assert_base_batch_matches_eval_unfiltered(&BaseSumGate::<4>::new(16));
+        assert_base_batch_matches_eval_unfiltered(&BaseSumGate::<6>::new(11));
+    }
+
+    #[test]
+    fn equality_base_batch_matches_eval_unfiltered_across_batch() {
+        use plonky2::gates::equality_base::EqualityGate;
+        use plonky2::plonk::circuit_data::CircuitConfig;
+
+        let gate = EqualityGate::new_from_config(&CircuitConfig::standard_recursion_config());
+        assert_base_batch_matches_eval_unfiltered(&gate);
+        assert_base_batch_matches_eval_unfiltered(&EqualityGate { num_ops: 1 });
+    }
+
+    #[test]
+    fn mul_extension_base_batch_matches_eval_unfiltered_across_batch() {
+        use plonky2::gates::multiplication_extension::MulExtensionGate;
+        use plonky2::plonk::circuit_data::CircuitConfig;
+
+        let gate =
+            MulExtensionGate::<2>::new_from_config(&CircuitConfig::standard_recursion_config());
+        assert_base_batch_matches_eval_unfiltered(&gate);
+        assert_base_batch_matches_eval_unfiltered(&MulExtensionGate::<2> { num_ops: 1 });
+    }
 }
 
 pub fn assert_base_batch_matches_eval_unfiltered<G>(gate: &G)
