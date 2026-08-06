@@ -183,22 +183,21 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         num_selectors: usize,
         num_lookup_selectors: usize,
         combined_gate_constraints: &mut [F],
+        filters: &mut Vec<F>,
     ) {
         let batch_size = vars_batch.len();
         debug_assert!(self.num_constraints() * batch_size <= combined_gate_constraints.len());
-        let filters: Vec<_> = vars_batch
-            .iter()
-            .map(|vars| {
-                compute_filter(
-                    row,
-                    group_range.clone(),
-                    vars.local_constants[selector_index],
-                    num_selectors > 1,
-                )
-            })
-            .collect();
+        filters.clear();
+        filters.extend(vars_batch.iter().map(|vars| {
+            compute_filter(
+                row,
+                group_range.clone(),
+                vars.local_constants[selector_index],
+                num_selectors > 1,
+            )
+        }));
         vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
-        self.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, combined_gate_constraints);
+        self.eval_unfiltered_base_batch_accumulate(vars_batch, filters, combined_gate_constraints);
     }
 
     /// Adds this gate's filtered constraints into the `combined_gate_constraints` buffer.

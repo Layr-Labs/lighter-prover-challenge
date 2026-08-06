@@ -174,6 +174,7 @@ pub(crate) struct VanishingScratch<F> {
     pub vanishing_all_lookup_terms: Vec<F>,
     pub lookup_selectors: Vec<F>,
     pub constraint_terms_batch: Vec<F>,
+    pub gate_filters: Vec<F>,
 }
 
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
@@ -228,6 +229,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         common_data,
         vars_batch,
         &mut scratch.constraint_terms_batch,
+        &mut scratch.gate_filters,
     );
     let constraint_terms_batch = &scratch.constraint_terms_batch;
     debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
@@ -731,7 +733,13 @@ pub fn evaluate_gate_constraints_base_batch<F: RichField + Extendable<D>, const 
     vars_batch: EvaluationVarsBaseBatch<F>,
 ) -> Vec<F> {
     let mut constraints_batch = Vec::new();
-    evaluate_gate_constraints_base_batch_into::<F, D>(common_data, vars_batch, &mut constraints_batch);
+    let mut gate_filters = Vec::new();
+    evaluate_gate_constraints_base_batch_into::<F, D>(
+        common_data,
+        vars_batch,
+        &mut constraints_batch,
+        &mut gate_filters,
+    );
     constraints_batch
 }
 
@@ -740,6 +748,7 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
     common_data: &CommonCircuitData<F, D>,
     vars_batch: EvaluationVarsBaseBatch<F>,
     constraints_batch: &mut Vec<F>,
+    gate_filters: &mut Vec<F>,
 ) {
     constraints_batch.clear();
     constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
@@ -753,6 +762,7 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
             common_data.selectors_info.num_selectors(),
             common_data.num_lookup_selectors,
             constraints_batch,
+            gate_filters,
         );
     }
 }
