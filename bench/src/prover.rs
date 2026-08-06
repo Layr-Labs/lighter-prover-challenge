@@ -333,11 +333,6 @@ fn prove_path(
                 .expect("chain step pipeline thread must start");
             chain = Some(ChainState::InFlight(handle));
         }
-        // Past this point the pipeline spawns no new chunk work: the drain
-        // below is the strictly sequential chain tail, so its mid-size
-        // commitment trees can use the mostly idle GPU exactly like the
-        // pre-execution and final block phases.
-        plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
         while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
             let tx_proof = proof_handle
                 .join()
@@ -354,11 +349,9 @@ fn prove_path(
                 &tx_proof,
             )));
         }
-        let chain_proof = chain
+        chain
             .map(ChainState::wait)
-            .expect("transaction path must produce a chain proof");
-        plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
-        chain_proof
+            .expect("transaction path must produce a chain proof")
     })
 }
 
@@ -533,10 +526,15 @@ mod tests {
         use circuit::types::constants::TX_TYPE_EMPTY;
         use plonky2::field::types::{Field, PrimeField64};
 
-        use crate::api::{LIGHT_TX_MODE, PathCircuits};
+        use crate::api::{LIGHT_TX_MODE, PathCircuits, cache_bytes, load_cached};
 
         let build_start = Instant::now();
-        let circuits = PathCircuits::new(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE);
+        let circuits = PathCircuits::new(
+            LIGHT_TX_PER_PROOF,
+            LIGHT_TX_MODE,
+            load_cached("light_tx", c"__lc_light_tx", &cache_bytes::LIGHT_TX),
+            load_cached("light_chain", c"__lc_light_ch", &cache_bytes::LIGHT_CHAIN),
+        );
         println!("light path circuits built in {:?}", build_start.elapsed());
 
         let block = Block::<F>::from_json_with_empty_txs(

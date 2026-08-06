@@ -53,3 +53,12 @@ incremental = false
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+# bench/build.rs constructs every prover circuit at compile time; without an
+# optimized build-override that generation runs unoptimized and dominates the
+# build.
+[profile.release.build-override]
+opt-level = 3
+
+[profile.dev.build-override]
+opt-level = 3
