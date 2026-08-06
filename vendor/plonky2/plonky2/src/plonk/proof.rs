@@ -12,6 +12,8 @@ use plonky2_maybe_rayon::*;
 use serde::{Deserialize, Serialize};
 
 use crate::field::extension::Extendable;
+use crate::field::polynomial::PolynomialCoeffs;
+use crate::field::types::Field;
 use crate::fri::oracle::PolynomialBatch;
 use crate::fri::proof::{
     CompressedFriProof, FriChallenges, FriChallengesTarget, FriProof, FriProofTarget,
@@ -310,6 +312,20 @@ pub struct OpeningSet<F: RichField + Extendable<D>, const D: usize> {
     pub lookup_zs_next: Vec<F::Extension>,
 }
 
+#[inline]
+fn eval_base_poly_at_extension<F: RichField + Extendable<D>, const D: usize>(
+    polynomial: &PolynomialCoeffs<F>,
+    point: F::Extension,
+) -> F::Extension {
+    polynomial
+        .coeffs
+        .iter()
+        .rev()
+        .fold(F::Extension::ZERO, |acc, &coefficient| {
+            acc * point + coefficient.into()
+        })
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
     pub fn new<C: GenericConfig<D, F = F>>(
         zeta: F::Extension,
@@ -323,7 +339,7 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         let eval_commitment = |z: F::Extension, c: &PolynomialBatch<F, C, D>| {
             c.polynomials
                 .par_iter()
-                .map(|p| p.to_extension().eval(z))
+                .map(|p| eval_base_poly_at_extension(p, z))
                 .collect::<Vec<_>>()
         };
         let constants_sigmas_eval = eval_commitment(zeta, constants_sigmas_commitment);
@@ -462,6 +478,8 @@ mod tests {
     use plonky2_field::types::Sample;
 
     use super::*;
+    use crate::field::extension::FieldExtension;
+    use crate::field::goldilocks_field::GoldilocksField;
     use crate::fri::reduction_strategies::FriReductionStrategy;
     use crate::gates::lookup_table::LookupTable;
     use crate::gates::noop::NoopGate;
@@ -470,6 +488,56 @@ mod tests {
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::PoseidonGoldilocksConfig;
     use crate::plonk::verifier::verify;
+
+    fn check_base_poly_evaluation<const D: usize>()
+    where
+        GoldilocksField: Extendable<D>,
+    {
+        type F = GoldilocksField;
+
+        let extension_point =
+            <F as Extendable<D>>::Extension::from_basefield_array(core::array::from_fn(|i| {
+                F::from_canonical_usize(i + 2)
+            }));
+        let points = [
+            <F as Extendable<D>>::Extension::ZERO,
+            <F as Extendable<D>>::Extension::ONE,
+            F::from_canonical_usize(7).into(),
+            extension_point,
+        ];
+
+        for len in [0, 1, 2, 17, 256, 16_384] {
+            let dense = PolynomialCoeffs::new(
+                (0..len)
+                    .map(|i| F::from_canonical_usize(i * i + 3 * i + 1))
+                    .collect(),
+            );
+            let zero = PolynomialCoeffs::zero(len);
+            let mut sparse = PolynomialCoeffs::zero(len);
+            if len > 0 {
+                sparse.coeffs[0] = F::ONE;
+                sparse.coeffs[len / 2] = F::from_canonical_usize(11);
+                sparse.coeffs[len - 1] = F::from_canonical_usize(19);
+            }
+
+            for polynomial in [&dense, &zero, &sparse] {
+                for point in points {
+                    assert_eq!(
+                        eval_base_poly_at_extension::<F, D>(polynomial, point),
+                        polynomial.to_extension::<D>().eval(point)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn base_polynomial_evaluation_matches_extension_materialization() {
+        check_base_poly_evaluation::<1>();
+        check_base_poly_evaluation::<2>();
+        check_base_poly_evaluation::<4>();
+        check_base_poly_evaluation::<5>();
+    }
 
     #[test]
     fn test_proof_compression() -> Result<()> {
