@@ -714,6 +714,22 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
     type Hash = HashOut<F>;
     type Permutation = Poseidon2Permutation<F>;
 
+    fn hash_or_noop(input: &[F]) -> Self::Hash {
+        if input.len() * 8 <= <Self as Hasher<F>>::HASH_SIZE {
+            // The generic implementation round-trips short inputs through a
+            // 32-byte buffer and parses it back into four field elements.
+            // Poseidon2 already returns HashOut<F>, so construct the same
+            // canonical elements directly and avoid the temporary buffer.
+            let mut elements = [F::ZERO; NUM_HASH_OUT_ELTS];
+            for (dst, &value) in elements.iter_mut().zip(input) {
+                *dst = F::from_canonical_u64(value.to_canonical_u64());
+            }
+            HashOut { elements }
+        } else {
+            Self::hash_no_pad(input)
+        }
+    }
+
     fn hash_no_pad(input: &[F]) -> Self::Hash {
         hash_n_to_hash_no_pad::<F, Self::Permutation>(input)
     }
