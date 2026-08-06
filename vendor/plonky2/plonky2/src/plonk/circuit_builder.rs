@@ -8,7 +8,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use hashbrown::{HashMap, HashSet};
 use itertools::Itertools;
-use log::{debug, info, warn, Level};
+use log::{Level, debug, info, warn};
 #[cfg(feature = "timing")]
 use web_time::Instant;
 
@@ -651,11 +651,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
 
     /// Returns a routable target with the given constant boolean value.
     pub fn constant_bool(&mut self, b: bool) -> BoolTarget {
-        if b {
-            self._true()
-        } else {
-            self._false()
-        }
+        if b { self._true() } else { self._false() }
     }
 
     /// Returns a routable [`HashOutTarget`].
@@ -1263,12 +1259,26 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
                 .collect(),
         );
 
-        // Index generator indices by their watched targets.
+        // Index generator indices by their watched targets, and record each generator's number
+        // of distinct watched representatives so witness initialization can start from these
+        // counts instead of rescanning the whole watcher index per proof. Deduplicating each
+        // generator's representatives here also inserts it at most once per watcher list,
+        // reproducing the previous per-list `dedup` without a second traversal.
         let mut generator_indices_by_watches = BTreeMap::new();
+        let mut generator_watch_counts = Vec::with_capacity(self.generators.len());
+        let mut watch_rep_indices = Vec::new();
         for (i, generator) in self.generators.iter().enumerate() {
+            watch_rep_indices.clear();
             for watch in generator.0.watch_list() {
                 let watch_index = forest.target_index(watch);
-                let watch_rep_index = forest.parents[watch_index];
+                // Zero-extend the compact `u32` parent to the map's `usize` key
+                // space; the watcher map's shape and serialization are unchanged.
+                watch_rep_indices.push(forest.parents[watch_index] as usize);
+            }
+            watch_rep_indices.sort_unstable();
+            watch_rep_indices.dedup();
+            generator_watch_counts.push(watch_rep_indices.len());
+            for &watch_rep_index in &watch_rep_indices {
                 generator_indices_by_watches
                     .entry(watch_rep_index)
                     .or_insert_with(Vec::new)
@@ -1276,7 +1286,6 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             }
         }
         for indices in generator_indices_by_watches.values_mut() {
-            indices.dedup();
             indices.shrink_to_fit();
         }
 
@@ -1330,7 +1339,9 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
 
         if let Some(goal_data) = self.goal_common_data {
             if goal_data != common {
-                warn!("The expected circuit data passed to cyclic recursion method did not match the actual circuit");
+                warn!(
+                    "The expected circuit data passed to cyclic recursion method did not match the actual circuit"
+                );
                 success = false;
             }
         }
@@ -1338,6 +1349,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,
             generator_indices_by_watches,
+            generator_watch_counts,
             constants_sigmas_commitment,
             sigmas: transpose_poly_values(sigma_vecs),
             subgroup,

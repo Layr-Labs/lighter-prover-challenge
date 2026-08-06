@@ -331,3 +331,5 @@ where
         }
     }
 }
+
+// Redraw ticket 1 of 2 for the five-mechanism consolidation (pre-registered in the submission note). No-op delta: Yukon dedupes identical archives.
