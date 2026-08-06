@@ -225,7 +225,12 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
 
         // Rayon task creation dominates the tiny subtrees near the leaves. Keep
         // enough parallelism at the upper levels, then recurse synchronously.
-        let (left_digest, right_digest) = if num_leaves > 16 {
+        //
+        // The right cutoff tracks core count: the more workers there are, the
+        // deeper it pays to keep splitting before the join overhead outweighs
+        // the parallelism. 64 -> 32 and 32 -> 16 each measured as ranked gains
+        // on this host, so the optimum had not yet been bracketed from below.
+        let (left_digest, right_digest) = if num_leaves > 8 {
             plonky2_maybe_rayon::join(
                 || fill_subtree_flat::<F, H>(left_digests_buf, left_leaves, leaf_width, half),
                 || fill_subtree_flat::<F, H>(right_digests_buf, right_leaves, leaf_width, half),
