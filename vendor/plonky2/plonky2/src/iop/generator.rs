@@ -33,39 +33,25 @@ pub fn generate_partial_witness<
     prover_data: &'a ProverOnlyCircuitData<F, C, D>,
     common_data: &'a CommonCircuitData<F, D>,
 ) -> Result<PartitionWitness<'a, F>> {
-    let config = &common_data.config;
+    PendingPartitionWitness::start(inputs, prover_data, common_data)?.finish()
+}
+
+/// Runs the given pending generators, and transitively any generator watching a newly populated
+/// representative, until no further progress can be made.
+fn run_generator_worklist<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &mut PartitionWitness<F>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    unresolved_watches: &mut [usize],
+    generator_is_expired: &mut [bool],
+    remaining_generators: &mut usize,
+    mut pending_generator_indices: Vec<usize>,
+) -> Result<()> {
     let generators = &prover_data.generators;
     let generator_indices_by_watches = &prover_data.generator_indices_by_watches;
-
-    let mut witness = PartitionWitness::new(
-        config.num_wires,
-        common_data.degree(),
-        &prover_data.representative_map,
-    );
-
-    for (t, v) in inputs.target_values.into_iter() {
-        witness.set_target(t, v)?;
-    }
-
-    // A simple generator can run once all of the distinct representatives it watches have values.
-    // Derive those unresolved counts from the existing watcher index so this remains local witness
-    // state and does not add anything to serialized prover data.
-    let mut unresolved_watches = vec![0usize; generators.len()];
-    for (&watch, watchers) in generator_indices_by_watches {
-        if witness.values[watch].is_none() {
-            for &generator_idx in watchers {
-                unresolved_watches[generator_idx] += 1;
-            }
-        }
-    }
-
-    // Build a list of "pending" generators which are queued to be run. Initially, all generators
-    // are queued.
-    let mut pending_generator_indices: Vec<_> = (0..generators.len()).collect();
-
-    // We also track a list of "expired" generators which have already returned false.
-    let mut generator_is_expired = vec![false; generators.len()];
-    let mut remaining_generators = generators.len();
 
     let mut buffer = GeneratedValues::empty();
 
@@ -79,13 +65,13 @@ pub fn generate_partial_witness<
             }
 
             let finished = generators[generator_idx].0.run_with_ready_hint(
-                &witness,
+                witness,
                 &mut buffer,
                 unresolved_watches[generator_idx] == 0,
             );
             if finished {
                 generator_is_expired[generator_idx] = true;
-                remaining_generators -= 1;
+                *remaining_generators -= 1;
             }
 
             // Merge any generated values into our witness, and get a list of newly-populated
@@ -114,11 +100,139 @@ pub fn generate_partial_witness<
         pending_generator_indices = next_pending_generator_indices;
     }
 
-    if remaining_generators != 0 {
-        return Err(anyhow!("{} generators weren't run", remaining_generators));
+    Ok(())
+}
+
+/// Resumable witness generation: [`Self::start`] seeds an initial set of inputs and runs every
+/// generator that can already make progress, each [`Self::feed`] sets newly available inputs and
+/// resumes only the generators watching them, and [`Self::finish`] performs the same completeness
+/// check as [`generate_partial_witness`].
+///
+/// Generators are deterministic functions of their watched values, so splitting the same inputs
+/// across `start`/`feed` calls in any order yields a witness identical to the single-shot path.
+pub struct PendingPartitionWitness<
+    'a,
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> {
+    witness: PartitionWitness<'a, F>,
+    unresolved_watches: Vec<usize>,
+    generator_is_expired: Vec<bool>,
+    remaining_generators: usize,
+    prover_data: &'a ProverOnlyCircuitData<F, C, D>,
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Debug
+    for PendingPartitionWitness<'_, F, C, D>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PendingPartitionWitness")
+            .field("remaining_generators", &self.remaining_generators)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    PendingPartitionWitness<'a, F, C, D>
+{
+    /// Seeds `inputs` and runs generators to quiescence. Unlike [`generate_partial_witness`],
+    /// generators whose watched values are still missing are left pending rather than being an
+    /// error.
+    pub fn start(
+        inputs: PartialWitness<F>,
+        prover_data: &'a ProverOnlyCircuitData<F, C, D>,
+        common_data: &CommonCircuitData<F, D>,
+    ) -> Result<Self> {
+        let generators = &prover_data.generators;
+        let generator_indices_by_watches = &prover_data.generator_indices_by_watches;
+
+        let mut witness = PartitionWitness::new(
+            common_data.config.num_wires,
+            common_data.degree(),
+            &prover_data.representative_map,
+        );
+
+        for (t, v) in inputs.target_values.into_iter() {
+            witness.set_target(t, v)?;
+        }
+
+        // A simple generator can run once all of the distinct representatives it watches have
+        // values. Derive those unresolved counts from the existing watcher index so this remains
+        // local witness state and does not add anything to serialized prover data.
+        let mut unresolved_watches = vec![0usize; generators.len()];
+        for (&watch, watchers) in generator_indices_by_watches {
+            if witness.values[watch].is_none() {
+                for &generator_idx in watchers {
+                    unresolved_watches[generator_idx] += 1;
+                }
+            }
+        }
+
+        let mut generator_is_expired = vec![false; generators.len()];
+        let mut remaining_generators = generators.len();
+
+        // Initially, all generators are queued.
+        run_generator_worklist(
+            &mut witness,
+            prover_data,
+            &mut unresolved_watches,
+            &mut generator_is_expired,
+            &mut remaining_generators,
+            (0..generators.len()).collect(),
+        )?;
+
+        Ok(Self {
+            witness,
+            unresolved_watches,
+            generator_is_expired,
+            remaining_generators,
+            prover_data,
+        })
     }
 
-    Ok(witness)
+    /// Sets newly available inputs and resumes witness generation. Only the unfinished watchers of
+    /// newly populated representatives are queued; every other unfinished generator was already
+    /// run to quiescence and cannot make progress without new values.
+    pub fn feed(&mut self, inputs: PartialWitness<F>) -> Result<()> {
+        let generator_indices_by_watches = &self.prover_data.generator_indices_by_watches;
+
+        let mut pending_generator_indices = Vec::new();
+        for (t, v) in inputs.target_values.into_iter() {
+            if let Some(watch) = self.witness.set_target_returning_rep(t, v)? {
+                if let Some(watchers) = generator_indices_by_watches.get(&watch) {
+                    for &watching_generator_idx in watchers {
+                        if !self.generator_is_expired[watching_generator_idx] {
+                            debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
+                            self.unresolved_watches[watching_generator_idx] -= 1;
+                            pending_generator_indices.push(watching_generator_idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        run_generator_worklist(
+            &mut self.witness,
+            self.prover_data,
+            &mut self.unresolved_watches,
+            &mut self.generator_is_expired,
+            &mut self.remaining_generators,
+            pending_generator_indices,
+        )
+    }
+
+    /// Returns the fully populated witness, or an error if some generators still couldn't run.
+    pub fn finish(self) -> Result<PartitionWitness<'a, F>> {
+        if self.remaining_generators != 0 {
+            return Err(anyhow!(
+                "{} generators weren't run",
+                self.remaining_generators
+            ));
+        }
+
+        Ok(self.witness)
+    }
 }
 
 /// A generator participates in the generation of the witness.
@@ -491,6 +605,7 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::gates::noop::NoopGate;
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::PoseidonGoldilocksConfig;
@@ -629,6 +744,150 @@ mod tests {
             dependency_calls.load(Ordering::Relaxed),
             dependency_calls_after_build
         );
+    }
+
+    #[test]
+    fn pending_partition_witness_matches_single_shot_for_recursive_circuit() -> Result<()> {
+        let config = CircuitConfig::standard_recursion_config();
+
+        // Inner circuit: expose x^2 as a public input.
+        let mut builder = CircuitBuilder::<F, D>::new(config.clone());
+        let x = builder.add_virtual_target();
+        let x_squared = builder.mul(x, x);
+        builder.register_public_input(x_squared);
+        for _ in 0..1_000 {
+            builder.add_gate(NoopGate, vec![]);
+        }
+        let inner = builder.build::<C>();
+
+        let mut inputs = PartialWitness::new();
+        inputs.set_target(x, F::from_canonical_u64(3))?;
+        let inner_proof_a = inner.prove(inputs)?;
+        let mut inputs = PartialWitness::new();
+        inputs.set_target(x, F::from_canonical_u64(5))?;
+        let inner_proof_b = inner.prove(inputs)?;
+
+        // Outer circuit: verify two independent inner proofs, mirroring a chain step's
+        // tx-proof/cyclic-proof pair.
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let proof_target_a = builder.add_virtual_proof_with_pis(&inner.common);
+        let proof_target_b = builder.add_virtual_proof_with_pis(&inner.common);
+        let verifier_data = builder.constant_verifier_data(&inner.verifier_only);
+        builder.verify_proof::<C>(&proof_target_a, &verifier_data, &inner.common);
+        builder.verify_proof::<C>(&proof_target_b, &verifier_data, &inner.common);
+        builder.register_public_inputs(&proof_target_a.public_inputs);
+        builder.register_public_inputs(&proof_target_b.public_inputs);
+        let outer = builder.build::<C>();
+
+        let mut single_shot_inputs = PartialWitness::new();
+        single_shot_inputs.set_proof_with_pis_target(&proof_target_a, &inner_proof_a)?;
+        single_shot_inputs.set_proof_with_pis_target(&proof_target_b, &inner_proof_b)?;
+        let single_shot = generate_partial_witness(
+            single_shot_inputs.clone(),
+            &outer.prover_only,
+            &outer.common,
+        )?;
+        // Every witness position is deterministic except the outputs of the circuit's
+        // `RandomValueGenerator`s (unused public-input-gate wires): a second single-shot run
+        // isolates exactly those positions.
+        let single_shot_repeat =
+            generate_partial_witness(single_shot_inputs, &outer.prover_only, &outer.common)?;
+        let num_random_generators = outer
+            .prover_only
+            .generators
+            .iter()
+            .filter(|generator| generator.0.id() == "RandomValueGenerator")
+            .count();
+
+        let mut early_inputs = PartialWitness::new();
+        early_inputs.set_proof_with_pis_target(&proof_target_a, &inner_proof_a)?;
+        let mut pending =
+            PendingPartitionWitness::start(early_inputs, &outer.prover_only, &outer.common)?;
+        // A feed with no new targets must be a no-op.
+        pending.feed(PartialWitness::new())?;
+        let mut late_inputs = PartialWitness::new();
+        late_inputs.set_proof_with_pis_target(&proof_target_b, &inner_proof_b)?;
+        pending.feed(late_inputs)?;
+        let two_phase = pending.finish()?;
+
+        let mut nondeterministic_positions = 0usize;
+        for ((single, repeat), split) in single_shot
+            .values
+            .iter()
+            .zip(&single_shot_repeat.values)
+            .zip(&two_phase.values)
+        {
+            if single == repeat {
+                assert_eq!(single, split);
+            } else {
+                nondeterministic_positions += 1;
+            }
+        }
+        assert!(
+            nondeterministic_positions <= num_random_generators,
+            "{nondeterministic_positions} nondeterministic positions exceed the {num_random_generators} random generators"
+        );
+
+        let single_shot_proof = crate::plonk::prover::prove_with_partition_witness(
+            &outer.prover_only,
+            &outer.common,
+            single_shot,
+            &mut crate::util::timing::TimingTree::default(),
+        )?;
+        let two_phase_proof = crate::plonk::prover::prove_with_partition_witness(
+            &outer.prover_only,
+            &outer.common,
+            two_phase,
+            &mut crate::util::timing::TimingTree::default(),
+        )?;
+        outer.verify(single_shot_proof)?;
+        outer.verify(two_phase_proof)
+    }
+
+    #[test]
+    fn pending_partition_witness_finish_and_feed_errors() -> Result<()> {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let a = builder.add_virtual_target();
+        let b = builder.add_virtual_target();
+        let product = builder.mul(a, b);
+        builder.register_public_input(product);
+        let circuit = builder.build::<C>();
+
+        let mut early_inputs = PartialWitness::new();
+        early_inputs.set_target(a, F::from_canonical_u64(3))?;
+
+        // Finishing before all inputs are fed reports the unrun generators.
+        let pending = PendingPartitionWitness::start(
+            early_inputs.clone(),
+            &circuit.prover_only,
+            &circuit.common,
+        )?;
+        let error = pending.finish().unwrap_err();
+        assert!(
+            error.to_string().contains("generators weren't run"),
+            "unexpected finish error: {error:?}"
+        );
+
+        // Feeding a value contradicting an already-set target fails.
+        let mut pending = PendingPartitionWitness::start(
+            early_inputs.clone(),
+            &circuit.prover_only,
+            &circuit.common,
+        )?;
+        let mut contradictory_inputs = PartialWitness::new();
+        contradictory_inputs.set_target(a, F::from_canonical_u64(4))?;
+        assert!(pending.feed(contradictory_inputs).is_err());
+
+        // Feeding the missing input completes witness generation.
+        let mut pending =
+            PendingPartitionWitness::start(early_inputs, &circuit.prover_only, &circuit.common)?;
+        let mut late_inputs = PartialWitness::new();
+        late_inputs.set_target(b, F::from_canonical_u64(5))?;
+        pending.feed(late_inputs)?;
+        let witness = pending.finish()?;
+        assert_eq!(witness.get_target(product), F::from_canonical_u64(15));
+
+        Ok(())
     }
 
     #[test]
