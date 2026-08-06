@@ -7,7 +7,7 @@ use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::batch_multiply_inplace;
 use crate::field::extension::Extendable;
-use crate::field::fft::FftRootTable;
+use crate::field::fft::{fft_in_place_with_options, FftRootTable};
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
@@ -15,7 +15,7 @@ use crate::fri::proof::FriProof;
 use crate::fri::prover::fri_proof;
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
 use crate::hash::hash_types::RichField;
-use crate::hash::merkle_tree::{MerkleLeaves, MerkleTree};
+use crate::hash::merkle_tree::{ColumnStore, MerkleLeaves, MerkleTree};
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::{GenericConfig, Hasher};
 use crate::timed;
@@ -159,6 +159,40 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             }
         }
 
+        let lde_len = degree << rate_bits;
+        let salt_size = if blinding { SALT_SIZE } else { 0 };
+        if let Some(mut columns) = C::Hasher::try_allocate_merkle_tree_columns(
+            polynomials.len() + salt_size,
+            lde_len,
+            cap_height,
+        ) {
+            let initialized = timed!(
+                timing,
+                "FFT + blinding",
+                Self::fill_lde_column_store(
+                    &mut columns,
+                    &polynomials,
+                    rate_bits,
+                    blinding,
+                    fft_root_table,
+                )
+            );
+            if initialized {
+                let merkle_tree = timed!(
+                    timing,
+                    "build Merkle tree",
+                    MerkleTree::new_column_store(columns, cap_height)
+                );
+                return Self {
+                    polynomials,
+                    merkle_tree,
+                    degree_log: log2_strict(degree),
+                    rate_bits,
+                    blinding,
+                };
+            }
+        }
+
         let lde_values = timed!(
             timing,
             "FFT + blinding",
@@ -214,6 +248,47 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     .map(|_| F::rand_vec(degree << rate_bits)),
             )
             .collect()
+    }
+
+    fn fill_lde_column_store(
+        columns: &mut ColumnStore<F>,
+        polynomials: &[PolynomialCoeffs<F>],
+        rate_bits: usize,
+        blinding: bool,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> bool {
+        let degree = polynomials[0].len();
+        let lde_len = degree << rate_bits;
+        let coset_powers = F::coset_shift().powers().take(degree).collect::<Vec<_>>();
+        let salt_size = if blinding { SALT_SIZE } else { 0 };
+        let Some(mut destinations) = columns.columns_mut() else {
+            return false;
+        };
+        assert_eq!(destinations.len(), polynomials.len() + salt_size);
+        assert!(destinations.iter().all(|column| column.len() == lde_len));
+        let salt_destinations = destinations.split_off(polynomials.len());
+
+        destinations
+            .into_par_iter()
+            .zip(polynomials.par_iter())
+            .for_each(|(destination, polynomial)| {
+                assert_eq!(
+                    polynomial.len(),
+                    degree,
+                    "Polynomial degrees inconsistent"
+                );
+                destination[..degree].copy_from_slice(&polynomial.coeffs);
+                destination[degree..].fill(F::ZERO);
+                batch_multiply_inplace(&mut destination[..degree], &coset_powers);
+                fft_in_place_with_options(destination, Some(rate_bits), fft_root_table);
+            });
+
+        salt_destinations
+            .into_par_iter()
+            .for_each(|destination| {
+                destination.copy_from_slice(&F::rand_vec(lde_len));
+            });
+        true
     }
 
     /// The number of value columns in this oracle, excluding any salt columns.
@@ -360,16 +435,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 &format!("reduce batch of {} polynomials", polynomials.len()),
                 alpha.reduce_polys_base(polys_coeff)
             );
-            // Fused (value-exact) form of:
-            //   let quotient = composition_poly.divide_by_linear_padded_in_place(*point);
-            //   alpha.shift_poly(&mut final_poly);
-            //   final_poly += quotient;
-            // (where the in-place division runs the classic `divide_by_linear`
-            // Horner recurrence and leaves its top slot as the power-of-two
-            // pad), writing straight into `final_poly`'s reusable buffer
-            // instead of a division pass + shift pass + add pass.
-            let shift = alpha.shift_factor();
-            accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+            // In-place synthetic division reusing `composition_poly`'s buffer;
+            // its final zeroed slot is the power-of-two pad.
+            let quotient = composition_poly.divide_by_linear_padded_in_place(*point);
+            alpha.shift_poly(&mut final_poly);
+            final_poly += quotient;
         }
 
         // `final_poly` is dead after this point, so pad it in place instead of
@@ -408,50 +478,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     }
 }
 
-/// Folds one batch's quotient `(p(X) - p(z))/(X - z)` into the running FRI
-/// `final_poly`, fusing the three passes of the previous code into one serial
-/// sweep with no per-batch buffer traffic beyond it:
-/// `divide_by_linear_padded_in_place` (the in-place Horner division whose top
-/// slot is the power-of-two zero pad), `shift_poly`'s `final_poly *= shift`,
-/// and `final_poly += quotient`.
-///
-/// Value-exact: the division's Horner recurrence (`acc = acc * z + c`)
-/// produces the quotient's coefficients highest-first, so a descending sweep
-/// can emit each coefficient in the same multiply-add order and combine it
-/// with the shifted accumulator entry (`old * shift + q_i`) immediately. The
-/// only dropped work is the recurrence's final step (the remainder `p(z)`,
-/// which the division discards) and the reference's `+ ZERO` on the pad
-/// slot / `ZERO * shift` on fresh slots, all of which leave values unchanged.
-fn accumulate_linear_quotient<F: Field>(
-    final_poly: &mut PolynomialCoeffs<F>,
-    composition_poly: &PolynomialCoeffs<F>,
-    z: F,
-    shift: F,
-) {
-    let d = composition_poly.len();
-    let coeffs = &composition_poly.coeffs;
-    let buf = &mut final_poly.coeffs;
-    // Entries past the padded quotient's length only see the shift.
-    for l in buf.iter_mut().skip(d) {
-        *l *= shift;
-    }
-    if buf.len() < d {
-        buf.resize(d, F::ZERO);
-    }
-    if d == 0 {
-        return;
-    }
-    // Highest slot: the quotient coefficient there is the explicit zero pad.
-    buf[d - 1] *= shift;
-    // Synthetic division, highest coefficient first: the quotient's
-    // coefficient at `x^i` is the accumulator after absorbing `coeffs[i + 1]`.
-    let mut acc = F::ZERO;
-    for i in (0..d - 1).rev() {
-        acc = acc * z + coeffs[i + 1];
-        buf[i] = buf[i] * shift + acc;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,65 +507,22 @@ mod tests {
         let actual = PolynomialBatch::<F, C, D>::lde_values(&polynomials, RATE_BITS, false, None);
 
         assert_eq!(actual, expected);
-    }
 
-    /// The fused quotient accumulation must be bit-identical (raw u64
-    /// representation) to the pre-fusion op sequences it replaces: both the
-    /// classic reference (`divide_by_linear` + explicit zero pad +
-    /// `shift_poly` + add) and this tree's in-place variant
-    /// (`divide_by_linear_padded_in_place` + `shift_poly` + add), including
-    /// the empty-accumulator first batch and mismatched lengths.
-    #[test]
-    fn fused_quotient_accumulation_matches_reference() {
-        use crate::field::extension::FieldExtension;
-        use crate::field::types::PrimeField64;
-
-        type F = <GoldilocksField as Extendable<2>>::Extension;
-
-        fn raw(values: &[F]) -> Vec<u64> {
-            values
-                .iter()
-                .flat_map(|x| FieldExtension::<2>::to_basefield_array(x))
-                .map(|c: GoldilocksField| c.to_noncanonical_u64())
-                .collect()
-        }
-
-        for &(old_len, d) in &[
-            (0usize, 1usize),
-            (0, 8),
-            (1, 1),
-            (8, 8),
-            (4, 8),
-            (8, 4),
-            (256, 256),
-        ] {
-            let initial = PolynomialCoeffs::new(F::rand_vec(old_len));
-            let composition_poly = PolynomialCoeffs::new(F::rand_vec(d));
-            let z = F::rand();
-            let shift = F::rand();
-
-            // Classic reference: the op sequence in `prove_openings` before
-            // either in-place rewrite.
-            let mut expected = initial.clone();
-            let mut quotient = composition_poly.divide_by_linear(z);
-            quotient.coeffs.push(F::ZERO); // pad back to power of two
-            expected *= shift; // shift_poly
-            expected += quotient;
-
-            // This tree's exact pre-fusion sequence: the consuming in-place
-            // division (top slot already the pad) + shift_poly + add.
-            let mut expected_in_place = initial.clone();
-            let quotient_in_place = composition_poly
-                .clone()
-                .divide_by_linear_padded_in_place(z);
-            expected_in_place *= shift; // shift_poly
-            expected_in_place += quotient_in_place;
-
-            let mut actual = initial;
-            accumulate_linear_quotient(&mut actual, &composition_poly, z, shift);
-
-            assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
-            assert_eq!(raw(&actual.coeffs), raw(&expected_in_place.coeffs));
-        }
+        let lde_len = (1 << 8) << RATE_BITS;
+        let mut in_place = ColumnStore::Owned(
+            (0..polynomials.len())
+                .map(|_| vec![F::ZERO; lde_len])
+                .collect(),
+        );
+        assert!(
+            PolynomialBatch::<F, C, D>::fill_lde_column_store(
+                &mut in_place,
+                &polynomials,
+                RATE_BITS,
+                false,
+                None,
+            )
+        );
+        assert_eq!(in_place, ColumnStore::Owned(expected));
     }
 }
