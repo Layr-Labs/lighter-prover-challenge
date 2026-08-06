@@ -206,12 +206,10 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     indices_batch: &[usize],
     xs_batch: &[F],
     vars_batch: EvaluationVarsBaseBatch<F>,
-    local_zs_batch: &[&[F]],
-    next_zs_batch: &[&[F]],
-    local_lookup_zs_batch: &[&[F]],
-    next_lookup_zs_batch: &[&[F]],
-    partial_products_batch: &[&[F]],
-    s_sigmas_batch: &[&[F]],
+    zs_local_flat: &[F],
+    zs_next_flat: &[F],
+    zs_row_width: usize,
+    s_sigmas_flat: &[F],
     betas: &[F],
     gammas: &[F],
     beta_k_is: &[F],
@@ -225,19 +223,12 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     let has_lookup = common_data.num_lookup_polys != 0;
 
     let n = indices_batch.len();
+    let num_routed_wires = common_data.config.num_routed_wires;
     assert_eq!(xs_batch.len(), n);
     assert_eq!(vars_batch.len(), n);
-    assert_eq!(local_zs_batch.len(), n);
-    assert_eq!(next_zs_batch.len(), n);
-    if has_lookup {
-        assert_eq!(local_lookup_zs_batch.len(), n);
-        assert_eq!(next_lookup_zs_batch.len(), n);
-    } else {
-        assert_eq!(local_lookup_zs_batch.len(), 0);
-        assert_eq!(next_lookup_zs_batch.len(), 0);
-    }
-    assert_eq!(partial_products_batch.len(), n);
-    assert_eq!(s_sigmas_batch.len(), n);
+    assert_eq!(zs_local_flat.len(), n * zs_row_width);
+    assert_eq!(zs_next_flat.len(), n * zs_row_width);
+    assert_eq!(s_sigmas_flat.len(), n * num_routed_wires);
 
     let max_degree = common_data.quotient_degree_factor;
     let num_prods = common_data.num_partial_products;
@@ -253,7 +244,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
 
     let num_challenges = common_data.config.num_challenges;
-    let num_routed_wires = common_data.config.num_routed_wires;
     debug_assert_eq!(betas.len(), num_challenges);
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
@@ -287,22 +277,24 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 .map(|i| vars.local_constants[common_data.selectors_info.num_selectors() + i]),
         );
 
-        let local_zs = local_zs_batch[k];
-        let next_zs = next_zs_batch[k];
+        let zs_local_row = &zs_local_flat[k * zs_row_width..(k + 1) * zs_row_width];
+        let zs_next_row = &zs_next_flat[k * zs_row_width..(k + 1) * zs_row_width];
+        let local_zs = &zs_local_row[common_data.zs_range()];
+        let next_zs = &zs_next_row[common_data.zs_range()];
         let local_lookup_zs = if has_lookup {
-            local_lookup_zs_batch[k]
+            &zs_local_row[common_data.lookup_range()]
         } else {
             &[]
         };
 
         let next_lookup_zs = if has_lookup {
-            next_lookup_zs_batch[k]
+            &zs_next_row[common_data.lookup_range()]
         } else {
             &[]
         };
 
-        let partial_products = partial_products_batch[k];
-        let s_sigmas = s_sigmas_batch[k];
+        let partial_products = &zs_local_row[common_data.partial_products_range()];
+        let s_sigmas = &s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires];
 
         let l_0_x = z_h_on_coset.eval_l_0(index, x);
         for i in 0..num_challenges {
