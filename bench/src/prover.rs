@@ -333,6 +333,11 @@ fn prove_path(
                 .expect("chain step pipeline thread must start");
             chain = Some(ChainState::InFlight(handle));
         }
+        // Past this point the pipeline spawns no new chunk work: the drain
+        // below is the strictly sequential chain tail, so its mid-size
+        // commitment trees can use the mostly idle GPU exactly like the
+        // pre-execution and final block phases.
+        plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
         while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
             let tx_proof = proof_handle
                 .join()
@@ -349,9 +354,11 @@ fn prove_path(
                 &tx_proof,
             )));
         }
-        chain
+        let chain_proof = chain
             .map(ChainState::wait)
-            .expect("transaction path must produce a chain proof")
+            .expect("transaction path must produce a chain proof");
+        plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+        chain_proof
     })
 }
 

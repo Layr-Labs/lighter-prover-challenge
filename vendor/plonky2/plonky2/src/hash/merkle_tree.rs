@@ -248,6 +248,103 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
             return H::two_to_one(left_digest, right_digest);
         }
 
+        // And one more level: two leaf quads, then a quad of level-1
+        // compressions, then a pair of level-2 compressions.
+        if num_leaves == 8 {
+            let (leaf_0, rest) = left_leaves.split_at(leaf_width);
+            let (leaf_1, rest2) = rest.split_at(leaf_width);
+            let (leaf_2, leaf_3) = rest2.split_at(leaf_width);
+            let (leaf_4, rest) = right_leaves.split_at(leaf_width);
+            let (leaf_5, rest2) = rest.split_at(leaf_width);
+            let (leaf_6, leaf_7) = rest2.split_at(leaf_width);
+
+            let (h0, h1, h2, h3) = H::hash_or_noop_quad(leaf_0, leaf_1, leaf_2, leaf_3);
+            let (h4, h5, h6, h7) = H::hash_or_noop_quad(leaf_4, leaf_5, leaf_6, leaf_7);
+            let [n01, n23, n45, n67] =
+                H::two_to_one_quad([(h0, h1), (h2, h3), (h4, h5), (h6, h7)]);
+
+            left_digests_buf[0].write(h0);
+            left_digests_buf[1].write(h1);
+            left_digests_buf[2].write(n01);
+            left_digests_buf[3].write(n23);
+            left_digests_buf[4].write(h2);
+            left_digests_buf[5].write(h3);
+            right_digests_buf[0].write(h4);
+            right_digests_buf[1].write(h5);
+            right_digests_buf[2].write(n45);
+            right_digests_buf[3].write(n67);
+            right_digests_buf[4].write(h6);
+            right_digests_buf[5].write(h7);
+
+            let (left_digest, right_digest) = H::two_to_one_pair(n01, n23, n45, n67);
+            left_digest_mem.write(left_digest);
+            right_digest_mem.write(right_digest);
+            return H::two_to_one(left_digest, right_digest);
+        }
+
+        // Whole synchronous 16-leaf subtree, level order: four leaf quads,
+        // two quads then one quad of level-1/2 compressions, one level-3 pair.
+        if num_leaves == 16 {
+            let mut leaf_digests = [core::mem::MaybeUninit::<H::Hash>::uninit(); 16];
+            for q in 0..4 {
+                let base = q * 4 * leaf_width;
+                let quad_leaves = if q < 2 { left_leaves } else { right_leaves };
+                let base = base - if q < 2 { 0 } else { 8 * leaf_width };
+                let (leaf_a, rest) = quad_leaves[base..base + 4 * leaf_width].split_at(leaf_width);
+                let (leaf_b, rest2) = rest.split_at(leaf_width);
+                let (leaf_c, leaf_d) = rest2.split_at(leaf_width);
+                let (ha, hb, hc, hd) = H::hash_or_noop_quad(leaf_a, leaf_b, leaf_c, leaf_d);
+                leaf_digests[4 * q].write(ha);
+                leaf_digests[4 * q + 1].write(hb);
+                leaf_digests[4 * q + 2].write(hc);
+                leaf_digests[4 * q + 3].write(hd);
+            }
+            // SAFETY: all 16 entries were initialized above.
+            let h: [H::Hash; 16] = unsafe { core::mem::transmute_copy(&leaf_digests) };
+
+            let n_a = H::two_to_one_quad([(h[0], h[1]), (h[2], h[3]), (h[4], h[5]), (h[6], h[7])]);
+            let n_b =
+                H::two_to_one_quad([(h[8], h[9]), (h[10], h[11]), (h[12], h[13]), (h[14], h[15])]);
+            let m = H::two_to_one_quad([
+                (n_a[0], n_a[1]),
+                (n_a[2], n_a[3]),
+                (n_b[0], n_b[1]),
+                (n_b[2], n_b[3]),
+            ]);
+            let (left_digest, right_digest) = H::two_to_one_pair(m[0], m[1], m[2], m[3]);
+
+            // Each 8-leaf child's buffer half follows the recursive layout:
+            // [4-leaf region | node | node | 4-leaf region], with leaf digests
+            // at region positions 0, 1, 4, 5 and level-1 nodes at 2, 3.
+            for half in 0..2 {
+                let buf: &mut [MaybeUninit<H::Hash>] = if half == 0 {
+                    &mut *left_digests_buf
+                } else {
+                    &mut *right_digests_buf
+                };
+                let h = &h[8 * half..8 * (half + 1)];
+                let n = if half == 0 { &n_a } else { &n_b };
+                let m = &m[2 * half..2 * (half + 1)];
+                buf[0].write(h[0]);
+                buf[1].write(h[1]);
+                buf[2].write(n[0]);
+                buf[3].write(n[1]);
+                buf[4].write(h[2]);
+                buf[5].write(h[3]);
+                buf[6].write(m[0]);
+                buf[7].write(m[1]);
+                buf[8].write(h[4]);
+                buf[9].write(h[5]);
+                buf[10].write(n[2]);
+                buf[11].write(n[3]);
+                buf[12].write(h[6]);
+                buf[13].write(h[7]);
+            }
+            left_digest_mem.write(left_digest);
+            right_digest_mem.write(right_digest);
+            return H::two_to_one(left_digest, right_digest);
+        }
+
         // Rayon task creation dominates the tiny subtrees near the leaves. Keep
         // enough parallelism at the upper levels, then recurse synchronously.
         let (left_digest, right_digest) = if num_leaves > 16 {

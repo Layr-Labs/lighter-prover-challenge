@@ -442,31 +442,48 @@ fn wires_permutation_partial_products_and_zs<
     let num_prods = common_data.num_partial_products;
     debug_assert_eq!(beta_k_is.len(), common_data.config.num_routed_wires);
     let num_routed_wires = common_data.config.num_routed_wires;
+    // Group the denominator inversions across many subgroup points: one
+    // Montgomery-trick batch inversion per 64 points instead of one per
+    // point. Field inverses are unique, so every quotient value is identical
+    // to the per-point version.
+    const INV_BATCH: usize = 64;
     let all_quotient_chunk_products = subgroup
-        .par_iter()
+        .par_chunks(INV_BATCH)
         .enumerate()
         .map_init(
-            // One denominator scratch buffer per worker thread instead of a
-            // fresh Vec per subgroup point.
-            || vec![F::ZERO; num_routed_wires],
-            |denominators, (i, &x)| {
-                let s_sigmas = &prover_data.sigmas[i];
-                for (j, denominator) in denominators.iter_mut().enumerate() {
-                    let wire_value = witness.get_wire(i, j);
-                    *denominator = wire_value + beta * s_sigmas[j] + gamma;
+            // One denominator scratch buffer per worker thread.
+            || vec![F::ZERO; num_routed_wires * INV_BATCH],
+            |denominators, (chunk_idx, xs)| {
+                let base = chunk_idx * INV_BATCH;
+                let denoms = &mut denominators[..xs.len() * num_routed_wires];
+                for t in 0..xs.len() {
+                    let i = base + t;
+                    let s_sigmas = &prover_data.sigmas[i];
+                    for j in 0..num_routed_wires {
+                        let wire_value = witness.get_wire(i, j);
+                        denoms[t * num_routed_wires + j] = wire_value + beta * s_sigmas[j] + gamma;
+                    }
                 }
-                let mut quotient_values = F::batch_multiplicative_inverse(denominators);
-                // Multiply the numerators into the inverse buffer in place;
-                // the per-point numerator and quotient Vecs are gone.
-                for (j, quotient_value) in quotient_values.iter_mut().enumerate() {
-                    let wire_value = witness.get_wire(i, j);
-                    let numerator = wire_value + beta_k_is[j] * x + gamma;
-                    *quotient_value *= numerator;
-                }
-
-                quotient_chunk_products(&quotient_values, degree)
+                let mut quotient_values = F::batch_multiplicative_inverse(denoms);
+                xs.iter()
+                    .enumerate()
+                    .map(|(t, &x)| {
+                        let i = base + t;
+                        let point_quotients =
+                            &mut quotient_values[t * num_routed_wires..(t + 1) * num_routed_wires];
+                        // Multiply the numerators into the inverse buffer in
+                        // place; the per-point numerator Vecs are gone.
+                        for (j, quotient_value) in point_quotients.iter_mut().enumerate() {
+                            let wire_value = witness.get_wire(i, j);
+                            let numerator = wire_value + beta_k_is[j] * x + gamma;
+                            *quotient_value *= numerator;
+                        }
+                        quotient_chunk_products(point_quotients, degree)
+                    })
+                    .collect::<Vec<_>>()
             },
         )
+        .flatten()
         .collect::<Vec<_>>();
 
     // Accumulate the sequential Z chain directly into the column-major output
