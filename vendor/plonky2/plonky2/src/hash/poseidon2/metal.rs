@@ -30,6 +30,15 @@ const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
 const MAX_BUFFER_SETS: usize = 1;
 /// Parallel staging copy granularity in u64 elements (4 MiB chunks).
 const STAGING_CHUNK: usize = 1 << 19;
+/// Merkle parent nodes hashed per GPU thread. `2` dispatches the additional
+/// `poseidon2_hash_parents_x2` kernel, which interleaves two independent
+/// permutations per thread for instruction-level parallelism at the cost of
+/// roughly double the register-resident state; `1` keeps the promoted
+/// one-node-per-thread dispatch shape as the fallback if the register
+/// pressure costs occupancy. Both kernels are always compiled and both
+/// settings pass the differential tests, so this is a pure A/B toggle for
+/// ranked experiments.
+const PARENT_NODES_PER_THREAD: usize = 1;
 
 struct MetalShared {
     device: Device,
@@ -37,6 +46,7 @@ struct MetalShared {
     leaf_pipeline: ComputePipelineState,
     leaf_colmajor_pipeline: ComputePipelineState,
     parent_pipeline: ComputePipelineState,
+    parent_x2_pipeline: ComputePipelineState,
     ntt_prepare_pipeline: ComputePipelineState,
     ntt_stage_pipeline: ComputePipelineState,
     ifft_finalize_pipeline: ComputePipelineState,
@@ -326,6 +336,9 @@ impl MetalShared {
             let parent_function = library
                 .get_function("poseidon2_hash_parents", None)
                 .map_err(|error| format!("parent kernel unavailable: {error}"))?;
+            let parent_x2_function = library
+                .get_function("poseidon2_hash_parents_x2", None)
+                .map_err(|error| format!("parent x2 kernel unavailable: {error}"))?;
             let ntt_prepare_function = library
                 .get_function("ntt_prepare", None)
                 .map_err(|error| format!("ntt prepare kernel unavailable: {error}"))?;
@@ -341,6 +354,9 @@ impl MetalShared {
             let parent_pipeline = device
                 .new_compute_pipeline_state_with_function(&parent_function)
                 .map_err(|error| format!("parent pipeline creation failed: {error}"))?;
+            let parent_x2_pipeline = device
+                .new_compute_pipeline_state_with_function(&parent_x2_function)
+                .map_err(|error| format!("parent x2 pipeline creation failed: {error}"))?;
             let ntt_prepare_pipeline = device
                 .new_compute_pipeline_state_with_function(&ntt_prepare_function)
                 .map_err(|error| format!("ntt prepare pipeline creation failed: {error}"))?;
@@ -371,6 +387,7 @@ impl MetalShared {
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
                 parent_pipeline,
+                parent_x2_pipeline,
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
@@ -498,6 +515,40 @@ impl MetalShared {
         });
         cache.insert(log_degree, buffer.clone());
         Ok(buffer)
+    }
+
+    /// Encodes one Merkle level: hashes `parent_count` parents from the
+    /// children at `child_offset` (u64 element offsets into `output_buffer`),
+    /// honoring the `PARENT_NODES_PER_THREAD` kernel selection.
+    fn encode_parents(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        output_buffer: &Buffer,
+        child_offset: usize,
+        parent_offset: usize,
+        parent_count: usize,
+    ) {
+        let (pipeline, thread_count) = if PARENT_NODES_PER_THREAD >= 2 {
+            (&self.parent_x2_pipeline, parent_count.div_ceil(2))
+        } else {
+            (&self.parent_pipeline, parent_count)
+        };
+        let parent_encoder = command_buffer.new_compute_command_encoder();
+        parent_encoder.set_compute_pipeline_state(pipeline);
+        parent_encoder.set_buffer(
+            0,
+            Some(output_buffer),
+            (child_offset * size_of::<u64>()) as NSUInteger,
+        );
+        parent_encoder.set_buffer(
+            1,
+            Some(output_buffer),
+            (parent_offset * size_of::<u64>()) as NSUInteger,
+        );
+        parent_encoder.set_buffer(2, Some(&self.parameters), 0);
+        set_u32(parent_encoder, 3, parent_count as u32);
+        dispatch(parent_encoder, pipeline, thread_count);
+        parent_encoder.end_encoding();
     }
 
     /// Fused GPU pipeline for `PolynomialBatch::from_values`: IFFT of every
@@ -708,23 +759,13 @@ impl MetalShared {
                     level_offset += child_count * 4;
                     level_offsets.push(level_offset);
 
-                    let parent_count_u32 = parent_count as u32;
-                    let parent_encoder = command_buffer.new_compute_command_encoder();
-                    parent_encoder.set_compute_pipeline_state(&self.parent_pipeline);
-                    parent_encoder.set_buffer(
-                        0,
-                        Some(output_buffer),
-                        (child_offset * size_of::<u64>()) as NSUInteger,
+                    self.encode_parents(
+                        command_buffer,
+                        output_buffer,
+                        child_offset,
+                        level_offset,
+                        parent_count,
                     );
-                    parent_encoder.set_buffer(
-                        1,
-                        Some(output_buffer),
-                        (level_offset * size_of::<u64>()) as NSUInteger,
-                    );
-                    parent_encoder.set_buffer(2, Some(&self.parameters), 0);
-                    set_u32(parent_encoder, 3, parent_count_u32);
-                    dispatch(parent_encoder, &self.parent_pipeline, parent_count);
-                    parent_encoder.end_encoding();
 
                     child_count = parent_count;
                 }
@@ -964,23 +1005,13 @@ impl MetalShared {
                 level_offset += child_count * 4;
                 level_offsets.push(level_offset);
 
-                let parent_count_u32 = parent_count as u32;
-                let parent_encoder = command_buffer.new_compute_command_encoder();
-                parent_encoder.set_compute_pipeline_state(&self.parent_pipeline);
-                parent_encoder.set_buffer(
-                    0,
-                    Some(output_buffer),
-                    (child_offset * size_of::<u64>()) as NSUInteger,
+                self.encode_parents(
+                    command_buffer,
+                    output_buffer,
+                    child_offset,
+                    level_offset,
+                    parent_count,
                 );
-                parent_encoder.set_buffer(
-                    1,
-                    Some(output_buffer),
-                    (level_offset * size_of::<u64>()) as NSUInteger,
-                );
-                parent_encoder.set_buffer(2, Some(&self.parameters), 0);
-                set_u32(parent_encoder, 3, parent_count_u32);
-                dispatch(parent_encoder, &self.parent_pipeline, parent_count);
-                parent_encoder.end_encoding();
 
                 child_count = parent_count;
             }
@@ -1162,27 +1193,13 @@ impl MetalShared {
                 level_offset += child_count * 4;
                 level_offsets.push(level_offset);
 
-                let parent_count_u32 = parent_count as u32;
-                let parent_encoder = command_buffer.new_compute_command_encoder();
-                parent_encoder.set_compute_pipeline_state(&self.parent_pipeline);
-                parent_encoder.set_buffer(
-                    0,
-                    Some(output_buffer),
-                    (child_offset * size_of::<u64>()) as NSUInteger,
+                self.encode_parents(
+                    command_buffer,
+                    output_buffer,
+                    child_offset,
+                    level_offset,
+                    parent_count,
                 );
-                parent_encoder.set_buffer(
-                    1,
-                    Some(output_buffer),
-                    (level_offset * size_of::<u64>()) as NSUInteger,
-                );
-                parent_encoder.set_buffer(2, Some(&self.parameters), 0);
-                parent_encoder.set_bytes(
-                    3,
-                    size_of::<u32>() as NSUInteger,
-                    (&parent_count_u32 as *const u32).cast::<c_void>(),
-                );
-                dispatch(parent_encoder, &self.parent_pipeline, parent_count);
-                parent_encoder.end_encoding();
 
                 child_count = parent_count;
             }

@@ -2,12 +2,14 @@
 // Copyright (c) 2023 Sebastien La Duca
 // Licensed under the MIT License. See THIRD_PARTY_NOTICES for details.
 
+use core::any::TypeId;
 use std::marker::PhantomData;
 
 use anyhow::Result;
 use num::BigUint;
 use plonky2::field::extension::quintic::QuinticExtension;
-use plonky2::field::extension::{Extendable, FieldExtension};
+use plonky2::field::extension::{Extendable, FieldExtension, OEF};
+use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::types::{Field, PrimeField64};
 use plonky2::hash::hash_types::RichField;
 use plonky2::iop::generator::{GeneratedValues, SimpleGenerator};
@@ -981,6 +983,69 @@ impl_circuit_builder_for_extension_degree!(2);
 impl_circuit_builder_for_extension_degree!(4);
 impl_circuit_builder_for_extension_degree!(5);
 
+type GoldilocksQuintic = QuinticExtension<GoldilocksField>;
+
+/// Frobenius multiplier tables for the Goldilocks quintic extension, i.e. the
+/// power sequences `DTH_ROOT^(count * i)` that `Frobenius::repeated_frobenius`
+/// recomputes on every call (for `count = 1` and `count = 2`).
+///
+/// They are computed once with the *identical* operation sequence the vendored
+/// implementation uses (`Powers` starts at `ONE` and repeatedly multiplies by
+/// the base; `z0` for `count = 2` is `DTH_ROOT * DTH_ROOT`), so the cached
+/// values — and everything derived from them — are bit-identical to the
+/// per-call computation they replace, including non-canonical representations.
+fn goldilocks_frobenius_tables() -> &'static ([GoldilocksField; 5], [GoldilocksField; 5]) {
+    static TABLES: std::sync::OnceLock<([GoldilocksField; 5], [GoldilocksField; 5])> =
+        std::sync::OnceLock::new();
+    TABLES.get_or_init(|| {
+        let root = <GoldilocksQuintic as OEF<5>>::DTH_ROOT;
+        let mut t1 = [GoldilocksField::ONE; 5];
+        let mut z = GoldilocksField::ONE;
+        for slot in t1.iter_mut() {
+            *slot = z;
+            z = z * root;
+        }
+        let mut z0 = root;
+        z0 = z0 * root;
+        let mut t2 = [GoldilocksField::ONE; 5];
+        let mut z = GoldilocksField::ONE;
+        for slot in t2.iter_mut() {
+            *slot = z;
+            z = z * z0;
+        }
+        (t1, t2)
+    })
+}
+
+#[inline]
+fn apply_frobenius(x: GoldilocksQuintic, table: &[GoldilocksField; 5]) -> GoldilocksQuintic {
+    let QuinticExtension(arr) = x;
+    let mut res = [GoldilocksField::ZERO; 5];
+    for i in 0..5 {
+        res[i] = arr[i] * table[i];
+    }
+    QuinticExtension(res)
+}
+
+/// `num / den` for a non-zero denominator, mirroring the vendored
+/// `QuinticExtension::try_inverse` (Algorithm 11.3.4, Frobenius norm chain)
+/// followed by `Div::div`, with the Frobenius power tables cached instead of
+/// being rebuilt on every call. The base-field operation sequence — and hence
+/// every output bit — is identical to `num / den`.
+fn goldilocks_quintic_div(num: GoldilocksQuintic, den: GoldilocksQuintic) -> GoldilocksQuintic {
+    let (t1, t2) = goldilocks_frobenius_tables();
+    let d = apply_frobenius(den, t1);
+    let e = d * apply_frobenius(d, t1);
+    let f = e * apply_frobenius(e, t2);
+
+    let QuinticExtension([a0, a1, a2, a3, a4]) = den;
+    let QuinticExtension([b0, b1, b2, b3, b4]) = f;
+    let g = a0 * b0 + <GoldilocksQuintic as OEF<5>>::W * (a1 * b4 + a2 * b3 + a3 * b2 + a4 * b1);
+
+    let inv = <GoldilocksQuintic as FieldExtension<5>>::scalar_mul(&f, g.inverse());
+    num * inv
+}
+
 #[derive(Debug, Default)]
 pub struct QuinticQuotientGenerator {
     numerator: QuinticExtensionTarget,
@@ -1020,12 +1085,37 @@ impl<F: RichField + Extendable<5> + Extendable<D>, const D: usize> SimpleGenerat
             .numerator
             .to_target_array()
             .map(|t| witness.get_target(t));
-        let numerator = QuinticExtension::<F>::from_basefield_array(numerator_limbs);
 
         let denominator_limbs = self
             .denominator
             .to_target_array()
             .map(|t| witness.get_target(t));
+
+        // Goldilocks fast path with cached Frobenius tables. The raw
+        // (noncanonical) u64 representations are moved across unchanged in
+        // both directions, and `goldilocks_quintic_div` performs the exact
+        // vendored operation sequence, so outputs are bit-identical.
+        if TypeId::of::<F>() == TypeId::of::<GoldilocksField>() {
+            let num = QuinticExtension(numerator_limbs.map(|x| GoldilocksField(x.to_noncanonical_u64())));
+            let den = QuinticExtension(denominator_limbs.map(|x| GoldilocksField(x.to_noncanonical_u64())));
+            let quotient = if den == GoldilocksQuintic::ZERO {
+                GoldilocksQuintic::ZERO
+            } else {
+                goldilocks_quintic_div(num, den)
+            };
+            let QuinticExtension(quotient_limbs) = quotient;
+            for (lhs, rhs) in self
+                .quotient
+                .to_target_array()
+                .into_iter()
+                .zip(quotient_limbs.into_iter())
+            {
+                out_buffer.set_target(lhs, F::from_noncanonical_u64(rhs.to_noncanonical_u64()))?;
+            }
+            return Ok(());
+        }
+
+        let numerator = QuinticExtension::<F>::from_basefield_array(numerator_limbs);
         let denominator = QuinticExtension::<F>::from_basefield_array(denominator_limbs);
 
         let quotient = if denominator == QuinticExtension::<F>::ZERO {
@@ -1161,6 +1251,55 @@ mod tests {
     use crate::eddsa::gadgets::scalar_field::{CircuitBuilderScalar, PartialWitnessScalar};
     use crate::nonnative::CircuitBuilderNonNative;
     use crate::types::config::CIRCUIT_CONFIG;
+
+    #[test]
+    fn test_goldilocks_quintic_div_bit_identical_to_reference() {
+        use plonky2::field::goldilocks_field::GoldilocksField as GF;
+
+        let mut rng = thread_rng();
+        let check = |num: QuinticExtension<GF>, den: QuinticExtension<GF>| {
+            if den == QuinticExtension::<GF>::ZERO {
+                return;
+            }
+            // Vendored reference path (per-call Frobenius power computation).
+            let expected = num / den;
+            let got = super::goldilocks_quintic_div(num, den);
+            // Compare raw (possibly noncanonical) u64 representations: the
+            // fast path must be bit-identical, not merely canonically equal.
+            let expected_raw: Vec<u64> = expected.0.iter().map(|x| x.0).collect();
+            let got_raw: Vec<u64> = got.0.iter().map(|x| x.0).collect();
+            assert_eq!(expected_raw, got_raw);
+        };
+
+        for _ in 0..500 {
+            check(
+                QuinticExtension::<GF>::sample(&mut rng),
+                QuinticExtension::<GF>::sample(&mut rng),
+            );
+        }
+
+        // Edge cases: units, negatives, sparse elements, base-field-only
+        // denominators, and large limb values.
+        let one = QuinticExtension::<GF>::ONE;
+        let neg_one = QuinticExtension::<GF>::NEG_ONE;
+        check(one, one);
+        check(neg_one, one);
+        check(one, neg_one);
+        for i in 0..5 {
+            let mut arr = [GF::ZERO; 5];
+            arr[i] = GF::from_canonical_u64(0xFFFF_FFFF_0000_0000);
+            let x = QuinticExtension(arr);
+            check(x, x);
+            check(one, x);
+            check(x, one);
+        }
+
+        // Noncanonical input representations must flow through identically.
+        let noncanonical = QuinticExtension([GF(u64::MAX); 5]);
+        check(noncanonical, noncanonical);
+        check(noncanonical, one);
+        check(one, noncanonical);
+    }
 
     #[test]
     fn test_add() -> Result<()> {
