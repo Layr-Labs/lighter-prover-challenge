@@ -38,6 +38,10 @@ fn main() {
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
+    // Circuit construction depends on nothing in the fixture, so it starts
+    // before the fixture is read and runs while the fixture is parsed.
+    let circuits = Circuits::new();
+
     let json = fs::read(fixture).expect("cannot read prover fixture");
     let block = Block::<F>::from_json_with_empty_txs(
         &json,
@@ -47,7 +51,7 @@ fn main() {
         PUBLIC_LIGHT_TX_COUNT,
     )
     .expect("invalid prover fixture");
-    let proof = prover::prove_block(block, &Circuits::new());
+    let proof = prover::prove_block(block, &circuits);
     bincode::serialize_into(
         BufWriter::with_capacity(
             PROOF_OUTPUT_BUFFER_BYTES,
