@@ -196,121 +196,49 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
         &self,
         vars_base: crate::plonk::vars::EvaluationVarsBaseBatch<F>,
     ) -> Vec<F> {
-        let n = vars_base.len();
-        let wires = vars_base.local_wires;
-        let col = |w: usize| &wires[w * n..][..n];
-        let mut res = vec![F::ZERO; n * self.num_constraints()];
-        let mut chunks = res.chunks_exact_mut(n);
-
-        // Per-point state rows, contiguous per point so the existing scalar
-        // Poseidon2 round helpers apply unchanged; wire reads and constraint
-        // writes are contiguous columns.
-        let mut states = vec![[F::ZERO; WIDTH]; n];
-
-        // Assert that `swap` is binary.
-        let swap = col(Self::WIRE_SWAP);
-        let out = chunks.next().unwrap();
-        for p in 0..n {
-            out[p] = swap[p] * swap[p].sub_one();
-        }
-
-        // Assert that each delta wire is set properly: `delta_i = swap * (rhs - lhs)`.
-        for i in 0..4 {
-            let input_lhs = col(Self::wire_input(i));
-            let input_rhs = col(Self::wire_input(i + 4));
-            let delta_i = col(Self::wire_delta(i));
-            let out = chunks.next().unwrap();
-            for p in 0..n {
-                out[p] = swap[p] * (input_rhs[p] - input_lhs[p]) - delta_i[p];
-            }
-        }
-
-        // Compute the possibly-swapped input layer.
-        for i in 0..4 {
-            let delta_i = col(Self::wire_delta(i));
-            let input_lhs = col(Self::wire_input(i));
-            let input_rhs = col(Self::wire_input(i + 4));
-            for p in 0..n {
-                states[p][i] = input_lhs[p] + delta_i[p];
-                states[p][i + 4] = input_rhs[p] - delta_i[p];
-            }
-        }
-        for i in 8..WIDTH {
-            let input = col(Self::wire_input(i));
-            for p in 0..n {
-                states[p][i] = input[p];
-            }
-        }
-
-        // The initial linear layer.
-        for state in states.iter_mut() {
-            <F as Poseidon2>::external_linear_layer(state);
-        }
-
-        // The first half of the external rounds.
-        for r in 0..ROUNDS_F_HALF {
-            for state in states.iter_mut() {
-                <F as Poseidon2>::add_rc(state, r);
-            }
-            if r != 0 {
-                for i in 0..WIDTH {
-                    let sbox_in = col(Self::wire_full_sbox_0(r, i));
-                    let out = chunks.next().unwrap();
-                    for p in 0..n {
-                        out[p] = states[p][i] - sbox_in[p];
-                        states[p][i] = sbox_in[p];
-                    }
-                }
-            }
-            for state in states.iter_mut() {
-                <F as Poseidon2>::sbox(state);
-                <F as Poseidon2>::external_linear_layer(state);
-            }
-        }
-
-        // The internal rounds.
-        for r in 0..ROUNDS_P {
-            let rc = F::from_canonical_u64(INTERNAL_CONSTANTS[r]);
-            let sbox_in = col(Self::wire_partial_sbox(r));
-            let out = chunks.next().unwrap();
-            for p in 0..n {
-                out[p] = states[p][0] + rc - sbox_in[p];
-                states[p][0] = <F as Poseidon2>::sbox_p(&sbox_in[p]);
-            }
-            for state in states.iter_mut() {
-                <F as Poseidon2>::internal_linear_layer(state);
-            }
-        }
-
-        // The second half of the external rounds.
-        for r in ROUNDS_F_HALF..ROUNDS_F {
-            for state in states.iter_mut() {
-                <F as Poseidon2>::add_rc(state, r);
-            }
-            for i in 0..WIDTH {
-                let sbox_in = col(Self::wire_full_sbox_1(r - ROUNDS_F_HALF, i));
-                let out = chunks.next().unwrap();
-                for p in 0..n {
-                    out[p] = states[p][i] - sbox_in[p];
-                    states[p][i] = sbox_in[p];
-                }
-            }
-            for state in states.iter_mut() {
-                <F as Poseidon2>::sbox(state);
-                <F as Poseidon2>::external_linear_layer(state);
-            }
-        }
-
-        for i in 0..WIDTH {
-            let output = col(Self::wire_output(i));
-            let out = chunks.next().unwrap();
-            for p in 0..n {
-                out[p] = states[p][i] - output[p];
-            }
-        }
-
+        let mut res = vec![F::ZERO; vars_base.len() * self.num_constraints()];
+        eval_p2_unfiltered_base_batch_into::<F, D>(vars_base, &mut res);
         res
     }
+
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: crate::plonk::vars::EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        use crate::field::batch_util::batch_multiply_add_inplace;
+
+        // This gate emits hundreds of constraint rows per batch (well beyond
+        // L1), so reuse one thread-local scratch buffer instead of allocating
+        // and zeroing a fresh Vec per call. Every constraint slot is fully
+        // overwritten by `eval_unfiltered_base_batch_into`, so stale contents
+        // are harmless.
+        std::thread_local! {
+            static SCRATCH: core::cell::RefCell<Vec<u64>> = const { core::cell::RefCell::new(Vec::new()) };
+        }
+        let n = vars_base.len();
+        let len = n * self.num_constraints();
+        SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            if scratch.len() < len {
+                scratch.resize(len, 0);
+            }
+            // SAFETY: `F` here is always a `PrimeField64` with `u64` layout
+            // (`RichField`), and every slot is overwritten before being read.
+            let scratch_f = unsafe {
+                core::slice::from_raw_parts_mut(scratch.as_mut_ptr().cast::<F>(), len)
+            };
+            eval_p2_unfiltered_base_batch_into::<F, D>(vars_base, scratch_f);
+            for (combined, res_row) in combined_gate_constraints
+                .chunks_exact_mut(n)
+                .zip(scratch_f.chunks_exact(n))
+            {
+                batch_multiply_add_inplace(combined, res_row, filters);
+            }
+        });
+    }
+
 
     fn eval_unfiltered_base_one(
         &self,
@@ -717,4 +645,124 @@ mod tests {
         let gate = PoseidonGate::<F, D>::new();
         test_eval_fns::<F, C, _, D>(gate)
     }
+}
+
+/// Contiguous-column constraint evaluation for `Poseidon2Gate`, writing
+/// every constraint row into `out` (all slots are overwritten).
+fn eval_p2_unfiltered_base_batch_into<F: RichField + Extendable<D> + Poseidon2, const D: usize>(
+    vars_base: crate::plonk::vars::EvaluationVarsBaseBatch<F>,
+    out: &mut [F],
+) {
+    let n = vars_base.len();
+    let wires = vars_base.local_wires;
+    let col = |w: usize| &wires[w * n..][..n];
+    let mut chunks = out.chunks_exact_mut(n);
+
+        // Per-point state rows, contiguous per point so the existing scalar
+        // Poseidon2 round helpers apply unchanged; wire reads and constraint
+        // writes are contiguous columns.
+        let mut states = vec![[F::ZERO; WIDTH]; n];
+
+        // Assert that `swap` is binary.
+        let swap = col(Poseidon2Gate::<F, D>::WIRE_SWAP);
+        let out = chunks.next().unwrap();
+        for p in 0..n {
+            out[p] = swap[p] * swap[p].sub_one();
+        }
+
+        // Assert that each delta wire is set properly: `delta_i = swap * (rhs - lhs)`.
+        for i in 0..4 {
+            let input_lhs = col(Poseidon2Gate::<F, D>::wire_input(i));
+            let input_rhs = col(Poseidon2Gate::<F, D>::wire_input(i + 4));
+            let delta_i = col(Poseidon2Gate::<F, D>::wire_delta(i));
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                out[p] = swap[p] * (input_rhs[p] - input_lhs[p]) - delta_i[p];
+            }
+        }
+
+        // Compute the possibly-swapped input layer.
+        for i in 0..4 {
+            let delta_i = col(Poseidon2Gate::<F, D>::wire_delta(i));
+            let input_lhs = col(Poseidon2Gate::<F, D>::wire_input(i));
+            let input_rhs = col(Poseidon2Gate::<F, D>::wire_input(i + 4));
+            for p in 0..n {
+                states[p][i] = input_lhs[p] + delta_i[p];
+                states[p][i + 4] = input_rhs[p] - delta_i[p];
+            }
+        }
+        for i in 8..WIDTH {
+            let input = col(Poseidon2Gate::<F, D>::wire_input(i));
+            for p in 0..n {
+                states[p][i] = input[p];
+            }
+        }
+
+        // The initial linear layer.
+        for state in states.iter_mut() {
+            <F as Poseidon2>::external_linear_layer(state);
+        }
+
+        // The first half of the external rounds.
+        for r in 0..ROUNDS_F_HALF {
+            for state in states.iter_mut() {
+                <F as Poseidon2>::add_rc(state, r);
+            }
+            if r != 0 {
+                for i in 0..WIDTH {
+                    let sbox_in = col(Poseidon2Gate::<F, D>::wire_full_sbox_0(r, i));
+                    let out = chunks.next().unwrap();
+                    for p in 0..n {
+                        out[p] = states[p][i] - sbox_in[p];
+                        states[p][i] = sbox_in[p];
+                    }
+                }
+            }
+            for state in states.iter_mut() {
+                <F as Poseidon2>::sbox(state);
+                <F as Poseidon2>::external_linear_layer(state);
+            }
+        }
+
+        // The internal rounds.
+        for r in 0..ROUNDS_P {
+            let rc = F::from_canonical_u64(INTERNAL_CONSTANTS[r]);
+            let sbox_in = col(Poseidon2Gate::<F, D>::wire_partial_sbox(r));
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                out[p] = states[p][0] + rc - sbox_in[p];
+                states[p][0] = <F as Poseidon2>::sbox_p(&sbox_in[p]);
+            }
+            for state in states.iter_mut() {
+                <F as Poseidon2>::internal_linear_layer(state);
+            }
+        }
+
+        // The second half of the external rounds.
+        for r in ROUNDS_F_HALF..ROUNDS_F {
+            for state in states.iter_mut() {
+                <F as Poseidon2>::add_rc(state, r);
+            }
+            for i in 0..WIDTH {
+                let sbox_in = col(Poseidon2Gate::<F, D>::wire_full_sbox_1(r - ROUNDS_F_HALF, i));
+                let out = chunks.next().unwrap();
+                for p in 0..n {
+                    out[p] = states[p][i] - sbox_in[p];
+                    states[p][i] = sbox_in[p];
+                }
+            }
+            for state in states.iter_mut() {
+                <F as Poseidon2>::sbox(state);
+                <F as Poseidon2>::external_linear_layer(state);
+            }
+        }
+
+        for i in 0..WIDTH {
+            let output = col(Poseidon2Gate::<F, D>::wire_output(i));
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                out[p] = states[p][i] - output[p];
+            }
+        }
+
 }

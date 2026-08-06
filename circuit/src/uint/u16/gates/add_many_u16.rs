@@ -94,6 +94,71 @@ impl<F: RichField + Extendable<D>, const D: usize> U16AddManyGate<F, D> {
         debug_assert!(j < Self::num_limbs());
         (self.num_addends + 3) * self.num_ops + Self::num_limbs() * i + j
     }
+
+    /// Contiguous-column constraint evaluation writing every constraint row
+    /// into `out` (all slots are overwritten).
+    fn eval_unfiltered_base_batch_into(&self, vars_base: EvaluationVarsBaseBatch<F>, out: &mut [F]) {
+        let n = vars_base.len();
+        let wires = vars_base.local_wires;
+        let three = F::from_canonical_usize(3);
+        let base_limb = F::from_canonical_u64(1u64 << Self::limb_bits());
+        let base16 = F::from_canonical_u64(1 << 16u64);
+        let mut chunks = out.chunks_exact_mut(n);
+
+        let mut combined_result = vec![F::ZERO; n];
+        let mut combined_carry = vec![F::ZERO; n];
+
+        for i in 0..self.num_ops {
+            let output_result = &wires[self.wire_ith_output_result(i) * n..][..n];
+            let output_carry = &wires[self.wire_ith_output_carry(i) * n..][..n];
+
+            // output_carry * 2^16 + output_result - (sum of addends + carry).
+            let out = chunks.next().unwrap();
+            out.copy_from_slice(&wires[self.wire_ith_carry(i) * n..][..n]);
+            for j in 0..self.num_addends {
+                let addend = &wires[self.wire_ith_op_jth_addend(i, j) * n..][..n];
+                for p in 0..n {
+                    out[p] += addend[p];
+                }
+            }
+            for p in 0..n {
+                out[p] = output_carry[p] * base16 + output_result[p] - out[p];
+            }
+
+            // Limb range products (base-4: x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3))
+            // in the same descending order as `eval_unfiltered`, accumulating
+            // the result/carry recompositions along the way.
+            combined_result.fill(F::ZERO);
+            combined_carry.fill(F::ZERO);
+            for j in (0..Self::num_limbs()).rev() {
+                let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
+                let out = chunks.next().unwrap();
+                debug_assert_eq!(1 << Self::limb_bits(), 4);
+                for p in 0..n {
+                    let x = limb[p];
+                    let y = x * (x - three);
+                    out[p] = y * (y + F::TWO);
+                }
+                let combined = if j < Self::num_result_limbs() {
+                    &mut combined_result
+                } else {
+                    &mut combined_carry
+                };
+                for p in 0..n {
+                    combined[p] = combined[p] * base_limb + limb[p];
+                }
+            }
+
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                out[p] = combined_result[p] - output_result[p];
+            }
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                out[p] = combined_carry[p] - output_carry[p];
+            }
+        }
+    }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16AddManyGate<F, D> {
@@ -163,67 +228,45 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16AddManyGate
     }
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        let n = vars_base.len();
-        let wires = vars_base.local_wires;
-        let three = F::from_canonical_usize(3);
-        let base_limb = F::from_canonical_u64(1u64 << Self::limb_bits());
-        let base16 = F::from_canonical_u64(1 << 16u64);
-        let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
-        let mut chunks = res.chunks_exact_mut(n);
-        let mut combined_result = vec![F::ZERO; n];
-        let mut combined_carry = vec![F::ZERO; n];
-
-        for i in 0..self.num_ops {
-            let output_result = &wires[self.wire_ith_output_result(i) * n..][..n];
-            let output_carry = &wires[self.wire_ith_output_carry(i) * n..][..n];
-
-            // output_carry * 2^16 + output_result - (sum of addends + carry).
-            let out = chunks.next().unwrap();
-            out.copy_from_slice(&wires[self.wire_ith_carry(i) * n..][..n]);
-            for j in 0..self.num_addends {
-                let addend = &wires[self.wire_ith_op_jth_addend(i, j) * n..][..n];
-                for p in 0..n {
-                    out[p] += addend[p];
-                }
-            }
-            for p in 0..n {
-                out[p] = output_carry[p] * base16 + output_result[p] - out[p];
-            }
-
-            // Limb range products (base-4: x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3))
-            // in the same descending order as `eval_unfiltered`, accumulating
-            // the result/carry recompositions along the way.
-            combined_result.fill(F::ZERO);
-            combined_carry.fill(F::ZERO);
-            for j in (0..Self::num_limbs()).rev() {
-                let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
-                let out = chunks.next().unwrap();
-                debug_assert_eq!(1 << Self::limb_bits(), 4);
-                for p in 0..n {
-                    let x = limb[p];
-                    let y = x * (x - three);
-                    out[p] = y * (y + F::TWO);
-                }
-                let combined = if j < Self::num_result_limbs() {
-                    &mut combined_result
-                } else {
-                    &mut combined_carry
-                };
-                for p in 0..n {
-                    combined[p] = combined[p] * base_limb + limb[p];
-                }
-            }
-
-            let out = chunks.next().unwrap();
-            for p in 0..n {
-                out[p] = combined_result[p] - output_result[p];
-            }
-            let out = chunks.next().unwrap();
-            for p in 0..n {
-                out[p] = combined_carry[p] - output_carry[p];
-            }
-        }
+        let mut res = vec![F::ZERO; vars_base.len() * <Self as Gate<F, D>>::num_constraints(self)];
+        self.eval_unfiltered_base_batch_into(vars_base, &mut res);
         res
+    }
+
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        use plonky2::field::batch_util::batch_multiply_add_inplace;
+
+        // Reuse one thread-local scratch buffer instead of allocating and
+        // zeroing a fresh Vec per batch call; every constraint slot is fully
+        // overwritten by `eval_unfiltered_base_batch_into`.
+        std::thread_local! {
+            static SCRATCH: core::cell::RefCell<Vec<u64>> = const { core::cell::RefCell::new(Vec::new()) };
+        }
+        let n = vars_base.len();
+        let len = n * <Self as Gate<F, D>>::num_constraints(self);
+        SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            if scratch.len() < len {
+                scratch.resize(len, 0);
+            }
+            // SAFETY: `F: RichField` has `u64` layout, and every slot is
+            // overwritten before being read.
+            let scratch_f = unsafe {
+                core::slice::from_raw_parts_mut(scratch.as_mut_ptr().cast::<F>(), len)
+            };
+            self.eval_unfiltered_base_batch_into(vars_base, scratch_f);
+            for (combined, res_row) in combined_gate_constraints
+                .chunks_exact_mut(n)
+                .zip(scratch_f.chunks_exact(n))
+            {
+                batch_multiply_add_inplace(combined, res_row, filters);
+            }
+        });
     }
 
     fn eval_unfiltered_base_one(
