@@ -93,8 +93,24 @@ impl<F: Field> ReducingFactor<F> {
         // per-power scalar products are accumulated in the same order), but
         // without one degree-sized temporary allocation + two clone passes per
         // polynomial.
-        let mut acc: Vec<F> = Vec::new();
-        for (base_power, poly) in self.base.powers().zip(polys) {
+        let mut weighted_polys = self.base.powers().zip(polys);
+        let Some((base_power, poly)) = weighted_polys.next() else {
+            return PolynomialCoeffs::empty();
+        };
+
+        self.count += 1;
+        let first_poly = poly.borrow();
+        let mut acc: Vec<F> = first_poly
+            .coeffs
+            .iter()
+            .map(|&c| {
+                let mut a = F::ZERO;
+                a += <F as FieldExtension<D>>::scalar_mul(&base_power, c);
+                a
+            })
+            .collect();
+
+        for (base_power, poly) in weighted_polys {
             self.count += 1;
             let coeffs = &poly.borrow().coeffs;
             if coeffs.len() > acc.len() {
@@ -298,11 +314,148 @@ mod tests {
     use anyhow::Result;
 
     use super::*;
-    use crate::field::types::Sample;
+    use crate::field::extension::quadratic::QuadraticExtension;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::{Field64, PrimeField64, Sample};
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
     use crate::plonk::verifier::verify;
+
+    type TestBaseField = GoldilocksField;
+    type TestExtension = QuadraticExtension<TestBaseField>;
+
+    fn reduce_polys_base_reference(
+        reducer: &mut ReducingFactor<TestExtension>,
+        polys: &[PolynomialCoeffs<TestBaseField>],
+    ) -> PolynomialCoeffs<TestExtension> {
+        let mut acc = Vec::new();
+        for (base_power, poly) in reducer.base.powers().zip(polys) {
+            reducer.count += 1;
+            let coeffs = &poly.coeffs;
+            if coeffs.len() > acc.len() {
+                acc.resize(coeffs.len(), TestExtension::ZERO);
+            }
+            for (a, &c) in acc.iter_mut().zip(coeffs.iter()) {
+                *a += <TestExtension as FieldExtension<2>>::scalar_mul(&base_power, c);
+            }
+        }
+        PolynomialCoeffs::new(acc)
+    }
+
+    fn next_deterministic_u64(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    fn make_raw_polys(lengths: &[usize], state: &mut u64) -> Vec<PolynomialCoeffs<TestBaseField>> {
+        let fixed = [
+            0,
+            1,
+            TestBaseField::ORDER - 1,
+            TestBaseField::ORDER,
+            TestBaseField::ORDER + 1,
+            u64::MAX,
+        ];
+        lengths
+            .iter()
+            .enumerate()
+            .map(|(poly_index, &len)| {
+                let coeffs = (0..len)
+                    .map(|coeff_index| {
+                        let selector = poly_index.wrapping_mul(257).wrapping_add(coeff_index);
+                        let raw = if selector % 3 == 0 {
+                            fixed[selector % fixed.len()]
+                        } else {
+                            next_deterministic_u64(state)
+                        };
+                        GoldilocksField(raw)
+                    })
+                    .collect();
+                PolynomialCoeffs::new(coeffs)
+            })
+            .collect()
+    }
+
+    fn assert_extension_raw_eq(left: TestExtension, right: TestExtension) {
+        for (left_limb, right_limb) in left.0.into_iter().zip(right.0) {
+            assert_eq!(
+                left_limb.to_noncanonical_u64(),
+                right_limb.to_noncanonical_u64()
+            );
+        }
+    }
+
+    fn assert_polynomial_raw_eq(
+        left: &PolynomialCoeffs<TestExtension>,
+        right: &PolynomialCoeffs<TestExtension>,
+    ) {
+        assert_eq!(left.coeffs.len(), right.coeffs.len());
+        for (&left_coeff, &right_coeff) in left.coeffs.iter().zip(&right.coeffs) {
+            assert_extension_raw_eq(left_coeff, right_coeff);
+        }
+    }
+
+    #[test]
+    fn first_term_seed_matches_reference_raw() {
+        let mut state = 0x4652_495f_5345_4544;
+        let mut alphas = vec![
+            TestExtension::ZERO,
+            TestExtension::ONE,
+            QuadraticExtension([GoldilocksField(7), GoldilocksField(11)]),
+            QuadraticExtension([
+                GoldilocksField(TestBaseField::ORDER),
+                GoldilocksField(TestBaseField::ORDER + 1),
+            ]),
+        ];
+        for _ in 0..3 {
+            alphas.push(QuadraticExtension([
+                GoldilocksField(next_deterministic_u64(&mut state)),
+                GoldilocksField(next_deterministic_u64(&mut state)),
+            ]));
+        }
+
+        let length_patterns = vec![
+            vec![],
+            vec![0],
+            vec![1],
+            vec![0, 1],
+            vec![1, 0],
+            vec![32, 32],
+            vec![33, 1, 257],
+            vec![1, 257, 0, 31],
+            vec![1; 17],
+            vec![256; 260],
+        ];
+
+        for lengths in length_patterns {
+            let polys = make_raw_polys(&lengths, &mut state);
+            let followup = make_raw_polys(&[3, 0, 5], &mut state);
+            for &alpha in &alphas {
+                let mut reference = ReducingFactor::new(alpha);
+                let mut candidate = ReducingFactor::new(alpha);
+
+                let reference_poly = reduce_polys_base_reference(&mut reference, &polys);
+                let candidate_poly = candidate.reduce_polys_base::<TestBaseField, 2>(&polys);
+                assert_polynomial_raw_eq(&reference_poly, &candidate_poly);
+                assert_eq!(reference.count, candidate.count);
+
+                let reference_shift = reference.shift_factor();
+                let candidate_shift = candidate.shift_factor();
+                assert_extension_raw_eq(reference_shift, candidate_shift);
+                assert_eq!(reference.count, 0);
+                assert_eq!(candidate.count, 0);
+
+                let reference_second = reduce_polys_base_reference(&mut reference, &followup);
+                let candidate_second = candidate.reduce_polys_base::<TestBaseField, 2>(&followup);
+                assert_polynomial_raw_eq(&reference_second, &candidate_second);
+                assert_eq!(reference.count, candidate.count);
+                assert_extension_raw_eq(reference.shift_factor(), candidate.shift_factor());
+            }
+        }
+    }
 
     fn test_reduce_gadget_base(n: usize) -> Result<()> {
         const D: usize = 2;
