@@ -370,12 +370,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let lde_final_values = timed!(
             timing,
             &format!("perform final FFT {}", lde_final_poly.len()),
-            // The top (1 - 1/2^rate_bits) of the padded coefficients are zero,
-            // so the FFT's zero-run shortcut applies.
-            lde_final_poly.coset_fft_with_options(
-                F::coset_shift().into(),
+            // Component-split (packed base-field) FFT with the zero-run
+            // shortcut: the top (1 - 1/2^rate_bits) coefficients are zero.
+            crate::fri::prover::coset_fft_ext_split(
+                &lde_final_poly,
+                F::coset_shift(),
                 Some(fri_params.config.rate_bits),
-                None,
             )
         );
 

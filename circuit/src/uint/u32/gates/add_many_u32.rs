@@ -12,8 +12,10 @@ use core::marker::PhantomData;
 
 use anyhow::Result;
 use plonky2::field::extension::Extendable;
+use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
 use plonky2::gates::gate::Gate;
+use plonky2::gates::packed_util::PackedEvaluableBase;
 use plonky2::gates::util::StridedConstraintConsumer;
 use plonky2::hash::hash_types::RichField;
 use plonky2::iop::ext_target::ExtensionTarget;
@@ -23,7 +25,10 @@ use plonky2::iop::wire::Wire;
 use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
-use plonky2::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBase};
+use plonky2::plonk::vars::{
+    EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch,
+    EvaluationVarsBasePacked,
+};
 use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
 
 use crate::utils::ceil_div_usize;
@@ -201,6 +206,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32AddManyGate
         }
     }
 
+    fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
+        self.eval_unfiltered_base_batch_packed(vars_base)
+    }
+
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,
@@ -291,6 +300,56 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32AddManyGate
 
     fn num_constraints(&self) -> usize {
         self.num_ops * (3 + Self::num_limbs())
+    }
+}
+
+impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
+    for U32AddManyGate<F, D>
+{
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+        &self,
+        vars: EvaluationVarsBasePacked<P>,
+        mut yield_constr: StridedConstraintConsumer<P>,
+    ) {
+        // limb_bits == 2: the degree-4 limb range product l(l-1)(l-2)(l-3)
+        // factors exactly as u(u+2) with u = l^2 - 3l, and multiplying the
+        // limb accumulators by the base 4 is two doublings. Field-exact.
+        debug_assert_eq!(Self::limb_bits(), 2);
+        let two = F::TWO;
+        let base32 = F::from_canonical_u64(1 << 32u64);
+
+        for i in 0..self.num_ops {
+            // Mirrors the scalar fold order: ((0 + a_0) + a_1) + ... + carry.
+            let mut computed_output = P::ZEROS;
+            for j in 0..self.num_addends {
+                computed_output = computed_output + vars.local_wires[self.wire_ith_op_jth_addend(i, j)];
+            }
+            computed_output = computed_output + vars.local_wires[self.wire_ith_carry(i)];
+
+            let output_result = vars.local_wires[self.wire_ith_output_result(i)];
+            let output_carry = vars.local_wires[self.wire_ith_output_carry(i)];
+            let combined_output = output_carry * base32 + output_result;
+
+            yield_constr.one(combined_output - computed_output);
+
+            let mut combined_result_limbs = P::ZEROS;
+            let mut combined_carry_limbs = P::ZEROS;
+            for j in (0..Self::num_limbs()).rev() {
+                let this_limb = vars.local_wires[self.wire_ith_output_jth_limb(i, j)];
+                let u = this_limb * this_limb - (this_limb + this_limb + this_limb);
+                yield_constr.one(u * (u + two));
+
+                if j < Self::num_result_limbs() {
+                    let doubled = combined_result_limbs + combined_result_limbs;
+                    combined_result_limbs = doubled + doubled + this_limb;
+                } else {
+                    let doubled = combined_carry_limbs + combined_carry_limbs;
+                    combined_carry_limbs = doubled + doubled + this_limb;
+                }
+            }
+            yield_constr.one(combined_result_limbs - output_result);
+            yield_constr.one(combined_carry_limbs - output_carry);
+        }
     }
 }
 

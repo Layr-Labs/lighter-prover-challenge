@@ -5,8 +5,10 @@ use core::marker::PhantomData;
 use anyhow::Result;
 
 use crate::field::extension::Extendable;
+use crate::field::packed::PackedField;
 use crate::field::types::Field;
 use crate::gates::gate::Gate;
+use crate::gates::packed_util::PackedEvaluableBase;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
 use crate::hash::poseidon2::config::*;
@@ -18,7 +20,10 @@ use crate::iop::wire::Wire;
 use crate::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use crate::plonk::circuit_builder::CircuitBuilder;
 use crate::plonk::circuit_data::CommonCircuitData;
-use crate::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBase};
+use crate::plonk::vars::{
+    EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch,
+    EvaluationVarsBasePacked,
+};
 use crate::util::serialization::{Buffer, IoResult, Read, Write};
 
 /// Evaluates a full Poseidon2 permutation with 12 state elements.
@@ -266,6 +271,10 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
         }
     }
 
+    fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
+        self.eval_unfiltered_base_batch_packed(vars_base)
+    }
+
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,
@@ -372,6 +381,135 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
 
     fn num_constraints(&self) -> usize {
         WIDTH * (ROUNDS_F - 1) + ROUNDS_P + WIDTH + 1 + 4
+    }
+}
+
+#[inline]
+fn add_rc_packed<P: PackedField>(state: &mut [P; WIDTH], external_round: usize) {
+    for i in 0..WIDTH {
+        state[i] += P::Scalar::from_canonical_u64(EXTERNAL_CONSTANTS[external_round][i]);
+    }
+}
+
+#[inline]
+fn sbox_p_packed<P: PackedField>(x: P) -> P {
+    let x2 = x * x;
+    let x4 = x2 * x2;
+    let x3 = x * x2;
+    x3 * x4
+}
+
+#[inline]
+fn mat4_packed<P: PackedField>(x: &mut [P]) {
+    let t01 = x[0] + x[1];
+    let t23 = x[2] + x[3];
+    let t0123 = t01 + t23;
+    let t01123 = t0123 + x[1];
+    let t01233 = t0123 + x[3];
+    // Overwrite x[0] and x[2] after x[1] and x[3], as in the scalar layers.
+    x[3] = t01233 + x[0].doubles();
+    x[1] = t01123 + x[2].doubles();
+    x[0] = t01123 + t01;
+    x[2] = t01233 + t23;
+}
+
+#[inline]
+fn external_linear_layer_packed<P: PackedField>(state: &mut [P; WIDTH]) {
+    for chunk in state.chunks_mut(4) {
+        mat4_packed(chunk);
+    }
+    let sums: [P; 4] = core::array::from_fn(|k| {
+        (0..WIDTH)
+            .step_by(4)
+            .map(|j| state[j + k])
+            .fold(P::ZEROS, |acc, x| acc + x)
+    });
+    for i in 0..WIDTH {
+        state[i] += sums[i % 4];
+    }
+}
+
+#[inline]
+fn internal_linear_layer_packed<P: PackedField>(state: &mut [P; WIDTH]) {
+    let sum = state.iter().fold(P::ZEROS, |acc, &x| acc + x);
+    for i in 0..WIDTH {
+        state[i] =
+            state[i] * P::Scalar::from_canonical_u64(MATRIX_DIAG_12_U64[i]) + sum;
+    }
+}
+
+impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> PackedEvaluableBase<F, D>
+    for Poseidon2Gate<F, D>
+{
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+        &self,
+        vars: EvaluationVarsBasePacked<P>,
+        mut yield_constr: StridedConstraintConsumer<P>,
+    ) {
+        // The packed layers compute the same field values as the scalar
+        // `Poseidon2` trait methods (all operations are exact field
+        // arithmetic), so every emitted constraint value is identical.
+        let swap = vars.local_wires[Self::WIRE_SWAP];
+        yield_constr.one(swap * swap - swap);
+
+        for i in 0..4 {
+            let input_lhs = vars.local_wires[Self::wire_input(i)];
+            let input_rhs = vars.local_wires[Self::wire_input(i + 4)];
+            let delta_i = vars.local_wires[Self::wire_delta(i)];
+            yield_constr.one(swap * (input_rhs - input_lhs) - delta_i);
+        }
+
+        let mut state = [P::ZEROS; WIDTH];
+        for i in 0..4 {
+            let delta_i = vars.local_wires[Self::wire_delta(i)];
+            state[i] = vars.local_wires[Self::wire_input(i)] + delta_i;
+            state[i + 4] = vars.local_wires[Self::wire_input(i + 4)] - delta_i;
+        }
+        for i in 8..WIDTH {
+            state[i] = vars.local_wires[Self::wire_input(i)];
+        }
+
+        external_linear_layer_packed(&mut state);
+
+        for r in 0..ROUNDS_F_HALF {
+            add_rc_packed(&mut state, r);
+            if r != 0 {
+                for i in 0..WIDTH {
+                    let sbox_in = vars.local_wires[Self::wire_full_sbox_0(r, i)];
+                    yield_constr.one(state[i] - sbox_in);
+                    state[i] = sbox_in;
+                }
+            }
+            for value in state.iter_mut() {
+                *value = sbox_p_packed(*value);
+            }
+            external_linear_layer_packed(&mut state);
+        }
+
+        for r in 0..ROUNDS_P {
+            state[0] += F::from_canonical_u64(INTERNAL_CONSTANTS[r]);
+            let sbox_in = vars.local_wires[Self::wire_partial_sbox(r)];
+            yield_constr.one(state[0] - sbox_in);
+            state[0] = sbox_p_packed(sbox_in);
+            internal_linear_layer_packed(&mut state);
+        }
+
+        for r in ROUNDS_F_HALF..ROUNDS_F {
+            add_rc_packed(&mut state, r);
+            for i in 0..WIDTH {
+                let sbox_in = vars.local_wires[Self::wire_full_sbox_1(r - ROUNDS_F_HALF, i)];
+                yield_constr.one(state[i] - sbox_in);
+                state[i] = sbox_in;
+            }
+            for value in state.iter_mut() {
+                *value = sbox_p_packed(*value);
+            }
+            external_linear_layer_packed(&mut state);
+        }
+
+        for i in 0..WIDTH {
+            yield_constr.one(state[i] - vars.local_wires[Self::wire_output(i)]);
+        }
     }
 }
 
