@@ -180,12 +180,12 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
     if r == 0 {
         reverse_index_bits_in_place(values);
     } else {
-        let repeat = 1 << r;
+        let block_len = 1 << r;
         let nonzero_len = n >> r;
         reverse_index_bits_in_place(&mut values[..nonzero_len]);
         for i in (0..nonzero_len).rev() {
             let value = values[i];
-            values[i * repeat..(i + 1) * repeat].fill(value);
+            values[i * block_len..(i + 1) * block_len].fill(value);
         }
     }
 
