@@ -121,7 +121,7 @@ fn run_generator_worklist<
 >(
     witness: &mut PartitionWitness<F>,
     prover_data: &ProverOnlyCircuitData<F, C, D>,
-    unresolved_watches: &mut [usize],
+    unresolved_watches: &mut [u32],
     generator_is_expired: &mut [bool],
     remaining_generators: &mut usize,
     mut pending_generator_indices: Vec<usize>,
@@ -152,7 +152,7 @@ fn run_generator_worklist<
             // records its generators in ready-set order, so the merge below observes ascending
             // generator-index order regardless of thread count.
             let round_witness: &PartitionWitness<F> = witness;
-            let round_unresolved_watches: &[usize] = unresolved_watches;
+            let round_unresolved_watches: &[u32] = unresolved_watches;
             let round_generator_is_expired: &[bool] = generator_is_expired;
             #[allow(clippy::type_complexity)]
             let round_outputs: Vec<(
@@ -280,7 +280,7 @@ pub struct PendingPartitionWitness<
     const D: usize,
 > {
     witness: PartitionWitness<'a, F>,
-    unresolved_watches: Vec<usize>,
+    unresolved_watches: Vec<u32>,
     generator_is_expired: Vec<bool>,
     remaining_generators: usize,
     prover_data: &'a ProverOnlyCircuitData<F, C, D>,
@@ -331,18 +331,22 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &prover_data.representative_map,
         );
 
+        let mut populated_input_reps = Vec::with_capacity(inputs.target_values.len());
         for (t, v) in inputs.target_values.into_iter() {
-            witness.set_target(t, v)?;
+            if let Some(rep) = witness.set_target_returning_rep(t, v)? {
+                populated_input_reps.push(rep);
+            }
         }
 
         // A simple generator can run once all of the distinct representatives it watches have
-        // values. Derive those unresolved counts from the existing watcher index so this remains
-        // local witness state and does not add anything to serialized prover data.
-        let mut unresolved_watches = vec![0usize; generators.len()];
-        for (&watch, watchers) in generator_indices_by_watches {
-            if !witness.is_set_by_rep_index(watch) {
+        // values. Start from the build-time totals and subtract only representatives populated by
+        // this witness's inputs, avoiding a full watcher-edge traversal for every start phase.
+        let mut unresolved_watches = prover_data.generator_watch_counts.clone();
+        for rep in populated_input_reps {
+            if let Some(watchers) = generator_indices_by_watches.get(&rep) {
                 for &generator_idx in watchers {
-                    unresolved_watches[generator_idx] += 1;
+                    debug_assert_ne!(unresolved_watches[generator_idx], 0);
+                    unresolved_watches[generator_idx] -= 1;
                 }
             }
         }
