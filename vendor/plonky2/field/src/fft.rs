@@ -163,8 +163,6 @@ fn fft_classic_simd<P: PackedField>(
 /// input may be non-zero, but the last 1 - 1/2^r entries are
 /// definitely zero.
 pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &FftRootTable<F>) {
-    reverse_index_bits_in_place(values);
-
     let n = values.len();
     let lg_n = log2_strict(n);
 
@@ -176,18 +174,18 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
         );
     }
 
-    // After reverse_index_bits, the only non-zero elements of values
-    // are at indices i*2^r for i = 0..n/2^r.  The loop below copies
-    // the value at i*2^r to the positions [i*2^r + 1, i*2^r + 2, ...,
-    // (i+1)*2^r - 1]; i.e. it replaces the 2^r - 1 zeros following
-    // element i*2^r with the value at i*2^r.  This corresponds to the
-    // first r rounds of the FFT when there are 2^r zeros at the end
-    // of the original input.
-    if r > 0 {
-        // if r == 0 then this loop is a noop.
-        let mask = !((1 << r) - 1);
-        for i in 0..n {
-            values[i] = values[i & mask];
+    // After bit reversal, a zero-extended input consists of 2^r copies of each
+    // value in the bit-reversed nonzero prefix. Reverse only that prefix, then
+    // expand it backwards so unread values are never overwritten.
+    if r == 0 {
+        reverse_index_bits_in_place(values);
+    } else {
+        let repeat = 1 << r;
+        let nonzero_len = n >> r;
+        reverse_index_bits_in_place(&mut values[..nonzero_len]);
+        for i in (0..nonzero_len).rev() {
+            let value = values[i];
+            values[i * repeat..(i + 1) * repeat].fill(value);
         }
     }
 
