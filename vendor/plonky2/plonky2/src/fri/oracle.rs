@@ -43,6 +43,13 @@ pub(crate) enum BatchLayout {
     PolyMajor,
 }
 
+#[inline]
+fn resize_reusable_output<F: Field>(out: &mut Vec<F>, len: usize) {
+    // Every caller overwrites the full requested range. Preserve an already
+    // initialized prefix so reused scratch buffers do not get zeroed first.
+    out.resize(len, F::ZERO);
+}
+
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
 #[derive(Eq, PartialEq, Debug)]
 pub struct PolynomialBatch<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
@@ -246,8 +253,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let n = indices.len();
         let start = col_range.start;
         let w = col_range.len();
-        out.clear();
-        out.resize(n * w, F::ZERO);
+        resize_reusable_output(out, n * w);
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
                 for (ci, c) in col_range.enumerate() {
@@ -408,14 +414,16 @@ mod tests {
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::Sample;
+    use crate::hash::merkle_tree::{ColumnStore, MerkleLeaves};
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    const D: usize = 2;
+    type F = GoldilocksField;
+    type C = Poseidon2GoldilocksConfig;
 
     #[test]
     fn shared_coset_powers_match_per_polynomial_shifts() {
-        const D: usize = 2;
         const RATE_BITS: usize = 3;
-        type F = GoldilocksField;
-        type C = Poseidon2GoldilocksConfig;
 
         let polynomials = (0..7)
             .map(|_| PolynomialCoeffs::new(F::rand_vec(1 << 8)))
@@ -432,5 +440,113 @@ mod tests {
         let actual = PolynomialBatch::<F, C, D>::lde_values(&polynomials, RATE_BITS, false, None);
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn reusable_output_resize_preserves_initialized_prefix() {
+        let poison = F::NEG_ONE;
+
+        let mut equal = vec![poison; 9];
+        resize_reusable_output(&mut equal, 9);
+        assert_eq!(equal, vec![poison; 9]);
+
+        let mut oversized = vec![poison; 13];
+        resize_reusable_output(&mut oversized, 9);
+        assert_eq!(oversized, vec![poison; 9]);
+
+        let mut undersized = vec![poison; 5];
+        resize_reusable_output(&mut undersized, 9);
+        assert_eq!(&undersized[..5], &[poison; 5]);
+        assert_eq!(&undersized[5..], &[F::ZERO; 4]);
+    }
+
+    fn batch_test_columns() -> Vec<Vec<F>> {
+        (0..5)
+            .map(|column| {
+                (0..8)
+                    .map(|row| F::from_canonical_usize(column * 100 + row + 1))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn batch_test_oracle(columns: &[Vec<F>], column_major: bool) -> PolynomialBatch<F, C, D> {
+        let num_rows = columns[0].len();
+        let log_rows = log2_strict(num_rows);
+        let leaves = if column_major {
+            MerkleLeaves::Columns {
+                columns: ColumnStore::Owned(columns.to_vec()),
+                log_rows,
+            }
+        } else {
+            let mut data = Vec::with_capacity(num_rows * columns.len());
+            for tree_row in 0..num_rows {
+                let natural_row = reverse_bits(tree_row, log_rows);
+                for column in columns {
+                    data.push(column[natural_row]);
+                }
+            }
+            MerkleLeaves::Rows {
+                data,
+                width: columns.len(),
+            }
+        };
+        let mut merkle_tree =
+            MerkleTree::<F, <C as GenericConfig<D>>::Hasher>::default();
+        merkle_tree.leaves = leaves;
+        merkle_tree.num_leaves = num_rows;
+        PolynomialBatch {
+            polynomials: Vec::new(),
+            merkle_tree,
+            degree_log: log_rows,
+            rate_bits: 0,
+            blinding: false,
+        }
+    }
+
+    fn expected_batch(
+        columns: &[Vec<F>],
+        indices: &[usize],
+        col_range: core::ops::Range<usize>,
+        layout: BatchLayout,
+    ) -> Vec<F> {
+        let width = col_range.len();
+        let mut expected = vec![F::ZERO; indices.len() * width];
+        for (column_offset, column) in columns[col_range].iter().enumerate() {
+            for (point, &index) in indices.iter().enumerate() {
+                let destination = match layout {
+                    BatchLayout::PointMajor => point * width + column_offset,
+                    BatchLayout::PolyMajor => column_offset * indices.len() + point,
+                };
+                expected[destination] = column[index];
+            }
+        }
+        expected
+    }
+
+    #[test]
+    fn fill_lde_batch_overwrites_poisoned_reusable_outputs_on_56bbe17_frontier() {
+        let columns = batch_test_columns();
+        let indices = [0, 2, 5];
+        let col_range = 1..4;
+        let expected_len = indices.len() * col_range.len();
+
+        for column_major in [false, true] {
+            let oracle = batch_test_oracle(&columns, column_major);
+            for layout in [BatchLayout::PointMajor, BatchLayout::PolyMajor] {
+                let expected = expected_batch(&columns, &indices, col_range.clone(), layout);
+                for initial_len in [expected_len - 4, expected_len, expected_len + 4] {
+                    let mut actual = vec![F::NEG_ONE; initial_len];
+                    oracle.fill_lde_batch(
+                        &indices,
+                        1,
+                        col_range.clone(),
+                        layout,
+                        &mut actual,
+                    );
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
     }
 }
