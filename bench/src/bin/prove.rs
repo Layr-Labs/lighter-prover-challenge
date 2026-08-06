@@ -26,12 +26,28 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
+// A worker that runs anywhere near this long has already lost (the ranked
+// budget is 15 minutes for five fixtures); exiting with the current phase as
+// the status code turns an opaque harness timeout into a diagnosable failure
+// line in the workflow log. Codes: 44 startup, 45 fixture parsed, 46 loading
+// circuits, 47 circuits ready, 48 proving, 49 writing proof.
+const STALL_WATCHDOG_SECONDS: u64 = 300;
+
 fn main() {
     env_logger::init();
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
         .expect("cannot configure prover thread pool");
+    std::thread::Builder::new()
+        .name("stall-watchdog".into())
+        .spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(STALL_WATCHDOG_SECONDS));
+            std::process::exit(
+                api::WORKER_PHASE.load(std::sync::atomic::Ordering::Relaxed) as i32
+            );
+        })
+        .expect("stall watchdog thread must start");
 
     let mut args = env::args().skip(1);
     let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
@@ -47,7 +63,11 @@ fn main() {
         PUBLIC_LIGHT_TX_COUNT,
     )
     .expect("invalid prover fixture");
-    let proof = prover::prove_block(block, &Circuits::new());
+    api::set_worker_phase(46);
+    let circuits = Circuits::new();
+    api::set_worker_phase(48);
+    let proof = prover::prove_block(block, &circuits);
+    api::set_worker_phase(49);
     bincode::serialize_into(
         BufWriter::with_capacity(
             PROOF_OUTPUT_BUFFER_BYTES,

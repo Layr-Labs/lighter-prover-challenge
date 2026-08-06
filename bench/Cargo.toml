@@ -42,6 +42,13 @@ clap_derive = { workspace = true }
 tiny-keccak =  { workspace = true }
 paste = { workspace = true }
 circuit = { path = "../circuit", default-features = true }
+zstd = "0.13"
+
+[build-dependencies]
+circuit = { path = "../circuit", default-features = true }
+plonky2 = { workspace = true, default-features = true }
+rayon = { workspace = true }
+zstd = "0.13"
 
 [dev-dependencies]
 flate2 = "1.0"

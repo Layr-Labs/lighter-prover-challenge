@@ -526,10 +526,15 @@ mod tests {
         use circuit::types::constants::TX_TYPE_EMPTY;
         use plonky2::field::types::{Field, PrimeField64};
 
-        use crate::api::{LIGHT_TX_MODE, PathCircuits};
+        use crate::api::{LIGHT_TX_MODE, PathCircuits, cache_bytes};
 
         let build_start = Instant::now();
-        let circuits = PathCircuits::new(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE);
+        let circuits = PathCircuits::new(
+            LIGHT_TX_PER_PROOF,
+            LIGHT_TX_MODE,
+            cache_bytes::LIGHT_TX,
+            cache_bytes::LIGHT_CHAIN,
+        );
         println!("light path circuits built in {:?}", build_start.elapsed());
 
         let block = Block::<F>::from_json_with_empty_txs(
