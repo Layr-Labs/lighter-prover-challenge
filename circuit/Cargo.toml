@@ -34,6 +34,7 @@ serde = { workspace = true }
 rayon = { workspace = true }
 serde_with = { workspace = true }
 serde_json = { workspace = true }
+simd-json = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 log = { workspace = true }

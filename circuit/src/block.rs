@@ -154,7 +154,45 @@ where
         heavy_empty_tx_count: usize,
         light_empty_tx_count: usize,
     ) -> serde_json::Result<Self> {
-        let mut block: Self = serde_json::from_slice(data)?;
+        let block: Self = serde_json::from_slice(data)?;
+        Self::with_empty_txs(
+            block,
+            tx_per_proof,
+            light_tx_per_proof,
+            heavy_empty_tx_count,
+            light_empty_tx_count,
+        )
+    }
+
+    /// SIMD-accelerated variant of [`Self::from_json_with_empty_txs`] for
+    /// callers that own the byte buffer: simd-json parses in place through the
+    /// same serde derives and custom deserializers, producing an identical
+    /// block. The buffer contents are destroyed by parsing.
+    pub fn from_json_bytes_with_empty_txs(
+        data: &mut [u8],
+        tx_per_proof: usize,
+        light_tx_per_proof: usize,
+        heavy_empty_tx_count: usize,
+        light_empty_tx_count: usize,
+    ) -> serde_json::Result<Self> {
+        let block: Self =
+            simd_json::serde::from_slice(data).map_err(serde::de::Error::custom)?;
+        Self::with_empty_txs(
+            block,
+            tx_per_proof,
+            light_tx_per_proof,
+            heavy_empty_tx_count,
+            light_empty_tx_count,
+        )
+    }
+
+    fn with_empty_txs(
+        mut block: Self,
+        tx_per_proof: usize,
+        light_tx_per_proof: usize,
+        heavy_empty_tx_count: usize,
+        light_empty_tx_count: usize,
+    ) -> serde_json::Result<Self> {
         let mut txs = std::mem::take(&mut block.txs);
         // The block's witness ends with a single empty tx (older witnesses may carry one
         // per circuit type), kept aside as the template for all padding.
