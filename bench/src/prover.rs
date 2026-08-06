@@ -336,12 +336,20 @@ fn prove_path(
 }
 
 pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
-    let pre_proof = BlockPreExecutionCircuit::prove(
-        &circuits.pre_data,
-        &BlockPreExec::from_block(&block),
-        &circuits.pre_target,
-    )
-    .expect("block pre-execution proof failed");
+    std::thread::scope(|scope| {
+        // Circuit construction is independent of pre-execution proving. Start
+        // it before the pre-proof so the two expensive phases overlap.
+        let block_circuit_handle = std::thread::Builder::new()
+            .name("block-circuit-build".into())
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, || circuits.build_block_circuit())
+            .expect("block circuit build thread must start");
+        let pre_proof = BlockPreExecutionCircuit::prove(
+            &circuits.pre_data,
+            &BlockPreExec::from_block(&block),
+            &circuits.pre_target,
+        )
+        .expect("block pre-execution proof failed");
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
@@ -358,16 +366,8 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     block.tx_chunks = tx_chunks;
     block.tx_chunks.push(Vec::new());
 
-    let (light_chain_proof, heavy_chain_proof, block_target, block_data) =
+    let (light_chain_proof, heavy_chain_proof) =
         std::thread::scope(|scope| {
-            // The final block circuit depends only on already-built circuit data
-            // and is not needed until the final proof, so it builds concurrently
-            // with the entire transaction/chain proving pipeline.
-            let block_circuit_handle = std::thread::Builder::new()
-                .name("block-circuit-build".into())
-                .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, || circuits.build_block_circuit())
-                .expect("block circuit build thread must start");
             let heavy_handle = std::thread::Builder::new()
                 .name("heavy-tx-chain".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -397,16 +397,12 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
             let heavy_chain_proof = heavy_handle
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            let (block_target, block_data) = block_circuit_handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            (
-                light_chain_proof,
-                heavy_chain_proof,
-                block_target,
-                block_data,
-            )
+            (light_chain_proof, heavy_chain_proof)
         });
+
+    let (block_target, block_data) = block_circuit_handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 
     let (light_chain_input, heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
@@ -419,6 +415,7 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
         heavy_chain_input,
     )
     .expect("final block proof failed")
+    })
 }
 
 #[cfg(test)]
