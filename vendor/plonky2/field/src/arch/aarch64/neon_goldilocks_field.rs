@@ -191,6 +191,19 @@ unsafe impl PackedField for NeonGoldilocksField {
             _ => panic!("unsupported block length"),
         }
     }
+
+    #[inline]
+    fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
+        let (lane0, lane1) = mul_add_reduce_pair(
+            self.0[0].0,
+            x.0[0].0,
+            y.0[0].0,
+            self.0[1].0,
+            x.0[1].0,
+            y.0[1].0,
+        );
+        Self([GoldilocksField(lane0), GoldilocksField(lane1)])
+    }
 }
 
 impl Square for NeonGoldilocksField {
@@ -310,6 +323,84 @@ fn mul_reduce_pair(a0: u64, b0: u64, a1: u64, b1: u64) -> (u64, u64) {
     (result0, result1)
 }
 
+/// Reduce two independent `accumulator + lhs * rhs` values modulo
+/// `2^64 - 2^32 + 1`, interleaving both reduction chains for ILP.
+///
+/// `adds` plus `adc` constructs the exact 128-bit value used by scalar
+/// `Field::multiply_accumulate`. The maximum possible sum is `2^128 - 2^64`, so the carry into
+/// the product-high word cannot overflow it.
+#[inline(always)]
+fn mul_add_reduce_pair(
+    accumulator0: u64,
+    lhs0: u64,
+    rhs0: u64,
+    accumulator1: u64,
+    lhs1: u64,
+    rhs1: u64,
+) -> (u64, u64) {
+    let result0: u64;
+    let result1: u64;
+
+    unsafe {
+        asm!(
+            "mul   {lo0}, {lhs0}, {rhs0}",
+            "mul   {lo1}, {lhs1}, {rhs1}",
+            "umulh {hi0}, {lhs0}, {rhs0}",
+            "umulh {hi1}, {lhs1}, {rhs1}",
+            "adds  {lo0}, {lo0}, {accumulator0}",
+            "adc   {hi0}, {hi0}, xzr",
+            "adds  {lo1}, {lo1}, {accumulator1}",
+            "adc   {hi1}, {hi1}, xzr",
+            "lsr   {hi_hi0}, {hi0}, #32",
+            "lsr   {hi_hi1}, {hi1}, #32",
+            "subs  {tmp0}, {lo0}, {hi_hi0}",
+            "csetm {adjust0:w}, cc",
+            "subs  {tmp1}, {lo1}, {hi_hi1}",
+            "csetm {adjust1:w}, cc",
+            "sub   {tmp0}, {tmp0}, {adjust0}",
+            "sub   {tmp1}, {tmp1}, {adjust1}",
+            "and   {hi_lo0}, {hi0}, {epsilon}",
+            "and   {hi_lo1}, {hi1}, {epsilon}",
+            "lsl   {fold0}, {hi_lo0}, #32",
+            "lsl   {fold1}, {hi_lo1}, #32",
+            "sub   {fold0}, {fold0}, {hi_lo0}",
+            "sub   {fold1}, {fold1}, {hi_lo1}",
+            "adds  {result0}, {tmp0}, {fold0}",
+            "csetm {adjust0:w}, cs",
+            "adds  {result1}, {tmp1}, {fold1}",
+            "csetm {adjust1:w}, cs",
+            "add   {result0}, {result0}, {adjust0}",
+            "add   {result1}, {result1}, {adjust1}",
+            accumulator0 = in(reg) accumulator0,
+            lhs0 = in(reg) lhs0,
+            rhs0 = in(reg) rhs0,
+            accumulator1 = in(reg) accumulator1,
+            lhs1 = in(reg) lhs1,
+            rhs1 = in(reg) rhs1,
+            epsilon = in(reg) GoldilocksField::ORDER.wrapping_neg(),
+            lo0 = out(reg) _,
+            lo1 = out(reg) _,
+            hi0 = out(reg) _,
+            hi1 = out(reg) _,
+            hi_hi0 = out(reg) _,
+            hi_hi1 = out(reg) _,
+            tmp0 = out(reg) _,
+            tmp1 = out(reg) _,
+            hi_lo0 = out(reg) _,
+            hi_lo1 = out(reg) _,
+            fold0 = out(reg) _,
+            fold1 = out(reg) _,
+            adjust0 = out(reg) _,
+            adjust1 = out(reg) _,
+            result0 = out(reg) result0,
+            result1 = out(reg) result1,
+            options(pure, nomem, nostack),
+        );
+    }
+
+    (result0, result1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::NeonGoldilocksField;
@@ -350,6 +441,18 @@ mod tests {
                 assert_eq!((a * scalar).0, [a.0[0] * scalar, a.0[1] * scalar]);
                 assert_eq!((-a).0, [-a.0[0], -a.0[1]]);
                 assert_eq!(a.square().0, [a.0[0].square(), a.0[1].square()]);
+
+                for k in 0..values.len() {
+                    let accumulator =
+                        NeonGoldilocksField([values[k], values[(k + 11) % values.len()]]);
+                    assert_eq!(
+                        accumulator.multiply_accumulate(a, b).0,
+                        [
+                            Field::multiply_accumulate(&accumulator.0[0], a.0[0], b.0[0]),
+                            Field::multiply_accumulate(&accumulator.0[1], a.0[1], b.0[1]),
+                        ]
+                    );
+                }
             }
         }
     }

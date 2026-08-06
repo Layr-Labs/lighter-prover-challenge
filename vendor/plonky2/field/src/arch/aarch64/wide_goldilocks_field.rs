@@ -216,12 +216,10 @@ unsafe impl PackedField for WideGoldilocksField {
 
     #[inline]
     fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
-        let out = self.lanes();
-        let lhs = x.lanes();
-        let rhs = y.lanes();
-        Self::from_lanes(core::array::from_fn(|lane| {
-            Field::multiply_accumulate(&out[lane], lhs[lane], rhs[lane])
-        }))
+        Self([
+            self.0[0].multiply_accumulate(x.0[0], y.0[0]),
+            self.0[1].multiply_accumulate(x.0[1], y.0[1]),
+        ])
     }
 }
 
@@ -448,6 +446,20 @@ mod tests {
                     packed_a.square().as_slice(),
                     core::array::from_fn::<_, 4, _>(|lane| a[lane].square())
                 );
+
+                for k in 0..values.len() {
+                    let accumulator: [GoldilocksField; 4] =
+                        core::array::from_fn(|lane| values[(k + 5 * lane) % values.len()]);
+                    let packed_accumulator = *WideGoldilocksField::from_slice(&accumulator);
+                    assert_eq!(
+                        packed_accumulator
+                            .multiply_accumulate(packed_a, packed_b)
+                            .as_slice(),
+                        core::array::from_fn::<_, 4, _>(|lane| {
+                            Field::multiply_accumulate(&accumulator[lane], a[lane], b[lane])
+                        })
+                    );
+                }
             }
         }
     }
