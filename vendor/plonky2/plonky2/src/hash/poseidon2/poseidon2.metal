@@ -94,10 +94,25 @@ inline ulong gl_mul(ulong a, ulong b) {
     ulong result = reduced + addend;
     return result + (result < reduced) * GOLDILOCKS_EPSILON;
 #else
-    ulong low = a * b;
-    ulong high = metal::mulhi(a, b);
-    uint l0 = (uint)low;
-    uint l1 = (uint)(low >> 32);
+    // One 128-bit product built from four 32x32->64 multiplies. Calling `a * b`
+    // and `mulhi(a, b)` separately recomputes the shared cross terms a0*b1 and
+    // a1*b0, which the 64-bit ops are themselves synthesized from.
+    uint a0 = (uint)a;
+    uint a1 = (uint)(a >> 32);
+    uint b0 = (uint)b;
+    uint b1 = (uint)(b >> 32);
+
+    ulong p00 = (ulong)a0 * (ulong)b0;
+    ulong p01 = (ulong)a0 * (ulong)b1;
+    ulong p10 = (ulong)a1 * (ulong)b0;
+    ulong p11 = (ulong)a1 * (ulong)b1;
+
+    // middle = high(p00) + low(p01) + low(p10); cannot overflow 64 bits.
+    ulong middle = (p00 >> 32) + (ulong)(uint)p01 + (ulong)(uint)p10;
+
+    uint l0 = (uint)p00;
+    uint l1 = (uint)middle;
+    ulong high = p11 + (p01 >> 32) + (p10 >> 32) + (middle >> 32);
     uint h0 = (uint)high;
     uint h1 = (uint)(high >> 32);
 
