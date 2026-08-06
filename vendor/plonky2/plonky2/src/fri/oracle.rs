@@ -7,7 +7,7 @@ use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::batch_multiply_inplace;
 use crate::field::extension::Extendable;
-use crate::field::fft::FftRootTable;
+use crate::field::fft::{ifft_with_options, FftRootTable};
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
@@ -107,10 +107,15 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             }
         }
 
+        let degree_bits = log2_strict(values[0].len());
+        let ifft_root_table = fft_root_table.map(|table| &table[..degree_bits]);
         let coeffs = timed!(
             timing,
             "IFFT",
-            values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
+            values
+                .into_par_iter()
+                .map(|v| ifft_with_options(v, None, ifft_root_table))
+                .collect::<Vec<_>>()
         );
 
         Self::from_coeffs(
