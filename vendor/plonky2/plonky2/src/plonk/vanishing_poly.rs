@@ -176,6 +176,116 @@ pub(crate) struct VanishingScratch<F> {
     pub constraint_terms_batch: Vec<F>,
 }
 
+#[inline(always)]
+fn for_each_permutation_partial_product_term_rev<F, W, C>(
+    local_wires: &W,
+    s_sigmas: &[F],
+    beta_k_is: &[F],
+    x: F,
+    beta: F,
+    gamma: F,
+    partials: &[F],
+    z_x: F,
+    z_gx: F,
+    max_degree: usize,
+    mut consume: C,
+) where
+    F: Field,
+    W: core::ops::Index<usize, Output = F> + ?Sized,
+    C: FnMut(F),
+{
+    debug_assert!(max_degree > 1);
+    let num_wires = s_sigmas.len();
+    debug_assert!(num_wires > 0);
+    debug_assert_eq!(beta_k_is.len(), num_wires);
+    let num_chunks = num_wires.div_ceil(max_degree);
+    debug_assert_eq!(partials.len() + 1, num_chunks);
+
+    for chunk in (0..num_chunks).rev() {
+        let chunk_start = chunk * max_degree;
+        let chunk_end = min(chunk_start + max_degree, num_wires);
+        let mut numerator_product = F::ONE;
+        let mut denominator_product = F::ONE;
+        for j in chunk_start..chunk_end {
+            let wire_value = local_wires[j];
+            numerator_product *= wire_value + beta_k_is[j] * x + gamma;
+            denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
+        }
+
+        let prev_acc = if chunk == 0 { z_x } else { partials[chunk - 1] };
+        let next_acc = if chunk + 1 == num_chunks {
+            z_gx
+        } else {
+            partials[chunk]
+        };
+        consume(prev_acc * numerator_product - next_acc * denominator_product);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn reduce_no_lookup_vanishing_terms_streamed<F, W, I>(
+    local_wires: &W,
+    s_sigmas: &[F],
+    beta_k_is: &[F],
+    local_zs: &[F],
+    next_zs: &[F],
+    partial_products: &[F],
+    betas: &[F],
+    gammas: &[F],
+    alphas: &[F],
+    x: F,
+    l_0_x: F,
+    max_degree: usize,
+    constraint_terms_rev: I,
+    res: &mut [F],
+) where
+    F: RichField,
+    W: core::ops::Index<usize, Output = F> + ?Sized,
+    I: IntoIterator<Item = F>,
+{
+    let num_challenges = betas.len();
+    let num_wires = s_sigmas.len();
+    let num_prods = num_wires.div_ceil(max_degree) - 1;
+    debug_assert!(num_challenges > 0);
+    debug_assert!(num_wires > 0);
+    debug_assert_eq!(gammas.len(), num_challenges);
+    debug_assert_eq!(alphas.len(), num_challenges);
+    debug_assert_eq!(local_zs.len(), num_challenges);
+    debug_assert_eq!(next_zs.len(), num_challenges);
+    debug_assert_eq!(beta_k_is.len(), num_challenges * num_wires);
+    debug_assert_eq!(partial_products.len(), num_challenges * num_prods);
+    debug_assert_eq!(res.len(), num_challenges);
+
+    let mut consume = |term: F| {
+        for (acc, &alpha) in res.iter_mut().zip(alphas) {
+            *acc = term.multiply_accumulate(*acc, alpha);
+        }
+    };
+
+    for term in constraint_terms_rev {
+        consume(term);
+    }
+    for i in (0..num_challenges).rev() {
+        for_each_permutation_partial_product_term_rev(
+            local_wires,
+            s_sigmas,
+            &beta_k_is[i * num_wires..(i + 1) * num_wires],
+            x,
+            betas[i],
+            gammas[i],
+            &partial_products[i * num_prods..(i + 1) * num_prods],
+            local_zs[i],
+            next_zs[i],
+            max_degree,
+            &mut consume,
+        );
+    }
+    for i in (0..num_challenges).rev() {
+        consume(l_0_x * local_zs[i].sub_one());
+    }
+}
+
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
 ///
 /// Results are stored point-major: the challenges for point `k` occupy
@@ -287,6 +397,27 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         let constraint_terms = PackedStridedView::new(constraint_terms_batch, n, k);
 
         let l_0_x = z_h_on_coset.eval_l_0(index, x);
+        if !has_lookup {
+            let res = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
+            reduce_no_lookup_vanishing_terms_streamed(
+                &vars.local_wires,
+                s_sigmas,
+                beta_k_is,
+                local_zs,
+                next_zs,
+                partial_products,
+                betas,
+                gammas,
+                alphas,
+                x,
+                l_0_x,
+                max_degree,
+                constraint_terms.into_iter().rev().copied(),
+                res,
+            );
+            continue;
+        }
+
         for i in 0..num_challenges {
             let z_x = local_zs[i];
             let z_gx = next_zs[i];
@@ -734,8 +865,175 @@ pub fn evaluate_gate_constraints_base_batch<F: RichField + Extendable<D>, const 
     vars_batch: EvaluationVarsBaseBatch<F>,
 ) -> Vec<F> {
     let mut constraints_batch = Vec::new();
-    evaluate_gate_constraints_base_batch_into::<F, D>(common_data, vars_batch, &mut constraints_batch);
+    evaluate_gate_constraints_base_batch_into::<F, D>(
+        common_data,
+        vars_batch,
+        &mut constraints_batch,
+    );
     constraints_batch
+}
+
+#[cfg(test)]
+mod streaming_permutation_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::{Field64, PrimeField64};
+
+    #[test]
+    fn reverse_streamed_permutation_terms_match_materialized_reference() {
+        type F = GoldilocksField;
+
+        for (num_wires, max_degree) in [(80, 8), (11, 4)] {
+            let local_wires = (0..num_wires)
+                .map(|j| F::from_canonical_usize(3 * j + 5))
+                .collect::<Vec<_>>();
+            let s_sigmas = (0..num_wires)
+                .map(|j| F::from_canonical_usize(7 * j + 11))
+                .collect::<Vec<_>>();
+            let beta_k_is = (0..num_wires)
+                .map(|j| F::from_canonical_usize(13 * j + 17))
+                .collect::<Vec<_>>();
+            let x = F::from_canonical_u64(23);
+            let beta = F::from_canonical_u64(29);
+            let gamma = F::from_canonical_u64(31);
+            let z_x = F::from_canonical_u64(37);
+            let z_gx = F::from_canonical_u64(41);
+            let num_chunks = num_wires.div_ceil(max_degree);
+            let partials = (0..num_chunks - 1)
+                .map(|j| F::from_canonical_usize(43 + 5 * j))
+                .collect::<Vec<_>>();
+
+            let numerators = (0..num_wires)
+                .map(|j| local_wires[j] + beta_k_is[j] * x + gamma)
+                .collect::<Vec<_>>();
+            let denominators = (0..num_wires)
+                .map(|j| local_wires[j] + beta * s_sigmas[j] + gamma)
+                .collect::<Vec<_>>();
+            let expected = check_partial_products(
+                &numerators,
+                &denominators,
+                &partials,
+                z_x,
+                z_gx,
+                max_degree,
+            )
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+
+            let mut actual = Vec::<F>::new();
+            for_each_permutation_partial_product_term_rev(
+                &local_wires,
+                &s_sigmas,
+                &beta_k_is,
+                x,
+                beta,
+                gamma,
+                &partials,
+                z_x,
+                z_gx,
+                max_degree,
+                |term: F| actual.push(term),
+            );
+
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_no_lookup_reduction_matches_materialized_reference() {
+        type F = GoldilocksField;
+
+        let num_wires: usize = 11;
+        let max_degree: usize = 4;
+        let num_challenges: usize = 2;
+        let num_prods = num_wires.div_ceil(max_degree) - 1;
+        let local_wires = (0..num_wires)
+            .map(|j| F::from_canonical_usize(3 * j + 5))
+            .collect::<Vec<_>>();
+        let s_sigmas = (0..num_wires)
+            .map(|j| F::from_canonical_usize(7 * j + 11))
+            .collect::<Vec<_>>();
+        let beta_k_is = (0..num_challenges * num_wires)
+            .map(|j| F::from_canonical_usize(13 * j + 17))
+            .collect::<Vec<_>>();
+        let partial_products = (0..num_challenges * num_prods)
+            .map(|j| F::from_canonical_usize(19 * j + 23))
+            .collect::<Vec<_>>();
+        let local_zs = [F::from_canonical_u64(29), F::from_canonical_u64(31)];
+        let next_zs = [F::from_canonical_u64(37), F::from_canonical_u64(41)];
+        let betas = [F::from_canonical_u64(43), F::from_canonical_u64(47)];
+        let gammas = [F::from_canonical_u64(53), F::from_canonical_u64(59)];
+        let alphas = [F::from_canonical_u64(61), F::from_canonical_u64(67)];
+        let constraint_terms = (0..7)
+            .map(|j| F::from_canonical_usize(71 + 5 * j))
+            .collect::<Vec<_>>();
+        let x = F::from_canonical_u64(107);
+        let l_0_x = F::from_canonical_u64(109);
+
+        let mut z_1_terms = Vec::new();
+        let mut partial_product_terms = Vec::new();
+        for i in 0..num_challenges {
+            z_1_terms.push(l_0_x * local_zs[i].sub_one());
+            let numerators = (0..num_wires)
+                .map(|j| local_wires[j] + beta_k_is[i * num_wires + j] * x + gammas[i])
+                .collect::<Vec<_>>();
+            let denominators = (0..num_wires)
+                .map(|j| local_wires[j] + betas[i] * s_sigmas[j] + gammas[i])
+                .collect::<Vec<_>>();
+            partial_product_terms.extend(check_partial_products(
+                &numerators,
+                &denominators,
+                &partial_products[i * num_prods..(i + 1) * num_prods],
+                local_zs[i],
+                next_zs[i],
+                max_degree,
+            ));
+        }
+        let mut expected = [F::ZERO; 2];
+        for &term in z_1_terms
+            .iter()
+            .chain(partial_product_terms.iter())
+            .chain(constraint_terms.iter())
+            .rev()
+        {
+            for (acc, &alpha) in expected.iter_mut().zip(&alphas) {
+                *acc = term.multiply_accumulate(*acc, alpha);
+            }
+        }
+
+        let mut actual = [F::ZERO; 2];
+        reduce_no_lookup_vanishing_terms_streamed(
+            &local_wires,
+            &s_sigmas,
+            &beta_k_is,
+            &local_zs,
+            &next_zs,
+            &partial_products,
+            &betas,
+            &gammas,
+            &alphas,
+            x,
+            l_0_x,
+            max_degree,
+            constraint_terms.iter().rev().copied(),
+            &mut actual,
+        );
+
+        assert_eq!(
+            actual.map(|value| value.to_noncanonical_u64()),
+            expected.map(|value| value.to_noncanonical_u64())
+        );
+    }
 }
 
 /// Like [`evaluate_gate_constraints_base_batch`], but reuses the caller's buffer.
