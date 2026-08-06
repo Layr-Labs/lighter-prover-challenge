@@ -223,19 +223,10 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
         let half = num_leaves / 2;
         let (left_leaves, right_leaves) = leaves.split_at(half * leaf_width);
 
-        // Rayon task creation dominates the tiny subtrees near the leaves. Keep
-        // enough parallelism at the upper levels, then recurse synchronously.
-        let (left_digest, right_digest) = if num_leaves > 32 {
-            plonky2_maybe_rayon::join(
-                || fill_subtree_flat::<F, H>(left_digests_buf, left_leaves, leaf_width, half),
-                || fill_subtree_flat::<F, H>(right_digests_buf, right_leaves, leaf_width, half),
-            )
-        } else {
-            (
-                fill_subtree_flat::<F, H>(left_digests_buf, left_leaves, leaf_width, half),
-                fill_subtree_flat::<F, H>(right_digests_buf, right_leaves, leaf_width, half),
-            )
-        };
+        let (left_digest, right_digest) = plonky2_maybe_rayon::join(
+            || fill_subtree_flat::<F, H>(left_digests_buf, left_leaves, leaf_width, half),
+            || fill_subtree_flat::<F, H>(right_digests_buf, right_leaves, leaf_width, half),
+        );
 
         left_digest_mem.write(left_digest);
         right_digest_mem.write(right_digest);

@@ -283,12 +283,24 @@ impl<F: Field> PolynomialCoeffs<F> {
         zero_factor: Option<usize>,
         root_table: Option<&FftRootTable<F>>,
     ) -> PolynomialValues<F> {
-        let modified_poly: Self = shift
-            .powers()
-            .zip(&self.coeffs)
-            .map(|(r, &c)| r * c)
-            .collect::<Vec<_>>()
-            .into();
+        let n = self.coeffs.len();
+        // By the zero_factor contract, only the first nonzero_len = n >> r
+        // coefficients can be nonzero; the rest are zero and stay zero after the
+        // shift multiplication. Skip the shift multiplication for that zero tail
+        // (same traffic-reduction idea as fft_classic prefix-only bit-reversal).
+        let nonzero_len = match zero_factor {
+            Some(r) => n >> r,
+            None => n,
+        };
+        let mut modified_coeffs: Vec<F> = Vec::with_capacity(n);
+        modified_coeffs.extend(
+            shift
+                .powers()
+                .zip(&self.coeffs[..nonzero_len])
+                .map(|(r, &c)| r * c),
+        );
+        modified_coeffs.resize(n, F::ZERO);
+        let modified_poly: Self = modified_coeffs.into();
         modified_poly.fft_with_options(zero_factor, root_table)
     }
 
