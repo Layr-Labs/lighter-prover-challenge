@@ -69,9 +69,11 @@ pub fn generate_partial_witness<
 
     let mut buffer = GeneratedValues::empty();
 
-    // Keep running generators until we fail to make progress.
+    // Keep running generators until we fail to make progress. The next wave's buffer persists
+    // across waves and is reused via clear/swap; the indices pushed and their order are unchanged.
+    let mut next_pending_generator_indices = Vec::new();
     while !pending_generator_indices.is_empty() {
-        let mut next_pending_generator_indices = Vec::new();
+        next_pending_generator_indices.clear();
 
         for &generator_idx in &pending_generator_indices {
             if generator_is_expired[generator_idx] {
@@ -88,30 +90,30 @@ pub fn generate_partial_witness<
                 remaining_generators -= 1;
             }
 
-            // Merge any generated values into our witness, and get a list of newly-populated
-            // targets' representatives.
-            let mut new_target_reps = Vec::with_capacity(buffer.target_values.len());
+            // Merge any generated values into our witness, and enqueue unfinished generators that
+            // were watching one of the newly populated targets. Fused single pass: setting targets
+            // touches only witness state and enqueueing touches only scheduling state, so handling
+            // each new representative inline preserves the two-loop order exactly.
             for (t, v) in buffer.target_values.drain(..) {
-                let reps = witness.set_target_returning_rep(t, v)?;
-                new_target_reps.extend(reps);
-            }
-
-            // Enqueue unfinished generators that were watching one of the newly populated targets.
-            for watch in new_target_reps {
-                let opt_watchers = generator_indices_by_watches.get(&watch);
-                if let Some(watchers) = opt_watchers {
-                    for &watching_generator_idx in watchers {
-                        if !generator_is_expired[watching_generator_idx] {
-                            debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                            unresolved_watches[watching_generator_idx] -= 1;
-                            next_pending_generator_indices.push(watching_generator_idx);
+                if let Some(watch) = witness.set_target_returning_rep(t, v)? {
+                    let opt_watchers = generator_indices_by_watches.get(&watch);
+                    if let Some(watchers) = opt_watchers {
+                        for &watching_generator_idx in watchers {
+                            if !generator_is_expired[watching_generator_idx] {
+                                debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
+                                unresolved_watches[watching_generator_idx] -= 1;
+                                next_pending_generator_indices.push(watching_generator_idx);
+                            }
                         }
                     }
                 }
             }
         }
 
-        pending_generator_indices = next_pending_generator_indices;
+        core::mem::swap(
+            &mut pending_generator_indices,
+            &mut next_pending_generator_indices,
+        );
     }
 
     if remaining_generators != 0 {
