@@ -182,6 +182,7 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         group_range: Range<usize>,
         num_selectors: usize,
         num_lookup_selectors: usize,
+        filters: &mut Vec<F>,
         combined_gate_constraints: &mut [F],
     ) {
         let batch_size = vars_batch.len();
@@ -191,19 +192,24 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         // order, as the per-point `compute_filter` — identical field values
         // without the per-point strided views.
         let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
-        let mut filters = vec![F::ONE; batch_size];
-        for i in group_range
-            .clone()
+        let mut factors = group_range
             .filter(|&i| i != row)
-            .chain((num_selectors > 1).then_some(UNUSED_SELECTOR))
-        {
+            .chain((num_selectors > 1).then_some(UNUSED_SELECTOR));
+        filters.clear();
+        if let Some(i) = factors.next() {
+            let k = F::from_canonical_usize(i);
+            filters.extend(selector_col.iter().map(|&s| k - s));
+        } else {
+            filters.resize(batch_size, F::ONE);
+        }
+        for i in factors {
             let k = F::from_canonical_usize(i);
             for (filter, &s) in filters.iter_mut().zip(selector_col) {
                 *filter *= k - s;
             }
         }
         vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
-        self.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, combined_gate_constraints);
+        self.eval_unfiltered_base_batch_accumulate(vars_batch, filters, combined_gate_constraints);
     }
 
     /// Adds this gate's filtered constraints into the `combined_gate_constraints` buffer.
@@ -377,4 +383,96 @@ fn compute_filter_circuit<F: RichField + Extendable<D>, const D: usize>(
         })
         .collect::<Vec<_>>();
     builder.mul_many_extension(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::gates::constant::ConstantGate;
+
+    use super::*;
+
+    type F = GoldilocksField;
+    const D: usize = 2;
+
+    fn check_filtered_batch(
+        row: usize,
+        group_range: Range<usize>,
+        num_selectors: usize,
+        selector_index: usize,
+        num_lookup_selectors: usize,
+    ) {
+        let selector_values = [
+            0,
+            row,
+            group_range.start,
+            group_range.end - 1,
+            UNUSED_SELECTOR,
+            7,
+            19,
+        ];
+        let batch_size = selector_values.len();
+        let gate = ConstantGate::new(2);
+        let gate_num_constants = <ConstantGate as Gate<F, D>>::num_constants(&gate);
+        let gate_num_wires = <ConstantGate as Gate<F, D>>::num_wires(&gate);
+        let gate_num_constraints = <ConstantGate as Gate<F, D>>::num_constraints(&gate);
+        let num_constants = num_selectors + num_lookup_selectors + gate_num_constants;
+        let mut local_constants = vec![F::ZERO; num_constants * batch_size];
+        for column in 0..num_constants {
+            for point in 0..batch_size {
+                local_constants[column * batch_size + point] =
+                    F::from_canonical_usize(column * 31 + point * 17 + 3);
+            }
+        }
+        for (point, selector) in selector_values.into_iter().enumerate() {
+            local_constants[selector_index * batch_size + point] =
+                F::from_canonical_usize(selector);
+        }
+        let local_wires = (0..gate_num_wires * batch_size)
+            .map(|i| F::from_canonical_usize(i * 13 + 5))
+            .collect::<Vec<_>>();
+        let public_inputs_hash = crate::hash::hash_types::HashOut::<F>::ZERO;
+        let vars_batch = EvaluationVarsBaseBatch::new(
+            batch_size,
+            &local_constants,
+            &local_wires,
+            &public_inputs_hash,
+        );
+
+        let mut actual = (0..gate_num_constraints * batch_size)
+            .map(|i| F::from_canonical_usize(i * 11 + 1))
+            .collect::<Vec<_>>();
+        let mut expected = actual.clone();
+        for constraint in 0..gate_num_constraints {
+            for point in 0..batch_size {
+                let selector = local_constants[selector_index * batch_size + point];
+                let filter = compute_filter(row, group_range.clone(), selector, num_selectors > 1);
+                let constant = local_constants
+                    [(num_selectors + num_lookup_selectors + constraint) * batch_size + point];
+                let wire = local_wires[constraint * batch_size + point];
+                expected[constraint * batch_size + point] += filter * (constant - wire);
+            }
+        }
+
+        let mut filters = vec![F::from_canonical_u64(123); batch_size + 3];
+        <ConstantGate as Gate<F, D>>::eval_filtered_base_batch(
+            &gate,
+            vars_batch,
+            row,
+            selector_index,
+            group_range,
+            num_selectors,
+            num_lookup_selectors,
+            &mut filters,
+            &mut actual,
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(filters.len(), batch_size);
+    }
+
+    #[test]
+    fn seeded_base_batch_filter_matches_scalar_filter() {
+        check_filtered_batch(2, 0..4, 2, 1, 1);
+        check_filtered_batch(0, 0..1, 1, 0, 0);
+    }
 }

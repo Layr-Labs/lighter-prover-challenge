@@ -897,6 +897,7 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
 ) {
     constraints_batch.clear();
     constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
+    let mut filters = Vec::with_capacity(vars_batch.len());
     for (i, gate) in common_data.gates.iter().enumerate() {
         let selector_index = common_data.selectors_info.selector_indices[i];
         gate.0.eval_filtered_base_batch(
@@ -906,6 +907,7 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
             common_data.selectors_info.groups[selector_index].clone(),
             common_data.selectors_info.num_selectors(),
             common_data.num_lookup_selectors,
+            &mut filters,
             constraints_batch,
         );
     }
