@@ -645,6 +645,12 @@ pub(crate) fn hash_pair_no_pad<F: RichField + Poseidon2>(
 /// Four-input variant of `hash_pair_no_pad`: four lockstep overwrite-mode
 /// sponges over equal-length inputs, permuted via `poseidon2_x4`. Each output
 /// is bit-identical to `hash_n_to_hash_no_pad` on the corresponding input.
+///
+/// For Goldilocks on aarch64/macOS the four sponges instead run as one 4-lane
+/// packed permutation (`packed::hash_quad_no_pad_packed`); outputs are then
+/// canonically equal (raw representations may differ between reduction
+/// paths), which is interchangeable since `GoldilocksField` equality and
+/// serialization are canonical.
 pub(crate) fn hash_quad_no_pad<F: RichField + Poseidon2>(
     input_a: &[F],
     input_b: &[F],
@@ -654,6 +660,16 @@ pub(crate) fn hash_quad_no_pad<F: RichField + Poseidon2>(
     debug_assert_eq!(input_a.len(), input_b.len());
     debug_assert_eq!(input_a.len(), input_c.len());
     debug_assert_eq!(input_a.len(), input_d.len());
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    if core::any::TypeId::of::<F>()
+        == core::any::TypeId::of::<crate::field::goldilocks_field::GoldilocksField>()
+    {
+        let [a, b, c, d] =
+            super::packed::hash_quad_no_pad_packed::<F>(input_a, input_b, input_c, input_d);
+        return (a, b, c, d);
+    }
+
     let mut state_a = [F::ZERO; WIDTH];
     let mut state_b = [F::ZERO; WIDTH];
     let mut state_c = [F::ZERO; WIDTH];
@@ -681,6 +697,9 @@ pub(crate) fn hash_quad_no_pad<F: RichField + Poseidon2>(
 
 /// Two independent `compress` calls with their permutations interleaved via
 /// `poseidon2_x2`. Each output is bit-identical to `compress` on that pair.
+///
+/// Deliberately kept on the scalar-interleaved x2 path rather than the packed
+/// 4-lane permutation; see the pair decision note in `super::packed`.
 pub(crate) fn compress_pair<F: RichField + Poseidon2>(
     x0: HashOut<F>,
     y0: HashOut<F>,
@@ -1007,6 +1026,35 @@ mod pair_hash_tests {
             let (ha, hb) = Poseidon2Hash::hash_or_noop_pair(&a, &b);
             assert_eq!(ha, <Poseidon2Hash as Hasher<F>>::hash_or_noop(&a), "width {width} a");
             assert_eq!(hb, <Poseidon2Hash as Hasher<F>>::hash_or_noop(&b), "width {width} b");
+        }
+    }
+
+    #[test]
+    fn quad_hash_matches_individual_across_widths() {
+        use plonky2_field::types::Field64;
+
+        // Mix in noncanonical raw representations: the packed quad fast path
+        // moves raw u64s across unchanged, so bit-level absorb behavior on
+        // values in [ORDER, 2^64) must match the scalar sponge canonically.
+        let make = |width: usize, seed: u64| -> Vec<F> {
+            (0..width)
+                .map(|i| match i % 5 {
+                    0 => F::from_noncanonical_u64(F::ORDER + seed + i as u64),
+                    1 => F::from_noncanonical_u64(u64::MAX - seed),
+                    _ => F::rand(),
+                })
+                .collect()
+        };
+        for width in [1, 2, 4, 5, 7, 8, 9, 16, 17, 24, 33, 87, 135] {
+            let a = make(width, 0);
+            let b = make(width, 1);
+            let c = make(width, 2);
+            let d = make(width, 3);
+            let (ha, hb, hc, hd) = Poseidon2Hash::hash_or_noop_quad(&a, &b, &c, &d);
+            assert_eq!(ha, <Poseidon2Hash as Hasher<F>>::hash_or_noop(&a), "width {width} a");
+            assert_eq!(hb, <Poseidon2Hash as Hasher<F>>::hash_or_noop(&b), "width {width} b");
+            assert_eq!(hc, <Poseidon2Hash as Hasher<F>>::hash_or_noop(&c), "width {width} c");
+            assert_eq!(hd, <Poseidon2Hash as Hasher<F>>::hash_or_noop(&d), "width {width} d");
         }
     }
 

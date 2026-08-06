@@ -143,7 +143,71 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for QuinticSquarin
     }
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        self.eval_unfiltered_base_batch_packed(vars_base)
+        let n = vars_base.len();
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        let const_2 = F::from_canonical_u64(2);
+        let const_3 = F::from_canonical_u64(3);
+        let const_6 = F::from_canonical_u64(6);
+        let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
+        let mut chunks = res.chunks_exact_mut(n);
+
+        for i in 0..self.num_ops {
+            let a: [&[F]; 5] =
+                core::array::from_fn(|j| col(self.wire_ith_multiplicand_jth_limb(i, j)));
+            let c: [&[F]; 5] = core::array::from_fn(|j| col(self.wire_ith_output_jth_limb(i, j)));
+            let extra: [&[F]; 10] = core::array::from_fn(|j| col(self.temporary_wire(i, j)));
+
+            // Each constraint row: coeff * a[x] * a[y] (+ prev) - target,
+            // exactly mirroring `eval_unfiltered`'s push order.
+            // (coeff, x, y, add_prev: Option<extra index>, target)
+            let square = |x: &[F], t: &[F], out: &mut [F]| {
+                for p in 0..n {
+                    out[p] = x[p] * x[p] - t[p];
+                }
+            };
+            let mul_add = |coeff: F, x: &[F], y: &[F], prev: &[F], t: &[F], out: &mut [F]| {
+                for p in 0..n {
+                    out[p] = (coeff * x[p] * y[p] + prev[p]) - t[p];
+                }
+            };
+
+            //c[0]
+            square(a[0], extra[0], chunks.next().unwrap());
+            mul_add(const_6, a[1], a[4], extra[0], extra[1], chunks.next().unwrap());
+            mul_add(const_6, a[2], a[3], extra[1], c[0], chunks.next().unwrap());
+
+            //c[1]
+            {
+                let out = chunks.next().unwrap();
+                for p in 0..n {
+                    out[p] = const_3 * a[3][p] * a[3][p] - extra[2][p];
+                }
+            }
+            mul_add(const_2, a[0], a[1], extra[2], extra[3], chunks.next().unwrap());
+            mul_add(const_6, a[2], a[4], extra[3], c[1], chunks.next().unwrap());
+
+            //c[2]
+            square(a[1], extra[4], chunks.next().unwrap());
+            mul_add(const_2, a[0], a[2], extra[4], extra[5], chunks.next().unwrap());
+            mul_add(const_6, a[3], a[4], extra[5], c[2], chunks.next().unwrap());
+
+            //c[3]
+            {
+                let out = chunks.next().unwrap();
+                for p in 0..n {
+                    out[p] = const_3 * a[4][p] * a[4][p] - extra[6][p];
+                }
+            }
+            mul_add(const_2, a[0], a[3], extra[6], extra[7], chunks.next().unwrap());
+            mul_add(const_2, a[1], a[2], extra[7], c[3], chunks.next().unwrap());
+
+            //c[4]
+            square(a[2], extra[8], chunks.next().unwrap());
+            mul_add(const_2, a[0], a[4], extra[8], extra[9], chunks.next().unwrap());
+            mul_add(const_2, a[1], a[3], extra[9], c[4], chunks.next().unwrap());
+        }
+        res
     }
 
     fn eval_unfiltered_circuit(
@@ -455,5 +519,20 @@ mod tests {
         let gate =
             QuinticSquaringGate::new_from_config(&CircuitConfig::standard_recursion_config());
         test_eval_fns::<F, C, _, D>(gate)
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use crate::eddsa::gates::square_quintic_ext_base::QuinticSquaringGate;
+    use crate::gate_batch_testing::assert_base_batch_matches_eval_unfiltered;
+    use crate::plonky2::plonk::circuit_data::CircuitConfig;
+
+    #[test]
+    fn base_batch_matches_eval_unfiltered_across_batch() {
+        let gate =
+            QuinticSquaringGate::new_from_config(&CircuitConfig::standard_recursion_config());
+        assert_base_batch_matches_eval_unfiltered(&gate);
+        assert_base_batch_matches_eval_unfiltered(&QuinticSquaringGate { num_ops: 1 });
     }
 }

@@ -213,7 +213,132 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ComparisonGate
     }
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        self.eval_unfiltered_base_batch_packed(vars_base)
+        let n = vars_base.len();
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        let chunk_bits = self.chunk_bits();
+        let chunk_size = 1usize << chunk_bits;
+        let chunk_base = F::from_canonical_usize(chunk_size);
+        let three = F::from_canonical_usize(3);
+        let mut res = vec![F::ZERO; n * self.num_constraints()];
+        let mut chunks = res.chunks_exact_mut(n);
+        let mut msd_so_far = vec![F::ZERO; n];
+
+        // The chunks of each input combine (by powers of the chunk base,
+        // Horner from the most significant chunk) to the input itself.
+        for (wire_chunk_val, wire_input) in [
+            (
+                Self::wire_first_chunk_val as fn(&Self, usize) -> usize,
+                self.wire_first_input(),
+            ),
+            (Self::wire_second_chunk_val, self.wire_second_input()),
+        ] {
+            let out = chunks.next().unwrap();
+            out.copy_from_slice(col(wire_chunk_val(self, self.num_chunks - 1)));
+            for c in (0..self.num_chunks - 1).rev() {
+                let chunk_col = col(wire_chunk_val(self, c));
+                for p in 0..n {
+                    out[p] = out[p] * chunk_base + chunk_col[p];
+                }
+            }
+            let input = col(wire_input);
+            for p in 0..n {
+                out[p] -= input[p];
+            }
+        }
+
+        for i in 0..self.num_chunks {
+            let fc = col(self.wire_first_chunk_val(i));
+            let sc = col(self.wire_second_chunk_val(i));
+
+            // Range-check the chunks to be less than `chunk_size`:
+            // x(x-1)...(x-(chunk_size-1)). For chunk_size 4 this factors as
+            // y(y+2) with y = x(x-3); otherwise take the product directly.
+            for chunk_col in [fc, sc] {
+                let out = chunks.next().unwrap();
+                if chunk_size == 4 {
+                    for p in 0..n {
+                        let x = chunk_col[p];
+                        let y = x * (x - three);
+                        out[p] = y * (y + F::TWO);
+                    }
+                } else if chunk_size == 2 {
+                    for p in 0..n {
+                        out[p] = chunk_col[p] * (chunk_col[p] - F::ONE);
+                    }
+                } else {
+                    out.copy_from_slice(chunk_col);
+                    for x in 1..chunk_size {
+                        let x_f = F::from_canonical_usize(x);
+                        for p in 0..n {
+                            out[p] *= chunk_col[p] - x_f;
+                        }
+                    }
+                }
+            }
+
+            let equality_dummy = col(self.wire_equality_dummy(i));
+            let chunks_equal = col(self.wire_chunks_equal(i));
+
+            // Two constraints to assert that `chunks_equal` is valid.
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                let difference = sc[p] - fc[p];
+                out[p] = difference * equality_dummy[p] - (F::ONE - chunks_equal[p]);
+            }
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                out[p] = chunks_equal[p] * (sc[p] - fc[p]);
+            }
+
+            // Update `most_significant_diff_so_far`.
+            let intermediate_value = col(self.wire_intermediate_value(i));
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                out[p] = intermediate_value[p] - chunks_equal[p] * msd_so_far[p];
+                msd_so_far[p] =
+                    intermediate_value[p] + (F::ONE - chunks_equal[p]) * (sc[p] - fc[p]);
+            }
+        }
+
+        let most_significant_diff = col(self.wire_most_significant_diff());
+        let out = chunks.next().unwrap();
+        for p in 0..n {
+            out[p] = most_significant_diff[p] - msd_so_far[p];
+        }
+
+        // Range-check the bits.
+        for b in 0..chunk_bits + 1 {
+            let bit = col(self.wire_most_significant_diff_bit(b));
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                out[p] = bit[p] * (F::ONE - bit[p]);
+            }
+        }
+
+        // (2^n + most_significant_diff) equals the bits combined by powers of
+        // two (Horner from the most significant bit).
+        let out = chunks.next().unwrap();
+        out.copy_from_slice(col(self.wire_most_significant_diff_bit(chunk_bits)));
+        for b in (0..chunk_bits).rev() {
+            let bit = col(self.wire_most_significant_diff_bit(b));
+            for p in 0..n {
+                out[p] = out[p].double() + bit[p];
+            }
+        }
+        let two_n = F::from_canonical_u64(1 << chunk_bits);
+        for p in 0..n {
+            out[p] = (two_n + most_significant_diff[p]) - out[p];
+        }
+
+        // Iff first <= second, the top (n + 1st) bit of (2^n + most_significant_diff) will be 1.
+        let result_bool = col(self.wire_result_bool());
+        let top_bit = col(self.wire_most_significant_diff_bit(chunk_bits));
+        let out = chunks.next().unwrap();
+        for p in 0..n {
+            out[p] = result_bool[p] - top_bit[p];
+        }
+        res
     }
 
     fn eval_unfiltered_circuit(
@@ -559,5 +684,22 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         let row = src.read_usize()?;
         let gate = ComparisonGate::deserialize(src, common_data)?;
         Ok(Self { row, gate })
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use plonky2::field::goldilocks_field::GoldilocksField;
+
+    use super::*;
+    use crate::gate_batch_testing::assert_base_batch_matches_eval_unfiltered;
+
+    #[test]
+    fn base_batch_matches_eval_unfiltered_across_batch() {
+        // Covers chunk sizes 4 (factored range product), 8 and 16 (generic).
+        for (num_bits, num_chunks) in [(32, 16), (30, 10), (32, 8), (16, 8)] {
+            let gate = ComparisonGate::<GoldilocksField, 2>::new(num_bits, num_chunks);
+            assert_base_batch_matches_eval_unfiltered(&gate);
+        }
     }
 }

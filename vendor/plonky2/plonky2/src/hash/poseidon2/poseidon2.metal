@@ -171,10 +171,55 @@ inline ulong sum_state(thread const ulong state[12]) {
     return gl_add(sum, (ulong)carries * GOLDILOCKS_EPSILON);
 }
 
+// Fused `a * b + c` with a single Goldilocks reduction.
+//
+// `gl_add(c, gl_mul(a, b))` reduces twice: once to bring the 128-bit product
+// back into the field, then again after adding `c`. The reduction below already
+// accepts an arbitrary `(low, high)` pair, so folding `c` into the product
+// before reducing is exact and removes one entire reduction sequence per
+// operation. The internal linear layer runs 12 of these per round over 22
+// rounds, so this deletes 264 reduction sequences per permutation.
+//
+// `high` is at most `(2^32-1)^2 = 2^64 - 2^33 + 1`, so the carry out of
+// `low + c` cannot overflow it.
+inline ulong gl_mul_add(ulong a, ulong b, ulong c) {
+#if defined(POSEIDON2_NATIVE_ARITHMETIC_REFERENCE)
+    return gl_add(c, gl_mul(a, b));
+#else
+    ulong low = a * b;
+    ulong high = metal::mulhi(a, b);
+    ulong s = low + c;
+    high += (ulong)(s < low);
+    low = s;
+
+    uint l0 = (uint)low;
+    uint l1 = (uint)(low >> 32);
+    uint h0 = (uint)high;
+    uint h1 = (uint)(high >> 32);
+
+    uint r0 = l0 - h0;
+    uint borrow = (uint)(r0 > l0);
+    uint next = r0 - h1;
+    borrow += (uint)(next > r0);
+    r0 = next;
+
+    uint r1 = l1 + h0;
+    uint carry = (uint)(r1 < l1);
+    next = r1 - borrow;
+    uint under = (uint)(next > r1);
+    r1 = next;
+
+    int top = (int)carry - (int)under;
+    add_epsilon_u32(r0, r1, (uint)(top > 0));
+    sub_epsilon_u32(r0, r1, (uint)(top < 0));
+    return ((ulong)r1 << 32) | (ulong)r0;
+#endif
+}
+
 inline void internal_linear_layer(thread ulong state[12], constant ulong* diagonal) {
     ulong sum = sum_state(state);
     for (uint i = 0; i < 12; ++i) {
-        state[i] = gl_add(sum, gl_mul(state[i], diagonal[i]));
+        state[i] = gl_mul_add(state[i], diagonal[i], sum);
     }
 }
 
@@ -204,6 +249,54 @@ inline void poseidon2(thread ulong state[12], constant ulong* parameters) {
             state[i] = pow7(gl_add(state[i], external_constants[round * 12 + i]));
         }
         external_linear_layer(state);
+    }
+}
+
+// Two independent permutations with stage-interleaved instruction streams:
+// corresponding stages of the two states sit adjacent in the (fully unrolled)
+// instruction sequence, so the scheduler can overlap one state's dependency
+// chains -- the serial pow7 of the partial rounds in particular -- with the
+// other's. Per lane this executes exactly the operation sequence of
+// `poseidon2` above, so digests are bit-identical to running the two states
+// through it back to back.
+inline void poseidon2_x2(thread ulong state[2][12], constant ulong* parameters) {
+    constant ulong* external_constants = parameters;
+    constant ulong* internal_constants = parameters + 96;
+    constant ulong* diagonal = parameters + 118;
+
+    for (uint n = 0; n < 2; ++n) {
+        external_linear_layer(state[n]);
+    }
+
+    for (uint round = 0; round < 4; ++round) {
+        for (uint n = 0; n < 2; ++n) {
+            for (uint i = 0; i < 12; ++i) {
+                state[n][i] = pow7(gl_add(state[n][i], external_constants[round * 12 + i]));
+            }
+        }
+        for (uint n = 0; n < 2; ++n) {
+            external_linear_layer(state[n]);
+        }
+    }
+
+    for (uint round = 0; round < 22; ++round) {
+        for (uint n = 0; n < 2; ++n) {
+            state[n][0] = pow7(gl_add(state[n][0], internal_constants[round]));
+        }
+        for (uint n = 0; n < 2; ++n) {
+            internal_linear_layer(state[n], diagonal);
+        }
+    }
+
+    for (uint round = 4; round < 8; ++round) {
+        for (uint n = 0; n < 2; ++n) {
+            for (uint i = 0; i < 12; ++i) {
+                state[n][i] = pow7(gl_add(state[n][i], external_constants[round * 12 + i]));
+            }
+        }
+        for (uint n = 0; n < 2; ++n) {
+            external_linear_layer(state[n]);
+        }
     }
 }
 
@@ -387,5 +480,44 @@ kernel void poseidon2_hash_parents(
     device ulong* output = parents + (ulong)gid * 4;
     for (uint i = 0; i < 4; ++i) {
         output[i] = gl_canonicalize(state[i]);
+    }
+}
+
+// Two parent nodes per thread, permuted with interleaved instruction streams
+// (poseidon2_x2) for instruction-level parallelism. Selected by the host-side
+// PARENT_NODES_PER_THREAD toggle; the one-node kernel above stays available
+// as the low-register-pressure fallback. An odd tail duplicates the last
+// node's input into the second lane and simply skips its write.
+kernel void poseidon2_hash_parents_x2(
+    const device ulong* children [[buffer(0)]],
+    device ulong* parents [[buffer(1)]],
+    constant ulong* parameters [[buffer(2)]],
+    constant uint& parent_count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint first = gid * 2;
+    if (first >= parent_count) {
+        return;
+    }
+    bool has_second = first + 1 < parent_count;
+    uint second = has_second ? first + 1 : first;
+
+    ulong state[2][12] = { { 0 }, { 0 } };
+    const device ulong* input0 = children + (ulong)first * 8;
+    const device ulong* input1 = children + (ulong)second * 8;
+    for (uint i = 0; i < 8; ++i) {
+        state[0][i] = input0[i];
+        state[1][i] = input1[i];
+    }
+    poseidon2_x2(state, parameters);
+
+    device ulong* output0 = parents + (ulong)first * 4;
+    for (uint i = 0; i < 4; ++i) {
+        output0[i] = gl_canonicalize(state[0][i]);
+    }
+    if (has_second) {
+        device ulong* output1 = parents + (ulong)second * 4;
+        for (uint i = 0; i < 4; ++i) {
+            output1[i] = gl_canonicalize(state[1][i]);
+        }
     }
 }

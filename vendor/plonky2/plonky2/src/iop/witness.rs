@@ -369,29 +369,43 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         }
     }
 
+    /// Compare-and-set the value slot `slot`, which must be `target`'s representative slot
+    /// (`target` is only used for error reporting). Preserves the exact write-once semantics
+    /// of [`Self::set_target_returning_rep`]: an empty slot is filled, an equal value is a
+    /// no-op, and a conflicting value is an error with the same message. Used by
+    /// recorded-schedule replays, which resolve representative slots ahead of time; see
+    /// [`crate::iop::topo_schedule`].
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(crate) fn set_slot_checked(&mut self, slot: usize, target: Target, value: F) -> Result<()> {
+        let rep_value = &mut self.values[slot];
+        if let Some(old_value) = *rep_value {
+            if value != old_value {
+                return Err(anyhow!(
+                    "Partition containing {:?} was set twice with different values: {} != {}",
+                    target,
+                    old_value,
+                    value
+                ));
+            }
+        } else {
+            *rep_value = Some(value);
+        }
+        Ok(())
+    }
+
     pub(crate) fn target_index(&self, target: Target) -> usize {
         target.index(self.num_wires, self.degree)
     }
 
     pub fn full_witness(self) -> MatrixWitness<F> {
-        // Redraw ticket 5.
-        // Single fused pass. Cell (column j, row i) is
-        // `values[representative_map[i * num_wires + j]]` or zero — the same
-        // lookup `try_get_target(Target::Wire { row: i, column: j })` resolved
-        // to, with `Target::index`'s `row * num_wires + column` inlined as a
-        // running cursor. This deletes the full zero-prefill pass over the
-        // matrix and the per-cell Target construction and index arithmetic of
-        // the second pass, while reading `representative_map` sequentially.
-        let mut wire_values: Vec<Vec<F>> = (0..self.num_wires)
-            .map(|_| Vec::with_capacity(self.degree))
-            .collect();
-        let mut wire_index = 0;
-        for _ in 0..self.degree {
-            for column in wire_values.iter_mut() {
-                column.push(
-                    self.values[self.representative_map[wire_index]].unwrap_or(F::ZERO),
-                );
-                wire_index += 1;
+        let mut wire_values = vec![vec![F::ZERO; self.degree]; self.num_wires];
+        for i in 0..self.degree {
+            for j in 0..self.num_wires {
+                let t = Target::Wire(Wire { row: i, column: j });
+                if let Some(x) = self.try_get_target(t) {
+                    wire_values[j][i] = x;
+                }
             }
         }
 
