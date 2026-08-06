@@ -25,6 +25,7 @@ use super::circuit_builder::LookupWire;
 use crate::field::extension::Extendable;
 use crate::field::fft::FftRootTable;
 use crate::field::types::Field;
+use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::fri::oracle::PolynomialBatch;
 use crate::fri::reduction_strategies::FriReductionStrategy;
 use crate::fri::structure::{
@@ -48,6 +49,7 @@ use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::proof::{CompressedProofWithPublicInputs, ProofWithPublicInputs};
 use crate::plonk::prover::prove;
 use crate::plonk::verifier::verify;
+use crate::util::log2_ceil;
 use crate::util::serialization::{
     Buffer, GateSerializer, IoResult, Read, WitnessGeneratorSerializer, Write,
 };
@@ -360,6 +362,32 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     }
 }
 
+/// The quotient coset data shared by every proof of a circuit.
+#[derive(Eq, PartialEq, Debug)]
+pub(crate) struct QuotientDomain<F: Field> {
+    pub(crate) coset_points: Vec<F>,
+    pub(crate) l_0_evals: Vec<F>,
+    pub(crate) zero_poly: ZeroPolyOnCoset<F>,
+}
+
+impl<F: Field> QuotientDomain<F> {
+    pub(crate) fn new(degree_bits: usize, quotient_degree_factor: usize) -> Self {
+        let quotient_degree_bits = log2_ceil(quotient_degree_factor);
+        let coset_points = F::two_adic_subgroup(degree_bits + quotient_degree_bits)
+            .into_iter()
+            .map(|x| F::coset_shift() * x)
+            .collect::<Vec<_>>();
+        let zero_poly = ZeroPolyOnCoset::new(degree_bits, quotient_degree_bits);
+        let l_0_evals = zero_poly.l_0_evals(&coset_points);
+
+        Self {
+            coset_points,
+            l_0_evals,
+            zero_poly,
+        }
+    }
+}
+
 /// Circuit data required by the prover, but not the verifier.
 #[derive(Eq, PartialEq, Debug)]
 pub struct ProverOnlyCircuitData<
@@ -384,6 +412,8 @@ pub struct ProverOnlyCircuitData<
     pub representative_map: Vec<usize>,
     /// Pre-computed roots for faster FFT.
     pub fft_root_table: Option<FftRootTable<F>>,
+    /// Pre-computed quotient coset points and Lagrange evaluations.
+    pub(crate) quotient_domain: QuotientDomain<F>,
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to
     /// seed Fiat-Shamir.
     pub circuit_digest: <<C as GenericConfig<D>>::Hasher as Hasher<F>>::Hash,

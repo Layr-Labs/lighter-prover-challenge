@@ -30,18 +30,7 @@ const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
 /// the default 1<<19 cutoff) hash on an otherwise idle GPU. The global cutoff
 /// stays untouched for the pipelined phases, where lowering it is the
 /// documented priority-inversion regression.
-// Measured head-to-head (equal-output asserted, warm runs, cap height 4):
-// the GPU wins ~2x already at 262,128 permutations (2^17-leaf width-8 trees:
-// CPU 14.9 ms vs GPU 7.8 ms) — the chain-step quotient/FRI commitment shape,
-// which sits 16 permutations BELOW the 1 << 18 gate and was still hashing on
-// the CPU during the exclusive phases. 1 << 17 captures it; the measured
-// GPU/CPU break-even is ~131k permutations.
-// Within an exclusive phase nothing contends for the GPU, so even the
-// measured-parity shapes win: 2^16-leaf width-8 trees (131,056 permutations)
-// measured GPU/CPU 0.88 warm with zero contention. 1 << 16 admits them while
-// still keeping the genuinely CPU-favored tiny shapes (2^15 width-8 measured
-// 1.37) on the CPU.
-const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
+const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 18;
 /// Upper bound on concurrently in-flight GPU tree builds. One set serializes
 /// GPU tree builds exactly like the promoted base's global context mutex: a
 /// 3-set experiment measured 13-18% faster locally but scored -21.6% on the
@@ -185,15 +174,7 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     } else {
         MIN_GPU_PERMUTATIONS
     };
-    // The 2^17-leaf commitment trees are produced only by the degree-2^14
-    // serial circuits (chain steps and pre-execution; the pipelined chunk
-    // circuits commit at 2^19 leaves and their FRI folds at 2^16 and below).
-    // Those trees sit on the strictly sequential critical path in every
-    // phase and measured ~2x faster on the GPU (2^17 width-8: CPU 14.9 ms vs
-    // GPU 7.8 ms), so route them to the GPU regardless of phase; each build
-    // occupies the serialized GPU stream only briefly.
-    let serial_critical_shape = leaf_count == 1 << 17 && leaf_width > 4;
-    serial_critical_shape || leaf_permutations + parent_permutations >= min_permutations
+    leaf_permutations + parent_permutations >= min_permutations
 }
 
 fn shared_context() -> Option<&'static MetalShared> {
