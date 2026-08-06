@@ -30,7 +30,7 @@ enum TxPath {
 
 const LIGHT_TX_PROOF_WINDOW: usize = 2;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
-const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
+const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 4;
 
 fn chunk_is_light(txs: &[Tx<F>]) -> bool {
     txs.first()
