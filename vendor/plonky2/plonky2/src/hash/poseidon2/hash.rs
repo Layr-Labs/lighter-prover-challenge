@@ -511,64 +511,10 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     fn try_build_merkle_tree(
-        leaves: &[F],
-        leaf_width: usize,
-        num_leaves: usize,
+        leaves: &[Vec<F>],
         cap_height: usize,
     ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
-        super::metal::build_merkle_tree(leaves, leaf_width, num_leaves, cap_height)
-    }
-
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    fn try_build_merkle_tree_columns(
-        columns: &[Vec<F>],
-        cap_height: usize,
-    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
-        super::metal::build_merkle_tree_columns(columns, cap_height)
-    }
-
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    fn try_build_commitment_from_coeffs(
-        coeff_columns: &[&[F]],
-        rate_bits: usize,
-        cap_height: usize,
-    ) -> Option<(
-        crate::hash::merkle_tree::ColumnStore<F>,
-        Vec<Self::Hash>,
-        Vec<Self::Hash>,
-    )> {
-        super::metal::build_commitment_from_coeffs(coeff_columns, rate_bits, cap_height).map(
-            |(columns, digests, cap)| {
-                (
-                    crate::hash::merkle_tree::ColumnStore::Shared(columns),
-                    digests,
-                    cap,
-                )
-            },
-        )
-    }
-
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    fn try_build_commitment_from_values(
-        value_columns: &[&[F]],
-        rate_bits: usize,
-        cap_height: usize,
-    ) -> Option<(
-        crate::hash::merkle_tree::ColumnStore<F>,
-        Vec<Self::Hash>,
-        Vec<Self::Hash>,
-        Vec<Vec<F>>,
-    )> {
-        super::metal::build_commitment_from_values(value_columns, rate_bits, cap_height).map(
-            |(columns, digests, cap, coeffs)| {
-                (
-                    crate::hash::merkle_tree::ColumnStore::Shared(columns),
-                    digests,
-                    cap,
-                    coeffs,
-                )
-            },
-        )
+        super::metal::build_merkle_tree(leaves, cap_height)
     }
 }
 
