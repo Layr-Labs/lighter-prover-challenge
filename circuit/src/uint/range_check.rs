@@ -304,16 +304,17 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
         let base = F::from_canonical_usize(Self::BASE);
         for i in 0..self.num_ops {
             let input_limb = vars.local_wires[self.wire_ith_input(i)];
-            let aux_limbs: Vec<_> = (0..self.aux_limbs_per_input())
-                .map(|j| vars.local_wires[self.wire_ith_input_jth_aux_limb(i, j)])
-                .collect();
-            let computed_sum = reduce_with_powers(&aux_limbs, base);
+            let aux_limbs = 0..self.aux_limbs_per_input();
+            let computed_sum = aux_limbs.clone().rev().fold(F::ZERO, |sum, j| {
+                sum * base + vars.local_wires[self.wire_ith_input_jth_aux_limb(i, j)]
+            });
 
             yield_constr.one(computed_sum - input_limb);
-            for aux_limb in aux_limbs.iter().take(aux_limbs.len() - 1) {
+            for j in aux_limbs.clone().take(aux_limbs.len() - 1) {
+                let aux_limb = vars.local_wires[self.wire_ith_input_jth_aux_limb(i, j)];
                 yield_constr.one(
                     (0..Self::BASE)
-                        .map(|i| *aux_limb - F::from_canonical_usize(i))
+                        .map(|i| aux_limb - F::from_canonical_usize(i))
                         .product(),
                 );
             }
@@ -322,9 +323,11 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
             } else {
                 Self::BASE
             };
+            let last_aux_limb =
+                vars.local_wires[self.wire_ith_input_jth_aux_limb(i, aux_limbs.len() - 1)];
             yield_constr.one(
                 (0..iter)
-                    .map(|i| *aux_limbs.last().unwrap() - F::from_canonical_usize(i))
+                    .map(|i| last_aux_limb - F::from_canonical_usize(i))
                     .product(),
             );
         }
