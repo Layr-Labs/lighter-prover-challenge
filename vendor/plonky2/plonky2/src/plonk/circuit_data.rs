@@ -39,7 +39,7 @@ use crate::gates::selectors::SelectorsInfo;
 use crate::hash::hash_types::{HashOutTarget, MerkleCapTarget, RichField};
 use crate::hash::merkle_tree::MerkleCap;
 use crate::iop::ext_target::ExtensionTarget;
-use crate::iop::generator::{generate_partial_witness, WitnessGeneratorRef};
+use crate::iop::generator::{WitnessGeneratorRef, generate_partial_witness};
 use crate::iop::target::Target;
 use crate::iop::witness::{PartialWitness, PartitionWitness};
 use crate::plonk::circuit_builder::CircuitBuilder;
@@ -371,6 +371,10 @@ pub struct ProverOnlyCircuitData<
     /// Generator indices (within the `Vec` above), indexed by the representative of each target
     /// they watch.
     pub generator_indices_by_watches: BTreeMap<usize, Vec<usize>>,
+    /// The number of distinct watched representatives per generator; witness generation starts
+    /// its unresolved-watch counters from these instead of rescanning the watcher index. Not
+    /// serialized: reconstructed from `generator_indices_by_watches` on deserialization.
+    pub generator_watch_counts: Vec<usize>,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.
@@ -380,8 +384,10 @@ pub struct ProverOnlyCircuitData<
     /// Targets to be made public.
     pub public_inputs: Vec<Target>,
     /// A map from each `Target`'s index to the index of its representative in the disjoint-set
-    /// forest.
-    pub representative_map: Vec<usize>,
+    /// forest. Stored as `u32` (checked at construction): the map is read on every witness write
+    /// and by `full_witness`, so halving its entry width halves that read traffic. The serialized
+    /// wire format keeps the legacy 8-byte-per-entry `usize` encoding.
+    pub representative_map: Vec<u32>,
     /// Pre-computed roots for faster FFT.
     pub fft_root_table: Option<FftRootTable<F>>,
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to

@@ -175,8 +175,9 @@ fn run_generator_worklist<
                         );
                         entries.push((generator_idx, finished, round_buffer.target_values.len()));
                         for (t, v) in round_buffer.target_values.drain(..) {
-                            let rep_index =
-                                round_witness.representative_map[round_witness.target_index(t)];
+                            let rep_index = round_witness.representative_map
+                                [round_witness.target_index(t)]
+                                as usize;
                             let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
                                 generator_indices_by_watches.get(&rep_index)
                             } else {
@@ -331,18 +332,19 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &prover_data.representative_map,
         );
 
-        for (t, v) in inputs.target_values.into_iter() {
-            witness.set_target(t, v)?;
-        }
-
         // A simple generator can run once all of the distinct representatives it watches have
-        // values. Derive those unresolved counts from the existing watcher index so this remains
-        // local witness state and does not add anything to serialized prover data.
-        let mut unresolved_watches = vec![0usize; generators.len()];
-        for (&watch, watchers) in generator_indices_by_watches {
-            if !witness.is_set_by_rep_index(watch) {
-                for &generator_idx in watchers {
-                    unresolved_watches[generator_idx] += 1;
+        // values. Start from the builder's precomputed distinct-watch counts and resolve the
+        // representatives populated by the inputs, instead of rescanning the whole watcher index
+        // per proof. `set_target_returning_rep` reports each representative's first population
+        // only, so aliased or duplicate inputs decrement a watcher at most once.
+        let mut unresolved_watches = prover_data.generator_watch_counts.clone();
+        for (t, v) in inputs.target_values.into_iter() {
+            if let Some(watch) = witness.set_target_returning_rep(t, v)? {
+                if let Some(watchers) = generator_indices_by_watches.get(&watch) {
+                    for &generator_idx in watchers {
+                        debug_assert_ne!(unresolved_watches[generator_idx], 0);
+                        unresolved_watches[generator_idx] -= 1;
+                    }
                 }
             }
         }
@@ -925,6 +927,95 @@ mod tests {
             dependency_calls.load(Ordering::Relaxed),
             dependency_calls_after_build
         );
+
+        // The duplicated dependencies and the connected alias collapse to three distinct
+        // representatives in the builder's precomputed watch counts.
+        let counting_generator_index = circuit
+            .prover_only
+            .generators
+            .iter()
+            .position(|generator| generator.0.id() == "CountingSimpleGenerator")
+            .expect("counting generator must be registered");
+        assert_eq!(
+            circuit.prover_only.generator_watch_counts[counting_generator_index],
+            3
+        );
+        assert_watch_counts_match_watcher_index(&circuit.prover_only, &circuit.common);
+    }
+
+    /// Asserts the builder-derived distinct-watch counts agree with both the watcher index and a
+    /// direct recomputation from each generator's watch list.
+    fn assert_watch_counts_match_watcher_index(
+        prover_only: &crate::plonk::circuit_data::ProverOnlyCircuitData<F, C, D>,
+        common: &CommonCircuitData<F, D>,
+    ) {
+        let mut appearances = vec![0usize; prover_only.generators.len()];
+        for indices in prover_only.generator_indices_by_watches.values() {
+            for &generator_idx in indices {
+                appearances[generator_idx] += 1;
+            }
+        }
+        assert_eq!(appearances, prover_only.generator_watch_counts);
+
+        for (generator, &count) in prover_only
+            .generators
+            .iter()
+            .zip(&prover_only.generator_watch_counts)
+        {
+            let mut reps: Vec<usize> = generator
+                .0
+                .watch_list()
+                .iter()
+                .map(|&watch| {
+                    prover_only.representative_map
+                        [watch.index(common.config.num_wires, common.degree())]
+                        as usize
+                })
+                .collect();
+            reps.sort_unstable();
+            reps.dedup();
+            assert_eq!(reps.len(), count);
+        }
+    }
+
+    #[test]
+    fn deserialized_prover_data_reconstructs_watch_counts() -> Result<()> {
+        use crate::util::serialization::{DefaultGateSerializer, DefaultGeneratorSerializer};
+
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let a = builder.add_virtual_target();
+        let b = builder.add_virtual_target();
+        let product = builder.mul(a, b);
+        builder.register_public_input(product);
+        let circuit = builder.build::<C>();
+        assert_watch_counts_match_watcher_index(&circuit.prover_only, &circuit.common);
+        assert!(
+            circuit
+                .prover_only
+                .generator_watch_counts
+                .iter()
+                .any(|&count| count > 0)
+        );
+
+        let gate_serializer = DefaultGateSerializer;
+        let generator_serializer = DefaultGeneratorSerializer::<C, D>::default();
+        let bytes = circuit
+            .to_bytes(&gate_serializer, &generator_serializer)
+            .map_err(|error| anyhow!("serialization failed: {error:?}"))?;
+        let restored = crate::plonk::circuit_data::CircuitData::<F, C, D>::from_bytes(
+            &bytes,
+            &gate_serializer,
+            &generator_serializer,
+        )
+        .map_err(|error| anyhow!("deserialization failed: {error:?}"))?;
+
+        assert_eq!(
+            restored.prover_only.generator_watch_counts,
+            circuit.prover_only.generator_watch_counts
+        );
+        assert_watch_counts_match_watcher_index(&restored.prover_only, &restored.common);
+
+        Ok(())
     }
 
     /// Builds an outer circuit verifying two independent inner proofs, mirroring a chain step's

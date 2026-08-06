@@ -32,7 +32,6 @@ use crate::plonk::vanishing_poly::{
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
-use crate::util::partial_products::quotient_chunk_products;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_ceil};
 
@@ -437,49 +436,122 @@ fn wires_permutation_partial_products_and_zs<
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
 ) -> Vec<PolynomialValues<F>> {
-    let degree = common_data.quotient_degree_factor;
-    let subgroup = &prover_data.subgroup;
-    let num_prods = common_data.num_partial_products;
     debug_assert_eq!(beta_k_is.len(), common_data.config.num_routed_wires);
-    let num_routed_wires = common_data.config.num_routed_wires;
-    let all_quotient_chunk_products = subgroup
-        .par_iter()
-        .enumerate()
-        .map_init(
-            // One denominator scratch buffer per worker thread instead of a
-            // fresh Vec per subgroup point.
-            || vec![F::ZERO; num_routed_wires],
-            |denominators, (i, &x)| {
-                let s_sigmas = &prover_data.sigmas[i];
-                for (j, denominator) in denominators.iter_mut().enumerate() {
-                    let wire_value = witness.get_wire(i, j);
-                    *denominator = wire_value + beta * s_sigmas[j] + gamma;
-                }
-                let mut quotient_values = F::batch_multiplicative_inverse(denominators);
-                // Multiply the numerators into the inverse buffer in place;
-                // the per-point numerator and quotient Vecs are gone.
-                for (j, quotient_value) in quotient_values.iter_mut().enumerate() {
-                    let wire_value = witness.get_wire(i, j);
-                    let numerator = wire_value + beta_k_is[j] * x + gamma;
-                    *quotient_value *= numerator;
-                }
+    wires_permutation_partial_products_and_zs_impl(
+        witness,
+        beta,
+        beta_k_is,
+        gamma,
+        &prover_data.sigmas,
+        &prover_data.subgroup,
+        common_data.quotient_degree_factor,
+        common_data.num_partial_products,
+    )
+}
 
-                quotient_chunk_products(&quotient_values, degree)
+/// Subgroup points per batch inversion in the chunk-direct partial-products
+/// phase: one Montgomery batch-inversion pass covers the denominator chunk
+/// products of this many consecutive points.
+const INVERSION_SLAB: usize = 128;
+
+/// Chunk-direct permutation products with slab batch inversion.
+///
+/// The previous code materialized all `num_routed_wires` per-wire quotient
+/// values for every subgroup point — each a numerator times a batch-inverted
+/// denominator, with one batch inversion (and its result `Vec`) per point plus
+/// a chunk-products `Vec` per point — and then folded them into
+/// `num_routed_wires / max_degree` chunk products.
+///
+/// This form never materializes the per-wire values. Each chunk of
+/// `max_degree` wires accumulates one numerator product and one denominator
+/// product directly as the wires are read (each witness value is read once
+/// instead of twice), and the denominator chunk products of `INVERSION_SLAB`
+/// consecutive points are inverted together in one Montgomery batch-inversion
+/// pass: one field inversion per slab instead of one per point, and no
+/// per-point heap allocations at all.
+///
+/// The regrouping is exact: the old chunk product is `∏_j (N_j * D_j^{-1})`
+/// and this computes `(∏_j N_j) * (∏_j D_j)^{-1}`. Over a field these are the
+/// same element — multiplication is commutative and associative, and
+/// inversion is a homomorphism of the multiplicative group — so the partial
+/// products and Z polynomials are identical (see the differential test module
+/// `chunk_direct_partial_products_tests`). The sequential Z chain below
+/// consumes the chunk products in exactly the same order as before.
+#[allow(clippy::too_many_arguments)]
+fn wires_permutation_partial_products_and_zs_impl<F: Field>(
+    witness: &MatrixWitness<F>,
+    beta: F,
+    beta_k_is: &[F],
+    gamma: F,
+    sigmas: &[Vec<F>],
+    subgroup: &[F],
+    max_degree: usize,
+    num_prods: usize,
+) -> Vec<PolynomialValues<F>> {
+    let num_routed_wires = beta_k_is.len();
+    let num_chunks = num_prods + 1;
+    debug_assert_eq!(num_chunks, num_routed_wires.div_ceil(max_degree));
+    let n_points = subgroup.len();
+
+    // Flat row-major chunk products: point `i`'s products occupy
+    // `[i * num_chunks..(i + 1) * num_chunks]`, replacing one small `Vec` per
+    // point.
+    let mut all_quotient_chunk_products = vec![F::ZERO; n_points * num_chunks];
+    all_quotient_chunk_products
+        .par_chunks_mut(INVERSION_SLAB * num_chunks)
+        .zip(subgroup.par_chunks(INVERSION_SLAB))
+        .enumerate()
+        .for_each_init(
+            // One denominator-chunk-product scratch buffer per worker thread.
+            || vec![F::ZERO; INVERSION_SLAB * num_chunks],
+            |denominator_products, (slab_i, (out_slab, xs_slab))| {
+                let slab_len = xs_slab.len();
+                let num_terms = slab_len * num_chunks;
+                for (p, &x) in xs_slab.iter().enumerate() {
+                    let i = slab_i * INVERSION_SLAB + p;
+                    let s_sigmas = &sigmas[i];
+                    let numerator_row = &mut out_slab[p * num_chunks..(p + 1) * num_chunks];
+                    let denominator_row =
+                        &mut denominator_products[p * num_chunks..(p + 1) * num_chunks];
+                    for (c, (numerator_out, denominator_out)) in numerator_row
+                        .iter_mut()
+                        .zip(denominator_row.iter_mut())
+                        .enumerate()
+                    {
+                        let j_start = c * max_degree;
+                        let j_end = min(j_start + max_degree, num_routed_wires);
+                        let mut numerator_product = F::ONE;
+                        let mut denominator_product = F::ONE;
+                        for j in j_start..j_end {
+                            let wire_value = witness.get_wire(i, j);
+                            numerator_product *= wire_value + beta_k_is[j] * x + gamma;
+                            denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
+                        }
+                        *numerator_out = numerator_product;
+                        *denominator_out = denominator_product;
+                    }
+                }
+                // One Montgomery batch inversion for the whole slab, then
+                // multiply the numerator products by the inverted denominator
+                // products in place.
+                let inverses =
+                    F::batch_multiplicative_inverse(&denominator_products[..num_terms]);
+                for (out, inverse) in out_slab[..num_terms].iter_mut().zip(inverses) {
+                    *out *= inverse;
+                }
             },
-        )
-        .collect::<Vec<_>>();
+        );
 
     // Accumulate the sequential Z chain directly into the column-major output
     // polynomials, deleting the per-point row Vec, the row-major intermediate,
     // and the whole-phase transpose. Values and their order are identical: for
     // each point, column k receives the k-th running product, and the last
     // column receives the previous Z(x) exactly as the swap-based version did.
-    let n_points = all_quotient_chunk_products.len();
-    let mut columns: Vec<Vec<F>> = (0..num_prods + 1)
+    let mut columns: Vec<Vec<F>> = (0..num_chunks)
         .map(|_| Vec::with_capacity(n_points))
         .collect();
     let mut z_x = F::ONE;
-    for quotient_chunk_products in all_quotient_chunk_products {
+    for quotient_chunk_products in all_quotient_chunk_products.chunks_exact(num_chunks) {
         let mut acc = z_x;
         for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
             acc *= quotient_chunk_product;
@@ -655,6 +727,34 @@ fn compute_all_lookup_polys<
 
 const BATCH_SIZE: usize = 32;
 
+/// One shifted starting point per `batch_size`-point batch of the coset
+/// quotient-evaluation domain, plus the domain's primitive root `w`.
+///
+/// Entry `k` is exactly `F::coset_shift() * w^(batch_size * k)`, built by a
+/// short recurrence over batch starts. Each worker then generates its batch
+/// in-place: element `j` of batch `k` is `start_k * w^j`, i.e. the field
+/// element `shift * w^(batch_size * k + j)` — the same value, in the same
+/// order, as element `batch_size * k + j` of the previous construction
+/// (`F::coset_shift() * F::two_adic_subgroup(domain_bits)[i]`). Finite-field
+/// multiplication is exact, so the points are identical.
+///
+/// This deletes the retained full-domain vector (2^21 elements, 16 MiB, for
+/// the largest production proof), shrinks the serial recurrence from `N`
+/// steps to `N / batch_size`, and removes the separate per-point coset-shift
+/// multiplication pass.
+fn batched_shifted_domain_starts<F: Field>(domain_bits: usize, batch_size: usize) -> (F, Vec<F>) {
+    let point_step = F::primitive_root_of_unity(domain_bits);
+    let num_batches = (1usize << domain_bits).div_ceil(batch_size);
+    let batch_step = point_step.exp_u64(batch_size as u64);
+    let mut starts = Vec::with_capacity(num_batches);
+    let mut start = F::coset_shift();
+    for _ in 0..num_batches {
+        starts.push(start);
+        start *= batch_step;
+    }
+    (point_step, starts)
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -690,8 +790,8 @@ fn compute_quotient_polys<
     // steps away since we work on an LDE of degree `max_filtered_constraint_degree`.
     let next_step = 1 << quotient_degree_bits;
 
-    let points = F::two_adic_subgroup(common_data.degree_bits() + quotient_degree_bits);
-    let lde_size = points.len();
+    let domain_bits = common_data.degree_bits() + quotient_degree_bits;
+    let lde_size: usize = 1 << domain_bits;
 
     let z_h_on_coset = ZeroPolyOnCoset::new(common_data.degree_bits(), quotient_degree_bits);
 
@@ -731,8 +831,9 @@ fn compute_quotient_polys<
     let lut_re_poly_evals_refs: Vec<&[F]> =
         lut_re_poly_evals.iter().map(|v| v.as_slice()).collect();
 
-    let points_batches = points.par_chunks(BATCH_SIZE);
-    let num_batches = points.len().div_ceil(BATCH_SIZE);
+    let (point_step, batch_starts) = batched_shifted_domain_starts::<F>(domain_bits, BATCH_SIZE);
+    let num_batches = batch_starts.len();
+    debug_assert_eq!(num_batches, lde_size.div_ceil(BATCH_SIZE));
 
     struct QuotientScratch<F: RichField> {
         indices: Vec<usize>,
@@ -750,10 +851,10 @@ fn compute_quotient_polys<
     let zs_row_width = zs_partial_products_and_lookup_commitment.lde_row_width();
     let num_routed_wires = common_data.config.num_routed_wires;
 
-    let mut quotient_values = vec![F::ZERO; points.len() * num_challenges];
+    let mut quotient_values = vec![F::ZERO; lde_size * num_challenges];
     quotient_values
         .par_chunks_mut(BATCH_SIZE * num_challenges)
-        .zip(points_batches)
+        .zip(batch_starts.par_iter())
         .enumerate()
         .for_each_init(
             || QuotientScratch::<F> {
@@ -767,14 +868,13 @@ fn compute_quotient_polys<
                 zs_next_flat: Vec::new(),
                 vanishing: VanishingScratch::default(),
             },
-            |scratch, (batch_i, (quotient_values_batch, xs_batch))| {
+            |scratch, (batch_i, (quotient_values_batch, &batch_start))| {
+                let n = quotient_values_batch.len() / num_challenges;
                 // Each batch must be the same size, except the last one, which may be smaller.
                 debug_assert!(
-                    xs_batch.len() == BATCH_SIZE
-                        || (batch_i == num_batches - 1 && xs_batch.len() <= BATCH_SIZE)
+                    n == BATCH_SIZE || (batch_i == num_batches - 1 && n <= BATCH_SIZE)
                 );
 
-                let n = xs_batch.len();
                 scratch.indices.clear();
                 scratch
                     .indices
@@ -784,10 +884,16 @@ fn compute_quotient_polys<
                     .indices_next
                     .extend(scratch.indices.iter().map(|&i| (i + next_step) % lde_size));
 
+                // Generate this batch's already-shifted domain points directly
+                // into worker scratch: `batch_start * point_step^j` is the same
+                // field element, in the same order, as the old
+                // `F::coset_shift() * points[BATCH_SIZE * batch_i + j]`.
                 scratch.shifted_xs.clear();
-                scratch
-                    .shifted_xs
-                    .extend(xs_batch.iter().map(|&x| F::coset_shift() * x));
+                let mut x = batch_start;
+                for _ in 0..n {
+                    scratch.shifted_xs.push(x);
+                    x *= point_step;
+                }
 
                 prover_data.constants_sigmas_commitment.fill_lde_batch(
                     &scratch.indices,
@@ -903,7 +1009,7 @@ fn compute_quotient_polys<
             },
         );
 
-    debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
+    debug_assert_eq!(quotient_values.len(), lde_size * num_challenges);
     (0..num_challenges)
         .into_par_iter()
         .map(|challenge| {
@@ -916,4 +1022,343 @@ fn compute_quotient_polys<
         })
         .map(|values| values.coset_ifft(F::coset_shift()))
         .collect()
+}
+
+/// Differential tests for the batched shifted quotient-domain generation
+/// (test-only code; the production path is `batched_shifted_domain_starts`
+/// plus the per-batch recurrence in `compute_quotient_polys`).
+#[cfg(test)]
+mod quotient_domain_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    type F = GoldilocksField;
+
+    /// Expands the batch starts exactly the way the `compute_quotient_polys`
+    /// worker does: start at the batch's shifted start and repeatedly multiply
+    /// by the domain's primitive root.
+    fn expand_batched(domain_bits: usize, batch_size: usize) -> Vec<F> {
+        let (point_step, starts) = batched_shifted_domain_starts::<F>(domain_bits, batch_size);
+        let size = 1usize << domain_bits;
+        assert_eq!(starts.len(), size.div_ceil(batch_size));
+        let mut out = Vec::with_capacity(size);
+        for (k, &start) in starts.iter().enumerate() {
+            let n = min(batch_size, size - k * batch_size);
+            let mut x = start;
+            for _ in 0..n {
+                out.push(x);
+                x *= point_step;
+            }
+        }
+        out
+    }
+
+    /// The previous construction: materialize the full unshifted subgroup,
+    /// then multiply every point by the coset shift.
+    fn reference_shifted_domain(domain_bits: usize) -> Vec<F> {
+        F::two_adic_subgroup(domain_bits)
+            .into_iter()
+            .map(|x| F::coset_shift() * x)
+            .collect()
+    }
+
+    #[test]
+    fn batched_domain_matches_full_construction_small_and_partial() {
+        // Includes domains smaller than a batch and batch sizes that do not
+        // divide the domain (deliberately non-production shapes to exercise
+        // the final-partial-batch path).
+        for &(bits, batch_size) in &[
+            (0usize, 32usize),
+            (2, 32),
+            (3, 8),
+            (5, 32),
+            (6, 5),
+            (7, 3),
+            (10, 32),
+            (12, 7),
+        ] {
+            let batched = expand_batched(bits, batch_size);
+            let reference = reference_shifted_domain(bits);
+            assert_eq!(batched, reference, "bits={bits} batch_size={batch_size}");
+        }
+    }
+
+    #[test]
+    fn batched_domain_matches_full_construction_production_sizes() {
+        // The production quotient domains: chain proofs 2^(14+3), transaction
+        // proofs 2^(16+3), the final block proof 2^(18+3). Every generated
+        // point is compared against the previous full construction.
+        for &bits in &[17usize, 19, 21] {
+            let batched = expand_batched(bits, BATCH_SIZE);
+            let reference = reference_shifted_domain(bits);
+            assert_eq!(batched.len(), reference.len(), "bits={bits}");
+            for (i, (a, b)) in batched.iter().zip(&reference).enumerate() {
+                assert_eq!(a, b, "mismatch at index {i} for bits={bits}");
+            }
+        }
+    }
+
+    /// Microbench: full shifted-domain construction (subgroup + coset
+    /// multiply) vs batch starts + in-batch recurrence, single-threaded, on
+    /// the production domain sizes. Run explicitly:
+    /// `cargo test --release -- --ignored --nocapture microbench_domain`
+    #[test]
+    #[ignore = "microbench; run with --ignored --nocapture"]
+    fn microbench_domain_generation() {
+        use core::hint::black_box;
+
+        let trials = 11usize;
+        for &bits in &[17usize, 19, 21] {
+            let mut medians = Vec::new();
+            for new_path in [false, true] {
+                let mut samples = Vec::new();
+                for _ in 0..trials {
+                    let start = std::time::Instant::now();
+                    let out = if new_path {
+                        expand_batched(bits, BATCH_SIZE)
+                    } else {
+                        reference_shifted_domain(bits)
+                    };
+                    samples.push(start.elapsed().as_secs_f64());
+                    black_box(out);
+                }
+                samples.sort_by(f64::total_cmp);
+                medians.push(samples[trials / 2]);
+            }
+            eprintln!(
+                "domain bits {bits}: old {:.3} ms, new {:.3} ms, ratio {:.3}x",
+                medians[0] * 1e3,
+                medians[1] * 1e3,
+                medians[0] / medians[1]
+            );
+        }
+    }
+}
+
+/// Differential tests for the chunk-direct partial-products construction
+/// (test-only code): the slab implementation must produce exactly the same
+/// partial-product and Z polynomials as the previous per-point algorithm,
+/// which is re-implemented here as the reference.
+#[cfg(test)]
+mod chunk_direct_partial_products_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::util::partial_products::quotient_chunk_products;
+
+    type F = GoldilocksField;
+
+    /// Deterministic pseudorandom field elements (no OS entropy): xorshift64*
+    /// masked to 63 bits, which is always a canonical Goldilocks value.
+    struct DeterministicValues {
+        state: u64,
+    }
+
+    impl DeterministicValues {
+        fn new(seed: u64) -> Self {
+            Self {
+                state: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+            }
+        }
+
+        fn next_field(&mut self) -> F {
+            self.state ^= self.state << 13;
+            self.state ^= self.state >> 7;
+            self.state ^= self.state << 17;
+            F::from_canonical_u64(self.state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 1)
+        }
+    }
+
+    /// The previous per-point algorithm, kept verbatim as the reference: all
+    /// per-wire quotients materialized, one batch inversion per point, chunk
+    /// products via `quotient_chunk_products`, then the identical Z chain.
+    #[allow(clippy::too_many_arguments)]
+    fn reference_partial_products_and_zs(
+        witness: &MatrixWitness<F>,
+        beta: F,
+        beta_k_is: &[F],
+        gamma: F,
+        sigmas: &[Vec<F>],
+        subgroup: &[F],
+        max_degree: usize,
+        num_prods: usize,
+    ) -> Vec<PolynomialValues<F>> {
+        let num_routed_wires = beta_k_is.len();
+        let all_quotient_chunk_products: Vec<Vec<F>> = subgroup
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                let s_sigmas = &sigmas[i];
+                let denominators: Vec<F> = (0..num_routed_wires)
+                    .map(|j| witness.get_wire(i, j) + beta * s_sigmas[j] + gamma)
+                    .collect();
+                let mut quotient_values = F::batch_multiplicative_inverse(&denominators);
+                for (j, quotient_value) in quotient_values.iter_mut().enumerate() {
+                    let numerator = witness.get_wire(i, j) + beta_k_is[j] * x + gamma;
+                    *quotient_value *= numerator;
+                }
+                quotient_chunk_products(&quotient_values, max_degree)
+            })
+            .collect();
+
+        let n_points = all_quotient_chunk_products.len();
+        let mut columns: Vec<Vec<F>> = (0..num_prods + 1)
+            .map(|_| Vec::with_capacity(n_points))
+            .collect();
+        let mut z_x = F::ONE;
+        for quotient_chunk_products in all_quotient_chunk_products {
+            let mut acc = z_x;
+            for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
+                acc *= quotient_chunk_product;
+                if k == num_prods {
+                    columns[k].push(z_x);
+                    z_x = acc;
+                } else {
+                    columns[k].push(acc);
+                }
+            }
+        }
+
+        columns.into_iter().map(PolynomialValues::new).collect()
+    }
+
+    fn check_combination(num_routed_wires: usize, max_degree: usize, n_points: usize, seed: u64) {
+        let num_prods = num_partial_products_for_test(num_routed_wires, max_degree);
+        let mut values = DeterministicValues::new(seed);
+
+        // Column-major wire values, exactly as `MatrixWitness` stores them.
+        let wire_values: Vec<Vec<F>> = (0..num_routed_wires)
+            .map(|_| (0..n_points).map(|_| values.next_field()).collect())
+            .collect();
+        let witness = MatrixWitness { wire_values };
+
+        let sigmas: Vec<Vec<F>> = (0..n_points)
+            .map(|_| (0..num_routed_wires).map(|_| values.next_field()).collect())
+            .collect();
+        let subgroup: Vec<F> = (0..n_points).map(|_| values.next_field()).collect();
+        let beta = values.next_field();
+        let gamma = values.next_field();
+        let beta_k_is: Vec<F> = (0..num_routed_wires).map(|_| values.next_field()).collect();
+
+        let actual = wires_permutation_partial_products_and_zs_impl(
+            &witness,
+            beta,
+            &beta_k_is,
+            gamma,
+            &sigmas,
+            &subgroup,
+            max_degree,
+            num_prods,
+        );
+        let expected = reference_partial_products_and_zs(
+            &witness,
+            beta,
+            &beta_k_is,
+            gamma,
+            &sigmas,
+            &subgroup,
+            max_degree,
+            num_prods,
+        );
+
+        assert_eq!(actual.len(), expected.len());
+        for (k, (a, e)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                a, e,
+                "polynomial {k} differs for wires={num_routed_wires} degree={max_degree} points={n_points}"
+            );
+        }
+    }
+
+    fn num_partial_products_for_test(n: usize, max_degree: usize) -> usize {
+        n.div_ceil(max_degree) - 1
+    }
+
+    /// Microbench: previous per-point algorithm vs chunk-direct slab
+    /// implementation on the production wire shape (80 routed wires, degree
+    /// 8), 2^12 points. Run single-threaded for an honest per-core number:
+    /// `RAYON_NUM_THREADS=1 cargo test --release -- --ignored --nocapture microbench_partial`
+    #[test]
+    #[ignore = "microbench; run with --ignored --nocapture (set RAYON_NUM_THREADS=1)"]
+    fn microbench_partial_products() {
+        use core::hint::black_box;
+
+        let num_routed_wires = 80usize;
+        let max_degree = 8usize;
+        let n_points = 1usize << 12;
+        let num_prods = num_partial_products_for_test(num_routed_wires, max_degree);
+        let mut values = DeterministicValues::new(0x5EED_0001);
+
+        let wire_values: Vec<Vec<F>> = (0..num_routed_wires)
+            .map(|_| (0..n_points).map(|_| values.next_field()).collect())
+            .collect();
+        let witness = MatrixWitness { wire_values };
+        let sigmas: Vec<Vec<F>> = (0..n_points)
+            .map(|_| (0..num_routed_wires).map(|_| values.next_field()).collect())
+            .collect();
+        let subgroup: Vec<F> = (0..n_points).map(|_| values.next_field()).collect();
+        let beta = values.next_field();
+        let gamma = values.next_field();
+        let beta_k_is: Vec<F> = (0..num_routed_wires).map(|_| values.next_field()).collect();
+
+        let trials = 11usize;
+        let mut medians = Vec::new();
+        for new_path in [false, true] {
+            let mut samples = Vec::new();
+            for _ in 0..trials {
+                let start = std::time::Instant::now();
+                let out = if new_path {
+                    wires_permutation_partial_products_and_zs_impl(
+                        &witness, beta, &beta_k_is, gamma, &sigmas, &subgroup, max_degree,
+                        num_prods,
+                    )
+                } else {
+                    reference_partial_products_and_zs(
+                        &witness, beta, &beta_k_is, gamma, &sigmas, &subgroup, max_degree,
+                        num_prods,
+                    )
+                };
+                samples.push(start.elapsed().as_secs_f64());
+                black_box(out);
+            }
+            samples.sort_by(f64::total_cmp);
+            medians.push(samples[trials / 2]);
+        }
+        eprintln!(
+            "partial products 80x8x{n_points} (threads={}): old {:.3} ms, new {:.3} ms, ratio {:.3}x",
+            std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "default".into()),
+            medians[0] * 1e3,
+            medians[1] * 1e3,
+            medians[0] / medians[1]
+        );
+    }
+
+    #[test]
+    fn chunk_direct_products_match_per_point_reference() {
+        // Production wire shape (80 routed wires, quotient degree factor 8)
+        // across sub-slab, exact-slab, and multi-slab point counts, plus
+        // ragged-chunk shapes where `max_degree` does not divide the wire
+        // count, and small degenerate shapes.
+        for &(wires, degree, points, seed) in &[
+            // Production shape: partial slab, exact slab, multiple slabs.
+            (80usize, 8usize, 4usize, 1u64),
+            (80, 8, 64, 2),
+            (80, 8, 128, 3),
+            (80, 8, 256, 4),
+            (80, 8, 512, 5),
+            // Ragged chunks (max_degree does not divide the wire count).
+            (7, 3, 128, 6),
+            (7, 3, 32, 7),
+            (10, 4, 256, 8),
+            (12, 5, 64, 9),
+            (13, 6, 128, 10),
+            // Minimal shapes.
+            (3, 2, 4, 11),
+            (5, 2, 128, 12),
+            (9, 2, 16, 13),
+            (11, 3, 512, 14),
+            (33, 32, 64, 15),
+        ] {
+            check_combination(wires, degree, points, seed);
+        }
+    }
 }

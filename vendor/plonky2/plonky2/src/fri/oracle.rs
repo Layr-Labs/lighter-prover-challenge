@@ -246,7 +246,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let n = indices.len();
         let start = col_range.start;
         let w = col_range.len();
-        out.clear();
+        // Resize without clearing. For the usual equal-size reuse this is a
+        // no-op; a shorter final batch truncates; growth zero-initializes only
+        // the new suffix. Every branch below overwrites the entire `n * w`
+        // logical range (and if either dimension is zero the range is empty),
+        // so no stale logical element survives. The previous `clear()` forced
+        // `resize` to rewrite the whole buffer with zeros before every gather,
+        // only for every slot to be immediately overwritten with LDE data.
         out.resize(n * w, F::ZERO);
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
@@ -458,6 +464,150 @@ mod tests {
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::Sample;
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    /// `fill_lde_batch` resizes its reusable output without clearing it, on
+    /// the argument that every branch (both storage modes x both layouts)
+    /// overwrites the entire logical range. Differential check: for every
+    /// combination, filling a poisoned undersized / equal-sized / oversized
+    /// starting buffer must produce exactly the same output as filling a
+    /// fresh one (which is byte-for-byte the old clear-then-zero-fill
+    /// behavior).
+    #[test]
+    fn fill_lde_batch_poisoned_reuse_matches_fresh() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        let width = 5usize;
+        let n_leaves = 8usize; // log = 3 = degree_log + rate_bits below
+
+        // Rows-mode oracle (flat row-major leaves).
+        let rows: Vec<Vec<F>> = (0..n_leaves)
+            .map(|i| {
+                (0..width)
+                    .map(|j| F::from_canonical_u64((i * width + j + 1) as u64))
+                    .collect()
+            })
+            .collect();
+        let rows_batch = PolynomialBatch::<F, C, D> {
+            polynomials: Vec::new(),
+            merkle_tree: MerkleTree::<F, H>::new(rows, 0),
+            degree_log: 2,
+            rate_bits: 1,
+            blinding: false,
+        };
+
+        // Columns-mode oracle (natural-order poly-major columns).
+        let columns: Vec<Vec<F>> = (0..width)
+            .map(|j| {
+                (0..n_leaves)
+                    .map(|i| F::from_canonical_u64((j * n_leaves + i + 100) as u64))
+                    .collect()
+            })
+            .collect();
+        let columns_batch = PolynomialBatch::<F, C, D> {
+            polynomials: Vec::new(),
+            merkle_tree: MerkleTree::<F, H>::new_columns(columns, 0),
+            degree_log: 2,
+            rate_bits: 1,
+            blinding: false,
+        };
+
+        let indices = [0usize, 2, 3];
+        let step = 2usize;
+        let poison = F::from_canonical_u64(0xDEAD_BEEF_DEAD_BEEF);
+
+        for batch in [&rows_batch, &columns_batch] {
+            for layout in [BatchLayout::PointMajor, BatchLayout::PolyMajor] {
+                for col_range in [0..width, 1..4] {
+                    // Filling a fresh buffer is exactly the old behavior
+                    // (resize from empty zero-fills everything first).
+                    let mut expected = Vec::new();
+                    batch.fill_lde_batch(
+                        &indices,
+                        step,
+                        col_range.clone(),
+                        layout,
+                        &mut expected,
+                    );
+                    let out_len = expected.len();
+                    assert_eq!(out_len, indices.len() * col_range.len());
+
+                    for start_len in [out_len.saturating_sub(3), out_len, out_len + 7] {
+                        let mut out = vec![poison; start_len];
+                        batch.fill_lde_batch(&indices, step, col_range.clone(), layout, &mut out);
+                        assert_eq!(out, expected);
+                    }
+                }
+            }
+        }
+
+        // An empty column range must leave an empty logical output even when
+        // the reused buffer starts non-empty.
+        let mut out = vec![poison; 9];
+        rows_batch.fill_lde_batch(&indices, step, 2..2, BatchLayout::PointMajor, &mut out);
+        assert!(out.is_empty());
+    }
+
+    /// Microbench for the gather-buffer zero-fill deletion: clear+resize vs
+    /// resize alone, followed by the same full overwrite, on the five
+    /// production quotient-scratch buffer lengths (constants 2x32, sigmas
+    /// 80x32, wires 136x32, zs local/next 20x32). Run explicitly:
+    /// `cargo test --release -- --ignored --nocapture microbench_gather`
+    #[test]
+    #[ignore = "microbench; run with --ignored --nocapture"]
+    fn microbench_gather_resize_with_and_without_clear() {
+        use core::hint::black_box;
+
+        type F = GoldilocksField;
+
+        let lengths = [64usize, 2560, 4352, 640, 640];
+        let iterations = 250_000usize;
+        let trials = 11usize;
+
+        let mut medians = Vec::new();
+        for clear_first in [true, false] {
+            let mut samples = Vec::new();
+            for _ in 0..trials {
+                let mut buffers: Vec<Vec<F>> =
+                    lengths.iter().map(|&len| vec![F::ZERO; len]).collect();
+                let start = std::time::Instant::now();
+                for it in 0..iterations {
+                    let fill = F::from_canonical_u64(it as u64 + 1);
+                    for (buffer, &len) in buffers.iter_mut().zip(&lengths) {
+                        if clear_first {
+                            buffer.clear();
+                        }
+                        buffer.resize(len, F::ZERO);
+                        // The full overwrite every branch of fill_lde_batch
+                        // performs.
+                        for slot in buffer.iter_mut() {
+                            *slot = fill;
+                        }
+                    }
+                }
+                samples.push(start.elapsed().as_secs_f64());
+                black_box(&buffers);
+            }
+            samples.sort_by(f64::total_cmp);
+            let median = samples[trials / 2];
+            medians.push(median);
+            eprintln!(
+                "gather fill ({}): median {:.3} ms over {trials} trials",
+                if clear_first {
+                    "clear+resize"
+                } else {
+                    "resize only "
+                },
+                median * 1e3
+            );
+        }
+        eprintln!(
+            "gather fill ratio clear/no-clear: {:.4}x",
+            medians[0] / medians[1]
+        );
+    }
 
     #[test]
     fn shared_coset_powers_match_per_polynomial_shifts() {
