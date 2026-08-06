@@ -1265,10 +1265,18 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
 
         // Index generator indices by their watched targets.
         let mut generator_indices_by_watches = BTreeMap::new();
+        let mut generator_watch_counts = vec![0usize; self.generators.len()];
         for (i, generator) in self.generators.iter().enumerate() {
-            for watch in generator.0.watch_list() {
-                let watch_index = forest.target_index(watch);
-                let watch_rep_index = forest.parents[watch_index];
+            let mut watch_rep_indices = generator
+                .0
+                .watch_list()
+                .into_iter()
+                .map(|watch| forest.parents[forest.target_index(watch)])
+                .collect::<Vec<_>>();
+            watch_rep_indices.sort_unstable();
+            watch_rep_indices.dedup();
+            generator_watch_counts[i] = watch_rep_indices.len();
+            for watch_rep_index in watch_rep_indices {
                 generator_indices_by_watches
                     .entry(watch_rep_index)
                     .or_insert_with(Vec::new)
@@ -1338,6 +1346,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,
             generator_indices_by_watches,
+            generator_watch_counts,
             constants_sigmas_commitment,
             sigmas: transpose_poly_values(sigma_vecs),
             subgroup,
