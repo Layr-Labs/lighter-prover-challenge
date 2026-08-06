@@ -33,7 +33,7 @@ use crate::plonk::vanishing_poly::{
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
-use crate::util::partial_products::{partial_products_and_z_gx, quotient_chunk_products};
+use crate::util::partial_products::quotient_chunk_products;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_ceil, transpose};
 
@@ -389,6 +389,19 @@ fn all_wires_permutation_partial_products<
         .collect()
 }
 
+fn partial_products_and_z_gx_in_place<F: Field>(quotient_chunk_products: &mut [F], z_x: &mut F) {
+    assert!(!quotient_chunk_products.is_empty());
+
+    let mut accumulator = *z_x;
+    for quotient_chunk_product in quotient_chunk_products.iter_mut() {
+        accumulator *= *quotient_chunk_product;
+        *quotient_chunk_product = accumulator;
+    }
+
+    let last = quotient_chunk_products.len() - 1;
+    swap(z_x, &mut quotient_chunk_products[last]);
+}
+
 /// Compute the partial products used in the `Z` polynomial.
 /// Returns the polynomials interpolating `partial_products(f / g)`
 /// where `f, g` are the products in the definition of `Z`: `Z(g^i) = f / g`.
@@ -407,7 +420,7 @@ fn wires_permutation_partial_products_and_zs<
     let subgroup = &prover_data.subgroup;
     let k_is = &common_data.k_is;
     let num_prods = common_data.num_partial_products;
-    let all_quotient_chunk_products = subgroup
+    let mut all_partial_products_and_zs = subgroup
         .par_iter()
         .enumerate()
         .map(|(i, &x)| {
@@ -436,13 +449,10 @@ fn wires_permutation_partial_products_and_zs<
         .collect::<Vec<_>>();
 
     let mut z_x = F::ONE;
-    let mut all_partial_products_and_zs = Vec::with_capacity(all_quotient_chunk_products.len());
-    for quotient_chunk_products in all_quotient_chunk_products {
-        let mut partial_products_and_z_gx =
-            partial_products_and_z_gx(z_x, &quotient_chunk_products);
-        // The last term is Z(gx), but we replace it with Z(x), otherwise Z would end up shifted.
-        swap(&mut z_x, &mut partial_products_and_z_gx[num_prods]);
-        all_partial_products_and_zs.push(partial_products_and_z_gx);
+    for partial_products_and_z_gx in &mut all_partial_products_and_zs {
+        debug_assert_eq!(partial_products_and_z_gx.len(), num_prods + 1);
+        // The last term is Z(gx), but replace it with Z(x), otherwise Z would end up shifted.
+        partial_products_and_z_gx_in_place(partial_products_and_z_gx, &mut z_x);
     }
 
     transpose(&all_partial_products_and_zs)
@@ -868,4 +878,66 @@ fn compute_quotient_polys<
         })
         .map(|values| values.coset_ifft(F::coset_shift()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use plonky2_field::goldilocks_field::GoldilocksField;
+    use plonky2_field::types::{Field64, PrimeField64};
+
+    use super::*;
+
+    #[test]
+    fn in_place_partial_products_match_legacy_allocation_and_swap() {
+        type F = GoldilocksField;
+
+        fn legacy(mut z_x: F, quotient_chunk_products: &[F]) -> (Vec<F>, F) {
+            assert!(!quotient_chunk_products.is_empty());
+            let mut result = Vec::with_capacity(quotient_chunk_products.len());
+            let mut accumulator = z_x;
+            for &quotient_chunk_product in quotient_chunk_products {
+                accumulator *= quotient_chunk_product;
+                result.push(accumulator);
+            }
+            let last = result.len() - 1;
+            swap(&mut z_x, &mut result[last]);
+            (result, z_x)
+        }
+
+        let incoming_zs = [
+            F::from_canonical_u64(13),
+            GoldilocksField(F::ORDER + 1),
+            GoldilocksField(F::ORDER + 0xffff_fffe),
+        ];
+
+        for row_len in [0, 1, 31, 32, 136] {
+            let input = (0..row_len)
+                .map(|j| GoldilocksField(F::ORDER + (j % 251 + 1) as u64))
+                .collect::<Vec<_>>();
+
+            for incoming_z in incoming_zs {
+                let expected = catch_unwind(|| legacy(incoming_z, &input));
+
+                let mut actual_row = input.clone();
+                let mut actual_z = incoming_z;
+                let actual = catch_unwind(AssertUnwindSafe(|| {
+                    partial_products_and_z_gx_in_place(&mut actual_row, &mut actual_z)
+                }));
+
+                assert_eq!(actual.is_err(), expected.is_err(), "row length {row_len}");
+                if let Ok((expected_row, expected_z)) = expected {
+                    assert_eq!(actual_row.len(), expected_row.len());
+                    for (actual, expected) in actual_row.iter().zip(&expected_row) {
+                        assert_eq!(actual.to_noncanonical_u64(), expected.to_noncanonical_u64());
+                    }
+                    assert_eq!(
+                        actual_z.to_noncanonical_u64(),
+                        expected_z.to_noncanonical_u64()
+                    );
+                }
+            }
+        }
+    }
 }

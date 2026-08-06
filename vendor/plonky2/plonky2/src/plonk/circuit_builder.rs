@@ -206,6 +206,12 @@ pub struct CircuitBuilder<F: RichField + Extendable<D>, const D: usize> {
     pub(crate) verifier_data_public_input: Option<VerifierCircuitTarget>,
 }
 
+fn take_constant_generators<F: Field>(
+    constant_generators: &mut Vec<ConstantGenerator<F>>,
+) -> Vec<ConstantGenerator<F>> {
+    core::mem::take(constant_generators)
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
     /// Given a [`CircuitConfig`], generate a new [`CircuitBuilder`] instance.
     /// It will also check that the configuration provided is consistent, i.e.
@@ -1164,7 +1170,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             // We need to enumerate constants_to_targets in some deterministic order to ensure that
             // building a circuit is deterministic.
             .sorted_by_key(|(c, _t)| c.to_canonical_u64())
-            .zip(self.constant_generators.clone())
+            .zip(take_constant_generators(&mut self.constant_generators))
         {
             // Set the constant in the constant polynomial.
             self.gate_instances[const_gen.row].constants[const_gen.constant_index] = c;
@@ -1391,5 +1397,47 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // TODO: Can skip parts of this.
         let circuit_data = self.build::<C>();
         circuit_data.verifier_data()
+    }
+}
+
+#[cfg(test)]
+mod constant_generator_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    #[test]
+    fn taking_constant_generators_preserves_order_and_empties_source() {
+        let expected = vec![(3, 1, 7, field(13)), (8, 2, 4, field(21))];
+        let mut generators = expected
+            .iter()
+            .map(
+                |&(row, constant_index, wire_index, constant)| ConstantGenerator {
+                    row,
+                    constant_index,
+                    wire_index,
+                    constant,
+                },
+            )
+            .collect::<Vec<_>>();
+
+        let taken = take_constant_generators(&mut generators);
+
+        assert!(generators.is_empty());
+        assert_eq!(
+            taken
+                .into_iter()
+                .map(|generator| (
+                    generator.row,
+                    generator.constant_index,
+                    generator.wire_index,
+                    generator.constant,
+                ))
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    fn field(value: usize) -> GoldilocksField {
+        GoldilocksField::from_canonical_usize(value)
     }
 }
