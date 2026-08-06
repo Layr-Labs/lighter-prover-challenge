@@ -223,6 +223,15 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
         let half = num_leaves / 2;
         let (left_leaves, right_leaves) = leaves.split_at(half * leaf_width);
 
+        // Sibling leaves are independent; hash them as one interleaved pair so
+        // the two permutation dependency chains overlap in the pipeline.
+        if num_leaves == 2 {
+            let (left_digest, right_digest) = H::hash_or_noop_pair(left_leaves, right_leaves);
+            left_digest_mem.write(left_digest);
+            right_digest_mem.write(right_digest);
+            return H::two_to_one(left_digest, right_digest);
+        }
+
         // Rayon task creation dominates the tiny subtrees near the leaves. Keep
         // enough parallelism at the upper levels, then recurse synchronously.
         let (left_digest, right_digest) = if num_leaves > 16 {

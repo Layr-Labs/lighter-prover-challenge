@@ -74,6 +74,13 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
         }
     }
 
+    /// Hash two equal-length inputs, allowing implementations to interleave
+    /// the two computations. Must return exactly
+    /// `(Self::hash_or_noop(input_a), Self::hash_or_noop(input_b))`.
+    fn hash_or_noop_pair(input_a: &[F], input_b: &[F]) -> (Self::Hash, Self::Hash) {
+        (Self::hash_or_noop(input_a), Self::hash_or_noop(input_b))
+    }
+
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash;
 
     /// Build the native Merkle digests and cap with a specialized backend, when available.

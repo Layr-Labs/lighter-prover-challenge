@@ -7,7 +7,7 @@ use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::goldilocks_field::GoldilocksField as F;
 use crate::field::types::{Field, PrimeField64};
 use crate::gates::poseidon2::Poseidon2Gate;
-use crate::hash::hash_types::{HashOut, RichField};
+use crate::hash::hash_types::{HashOut, NUM_HASH_OUT_ELTS, RichField};
 use crate::hash::hashing::{PlonkyPermutation, compress, hash_n_to_hash_no_pad};
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::{BoolTarget, Target};
@@ -26,6 +26,54 @@ pub trait Poseidon2: PrimeField64 {
         Self::full_rounds(&mut state, ROUNDS_F_HALF);
 
         state
+    }
+
+    /// Permute two independent states together. The layers are applied to the
+    /// two states in alternation so the CPU can overlap the serial sbox and
+    /// linear-layer dependency chains of one state with the other's. Each
+    /// state's output is bit-identical to `Self::poseidon2` on that state.
+    #[inline]
+    fn poseidon2_x2(
+        input_a: [Self; WIDTH],
+        input_b: [Self; WIDTH],
+    ) -> ([Self; WIDTH], [Self; WIDTH]) {
+        let mut a = input_a;
+        let mut b = input_b;
+
+        Self::external_linear_layer(&mut a);
+        Self::external_linear_layer(&mut b);
+
+        Self::full_rounds_x2(&mut a, &mut b, 0);
+        Self::partial_rounds_x2(&mut a, &mut b);
+        Self::full_rounds_x2(&mut a, &mut b, ROUNDS_F_HALF);
+
+        (a, b)
+    }
+
+    #[inline]
+    #[unroll::unroll_for_loops]
+    fn full_rounds_x2(a: &mut [Self; WIDTH], b: &mut [Self; WIDTH], start: usize) {
+        for r in start..(start + ROUNDS_F_HALF) {
+            Self::add_rc(a, r);
+            Self::add_rc(b, r);
+            Self::sbox(a);
+            Self::sbox(b);
+            Self::external_linear_layer(a);
+            Self::external_linear_layer(b);
+        }
+    }
+
+    #[inline]
+    #[unroll::unroll_for_loops]
+    fn partial_rounds_x2(a: &mut [Self; WIDTH], b: &mut [Self; WIDTH]) {
+        for r in 0..ROUNDS_P {
+            a[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
+            b[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
+            a[0] = Self::sbox_p(&a[0]);
+            b[0] = Self::sbox_p(&b[0]);
+            Self::internal_linear_layer(a);
+            Self::internal_linear_layer(b);
+        }
     }
 
     #[inline]
@@ -493,6 +541,33 @@ fn sum_12<F: PrimeField64>(inputs: &[F]) -> F {
     F::from_noncanonical_u128_with_96_bits(tmp)
 }
 
+/// Hash two equal-length inputs with two lockstep overwrite-mode sponges whose
+/// permutations run interleaved via `poseidon2_x2`. Each output is
+/// bit-identical to `hash_n_to_hash_no_pad` on the corresponding input.
+pub(crate) fn hash_pair_no_pad<F: RichField + Poseidon2>(
+    input_a: &[F],
+    input_b: &[F],
+) -> (HashOut<F>, HashOut<F>) {
+    debug_assert_eq!(input_a.len(), input_b.len());
+    let mut state_a = [F::ZERO; WIDTH];
+    let mut state_b = [F::ZERO; WIDTH];
+
+    for (chunk_a, chunk_b) in input_a.chunks(RATE).zip(input_b.chunks(RATE)) {
+        state_a[..chunk_a.len()].copy_from_slice(chunk_a);
+        state_b[..chunk_b.len()].copy_from_slice(chunk_b);
+        (state_a, state_b) = F::poseidon2_x2(state_a, state_b);
+    }
+
+    (
+        HashOut {
+            elements: state_a[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
+        },
+        HashOut {
+            elements: state_b[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
+        },
+    )
+}
+
 /// Poseidon2 hash function.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Poseidon2Hash;
@@ -503,6 +578,18 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
 
     fn hash_no_pad(input: &[F]) -> Self::Hash {
         hash_n_to_hash_no_pad::<F, Self::Permutation>(input)
+    }
+
+    fn hash_or_noop_pair(input_a: &[F], input_b: &[F]) -> (Self::Hash, Self::Hash) {
+        debug_assert_eq!(input_a.len(), input_b.len());
+        if input_a.len() * 8 <= <Self as Hasher<F>>::HASH_SIZE {
+            (
+                <Self as Hasher<F>>::hash_or_noop(input_a),
+                <Self as Hasher<F>>::hash_or_noop(input_b),
+            )
+        } else {
+            hash_pair_no_pad::<F>(input_a, input_b)
+        }
     }
 
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash {
@@ -734,5 +821,62 @@ mod test {
 
         let proof = circuit.prove(pw).unwrap();
         circuit.verify(proof.clone())
+    }
+}
+
+#[cfg(test)]
+mod pair_hash_tests {
+    use plonky2_field::types::Sample;
+
+    use super::*;
+    use crate::plonk::config::Hasher;
+
+    #[test]
+    fn pair_hash_matches_individual_across_widths() {
+        for width in [1, 2, 4, 5, 7, 8, 9, 16, 17, 24, 33, 87, 135] {
+            let a: Vec<F> = (0..width).map(|_| F::rand()).collect();
+            let b: Vec<F> = (0..width).map(|_| F::rand()).collect();
+            let (ha, hb) = Poseidon2Hash::hash_or_noop_pair(&a, &b);
+            assert_eq!(ha, <Poseidon2Hash as Hasher<F>>::hash_or_noop(&a), "width {width} a");
+            assert_eq!(hb, <Poseidon2Hash as Hasher<F>>::hash_or_noop(&b), "width {width} b");
+        }
+    }
+
+    // Not a correctness test: times sequential sibling-leaf hashing against the
+    // interleaved pair sponge. Run with --nocapture.
+    #[test]
+    fn time_sequential_vs_pair_leaf_hash() {
+        let width = 87;
+        let a: Vec<F> = (0..width).map(|_| F::rand()).collect();
+        let b: Vec<F> = (0..width).map(|_| F::rand()).collect();
+        let iters = 100_000;
+
+        let t0 = std::time::Instant::now();
+        let mut sink_old = F::ZERO;
+        for _ in 0..iters {
+            let ha = <Poseidon2Hash as Hasher<F>>::hash_or_noop(core::hint::black_box(&a));
+            let hb = <Poseidon2Hash as Hasher<F>>::hash_or_noop(core::hint::black_box(&b));
+            sink_old += ha.elements[0] + hb.elements[0];
+        }
+        let old_time = t0.elapsed();
+
+        let t1 = std::time::Instant::now();
+        let mut sink_new = F::ZERO;
+        for _ in 0..iters {
+            let (ha, hb) = Poseidon2Hash::hash_or_noop_pair(
+                core::hint::black_box(&a),
+                core::hint::black_box(&b),
+            );
+            sink_new += ha.elements[0] + hb.elements[0];
+        }
+        let new_time = t1.elapsed();
+
+        assert_eq!(sink_old, sink_new);
+        println!(
+            "sequential: {:?}  interleaved pair: {:?}  speedup: {:.2}x",
+            old_time,
+            new_time,
+            old_time.as_secs_f64() / new_time.as_secs_f64()
+        );
     }
 }
