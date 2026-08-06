@@ -110,40 +110,20 @@ impl Field for GoldilocksField {
             return None;
         }
 
-        // compute base^(P - 2) using 72 multiplications
-        // The exponent P - 2 is represented in binary as:
-        // 0b1111111111111111111111111111111011111111111111111111111111111111
-
-        // compute base^11
-        let t2 = self.square() * *self;
-
-        // compute base^111
-        let t3 = t2.square() * *self;
-
-        // compute base^111111 (6 ones)
-        // repeatedly square t3 3 times and multiply by t3
-        let t6 = exp_acc::<3>(t3, t3);
-
-        // compute base^111111111111 (12 ones)
-        // repeatedly square t6 6 times and multiply by t6
-        let t12 = exp_acc::<6>(t6, t6);
-
-        // compute base^111111111111111111111111 (24 ones)
-        // repeatedly square t12 12 times and multiply by t12
-        let t24 = exp_acc::<12>(t12, t12);
-
-        // compute base^1111111111111111111111111111111 (31 ones)
-        // repeatedly square t24 6 times and multiply by t6 first. then square t30 and
-        // multiply by base
-        let t30 = exp_acc::<6>(t24, t6);
-        let t31 = t30.square() * *self;
-
-        // compute base^111111111111111111111111111111101111111111111111111111111111111
-        // repeatedly square t31 32 times and multiply by t31
-        let t63 = exp_acc::<32>(t31, t31);
-
-        // compute base^1111111111111111111111111111111011111111111111111111111111111111
-        Some(t63.square() * *self)
+        // Goldilocks fits in u64; extended Euclid avoids the 72-multiply
+        // Fermat chain for the prover's non-secret field inversions.
+        let modulus = Self::ORDER as i128;
+        let mut r = modulus;
+        let mut new_r = self.0 as i128;
+        let mut t = 0i128;
+        let mut new_t = 1i128;
+        while new_r != 0 {
+            let quotient = r / new_r;
+            (r, new_r) = (new_r, r - quotient * new_r);
+            (t, new_t) = (new_t, t - quotient * new_t);
+        }
+        let inverse = if t < 0 { t + modulus } else { t };
+        Some(Self::from_canonical_u64(inverse as u64))
     }
 
     fn from_noncanonical_biguint(n: BigUint) -> Self {
