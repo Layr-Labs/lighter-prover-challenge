@@ -27,11 +27,32 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
-    env_logger::init();
+    // Active ranked fixtures nest deeper than the public smoke fixture, and the
+    // test suite already parses them on 32MiB stacks. Run the whole prover on a
+    // generously sized worker thread so fixture parsing can never overflow the
+    // 8MiB default main stack in the sandbox. (The rayon pool below gets the
+    // same stack size for its workers.)
+    std::thread::Builder::new()
+        .name("prove-main".into())
+        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .spawn(prove_main)
+        .expect("cannot spawn prover thread")
+        .join()
+        .expect("prover thread panicked");
+}
+
+fn prove_main() {
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
         .expect("cannot configure prover thread pool");
+
+    // Local profiling only: the ranked sandbox clears the environment, so both
+    // branches below are inert there.
+    if env::var_os("RUST_LOG").is_some() {
+        let _ = env_logger::try_init();
+    }
+    let mut timer = api::StageTimer::new();
 
     let mut args = env::args().skip(1);
     let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
@@ -39,6 +60,7 @@ fn main() {
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
     let json = fs::read(fixture).expect("cannot read prover fixture");
+    timer.mark("read fixture");
     let block = Block::<F>::from_json_with_empty_txs(
         &json,
         HEAVY_TX_PER_PROOF,
@@ -47,7 +69,13 @@ fn main() {
         PUBLIC_LIGHT_TX_COUNT,
     )
     .expect("invalid prover fixture");
-    let proof = prover::prove_block(block, &Circuits::new());
+    timer.mark("parse fixture");
+    // Only the leaf tx circuits are built here (they gate leaf proving); the
+    // pre/chain/block circuits build on a background thread inside prove_block.
+    let circuits = Circuits::new();
+    timer.mark("tx circuits ready");
+    let proof = prover::prove_block(block, &circuits);
+    timer.mark("prove_block");
     bincode::serialize_into(
         BufWriter::with_capacity(
             PROOF_OUTPUT_BUFFER_BYTES,
@@ -56,4 +84,5 @@ fn main() {
         &proof,
     )
     .expect("cannot write proof output");
+    timer.mark("write proof");
 }

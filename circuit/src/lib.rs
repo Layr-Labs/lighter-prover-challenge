@@ -38,6 +38,7 @@ pub mod block_tx;
 pub mod block_tx_chain;
 pub mod block_tx_chain_constraints;
 pub mod block_tx_constraints;
+pub mod block_tx_native;
 pub mod bool_utils;
 pub mod builder;
 pub mod byte;
@@ -70,3 +71,6 @@ pub mod tx_interface;
 pub mod types;
 pub mod uint;
 pub mod utils;
+
+#[cfg(test)]
+pub mod gate_batch_testing;

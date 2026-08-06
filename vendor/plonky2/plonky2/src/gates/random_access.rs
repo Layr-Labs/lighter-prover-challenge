@@ -197,7 +197,76 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
     }
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        self.eval_unfiltered_base_batch_packed(vars_base)
+        let n = vars_base.len();
+        let wires = vars_base.local_wires;
+        let constants = vars_base.local_constants;
+        let col = |w: usize| &wires[w * n..][..n];
+        let vec_size = self.vec_size();
+        let mut res = vec![F::ZERO; n * self.num_constraints()];
+        let mut chunks = res.chunks_exact_mut(n);
+        // `items` holds vec_size columns of n points, folded in place; the
+        // write index k always trails the read indices 2k, 2k+1, which were
+        // consumed at an earlier k of the same level.
+        let mut items = vec![F::ZERO; vec_size * n];
+        let mut acc = vec![F::ZERO; n];
+
+        for copy in 0..self.num_copies {
+            // Assert that each bit wire value is indeed boolean.
+            for i in 0..self.bits {
+                let b = col(self.wire_bit(i, copy));
+                let out = chunks.next().unwrap();
+                for p in 0..n {
+                    out[p] = b[p] * (b[p] - F::ONE);
+                }
+            }
+
+            // Assert that the binary decomposition was correct.
+            acc.fill(F::ZERO);
+            for i in (0..self.bits).rev() {
+                let b = col(self.wire_bit(i, copy));
+                for p in 0..n {
+                    acc[p] = acc[p].double() + b[p];
+                }
+            }
+            let access_index = col(self.wire_access_index(copy));
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                out[p] = acc[p] - access_index[p];
+            }
+
+            // Repeatedly fold the list, selecting the left or right item from
+            // each pair based on the corresponding bit.
+            for i in 0..vec_size {
+                items[i * n..][..n].copy_from_slice(col(self.wire_list_item(i, copy)));
+            }
+            let mut level_size = vec_size;
+            for i in 0..self.bits {
+                let b = col(self.wire_bit(i, copy));
+                for k in 0..level_size / 2 {
+                    for p in 0..n {
+                        let x = items[2 * k * n + p];
+                        let y = items[(2 * k + 1) * n + p];
+                        items[k * n + p] = x + b[p] * (y - x);
+                    }
+                }
+                level_size /= 2;
+            }
+            let claimed_element = col(self.wire_claimed_element(copy));
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                out[p] = items[p] - claimed_element[p];
+            }
+        }
+
+        for i in 0..self.num_extra_constants {
+            let constant = &constants[i * n..][..n];
+            let wire = col(self.wire_extra_constant(i));
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                out[p] = constant[p] - wire[p];
+            }
+        }
+        res
     }
 
     fn eval_unfiltered_circuit(
