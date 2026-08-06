@@ -213,16 +213,6 @@ unsafe impl PackedField for WideGoldilocksField {
             _ => panic!("unsupported block length"),
         }
     }
-
-    #[inline]
-    fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
-        let out = self.lanes();
-        let lhs = x.lanes();
-        let rhs = y.lanes();
-        Self::from_lanes(core::array::from_fn(|lane| {
-            Field::multiply_accumulate(&out[lane], lhs[lane], rhs[lane])
-        }))
-    }
 }
 
 impl Square for WideGoldilocksField {
@@ -416,10 +406,6 @@ mod tests {
         assert_eq!(
             packed_a.square().as_slice(),
             core::array::from_fn::<_, 4, _>(|i| a[i].square())
-        );
-        assert_eq!(
-            packed_a.multiply_accumulate(packed_b, packed_a).as_slice(),
-            core::array::from_fn::<_, 4, _>(|i| a[i] + b[i] * a[i])
         );
 
         for block_len in [1, 2, 4] {
