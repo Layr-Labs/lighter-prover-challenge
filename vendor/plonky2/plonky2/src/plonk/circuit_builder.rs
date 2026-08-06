@@ -1092,29 +1092,29 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             }
         }
 
-        let binding = self.gate_instances.clone();
-        let gate_instances_list = binding.iter().enumerate();
+        let mut incomplete_gate_rows = incomplete_gates.keys().copied().collect::<Vec<_>>();
+        incomplete_gate_rows.sort_unstable();
 
-        for (gate_row, gate) in gate_instances_list {
-            if let Some(&op) = incomplete_gates.get(&gate_row) {
-                let mut any_was_set: bool = false;
-                for j in op..gate.gate_ref.0.num_ops() {
-                    let defaults = gate.gate_ref.0.input_wires_defaults(j);
-                    any_was_set |= !defaults.is_empty();
-                    for (column, value) in defaults {
-                        let const_val = self.constant(value);
-                        self.connect(const_val, Target::wire(gate_row, column));
-                    }
+        for gate_row in incomplete_gate_rows {
+            let op = incomplete_gates[&gate_row];
+            let gate_ref = self.gate_instances[gate_row].gate_ref.clone();
+            let mut any_was_set: bool = false;
+            for j in op..gate_ref.0.num_ops() {
+                let defaults = gate_ref.0.input_wires_defaults(j);
+                any_was_set |= !defaults.is_empty();
+                for (column, value) in defaults {
+                    let const_val = self.constant(value);
+                    self.connect(const_val, Target::wire(gate_row, column));
                 }
-                if any_was_set {
-                    let params = row_to_parameters[&gate_row].clone();
-                    let target_slot = &mut self
-                        .current_slots
-                        .get_mut(&gate.gate_ref)
-                        .unwrap()
-                        .current_slot;
-                    target_slot.remove(&params);
-                }
+            }
+            if any_was_set {
+                let params = row_to_parameters[&gate_row].clone();
+                let target_slot = &mut self
+                    .current_slots
+                    .get_mut(&gate_ref)
+                    .unwrap()
+                    .current_slot;
+                target_slot.remove(&params);
             }
         }
 
