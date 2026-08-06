@@ -4,7 +4,6 @@
 use core::ops::Range;
 
 use anyhow::Result;
-use itertools::Itertools;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
@@ -342,35 +341,19 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
             .to_canonical_u64();
 
         // Set bytes
-        let limbs = dummy_gate
-            .i_th_limbs(self.i)
-            .map(|i| Target::wire(self.row, i));
-        let limbs_value = (0..self.num_limbs)
-            .scan(sum_value, |acc, _| {
-                let tmp = *acc % (256_u64);
-                *acc /= 256_u64;
-                Some(F::from_canonical_u64(tmp))
-            })
-            .collect::<Vec<_>>();
-
-        for (b, b_value) in limbs.zip_eq(limbs_value) {
-            out_buffer.set_target(b, b_value)?;
+        let mut remaining = sum_value;
+        for wire in dummy_gate.i_th_limbs(self.i) {
+            let value = F::from_canonical_u64(remaining % 256_u64);
+            remaining /= 256_u64;
+            out_buffer.set_target(Target::wire(self.row, wire), value)?;
         }
 
         // Set aux limbs
-        let limbs = dummy_gate
-            .i_th_aux_limbs(self.i)
-            .map(|i| Target::wire(self.row, i));
-        let limbs_value = (0..4 * self.num_limbs)
-            .scan(sum_value, |acc, _| {
-                let tmp = *acc % (4_u64);
-                *acc /= 4_u64;
-                Some(F::from_canonical_u64(tmp))
-            })
-            .collect::<Vec<_>>();
-
-        for (b, b_value) in limbs.zip_eq(limbs_value) {
-            out_buffer.set_target(b, b_value)?;
+        let mut remaining = sum_value;
+        for wire in dummy_gate.i_th_aux_limbs(self.i) {
+            let value = F::from_canonical_u64(remaining % 4_u64);
+            remaining /= 4_u64;
+            out_buffer.set_target(Target::wire(self.row, wire), value)?;
         }
 
         Ok(())
@@ -419,12 +402,109 @@ mod tests {
         test_eval_fns::<F, C, _, D>(ByteDecompositionGate::new(1, 1))
     }
 
+    #[test]
+    fn generator_emits_reference_target_value_sequence() -> Result<()> {
+        use plonky2::field::types::{Field64, PrimeField64};
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+
+        let gate = ByteDecompositionGate::new(8, 2);
+        let row = 2;
+        let degree = row + 1;
+        let num_wires = <ByteDecompositionGate as Gate<F, D>>::num_wires(&gate);
+        let representative_map: Vec<_> = (0..num_wires * degree).collect();
+        let prefix = (
+            Target::VirtualTarget { index: 0 },
+            F::from_canonical_u64(17),
+        );
+
+        let mut inputs = vec![
+            0,
+            1,
+            2,
+            3,
+            4,
+            255,
+            256,
+            257,
+            u32::MAX as u64,
+            1_u64 << 32,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            u64::MAX,
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..256 {
+            state ^= state << 7;
+            state ^= state >> 9;
+            state ^= state << 8;
+            inputs.push(state);
+        }
+
+        for i in 0..gate.num_ops {
+            let generator = ByteDecompositionGenerator {
+                row,
+                num_limbs: gate.num_limbs,
+                num_ops: gate.num_ops,
+                i,
+            };
+            let sum_target = Target::wire(row, gate.i_th_sum(i));
+
+            for &raw_input in &inputs {
+                let sum = F::from_noncanonical_u64(raw_input);
+                let canonical_sum = sum.to_canonical_u64();
+                let mut witness = PartitionWitness::new(num_wires, degree, &representative_map);
+                witness.set_target(sum_target, sum)?;
+
+                let mut actual = GeneratedValues::from(vec![prefix]);
+                <ByteDecompositionGenerator as SimpleGenerator<F, D>>::run_once(
+                    &generator,
+                    &witness,
+                    &mut actual,
+                )?;
+
+                let mut expected = vec![prefix];
+                for (j, wire) in gate.i_th_limbs(i).enumerate() {
+                    expected.push((
+                        Target::wire(row, wire),
+                        F::from_canonical_u64((canonical_sum >> (8 * j)) & 0xff),
+                    ));
+                }
+                for (j, wire) in gate.i_th_aux_limbs(i).enumerate() {
+                    expected.push((
+                        Target::wire(row, wire),
+                        F::from_canonical_u64((canonical_sum >> (2 * j)) & 0x3),
+                    ));
+                }
+
+                assert_eq!(actual.target_values.len(), expected.len());
+                for (entry, ((actual_target, actual_value), (expected_target, expected_value))) in
+                    actual.target_values.iter().zip(&expected).enumerate()
+                {
+                    assert_eq!(
+                        actual_target, expected_target,
+                        "op {i}, raw input {raw_input:#018x}, entry {entry}: target"
+                    );
+                    assert_eq!(
+                        actual_value.to_noncanonical_u64(),
+                        expected_value.to_noncanonical_u64(),
+                        "op {i}, raw input {raw_input:#018x}, entry {entry}: value"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     // `test_eval_fns` only checks a batch of one point; compare the batched
     // path against per-point `eval_unfiltered` across a multi-point batch.
     #[test]
     fn base_batch_matches_eval_unfiltered_across_batch() {
         use plonky2::field::extension::FieldExtension;
-        use plonky2::field::types::{Field64, PrimeField64};
+        use plonky2::field::types::Field64;
         use plonky2::hash::hash_types::HashOut;
         use plonky2::plonk::vars::{EvaluationVars, EvaluationVarsBaseBatch};
         use rand::Rng;
