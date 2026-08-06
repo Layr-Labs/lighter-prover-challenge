@@ -12,7 +12,7 @@ use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQuerySt
 use crate::fri::{FriConfig, FriParams};
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
-use crate::hash::merkle_tree::MerkleTree;
+use crate::hash::merkle_tree::{capacity_up_to_mut, MerkleTree};
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
 use crate::plonk::plonk_common::reduce_with_powers;
@@ -81,6 +81,44 @@ pub fn final_poly_coeff_len(mut degree_bits: usize, reduction_arity_bits: &Vec<u
     1 << degree_bits
 }
 
+fn bit_reverse_flatten_extension<F: RichField + Extendable<D>, const D: usize>(
+    values: &[F::Extension],
+) -> Vec<F> {
+    assert!(D > 0, "extension degree must be nonzero");
+    if values.is_empty() {
+        return Vec::new();
+    }
+    assert!(
+        values.len().is_power_of_two(),
+        "FRI codeword length must be a power of two"
+    );
+
+    let n = values.len();
+    let flat_len = n.checked_mul(D).expect("flattened FRI leaf length overflow");
+    let log_n = log2_strict(n);
+    let mut flat_values = Vec::with_capacity(flat_len);
+    {
+        let flat_spare = capacity_up_to_mut(&mut flat_values, flat_len);
+        flat_spare
+            .par_chunks_mut(D)
+            .enumerate()
+            .for_each(|(i, destination)| {
+                let source = values[reverse_bits(i, log_n)].to_basefield_array();
+                for (slot, value) in destination.iter_mut().zip(source) {
+                    slot.write(value);
+                }
+            });
+    }
+    unsafe {
+        // SAFETY: `flat_spare` contains exactly `n` disjoint chunks of `D`
+        // elements. The joined parallel loop writes every slot in every chunk.
+        // If a worker panics, this statement is not reached and the Vec length
+        // remains zero, so uninitialized elements are never dropped or read.
+        flat_values.set_len(flat_len);
+    }
+    flat_values
+}
+
 fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     mut coeffs: PolynomialCoeffs<F::Extension>,
     mut values: PolynomialValues<F::Extension>,
@@ -100,13 +138,7 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // codeword starting at `i * arity`), instead of a random-access
         // in-place permutation followed by a separate flattening pass with a
         // heap allocation per element.
-        let n = values.values.len();
-        let log_n = log2_strict(n);
-        let mut flat_values: Vec<F> = Vec::with_capacity(n * D);
-        for i in 0..n {
-            let x = values.values[reverse_bits(i, log_n)];
-            flat_values.extend_from_slice(&x.to_basefield_array());
-        }
+        let flat_values = bit_reverse_flatten_extension::<F, D>(&values.values);
         let tree = MerkleTree::<F, C::Hasher>::new_flat(
             flat_values,
             arity * D,
@@ -277,5 +309,87 @@ fn fri_prover_query_round<
             evals_proofs: initial_proof,
         },
         steps: query_steps,
+    }
+}
+
+#[cfg(test)]
+mod bit_reverse_flatten_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::PrimeField64;
+
+    fn extension_fixture<const D: usize>(
+        n: usize,
+    ) -> Vec<<GoldilocksField as Extendable<D>>::Extension>
+    where
+        GoldilocksField: Extendable<D>,
+    {
+        type F = GoldilocksField;
+
+        (0..n)
+            .map(|i| {
+                let limbs = core::array::from_fn(|lane| {
+                    F::from_canonical_usize(i * (D + 17) + lane * 29 + 3)
+                });
+                <F as Extendable<D>>::Extension::from_basefield_array(limbs)
+            })
+            .collect()
+    }
+
+    fn bit_reverse_flatten_sequential<const D: usize>(
+        values: &[<GoldilocksField as Extendable<D>>::Extension],
+    ) -> Vec<GoldilocksField>
+    where
+        GoldilocksField: Extendable<D>,
+    {
+        if values.is_empty() {
+            return Vec::new();
+        }
+        assert!(values.len().is_power_of_two());
+        let log_n = log2_strict(values.len());
+        let mut flat = Vec::with_capacity(values.len() * D);
+        for i in 0..values.len() {
+            flat.extend_from_slice(
+                &values[reverse_bits(i, log_n)].to_basefield_array(),
+            );
+        }
+        flat
+    }
+
+    fn assert_exact_for_degree<const D: usize>()
+    where
+        GoldilocksField: Extendable<D>,
+    {
+        for n in [0, 1, 2, 4, 8, 32, 256, 1 << 14] {
+            let values = extension_fixture::<D>(n);
+            let expected = bit_reverse_flatten_sequential::<D>(&values);
+            let actual = bit_reverse_flatten_extension::<GoldilocksField, D>(&values);
+            assert_eq!(actual.len(), n * D);
+            assert_eq!(actual, expected, "canonical mismatch for D={D}, n={n}");
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>(),
+                "raw/order mismatch for D={D}, n={n}"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_bit_reverse_flatten_matches_sequential_exactly() {
+        assert_exact_for_degree::<2>();
+        assert_exact_for_degree::<4>();
+    }
+
+    #[test]
+    #[should_panic(expected = "power of two")]
+    fn parallel_bit_reverse_flatten_rejects_non_power_of_two() {
+        let values = extension_fixture::<2>(3);
+        let _ = bit_reverse_flatten_extension::<GoldilocksField, 2>(&values);
     }
 }
