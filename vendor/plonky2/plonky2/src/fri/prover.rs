@@ -96,12 +96,15 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         let arity = 1 << arity_bits;
 
         reverse_index_bits_in_place(&mut values.values);
-        let chunked_values = values
-            .values
-            .par_chunks(arity)
-            .map(|chunk: &[F::Extension]| flatten(chunk))
-            .collect();
-        let tree = MerkleTree::<F, C::Hasher>::new(chunked_values, fri_params.config.cap_height);
+        // Leaf `i` is the `arity`-chunk starting at `i * arity`, flattened to the
+        // base field; flattening the whole codeword at once yields exactly the
+        // concatenation of those rows without one `Vec` per leaf.
+        let flat_values = flatten(&values.values);
+        let tree = MerkleTree::<F, C::Hasher>::new_flat(
+            flat_values,
+            arity * D,
+            fri_params.config.cap_height,
+        );
 
         challenger.observe_cap(&tree.cap);
         trees.push(tree);
@@ -235,7 +238,7 @@ fn fri_prover_query_round<
     let mut query_steps = Vec::new();
     let initial_proof = initial_merkle_trees
         .iter()
-        .map(|t| (t.get(x_index).to_vec(), t.prove(x_index)))
+        .map(|t| (t.leaf_vec(x_index), t.prove(x_index)))
         .collect::<Vec<_>>();
     for (i, tree) in trees.iter().enumerate() {
         let arity_bits = fri_params.reduction_arity_bits[i];
