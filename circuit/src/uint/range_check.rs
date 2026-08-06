@@ -352,7 +352,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
 
         let wires = vars_base.local_wires;
         let num_aux = self.aux_limbs_per_input();
-        let base = F::from_canonical_usize(Self::BASE);
         let three = F::from_canonical_usize(3);
         let mut scratch = vec![F::ZERO; n];
         let mut constraint_index = 0;
@@ -361,15 +360,27 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
             let input = &wires[self.wire_ith_input(i) * n..][..n];
             let top = self.wire_ith_input_jth_aux_limb(i, num_aux - 1);
 
+            // BASE == 4: each Horner step multiplies by two doublings, exactly
+            // as the packed evaluator does, and the final step folds the input
+            // subtraction into the same pass. Field-exact reassociations only.
             scratch.copy_from_slice(&wires[top * n..][..n]);
-            for j in (0..num_aux - 1).rev() {
+            for j in (1..num_aux - 1).rev() {
                 let limb = &wires[self.wire_ith_input_jth_aux_limb(i, j) * n..][..n];
                 for p in 0..n {
-                    scratch[p] = scratch[p] * base + limb[p];
+                    let doubled = scratch[p] + scratch[p];
+                    scratch[p] = doubled + doubled + limb[p];
                 }
             }
-            for p in 0..n {
-                scratch[p] -= input[p];
+            if num_aux == 1 {
+                for p in 0..n {
+                    scratch[p] -= input[p];
+                }
+            } else {
+                let limb = &wires[self.wire_ith_input_jth_aux_limb(i, 0) * n..][..n];
+                for p in 0..n {
+                    let doubled = scratch[p] + scratch[p];
+                    scratch[p] = doubled + doubled + limb[p] - input[p];
+                }
             }
             let combined =
                 &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
@@ -613,30 +624,34 @@ mod tests {
         const N: usize = 11;
         type F = GoldilocksField;
 
-        let gate = RangeCheckGate::<F, D>::new_from_config(
-            &CircuitConfig::standard_recursion_config(),
-            47,
-        );
-        let wires = (0..gate.num_wires() * N)
-            .map(|i| F::from_canonical_usize(3 * i + 5))
-            .collect::<Vec<_>>();
-        let constants = Vec::new();
-        let hash = HashOut::ZERO;
-        let vars = EvaluationVarsBaseBatch::new(N, &constants, &wires, &hash);
-        let filters = (0..N)
-            .map(|i| F::from_canonical_usize(2 * i + 1))
-            .collect::<Vec<_>>();
-        let mut expected = vec![F::ZERO; gate.num_constraints() * N];
-        let materialized = gate.eval_unfiltered_base_batch(vars);
-        for (acc, constraints) in expected
-            .chunks_exact_mut(N)
-            .zip(materialized.chunks_exact(N))
-        {
-            batch_multiply_add_inplace(acc, constraints, &filters);
+        // Cover the production sizes (16/32/48), an odd size with a halved top
+        // limb (47), and the single-aux-limb edge cases (1/2/3).
+        for bit_size in [1, 2, 3, 16, 32, 47, 48] {
+            let gate = RangeCheckGate::<F, D>::new_from_config(
+                &CircuitConfig::standard_recursion_config(),
+                bit_size,
+            );
+            let wires = (0..gate.num_wires() * N)
+                .map(|i| F::from_canonical_usize(3 * i + 5))
+                .collect::<Vec<_>>();
+            let constants = Vec::new();
+            let hash = HashOut::ZERO;
+            let vars = EvaluationVarsBaseBatch::new(N, &constants, &wires, &hash);
+            let filters = (0..N)
+                .map(|i| F::from_canonical_usize(2 * i + 1))
+                .collect::<Vec<_>>();
+            let mut expected = vec![F::ZERO; gate.num_constraints() * N];
+            let materialized = gate.eval_unfiltered_base_batch(vars);
+            for (acc, constraints) in expected
+                .chunks_exact_mut(N)
+                .zip(materialized.chunks_exact(N))
+            {
+                batch_multiply_add_inplace(acc, constraints, &filters);
+            }
+            let mut actual = vec![F::ZERO; expected.len()];
+            gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+            assert_eq!(actual, expected, "bit_size {bit_size}");
         }
-        let mut actual = vec![F::ZERO; expected.len()];
-        gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
-        assert_eq!(actual, expected);
     }
 
     macro_rules! generate_low_degree_tests {
