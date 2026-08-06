@@ -10,7 +10,6 @@ use core::marker::PhantomData;
 use anyhow::Result;
 use itertools::Itertools;
 
-use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::Extendable;
 use crate::field::packed::PackedField;
 use crate::field::types::Field;
@@ -268,98 +267,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
             }
         }
         res
-    }
-
-    /// Same contiguous-column evaluation as `eval_unfiltered_base_batch`, but
-    /// multiply-adds each filtered constraint row straight into the shared
-    /// buffer instead of materializing the full constraint matrix first.
-    fn eval_unfiltered_base_batch_accumulate(
-        &self,
-        vars_base: EvaluationVarsBaseBatch<F>,
-        filters: &[F],
-        combined_gate_constraints: &mut [F],
-    ) {
-        let n = vars_base.len();
-        assert_eq!(filters.len(), n);
-        assert!(combined_gate_constraints.len() >= self.num_constraints() * n);
-
-        let wires = vars_base.local_wires;
-        let constants = vars_base.local_constants;
-        let col = |w: usize| &wires[w * n..][..n];
-        let vec_size = self.vec_size();
-        let mut row = 0;
-        let mut scratch = vec![F::ZERO; n];
-        // `items` holds vec_size columns of n points, folded in place; the
-        // write index k always trails the read indices 2k, 2k+1, which were
-        // consumed at an earlier k of the same level.
-        let mut items = vec![F::ZERO; vec_size * n];
-
-        let mut emit = |row: &mut usize, scratch: &[F]| {
-            batch_multiply_add_inplace(
-                &mut combined_gate_constraints[*row * n..][..n],
-                scratch,
-                filters,
-            );
-            *row += 1;
-        };
-
-        for copy in 0..self.num_copies {
-            // Assert that each bit wire value is indeed boolean.
-            for i in 0..self.bits {
-                let b = col(self.wire_bit(i, copy));
-                for p in 0..n {
-                    scratch[p] = b[p] * (b[p] - F::ONE);
-                }
-                emit(&mut row, &scratch);
-            }
-
-            // Assert that the binary decomposition was correct.
-            scratch.fill(F::ZERO);
-            for i in (0..self.bits).rev() {
-                let b = col(self.wire_bit(i, copy));
-                for p in 0..n {
-                    scratch[p] = scratch[p].double() + b[p];
-                }
-            }
-            let access_index = col(self.wire_access_index(copy));
-            for p in 0..n {
-                scratch[p] -= access_index[p];
-            }
-            emit(&mut row, &scratch);
-
-            // Repeatedly fold the list, selecting the left or right item from
-            // each pair based on the corresponding bit.
-            for i in 0..vec_size {
-                items[i * n..][..n].copy_from_slice(col(self.wire_list_item(i, copy)));
-            }
-            let mut level_size = vec_size;
-            for i in 0..self.bits {
-                let b = col(self.wire_bit(i, copy));
-                for k in 0..level_size / 2 {
-                    for p in 0..n {
-                        let x = items[2 * k * n + p];
-                        let y = items[(2 * k + 1) * n + p];
-                        items[k * n + p] = x + b[p] * (y - x);
-                    }
-                }
-                level_size /= 2;
-            }
-            let claimed_element = col(self.wire_claimed_element(copy));
-            for p in 0..n {
-                scratch[p] = items[p] - claimed_element[p];
-            }
-            emit(&mut row, &scratch);
-        }
-
-        for i in 0..self.num_extra_constants {
-            let constant = &constants[i * n..][..n];
-            let wire = col(self.wire_extra_constant(i));
-            for p in 0..n {
-                scratch[p] = constant[p] - wire[p];
-            }
-            emit(&mut row, &scratch);
-        }
-        debug_assert_eq!(row, self.num_constraints());
     }
 
     fn eval_unfiltered_circuit(

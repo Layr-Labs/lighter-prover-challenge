@@ -22,15 +22,6 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
 /// window and is treated as contaminated evidence.
 const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
-/// Lower routing threshold used only while an exclusive serial proving phase
-/// is active (see [`set_exclusive_gpu_phase`]). During the pre-execution and
-/// final block proofs nothing else can contend for the serialized GPU stream,
-/// so the mid-size column trees those proofs commit (their Zs/partial-products
-/// tree at 524,272 estimated permutations and quotient tree at 393,200 miss
-/// the default 1<<19 cutoff) hash on an otherwise idle GPU. The global cutoff
-/// stays untouched for the pipelined phases, where lowering it is the
-/// documented priority-inversion regression.
-const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 18;
 /// Upper bound on concurrently in-flight GPU tree builds. One set serializes
 /// GPU tree builds exactly like the promoted base's global context mutex: a
 /// 3-set experiment measured 13-18% faster locally but scored -21.6% on the
@@ -147,21 +138,6 @@ struct BufferPool {
 
 static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShared::new);
 
-/// True while the prover is inside an exclusive serial phase (pre-execution
-/// or final block proof) where no concurrent proof can contend for the
-/// serialized GPU stream. Process-global on purpose: the phases it brackets
-/// are the only proving work alive, and tree builds may run on rayon workers,
-/// which a thread-local would not reach.
-static EXCLUSIVE_GPU_PHASE: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Marks the start/end of an exclusive serial proving phase during which the
-/// GPU routing cutoff drops to [`EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS`].
-/// Callers must guarantee no other proof runs concurrently while enabled.
-pub fn set_exclusive_gpu_phase(enabled: bool) {
-    EXCLUSIVE_GPU_PHASE.store(enabled, core::sync::atomic::Ordering::Relaxed);
-}
-
 fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bool {
     let leaf_permutations = if leaf_width <= 4 {
         0
@@ -169,12 +145,7 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
         leaf_width.div_ceil(8) * leaf_count
     };
     let parent_permutations = leaf_count - (1usize << cap_height);
-    let min_permutations = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
-        EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS
-    } else {
-        MIN_GPU_PERMUTATIONS
-    };
-    leaf_permutations + parent_permutations >= min_permutations
+    leaf_permutations + parent_permutations >= MIN_GPU_PERMUTATIONS
 }
 
 fn shared_context() -> Option<&'static MetalShared> {
