@@ -7,7 +7,7 @@ use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
 use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
 use circuit::block_tx::{BlockTx, JumpState, JumpStateTarget};
 use circuit::block_tx_chain_constraints::{
-    BlockTxChainCircuit, BlockTxChainTarget, cyclic_base_witness,
+    cyclic_base_witness, BlockTxChainCircuit, BlockTxChainTarget,
 };
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _};
 use circuit::tx::Tx;
@@ -15,14 +15,14 @@ use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
 use plonky2::iop::generator::{
-    ParallelWitnessGuard, PendingPartitionWitness, generate_partial_witness,
+    generate_partial_witness, ParallelWitnessGuard, PendingPartitionWitness,
 };
 use plonky2::iop::witness::{PartitionWitness, Witness};
 use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::util::timing::TimingTree;
 
-use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
+use crate::api::{Circuits, Proof, PROVER_THREAD_STACK_BYTES};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxPath {
@@ -33,6 +33,45 @@ enum TxPath {
 const LIGHT_TX_PROOF_WINDOW: usize = 2;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
+
+fn tx_proof_worker_count(path: TxPath) -> usize {
+    match path {
+        TxPath::Heavy => 1,
+        TxPath::Light => LIGHT_TX_PROOF_WINDOW,
+    }
+}
+
+fn max_tx_proofs_in_flight(path: TxPath, step: u64) -> usize {
+    if path == TxPath::Light && step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
+        LIGHT_TX_PROOF_WINDOW
+    } else {
+        1
+    }
+}
+
+fn receive_tx_worker_result<'scope, T>(
+    expected_step: u64,
+    worker_slot: usize,
+    result_receivers: &[std::sync::mpsc::Receiver<(u64, T)>],
+    worker_handles: &mut [Option<std::thread::ScopedJoinHandle<'scope, ()>>],
+    busy_steps: &mut [Option<u64>],
+) -> T {
+    let (returned_step, result) = result_receivers[worker_slot].recv().unwrap_or_else(|_| {
+        let handle = worker_handles[worker_slot]
+            .take()
+            .expect("transaction proof worker handle must exist");
+        match handle.join() {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(()) => {
+                panic!("transaction proof worker exited before returning step {expected_step}")
+            }
+        }
+    });
+    assert_eq!(busy_steps[worker_slot], Some(expected_step));
+    assert_eq!(returned_step, expected_step);
+    busy_steps[worker_slot] = None;
+    result
+}
 
 fn chunk_is_light(txs: &[Tx<F>]) -> bool {
     txs.first()
@@ -233,9 +272,35 @@ fn prove_path(
 
     std::thread::scope(|scope| {
         let base = &base_proof;
+        let worker_count = tx_proof_worker_count(path);
+        let mut job_senders = Vec::with_capacity(worker_count);
+        let mut result_receivers = Vec::with_capacity(worker_count);
+        let mut worker_handles = Vec::with_capacity(worker_count);
+        for worker_slot in 0..worker_count {
+            let (job_sender, job_receiver) =
+                std::sync::mpsc::sync_channel::<(u64, usize, PartitionWitness<'_, F>)>(1);
+            let (result_sender, result_receiver) = std::sync::mpsc::sync_channel::<(u64, Proof)>(1);
+            let handle = std::thread::Builder::new()
+                .name(format!("{path:?}-tx-proof-worker-{worker_slot}"))
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    while let Ok((step, chunk_index, witness)) = job_receiver.recv() {
+                        let proof = prove_tx_witness(path, chunk_index, tx_data, witness);
+                        if result_sender.send((step, proof)).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .expect("transaction proof worker thread must start");
+            job_senders.push(job_sender);
+            result_receivers.push(result_receiver);
+            worker_handles.push(Some(handle));
+        }
+
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
+        let mut busy_steps = vec![None; worker_count];
         let mut current_step = 0u64;
 
         loop {
@@ -262,14 +327,14 @@ fn prove_path(
                 chain = Some(ChainState::InFlight(handle));
             }
 
-            let witness = current_witness;
-            let proof_handle = std::thread::Builder::new()
-                .name(format!("{path:?}-tx-proof-{current_step}"))
-                .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, move || {
-                    prove_tx_witness(path, current_chunk_index, tx_data, witness)
-                })
-                .expect("transaction proof pipeline thread must start");
+            let worker_slot = busy_steps
+                .iter()
+                .position(Option::is_none)
+                .expect("transaction proof worker must be available");
+            job_senders[worker_slot]
+                .send((current_step, current_chunk_index, current_witness))
+                .expect("transaction proof worker must accept a job");
+            busy_steps[worker_slot] = Some(current_step);
 
             let next_witness = chunks.next().map(|(chunk_index, txs)| {
                 let (witness, next_jump) = generate_tx_witness(
@@ -286,20 +351,19 @@ fn prove_path(
                 (chunk_index, witness)
             });
 
-            in_flight.push_back((current_step, proof_handle));
-            let max_in_flight =
-                if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
-                    LIGHT_TX_PROOF_WINDOW
-                } else {
-                    1
-                };
+            in_flight.push_back((current_step, worker_slot));
+            let max_in_flight = max_tx_proofs_in_flight(path, current_step);
             if in_flight.len() >= max_in_flight {
-                let (proof_step, proof_handle) = in_flight
+                let (proof_step, worker_slot) = in_flight
                     .pop_front()
                     .expect("transaction proof window must not be empty");
-                let tx_proof = proof_handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                let tx_proof = receive_tx_worker_result(
+                    proof_step,
+                    worker_slot,
+                    &result_receivers,
+                    &mut worker_handles,
+                    &mut busy_steps,
+                );
                 pending_tx = Some((proof_step, tx_proof));
             }
             current_step += 1;
@@ -333,10 +397,14 @@ fn prove_path(
                 .expect("chain step pipeline thread must start");
             chain = Some(ChainState::InFlight(handle));
         }
-        while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
-            let tx_proof = proof_handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        while let Some((chain_step, worker_slot)) = in_flight.pop_front() {
+            let tx_proof = receive_tx_worker_result(
+                chain_step,
+                worker_slot,
+                &result_receivers,
+                &mut worker_handles,
+                &mut busy_steps,
+            );
             let previous = chain.take();
             chain = Some(ChainState::Ready(chain_step_proof(
                 path,
@@ -348,6 +416,14 @@ fn prove_path(
                 dummy_proof,
                 &tx_proof,
             )));
+        }
+
+        assert!(busy_steps.iter().all(Option::is_none));
+        drop(job_senders);
+        for handle in worker_handles.into_iter().flatten() {
+            handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         }
         chain
             .map(ChainState::wait)
@@ -515,7 +591,7 @@ mod tests {
         use circuit::types::constants::TX_TYPE_EMPTY;
         use plonky2::field::types::{Field, PrimeField64};
 
-        use crate::api::{LIGHT_TX_MODE, PathCircuits};
+        use crate::api::{PathCircuits, LIGHT_TX_MODE};
 
         let build_start = Instant::now();
         let circuits = PathCircuits::new(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE);
@@ -658,5 +734,82 @@ mod tests {
             .chain_data
             .verify(previous.expect("chain must produce proofs"))
             .expect("final chain step proof must verify");
+    }
+
+    #[test]
+    fn transaction_proof_worker_counts_match_path_windows() {
+        assert_eq!(tx_proof_worker_count(TxPath::Heavy), 1);
+        assert_eq!(tx_proof_worker_count(TxPath::Light), 2);
+
+        for step in 0..8 {
+            assert_eq!(max_tx_proofs_in_flight(TxPath::Heavy, step), 1);
+        }
+        for step in 0..LIGHT_TX_PROOF_OVERLAP_START_STEP {
+            assert_eq!(max_tx_proofs_in_flight(TxPath::Light, step), 1);
+        }
+        for step in LIGHT_TX_PROOF_OVERLAP_START_STEP..8 {
+            assert_eq!(max_tx_proofs_in_flight(TxPath::Light, step), 2);
+        }
+    }
+
+    #[test]
+    fn transaction_proof_worker_slots_preserve_fifo_windows() {
+        for path in [TxPath::Heavy, TxPath::Light] {
+            let mut busy_steps = vec![None; tx_proof_worker_count(path)];
+            let mut in_flight = std::collections::VecDeque::new();
+            let mut consumed = Vec::new();
+
+            for step in 0..8 {
+                let worker_slot = busy_steps
+                    .iter()
+                    .position(Option::is_none)
+                    .expect("a worker slot must be available");
+                busy_steps[worker_slot] = Some(step);
+                in_flight.push_back((step, worker_slot));
+
+                if in_flight.len() >= max_tx_proofs_in_flight(path, step) {
+                    let (expected_step, worker_slot) = in_flight.pop_front().unwrap();
+                    assert_eq!(busy_steps[worker_slot], Some(expected_step));
+                    busy_steps[worker_slot] = None;
+                    consumed.push(expected_step);
+                }
+            }
+
+            while let Some((expected_step, worker_slot)) = in_flight.pop_front() {
+                assert_eq!(busy_steps[worker_slot], Some(expected_step));
+                busy_steps[worker_slot] = None;
+                consumed.push(expected_step);
+            }
+
+            assert_eq!(consumed, (0..8).collect::<Vec<_>>());
+            assert!(busy_steps.iter().all(Option::is_none));
+        }
+    }
+
+    #[test]
+    fn transaction_proof_worker_panic_payload_is_resumed() {
+        let panic = std::panic::catch_unwind(|| {
+            std::thread::scope(|scope| {
+                let (result_sender, result_receiver) =
+                    std::sync::mpsc::sync_channel::<(u64, ())>(1);
+                let handle = std::thread::Builder::new()
+                    .name("panic-propagation-worker".into())
+                    .spawn_scoped(scope, move || {
+                        let _result_sender = result_sender;
+                        std::panic::panic_any("fixed-worker-panic-payload");
+                    })
+                    .expect("panic propagation worker must start");
+                let mut handles = vec![Some(handle)];
+                let mut busy_steps = vec![Some(7)];
+
+                receive_tx_worker_result(7, 0, &[result_receiver], &mut handles, &mut busy_steps);
+            });
+        })
+        .expect_err("worker panic must escape the result receiver");
+
+        assert_eq!(
+            panic.downcast_ref::<&'static str>(),
+            Some(&"fixed-worker-panic-payload")
+        );
     }
 }
