@@ -407,32 +407,32 @@ fn wires_permutation_partial_products_and_zs<
     let subgroup = &prover_data.subgroup;
     let k_is = &common_data.k_is;
     let num_prods = common_data.num_partial_products;
+    let num_routed_wires = common_data.config.num_routed_wires;
     let all_quotient_chunk_products = subgroup
         .par_iter()
         .enumerate()
-        .map(|(i, &x)| {
-            let s_sigmas = &prover_data.sigmas[i];
-            let numerators = (0..common_data.config.num_routed_wires).map(|j| {
-                let wire_value = witness.get_wire(i, j);
-                let k_i = k_is[j];
-                let s_id = k_i * x;
-                wire_value + beta * s_id + gamma
-            });
-            let denominators = (0..common_data.config.num_routed_wires)
-                .map(|j| {
+        .map_init(
+            // One denominator scratch buffer per worker thread instead of a
+            // fresh Vec per subgroup point.
+            || vec![F::ZERO; num_routed_wires],
+            |denominators, (i, &x)| {
+                let s_sigmas = &prover_data.sigmas[i];
+                for (j, denominator) in denominators.iter_mut().enumerate() {
                     let wire_value = witness.get_wire(i, j);
-                    let s_sigma = s_sigmas[j];
-                    wire_value + beta * s_sigma + gamma
-                })
-                .collect::<Vec<_>>();
-            let denominator_invs = F::batch_multiplicative_inverse(&denominators);
-            let quotient_values = numerators
-                .zip(denominator_invs)
-                .map(|(num, den_inv)| num * den_inv)
-                .collect::<Vec<_>>();
+                    *denominator = wire_value + beta * s_sigmas[j] + gamma;
+                }
+                let mut quotient_values = F::batch_multiplicative_inverse(denominators);
+                // Multiply the numerators into the inverse buffer in place;
+                // the per-point numerator and quotient Vecs are gone.
+                for (j, quotient_value) in quotient_values.iter_mut().enumerate() {
+                    let wire_value = witness.get_wire(i, j);
+                    let numerator = wire_value + beta * (k_is[j] * x) + gamma;
+                    *quotient_value *= numerator;
+                }
 
-            quotient_chunk_products(&quotient_values, degree)
-        })
+                quotient_chunk_products(&quotient_values, degree)
+            },
+        )
         .collect::<Vec<_>>();
 
     let mut z_x = F::ONE;
