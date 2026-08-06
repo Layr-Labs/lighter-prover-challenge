@@ -30,7 +30,10 @@ enum TxPath {
     Light,
 }
 
-const LIGHT_TX_PROOF_WINDOW: usize = 2;
+// A window of 2 leaves the chain consumer starved whenever one chunk proof
+// runs long; 3 keeps one extra producer ahead of the strictly sequential
+// chain at ~0.6 GB additional peak retention, well within the 48 GB runner.
+const LIGHT_TX_PROOF_WINDOW: usize = 3;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
