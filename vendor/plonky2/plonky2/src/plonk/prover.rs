@@ -670,7 +670,90 @@ fn compute_all_lookup_polys<
     }
 }
 
-const BATCH_SIZE: usize = 32;
+const BATCH_SIZE: usize = 64;
+
+fn quotient_challenge_values<F: Copy>(
+    quotient_values: &[F],
+    num_points: usize,
+    num_challenges: usize,
+    challenge: usize,
+    point_major: bool,
+) -> Vec<F> {
+    assert_eq!(quotient_values.len(), num_points * num_challenges);
+    assert!(challenge < num_challenges);
+    if point_major {
+        quotient_values
+            .chunks_exact(num_challenges)
+            .map(|point_values| point_values[challenge])
+            .collect()
+    } else {
+        let num_batches = num_points.div_ceil(BATCH_SIZE);
+        let mut values = Vec::with_capacity(num_points);
+        for batch_i in 0..num_batches {
+            let batch_start = batch_i * BATCH_SIZE;
+            let n = BATCH_SIZE.min(num_points - batch_start);
+            let block_start = batch_i * BATCH_SIZE * num_challenges;
+            values.extend_from_slice(&quotient_values[block_start + challenge * n..][..n]);
+        }
+        values
+    }
+}
+
+#[cfg(test)]
+mod quotient_layout_tests {
+    use super::{quotient_challenge_values, BATCH_SIZE};
+
+    #[test]
+    fn batch_challenge_major_assembly_preserves_point_order() {
+        for num_points in [1usize, 7, 31, 32, 33, 63, 64, 65, 127, 128, 129] {
+            for num_challenges in [1, 2, 3] {
+                let point_major = (0..num_points)
+                    .flat_map(|point| {
+                        (0..num_challenges).map(move |challenge| point * 10 + challenge)
+                    })
+                    .collect::<Vec<_>>();
+                let mut blocked = vec![0; point_major.len()];
+                for batch_i in 0..num_points.div_ceil(BATCH_SIZE) {
+                    let batch_start = batch_i * BATCH_SIZE;
+                    let n = BATCH_SIZE.min(num_points - batch_start);
+                    let block_start = batch_i * BATCH_SIZE * num_challenges;
+                    for challenge in 0..num_challenges {
+                        for k in 0..n {
+                            blocked[block_start + challenge * n + k] =
+                                point_major[(batch_start + k) * num_challenges + challenge];
+                        }
+                    }
+                }
+
+                for challenge in 0..num_challenges {
+                    let expected = (0..num_points)
+                        .map(|point| point_major[point * num_challenges + challenge])
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        quotient_challenge_values(
+                            &point_major,
+                            num_points,
+                            num_challenges,
+                            challenge,
+                            true,
+                        ),
+                        expected
+                    );
+                    assert_eq!(
+                        quotient_challenge_values(
+                            &blocked,
+                            num_points,
+                            num_challenges,
+                            challenge,
+                            false,
+                        ),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+}
 
 fn compute_quotient_polys<
     'a,
@@ -765,7 +848,6 @@ fn compute_quotient_polys<
 
     let num_wires = common_data.config.num_wires;
     let zs_row_width = zs_partial_products_and_lookup_commitment.lde_row_width();
-    let num_routed_wires = common_data.config.num_routed_wires;
 
     let mut quotient_values = vec![F::ZERO; points.len() * num_challenges];
     quotient_values
@@ -806,6 +888,12 @@ fn compute_quotient_polys<
                     .shifted_xs
                     .extend(xs_batch.iter().map(|&x| F::coset_shift() * x));
 
+                let auxiliary_layout = if has_lookup {
+                    BatchLayout::PointMajor
+                } else {
+                    BatchLayout::PolyMajor
+                };
+
                 prover_data.constants_sigmas_commitment.fill_lde_batch(
                     &scratch.indices,
                     step,
@@ -817,7 +905,7 @@ fn compute_quotient_polys<
                     &scratch.indices,
                     step,
                     common_data.sigmas_range(),
-                    BatchLayout::PointMajor,
+                    auxiliary_layout,
                     &mut scratch.s_sigmas_flat,
                 );
                 wires_commitment.fill_lde_batch(
@@ -831,72 +919,33 @@ fn compute_quotient_polys<
                     &scratch.indices,
                     step,
                     0..zs_row_width,
-                    BatchLayout::PointMajor,
+                    auxiliary_layout,
                     &mut scratch.zs_local_flat,
                 );
                 zs_partial_products_and_lookup_commitment.fill_lde_batch(
                     &scratch.indices_next,
                     step,
                     0..zs_row_width,
-                    BatchLayout::PointMajor,
+                    auxiliary_layout,
                     &mut scratch.zs_next_flat,
                 );
 
                 let indices_batch = &scratch.indices;
-                let local_zs_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.zs_local_flat[k * zs_row_width..][common_data.zs_range()])
-                    .collect();
-                let next_zs_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.zs_next_flat[k * zs_row_width..][common_data.zs_range()])
-                    .collect();
-                let partial_products_batch: Vec<&[F]> = (0..n)
-                    .map(|k| {
-                        &scratch.zs_local_flat[k * zs_row_width..]
-                            [common_data.partial_products_range()]
-                    })
-                    .collect();
-                let s_sigmas_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires])
-                    .collect();
-                let (local_lookup_batch, next_lookup_batch): (Vec<&[F]>, Vec<&[F]>) = if has_lookup
-                {
-                    (
-                        (0..n)
-                            .map(|k| {
-                                &scratch.zs_local_flat[k * zs_row_width..]
-                                    [common_data.lookup_range()]
-                            })
-                            .collect(),
-                        (0..n)
-                            .map(|k| {
-                                &scratch.zs_next_flat[k * zs_row_width..]
-                                    [common_data.lookup_range()]
-                            })
-                            .collect(),
-                    )
-                } else {
-                    (Vec::new(), Vec::new())
-                };
-
                 let vars_batch = EvaluationVarsBaseBatch::new(
                     n,
                     &scratch.local_constants,
                     &scratch.local_wires,
                     public_inputs_hash,
                 );
-
                 let quotient_values_batch = &mut quotient_values_batch[..n * num_challenges];
                 eval_vanishing_poly_base_batch::<F, D>(
                     common_data,
                     indices_batch,
                     &scratch.shifted_xs,
                     vars_batch,
-                    &local_zs_batch,
-                    &next_zs_batch,
-                    &local_lookup_batch,
-                    &next_lookup_batch,
-                    &partial_products_batch,
-                    &s_sigmas_batch,
+                    &scratch.zs_local_flat,
+                    &scratch.zs_next_flat,
+                    &scratch.s_sigmas_flat,
                     betas,
                     gammas,
                     beta_k_is,
@@ -908,14 +957,22 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
+                if has_lookup {
+                    for (&i, quotient_values) in indices_batch
+                        .iter()
+                        .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
+                    {
+                        let denominator_inv = z_h_on_coset.eval_inverse(i);
+                        quotient_values
+                            .iter_mut()
+                            .for_each(|v| *v *= denominator_inv);
+                    }
+                } else {
+                    for quotient_values in quotient_values_batch.chunks_exact_mut(n) {
+                        for (value, &i) in quotient_values.iter_mut().zip(indices_batch) {
+                            *value *= z_h_on_coset.eval_inverse(i);
+                        }
+                    }
                 }
             },
         );
@@ -924,12 +981,13 @@ fn compute_quotient_polys<
     (0..num_challenges)
         .into_par_iter()
         .map(|challenge| {
-            PolynomialValues::new(
-                quotient_values
-                    .chunks_exact(num_challenges)
-                    .map(|point_values| point_values[challenge])
-                    .collect(),
-            )
+            PolynomialValues::new(quotient_challenge_values(
+                &quotient_values,
+                points.len(),
+                num_challenges,
+                challenge,
+                has_lookup,
+            ))
         })
         .map(|values| values.coset_ifft(F::coset_shift()))
         .collect()

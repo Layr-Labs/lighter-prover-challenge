@@ -170,6 +170,7 @@ pub(crate) fn eval_vanishing_poly<F: RichField + Extendable<D>, const D: usize>(
 pub(crate) struct VanishingScratch<F> {
     pub numerator_values: Vec<F>,
     pub denominator_values: Vec<F>,
+    pub l_0_values: Vec<F>,
     pub vanishing_z_1_terms: Vec<F>,
     pub vanishing_partial_products_terms: Vec<F>,
     pub vanishing_all_lookup_terms: Vec<F>,
@@ -182,16 +183,28 @@ fn reduce_gate_constraints_base_batch<F: Field>(
     batch_size: usize,
     alphas: &[F],
     res_out: &mut [F],
+    poly_major: bool,
 ) {
     debug_assert!(batch_size > 0);
     debug_assert_eq!(constraint_terms_batch.len() % batch_size, 0);
     debug_assert_eq!(res_out.len(), batch_size * alphas.len());
 
-    for constraint_row in constraint_terms_batch.chunks_exact(batch_size).rev() {
-        for (point, &term) in constraint_row.iter().enumerate() {
-            let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
-            for (value, &alpha) in result.iter_mut().zip(alphas) {
-                *value = term.multiply_accumulate(*value, alpha);
+    if poly_major {
+        for constraint_row in constraint_terms_batch.chunks_exact(batch_size).rev() {
+            for (point, &term) in constraint_row.iter().enumerate() {
+                for (challenge, &alpha) in alphas.iter().enumerate() {
+                    let result = &mut res_out[challenge * batch_size + point];
+                    *result = term.multiply_accumulate(*result, alpha);
+                }
+            }
+        }
+    } else {
+        for constraint_row in constraint_terms_batch.chunks_exact(batch_size).rev() {
+            for (point, &term) in constraint_row.iter().enumerate() {
+                let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
+                for (value, &alpha) in result.iter_mut().zip(alphas) {
+                    *value = term.multiply_accumulate(*value, alpha);
+                }
             }
         }
     }
@@ -199,21 +212,17 @@ fn reduce_gate_constraints_base_batch<F: Field>(
 
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
 ///
-/// Results are stored point-major: the challenges for point `k` occupy
-/// `res_out[k * num_challenges..(k + 1) * num_challenges]`. `res_out` must be
-/// zero-initialized by the caller.
+/// Results are stored challenge-major for the no-lookup fast path and point-major for the lookup
+/// fallback. In either case, `res_out` must be zero-initialized by the caller.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
     indices_batch: &[usize],
     xs_batch: &[F],
     vars_batch: EvaluationVarsBaseBatch<F>,
-    local_zs_batch: &[&[F]],
-    next_zs_batch: &[&[F]],
-    local_lookup_zs_batch: &[&[F]],
-    next_lookup_zs_batch: &[&[F]],
-    partial_products_batch: &[&[F]],
-    s_sigmas_batch: &[&[F]],
+    zs_local_batch: &[F],
+    zs_next_batch: &[F],
+    s_sigmas_batch: &[F],
     betas: &[F],
     gammas: &[F],
     beta_k_is: &[F],
@@ -229,17 +238,10 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     let n = indices_batch.len();
     assert_eq!(xs_batch.len(), n);
     assert_eq!(vars_batch.len(), n);
-    assert_eq!(local_zs_batch.len(), n);
-    assert_eq!(next_zs_batch.len(), n);
-    if has_lookup {
-        assert_eq!(local_lookup_zs_batch.len(), n);
-        assert_eq!(next_lookup_zs_batch.len(), n);
-    } else {
-        assert_eq!(local_lookup_zs_batch.len(), 0);
-        assert_eq!(next_lookup_zs_batch.len(), 0);
-    }
-    assert_eq!(partial_products_batch.len(), n);
-    assert_eq!(s_sigmas_batch.len(), n);
+    let zs_row_width = zs_local_batch.len() / n;
+    assert_eq!(zs_local_batch.len(), n * zs_row_width);
+    assert_eq!(zs_next_batch.len(), n * zs_row_width);
+    assert_eq!(s_sigmas_batch.len(), n * common_data.config.num_routed_wires);
 
     let max_degree = common_data.quotient_degree_factor;
     let num_prods = common_data.num_partial_products;
@@ -259,11 +261,19 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(betas.len(), num_challenges);
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
-    reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out);
+    reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out, !has_lookup);
 
     let numerator_values = &mut scratch.numerator_values;
     let denominator_values = &mut scratch.denominator_values;
     numerator_values.clear();
+    denominator_values.clear();
+    z_h_on_coset.eval_l_0_batch_into(
+        indices_batch,
+        xs_batch,
+        denominator_values,
+        &mut scratch.l_0_values,
+    );
+    let l_0_values = &scratch.l_0_values;
     denominator_values.clear();
 
     // The L_0(x) (Z(x) - 1) vanishing terms.
@@ -300,59 +310,20 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         term_rows.clear();
         term_rows.resize(num_rows * n, F::ZERO);
 
-        let l_0_xs = &mut scratch.vanishing_z_1_terms;
-        l_0_xs.clear();
-        l_0_xs.extend(
-            indices_batch
-                .iter()
-                .zip(xs_batch)
-                .map(|(&index, &x)| z_h_on_coset.eval_l_0(index, x)),
-        );
-
         let num_prod = &mut scratch.numerator_values;
         let den_prod = &mut scratch.denominator_values;
 
-        // Hoist the per-point sigma rows into contiguous columns so the
-        // chunk-product loops read them with unit stride. Values unchanged;
-        // each sigma is read once per challenge, so the transpose pays for
-        // itself with the standard two challenges.
-        let sigma_cols = &mut scratch.lookup_selectors;
-        sigma_cols.clear();
-        sigma_cols.resize(num_routed_wires * n, F::ZERO);
-        for (k, s_sigmas) in s_sigmas_batch.iter().enumerate() {
-            for (j, &s) in s_sigmas.iter().take(num_routed_wires).enumerate() {
-                sigma_cols[j * n + k] = s;
-            }
-        }
-
-        // Same treatment for the per-point Z and partial-product slices: one
-        // transpose into contiguous columns kills the per-point double
-        // dereferences in the accumulator-selection loop below.
-        let acc_cols_len = num_challenges * (num_prods + 2) * n;
-        let mut acc_cols = vec![F::ZERO; acc_cols_len];
-        let acc_stride = (num_prods + 2) * n;
-        for k in 0..n {
-            let local_zs = local_zs_batch[k];
-            let next_zs = next_zs_batch[k];
-            let partial_products = partial_products_batch[k];
-            for i in 0..num_challenges {
-                let base = i * acc_stride;
-                acc_cols[base + k] = local_zs[i];
-                for (c, &p) in partial_products[i * num_prods..(i + 1) * num_prods]
-                    .iter()
-                    .enumerate()
-                {
-                    acc_cols[base + (c + 1) * n + k] = p;
-                }
-                acc_cols[base + (num_prods + 1) * n + k] = next_zs[i];
-            }
-        }
+        // The no-lookup prover gathers these inputs column-major, so every hot inner-loop
+        // source is already contiguous. This replaces the old point-major gather followed by
+        // per-batch sigma and accumulator transposes without changing any field operation.
+        let zs_start = common_data.zs_range().start;
+        let partial_products_start = common_data.partial_products_range().start;
 
         for i in 0..num_challenges {
-            let z_col = &acc_cols[i * acc_stride..][..n];
+            let z_col = &zs_local_batch[(zs_start + i) * n..][..n];
             let z1_row = &mut term_rows[i * n..][..n];
             for k in 0..n {
-                z1_row[k] = l_0_xs[k] * z_col[k].sub_one();
+                z1_row[k] = l_0_values[k] * z_col[k].sub_one();
             }
 
             for c in 0..num_chunks {
@@ -364,7 +335,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 den_prod.resize(n, F::ONE);
                 for j in j_range {
                     let wire_col = &wires[j * n..][..n];
-                    let sigma_col = &sigma_cols[j * n..][..n];
+                    let sigma_col = &s_sigmas_batch[j * n..][..n];
                     let beta_k_i = beta_k_is[i * num_routed_wires + j];
                     let beta = betas[i];
                     let gamma = gammas[i];
@@ -376,11 +347,18 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
                 let row =
                     &mut term_rows[(num_challenges + i * num_chunks + c) * n..][..n];
-                // The accumulator chain per challenge is laid out as columns
-                // [Z(x) | partials 0..num_prods | Z(gx)], so chunk c reads
-                // column c as prev and column c+1 as next — contiguously.
-                let prev_col = &acc_cols[i * acc_stride + c * n..][..n];
-                let next_col = &acc_cols[i * acc_stride + (c + 1) * n..][..n];
+                // Preserve the exact accumulator chain [Z(x), partials..., Z(gx)].
+                let prev_col = if c == 0 {
+                    z_col
+                } else {
+                    &zs_local_batch
+                        [(partial_products_start + i * num_prods + c - 1) * n..][..n]
+                };
+                let next_col = if c == num_prods {
+                    &zs_next_batch[(zs_start + i) * n..][..n]
+                } else {
+                    &zs_local_batch[(partial_products_start + i * num_prods + c) * n..][..n]
+                };
                 for k in 0..n {
                     row[k] = prev_col[k] * num_prod[k] - next_col[k] * den_prod[k];
                 }
@@ -391,23 +369,20 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         for t in (0..num_rows).rev() {
             let row = &term_rows[t * n..][..n];
             for k in 0..n {
-                let res = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
-                for (c, &alpha) in res.iter_mut().zip(alphas) {
-                    *c = row[k].multiply_accumulate(*c, alpha);
+                for (challenge, &alpha) in alphas.iter().enumerate() {
+                    let result = &mut res_out[challenge * n + k];
+                    *result = row[k].multiply_accumulate(*result, alpha);
                 }
             }
         }
 
         term_rows.clear();
-        l_0_xs.clear();
         num_prod.clear();
         den_prod.clear();
-        scratch.lookup_selectors.clear();
         return;
     }
 
     for k in 0..n {
-        let index = indices_batch[k];
         let x = xs_batch[k];
         let vars = vars_batch.view(k);
 
@@ -418,24 +393,17 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 .map(|i| vars.local_constants[common_data.selectors_info.num_selectors() + i]),
         );
 
-        let local_zs = local_zs_batch[k];
-        let next_zs = next_zs_batch[k];
-        let local_lookup_zs = if has_lookup {
-            local_lookup_zs_batch[k]
-        } else {
-            &[]
-        };
+        let zs_local = &zs_local_batch[k * zs_row_width..(k + 1) * zs_row_width];
+        let zs_next = &zs_next_batch[k * zs_row_width..(k + 1) * zs_row_width];
+        let local_zs = &zs_local[common_data.zs_range()];
+        let next_zs = &zs_next[common_data.zs_range()];
+        let local_lookup_zs = &zs_local[common_data.lookup_range()];
+        let next_lookup_zs = &zs_next[common_data.lookup_range()];
+        let partial_products = &zs_local[common_data.partial_products_range()];
+        let s_sigmas =
+            &s_sigmas_batch[k * num_routed_wires..(k + 1) * num_routed_wires];
 
-        let next_lookup_zs = if has_lookup {
-            next_lookup_zs_batch[k]
-        } else {
-            &[]
-        };
-
-        let partial_products = partial_products_batch[k];
-        let s_sigmas = s_sigmas_batch[k];
-
-        let l_0_x = z_h_on_coset.eval_l_0(index, x);
+        let l_0_x = l_0_values[k];
         for i in 0..num_challenges {
             let z_x = local_zs[i];
             let z_gx = next_zs[i];
@@ -1143,7 +1111,7 @@ mod tests {
             F::from_canonical_u64(6),
             F::from_canonical_u64(6),
         ];
-        reduce_gate_constraints_base_batch(&terms, 2, &alphas, &mut actual);
+        reduce_gate_constraints_base_batch(&terms, 2, &alphas, &mut actual, false);
         assert_eq!(actual[0], F::from_canonical_u64(91));
         assert_eq!(actual[2], F::from_canonical_u64(116));
 
@@ -1166,9 +1134,122 @@ mod tests {
                 }
             }
 
-            let mut actual = initial;
-            reduce_gate_constraints_base_batch(&terms, batch_size, &alphas, &mut actual);
-            assert_eq!(actual, expected, "batch size {batch_size}");
+            let mut actual = initial.clone();
+            reduce_gate_constraints_base_batch(&terms, batch_size, &alphas, &mut actual, false);
+            assert_eq!(actual, expected, "point-major batch size {batch_size}");
+
+            let transpose = |point_major: &[F]| {
+                (0..alphas.len())
+                    .flat_map(|challenge| {
+                        (0..batch_size)
+                            .map(move |point| point_major[point * alphas.len() + challenge])
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut actual_poly = transpose(&initial);
+            reduce_gate_constraints_base_batch(
+                &terms,
+                batch_size,
+                &alphas,
+                &mut actual_poly,
+                true,
+            );
+            assert_eq!(
+                actual_poly,
+                transpose(&expected),
+                "poly-major batch size {batch_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_auxiliary_columns_match_point_major_transposes() {
+        type F = GoldilocksField;
+        const NUM_CHALLENGES: usize = 2;
+        const NUM_PRODS: usize = 2;
+        const NUM_ROUTED_WIRES: usize = 11;
+        const MAX_DEGREE: usize = 4;
+        const NUM_CHUNKS: usize = 3;
+        const ZS_WIDTH: usize = NUM_CHALLENGES * (NUM_PRODS + 1);
+
+        for n in [1, 7, 31, 32] {
+            let point_major = |width: usize, offset: usize| {
+                (0..n * width)
+                    .map(|i| F::from_canonical_usize(offset + i * 17))
+                    .collect::<Vec<_>>()
+            };
+            let transpose = |rows: &[F], width: usize| {
+                let mut columns = vec![F::ZERO; rows.len()];
+                for k in 0..n {
+                    for c in 0..width {
+                        columns[c * n + k] = rows[k * width + c];
+                    }
+                }
+                columns
+            };
+
+            let zs_local_rows = point_major(ZS_WIDTH, 3);
+            let zs_next_rows = point_major(ZS_WIDTH, 5);
+            let sigma_rows = point_major(NUM_ROUTED_WIRES, 7);
+            let zs_local_columns = transpose(&zs_local_rows, ZS_WIDTH);
+            let zs_next_columns = transpose(&zs_next_rows, ZS_WIDTH);
+            let sigma_columns = transpose(&sigma_rows, NUM_ROUTED_WIRES);
+
+            // Differentially reconstruct the old accumulator transpose and compare every source
+            // used by the direct-column path, including its exact chunk ordering.
+            let mut legacy_acc = vec![F::ZERO; NUM_CHALLENGES * (NUM_PRODS + 2) * n];
+            let acc_stride = (NUM_PRODS + 2) * n;
+            for k in 0..n {
+                for i in 0..NUM_CHALLENGES {
+                    let base = i * acc_stride;
+                    legacy_acc[base + k] = zs_local_rows[k * ZS_WIDTH + i];
+                    for c in 0..NUM_PRODS {
+                        legacy_acc[base + (c + 1) * n + k] =
+                            zs_local_rows[k * ZS_WIDTH + NUM_CHALLENGES + i * NUM_PRODS + c];
+                    }
+                    legacy_acc[base + (NUM_PRODS + 1) * n + k] =
+                        zs_next_rows[k * ZS_WIDTH + i];
+                }
+            }
+
+            for i in 0..NUM_CHALLENGES {
+                for c in 0..NUM_CHUNKS {
+                    let legacy_prev = &legacy_acc[i * acc_stride + c * n..][..n];
+                    let legacy_next = &legacy_acc[i * acc_stride + (c + 1) * n..][..n];
+                    let direct_prev = if c == 0 {
+                        &zs_local_columns[i * n..(i + 1) * n]
+                    } else {
+                        &zs_local_columns
+                            [(NUM_CHALLENGES + i * NUM_PRODS + c - 1) * n..]
+                            [..n]
+                    };
+                    let direct_next = if c == NUM_PRODS {
+                        &zs_next_columns[i * n..(i + 1) * n]
+                    } else {
+                        &zs_local_columns[(NUM_CHALLENGES + i * NUM_PRODS + c) * n..][..n]
+                    };
+                    assert_eq!(
+                        direct_prev, legacy_prev,
+                        "n={n}, challenge={i}, chunk={c}"
+                    );
+                    assert_eq!(
+                        direct_next, legacy_next,
+                        "n={n}, challenge={i}, chunk={c}"
+                    );
+                }
+            }
+            for j in 0..NUM_ROUTED_WIRES {
+                let legacy = (0..n)
+                    .map(|k| sigma_rows[k * NUM_ROUTED_WIRES + j])
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    &sigma_columns[j * n..(j + 1) * n],
+                    legacy,
+                    "n={n}, sigma={j}"
+                );
+            }
+
+            assert_eq!(NUM_ROUTED_WIRES.div_ceil(MAX_DEGREE), NUM_CHUNKS);
         }
     }
 }

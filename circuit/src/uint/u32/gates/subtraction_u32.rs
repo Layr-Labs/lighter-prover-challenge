@@ -391,17 +391,12 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
 
         let num_limbs = U32SubtractionGate::<F, D>::num_limbs();
         let limb_base = 1 << U32SubtractionGate::<F, D>::limb_bits();
-        let output_limbs: Vec<_> = (0..num_limbs)
-            .scan(output_result_u64, |acc, _| {
-                let tmp = *acc % limb_base;
-                *acc /= limb_base;
-                Some(F::from_canonical_u64(tmp))
-            })
-            .collect();
-
+        let mut remaining = output_result_u64;
         for j in 0..num_limbs {
+            let limb = F::from_canonical_u64(remaining % limb_base);
+            remaining /= limb_base;
             let wire = local_wire(self.gate.wire_ith_output_jth_limb(self.i, j));
-            out_buffer.set_wire(wire, output_limbs[j])?;
+            out_buffer.set_wire(wire, limb)?;
         }
 
         Ok(())
@@ -433,10 +428,109 @@ mod tests {
     use plonky2::field::goldilocks_field::GoldilocksField;
     use plonky2::field::types::{PrimeField64, Sample};
     use plonky2::hash::hash_types::HashOut;
-    use rand::Rng;
+    use rand::{Rng, SeedableRng};
     use rand::rngs::OsRng;
 
     use super::*;
+
+    #[test]
+    fn streaming_limbs_match_materialized_generator_path() {
+        type F = GoldilocksField;
+        const D: usize = 2;
+
+        let num_limbs = U32SubtractionGate::<F, D>::num_limbs();
+        let limb_base = 1u64 << U32SubtractionGate::<F, D>::limb_bits();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5ab_32);
+        let mut cases = vec![
+            (0u32, 0u32, 0u32),
+            (0, 0, 1),
+            (u32::MAX, 0, 0),
+            (0, u32::MAX, 1),
+            (5, 3, 1),
+            (3, 5, 0),
+        ];
+        cases.extend((0..3000).map(|_| {
+            (
+                rng.r#gen::<u32>(),
+                rng.r#gen::<u32>(),
+                rng.gen_range(0..=1),
+            )
+        }));
+
+        for (x, y, borrow) in cases {
+            let result_initial = F::from_canonical_u64(x as u64)
+                - F::from_canonical_u64(y as u64)
+                - F::from_canonical_u64(borrow as u64);
+            let output_borrow = if result_initial.to_canonical_u64() > 1 << 32u64 {
+                F::ONE
+            } else {
+                F::ZERO
+            };
+            let output_result =
+                result_initial + F::from_canonical_u64(1 << 32u64) * output_borrow;
+            let output_result_u64 = output_result.to_canonical_u64();
+
+            let materialized = (0..num_limbs)
+                .scan(output_result_u64, |remaining, _| {
+                    let limb = *remaining % limb_base;
+                    *remaining /= limb_base;
+                    Some(F::from_canonical_u64(limb))
+                })
+                .collect::<Vec<_>>();
+            let mut remaining = output_result_u64;
+            let mut streamed = Vec::with_capacity(num_limbs);
+            for _ in 0..num_limbs {
+                streamed.push(F::from_canonical_u64(remaining % limb_base));
+                remaining /= limb_base;
+            }
+            assert_eq!(streamed, materialized);
+        }
+    }
+
+    #[test]
+    fn streaming_subtraction_generator_proves_boundary_cases() -> anyhow::Result<()> {
+        use plonky2::iop::witness::PartialWitness;
+
+        use crate::types::config::{Builder, C, CIRCUIT_CONFIG};
+        use crate::uint::u32::gadgets::arithmetic_u32::CircuitBuilderU32;
+        use crate::uint::u32::witness::WitnessU32;
+
+        let cases = [
+            (0u32, 0u32, 1u32),
+            (u32::MAX, 1, 0),
+            (0, u32::MAX, 1),
+            (5, 3, 1),
+            (3, 5, 0),
+        ];
+        let mut builder = Builder::new(CIRCUIT_CONFIG);
+        let mut targets = Vec::new();
+        for &(x, y, borrow) in &cases {
+            let x_target = builder.add_virtual_u32_target_safe();
+            let y_target = builder.add_virtual_u32_target_safe();
+            let borrow_target = builder.add_virtual_u32_target_safe();
+            let (result_target, output_borrow_target) =
+                builder.sub_u32(x_target, y_target, borrow_target);
+
+            let (intermediate, borrow_0) = x.overflowing_sub(y);
+            let (expected_result, borrow_1) = intermediate.overflowing_sub(borrow);
+            let expected_borrow = u32::from(borrow_0 || borrow_1);
+            let expected_result_target = builder.constant_u32(expected_result);
+            let expected_borrow_target = builder.constant_u32(expected_borrow);
+            builder.connect_u32(result_target, expected_result_target);
+            builder.connect_u32(output_borrow_target, expected_borrow_target);
+            targets.push((x_target, x, y_target, y, borrow_target, borrow));
+        }
+
+        let circuit = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+        for (x_target, x, y_target, y, borrow_target, borrow) in targets {
+            pw.set_u32_target(x_target, x)?;
+            pw.set_u32_target(y_target, y)?;
+            pw.set_u32_target(borrow_target, borrow)?;
+        }
+        let proof = circuit.prove(pw)?;
+        circuit.verify(proof)
+    }
 
     #[test]
     fn test_gate_constraint() {

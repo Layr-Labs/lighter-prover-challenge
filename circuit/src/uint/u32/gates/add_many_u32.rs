@@ -414,12 +414,12 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
 
         let get_local_wire = |column| witness.get_wire(local_wire(column));
 
-        let addends: Vec<_> = (0..self.gate.num_addends)
-            .map(|j| get_local_wire(self.gate.wire_ith_op_jth_addend(self.i, j)))
-            .collect();
+        let mut output = F::ZERO;
+        for j in 0..self.gate.num_addends {
+            output = output + get_local_wire(self.gate.wire_ith_op_jth_addend(self.i, j));
+        }
         let carry = get_local_wire(self.gate.wire_ith_carry(self.i));
-
-        let output = addends.iter().fold(F::ZERO, |x, &y| x + y) + carry;
+        output = output + carry;
         let output_u64 = output.to_canonical_u64();
 
         let output_carry_u64 = output_u64 >> 32;
@@ -438,25 +438,22 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         let num_carry_limbs = U32AddManyGate::<F, D>::num_carry_limbs();
         let limb_base = 1 << U32AddManyGate::<F, D>::limb_bits();
 
-        let split_to_limbs = |mut val, num| {
-            std::iter::from_fn(move || {
-                if num == 0 {
-                    None
-                } else {
-                    let ret = val % limb_base;
-                    val /= limb_base;
-                    Some(F::from_canonical_u64(ret))
-                }
-            })
-            .take(num)
-            .collect::<Vec<_>>()
-        };
-
-        let result_limbs = split_to_limbs(output_result_u64, num_result_limbs);
-        let carry_limbs = split_to_limbs(output_carry_u64, num_carry_limbs);
-
-        for (j, limb) in result_limbs.into_iter().chain(carry_limbs).enumerate() {
+        let mut remaining_result = output_result_u64;
+        for j in 0..num_result_limbs {
+            let limb = F::from_canonical_u64(remaining_result % limb_base);
+            remaining_result /= limb_base;
             let wire = local_wire(self.gate.wire_ith_output_jth_limb(self.i, j));
+            out_buffer.set_wire(wire, limb)?;
+        }
+
+        let mut remaining_carry = output_carry_u64;
+        for j in 0..num_carry_limbs {
+            let limb = F::from_canonical_u64(remaining_carry % limb_base);
+            remaining_carry /= limb_base;
+            let wire = local_wire(
+                self.gate
+                    .wire_ith_output_jth_limb(self.i, num_result_limbs + j),
+            );
             out_buffer.set_wire(wire, limb)?;
         }
 
@@ -467,10 +464,75 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
 #[cfg(test)]
 mod batch_tests {
     use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::field::types::PrimeField64;
     use plonky2::plonk::circuit_data::CircuitConfig;
 
     use super::*;
     use crate::gate_batch_testing::assert_base_batch_matches_eval_unfiltered;
+
+    #[test]
+    fn streaming_generator_arithmetic_and_limbs_match_materialized_path() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        type F = GoldilocksField;
+        let mut rng = StdRng::seed_from_u64(0xadd_32);
+        let limb_base = 1u64 << U32AddManyGate::<F, 2>::limb_bits();
+        let num_result_limbs = U32AddManyGate::<F, 2>::num_result_limbs();
+        let num_carry_limbs = U32AddManyGate::<F, 2>::num_carry_limbs();
+
+        for num_addends in [2, 5, 16] {
+            for _ in 0..1000 {
+                let addends = (0..num_addends)
+                    .map(|_| F::from_canonical_u64(rng.r#gen::<u32>() as u64))
+                    .collect::<Vec<_>>();
+                let carry = F::from_canonical_u64(rng.gen_range(0..16));
+
+                let materialized_output =
+                    addends.iter().fold(F::ZERO, |sum, &addend| sum + addend) + carry;
+                let mut streamed_output = F::ZERO;
+                for &addend in &addends {
+                    streamed_output = streamed_output + addend;
+                }
+                streamed_output = streamed_output + carry;
+                assert_eq!(streamed_output, materialized_output);
+
+                let output_u64 = materialized_output.to_canonical_u64();
+                let result = output_u64 & 0xffff_ffff;
+                let carry = output_u64 >> 32;
+                let materialized_limbs = [
+                    (0..num_result_limbs)
+                        .scan(result, |remaining, _| {
+                            let limb = *remaining % limb_base;
+                            *remaining /= limb_base;
+                            Some(limb)
+                        })
+                        .collect::<Vec<_>>(),
+                    (0..num_carry_limbs)
+                        .scan(carry, |remaining, _| {
+                            let limb = *remaining % limb_base;
+                            *remaining /= limb_base;
+                            Some(limb)
+                        })
+                        .collect::<Vec<_>>(),
+                ]
+                .concat();
+
+                let mut streamed_limbs = Vec::new();
+                let mut remaining_result = result;
+                for _ in 0..num_result_limbs {
+                    streamed_limbs.push(remaining_result % limb_base);
+                    remaining_result /= limb_base;
+                }
+                let mut remaining_carry = carry;
+                for _ in 0..num_carry_limbs {
+                    streamed_limbs.push(remaining_carry % limb_base);
+                    remaining_carry /= limb_base;
+                }
+                assert_eq!(streamed_limbs, materialized_limbs);
+            }
+        }
+    }
 
     #[test]
     fn base_batch_matches_eval_unfiltered_across_batch() {

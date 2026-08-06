@@ -53,6 +53,10 @@ use crate::util::serialization::{Buffer, IoResult};
 pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + Sync {
     /// Defines a unique identifier for this custom gate.
     ///
+    /// Two gates with the same ID must be fully interchangeable, including all parameters that
+    /// affect their constraints, generators, or serialization. Circuit construction deduplicates
+    /// gate values by this ID.
+    ///
     /// This is used as differentiating tag in gate serializers.
     fn id(&self) -> String;
 
@@ -299,6 +303,10 @@ pub struct GateRef<F: RichField + Extendable<D>, const D: usize>(pub Arc<dyn Any
 impl<F: RichField + Extendable<D>, const D: usize> GateRef<F, D> {
     pub fn new<G: Gate<F, D>>(gate: G) -> GateRef<F, D> {
         GateRef(Arc::new(gate))
+    }
+
+    pub(crate) fn as_ptr(&self) -> *const () {
+        Arc::as_ptr(&self.0) as *const ()
     }
 }
 

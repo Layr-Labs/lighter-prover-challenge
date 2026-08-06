@@ -56,7 +56,134 @@ impl<F: Field> ZeroPolyOnCoset<F> {
 
     /// Returns `L_0(x) = Z_H(x)/(n * (x - 1))` with `x = w^i`.
     pub fn eval_l_0(&self, i: usize, x: F) -> F {
-        // Could also precompute the inverses using Montgomery.
         self.eval(i) * (self.n * (x - F::ONE)).inverse()
+    }
+
+    /// Batched version of [`Self::eval_l_0`] which uses one inversion for the whole batch.
+    ///
+    /// Both output buffers retain their allocations for reuse by the caller. `values` has the
+    /// same order as `indices` and `xs`; `denominators` is scratch after this call.
+    pub fn eval_l_0_batch_into(
+        &self,
+        indices: &[usize],
+        xs: &[F],
+        denominators: &mut Vec<F>,
+        values: &mut Vec<F>,
+    ) {
+        assert_eq!(indices.len(), xs.len());
+        denominators.clear();
+        denominators.extend(xs.iter().map(|&x| self.n * (x - F::ONE)));
+        F::batch_multiplicative_inverse_into(denominators, values);
+        for (&index, value) in indices.iter().zip(values) {
+            *value *= self.eval(index);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    use super::ZeroPolyOnCoset;
+    use crate::goldilocks_field::GoldilocksField;
+    use crate::types::Field;
+
+    #[test]
+    fn eval_l_0_batch_matches_scalar() {
+        type F = GoldilocksField;
+
+        for n_log in [1, 8, 16] {
+            for rate_bits in [0, 1, 3] {
+                let zero_poly = ZeroPolyOnCoset::<F>::new(n_log, rate_bits);
+                let root = F::primitive_root_of_unity(n_log + rate_bits);
+                for start in [0, 5, 31, (1 << rate_bits) + 7] {
+                    for len in [0, 1, 2, 3, 4, 7, 31, 32] {
+                        let indices = (start..start + len).collect::<Vec<_>>();
+                        let xs = indices
+                            .iter()
+                            .map(|&i| F::coset_shift() * root.exp_u64(i as u64))
+                            .collect::<Vec<_>>();
+                        let expected = indices
+                            .iter()
+                            .zip(&xs)
+                            .map(|(&i, &x)| zero_poly.eval_l_0(i, x))
+                            .collect::<Vec<_>>();
+                        let mut denominators = Vec::new();
+                        let mut actual = Vec::new();
+                        zero_poly.eval_l_0_batch_into(
+                            &indices,
+                            &xs,
+                            &mut denominators,
+                            &mut actual,
+                        );
+                        assert_eq!(
+                            actual, expected,
+                            "n_log={n_log}, rate_bits={rate_bits}, start={start}, len={len}"
+                        );
+                        assert_eq!(
+                            actual.iter().map(|x| x.0).collect::<Vec<_>>(),
+                            expected.iter().map(|x| x.0).collect::<Vec<_>>(),
+                            "raw representations differ"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Manual release-mode microbenchmark with the production quotient batch size and a
+    /// representative degree-2^16/rate-8 quotient domain.
+    #[test]
+    #[ignore]
+    fn benchmark_eval_l_0_batch() {
+        type F = GoldilocksField;
+        const N_LOG: usize = 16;
+        const RATE_BITS: usize = 3;
+        const BATCH_SIZE: usize = 32;
+        const REPEATS: usize = 5;
+
+        let zero_poly = ZeroPolyOnCoset::<F>::new(N_LOG, RATE_BITS);
+        let points = F::two_adic_subgroup(N_LOG + RATE_BITS);
+        let xs = points
+            .into_iter()
+            .map(|x| F::coset_shift() * x)
+            .collect::<Vec<_>>();
+        let indices = (0..xs.len()).collect::<Vec<_>>();
+
+        let start = Instant::now();
+        let mut scalar = Vec::with_capacity(xs.len());
+        for _ in 0..REPEATS {
+            scalar.clear();
+            scalar.extend(
+                indices
+                    .iter()
+                    .zip(&xs)
+                    .map(|(&i, &x)| zero_poly.eval_l_0(i, x)),
+            );
+            black_box(&scalar);
+        }
+        let scalar_elapsed = start.elapsed();
+
+        let start = Instant::now();
+        let mut denominators = Vec::with_capacity(BATCH_SIZE);
+        let mut batch = Vec::with_capacity(BATCH_SIZE);
+        let mut batched = Vec::with_capacity(xs.len());
+        for _ in 0..REPEATS {
+            batched.clear();
+            for (indices, xs) in indices.chunks(BATCH_SIZE).zip(xs.chunks(BATCH_SIZE)) {
+                zero_poly.eval_l_0_batch_into(indices, xs, &mut denominators, &mut batch);
+                batched.extend_from_slice(&batch);
+            }
+            black_box(&batched);
+        }
+        let batch_elapsed = start.elapsed();
+
+        assert_eq!(batched, scalar);
+        eprintln!(
+            "eval_l_0 degree=2^{N_LOG} rate=2^{RATE_BITS}, {} points x {REPEATS}: scalar={scalar_elapsed:?}, batch32={batch_elapsed:?}, speedup={:.2}x",
+            xs.len(),
+            scalar_elapsed.as_secs_f64() / batch_elapsed.as_secs_f64()
+        );
     }
 }

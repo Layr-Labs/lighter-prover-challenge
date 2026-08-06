@@ -559,18 +559,15 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
             .to_canonical_u64();
 
         let base = RangeCheckGate::<F, D>::BASE as u64;
-        let limbs = (0..self.gate.aux_limbs_per_input())
-            .map(|j| Target::wire(self.row, self.gate.wire_ith_input_jth_aux_limb(self.i, j)));
-        let limbs_value = (0..self.gate.aux_limbs_per_input())
-            .scan(sum_value, |acc, _| {
-                let tmp = *acc % base;
-                *acc /= base;
-                Some(F::from_canonical_u64(tmp))
-            })
-            .collect::<Vec<_>>();
-
-        for (b, b_value) in limbs.zip(limbs_value) {
-            out_buffer.set_target(b, b_value)?;
+        let mut remaining = sum_value;
+        for j in 0..self.gate.aux_limbs_per_input() {
+            let limb = Target::wire(
+                self.row,
+                self.gate.wire_ith_input_jth_aux_limb(self.i, j),
+            );
+            let limb_value = F::from_canonical_u64(remaining % base);
+            remaining /= base;
+            out_buffer.set_target(limb, limb_value)?;
         }
         Ok(())
     }
@@ -600,12 +597,81 @@ mod tests {
     use plonky2::gates::gate_testing::{test_eval_fns, test_low_degree};
     use plonky2::hash::hash_types::HashOut;
     use plonky2::iop::target::Target;
-    use plonky2::iop::witness::{PartialWitness, WitnessWrite};
+    use plonky2::iop::generator::generate_partial_witness;
+    use plonky2::iop::witness::{PartialWitness, Witness, WitnessWrite};
     use plonky2::plonk::circuit_data::CircuitConfig;
     use plonky2::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
     use rand::Rng;
 
     use super::*;
+
+    #[test]
+    fn streamed_generator_matches_materialized_digits_and_proves_boundary() -> Result<()> {
+        const D: usize = 2;
+        const BIT_SIZE: usize = 47;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+
+        let config = CircuitConfig::standard_recursion_config();
+        let gate = RangeCheckGate::<F, D>::new_from_config(&config, BIT_SIZE);
+        let aux_count = gate.aux_limbs_per_input();
+        let base = RangeCheckGate::<F, D>::BASE as u64;
+
+        // Differentially compare the former materialized scan with the streaming recurrence for
+        // boundary, adversarial, and randomized canonical inputs. The generator is also well
+        // defined for out-of-range values; the constraints (not witness generation) reject them.
+        let mut rng = rand::thread_rng();
+        let mut values = vec![
+            0,
+            1,
+            (1u64 << BIT_SIZE) - 1,
+            1u64 << BIT_SIZE,
+            F::ORDER - 1,
+        ];
+        values.extend((0..1000).map(|_| rng.gen_range(0..F::ORDER)));
+        for value in values {
+            let old_digits = (0..aux_count)
+                .scan(value, |remaining, _| {
+                    let digit = *remaining % base;
+                    *remaining /= base;
+                    Some(digit)
+                })
+                .collect::<Vec<_>>();
+            let mut remaining = value;
+            let mut streamed_digits = Vec::with_capacity(aux_count);
+            for _ in 0..aux_count {
+                streamed_digits.push(remaining % base);
+                remaining /= base;
+            }
+            assert_eq!(streamed_digits, old_digits);
+        }
+
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let input = builder.add_virtual_target();
+        let gate_ref = gate.clone();
+        let (row, op) = builder.find_slot(gate, &[], &[]);
+        builder.connect(input, Target::wire(row, gate_ref.wire_ith_input(op)));
+        let circuit = builder.build::<C>();
+        let value = (1u64 << BIT_SIZE) - 1;
+        let mut pw = PartialWitness::new();
+        pw.set_target(input, F::from_canonical_u64(value))?;
+        let witness = generate_partial_witness(pw, &circuit.prover_only, &circuit.common)?;
+
+        let mut remaining = value;
+        for j in 0..aux_count {
+            let limb = Target::wire(row, gate_ref.wire_ith_input_jth_aux_limb(op, j));
+            assert_eq!(
+                witness.get_target(limb),
+                F::from_canonical_u64(remaining % base)
+            );
+            remaining /= base;
+        }
+
+        let mut proof_pw = PartialWitness::new();
+        proof_pw.set_target(input, F::from_canonical_u64(value))?;
+        let proof = circuit.prove(proof_pw)?;
+        circuit.verify(proof)
+    }
 
     #[test]
     fn direct_filtered_accumulation_matches_materialized_batch() {

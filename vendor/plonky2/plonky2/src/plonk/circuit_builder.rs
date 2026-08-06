@@ -53,7 +53,7 @@ use crate::timed;
 use crate::util::context_tree::ContextTree;
 use crate::util::partial_products::num_partial_products;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil, log2_strict, transpose, transpose_poly_values};
+use crate::util::{log2_ceil, log2_strict, transpose_poly_values};
 
 /// Number of random coins needed for lookups (for each challenge).
 /// A coin is a randomly sampled extension field element from the verifier,
@@ -474,9 +474,10 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // could be modified later, i.e. in the case of `ConstantGate`. We will add them later in
         // `build` instead.
 
-        // Register this gate type if we haven't seen it before.
-        let gate_ref = GateRef::new(gate_type);
-        self.gates.insert(gate_ref.clone());
+        // Register this gate type if we haven't seen it before. Each row reuses the canonical
+        // `Arc` from the set, so later row-to-gate indexing can use pointer identity instead of
+        // allocating an ID string for every row.
+        let gate_ref = self.gates.get_or_insert(GateRef::new(gate_type)).clone();
 
         self.gate_instances.push(GateInstance {
             gate_ref,
@@ -979,20 +980,20 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .map(|g| g.0.num_constants())
             .max()
             .unwrap();
-        transpose(
-            &self
-                .gate_instances
-                .iter()
-                .map(|g| {
-                    let mut consts = g.constants.clone();
-                    consts.resize(max_constants, F::ZERO);
-                    consts
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_iter()
-        .map(PolynomialValues::new)
-        .collect()
+
+        // Build the constant polynomials directly in column-major order. The old path cloned and
+        // zero-padded one tiny `Vec` per gate row, then copied the entire row-major matrix through
+        // `transpose`; those row vectors were never observed anywhere else.
+        (0..max_constants)
+            .map(|constant| {
+                PolynomialValues::new(
+                    self.gate_instances
+                        .iter()
+                        .map(|gate| gate.constants.get(constant).copied().unwrap_or(F::ZERO))
+                        .collect(),
+                )
+            })
+            .collect()
     }
 
     fn sigma_vecs(&self, k_is: &[F], subgroup: &[F]) -> (Vec<PolynomialValues<F>>, Forest) {
@@ -1391,5 +1392,124 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // TODO: Can skip parts of this.
         let circuit_data = self.build::<C>();
         circuit_data.verifier_data()
+    }
+}
+#[cfg(test)]
+mod constant_polys_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::util::transpose;
+
+    const D: usize = 2;
+    type F = GoldilocksField;
+
+    fn legacy_constant_polys(builder: &CircuitBuilder<F, D>) -> Vec<PolynomialValues<F>> {
+        let max_constants = builder
+            .gates
+            .iter()
+            .map(|g| g.0.num_constants())
+            .max()
+            .unwrap();
+        transpose(
+            &builder
+                .gate_instances
+                .iter()
+                .map(|g| {
+                    let mut constants = g.constants.clone();
+                    constants.resize(max_constants, F::ZERO);
+                    constants
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(PolynomialValues::new)
+        .collect()
+    }
+
+    fn mixed_constant_builder(rows: usize) -> CircuitBuilder<F, D> {
+        let config = CircuitConfig::standard_recursion_config();
+        let arithmetic = ArithmeticGate::new_from_config(&config);
+        let mut builder = CircuitBuilder::new(config);
+        for row in 0..rows {
+            match row % 3 {
+                0 => {
+                    builder.add_gate(NoopGate, vec![]);
+                }
+                1 => {
+                    builder.add_gate(arithmetic.clone(), vec![F::from_canonical_usize(row + 1)]);
+                }
+                _ => {
+                    builder.add_gate(
+                        arithmetic.clone(),
+                        vec![
+                            F::from_canonical_usize(row + 1),
+                            F::from_canonical_usize(2 * row + 3),
+                        ],
+                    );
+                }
+            }
+        }
+        builder
+    }
+
+    #[test]
+    fn constant_polys_direct_matches_row_transpose() {
+        let builder = mixed_constant_builder(257);
+        let expected = legacy_constant_polys(&builder);
+        let actual = builder.constant_polys();
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_eq!(actual.values, expected.values);
+        }
+    }
+}
+#[cfg(test)]
+mod canonical_gate_ref_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::PrimeField64;
+    use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    const D: usize = 2;
+    type F = GoldilocksField;
+
+    #[test]
+    fn repeated_gate_rows_reuse_the_gate_set_arc() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let canonical = GateRef::new(NoopGate);
+        builder.add_gate_to_gate_set(canonical.clone());
+        for _ in 0..16 {
+            builder.add_gate(NoopGate, vec![]);
+        }
+
+        assert_eq!(builder.gates.len(), 1);
+        assert!(builder
+            .gate_instances
+            .iter()
+            .all(|instance| instance.gate_ref.as_ptr() == canonical.as_ptr()));
+    }
+
+    #[test]
+    fn canonical_gate_refs_preserve_the_legacy_circuit_digest() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        for _ in 0..64 {
+            builder.add_gate(NoopGate, vec![]);
+        }
+        let data = builder.build::<Poseidon2GoldilocksConfig>();
+
+        assert_eq!(data.common.degree(), 128);
+        // Golden digest from the legacy ID-indexed selector path at e59c0d2.
+        assert_eq!(
+            data.verifier_only
+                .circuit_digest
+                .elements
+                .map(|element| element.to_canonical_u64()),
+            [
+                16456943430030426595,
+                7005619416509202674,
+                8221823471736641978,
+                5634272657483397380,
+            ],
+        );
     }
 }
