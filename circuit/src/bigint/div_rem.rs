@@ -194,8 +194,8 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let a = witness.get_biguint_target(self.a.clone());
-        let b = witness.get_biguint_target(self.b.clone());
+        let a = witness.get_biguint_target(&self.a);
+        let b = witness.get_biguint_target(&self.b);
 
         if b.is_zero() {
             out_buffer.set_biguint_target(&self.div, &BigUint::ZERO)?;

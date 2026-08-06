@@ -12,7 +12,7 @@ use core::array;
 
 use anyhow::Result;
 use itertools::Itertools;
-use num::{BigUint, One, Zero};
+use num::{BigUint, One};
 use plonky2::field::extension::Extendable;
 use plonky2::field::types::{PrimeField, PrimeField64};
 use plonky2::hash::hash_types::RichField;
@@ -922,19 +922,26 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderBiguint<F, D> f
 }
 
 pub trait WitnessBigUint<F: PrimeField64>: Witness<F> {
-    fn get_biguint_target(&self, target: BigUintTarget) -> BigUint;
+    fn get_biguint_target(&self, target: &BigUintTarget) -> BigUint;
     fn set_biguint_target(&mut self, target: &BigUintTarget, value: &BigUint) -> Result<()>;
 }
 
 impl<T: Witness<F>, F: PrimeField64> WitnessBigUint<F> for T {
-    fn get_biguint_target(&self, target: BigUintTarget) -> BigUint {
-        target
-            .limbs
-            .into_iter()
-            .rev()
-            .fold(BigUint::zero(), |acc, limb| {
-                (acc << 32) + self.get_target(limb.0).to_canonical_biguint()
-            })
+    fn get_biguint_target(&self, target: &BigUintTarget) -> BigUint {
+        // Little-endian u32 digits; limb values are u32-constrained, so each
+        // canonical value fits one digit. `BigUint::new` normalizes trailing
+        // zeros, giving exactly the value the old shift-and-add fold produced.
+        BigUint::new(
+            target
+                .limbs
+                .iter()
+                .map(|limb| {
+                    let v = self.get_target(limb.0).to_canonical_u64();
+                    debug_assert!(v <= u32::MAX as u64);
+                    v as u32
+                })
+                .collect(),
+        )
     }
 
     fn set_biguint_target(&mut self, target: &BigUintTarget, value: &BigUint) -> Result<()> {
@@ -989,6 +996,48 @@ mod tests {
             sum = builder.add_biguint_non_carry(&sum, target, num_limbs);
         }
         sum
+    }
+
+    #[test]
+    fn get_biguint_target_matches_shift_fold_reference() -> Result<()> {
+        use num::Zero;
+
+        let mut builder = Builder::<F, D>::new(CIRCUIT_CONFIG);
+        let mut pw = PartialWitness::<F>::new();
+        let mut rng = rand::thread_rng();
+
+        let mut cases: Vec<(BigUintTarget, BigUint)> = Vec::new();
+        for num_limbs in 1..=10usize {
+            // Random value, value with high zero digits, and zero.
+            let full = BigUint::new((0..num_limbs).map(|_| rng.r#gen::<u32>()).collect());
+            let sparse = BigUint::new(
+                (0..num_limbs)
+                    .map(|i| if i % 2 == 0 { rng.r#gen::<u32>() } else { 0 })
+                    .collect(),
+            );
+            for value in [full, sparse, BigUint::zero()] {
+                let target = builder.add_virtual_biguint_target_unsafe(num_limbs);
+                pw.set_biguint_target(&target, &value)?;
+                cases.push((target, value));
+            }
+        }
+
+        for (target, value) in &cases {
+            // Old implementation, kept as the reference oracle.
+            let reference = target
+                .limbs
+                .iter()
+                .rev()
+                .fold(BigUint::zero(), |acc, limb| {
+                    (acc << 32) + pw.get_target(limb.0).to_canonical_biguint()
+                });
+            let got = pw.get_biguint_target(target);
+            assert_eq!(&got, value);
+            assert_eq!(got, reference);
+            assert_eq!(got.to_u32_digits(), reference.to_u32_digits());
+        }
+
+        Ok(())
     }
 
     #[test]

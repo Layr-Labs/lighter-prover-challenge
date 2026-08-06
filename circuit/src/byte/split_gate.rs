@@ -345,13 +345,11 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         let limbs = dummy_gate
             .i_th_limbs(self.i)
             .map(|i| Target::wire(self.row, i));
-        let limbs_value = (0..self.num_limbs)
-            .scan(sum_value, |acc, _| {
-                let tmp = *acc % (256_u64);
-                *acc /= 256_u64;
-                Some(F::from_canonical_u64(tmp))
-            })
-            .collect::<Vec<_>>();
+        let limbs_value = (0..self.num_limbs).scan(sum_value, |acc, _| {
+            let tmp = *acc % (256_u64);
+            *acc /= 256_u64;
+            Some(F::from_canonical_u64(tmp))
+        });
 
         for (b, b_value) in limbs.zip_eq(limbs_value) {
             out_buffer.set_target(b, b_value)?;
@@ -361,13 +359,11 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         let limbs = dummy_gate
             .i_th_aux_limbs(self.i)
             .map(|i| Target::wire(self.row, i));
-        let limbs_value = (0..4 * self.num_limbs)
-            .scan(sum_value, |acc, _| {
-                let tmp = *acc % (4_u64);
-                *acc /= 4_u64;
-                Some(F::from_canonical_u64(tmp))
-            })
-            .collect::<Vec<_>>();
+        let limbs_value = (0..4 * self.num_limbs).scan(sum_value, |acc, _| {
+            let tmp = *acc % (4_u64);
+            *acc /= 4_u64;
+            Some(F::from_canonical_u64(tmp))
+        });
 
         for (b, b_value) in limbs.zip_eq(limbs_value) {
             out_buffer.set_target(b, b_value)?;

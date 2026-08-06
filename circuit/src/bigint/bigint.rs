@@ -548,7 +548,7 @@ pub trait WitnessBigInt<F: PrimeField64>: Witness<F> {
 
 impl<T: Witness<F>, F: PrimeField64> WitnessBigInt<F> for T {
     fn get_bigint_target(&self, target: BigIntTarget) -> BigInt {
-        let abs = self.get_biguint_target(target.abs);
+        let abs = self.get_biguint_target(&target.abs);
         let sign = self.get_target(target.sign.target);
 
         let sign = if sign == F::ONE {
