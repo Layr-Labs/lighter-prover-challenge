@@ -15,9 +15,9 @@ use crate::fri::proof::FriProof;
 use crate::fri::prover::fri_proof;
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
 use crate::hash::hash_types::RichField;
-use crate::hash::merkle_tree::MerkleTree;
+use crate::hash::merkle_tree::{MerkleCap, MerkleTree};
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::timed;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
@@ -95,12 +95,31 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             Self::lde_values(&polynomials, rate_bits, blinding, fft_root_table)
         );
 
+        // Start the GPU Merkle build straight from the column-major LDE
+        // values when the backend supports it: the GPU hashes coalesced
+        // column reads while this thread performs the row-major transpose the
+        // prover needs for later leaf reads.
+        let poly_refs: Vec<&[F]> = lde_values.iter().map(|values| values.as_slice()).collect();
+        let pending_tree =
+            <C::Hasher as Hasher<F>>::try_start_build_merkle_tree_cols(&poly_refs, cap_height);
+        drop(poly_refs);
+
+        // The row-major transpose (needed only for later CPU-side leaf reads)
+        // runs while the GPU hashes the committed column-major build; the
+        // subsequent wait is then mostly or fully absorbed.
         let mut leaves = timed!(timing, "transpose LDEs", transpose(&lde_values));
         reverse_index_bits_in_place(&mut leaves);
         let merkle_tree = timed!(
             timing,
             "build Merkle tree",
-            MerkleTree::new(leaves, cap_height)
+            match pending_tree.and_then(|finish| finish()) {
+                Some((digests, cap)) => MerkleTree {
+                    leaves,
+                    digests,
+                    cap: MerkleCap(cap),
+                },
+                None => MerkleTree::new(leaves, cap_height),
+            }
         );
 
         Self {

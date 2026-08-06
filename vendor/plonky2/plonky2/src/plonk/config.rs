@@ -85,6 +85,22 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
     ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
         None
     }
+
+    /// Start building the Merkle digests and cap from column-major polynomial
+    /// values (`polys[i][point]`, natural point order; tree leaf `j` holds
+    /// point `reverse_bits(j)` of every polynomial), when an asynchronous
+    /// specialized backend is available. The backend's work is already
+    /// committed when this returns, so the caller can overlap CPU work before
+    /// calling the returned closure, which waits and returns the digests and
+    /// cap in [`crate::hash::merkle_tree::MerkleTree::digests`] layout — or
+    /// `None` if the backend failed after starting, in which case the caller
+    /// must fall back to a CPU build.
+    fn try_start_build_merkle_tree_cols(
+        _polys: &[&[F]],
+        _cap_height: usize,
+    ) -> Option<Box<dyn FnOnce() -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)>>> {
+        None
+    }
 }
 
 /// Trait for algebraic hash functions, built from a permutation using the sponge construction.
