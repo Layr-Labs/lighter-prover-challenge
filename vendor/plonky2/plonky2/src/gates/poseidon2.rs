@@ -18,7 +18,9 @@ use crate::iop::wire::Wire;
 use crate::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use crate::plonk::circuit_builder::CircuitBuilder;
 use crate::plonk::circuit_data::CommonCircuitData;
-use crate::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBase};
+use crate::plonk::vars::{
+    EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch,
+};
 use crate::util::serialization::{Buffer, IoResult, Read, Write};
 
 /// Evaluates a full Poseidon2 permutation with 12 state elements.
@@ -99,6 +101,7 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Poseidon2Gate<F, 
     const fn end() -> usize {
         Self::START_ROUND_F_END + WIDTH * ROUNDS_F_HALF
     }
+
 }
 
 impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Poseidon2Gate<F, D> {
@@ -192,10 +195,7 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
         constraints
     }
 
-    fn eval_unfiltered_base_batch(
-        &self,
-        vars_base: crate::plonk::vars::EvaluationVarsBaseBatch<F>,
-    ) -> Vec<F> {
+    fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
         let n = vars_base.len();
         let wires = vars_base.local_wires;
         let col = |w: usize| &wires[w * n..][..n];
@@ -310,6 +310,149 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
         }
 
         res
+    }
+
+    /// Contiguous-column evaluation that fuses the selector filter into each
+    /// constraint write: `combined[j*n+p] += constraint(p) * filter[p]`.
+    ///
+    /// Compared with the default materialize-then-`batch_multiply_add` path this
+    /// deletes the full `num_constraints × batch` temporary matrix and the second
+    /// pass over it. Constraint arithmetic and emit order match
+    /// [`Self::eval_unfiltered_base_batch`] / [`Self::eval_unfiltered_base_one`].
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        let num_constraints = self.num_constraints();
+        assert!(combined_gate_constraints.len() >= num_constraints * n);
+
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        let mut states = vec![[F::ZERO; WIDTH]; n];
+        let mut row = 0usize;
+
+        // Assert that `swap` is binary.
+        let swap = col(Self::WIRE_SWAP);
+        {
+            let out = &mut combined_gate_constraints[row * n..][..n];
+            for p in 0..n {
+                let term = swap[p] * swap[p].sub_one();
+                out[p] = out[p].multiply_accumulate(term, filters[p]);
+            }
+            row += 1;
+        }
+
+        // Assert that each delta wire is set properly: `delta_i = swap * (rhs - lhs)`.
+        for i in 0..4 {
+            let input_lhs = col(Self::wire_input(i));
+            let input_rhs = col(Self::wire_input(i + 4));
+            let delta_i = col(Self::wire_delta(i));
+            let out = &mut combined_gate_constraints[row * n..][..n];
+            for p in 0..n {
+                let term = swap[p] * (input_rhs[p] - input_lhs[p]) - delta_i[p];
+                out[p] = out[p].multiply_accumulate(term, filters[p]);
+            }
+            row += 1;
+        }
+
+        // Compute the possibly-swapped input layer.
+        for i in 0..4 {
+            let delta_i = col(Self::wire_delta(i));
+            let input_lhs = col(Self::wire_input(i));
+            let input_rhs = col(Self::wire_input(i + 4));
+            for p in 0..n {
+                states[p][i] = input_lhs[p] + delta_i[p];
+                states[p][i + 4] = input_rhs[p] - delta_i[p];
+            }
+        }
+        for i in 8..WIDTH {
+            let input = col(Self::wire_input(i));
+            for p in 0..n {
+                states[p][i] = input[p];
+            }
+        }
+
+        // The initial linear layer.
+        for state in states.iter_mut() {
+            <F as Poseidon2>::external_linear_layer(state);
+        }
+
+        // The first half of the external rounds.
+        for r in 0..ROUNDS_F_HALF {
+            for state in states.iter_mut() {
+                <F as Poseidon2>::add_rc(state, r);
+            }
+            if r != 0 {
+                for i in 0..WIDTH {
+                    let sbox_in = col(Self::wire_full_sbox_0(r, i));
+                    // Capture state update after the constraint is formed.
+                    let out = &mut combined_gate_constraints[row * n..][..n];
+                    for p in 0..n {
+                        let term = states[p][i] - sbox_in[p];
+                        out[p] = out[p].multiply_accumulate(term, filters[p]);
+                        states[p][i] = sbox_in[p];
+                    }
+                    row += 1;
+                }
+            }
+            for state in states.iter_mut() {
+                <F as Poseidon2>::sbox(state);
+                <F as Poseidon2>::external_linear_layer(state);
+            }
+        }
+
+        // The internal rounds.
+        for r in 0..ROUNDS_P {
+            let rc = F::from_canonical_u64(INTERNAL_CONSTANTS[r]);
+            let sbox_in = col(Self::wire_partial_sbox(r));
+            let out = &mut combined_gate_constraints[row * n..][..n];
+            for p in 0..n {
+                let term = states[p][0] + rc - sbox_in[p];
+                out[p] = out[p].multiply_accumulate(term, filters[p]);
+                states[p][0] = <F as Poseidon2>::sbox_p(&sbox_in[p]);
+            }
+            row += 1;
+            for state in states.iter_mut() {
+                <F as Poseidon2>::internal_linear_layer(state);
+            }
+        }
+
+        // The second half of the external rounds.
+        for r in ROUNDS_F_HALF..ROUNDS_F {
+            for state in states.iter_mut() {
+                <F as Poseidon2>::add_rc(state, r);
+            }
+            for i in 0..WIDTH {
+                let sbox_in = col(Self::wire_full_sbox_1(r - ROUNDS_F_HALF, i));
+                let out = &mut combined_gate_constraints[row * n..][..n];
+                for p in 0..n {
+                    let term = states[p][i] - sbox_in[p];
+                    out[p] = out[p].multiply_accumulate(term, filters[p]);
+                    states[p][i] = sbox_in[p];
+                }
+                row += 1;
+            }
+            for state in states.iter_mut() {
+                <F as Poseidon2>::sbox(state);
+                <F as Poseidon2>::external_linear_layer(state);
+            }
+        }
+
+        for i in 0..WIDTH {
+            let output = col(Self::wire_output(i));
+            let out = &mut combined_gate_constraints[row * n..][..n];
+            for p in 0..n {
+                let term = states[p][i] - output[p];
+                out[p] = out[p].multiply_accumulate(term, filters[p]);
+            }
+            row += 1;
+        }
+
+        debug_assert_eq!(row, num_constraints);
     }
 
     fn eval_unfiltered_base_one(
@@ -716,5 +859,95 @@ mod tests {
 
         let gate = PoseidonGate::<F, D>::new();
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    /// Fused accumulate must match materialize-batch + row-wise filter MAC
+    /// on multi-point batches with a non-zero pre-seeded accumulator.
+    #[test]
+    fn accumulate_matches_default_across_batch() {
+        use crate::field::types::Sample;
+        use crate::hash::hash_types::HashOut;
+        use crate::plonk::vars::EvaluationVarsBaseBatch;
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+
+        let n = 32;
+        let gate = Poseidon2Gate::<F, D>::new();
+        let num_wires = <Poseidon2Gate<F, D> as Gate<F, D>>::num_wires(&gate);
+        let num_constraints = <Poseidon2Gate<F, D> as Gate<F, D>>::num_constraints(&gate);
+
+        let wires_batch: Vec<F> = (0..num_wires * n).map(|_| F::rand()).collect();
+        let filters: Vec<F> = (0..n).map(|_| F::rand()).collect();
+        let initial: Vec<F> = (0..num_constraints * n).map(|_| F::rand()).collect();
+        let public_inputs_hash = HashOut::<F>::ZERO;
+        let vars_batch = EvaluationVarsBaseBatch::new(n, &[], &wires_batch, &public_inputs_hash);
+
+        let reference = gate.eval_unfiltered_base_batch(vars_batch);
+        let mut expected = initial.clone();
+        for (combined, row) in expected.chunks_exact_mut(n).zip(reference.chunks_exact(n)) {
+            for p in 0..n {
+                combined[p] += row[p] * filters[p];
+            }
+        }
+
+        let mut actual = initial;
+        gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut actual);
+        assert_eq!(actual, expected);
+    }
+
+    /// Single-threaded microbenchmark of materialize+fuse vs fused accumulate.
+    /// Run with:
+    /// `cargo test --release -p plonky2 --lib -- --ignored --nocapture poseidon2_accumulate_microbench`
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn poseidon2_accumulate_microbench() {
+        use core::time::Duration;
+        use std::time::Instant;
+
+        use crate::field::batch_util::batch_multiply_add_inplace;
+        use crate::field::types::Sample;
+        use crate::hash::hash_types::HashOut;
+        use crate::plonk::vars::EvaluationVarsBaseBatch;
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+
+        let n = 32;
+        let iters = 2_000;
+        let gate = Poseidon2Gate::<F, D>::new();
+        let num_wires = <Poseidon2Gate<F, D> as Gate<F, D>>::num_wires(&gate);
+        let num_constraints = <Poseidon2Gate<F, D> as Gate<F, D>>::num_constraints(&gate);
+
+        let wires_batch: Vec<F> = (0..num_wires * n).map(|_| F::rand()).collect();
+        let filters: Vec<F> = (0..n).map(|_| F::rand()).collect();
+        let public_inputs_hash = HashOut::<F>::ZERO;
+        let vars_batch = EvaluationVarsBaseBatch::new(n, &[], &wires_batch, &public_inputs_hash);
+
+        let mut combined = vec![F::ZERO; num_constraints * n];
+        let start = Instant::now();
+        for _ in 0..iters {
+            let res = gate.eval_unfiltered_base_batch(vars_batch);
+            for (acc, row) in combined.chunks_exact_mut(n).zip(res.chunks_exact(n)) {
+                batch_multiply_add_inplace(acc, row, &filters);
+            }
+        }
+        let old: Duration = start.elapsed();
+        let old_sink = combined[0];
+
+        let mut combined = vec![F::ZERO; num_constraints * n];
+        let start = Instant::now();
+        for _ in 0..iters {
+            gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut combined);
+        }
+        let new: Duration = start.elapsed();
+        assert_eq!(old_sink, combined[0], "paths diverged");
+
+        println!(
+            "{:>10.3}us/iter -> {:>10.3}us/iter ({:.2}x)  Poseidon2Gate WIDTH={WIDTH}",
+            old.as_secs_f64() * 1e6 / iters as f64,
+            new.as_secs_f64() * 1e6 / iters as f64,
+            old.as_secs_f64() / new.as_secs_f64(),
+        );
     }
 }

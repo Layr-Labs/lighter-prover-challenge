@@ -11,6 +11,7 @@
 use core::marker::PhantomData;
 
 use anyhow::Result;
+use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::types::Field;
 use plonky2::gates::gate::Gate;
@@ -224,6 +225,91 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16AddManyGate
             }
         }
         res
+    }
+
+    /// Contiguous-column evaluation fused with the selector filter: each
+    /// constraint row is multiply-added into the shared accumulator instead of
+    /// materializing the full `num_constraints × batch` temporary first.
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        let num_constraints = <Self as Gate<F, D>>::num_constraints(self);
+        assert!(combined_gate_constraints.len() >= num_constraints * n);
+
+        let wires = vars_base.local_wires;
+        let three = F::from_canonical_usize(3);
+        let base_limb = F::from_canonical_u64(1u64 << Self::limb_bits());
+        let base16 = F::from_canonical_u64(1 << 16u64);
+        let mut combined_result = vec![F::ZERO; n];
+        let mut combined_carry = vec![F::ZERO; n];
+        let mut scratch = vec![F::ZERO; n];
+        let mut row = 0usize;
+
+        let mut emit = |row: &mut usize, scratch: &[F]| {
+            batch_multiply_add_inplace(
+                &mut combined_gate_constraints[*row * n..][..n],
+                scratch,
+                filters,
+            );
+            *row += 1;
+        };
+
+        for i in 0..self.num_ops {
+            let output_result = &wires[self.wire_ith_output_result(i) * n..][..n];
+            let output_carry = &wires[self.wire_ith_output_carry(i) * n..][..n];
+
+            // output_carry * 2^16 + output_result - (sum of addends + carry).
+            scratch.copy_from_slice(&wires[self.wire_ith_carry(i) * n..][..n]);
+            for j in 0..self.num_addends {
+                let addend = &wires[self.wire_ith_op_jth_addend(i, j) * n..][..n];
+                for p in 0..n {
+                    scratch[p] += addend[p];
+                }
+            }
+            for p in 0..n {
+                scratch[p] = output_carry[p] * base16 + output_result[p] - scratch[p];
+            }
+            emit(&mut row, &scratch);
+
+            // Limb range products (base-4: x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3))
+            // in the same descending order as `eval_unfiltered`, accumulating
+            // the result/carry recompositions along the way.
+            combined_result.fill(F::ZERO);
+            combined_carry.fill(F::ZERO);
+            for j in (0..Self::num_limbs()).rev() {
+                let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
+                debug_assert_eq!(1 << Self::limb_bits(), 4);
+                for p in 0..n {
+                    let x = limb[p];
+                    let y = x * (x - three);
+                    scratch[p] = y * (y + F::TWO);
+                }
+                emit(&mut row, &scratch);
+                let combined = if j < Self::num_result_limbs() {
+                    &mut combined_result
+                } else {
+                    &mut combined_carry
+                };
+                for p in 0..n {
+                    combined[p] = combined[p] * base_limb + limb[p];
+                }
+            }
+
+            for p in 0..n {
+                scratch[p] = combined_result[p] - output_result[p];
+            }
+            emit(&mut row, &scratch);
+            for p in 0..n {
+                scratch[p] = combined_carry[p] - output_carry[p];
+            }
+            emit(&mut row, &scratch);
+        }
+        debug_assert_eq!(row, num_constraints);
     }
 
     fn eval_unfiltered_base_one(

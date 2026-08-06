@@ -27,6 +27,25 @@ mod vendored_gate_tests {
     }
 
     #[test]
+    fn poseidon2_accumulate_matches_eval_unfiltered_across_batch() {
+        let gate = Poseidon2Gate::<GoldilocksField, 2>::new();
+        assert_accumulate_matches_eval_unfiltered(&gate);
+    }
+
+    #[test]
+    fn u16_add_many_accumulate_matches_eval_unfiltered_across_batch() {
+        use crate::uint::u16::gates::add_many_u16::U16AddManyGate;
+        use plonky2::plonk::circuit_data::CircuitConfig;
+
+        // Production configs use a range of addend counts; cover a few.
+        let config = CircuitConfig::standard_recursion_config();
+        for num_addends in [2, 4, 8, 16] {
+            let gate = U16AddManyGate::<GoldilocksField, 2>::new_from_config(&config, num_addends);
+            assert_accumulate_matches_eval_unfiltered(&gate);
+        }
+    }
+
+    #[test]
     fn random_access_base_batch_matches_eval_unfiltered_across_batch() {
         use plonky2::gates::random_access::RandomAccessGate;
         use plonky2::plonk::circuit_data::CircuitConfig;
@@ -184,7 +203,19 @@ mod accumulate_microbench {
     #[test]
     #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
     fn accumulate_microbench() {
+        use crate::uint::u16::gates::add_many_u16::U16AddManyGate;
+        use plonky2::gates::poseidon2::Poseidon2Gate;
+
         const ITERS: usize = 20_000;
+        // Poseidon2 is heavy; fewer iters still give a stable ratio.
+        bench_gate(&Poseidon2Gate::<GoldilocksField, 2>::new(), 2_000);
+        let u16_cfg = CircuitConfig::standard_recursion_config();
+        for num_addends in [4, 8, 16] {
+            bench_gate(
+                &U16AddManyGate::<GoldilocksField, 2>::new_from_config(&u16_cfg, num_addends),
+                ITERS,
+            );
+        }
         bench_gate(&ReducingGate::<2>::new(44), ITERS);
         bench_gate(&ReducingExtensionGate::<2>::new(33), ITERS);
         bench_gate(&ArithmeticExtensionGate::<2> { num_ops: 10 }, ITERS);
