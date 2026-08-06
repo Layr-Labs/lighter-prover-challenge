@@ -13,10 +13,10 @@ use core::ops::Range;
 #[cfg(feature = "std")]
 use std::{collections::BTreeMap, sync::Arc};
 
-pub use gate_serialization::default::DefaultGateSerializer;
 pub use gate_serialization::GateSerializer;
-pub use generator_serialization::default::DefaultGeneratorSerializer;
+pub use gate_serialization::default::DefaultGateSerializer;
 pub use generator_serialization::WitnessGeneratorSerializer;
+pub use generator_serialization::default::DefaultGeneratorSerializer;
 use hashbrown::HashMap;
 
 use crate::field::extension::{Extendable, FieldExtension};
@@ -856,6 +856,14 @@ pub trait Read {
             let k = self.read_usize()?;
             generator_indices_by_watches.insert(k, self.read_usize_vec()?);
         }
+        // Not serialized: each watcher list holds a generator at most once, so its distinct
+        // watched-representative count is its number of appearances across the map.
+        let mut generator_watch_counts = vec![0usize; gen_len];
+        for indices in generator_indices_by_watches.values() {
+            for &generator_idx in indices {
+                generator_watch_counts[generator_idx] += 1;
+            }
+        }
 
         let constants_sigmas_commitment = self.read_polynomial_batch()?;
         let sigmas_len = self.read_usize()?;
@@ -907,6 +915,7 @@ pub trait Read {
         Ok(ProverOnlyCircuitData {
             generators,
             generator_indices_by_watches,
+            generator_watch_counts,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
@@ -1860,6 +1869,8 @@ pub trait Write {
         let ProverOnlyCircuitData {
             generators,
             generator_indices_by_watches,
+            // Runtime-only; reconstructed from the watcher map when reading.
+            generator_watch_counts: _,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
