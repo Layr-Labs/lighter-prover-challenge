@@ -156,6 +156,33 @@ fn fft_classic_simd<P: PackedField>(
     }
 }
 
+/// Expands a bit-reversed nonzero prefix and performs the first nontrivial FFT
+/// round in one write. Processing pairs backwards preserves unread prefix values.
+fn expand_zero_tail_first_round<P: PackedField>(
+    values: &mut [P::Scalar],
+    r: usize,
+    root_table: &FftRootTable<P::Scalar>,
+) {
+    let repeat = 1 << r;
+    let nonzero_len = values.len() >> r;
+    debug_assert!(nonzero_len >= 2);
+    debug_assert_eq!(repeat % P::WIDTH, 0);
+
+    let half_packed = repeat / P::WIDTH;
+    let omegas = P::pack_slice(&root_table[r][..repeat]);
+    for pair in (0..nonzero_len / 2).rev() {
+        let u = P::from(values[2 * pair]);
+        let v = P::from(values[2 * pair + 1]);
+        let start = pair * 2 * repeat;
+        let destination = P::pack_slice_mut(&mut values[start..start + 2 * repeat]);
+        for j in 0..half_packed {
+            let t = omegas[j] * v;
+            destination[j] = u + t;
+            destination[half_packed + j] = u - t;
+        }
+    }
+}
+
 /// FFT implementation based on Section 32.3 of "Introduction to
 /// Algorithms" by Cormen et al.
 ///
@@ -174,28 +201,46 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
         );
     }
 
-    // After bit reversal, a zero-extended input consists of 2^r copies of each
-    // value in the bit-reversed nonzero prefix. Reverse only that prefix, then
-    // expand it backwards so unread values are never overwritten.
-    if r == 0 {
+    let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
+    let use_packing = lg_n > lg_packed_width;
+
+    // Reverse only the nonzero prefix. When the repeated block is at least one
+    // packed word, fuse its expansion with the first remaining butterfly round;
+    // this avoids writing and then rereading the repeated intermediate state.
+    let first_remaining_round = if r == 0 {
         reverse_index_bits_in_place(values);
+        r
     } else {
         let repeat = 1 << r;
         let nonzero_len = n >> r;
         reverse_index_bits_in_place(&mut values[..nonzero_len]);
-        for i in (0..nonzero_len).rev() {
-            let value = values[i];
-            values[i * repeat..(i + 1) * repeat].fill(value);
+        if r < lg_n && (!use_packing || r >= lg_packed_width) {
+            if use_packing {
+                expand_zero_tail_first_round::<<F as Packable>::Packing>(values, r, root_table);
+            } else {
+                expand_zero_tail_first_round::<F>(values, r, root_table);
+            }
+            r + 1
+        } else {
+            for i in (0..nonzero_len).rev() {
+                let value = values[i];
+                values[i * repeat..(i + 1) * repeat].fill(value);
+            }
+            r
         }
-    }
+    };
 
-    let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
-    if lg_n <= lg_packed_width {
+    if use_packing {
+        fft_classic_simd::<<F as Packable>::Packing>(
+            values,
+            first_remaining_round,
+            lg_n,
+            root_table,
+        );
+    } else {
         // Need the slice to be at least the width of two packed vectors for the vectorized version
         // to work. Do this tiny problem in scalar.
-        fft_classic_simd::<F>(values, r, lg_n, root_table);
-    } else {
-        fft_classic_simd::<<F as Packable>::Packing>(values, r, lg_n, root_table);
+        fft_classic_simd::<F>(values, first_remaining_round, lg_n, root_table);
     }
 }
 
