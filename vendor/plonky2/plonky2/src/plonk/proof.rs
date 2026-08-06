@@ -331,8 +331,39 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         // `zs_partial_products_lookup_eval` contains the permutation argument polynomials as well as lookup polynomials.
         let zs_partial_products_lookup_eval =
             eval_commitment(zeta, zs_partial_products_lookup_commitment);
-        let zs_partial_products_lookup_next_eval =
-            eval_commitment(g * zeta, zs_partial_products_lookup_commitment);
+        // At the next point, FRI opens only the Z and lookup polynomials.
+        let next_zs_range = common_data.zs_range();
+        let next_lookup_start = common_data.lookup_range().start;
+        let num_next_zs = next_zs_range.len();
+        let num_next_lookups =
+            zs_partial_products_lookup_commitment.polynomials.len() - next_lookup_start;
+        let zeta_next = g * zeta;
+        let zs_lookup_next_eval = (0..num_next_zs + num_next_lookups)
+            .into_par_iter()
+            .map(|output_index| {
+                let polynomial_index = if output_index < num_next_zs {
+                    next_zs_range.start + output_index
+                } else {
+                    next_lookup_start + output_index - num_next_zs
+                };
+                zs_partial_products_lookup_commitment.polynomials[polynomial_index]
+                    .to_extension()
+                    .eval(zeta_next)
+            })
+            .collect::<Vec<_>>();
+
+        #[cfg(test)]
+        {
+            let expected = eval_commitment(zeta_next, zs_partial_products_lookup_commitment);
+            assert_eq!(
+                &zs_lookup_next_eval[..num_next_zs],
+                &expected[common_data.zs_range()]
+            );
+            assert_eq!(
+                &zs_lookup_next_eval[num_next_zs..],
+                &expected[common_data.lookup_range()]
+            );
+        }
         let quotient_polys = eval_commitment(zeta, quotient_polys_commitment);
 
         Self {
@@ -340,13 +371,12 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
             plonk_sigmas: constants_sigmas_eval[common_data.sigmas_range()].to_vec(),
             wires: eval_commitment(zeta, wires_commitment),
             plonk_zs: zs_partial_products_lookup_eval[common_data.zs_range()].to_vec(),
-            plonk_zs_next: zs_partial_products_lookup_next_eval[common_data.zs_range()].to_vec(),
+            plonk_zs_next: zs_lookup_next_eval[..num_next_zs].to_vec(),
             partial_products: zs_partial_products_lookup_eval[common_data.partial_products_range()]
                 .to_vec(),
             quotient_polys,
             lookup_zs: zs_partial_products_lookup_eval[common_data.lookup_range()].to_vec(),
-            lookup_zs_next: zs_partial_products_lookup_next_eval[common_data.lookup_range()]
-                .to_vec(),
+            lookup_zs_next: zs_lookup_next_eval[num_next_zs..].to_vec(),
         }
     }
     pub(crate) fn to_fri_openings(&self) -> FriOpenings<F, D> {
