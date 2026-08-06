@@ -147,20 +147,33 @@ impl<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> FriProof<F, H, 
         let reduction_arity_bits = &params.reduction_arity_bits;
         let num_reductions = reduction_arity_bits.len();
         let num_initial_trees = query_round_proofs[0].initial_trees_proof.evals_proofs.len();
+        let num_query_rounds = indices.len().min(query_round_proofs.len());
 
         // "Transpose" the query round proofs, so that information for each Merkle tree is collected together.
-        let mut initial_trees_indices = vec![vec![]; num_initial_trees];
-        let mut initial_trees_leaves = vec![vec![]; num_initial_trees];
-        let mut initial_trees_proofs = vec![vec![]; num_initial_trees];
-        let mut steps_indices = vec![vec![]; num_reductions];
-        let mut steps_evals = vec![vec![]; num_reductions];
-        let mut steps_proofs = vec![vec![]; num_reductions];
+        let mut initial_trees_indices = (0..num_initial_trees)
+            .map(|_| Vec::with_capacity(num_query_rounds))
+            .collect::<Vec<_>>();
+        let mut initial_trees_leaves = (0..num_initial_trees)
+            .map(|_| Vec::with_capacity(num_query_rounds))
+            .collect::<Vec<_>>();
+        let mut initial_trees_proofs = (0..num_initial_trees)
+            .map(|_| Vec::with_capacity(num_query_rounds))
+            .collect::<Vec<_>>();
+        let mut steps_indices = (0..num_reductions)
+            .map(|_| Vec::with_capacity(num_query_rounds))
+            .collect::<Vec<_>>();
+        let mut steps_evals = (0..num_reductions)
+            .map(|_| Vec::with_capacity(num_query_rounds))
+            .collect::<Vec<_>>();
+        let mut steps_proofs = (0..num_reductions)
+            .map(|_| Vec::with_capacity(num_query_rounds))
+            .collect::<Vec<_>>();
 
-        for (mut index, qrp) in indices.iter().cloned().zip(&query_round_proofs) {
+        for (mut index, qrp) in indices.iter().copied().zip(query_round_proofs) {
             let FriQueryRound {
                 initial_trees_proof,
                 steps,
-            } = qrp.clone();
+            } = qrp;
             for (i, (leaves_data, proof)) in
                 initial_trees_proof.evals_proofs.into_iter().enumerate()
             {

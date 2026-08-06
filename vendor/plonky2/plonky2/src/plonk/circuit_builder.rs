@@ -9,6 +9,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use hashbrown::{HashMap, HashSet};
 use itertools::Itertools;
 use log::{debug, info, warn, Level};
+use plonky2_maybe_rayon::*;
 #[cfg(feature = "timing")]
 use web_time::Instant;
 
@@ -53,7 +54,7 @@ use crate::timed;
 use crate::util::context_tree::ContextTree;
 use crate::util::partial_products::num_partial_products;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil, log2_strict, transpose, transpose_poly_values};
+use crate::util::{log2_ceil, log2_strict, transpose_poly_values};
 
 /// Number of random coins needed for lookups (for each challenge).
 /// A coin is a randomly sampled extension field element from the verifier,
@@ -204,6 +205,23 @@ pub struct CircuitBuilder<F: RichField + Extendable<D>, const D: usize> {
     /// Optional verifier data that is registered as public inputs.
     /// This is used in cyclic recursion to hold the circuit's own verifier key.
     pub(crate) verifier_data_public_input: Option<VerifierCircuitTarget>,
+}
+
+fn constant_polys_direct<F: RichField + Extendable<D>, const D: usize>(
+    gate_instances: &[GateInstance<F, D>],
+    max_constants: usize,
+) -> Vec<PolynomialValues<F>> {
+    (0..max_constants)
+        .into_par_iter()
+        .map(|column| {
+            PolynomialValues::new(
+                gate_instances
+                    .iter()
+                    .map(|gate| gate.constants.get(column).copied().unwrap_or(F::ZERO))
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
@@ -979,20 +997,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .map(|g| g.0.num_constants())
             .max()
             .unwrap();
-        transpose(
-            &self
-                .gate_instances
-                .iter()
-                .map(|g| {
-                    let mut consts = g.constants.clone();
-                    consts.resize(max_constants, F::ZERO);
-                    consts
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_iter()
-        .map(PolynomialValues::new)
-        .collect()
+        constant_polys_direct(&self.gate_instances, max_constants)
     }
 
     fn sigma_vecs(&self, k_is: &[F], subgroup: &[F]) -> (Vec<PolynomialValues<F>>, Forest) {
@@ -1391,5 +1396,68 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // TODO: Can skip parts of this.
         let circuit_data = self.build::<C>();
         circuit_data.verifier_data()
+    }
+}
+
+#[cfg(test)]
+mod constant_poly_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::util::transpose;
+
+    #[test]
+    fn direct_constant_polys_match_clone_pad_transpose_reference() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+
+        for (rows, max_constants) in [
+            (vec![vec![], vec![], vec![]], 0),
+            (vec![vec![field(1)]], 1),
+            (
+                vec![
+                    vec![],
+                    vec![field(2)],
+                    vec![field(3), field(4), field(5)],
+                    vec![field(6), field(7)],
+                ],
+                4,
+            ),
+        ] {
+            let gate_ref = GateRef::<F, D>::new(NoopGate);
+            let gate_instances = rows
+                .into_iter()
+                .map(|constants| GateInstance {
+                    gate_ref: gate_ref.clone(),
+                    constants,
+                })
+                .collect::<Vec<_>>();
+
+            let expected = legacy_constant_polys(&gate_instances, max_constants);
+            let actual = constant_polys_direct(&gate_instances, max_constants);
+            assert_eq!(actual, expected);
+        }
+    }
+
+    fn legacy_constant_polys<F: RichField + Extendable<D>, const D: usize>(
+        gate_instances: &[GateInstance<F, D>],
+        max_constants: usize,
+    ) -> Vec<PolynomialValues<F>> {
+        transpose(
+            &gate_instances
+                .iter()
+                .map(|gate| {
+                    let mut constants = gate.constants.clone();
+                    constants.resize(max_constants, F::ZERO);
+                    constants
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(PolynomialValues::new)
+        .collect()
+    }
+
+    fn field(value: usize) -> GoldilocksField {
+        GoldilocksField::from_canonical_usize(value)
     }
 }
