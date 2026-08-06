@@ -1,6 +1,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
 use core::cmp::min;
+use core::mem::MaybeUninit;
 
 use plonky2_field::polynomial::PolynomialCoeffs;
 
@@ -176,11 +177,41 @@ pub(crate) struct VanishingScratch<F> {
     pub constraint_terms_batch: Vec<F>,
 }
 
+pub(super) fn reduce_with_powers_multi_into_uninit<'a, F: Field + 'a>(
+    terms: impl DoubleEndedIterator<Item = &'a F>,
+    alphas: &[F],
+    output: &mut [MaybeUninit<F>],
+) {
+    // Production passes an exact challenge-width point slice, with alpha
+    // equality checked globally before batching.
+    debug_assert_eq!(output.len(), alphas.len());
+    let mut reversed_terms = terms.rev();
+    let Some(&first_term) = reversed_terms.next() else {
+        for value in output {
+            value.write(F::ZERO);
+        }
+        return;
+    };
+
+    for (value, &alpha) in output.iter_mut().zip(alphas) {
+        value.write(first_term.multiply_accumulate(F::ZERO, alpha));
+    }
+    for &term in reversed_terms {
+        for (value, &alpha) in output.iter_mut().zip(alphas) {
+            let value = unsafe {
+                // SAFETY: The first reversed term initialized every output element above.
+                value.assume_init_mut()
+            };
+            *value = term.multiply_accumulate(*value, alpha);
+        }
+    }
+}
+
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
 ///
 /// Results are stored point-major: the challenges for point `k` occupy
-/// `res_out[k * num_challenges..(k + 1) * num_challenges]`. `res_out` must be
-/// zero-initialized by the caller.
+/// `res_out[k * num_challenges..(k + 1) * num_challenges]`. Every element of
+/// `res_out` is initialized by this function.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
@@ -200,7 +231,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
     scratch: &mut VanishingScratch<F>,
-    res_out: &mut [F],
+    res_out: &mut [MaybeUninit<F>],
 ) {
     let has_lookup = common_data.num_lookup_polys != 0;
 
@@ -233,6 +264,14 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
 
     let num_challenges = common_data.config.num_challenges;
+    debug_assert!(
+        num_challenges > 0,
+        "vanishing evaluation requires a challenge"
+    );
+    debug_assert_eq!(alphas.len(), num_challenges);
+    // The quotient caller globally checks point/challenge geometry before
+    // partitioning, so this per-batch product cannot overflow.
+    debug_assert_eq!(res_out.len(), n * num_challenges);
     let num_routed_wires = common_data.config.num_routed_wires;
 
     let numerator_values = &mut scratch.numerator_values;
@@ -250,7 +289,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     vanishing_partial_products_terms.clear();
     vanishing_all_lookup_terms.clear();
 
-    debug_assert_eq!(res_out.len(), n * num_challenges);
     for k in 0..n {
         let index = indices_batch[k];
         let x = xs_batch[k];
@@ -344,11 +382,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             .chain(vanishing_all_lookup_terms.iter())
             .chain(constraint_terms);
         let res = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
-        for &term in vanishing_terms.rev() {
-            for (c, &alpha) in res.iter_mut().zip(alphas) {
-                *c = term.multiply_accumulate(*c, alpha);
-            }
-        }
+        reduce_with_powers_multi_into_uninit(vanishing_terms, alphas, res);
 
         vanishing_z_1_terms.clear();
         vanishing_partial_products_terms.clear();
@@ -1172,4 +1206,67 @@ pub fn check_lookup_constraints_circuit<F: RichField + Extendable<D>, const D: u
         ));
     }
     constraints
+}
+
+#[cfg(test)]
+mod tests {
+    use core::mem::MaybeUninit;
+
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::{Field64, PrimeField64};
+
+    #[test]
+    fn uninitialized_reduction_matches_zero_initialized_horner_raw_values() {
+        type F = GoldilocksField;
+
+        let term_cases = [
+            vec![],
+            vec![GoldilocksField(F::ORDER + 7)],
+            vec![
+                GoldilocksField(F::ORDER + 1),
+                F::ZERO,
+                GoldilocksField(u64::MAX),
+                F::from_canonical_u64(19),
+            ],
+        ];
+        let alpha_cases = [
+            vec![],
+            vec![GoldilocksField(F::ORDER + 3)],
+            vec![F::ZERO, F::ONE, GoldilocksField(F::ORDER + 11)],
+        ];
+
+        for terms in &term_cases {
+            for alphas in &alpha_cases {
+                let mut expected = vec![F::ZERO; alphas.len()];
+                for &term in terms.iter().rev() {
+                    for (value, &alpha) in expected.iter_mut().zip(alphas) {
+                        *value = term.multiply_accumulate(*value, alpha);
+                    }
+                }
+
+                let mut actual = core::iter::repeat_with(MaybeUninit::uninit)
+                    .take(alphas.len())
+                    .collect::<Vec<_>>();
+                reduce_with_powers_multi_into_uninit(terms.iter(), alphas, &mut actual);
+                let actual_raw = actual
+                    .iter()
+                    .map(|value| {
+                        unsafe {
+                            // SAFETY: The reducer initializes every output slot, including
+                            // the explicit empty-term case.
+                            value.assume_init_ref()
+                        }
+                        .to_noncanonical_u64()
+                    })
+                    .collect::<Vec<_>>();
+                let expected_raw = expected
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>();
+
+                assert_eq!(actual_raw, expected_raw);
+            }
+        }
+    }
 }

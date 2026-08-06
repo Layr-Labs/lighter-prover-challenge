@@ -3,7 +3,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
 use core::cmp::min;
-use core::mem::swap;
+use core::mem::{swap, MaybeUninit};
 
 use anyhow::{ensure, Result};
 use hashbrown::HashMap;
@@ -36,6 +36,95 @@ use crate::timed;
 use crate::util::partial_products::{partial_products_and_z_gx, quotient_chunk_products};
 use crate::util::timing::TimingTree;
 use crate::util::{log2_ceil, transpose};
+
+/// Initializes `len` elements in `output`'s spare capacity, publishing them
+/// only after `initialize` returns normally.
+///
+/// # Safety
+/// If `initialize` returns normally, it must have initialized every element
+/// of the provided spare-capacity slice.
+unsafe fn initialize_vec_from_spare<T: Copy>(
+    output: &mut Vec<T>,
+    len: usize,
+    initialize: impl FnOnce(&mut [MaybeUninit<T>]),
+) {
+    output.clear();
+    output.reserve(len);
+    {
+        let spare = &mut output.spare_capacity_mut()[..len];
+        initialize(spare);
+    }
+    unsafe {
+        // SAFETY: Guaranteed by this function's caller contract. The spare
+        // borrow has ended, and a panic above leaves `output.len()` at zero.
+        output.set_len(len);
+    }
+}
+
+/// Initializes a point-major vector in parallel batches, publishing it only
+/// after every point batch has been initialized.
+///
+/// # Safety
+/// `initialize_batch` must initialize every element of the output batch it is
+/// given before returning normally.
+#[inline(always)]
+unsafe fn initialize_vec_in_point_batches<T, P, S, InitScratch, InitializeBatch>(
+    output: &mut Vec<T>,
+    points: &[P],
+    batch_size: usize,
+    elements_per_point: usize,
+    init_scratch: InitScratch,
+    initialize_batch: InitializeBatch,
+) where
+    T: Copy + Send,
+    P: Sync,
+    S: Send,
+    InitScratch: Fn() -> S + Sync + Send,
+    InitializeBatch: Fn(&mut S, usize, &[P], &mut [MaybeUninit<T>]) + Sync + Send,
+{
+    assert!(batch_size > 0, "point batch size must be positive");
+    assert!(
+        elements_per_point > 0,
+        "elements per point must be positive"
+    );
+    let output_len = points
+        .len()
+        .checked_mul(elements_per_point)
+        .expect("point-major output length overflow");
+    let output_batch_len = batch_size
+        .checked_mul(elements_per_point)
+        .expect("point-major batch length overflow");
+
+    unsafe {
+        // SAFETY: The checked global products fix both the total output length
+        // and full output-chunk width. Equal point/output chunk counts prevent
+        // `zip` from dropping a tail, so slice chunk geometry gives every spare
+        // element to exactly one callback. The caller contract requires each
+        // callback to initialize its complete batch.
+        initialize_vec_from_spare(output, output_len, |output_uninit| {
+            assert_eq!(
+                output_uninit.chunks(output_batch_len).count(),
+                points.chunks(batch_size).count()
+            );
+            output_uninit
+                .par_chunks_mut(output_batch_len)
+                .zip(points.par_chunks(batch_size))
+                .enumerate()
+                .for_each_init(
+                    init_scratch,
+                    |scratch, (batch_i, (output_batch, points_batch))| {
+                        // `points_batch.len() <= batch_size`, and the full batch
+                        // product was checked above, so this cannot overflow.
+                        debug_assert_eq!(
+                            output_batch.len(),
+                            points_batch.len() * elements_per_point
+                        );
+                        initialize_batch(scratch, batch_i, points_batch, output_batch);
+                    },
+                );
+        });
+    }
+}
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -684,7 +773,6 @@ fn compute_quotient_polys<
     let lut_re_poly_evals_refs: Vec<&[F]> =
         lut_re_poly_evals.iter().map(|v| v.as_slice()).collect();
 
-    let points_batches = points.par_chunks(BATCH_SIZE);
     let num_batches = points.len().div_ceil(BATCH_SIZE);
 
     struct QuotientScratch<F: RichField> {
@@ -703,12 +791,161 @@ fn compute_quotient_polys<
     let zs_row_width = zs_partial_products_and_lookup_commitment.lde_row_width();
     let num_routed_wires = common_data.config.num_routed_wires;
 
-    let mut quotient_values = vec![F::ZERO; points.len() * num_challenges];
-    quotient_values
-        .par_chunks_mut(BATCH_SIZE * num_challenges)
-        .zip(points_batches)
-        .enumerate()
-        .for_each_init(
+    assert_eq!(alphas.len(), num_challenges);
+    let mut quotient_values = Vec::new();
+    let initialize_quotient_batch =
+        |scratch: &mut QuotientScratch<F>,
+         batch_i: usize,
+         xs_batch: &[F],
+         quotient_values_batch: &mut [MaybeUninit<F>]| {
+            // Enumeration is bounded by chunks of the allocated `points`
+            // slice, so the original batch-offset arithmetic is in bounds.
+            let point_start = BATCH_SIZE * batch_i;
+            // Each batch must be the same size, except the last one, which may be smaller.
+            debug_assert!(
+                xs_batch.len() == BATCH_SIZE
+                    || (batch_i == num_batches - 1 && xs_batch.len() <= BATCH_SIZE)
+            );
+
+            let n = xs_batch.len();
+            scratch.indices.clear();
+            scratch.indices.extend(point_start..point_start + n);
+            scratch.indices_next.clear();
+            scratch
+                .indices_next
+                .extend(scratch.indices.iter().map(|&i| (i + next_step) % lde_size));
+
+            scratch.shifted_xs.clear();
+            scratch
+                .shifted_xs
+                .extend(xs_batch.iter().map(|&x| F::coset_shift() * x));
+
+            prover_data.constants_sigmas_commitment.fill_lde_batch(
+                &scratch.indices,
+                step,
+                common_data.constants_range(),
+                BatchLayout::PolyMajor,
+                &mut scratch.local_constants,
+            );
+            prover_data.constants_sigmas_commitment.fill_lde_batch(
+                &scratch.indices,
+                step,
+                common_data.sigmas_range(),
+                BatchLayout::PointMajor,
+                &mut scratch.s_sigmas_flat,
+            );
+            wires_commitment.fill_lde_batch(
+                &scratch.indices,
+                step,
+                0..num_wires,
+                BatchLayout::PolyMajor,
+                &mut scratch.local_wires,
+            );
+            zs_partial_products_and_lookup_commitment.fill_lde_batch(
+                &scratch.indices,
+                step,
+                0..zs_row_width,
+                BatchLayout::PointMajor,
+                &mut scratch.zs_local_flat,
+            );
+            zs_partial_products_and_lookup_commitment.fill_lde_batch(
+                &scratch.indices_next,
+                step,
+                0..zs_row_width,
+                BatchLayout::PointMajor,
+                &mut scratch.zs_next_flat,
+            );
+
+            let indices_batch = &scratch.indices;
+            let local_zs_batch: Vec<&[F]> = (0..n)
+                .map(|k| &scratch.zs_local_flat[k * zs_row_width..][common_data.zs_range()])
+                .collect();
+            let next_zs_batch: Vec<&[F]> = (0..n)
+                .map(|k| &scratch.zs_next_flat[k * zs_row_width..][common_data.zs_range()])
+                .collect();
+            let partial_products_batch: Vec<&[F]> = (0..n)
+                .map(|k| {
+                    &scratch.zs_local_flat[k * zs_row_width..][common_data.partial_products_range()]
+                })
+                .collect();
+            let s_sigmas_batch: Vec<&[F]> = (0..n)
+                .map(|k| &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires])
+                .collect();
+            let (local_lookup_batch, next_lookup_batch): (Vec<&[F]>, Vec<&[F]>) = if has_lookup {
+                (
+                    (0..n)
+                        .map(|k| {
+                            &scratch.zs_local_flat[k * zs_row_width..][common_data.lookup_range()]
+                        })
+                        .collect(),
+                    (0..n)
+                        .map(|k| {
+                            &scratch.zs_next_flat[k * zs_row_width..][common_data.lookup_range()]
+                        })
+                        .collect(),
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
+
+            let vars_batch = EvaluationVarsBaseBatch::new(
+                n,
+                &scratch.local_constants,
+                &scratch.local_wires,
+                public_inputs_hash,
+            );
+
+            eval_vanishing_poly_base_batch::<F, D>(
+                common_data,
+                indices_batch,
+                &scratch.shifted_xs,
+                vars_batch,
+                &local_zs_batch,
+                &next_zs_batch,
+                &local_lookup_batch,
+                &next_lookup_batch,
+                &partial_products_batch,
+                &s_sigmas_batch,
+                betas,
+                gammas,
+                deltas,
+                alphas,
+                &z_h_on_coset,
+                &lut_re_poly_evals_refs,
+                &mut scratch.vanishing,
+                quotient_values_batch,
+            );
+
+            debug_assert_eq!(
+                quotient_values_batch.chunks_exact(num_challenges).len(),
+                indices_batch.len()
+            );
+            for (&i, quotient_values) in indices_batch
+                .iter()
+                .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
+            {
+                let denominator_inv = z_h_on_coset.eval_inverse(i);
+                for value in quotient_values {
+                    let value = unsafe {
+                        // SAFETY: The vanishing evaluator returned normally
+                        // after initializing every element in this batch.
+                        value.assume_init_mut()
+                    };
+                    *value *= denominator_inv;
+                }
+            }
+        };
+    unsafe {
+        // SAFETY: The checked global point/challenge and batch/challenge
+        // products, plus the helper's equal chunk-count check, establish exact
+        // full/tail geometry. The global alpha/challenge equality guarantees
+        // the evaluator initializes each complete output batch before scaling.
+        // Publication occurs only after every callback returns normally.
+        initialize_vec_in_point_batches(
+            &mut quotient_values,
+            &points,
+            BATCH_SIZE,
+            num_challenges,
             || QuotientScratch::<F> {
                 indices: Vec::with_capacity(BATCH_SIZE),
                 indices_next: Vec::with_capacity(BATCH_SIZE),
@@ -720,140 +957,9 @@ fn compute_quotient_polys<
                 zs_next_flat: Vec::new(),
                 vanishing: VanishingScratch::default(),
             },
-            |scratch, (batch_i, (quotient_values_batch, xs_batch))| {
-                // Each batch must be the same size, except the last one, which may be smaller.
-                debug_assert!(
-                    xs_batch.len() == BATCH_SIZE
-                        || (batch_i == num_batches - 1 && xs_batch.len() <= BATCH_SIZE)
-                );
-
-                let n = xs_batch.len();
-                scratch.indices.clear();
-                scratch
-                    .indices
-                    .extend(BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n);
-                scratch.indices_next.clear();
-                scratch
-                    .indices_next
-                    .extend(scratch.indices.iter().map(|&i| (i + next_step) % lde_size));
-
-                scratch.shifted_xs.clear();
-                scratch
-                    .shifted_xs
-                    .extend(xs_batch.iter().map(|&x| F::coset_shift() * x));
-
-                prover_data.constants_sigmas_commitment.fill_lde_batch(
-                    &scratch.indices,
-                    step,
-                    common_data.constants_range(),
-                    BatchLayout::PolyMajor,
-                    &mut scratch.local_constants,
-                );
-                prover_data.constants_sigmas_commitment.fill_lde_batch(
-                    &scratch.indices,
-                    step,
-                    common_data.sigmas_range(),
-                    BatchLayout::PointMajor,
-                    &mut scratch.s_sigmas_flat,
-                );
-                wires_commitment.fill_lde_batch(
-                    &scratch.indices,
-                    step,
-                    0..num_wires,
-                    BatchLayout::PolyMajor,
-                    &mut scratch.local_wires,
-                );
-                zs_partial_products_and_lookup_commitment.fill_lde_batch(
-                    &scratch.indices,
-                    step,
-                    0..zs_row_width,
-                    BatchLayout::PointMajor,
-                    &mut scratch.zs_local_flat,
-                );
-                zs_partial_products_and_lookup_commitment.fill_lde_batch(
-                    &scratch.indices_next,
-                    step,
-                    0..zs_row_width,
-                    BatchLayout::PointMajor,
-                    &mut scratch.zs_next_flat,
-                );
-
-                let indices_batch = &scratch.indices;
-                let local_zs_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.zs_local_flat[k * zs_row_width..][common_data.zs_range()])
-                    .collect();
-                let next_zs_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.zs_next_flat[k * zs_row_width..][common_data.zs_range()])
-                    .collect();
-                let partial_products_batch: Vec<&[F]> = (0..n)
-                    .map(|k| {
-                        &scratch.zs_local_flat[k * zs_row_width..]
-                            [common_data.partial_products_range()]
-                    })
-                    .collect();
-                let s_sigmas_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires])
-                    .collect();
-                let (local_lookup_batch, next_lookup_batch): (Vec<&[F]>, Vec<&[F]>) = if has_lookup
-                {
-                    (
-                        (0..n)
-                            .map(|k| {
-                                &scratch.zs_local_flat[k * zs_row_width..]
-                                    [common_data.lookup_range()]
-                            })
-                            .collect(),
-                        (0..n)
-                            .map(|k| {
-                                &scratch.zs_next_flat[k * zs_row_width..]
-                                    [common_data.lookup_range()]
-                            })
-                            .collect(),
-                    )
-                } else {
-                    (Vec::new(), Vec::new())
-                };
-
-                let vars_batch = EvaluationVarsBaseBatch::new(
-                    n,
-                    &scratch.local_constants,
-                    &scratch.local_wires,
-                    public_inputs_hash,
-                );
-
-                let quotient_values_batch = &mut quotient_values_batch[..n * num_challenges];
-                eval_vanishing_poly_base_batch::<F, D>(
-                    common_data,
-                    indices_batch,
-                    &scratch.shifted_xs,
-                    vars_batch,
-                    &local_zs_batch,
-                    &next_zs_batch,
-                    &local_lookup_batch,
-                    &next_lookup_batch,
-                    &partial_products_batch,
-                    &s_sigmas_batch,
-                    betas,
-                    gammas,
-                    deltas,
-                    alphas,
-                    &z_h_on_coset,
-                    &lut_re_poly_evals_refs,
-                    &mut scratch.vanishing,
-                    quotient_values_batch,
-                );
-
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
-                }
-            },
+            initialize_quotient_batch,
         );
+    }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
     (0..num_challenges)
@@ -868,4 +974,135 @@ fn compute_quotient_polys<
         })
         .map(|values| values.coset_ifft(F::coset_shift()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::{Field64, PrimeField64};
+
+    #[test]
+    fn uninitialized_vec_publication_keeps_length_zero_on_panic() {
+        let mut output = vec![GoldilocksField::ONE, GoldilocksField::TWO];
+        let points = [0usize, 1, 2];
+
+        let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+            // SAFETY: The callback never returns normally, so its complete-
+            // initialization obligation does not arise. This verifies that
+            // partial writes are not published on that path.
+            initialize_vec_in_point_batches(
+                &mut output,
+                &points,
+                2,
+                2,
+                || (),
+                |_, _, _, output_batch| {
+                    output_batch[0].write(GoldilocksField::from_canonical_u64(17));
+                    panic!("stop after partial batch initialization");
+                },
+            );
+        }));
+
+        assert!(result.is_err());
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn uninitialized_vec_publication_handles_full_and_partial_batches() {
+        type F = GoldilocksField;
+
+        let points = (0..BATCH_SIZE + 3).collect::<Vec<_>>();
+        let num_challenges = 2usize;
+        let alphas = [GoldilocksField(F::ORDER + 3), F::from_canonical_u64(7)];
+        let terms_for_point = |point_i: usize| {
+            [
+                GoldilocksField(F::ORDER + point_i as u64 + 1),
+                F::ZERO,
+                GoldilocksField(u64::MAX - point_i as u64),
+            ]
+        };
+        let denominator_for_point = |point_i: usize| F::from_canonical_usize(point_i % 7 + 2);
+
+        let expected = points
+            .iter()
+            .flat_map(|&point_i| {
+                let terms = terms_for_point(point_i);
+                let denominator = denominator_for_point(point_i);
+                let mut values = vec![F::ZERO; num_challenges];
+                for &term in terms.iter().rev() {
+                    for (value, &alpha) in values.iter_mut().zip(&alphas) {
+                        *value = term.multiply_accumulate(*value, alpha);
+                    }
+                }
+                for value in &mut values {
+                    *value *= denominator;
+                }
+                values
+            })
+            .collect::<Vec<_>>();
+
+        for initial_capacity in [1, expected.len() + 8] {
+            let mut output = Vec::with_capacity(initial_capacity);
+            output.push(GoldilocksField::ONE);
+            let original_capacity = output.capacity();
+            let initialize_batch =
+                |_: &mut (),
+                 batch_i: usize,
+                 points_batch: &[usize],
+                 output_batch: &mut [MaybeUninit<F>]| {
+                    assert_eq!(batch_i * BATCH_SIZE, points_batch[0]);
+                    for (&point_i, point_output) in points_batch
+                        .iter()
+                        .zip(output_batch.chunks_exact_mut(num_challenges))
+                    {
+                        let terms = terms_for_point(point_i);
+                        crate::plonk::vanishing_poly::reduce_with_powers_multi_into_uninit(
+                            terms.iter(),
+                            &alphas,
+                            point_output,
+                        );
+                        let denominator = denominator_for_point(point_i);
+                        for value in point_output {
+                            let value = unsafe {
+                                // SAFETY: The real reducer above initialized this
+                                // point's complete challenge slice.
+                                value.assume_init_mut()
+                            };
+                            *value *= denominator;
+                        }
+                    }
+                };
+            unsafe {
+                // SAFETY: `initialize_batch` initializes every point's exact
+                // challenge slice before returning.
+                initialize_vec_in_point_batches(
+                    &mut output,
+                    &points,
+                    BATCH_SIZE,
+                    num_challenges,
+                    || (),
+                    initialize_batch,
+                );
+            }
+
+            if initial_capacity < expected.len() {
+                assert!(output.capacity() > original_capacity);
+            } else {
+                assert_eq!(output.capacity(), original_capacity);
+            }
+            assert_eq!(
+                output
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }
