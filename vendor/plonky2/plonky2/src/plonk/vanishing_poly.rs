@@ -174,6 +174,7 @@ pub(crate) struct VanishingScratch<F> {
     pub vanishing_partial_products_terms: Vec<F>,
     pub vanishing_all_lookup_terms: Vec<F>,
     pub lookup_selectors: Vec<F>,
+    pub acc_cols: Vec<F>,
     pub constraint_terms_batch: Vec<F>,
 }
 
@@ -329,7 +330,9 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         // transpose into contiguous columns kills the per-point double
         // dereferences in the accumulator-selection loop below.
         let acc_cols_len = num_challenges * (num_prods + 2) * n;
-        let mut acc_cols = vec![F::ZERO; acc_cols_len];
+        let acc_cols = &mut scratch.acc_cols;
+        acc_cols.clear();
+        acc_cols.resize(acc_cols_len, F::ZERO);
         let acc_stride = (num_prods + 2) * n;
         for k in 0..n {
             let local_zs = local_zs_batch[k];
