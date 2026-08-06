@@ -615,24 +615,7 @@ fn select_on_chain_pub_data(
 }
 
 // Generates `CommonCircuitData` usable for recursion.
-//
-// The result depends only on `log_gates` and compile-time constants, and both
-// chain paths request it with the same size during `Circuits::new`, so the
-// three-stage throwaway build (including a full 2^log_gates-gate `build`) runs
-// once and later callers clone the cached result.
 fn common_data_for_recursion(log_gates: usize) -> CommonCircuitData<F, D> {
-    static CACHE: std::sync::OnceLock<(usize, CommonCircuitData<F, D>)> =
-        std::sync::OnceLock::new();
-    let (cached_log_gates, common) =
-        CACHE.get_or_init(|| (log_gates, build_common_data_for_recursion(log_gates)));
-    assert_eq!(
-        *cached_log_gates, log_gates,
-        "common_data_for_recursion cached at a different size"
-    );
-    common.clone()
-}
-
-fn build_common_data_for_recursion(log_gates: usize) -> CommonCircuitData<F, D> {
     let builder = Builder::new(CIRCUIT_CONFIG);
     let data = builder.build::<C>();
 
