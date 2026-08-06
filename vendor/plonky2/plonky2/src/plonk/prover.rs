@@ -14,7 +14,7 @@ use crate::field::extension::Extendable;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
-use crate::fri::oracle::PolynomialBatch;
+use crate::fri::oracle::{BatchLayout, PolynomialBatch};
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
 use crate::gates::selectors::LookupSelectors;
@@ -28,7 +28,9 @@ use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
 use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
-use crate::plonk::vanishing_poly::{eval_vanishing_poly_base_batch, get_lut_poly};
+use crate::plonk::vanishing_poly::{
+    eval_vanishing_poly_base_batch, get_lut_poly, VanishingScratch,
+};
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
 use crate::util::partial_products::{partial_products_and_z_gx, quotient_chunk_products};
@@ -685,130 +687,173 @@ fn compute_quotient_polys<
     let points_batches = points.par_chunks(BATCH_SIZE);
     let num_batches = points.len().div_ceil(BATCH_SIZE);
 
-    let quotient_values: Vec<F> = points_batches
+    struct QuotientScratch<F: RichField> {
+        indices: Vec<usize>,
+        indices_next: Vec<usize>,
+        shifted_xs: Vec<F>,
+        local_constants: Vec<F>,
+        local_wires: Vec<F>,
+        s_sigmas_flat: Vec<F>,
+        zs_local_flat: Vec<F>,
+        zs_next_flat: Vec<F>,
+        vanishing: VanishingScratch<F>,
+    }
+
+    let num_wires = common_data.config.num_wires;
+    let zs_row_width = zs_partial_products_and_lookup_commitment.lde_row_width();
+    let num_routed_wires = common_data.config.num_routed_wires;
+
+    let mut quotient_values = vec![F::ZERO; points.len() * num_challenges];
+    quotient_values
+        .par_chunks_mut(BATCH_SIZE * num_challenges)
+        .zip(points_batches)
         .enumerate()
-        .flat_map(|(batch_i, xs_batch)| {
-            // Each batch must be the same size, except the last one, which may be smaller.
-            debug_assert!(
-                xs_batch.len() == BATCH_SIZE
-                    || (batch_i == num_batches - 1 && xs_batch.len() <= BATCH_SIZE)
-            );
+        .for_each_init(
+            || QuotientScratch::<F> {
+                indices: Vec::with_capacity(BATCH_SIZE),
+                indices_next: Vec::with_capacity(BATCH_SIZE),
+                shifted_xs: Vec::with_capacity(BATCH_SIZE),
+                local_constants: Vec::new(),
+                local_wires: Vec::new(),
+                s_sigmas_flat: Vec::new(),
+                zs_local_flat: Vec::new(),
+                zs_next_flat: Vec::new(),
+                vanishing: VanishingScratch::default(),
+            },
+            |scratch, (batch_i, (quotient_values_batch, xs_batch))| {
+                // Each batch must be the same size, except the last one, which may be smaller.
+                debug_assert!(
+                    xs_batch.len() == BATCH_SIZE
+                        || (batch_i == num_batches - 1 && xs_batch.len() <= BATCH_SIZE)
+                );
 
-            let indices_batch: Vec<usize> =
-                (BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + xs_batch.len()).collect();
+                let n = xs_batch.len();
+                scratch.indices.clear();
+                scratch
+                    .indices
+                    .extend(BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n);
+                scratch.indices_next.clear();
+                scratch
+                    .indices_next
+                    .extend(scratch.indices.iter().map(|&i| (i + next_step) % lde_size));
 
-            let mut shifted_xs_batch = Vec::with_capacity(xs_batch.len());
-            let mut local_zs_batch = Vec::with_capacity(xs_batch.len());
-            let mut next_zs_batch = Vec::with_capacity(xs_batch.len());
+                scratch.shifted_xs.clear();
+                scratch
+                    .shifted_xs
+                    .extend(xs_batch.iter().map(|&x| F::coset_shift() * x));
 
-            let mut local_lookup_batch = Vec::with_capacity(xs_batch.len());
-            let mut next_lookup_batch = Vec::with_capacity(xs_batch.len());
+                prover_data.constants_sigmas_commitment.fill_lde_batch(
+                    &scratch.indices,
+                    step,
+                    common_data.constants_range(),
+                    BatchLayout::PolyMajor,
+                    &mut scratch.local_constants,
+                );
+                prover_data.constants_sigmas_commitment.fill_lde_batch(
+                    &scratch.indices,
+                    step,
+                    common_data.sigmas_range(),
+                    BatchLayout::PointMajor,
+                    &mut scratch.s_sigmas_flat,
+                );
+                wires_commitment.fill_lde_batch(
+                    &scratch.indices,
+                    step,
+                    0..num_wires,
+                    BatchLayout::PolyMajor,
+                    &mut scratch.local_wires,
+                );
+                zs_partial_products_and_lookup_commitment.fill_lde_batch(
+                    &scratch.indices,
+                    step,
+                    0..zs_row_width,
+                    BatchLayout::PointMajor,
+                    &mut scratch.zs_local_flat,
+                );
+                zs_partial_products_and_lookup_commitment.fill_lde_batch(
+                    &scratch.indices_next,
+                    step,
+                    0..zs_row_width,
+                    BatchLayout::PointMajor,
+                    &mut scratch.zs_next_flat,
+                );
 
-            let mut partial_products_batch = Vec::with_capacity(xs_batch.len());
-            let mut s_sigmas_batch = Vec::with_capacity(xs_batch.len());
+                let indices_batch = &scratch.indices;
+                let local_zs_batch: Vec<&[F]> = (0..n)
+                    .map(|k| &scratch.zs_local_flat[k * zs_row_width..][common_data.zs_range()])
+                    .collect();
+                let next_zs_batch: Vec<&[F]> = (0..n)
+                    .map(|k| &scratch.zs_next_flat[k * zs_row_width..][common_data.zs_range()])
+                    .collect();
+                let partial_products_batch: Vec<&[F]> = (0..n)
+                    .map(|k| {
+                        &scratch.zs_local_flat[k * zs_row_width..]
+                            [common_data.partial_products_range()]
+                    })
+                    .collect();
+                let s_sigmas_batch: Vec<&[F]> = (0..n)
+                    .map(|k| &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires])
+                    .collect();
+                let (local_lookup_batch, next_lookup_batch): (Vec<&[F]>, Vec<&[F]>) = if has_lookup
+                {
+                    (
+                        (0..n)
+                            .map(|k| {
+                                &scratch.zs_local_flat[k * zs_row_width..]
+                                    [common_data.lookup_range()]
+                            })
+                            .collect(),
+                        (0..n)
+                            .map(|k| {
+                                &scratch.zs_next_flat[k * zs_row_width..]
+                                    [common_data.lookup_range()]
+                            })
+                            .collect(),
+                    )
+                } else {
+                    (Vec::new(), Vec::new())
+                };
 
-            let mut local_constants_batch_refs = Vec::with_capacity(xs_batch.len());
-            let mut local_wires_batch_refs = Vec::with_capacity(xs_batch.len());
+                let vars_batch = EvaluationVarsBaseBatch::new(
+                    n,
+                    &scratch.local_constants,
+                    &scratch.local_wires,
+                    public_inputs_hash,
+                );
 
-            for (&i, &x) in indices_batch.iter().zip(xs_batch) {
-                let shifted_x = F::coset_shift() * x;
-                let i_next = (i + next_step) % lde_size;
-                let local_constants_sigmas = prover_data
-                    .constants_sigmas_commitment
-                    .get_lde_values(i, step);
-                let local_constants = &local_constants_sigmas[common_data.constants_range()];
-                let s_sigmas = &local_constants_sigmas[common_data.sigmas_range()];
-                let local_wires = wires_commitment.get_lde_values(i, step);
-                let local_zs_partial_and_lookup =
-                    zs_partial_products_and_lookup_commitment.get_lde_values(i, step);
-                let next_zs_partial_and_lookup =
-                    zs_partial_products_and_lookup_commitment.get_lde_values(i_next, step);
+                let quotient_values_batch = &mut quotient_values_batch[..n * num_challenges];
+                eval_vanishing_poly_base_batch::<F, D>(
+                    common_data,
+                    indices_batch,
+                    &scratch.shifted_xs,
+                    vars_batch,
+                    &local_zs_batch,
+                    &next_zs_batch,
+                    &local_lookup_batch,
+                    &next_lookup_batch,
+                    &partial_products_batch,
+                    &s_sigmas_batch,
+                    betas,
+                    gammas,
+                    deltas,
+                    alphas,
+                    &z_h_on_coset,
+                    &lut_re_poly_evals_refs,
+                    &mut scratch.vanishing,
+                    quotient_values_batch,
+                );
 
-                let local_zs = &local_zs_partial_and_lookup[common_data.zs_range()];
-
-                let next_zs = &next_zs_partial_and_lookup[common_data.zs_range()];
-
-                let partial_products =
-                    &local_zs_partial_and_lookup[common_data.partial_products_range()];
-
-                if has_lookup {
-                    let local_lookup_zs = &local_zs_partial_and_lookup[common_data.lookup_range()];
-
-                    let next_lookup_zs = &next_zs_partial_and_lookup[common_data.lookup_range()];
-                    debug_assert_eq!(local_lookup_zs.len(), common_data.num_all_lookup_polys());
-
-                    local_lookup_batch.push(local_lookup_zs);
-                    next_lookup_batch.push(next_lookup_zs);
+                for (&i, quotient_values) in indices_batch
+                    .iter()
+                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
+                {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    quotient_values
+                        .iter_mut()
+                        .for_each(|v| *v *= denominator_inv);
                 }
-
-                debug_assert_eq!(local_wires.len(), common_data.config.num_wires);
-                debug_assert_eq!(local_zs.len(), num_challenges);
-
-                local_constants_batch_refs.push(local_constants);
-                local_wires_batch_refs.push(local_wires);
-
-                shifted_xs_batch.push(shifted_x);
-                local_zs_batch.push(local_zs);
-                next_zs_batch.push(next_zs);
-                partial_products_batch.push(partial_products);
-                s_sigmas_batch.push(s_sigmas);
-            }
-
-            // NB (JN): I'm not sure how (in)efficient the below is. It needs measuring.
-            let mut local_constants_batch =
-                vec![F::ZERO; xs_batch.len() * local_constants_batch_refs[0].len()];
-            for i in 0..local_constants_batch_refs[0].len() {
-                for (j, constants) in local_constants_batch_refs.iter().enumerate() {
-                    local_constants_batch[i * xs_batch.len() + j] = constants[i];
-                }
-            }
-
-            let mut local_wires_batch =
-                vec![F::ZERO; xs_batch.len() * local_wires_batch_refs[0].len()];
-            for i in 0..local_wires_batch_refs[0].len() {
-                for (j, wires) in local_wires_batch_refs.iter().enumerate() {
-                    local_wires_batch[i * xs_batch.len() + j] = wires[i];
-                }
-            }
-
-            let vars_batch = EvaluationVarsBaseBatch::new(
-                xs_batch.len(),
-                &local_constants_batch,
-                &local_wires_batch,
-                public_inputs_hash,
-            );
-
-            let mut quotient_values_batch = eval_vanishing_poly_base_batch::<F, D>(
-                common_data,
-                &indices_batch,
-                &shifted_xs_batch,
-                vars_batch,
-                &local_zs_batch,
-                &next_zs_batch,
-                &local_lookup_batch,
-                &next_lookup_batch,
-                &partial_products_batch,
-                &s_sigmas_batch,
-                betas,
-                gammas,
-                deltas,
-                alphas,
-                &z_h_on_coset,
-                &lut_re_poly_evals_refs,
-            );
-
-            for (&i, quotient_values) in indices_batch
-                .iter()
-                .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-            {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                quotient_values
-                    .iter_mut()
-                    .for_each(|v| *v *= denominator_inv);
-            }
-            quotient_values_batch
-        })
-        .collect();
+            },
+        );
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
     (0..num_challenges)
