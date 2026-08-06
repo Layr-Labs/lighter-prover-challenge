@@ -366,7 +366,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             final_poly += quotient;
         }
 
-        let lde_final_poly = final_poly.lde(fri_params.config.rate_bits);
+        let lde_final_poly_len = final_poly.len() << fri_params.config.rate_bits;
+        final_poly.pad(lde_final_poly_len).unwrap();
+        let lde_final_poly = final_poly;
         let lde_final_values = timed!(
             timing,
             &format!("perform final FFT {}", lde_final_poly.len()),
