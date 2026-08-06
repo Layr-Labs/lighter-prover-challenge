@@ -185,6 +185,23 @@ fn reduce_gate_constraints_base_batch<F: Field>(
     debug_assert_eq!(constraint_terms_batch.len() % batch_size, 0);
     debug_assert_eq!(res_out.len(), batch_size * alphas.len());
 
+    // Every production Lighter circuit uses two quotient challenges. Keep a
+    // generic fallback for deserialized or test configurations, but specialize
+    // the dominant inner loop so it has no dynamic challenge iterator or
+    // point-to-offset multiplication.
+    if let [alpha_0, alpha_1] = alphas {
+        for constraint_row in constraint_terms_batch.chunks_exact(batch_size).rev() {
+            for (&term, result) in constraint_row.iter().zip(res_out.chunks_exact_mut(2)) {
+                let [value_0, value_1] = result else {
+                    unreachable!()
+                };
+                *value_0 = term.multiply_accumulate(*value_0, *alpha_0);
+                *value_1 = term.multiply_accumulate(*value_1, *alpha_1);
+            }
+        }
+        return;
+    }
+
     for constraint_row in constraint_terms_batch.chunks_exact(batch_size).rev() {
         for (point, &term) in constraint_row.iter().enumerate() {
             let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
@@ -1037,6 +1054,7 @@ mod tests {
             assert_eq!(actual, expected, "batch size {batch_size}");
         }
     }
+
 }
 
 /// Same as `check_lookup_constraints`, but for the recursive case.
