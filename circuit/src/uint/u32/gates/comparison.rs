@@ -216,6 +216,146 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ComparisonGate
         self.eval_unfiltered_base_batch_packed(vars_base)
     }
 
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        let chunk_bits = self.chunk_bits();
+        let chunk_base = F::from_canonical_usize(1 << chunk_bits);
+        let chunk_size = 1usize << chunk_bits;
+        let three = F::from_canonical_usize(3);
+        let mut chunks_iter = combined_gate_constraints.chunks_exact_mut(n);
+        let mut scratch = vec![F::ZERO; n];
+        let mut most_significant_diff_so_far = vec![F::ZERO; n];
+
+        // combined chunks - input, for both inputs, accumulated per point by
+        // Horner over the chunk columns from most to least significant.
+        for (input_wire, chunk_wire) in [
+            (
+                self.wire_first_input(),
+                &(0..self.num_chunks)
+                    .map(|i| self.wire_first_chunk_val(i))
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                self.wire_second_input(),
+                &(0..self.num_chunks)
+                    .map(|i| self.wire_second_chunk_val(i))
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            let out = chunks_iter.next().unwrap();
+            scratch.copy_from_slice(col(chunk_wire[self.num_chunks - 1]));
+            for &wire in chunk_wire[..self.num_chunks - 1].iter().rev() {
+                let chunk = col(wire);
+                for p in 0..n {
+                    scratch[p] = scratch[p] * chunk_base + chunk[p];
+                }
+            }
+            let input = col(input_wire);
+            for p in 0..n {
+                out[p] += filters[p] * (scratch[p] - input[p]);
+            }
+        }
+
+        for i in 0..self.num_chunks {
+            let first = col(self.wire_first_chunk_val(i));
+            let second = col(self.wire_second_chunk_val(i));
+            for value in [first, second] {
+                let out = chunks_iter.next().unwrap();
+                match chunk_size {
+                    4 => {
+                        for p in 0..n {
+                            let x = value[p];
+                            let y = x * (x - three);
+                            out[p] += filters[p] * (y * (y + F::TWO));
+                        }
+                    }
+                    2 => {
+                        for p in 0..n {
+                            let x = value[p];
+                            out[p] += filters[p] * (x * (x - F::ONE));
+                        }
+                    }
+                    _ => {
+                        for p in 0..n {
+                            let x = value[p];
+                            let mut product = x;
+                            for k in 1..chunk_size {
+                                product *= x - F::from_canonical_usize(k);
+                            }
+                            out[p] += filters[p] * product;
+                        }
+                    }
+                }
+            }
+
+            let equality_dummy = col(self.wire_equality_dummy(i));
+            let chunks_equal = col(self.wire_chunks_equal(i));
+            let intermediate_value = col(self.wire_intermediate_value(i));
+
+            let out = chunks_iter.next().unwrap();
+            for p in 0..n {
+                let difference = second[p] - first[p];
+                out[p] +=
+                    filters[p] * (difference * equality_dummy[p] - (F::ONE - chunks_equal[p]));
+            }
+            let out = chunks_iter.next().unwrap();
+            for p in 0..n {
+                out[p] += filters[p] * (chunks_equal[p] * (second[p] - first[p]));
+            }
+            let out = chunks_iter.next().unwrap();
+            for p in 0..n {
+                out[p] += filters[p]
+                    * (intermediate_value[p] - chunks_equal[p] * most_significant_diff_so_far[p]);
+                most_significant_diff_so_far[p] = intermediate_value[p]
+                    + (F::ONE - chunks_equal[p]) * (second[p] - first[p]);
+            }
+        }
+
+        let most_significant_diff = col(self.wire_most_significant_diff());
+        let out = chunks_iter.next().unwrap();
+        for p in 0..n {
+            out[p] += filters[p] * (most_significant_diff[p] - most_significant_diff_so_far[p]);
+        }
+
+        for i in 0..chunk_bits + 1 {
+            let bit = col(self.wire_most_significant_diff_bit(i));
+            let out = chunks_iter.next().unwrap();
+            for p in 0..n {
+                out[p] += filters[p] * (bit[p] * (F::ONE - bit[p]));
+            }
+        }
+
+        // (2^n + most_significant_diff) - bits_combined, Horner over bits.
+        let two_n = F::from_canonical_u64(1 << chunk_bits);
+        let out = chunks_iter.next().unwrap();
+        scratch.copy_from_slice(col(self.wire_most_significant_diff_bit(chunk_bits)));
+        for i in (0..chunk_bits).rev() {
+            let bit = col(self.wire_most_significant_diff_bit(i));
+            for p in 0..n {
+                scratch[p] = scratch[p].double() + bit[p];
+            }
+        }
+        for p in 0..n {
+            out[p] += filters[p] * ((two_n + most_significant_diff[p]) - scratch[p]);
+        }
+
+        let result_bool = col(self.wire_result_bool());
+        let top_bit = col(self.wire_most_significant_diff_bit(chunk_bits));
+        let out = chunks_iter.next().unwrap();
+        for p in 0..n {
+            out[p] += filters[p] * (result_bool[p] - top_bit[p]);
+        }
+    }
+
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,
