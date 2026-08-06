@@ -52,4 +52,3 @@ tiny-keccak = { version = "2.0.2", features = ["keccak"] }
 incremental = false
 lto = "fat"
 codegen-units = 1
-panic = "abort"
