@@ -1,6 +1,8 @@
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
+use core::fmt;
 use core::iter::zip;
+use core::mem::MaybeUninit;
 
 use anyhow::{anyhow, Result};
 use hashbrown::HashMap;
@@ -329,18 +331,67 @@ impl<F: Field> Witness<F> for PartialWitness<F> {
 
 /// `PartitionWitness` holds a disjoint-set forest of the targets respecting a circuit's copy constraints.
 /// The value of a target is defined to be the value of its root in the forest.
-#[derive(Clone, Debug)]
 pub struct PartitionWitness<'a, F: Field> {
-    pub values: Vec<Option<F>>,
+    values: Vec<MaybeUninit<F>>,
+    initialized: Vec<u64>,
     pub representative_map: &'a [usize],
     pub num_wires: usize,
     pub degree: usize,
 }
 
+impl<'a, F: Field> Clone for PartitionWitness<'a, F> {
+    fn clone(&self) -> Self {
+        let mut cloned = Self::new(self.num_wires, self.degree, self.representative_map);
+        for (word_index, &word) in self.initialized.iter().enumerate() {
+            let mut remaining = word;
+            while remaining != 0 {
+                let bit_index = remaining.trailing_zeros() as usize;
+                let rep_index = word_index * u64::BITS as usize + bit_index;
+                let value = self
+                    .representative_value(rep_index)
+                    .expect("set bitmap bit must have a value");
+                cloned.initialize_representative(rep_index, value);
+                remaining &= remaining - 1;
+            }
+        }
+        cloned
+    }
+}
+
+struct PartitionValuesDebug<'w, 'map, F: Field>(&'w PartitionWitness<'map, F>);
+
+impl<F: Field> fmt::Debug for PartitionValuesDebug<'_, '_, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut list = f.debug_list();
+        for rep_index in 0..self.0.values.len() {
+            list.entry(&self.0.representative_value(rep_index));
+        }
+        list.finish()
+    }
+}
+
+impl<F: Field> fmt::Debug for PartitionWitness<'_, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PartitionWitness")
+            .field("values", &PartitionValuesDebug(self))
+            .field("representative_map", &self.representative_map)
+            .field("num_wires", &self.num_wires)
+            .field("degree", &self.degree)
+            .finish()
+    }
+}
+
 impl<'a, F: Field> PartitionWitness<'a, F> {
     pub fn new(num_wires: usize, degree: usize, representative_map: &'a [usize]) -> Self {
+        let mut values = Vec::with_capacity(representative_map.len());
+        unsafe {
+            // SAFETY: `MaybeUninit<F>` may hold uninitialized storage, and its drop implementation
+            // never reads the contained `F`. Every read is guarded by `initialized` below.
+            values.set_len(representative_map.len());
+        }
         Self {
-            values: vec![None; representative_map.len()],
+            values,
+            initialized: vec![0; representative_map.len().div_ceil(u64::BITS as usize)],
             representative_map,
             num_wires,
             degree,
@@ -351,8 +402,7 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     /// target was already set, returns `None`.
     pub fn set_target_returning_rep(&mut self, target: Target, value: F) -> Result<Option<usize>> {
         let rep_index = self.representative_map[self.target_index(target)];
-        let rep_value = &mut self.values[rep_index];
-        if let Some(old_value) = *rep_value {
+        if let Some(old_value) = self.representative_value(rep_index) {
             if value != old_value {
                 return Err(anyhow!(
                     "Partition containing {:?} was set twice with different values: {} != {}",
@@ -364,8 +414,35 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
 
             Ok(None)
         } else {
-            *rep_value = Some(value);
+            self.initialize_representative(rep_index, value);
             Ok(Some(rep_index))
+        }
+    }
+
+    #[inline]
+    fn initialize_representative(&mut self, rep_index: usize, value: F) {
+        debug_assert!(!self.is_representative_set(rep_index));
+        self.values[rep_index].write(value);
+        self.initialized[rep_index / u64::BITS as usize] |= 1 << (rep_index % u64::BITS as usize);
+    }
+
+    #[inline]
+    pub(crate) fn is_representative_set(&self, rep_index: usize) -> bool {
+        self.initialized[rep_index / u64::BITS as usize] & (1 << (rep_index % u64::BITS as usize))
+            != 0
+    }
+
+    #[inline]
+    fn representative_value(&self, rep_index: usize) -> Option<F> {
+        if !self.is_representative_set(rep_index) {
+            return None;
+        }
+
+        unsafe {
+            // SAFETY: A bit is set only after `values[rep_index]` has been initialized, and no
+            // initialized slot is ever deinitialized. `F: Field` is `Copy`, so returning it leaves
+            // the initialized slot intact.
+            Some(*self.values[rep_index].assume_init_ref())
         }
     }
 
@@ -389,7 +466,8 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         for _ in 0..self.degree {
             for column in wire_values.iter_mut() {
                 column.push(
-                    self.values[self.representative_map[wire_index]].unwrap_or(F::ZERO),
+                    self.representative_value(self.representative_map[wire_index])
+                        .unwrap_or(F::ZERO),
                 );
                 wire_index += 1;
             }
@@ -408,6 +486,174 @@ impl<F: Field> WitnessWrite<F> for PartitionWitness<'_, F> {
 impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
     fn try_get_target(&self, target: Target) -> Option<F> {
         let rep_index = self.representative_map[self.target_index(target)];
-        self.values[rep_index]
+        self.representative_value(rep_index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::mem::{size_of, size_of_val};
+
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::circuit_data::CircuitConfig;
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+
+    #[test]
+    fn partition_witness_allocates_uninitialized_field_slots_and_a_compact_bitmap() {
+        let representative_map = (0..130).collect::<Vec<_>>();
+        let witness = PartitionWitness::<GoldilocksField>::new(2, 2, &representative_map);
+
+        assert_eq!(
+            size_of_val(witness.values.as_slice()),
+            representative_map.len() * size_of::<GoldilocksField>()
+        );
+        assert_eq!(witness.initialized.len(), 3);
+        assert!(witness.initialized.iter().all(|&word| word == 0));
+    }
+
+    #[test]
+    fn partition_witness_reads_initialized_representatives_through_aliases() {
+        let representative_map = [0, 0, 2, 3];
+        let mut witness = PartitionWitness::<GoldilocksField>::new(2, 2, &representative_map);
+        let original = Target::wire(0, 0);
+        let alias = Target::wire(0, 1);
+        let unset = Target::wire(1, 0);
+        let value = GoldilocksField::from_canonical_u64(17);
+
+        assert_eq!(witness.try_get_target(original), None);
+        assert_eq!(witness.try_get_target(alias), None);
+        assert_eq!(
+            witness.set_target_returning_rep(original, value).unwrap(),
+            Some(0)
+        );
+        assert_eq!(witness.try_get_target(original), Some(value));
+        assert_eq!(witness.try_get_target(alias), Some(value));
+        assert_eq!(witness.try_get_target(unset), None);
+    }
+
+    #[test]
+    fn partition_witness_rejects_conflicting_alias_without_overwriting_value() {
+        let representative_map = [0, 0];
+        let mut witness = PartitionWitness::<GoldilocksField>::new(2, 1, &representative_map);
+        let original = Target::wire(0, 0);
+        let alias = Target::wire(0, 1);
+        let original_value = GoldilocksField::from_canonical_u64(17);
+
+        assert_eq!(
+            witness
+                .set_target_returning_rep(original, original_value)
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            witness
+                .set_target_returning_rep(alias, original_value)
+                .unwrap(),
+            None
+        );
+        let error = witness
+            .set_target(alias, GoldilocksField::from_canonical_u64(18))
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("set twice with different values"));
+        assert_eq!(witness.get_target(original), original_value);
+        assert_eq!(witness.get_target(alias), original_value);
+        assert_eq!(witness.initialized[0].count_ones(), 1);
+    }
+
+    #[test]
+    fn partition_witness_clone_and_debug_expose_only_logical_values() {
+        let representative_map = [0, 1];
+        let mut witness = PartitionWitness::<GoldilocksField>::new(2, 1, &representative_map);
+        let initialized = Target::wire(0, 0);
+        let unset = Target::wire(0, 1);
+        let value = GoldilocksField::from_canonical_u64(17);
+        witness.set_target(initialized, value).unwrap();
+
+        let mut cloned = witness.clone();
+        assert_eq!(cloned.try_get_target(initialized), Some(value));
+        assert_eq!(cloned.try_get_target(unset), None);
+        let rendered = format!("{cloned:?}");
+        assert!(rendered.contains("values: [Some(17), None]"));
+        assert!(!rendered.contains("MaybeUninit"));
+
+        cloned
+            .set_target(unset, GoldilocksField::from_canonical_u64(23))
+            .unwrap();
+        assert_eq!(witness.try_get_target(unset), None);
+    }
+
+    #[test]
+    fn partition_witness_bitmap_handles_word_boundaries() {
+        let representative_map = (0..130).collect::<Vec<_>>();
+        let mut witness = PartitionWitness::<GoldilocksField>::new(1, 130, &representative_map);
+
+        for row in [0, 63, 64, 127, 128, 129] {
+            witness
+                .set_target(
+                    Target::wire(row, 0),
+                    GoldilocksField::from_canonical_usize(row + 1),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(witness.initialized, vec![1 | (1 << 63), 1 | (1 << 63), 3]);
+        for row in 0..130 {
+            let expected = [0, 63, 64, 127, 128, 129]
+                .contains(&row)
+                .then(|| GoldilocksField::from_canonical_usize(row + 1));
+            assert_eq!(witness.try_get_target(Target::wire(row, 0)), expected);
+        }
+    }
+
+    #[test]
+    fn partition_witness_full_witness_preserves_aliases_and_zero_fills_unset_wires() {
+        let representative_map = [0, 0, 2, 3];
+        let mut witness = PartitionWitness::<GoldilocksField>::new(2, 2, &representative_map);
+        let aliased_value = GoldilocksField::from_canonical_u64(17);
+        let last_value = GoldilocksField::from_canonical_u64(23);
+        witness
+            .set_target(Target::wire(0, 0), aliased_value)
+            .unwrap();
+        witness.set_target(Target::wire(1, 1), last_value).unwrap();
+
+        let full = witness.full_witness();
+
+        assert_eq!(
+            full.wire_values,
+            vec![
+                vec![aliased_value, GoldilocksField::ZERO],
+                vec![aliased_value, last_value]
+            ]
+        );
+    }
+
+    #[test]
+    fn partition_witness_sparse_storage_produces_a_valid_proof_on_fused_frontier() {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+
+        let mut builder =
+            CircuitBuilder::<GoldilocksField, D>::new(CircuitConfig::standard_recursion_config());
+        let input = builder.add_virtual_target();
+        let square = builder.square(input);
+        builder.register_public_input(square);
+        let circuit = builder.build::<C>();
+        let mut partial_witness = PartialWitness::new();
+        partial_witness
+            .set_target(input, GoldilocksField::from_canonical_u64(7))
+            .unwrap();
+
+        let proof = circuit.prove(partial_witness).unwrap();
+
+        assert_eq!(
+            proof.public_inputs,
+            vec![GoldilocksField::from_canonical_u64(49)]
+        );
+        circuit.verify(proof).unwrap();
     }
 }
