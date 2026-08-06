@@ -2,6 +2,7 @@
 use alloc::{vec, vec::Vec};
 use core::ops::Range;
 
+use hashbrown::HashMap;
 use serde::Serialize;
 
 use crate::field::extension::Extendable;
@@ -119,7 +120,19 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     let num_gates = gates.len();
     let max_gate_degree = gates.last().expect("No gates?").0.degree();
 
-    let index = |id| gates.iter().position(|g| g.0.id() == id).unwrap();
+    // Resolve each gate ID to its first position in the sorted gate list once, instead of a
+    // linear search that regenerates every candidate's owned ID string at every instance.
+    // First insertion wins on duplicate IDs, matching the old `position` semantics.
+    // Serial deliberately: builds overlap proving in this lineage, so this pass sheds work
+    // (O(gates) String allocations per row) without competing for proving cores.
+    let mut index_by_id: HashMap<String, usize> = HashMap::with_capacity(num_gates);
+    for (k, g) in gates.iter().enumerate() {
+        index_by_id.entry(g.0.id()).or_insert(k);
+    }
+    let instance_indices: Vec<usize> = instances
+        .iter()
+        .map(|g| index_by_id[&g.gate_ref.0.id()])
+        .collect();
 
     // Special case if we can use only one selector polynomial.
     if max_gate_degree + num_gates - 1 <= max_degree {
@@ -128,9 +141,9 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
         #[allow(clippy::single_range_in_vec_init)]
         return (
             vec![PolynomialValues::new(
-                instances
+                instance_indices
                     .iter()
-                    .map(|g| F::from_canonical_usize(index(g.gate_ref.0.id())))
+                    .map(|&i| F::from_canonical_usize(i))
                     .collect(),
             )],
             SelectorsInfo {
@@ -162,24 +175,30 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     let group = |i| groups.iter().position(|range| range.contains(&i)).unwrap();
 
     // `selector_indices[i] = j` iff the `i`-th gate uses the `j`-th selector polynomial.
-    let selector_indices = (0..num_gates).map(group).collect();
+    let selector_indices: Vec<usize> = (0..num_gates).map(group).collect();
 
     // Placeholder value to indicate that a gate doesn't use a selector polynomial.
     let unused = F::from_canonical_usize(UNUSED_SELECTOR);
 
-    let mut polynomials = vec![PolynomialValues::zero(n); groups.len()];
-    for (j, g) in instances.iter().enumerate() {
-        let GateInstance { gate_ref, .. } = g;
-        let i = index(gate_ref.0.id());
-        let gr = group(i);
-        for g in 0..groups.len() {
-            polynomials[g].values[j] = if g == gr {
-                F::from_canonical_usize(i)
-            } else {
-                unused
-            };
-        }
-    }
+    // Every cell is a pure function of (group, instance gate index); values are identical
+    // to what the stock per-instance loop wrote, without the per-row index searches.
+    let polynomials: Vec<PolynomialValues<F>> = (0..groups.len())
+        .map(|g| {
+            let values = instance_indices
+                .iter()
+                .map(|&i| {
+                    if selector_indices[i] == g {
+                        F::from_canonical_usize(i)
+                    } else {
+                        unused
+                    }
+                })
+                .collect();
+            PolynomialValues::new(values)
+        })
+        .collect();
+    debug_assert_eq!(polynomials.len(), groups.len());
+    debug_assert!(polynomials.iter().all(|p| p.values.len() == n));
 
     (
         polynomials,
@@ -188,4 +207,146 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
             groups,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::Field;
+    use crate::gates::arithmetic_base::ArithmeticGate;
+    use crate::gates::gate::GateRef;
+    use crate::gates::noop::NoopGate;
+    use crate::gates::public_input::PublicInputGate;
+
+    type F = GoldilocksField;
+    const D: usize = 2;
+
+    /// The stock implementation this crate shipped with, kept verbatim as the
+    /// differential reference.
+    fn selector_polynomials_reference(
+        gates: &[GateRef<F, D>],
+        instances: &[GateInstance<F, D>],
+        max_degree: usize,
+    ) -> (Vec<PolynomialValues<F>>, SelectorsInfo) {
+        let n = instances.len();
+        let num_gates = gates.len();
+        let max_gate_degree = gates.last().expect("No gates?").0.degree();
+
+        let index = |id| gates.iter().position(|g| g.0.id() == id).unwrap();
+
+        if max_gate_degree + num_gates - 1 <= max_degree {
+            #[allow(clippy::single_range_in_vec_init)]
+            return (
+                vec![PolynomialValues::new(
+                    instances
+                        .iter()
+                        .map(|g| F::from_canonical_usize(index(g.gate_ref.0.id())))
+                        .collect(),
+                )],
+                SelectorsInfo {
+                    selector_indices: vec![0; num_gates],
+                    groups: vec![0..num_gates],
+                },
+            );
+        }
+
+        assert!(max_gate_degree < max_degree);
+
+        let mut groups = Vec::new();
+        let mut start = 0;
+        while start < num_gates {
+            let mut size = 0;
+            while (start + size < gates.len())
+                && (size + gates[start + size].0.degree() < max_degree)
+            {
+                size += 1;
+            }
+            groups.push(start..start + size);
+            start += size;
+        }
+
+        let group = |i| groups.iter().position(|range| range.contains(&i)).unwrap();
+        let selector_indices = (0..num_gates).map(group).collect();
+        let unused = F::from_canonical_usize(UNUSED_SELECTOR);
+
+        let mut polynomials = vec![PolynomialValues::zero(n); groups.len()];
+        for (j, g) in instances.iter().enumerate() {
+            let GateInstance { gate_ref, .. } = g;
+            let i = index(gate_ref.0.id());
+            let gr = group(i);
+            for g in 0..groups.len() {
+                polynomials[g].values[j] = if g == gr {
+                    F::from_canonical_usize(i)
+                } else {
+                    unused
+                };
+            }
+        }
+
+        (
+            polynomials,
+            SelectorsInfo {
+                selector_indices,
+                groups,
+            },
+        )
+    }
+
+    fn assert_matches_reference(
+        gates: &[GateRef<F, D>],
+        instances: &[GateInstance<F, D>],
+        max_degree: usize,
+    ) {
+        let (polys_ref, info_ref) = selector_polynomials_reference(gates, instances, max_degree);
+        let (polys_new, info_new) = selector_polynomials(gates, instances, max_degree);
+        assert_eq!(polys_ref, polys_new);
+        assert_eq!(info_ref.selector_indices, info_new.selector_indices);
+        assert_eq!(info_ref.groups, info_new.groups);
+    }
+
+    fn instance(gate: &GateRef<F, D>, constants: Vec<F>) -> GateInstance<F, D> {
+        GateInstance {
+            gate_ref: gate.clone(),
+            constants,
+        }
+    }
+
+    #[test]
+    fn selector_polynomials_match_reference_single_group() {
+        // max_gate_degree + num_gates - 1 <= max_degree: one selector polynomial.
+        let noop = GateRef::new(NoopGate);
+        let pi = GateRef::new(PublicInputGate);
+        let gates = vec![noop.clone(), pi.clone()];
+        let instances: Vec<_> = (0..17)
+            .map(|j| {
+                let g = if j % 3 == 0 { &pi } else { &noop };
+                instance(g, vec![F::from_canonical_usize(j)])
+            })
+            .collect();
+        assert_matches_reference(&gates, &instances, 8);
+    }
+
+    #[test]
+    fn selector_polynomials_match_reference_multi_group() {
+        // Degrees [0, 1, 3] with max_degree 4 force two groups, including a
+        // duplicate-ID gate to lock first-match resolution semantics.
+        let noop = GateRef::new(NoopGate);
+        let pi = GateRef::new(PublicInputGate);
+        let arith = GateRef::new(ArithmeticGate { num_ops: 4 });
+        let arith_dup = GateRef::new(ArithmeticGate { num_ops: 4 });
+        let gates = vec![noop.clone(), pi.clone(), arith.clone()];
+        let instances: Vec<_> = (0..23)
+            .map(|j| {
+                let g = match j % 4 {
+                    0 => &arith,
+                    1 => &noop,
+                    2 => &arith_dup,
+                    _ => &pi,
+                };
+                instance(g, vec![F::from_canonical_usize(j), F::from_canonical_usize(j + 1)])
+            })
+            .collect();
+        assert_matches_reference(&gates, &instances, 4);
+    }
 }

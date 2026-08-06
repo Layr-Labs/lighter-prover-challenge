@@ -79,6 +79,10 @@ impl Forest {
 
     /// Compress all paths. After calling this, every `parent` value will point to the node's
     /// representative.
+    ///
+    /// Kept serial deliberately: circuit builds overlap proving (deferred block build) and
+    /// sibling-circuit construction in this lineage, so a parallel sweep here steals cores
+    /// from the proving critical path rather than shortening the timed window.
     pub(crate) fn compress_paths(&mut self) {
         for i in 0..self.parents.len() {
             self.find(i);
@@ -117,6 +121,68 @@ impl Forest {
 
 pub struct WirePartition {
     sigma: Vec<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stock serial compression this crate shipped with, kept verbatim as the
+    /// differential reference: mutating `find` on every index in order.
+    fn compress_paths_serial_reference(forest: &mut Forest) {
+        for i in 0..forest.parents.len() {
+            forest.find(i);
+        }
+    }
+
+    fn build_forest(num_wires: usize, num_routed_wires: usize, degree: usize, seed: u64) -> Forest {
+        let num_virtual = 17;
+        let mut forest = Forest::new(num_wires, num_routed_wires, degree, num_virtual);
+        for row in 0..degree {
+            for column in 0..num_wires {
+                forest.add(Target::Wire(Wire { row, column }));
+            }
+        }
+        for index in 0..num_virtual {
+            forest.add(Target::VirtualTarget { index });
+        }
+        // Deterministic LCG-driven merges, including long chains and repeated merges.
+        let mut state = seed;
+        let mut next = |bound: usize| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as usize) % bound
+        };
+        let merges = num_wires * degree * 2;
+        for _ in 0..merges {
+            let a = Wire {
+                row: next(degree),
+                column: next(num_wires),
+            };
+            let b = Wire {
+                row: next(degree),
+                column: next(num_wires),
+            };
+            forest.merge(Target::Wire(a), Target::Wire(b));
+        }
+        forest
+    }
+
+    #[test]
+    fn parallel_compress_paths_matches_serial_reference() {
+        for seed in [1u64, 7, 42, 0xdeadbeef] {
+            let mut reference = build_forest(13, 8, 64, seed);
+            let mut candidate = build_forest(13, 8, 64, seed);
+            assert_eq!(reference.parents, candidate.parents);
+
+            compress_paths_serial_reference(&mut reference);
+            candidate.compress_paths();
+            assert_eq!(reference.parents, candidate.parents, "seed {seed}");
+
+            let sigma_ref = reference.wire_partition().sigma;
+            let sigma_cand = candidate.wire_partition().sigma;
+            assert_eq!(sigma_ref, sigma_cand, "seed {seed}");
+        }
+    }
 }
 
 impl WirePartition {
