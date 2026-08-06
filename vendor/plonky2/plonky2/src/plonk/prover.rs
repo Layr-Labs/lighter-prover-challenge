@@ -609,6 +609,11 @@ fn compute_all_lookup_polys<
 
 const BATCH_SIZE: usize = 32;
 
+#[inline(always)]
+const fn next_index_in_power_of_two_lde(index: usize, next_step: usize, lde_mask: usize) -> usize {
+    (index + next_step) & lde_mask
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -645,6 +650,8 @@ fn compute_quotient_polys<
 
     let points = F::two_adic_subgroup(common_data.degree_bits() + quotient_degree_bits);
     let lde_size = points.len();
+    debug_assert!(lde_size.is_power_of_two() && next_step <= lde_size);
+    let lde_mask = lde_size - 1;
 
     let z_h_on_coset = ZeroPolyOnCoset::new(common_data.degree_bits(), quotient_degree_bits);
 
@@ -733,9 +740,12 @@ fn compute_quotient_polys<
                     .indices
                     .extend(BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n);
                 scratch.indices_next.clear();
-                scratch
-                    .indices_next
-                    .extend(scratch.indices.iter().map(|&i| (i + next_step) % lde_size));
+                scratch.indices_next.extend(
+                    scratch
+                        .indices
+                        .iter()
+                        .map(|&i| next_index_in_power_of_two_lde(i, next_step, lde_mask)),
+                );
 
                 scratch.shifted_xs.clear();
                 scratch
@@ -868,4 +878,48 @@ fn compute_quotient_polys<
         })
         .map(|values| values.coset_ifft(F::coset_shift()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    #[test]
+    fn two_adic_subgroup_lengths_are_nonzero_powers_of_two() {
+        for bits in 0..=12 {
+            let lde_size = GoldilocksField::two_adic_subgroup(bits).len();
+            assert!(lde_size.is_power_of_two());
+            assert_eq!(lde_size, 1 << bits);
+        }
+    }
+
+    #[test]
+    fn next_index_mask_matches_modulo_exhaustively() {
+        for lde_size in [1, 2, 4, 8, 16, 32, 64, 256] {
+            let lde_mask = lde_size - 1;
+            for i in 0..lde_size {
+                for next_step in 0..=lde_size {
+                    assert_eq!(
+                        next_index_in_power_of_two_lde(i, next_step, lde_mask),
+                        (i + next_step) % lde_size,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn next_index_mask_does_not_overflow_at_largest_power_of_two() {
+        let lde_size = 1usize << (usize::BITS - 1);
+        let lde_mask = lde_size - 1;
+        for i in [0, 1, lde_size - 1] {
+            for next_step in [0, 1, lde_size - 1, lde_size] {
+                assert_eq!(
+                    next_index_in_power_of_two_lde(i, next_step, lde_mask),
+                    (i + next_step) % lde_size,
+                );
+            }
+        }
+    }
 }
