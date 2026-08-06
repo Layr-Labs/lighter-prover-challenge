@@ -183,3 +183,79 @@ fn time_sequential_vs_pair_compress() {
         old_time.as_secs_f64() / new_time.as_secs_f64()
     );
 }
+
+#[test]
+fn compress_quad_matches_individual() {
+    for _ in 0..32 {
+        let h: Vec<_> = (0..8)
+            .map(|_| {
+                let v: Vec<F> = (0..8).map(|_| F::rand()).collect();
+                <Poseidon2Hash as Hasher<F>>::hash_or_noop(&v)
+            })
+            .collect();
+        let outs = Poseidon2Hash::two_to_one_quad([
+            (h[0], h[1]),
+            (h[2], h[3]),
+            (h[4], h[5]),
+            (h[6], h[7]),
+        ]);
+        for k in 0..4 {
+            assert_eq!(
+                outs[k],
+                <Poseidon2Hash as Hasher<F>>::two_to_one(h[2 * k], h[2 * k + 1]),
+                "quad compress {k}"
+            );
+        }
+    }
+}
+
+#[test]
+fn time_pair_vs_quad_compress() {
+    let h: Vec<_> = (0..8)
+        .map(|_| {
+            let v: Vec<F> = (0..8).map(|_| F::rand()).collect();
+            <Poseidon2Hash as Hasher<F>>::hash_or_noop(&v)
+        })
+        .collect();
+    let iters = 250_000;
+
+    let t0 = std::time::Instant::now();
+    let mut sink_pair = F::default();
+    for _ in 0..iters {
+        let (n0, n1) = Poseidon2Hash::two_to_one_pair(
+            core::hint::black_box(h[0]),
+            core::hint::black_box(h[1]),
+            core::hint::black_box(h[2]),
+            core::hint::black_box(h[3]),
+        );
+        let (n2, n3) = Poseidon2Hash::two_to_one_pair(
+            core::hint::black_box(h[4]),
+            core::hint::black_box(h[5]),
+            core::hint::black_box(h[6]),
+            core::hint::black_box(h[7]),
+        );
+        sink_pair += n0.elements[0] + n1.elements[0] + n2.elements[0] + n3.elements[0];
+    }
+    let pair_time = t0.elapsed();
+
+    let t1 = std::time::Instant::now();
+    let mut sink_quad = F::default();
+    for _ in 0..iters {
+        let outs = Poseidon2Hash::two_to_one_quad([
+            (core::hint::black_box(h[0]), core::hint::black_box(h[1])),
+            (core::hint::black_box(h[2]), core::hint::black_box(h[3])),
+            (core::hint::black_box(h[4]), core::hint::black_box(h[5])),
+            (core::hint::black_box(h[6]), core::hint::black_box(h[7])),
+        ]);
+        sink_quad += outs[0].elements[0] + outs[1].elements[0] + outs[2].elements[0] + outs[3].elements[0];
+    }
+    let quad_time = t1.elapsed();
+
+    assert_eq!(sink_pair, sink_quad);
+    println!(
+        "compress quad: 2x pair {:?}  quad {:?}  speedup {:.2}x",
+        pair_time,
+        quad_time,
+        pair_time.as_secs_f64() / quad_time.as_secs_f64()
+    );
+}
