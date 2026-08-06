@@ -177,7 +177,7 @@ fn run_generator_worklist<
                         for (t, v) in round_buffer.target_values.drain(..) {
                             let rep_index =
                                 round_witness.representative_map[round_witness.target_index(t)];
-                            let watchers = if round_witness.values[rep_index].is_none() {
+                            let watchers = if !round_witness.is_representative_set(rep_index) {
                                 generator_indices_by_watches.get(&rep_index)
                             } else {
                                 // The representative is populated in the snapshot, so the merge
@@ -340,7 +340,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         // local witness state and does not add anything to serialized prover data.
         let mut unresolved_watches = vec![0usize; generators.len()];
         for (&watch, watchers) in generator_indices_by_watches {
-            if witness.values[watch].is_none() {
+            if !witness.is_representative_set(watch) {
                 for &generator_idx in watchers {
                     unresolved_watches[generator_idx] += 1;
                 }
@@ -1017,12 +1017,10 @@ mod tests {
         let two_phase = pending.finish()?;
 
         let mut nondeterministic_positions = 0usize;
-        for ((single, repeat), split) in single_shot
-            .values
-            .iter()
-            .zip(&single_shot_repeat.values)
-            .zip(&two_phase.values)
-        {
+        for position in 0..single_shot.representative_map.len() {
+            let single = single_shot.representative_value(position);
+            let repeat = single_shot_repeat.representative_value(position);
+            let split = two_phase.representative_value(position);
             if single == repeat {
                 assert_eq!(single, split);
             } else {
@@ -1106,20 +1104,25 @@ mod tests {
         drop(parallel_guard);
 
         let mut nondeterministic_positions = 0usize;
-        for position in 0..sequential.values.len() {
-            if sequential.values[position] == sequential_repeat.values[position] {
-                assert_eq!(sequential.values[position], ungated.values[position]);
+        for position in 0..sequential.representative_map.len() {
+            if sequential.representative_value(position)
+                == sequential_repeat.representative_value(position)
+            {
                 assert_eq!(
-                    sequential.values[position],
-                    parallel_default.values[position]
+                    sequential.representative_value(position),
+                    ungated.representative_value(position)
                 );
                 assert_eq!(
-                    sequential.values[position],
-                    parallel_stress.values[position]
+                    sequential.representative_value(position),
+                    parallel_default.representative_value(position)
                 );
                 assert_eq!(
-                    sequential.values[position],
-                    parallel_two_phase.values[position]
+                    sequential.representative_value(position),
+                    parallel_stress.representative_value(position)
+                );
+                assert_eq!(
+                    sequential.representative_value(position),
+                    parallel_two_phase.representative_value(position)
                 );
             } else {
                 nondeterministic_positions += 1;
