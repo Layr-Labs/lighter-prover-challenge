@@ -219,8 +219,15 @@ unsafe impl PackedField for WideGoldilocksField {
         let out = self.lanes();
         let lhs = x.lanes();
         let rhs = y.lanes();
+        // Keep the four products in one AArch64 reduction block.  The previous
+        // implementation dispatched to the scalar field hook once per lane;
+        // that paid four independent reduction/setup costs before adding the
+        // accumulator.  Reducing the products together lets the existing
+        // four-lane asm amortize that overhead, while the final additions are
+        // the same canonical field operation as the scalar implementation.
+        let products = mul_reduce_quad(lhs.map(|value| value.0), rhs.map(|value| value.0));
         Self::from_lanes(core::array::from_fn(|lane| {
-            Field::multiply_accumulate(&out[lane], lhs[lane], rhs[lane])
+            GoldilocksField(products[lane]) + out[lane]
         }))
     }
 }
