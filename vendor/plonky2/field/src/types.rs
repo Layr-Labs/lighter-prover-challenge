@@ -1,4 +1,3 @@
-use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display};
 use core::hash::Hash;
@@ -131,6 +130,12 @@ pub trait Field:
     }
 
     fn batch_multiplicative_inverse(x: &[Self]) -> Vec<Self> {
+        let mut result = Vec::with_capacity(x.len());
+        Self::batch_multiplicative_inverse_into(x, &mut result);
+        result
+    }
+
+    fn batch_multiplicative_inverse_into(x: &[Self], out: &mut Vec<Self>) {
         // This is Montgomery's trick. At a high level, we invert the product of the given field
         // elements, then derive the individual inverses from that via multiplication.
 
@@ -148,20 +153,25 @@ pub trait Field:
         // Handle special cases. Paradoxically, below is repetitive but concise.
         // The branches should be very predictable.
         let n = x.len();
+        out.clear();
+        out.reserve(n);
         if n == 0 {
-            return Vec::new();
+            return;
         } else if n == 1 {
-            return vec![x[0].inverse()];
+            out.push(x[0].inverse());
+            return;
         } else if n == 2 {
             let x01 = x[0] * x[1];
             let x01inv = x01.inverse();
-            return vec![x01inv * x[1], x01inv * x[0]];
+            out.extend([x01inv * x[1], x01inv * x[0]]);
+            return;
         } else if n == 3 {
             let x01 = x[0] * x[1];
             let x012 = x01 * x[2];
             let x012inv = x012.inverse();
             let x01inv = x012inv * x[2];
-            return vec![x01inv * x[1], x01inv * x[0], x012inv * x01];
+            out.extend([x01inv * x[1], x01inv * x[0], x012inv * x01]);
+            return;
         }
         debug_assert!(n >= WIDTH);
 
@@ -175,16 +185,15 @@ pub trait Field:
         // ].
         // If n is not a multiple of WIDTH, the result is truncated from the end. For example,
         // for n == 5, we get [x[0], x[1], x[2], x[3], x[0] * x[4]].
-        let mut buf: Vec<Self> = Vec::with_capacity(n);
         // cumul_prod holds the last WIDTH elements of buf. This is redundant, but it's how we
         // convince LLVM to keep the values in the registers.
         let mut cumul_prod: [Self; WIDTH] = x[..WIDTH].try_into().unwrap();
-        buf.extend(cumul_prod);
+        out.extend(cumul_prod);
         for (i, &xi) in x[WIDTH..].iter().enumerate() {
             cumul_prod[i % WIDTH] *= xi;
-            buf.push(cumul_prod[i % WIDTH]);
+            out.push(cumul_prod[i % WIDTH]);
         }
-        debug_assert_eq!(buf.len(), n);
+        debug_assert_eq!(out.len(), n);
 
         let mut a_inv = {
             // This is where the four dependency chains meet.
@@ -206,20 +215,18 @@ pub trait Field:
         for i in (WIDTH..n).rev() {
             // buf[i - WIDTH] has not been written to by this loop, so it equals
             // x[i % WIDTH] * x[i % WIDTH + WIDTH] * ... * x[i - WIDTH].
-            buf[i] = buf[i - WIDTH] * a_inv[i % WIDTH];
+            out[i] = out[i - WIDTH] * a_inv[i % WIDTH];
             // buf[i] now holds the inverse of x[i].
             a_inv[i % WIDTH] *= x[i];
         }
         for i in (0..WIDTH).rev() {
-            buf[i] = a_inv[i];
+            out[i] = a_inv[i];
         }
 
-        for (&bi, &xi) in buf.iter().zip(x) {
+        for (&bi, &xi) in out.iter().zip(x) {
             // Sanity check only.
             debug_assert_eq!(bi * xi, Self::ONE);
         }
-
-        buf
     }
 
     /// Compute the inverse of 2^exp in this field.
@@ -624,7 +631,7 @@ impl<F: Field> Powers<F> {
 
 #[cfg(test)]
 mod tests {
-    use super::Field;
+    use super::{Field, Field64, PrimeField64};
     use crate::goldilocks_field::GoldilocksField;
 
     #[test]
@@ -641,6 +648,51 @@ mod tests {
             for &expect_next in &powers_of_two[n + 1..] {
                 assert_eq!(iter.next(), Some(expect_next));
             }
+        }
+    }
+
+    #[test]
+    fn batch_multiplicative_inverse_into_matches_allocating_api_raw_and_reuses_capacity() {
+        type F = GoldilocksField;
+
+        for len in [0usize, 1, 2, 3, 4, 5, 10] {
+            let values = (0..len)
+                .map(|i| GoldilocksField(F::ORDER + 1 + i as u64))
+                .collect::<Vec<_>>();
+            let expected = F::batch_multiplicative_inverse(&values);
+            let mut actual = Vec::with_capacity(16);
+            actual.extend([F::TWO, F::TWO]);
+            let capacity = actual.capacity();
+
+            F::batch_multiplicative_inverse_into(&values, &mut actual);
+
+            assert_eq!(actual.len(), len);
+            assert_eq!(actual.capacity(), capacity);
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn batch_multiplicative_inverse_retains_historical_exact_capacity() {
+        type F = GoldilocksField;
+
+        for len in 0usize..=10 {
+            let values = (0..len)
+                .map(|i| F::from_canonical_usize(i + 1))
+                .collect::<Vec<_>>();
+            let inverses = F::batch_multiplicative_inverse(&values);
+
+            assert_eq!(inverses.len(), len);
+            assert_eq!(inverses.capacity(), len);
         }
     }
 }
