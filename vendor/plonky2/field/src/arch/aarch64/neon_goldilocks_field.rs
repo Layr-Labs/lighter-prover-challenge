@@ -191,6 +191,16 @@ unsafe impl PackedField for NeonGoldilocksField {
             _ => panic!("unsupported block length"),
         }
     }
+
+    /// Use the scalar fused `acc + x * y` reduction per lane instead of the
+    /// default two-step `*self + x * y` path (separate mul + add reductions).
+    #[inline]
+    fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
+        Self([
+            Field::multiply_accumulate(&self.0[0], x.0[0], y.0[0]),
+            Field::multiply_accumulate(&self.0[1], x.0[1], y.0[1]),
+        ])
+    }
 }
 
 impl Square for NeonGoldilocksField {

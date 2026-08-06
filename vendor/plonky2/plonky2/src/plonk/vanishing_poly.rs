@@ -175,6 +175,8 @@ pub(crate) struct VanishingScratch<F> {
     pub vanishing_all_lookup_terms: Vec<F>,
     pub lookup_selectors: Vec<F>,
     pub constraint_terms_batch: Vec<F>,
+    /// Contiguous Z / partial-product / next-Z columns reused across 32-point batches.
+    pub accumulator_columns: Vec<F>,
 }
 
 fn reduce_gate_constraints_base_batch<F: Field>(
@@ -297,8 +299,11 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         let num_rows = num_challenges * (1 + num_chunks);
 
         let term_rows = &mut scratch.vanishing_partial_products_terms;
-        term_rows.clear();
-        term_rows.resize(num_rows * n, F::ZERO);
+        // Every term cell is written before reduction; retain logical length
+        // across equal-sized batches to avoid re-zeroing.
+        if term_rows.len() != num_rows * n {
+            term_rows.resize(num_rows * n, F::ZERO);
+        }
 
         let l_0_xs = &mut scratch.vanishing_z_1_terms;
         l_0_xs.clear();
@@ -317,8 +322,9 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         // each sigma is read once per challenge, so the transpose pays for
         // itself with the standard two challenges.
         let sigma_cols = &mut scratch.lookup_selectors;
-        sigma_cols.clear();
-        sigma_cols.resize(num_routed_wires * n, F::ZERO);
+        if sigma_cols.len() != num_routed_wires * n {
+            sigma_cols.resize(num_routed_wires * n, F::ZERO);
+        }
         for (k, s_sigmas) in s_sigmas_batch.iter().enumerate() {
             for (j, &s) in s_sigmas.iter().take(num_routed_wires).enumerate() {
                 sigma_cols[j * n + k] = s;
@@ -327,9 +333,13 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
         // Same treatment for the per-point Z and partial-product slices: one
         // transpose into contiguous columns kills the per-point double
-        // dereferences in the accumulator-selection loop below.
+        // dereferences in the accumulator-selection loop below. Retain the
+        // buffer on the scratch so equal-sized batches skip reallocation.
         let acc_cols_len = num_challenges * (num_prods + 2) * n;
-        let mut acc_cols = vec![F::ZERO; acc_cols_len];
+        let acc_cols = &mut scratch.accumulator_columns;
+        if acc_cols.len() != acc_cols_len {
+            acc_cols.resize(acc_cols_len, F::ZERO);
+        }
         let acc_stride = (num_prods + 2) * n;
         for k in 0..n {
             let local_zs = local_zs_batch[k];
@@ -398,11 +408,11 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             }
         }
 
-        term_rows.clear();
+        // Keep fully-overwritten term/sigma/acc buffers at their logical length
+        // for the next equal-sized batch; only free the short product scratch.
         l_0_xs.clear();
         num_prod.clear();
         den_prod.clear();
-        scratch.lookup_selectors.clear();
         return;
     }
 

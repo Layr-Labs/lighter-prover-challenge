@@ -1,7 +1,9 @@
 #[cfg(not(feature = "std"))]
-use alloc::{vec, vec::Vec};
+use alloc::{string::String, vec, vec::Vec};
 use core::ops::Range;
 
+use hashbrown::HashMap;
+use plonky2_maybe_rayon::*;
 use serde::Serialize;
 
 use crate::field::extension::Extendable;
@@ -119,7 +121,23 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     let num_gates = gates.len();
     let max_gate_degree = gates.last().expect("No gates?").0.degree();
 
-    let index = |id| gates.iter().position(|g| g.0.id() == id).unwrap();
+    // `Gate::id()` allocates a fresh String. Materialize the sorted gate list once and resolve
+    // instances against it so circuit builds do not re-allocate / re-scan per row.
+    let gate_ids: Vec<String> = gates.iter().map(|g| g.0.id()).collect();
+    let mut index_of: HashMap<&str, usize> = HashMap::with_capacity(num_gates);
+    for (i, id) in gate_ids.iter().enumerate() {
+        // First insertion wins, matching `position` on a duplicate-id list.
+        index_of.entry(id.as_str()).or_insert(i);
+    }
+    let instance_indices: Vec<usize> = instances
+        .par_iter()
+        .map(|g| {
+            let id = g.gate_ref.0.id();
+            *index_of
+                .get(id.as_str())
+                .unwrap_or_else(|| panic!("unknown gate id {id}"))
+        })
+        .collect();
 
     // Special case if we can use only one selector polynomial.
     if max_gate_degree + num_gates - 1 <= max_degree {
@@ -128,9 +146,9 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
         #[allow(clippy::single_range_in_vec_init)]
         return (
             vec![PolynomialValues::new(
-                instances
-                    .iter()
-                    .map(|g| F::from_canonical_usize(index(g.gate_ref.0.id())))
+                instance_indices
+                    .into_iter()
+                    .map(F::from_canonical_usize)
                     .collect(),
             )],
             SelectorsInfo {
@@ -143,7 +161,7 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     if max_gate_degree >= max_degree {
         panic!(
             "{} has too high degree. Consider increasing `quotient_degree_factor`.",
-            gates.last().unwrap().0.id()
+            gate_ids.last().unwrap()
         );
     }
 
@@ -162,24 +180,28 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     let group = |i| groups.iter().position(|range| range.contains(&i)).unwrap();
 
     // `selector_indices[i] = j` iff the `i`-th gate uses the `j`-th selector polynomial.
-    let selector_indices = (0..num_gates).map(group).collect();
+    let selector_indices: Vec<usize> = (0..num_gates).map(group).collect();
 
     // Placeholder value to indicate that a gate doesn't use a selector polynomial.
     let unused = F::from_canonical_usize(UNUSED_SELECTOR);
+    let num_groups = groups.len();
+    let instance_groups: Vec<usize> = instance_indices.iter().map(|&i| group(i)).collect();
 
-    let mut polynomials = vec![PolynomialValues::zero(n); groups.len()];
-    for (j, g) in instances.iter().enumerate() {
-        let GateInstance { gate_ref, .. } = g;
-        let i = index(gate_ref.0.id());
-        let gr = group(i);
-        for g in 0..groups.len() {
-            polynomials[g].values[j] = if g == gr {
-                F::from_canonical_usize(i)
-            } else {
-                unused
-            };
-        }
-    }
+    let polynomials = (0..num_groups)
+        .into_par_iter()
+        .map(|g| {
+            let values = (0..n)
+                .map(|j| {
+                    if instance_groups[j] == g {
+                        F::from_canonical_usize(instance_indices[j])
+                    } else {
+                        unused
+                    }
+                })
+                .collect();
+            PolynomialValues::new(values)
+        })
+        .collect();
 
     (
         polynomials,

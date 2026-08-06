@@ -246,8 +246,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let n = indices.len();
         let start = col_range.start;
         let w = col_range.len();
-        out.clear();
-        out.resize(n * w, F::ZERO);
+        // Every destination cell is overwritten below. Skip the clear/zero pass
+        // when the buffer already has the correct logical length.
+        if out.len() != n * w {
+            out.resize(n * w, F::ZERO);
+        }
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
                 for (ci, c) in col_range.enumerate() {

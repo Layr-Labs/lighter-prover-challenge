@@ -79,10 +79,23 @@ impl Forest {
 
     /// Compress all paths. After calling this, every `parent` value will point to the node's
     /// representative.
+    ///
+    /// Representatives are fixed by the merge history and are invariant under compression order,
+    /// so root resolution is a pure read-only map over the pre-pass parent array and parallelizes
+    /// safely. The final state is still `parents[i] = root(i)` for every index.
     pub(crate) fn compress_paths(&mut self) {
-        for i in 0..self.parents.len() {
-            self.find(i);
-        }
+        let parents = &self.parents;
+        let roots: Vec<usize> = (0..parents.len())
+            .into_par_iter()
+            .map(|i| {
+                let mut representative = i;
+                while parents[representative] != representative {
+                    representative = parents[representative];
+                }
+                representative
+            })
+            .collect();
+        self.parents = roots;
     }
 
     /// Assumes `compress_paths` has already been called.

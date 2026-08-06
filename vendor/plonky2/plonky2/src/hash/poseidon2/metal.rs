@@ -1266,17 +1266,22 @@ fn set_u32(encoder: &metal::ComputeCommandEncoderRef, index: u64, value: u32) {
     );
 }
 
+/// Largest multiple of `threadExecutionWidth` that fits in the driver-reported
+/// max threadgroup size. Kernels only index by `thread_position_in_grid`, so
+/// threadgroup width is pure occupancy scheduling and cannot change digests.
+fn dispatch_group_width(pipeline: &ComputePipelineState) -> NSUInteger {
+    let execution_width = pipeline.thread_execution_width();
+    let max_group = pipeline.max_total_threads_per_threadgroup();
+    ((max_group / execution_width) * execution_width).max(execution_width)
+}
+
 fn dispatch2d(
     encoder: &metal::ComputeCommandEncoderRef,
     pipeline: &ComputePipelineState,
     width: usize,
     height: usize,
 ) {
-    let execution_width = pipeline.thread_execution_width();
-    let group_width = pipeline
-        .max_total_threads_per_threadgroup()
-        .min(64)
-        .max(execution_width);
+    let group_width = dispatch_group_width(pipeline);
     encoder.dispatch_threads(
         MTLSize {
             width: width as NSUInteger,
@@ -1296,11 +1301,7 @@ fn dispatch(
     pipeline: &ComputePipelineState,
     thread_count: usize,
 ) {
-    let execution_width = pipeline.thread_execution_width();
-    let group_width = pipeline
-        .max_total_threads_per_threadgroup()
-        .min(64)
-        .max(execution_width);
+    let group_width = dispatch_group_width(pipeline);
     encoder.dispatch_threads(
         MTLSize {
             width: thread_count as NSUInteger,
