@@ -20,7 +20,7 @@ use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::util::timing::TimingTree;
 
-use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
+use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, PathCircuits, Proof};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxPath {
@@ -172,21 +172,15 @@ fn prove_path(
         !chunks.is_empty(),
         "{path:?} transaction path must contain at least one chunk"
     );
-    let (tx_data, tx_target, chain_data, chain_target, dummy_proof) = match path {
-        TxPath::Light => (
-            &circuits.light_tx_data,
-            &circuits.light_tx_target,
-            &circuits.light_chain_data,
-            &circuits.light_chain_target,
-            &circuits.dummy_light_proof,
-        ),
-        TxPath::Heavy => (
-            &circuits.heavy_tx_data,
-            &circuits.heavy_tx_target,
-            &circuits.heavy_chain_data,
-            &circuits.heavy_chain_target,
-            &circuits.dummy_heavy_proof,
-        ),
+    let PathCircuits {
+        tx_target,
+        tx_data,
+        chain_target,
+        chain_data,
+        dummy_proof,
+    } = match path {
+        TxPath::Light => circuits.light(),
+        TxPath::Heavy => circuits.heavy(),
     };
 
     let base_proof = cyclic_base_witness(
@@ -337,9 +331,9 @@ fn prove_path(
 
 pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     let pre_proof = BlockPreExecutionCircuit::prove(
-        &circuits.pre_data,
+        circuits.pre_data(),
         &BlockPreExec::from_block(&block),
-        &circuits.pre_target,
+        circuits.pre_target(),
     )
     .expect("block pre-execution proof failed");
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);

@@ -32,7 +32,6 @@ use crate::plonk::vanishing_poly::{
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
-use crate::util::partial_products::quotient_chunk_products;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_ceil};
 
@@ -410,6 +409,63 @@ fn all_wires_permutation_partial_products<
         .collect()
 }
 
+/// Number of consecutive subgroup rows whose chunk denominators share one field inversion.
+const PARTIAL_PRODUCTS_BATCH_SIZE: usize = 128;
+
+/// For every row of `xs`, returns the `beta_k_is.len().div_ceil(degree)` chunk ratios
+///
+/// ```text
+/// prod_{j in chunk} (w_j + beta_k_i_j * x + gamma) / prod_{j in chunk} (w_j + beta * sigma_j + gamma)
+/// ```
+///
+/// laid out row-major. `get_wire` is called with a row index relative to `xs` and a routed wire
+/// index. The per-wire ratios are never formed: each chunk accumulates one numerator product and
+/// one denominator product as the wires are read, and every denominator product in the batch is
+/// inverted by a single Montgomery pass.
+fn permutation_chunk_quotients<F: Field>(
+    xs: &[F],
+    sigmas: &[Vec<F>],
+    beta: F,
+    beta_k_is: &[F],
+    gamma: F,
+    degree: usize,
+    get_wire: impl Fn(usize, usize) -> F,
+) -> Vec<F> {
+    let num_routed_wires = beta_k_is.len();
+    debug_assert!(degree > 1);
+    debug_assert!(num_routed_wires > 0);
+    debug_assert_eq!(sigmas.len(), xs.len());
+    let chunks_per_row = num_routed_wires.div_ceil(degree);
+
+    let mut numerators = Vec::with_capacity(xs.len() * chunks_per_row);
+    let mut denominators = Vec::with_capacity(xs.len() * chunks_per_row);
+    for (row, &x) in xs.iter().enumerate() {
+        let s_sigmas = &sigmas[row];
+        debug_assert!(s_sigmas.len() >= num_routed_wires);
+        let mut lo = 0;
+        while lo < num_routed_wires {
+            let hi = min(lo + degree, num_routed_wires);
+            let wire_value = get_wire(row, lo);
+            let mut numerator = wire_value + beta_k_is[lo] * x + gamma;
+            let mut denominator = wire_value + beta * s_sigmas[lo] + gamma;
+            for j in lo + 1..hi {
+                let wire_value = get_wire(row, j);
+                numerator *= wire_value + beta_k_is[j] * x + gamma;
+                denominator *= wire_value + beta * s_sigmas[j] + gamma;
+            }
+            numerators.push(numerator);
+            denominators.push(denominator);
+            lo = hi;
+        }
+    }
+
+    let denominator_invs = F::batch_multiplicative_inverse(&denominators);
+    for (numerator, denominator_inv) in numerators.iter_mut().zip(denominator_invs) {
+        *numerator *= denominator_inv;
+    }
+    numerators
+}
+
 /// Compute the partial products used in the `Z` polynomial.
 /// Returns the polynomials interpolating `partial_products(f / g)`
 /// where `f, g` are the products in the definition of `Z`: `Z(g^i) = f / g`.
@@ -430,31 +486,23 @@ fn wires_permutation_partial_products_and_zs<
     let num_prods = common_data.num_partial_products;
     debug_assert_eq!(beta_k_is.len(), common_data.config.num_routed_wires);
     let num_routed_wires = common_data.config.num_routed_wires;
+    let chunks_per_row = num_routed_wires.div_ceil(degree);
+    debug_assert_eq!(chunks_per_row, num_prods + 1);
     let all_quotient_chunk_products = subgroup
-        .par_iter()
+        .par_chunks(PARTIAL_PRODUCTS_BATCH_SIZE)
         .enumerate()
-        .map_init(
-            // One denominator scratch buffer per worker thread instead of a
-            // fresh Vec per subgroup point.
-            || vec![F::ZERO; num_routed_wires],
-            |denominators, (i, &x)| {
-                let s_sigmas = &prover_data.sigmas[i];
-                for (j, denominator) in denominators.iter_mut().enumerate() {
-                    let wire_value = witness.get_wire(i, j);
-                    *denominator = wire_value + beta * s_sigmas[j] + gamma;
-                }
-                let mut quotient_values = F::batch_multiplicative_inverse(denominators);
-                // Multiply the numerators into the inverse buffer in place;
-                // the per-point numerator and quotient Vecs are gone.
-                for (j, quotient_value) in quotient_values.iter_mut().enumerate() {
-                    let wire_value = witness.get_wire(i, j);
-                    let numerator = wire_value + beta_k_is[j] * x + gamma;
-                    *quotient_value *= numerator;
-                }
-
-                quotient_chunk_products(&quotient_values, degree)
-            },
-        )
+        .map(|(batch, xs)| {
+            let first_row = batch * PARTIAL_PRODUCTS_BATCH_SIZE;
+            permutation_chunk_quotients(
+                xs,
+                &prover_data.sigmas[first_row..first_row + xs.len()],
+                beta,
+                beta_k_is,
+                gamma,
+                degree,
+                |row, j| witness.get_wire(first_row + row, j),
+            )
+        })
         .collect::<Vec<_>>();
 
     // Accumulate the sequential Z chain directly into the column-major output
@@ -462,22 +510,24 @@ fn wires_permutation_partial_products_and_zs<
     // and the whole-phase transpose. Values and their order are identical: for
     // each point, column k receives the k-th running product, and the last
     // column receives the previous Z(x) exactly as the swap-based version did.
-    let n_points = all_quotient_chunk_products.len();
+    let n_points = subgroup.len();
     let mut columns: Vec<Vec<F>> = (0..num_prods + 1)
         .map(|_| Vec::with_capacity(n_points))
         .collect();
     let mut z_x = F::ONE;
-    for quotient_chunk_products in all_quotient_chunk_products {
-        let mut acc = z_x;
-        for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
-            acc *= quotient_chunk_product;
-            if k == num_prods {
-                // The last term is Z(gx), but we store Z(x) in its place,
-                // otherwise Z would end up shifted.
-                columns[k].push(z_x);
-                z_x = acc;
-            } else {
-                columns[k].push(acc);
+    for batch in &all_quotient_chunk_products {
+        for quotient_chunk_products in batch.chunks_exact(chunks_per_row) {
+            let mut acc = z_x;
+            for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
+                acc *= quotient_chunk_product;
+                if k == num_prods {
+                    // The last term is Z(gx), but we store Z(x) in its place,
+                    // otherwise Z would end up shifted.
+                    columns[k].push(z_x);
+                    z_x = acc;
+                } else {
+                    columns[k].push(acc);
+                }
             }
         }
     }
@@ -904,4 +954,85 @@ fn compute_quotient_polys<
         })
         .map(|values| values.coset_ifft(F::coset_shift()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use plonky2_field::goldilocks_field::GoldilocksField;
+
+    use super::*;
+    use crate::util::partial_products::quotient_chunk_products;
+
+    fn next_field(state: &mut u64) -> GoldilocksField {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        GoldilocksField::from_canonical_u64(*state >> 1)
+    }
+
+    #[test]
+    fn chunk_quotients_match_per_wire_ratio_products() {
+        type F = GoldilocksField;
+
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        for &(num_routed_wires, degree) in &[(80_usize, 8_usize), (12, 4), (9, 4), (5, 8), (6, 3)] {
+            for &rows in &[1_usize, 3, 128] {
+                let beta = next_field(&mut state);
+                let gamma = next_field(&mut state);
+                let beta_k_is = (0..num_routed_wires)
+                    .map(|_| next_field(&mut state))
+                    .collect::<Vec<F>>();
+                let xs = (0..rows)
+                    .map(|_| next_field(&mut state))
+                    .collect::<Vec<F>>();
+                let sigmas = (0..rows)
+                    .map(|_| {
+                        (0..num_routed_wires)
+                            .map(|_| next_field(&mut state))
+                            .collect::<Vec<F>>()
+                    })
+                    .collect::<Vec<Vec<F>>>();
+                let wires = (0..rows)
+                    .map(|_| {
+                        (0..num_routed_wires)
+                            .map(|_| next_field(&mut state))
+                            .collect::<Vec<F>>()
+                    })
+                    .collect::<Vec<Vec<F>>>();
+
+                let mut expected = Vec::with_capacity(rows * num_routed_wires.div_ceil(degree));
+                let mut denominators = vec![F::ZERO; num_routed_wires];
+                for row in 0..rows {
+                    let x = xs[row];
+                    let s_sigmas = &sigmas[row];
+                    for (j, denominator) in denominators.iter_mut().enumerate() {
+                        let wire_value = wires[row][j];
+                        *denominator = wire_value + beta * s_sigmas[j] + gamma;
+                    }
+                    let mut quotient_values = F::batch_multiplicative_inverse(&denominators);
+                    for (j, quotient_value) in quotient_values.iter_mut().enumerate() {
+                        let wire_value = wires[row][j];
+                        let numerator = wire_value + beta_k_is[j] * x + gamma;
+                        *quotient_value *= numerator;
+                    }
+                    expected.extend(quotient_chunk_products(&quotient_values, degree));
+                }
+
+                let actual = permutation_chunk_quotients(
+                    &xs,
+                    &sigmas,
+                    beta,
+                    &beta_k_is,
+                    gamma,
+                    degree,
+                    |row, j| wires[row][j],
+                );
+
+                assert_eq!(
+                    actual, expected,
+                    "num_routed_wires {num_routed_wires}, degree {degree}, rows {rows}"
+                );
+            }
+        }
+    }
 }

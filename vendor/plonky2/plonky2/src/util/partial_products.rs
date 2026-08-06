@@ -10,6 +10,7 @@ use crate::hash::hash_types::RichField;
 use crate::iop::ext_target::ExtensionTarget;
 use crate::plonk::circuit_builder::CircuitBuilder;
 
+#[allow(dead_code)]
 pub(crate) fn quotient_chunk_products<F: Field>(
     quotient_values: &[F],
     max_degree: usize,

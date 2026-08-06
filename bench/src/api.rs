@@ -1,6 +1,9 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
+use std::sync::{Mutex, OnceLock};
+use std::thread::JoinHandle;
+
 use circuit::block_constraints::{BlockCircuit, BlockTarget, Circuit as _};
 use circuit::block_pre_execution_constraints::{
     BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
@@ -24,27 +27,51 @@ pub const PUBLIC_HEAVY_TX_COUNT: usize = 10;
 pub const PUBLIC_LIGHT_TX_COUNT: usize = 490;
 pub const PROVER_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
 
-pub struct Circuits {
-    pub heavy_tx_target: BlockTxTarget,
-    pub heavy_tx_data: CircuitData<F, C, D>,
-    pub light_tx_target: BlockTxTarget,
-    pub light_tx_data: CircuitData<F, C, D>,
-    pub pre_target: BlockPreExecutionTarget,
-    pub pre_data: CircuitData<F, C, D>,
-    pub heavy_chain_target: BlockTxChainTarget,
-    pub heavy_chain_data: CircuitData<F, C, D>,
-    pub light_chain_target: BlockTxChainTarget,
-    pub light_chain_data: CircuitData<F, C, D>,
-    pub dummy_heavy_proof: Proof,
-    pub dummy_light_proof: Proof,
+/// A value produced by a construction thread that was started ahead of time.
+/// The first accessor call blocks until that thread finishes; later calls are
+/// a plain load.
+struct Deferred<T> {
+    ready: OnceLock<T>,
+    pending: Mutex<Option<JoinHandle<T>>>,
 }
 
-struct PathCircuits {
-    tx_target: BlockTxTarget,
-    tx_data: CircuitData<F, C, D>,
-    chain_target: BlockTxChainTarget,
-    chain_data: CircuitData<F, C, D>,
-    dummy_proof: Proof,
+impl<T: Send + 'static> Deferred<T> {
+    fn start(name: &str, build: impl FnOnce() -> T + Send + 'static) -> Self {
+        let handle = std::thread::Builder::new()
+            .name(name.to_owned())
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(build)
+            .expect("circuit construction thread must start");
+        Self {
+            ready: OnceLock::new(),
+            pending: Mutex::new(Some(handle)),
+        }
+    }
+
+    fn get(&self) -> &T {
+        self.ready.get_or_init(|| {
+            self.pending
+                .lock()
+                .expect("circuit construction handle must not be poisoned")
+                .take()
+                .expect("circuit construction handle is taken exactly once")
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    }
+}
+
+pub struct PreExecutionCircuit {
+    pub target: BlockPreExecutionTarget,
+    pub data: CircuitData<F, C, D>,
+}
+
+pub struct PathCircuits {
+    pub tx_target: BlockTxTarget,
+    pub tx_data: CircuitData<F, C, D>,
+    pub chain_target: BlockTxChainTarget,
+    pub chain_data: CircuitData<F, C, D>,
+    pub dummy_proof: Proof,
 }
 
 impl PathCircuits {
@@ -76,34 +103,54 @@ impl PathCircuits {
     }
 }
 
+struct TxPathCircuits {
+    heavy: PathCircuits,
+    light: PathCircuits,
+}
+
+pub struct Circuits {
+    pre: Deferred<PreExecutionCircuit>,
+    paths: Deferred<TxPathCircuits>,
+}
+
 impl Circuits {
+    /// Starts circuit construction on background threads and returns without
+    /// waiting for it. Each accessor blocks only on the circuits it needs, so
+    /// fixture parsing and the pre-execution proof overlap with the
+    /// transaction and chain circuit construction they do not depend on.
     pub fn new() -> Self {
-        let ((pre_target, pre_data), (heavy, light)) = rayon::join(
-            || {
+        Self {
+            pre: Deferred::start("pre-execution-circuit", || {
                 let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
-                (pre.target, pre.builder.build::<C>())
-            },
-            || {
-                rayon::join(
+                PreExecutionCircuit {
+                    target: pre.target,
+                    data: pre.builder.build::<C>(),
+                }
+            }),
+            paths: Deferred::start("transaction-path-circuits", || {
+                let (heavy, light) = rayon::join(
                     || PathCircuits::new(HEAVY_TX_PER_PROOF, HEAVY_TX_MODE),
                     || PathCircuits::new(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE),
-                )
-            },
-        );
-        Self {
-            heavy_tx_target: heavy.tx_target,
-            heavy_tx_data: heavy.tx_data,
-            light_tx_target: light.tx_target,
-            light_tx_data: light.tx_data,
-            pre_target,
-            pre_data,
-            heavy_chain_target: heavy.chain_target,
-            heavy_chain_data: heavy.chain_data,
-            light_chain_target: light.chain_target,
-            light_chain_data: light.chain_data,
-            dummy_heavy_proof: heavy.dummy_proof,
-            dummy_light_proof: light.dummy_proof,
+                );
+                TxPathCircuits { heavy, light }
+            }),
         }
+    }
+
+    pub fn pre_target(&self) -> &BlockPreExecutionTarget {
+        &self.pre.get().target
+    }
+
+    pub fn pre_data(&self) -> &CircuitData<F, C, D> {
+        &self.pre.get().data
+    }
+
+    pub fn heavy(&self) -> &PathCircuits {
+        &self.paths.get().heavy
+    }
+
+    pub fn light(&self) -> &PathCircuits {
+        &self.paths.get().light
     }
 
     /// Builds the final block circuit, which depends on the pre-execution and
@@ -112,9 +159,9 @@ impl Circuits {
     pub fn build_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
         let block = BlockCircuit::define(
             CIRCUIT_CONFIG,
-            &self.pre_data,
-            &self.light_chain_data,
-            &self.heavy_chain_data,
+            self.pre_data(),
+            &self.light().chain_data,
+            &self.heavy().chain_data,
             ON_CHAIN_OPERATIONS_LIMIT,
         );
         (block.target, block.builder.build::<C>())
