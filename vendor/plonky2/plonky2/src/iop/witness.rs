@@ -361,16 +361,17 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         (self.set_bitmap[rep_index >> 6] >> (rep_index & 63)) & 1 != 0
     }
 
-    #[inline]
-    fn mark_set(&mut self, rep_index: usize) {
-        self.set_bitmap[rep_index >> 6] |= 1u64 << (rep_index & 63);
-    }
-
     /// Set a `Target`. On success, returns the representative index of the newly-set target. If the
     /// target was already set, returns `None`.
     pub fn set_target_returning_rep(&mut self, target: Target, value: F) -> Result<Option<usize>> {
         let rep_index = self.representative_map[self.target_index(target)];
-        if self.is_set_by_rep_index(rep_index) {
+        // Fuse the bitmap word load and mark: this is the hottest setter path,
+        // and the helper-based form otherwise recomputes the word/bit location
+        // for the successful (new-value) case.
+        let bitmap_word_index = rep_index >> 6;
+        let bitmap_bit = 1u64 << (rep_index & 63);
+        let bitmap_word = self.set_bitmap[bitmap_word_index];
+        if bitmap_word & bitmap_bit != 0 {
             let old_value = self.values[rep_index];
             if value != old_value {
                 return Err(anyhow!(
@@ -384,7 +385,7 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
             Ok(None)
         } else {
             self.values[rep_index] = value;
-            self.mark_set(rep_index);
+            self.set_bitmap[bitmap_word_index] = bitmap_word | bitmap_bit;
             Ok(Some(rep_index))
         }
     }
