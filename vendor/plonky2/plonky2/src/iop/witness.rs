@@ -373,18 +373,37 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         target.index(self.num_wires, self.degree)
     }
 
-    pub fn full_witness(self) -> MatrixWitness<F> {
-        let mut wire_values = vec![vec![F::ZERO; self.degree]; self.num_wires];
-        for i in 0..self.degree {
-            for j in 0..self.num_wires {
-                let t = Target::Wire(Wire { row: i, column: j });
-                if let Some(x) = self.try_get_target(t) {
-                    wire_values[j][i] = x;
+    fn into_wire_values_row_tiled(self) -> Vec<Vec<F>> {
+        // Keep each representative-map tile cache-resident while writing one output column
+        // contiguously. The production 136-wire configuration uses 34 KiB per tile.
+        const ROWS_PER_TILE: usize = 32;
+
+        let Self {
+            values,
+            representative_map,
+            num_wires,
+            degree,
+        } = self;
+        let mut wire_values = vec![vec![F::ZERO; degree]; num_wires];
+        for row_start in (0..degree).step_by(ROWS_PER_TILE) {
+            let row_end = (row_start + ROWS_PER_TILE).min(degree);
+            for (column, column_values) in wire_values.iter_mut().enumerate() {
+                for row in row_start..row_end {
+                    let representative = representative_map[row * num_wires + column];
+                    if let Some(value) = values[representative] {
+                        column_values[row] = value;
+                    }
                 }
             }
         }
 
-        MatrixWitness { wire_values }
+        wire_values
+    }
+
+    pub fn full_witness(self) -> MatrixWitness<F> {
+        MatrixWitness {
+            wire_values: self.into_wire_values_row_tiled(),
+        }
     }
 }
 
@@ -398,5 +417,53 @@ impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
     fn try_get_target(&self, target: Target) -> Option<F> {
         let rep_index = self.representative_map[self.target_index(target)];
         self.values[rep_index]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    #[test]
+    fn row_tiled_wire_values_preserve_assigned_copied_and_unset_cells_across_tiles() {
+        type F = GoldilocksField;
+
+        const NUM_WIRES: usize = 3;
+        const DEGREE: usize = 35;
+
+        let mut representative_map = (0..NUM_WIRES * DEGREE).collect::<Vec<_>>();
+        let shared_source = Target::wire(1, 0);
+        let shared_copy = Target::wire(33, 2);
+        representative_map[shared_copy.index(NUM_WIRES, DEGREE)] =
+            shared_source.index(NUM_WIRES, DEGREE);
+
+        let mut witness = PartitionWitness::<F>::new(NUM_WIRES, DEGREE, &representative_map);
+        witness
+            .set_target(Target::wire(0, 0), F::from_canonical_u64(11))
+            .unwrap();
+        witness
+            .set_target(shared_source, F::from_canonical_u64(55))
+            .unwrap();
+        witness
+            .set_target(Target::wire(31, 1), F::from_canonical_u64(22))
+            .unwrap();
+        witness
+            .set_target(Target::wire(32, 2), F::from_canonical_u64(33))
+            .unwrap();
+        witness
+            .set_target(Target::wire(34, 0), F::from_canonical_u64(44))
+            .unwrap();
+
+        let actual = witness.into_wire_values_row_tiled();
+        let mut expected = vec![vec![F::ZERO; DEGREE]; NUM_WIRES];
+        expected[0][0] = F::from_canonical_u64(11);
+        expected[0][1] = F::from_canonical_u64(55);
+        expected[1][31] = F::from_canonical_u64(22);
+        expected[2][32] = F::from_canonical_u64(33);
+        expected[2][33] = F::from_canonical_u64(55);
+        expected[0][34] = F::from_canonical_u64(44);
+
+        assert_eq!(actual, expected);
     }
 }
