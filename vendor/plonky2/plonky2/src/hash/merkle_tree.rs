@@ -140,6 +140,19 @@ pub(crate) fn capacity_up_to_mut<T>(v: &mut Vec<T>, len: usize) -> &mut [MaybeUn
     }
 }
 
+#[derive(Clone, Copy)]
+struct ColumnHashPtr<T>(*mut T);
+
+unsafe impl<T> Send for ColumnHashPtr<T> {}
+unsafe impl<T> Sync for ColumnHashPtr<T> {}
+
+impl<T> ColumnHashPtr<T> {
+    #[inline(always)]
+    fn get(self) -> *mut T {
+        self.0
+    }
+}
+
 pub(crate) fn fill_subtree<F: RichField, H: Hasher<F>>(
     digests_buf: &mut [MaybeUninit<H::Hash>],
     leaves: &[Vec<F>],
@@ -279,12 +292,11 @@ pub(crate) fn fill_digests_buf_flat<F: RichField, H: Hasher<F>>(
     // Special case of a tree that's all cap.
     if digests_buf.is_empty() {
         debug_assert_eq!(cap_buf.len(), num_leaves);
-        cap_buf
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, cap_buf)| {
-                cap_buf.write(H::hash_or_noop(&leaves[i * leaf_width..(i + 1) * leaf_width]));
-            });
+        cap_buf.par_iter_mut().enumerate().for_each(|(i, cap_buf)| {
+            cap_buf.write(H::hash_or_noop(
+                &leaves[i * leaf_width..(i + 1) * leaf_width],
+            ));
+        });
         return;
     }
 
@@ -302,6 +314,150 @@ pub(crate) fn fill_digests_buf_flat<F: RichField, H: Hasher<F>>(
                 leaf_width,
                 subtree_leaves_len,
             ));
+        },
+    );
+}
+fn hash_column_leaves<F: RichField, H: Hasher<F>>(
+    columns: &[Vec<F>],
+    log_rows: usize,
+) -> Vec<H::Hash> {
+    let width = columns.len();
+    let rows = columns[0].len();
+
+    if rows < 4 {
+        let mut scratch = vec![F::ZERO; width];
+        return (0..rows)
+            .map(|tree_index| {
+                let source_index = crate::util::reverse_bits(tree_index, log_rows);
+                for (value, column) in scratch.iter_mut().zip(columns) {
+                    *value = column[source_index];
+                }
+                H::hash_or_noop(&scratch)
+            })
+            .collect();
+    }
+
+    debug_assert_eq!(rows % 4, 0);
+    let mut leaf_hashes: Vec<H::Hash> = Vec::with_capacity(rows);
+    let output = ColumnHashPtr(leaf_hashes.as_mut_ptr());
+
+    (0..rows / 4).into_par_iter().for_each_init(
+        || vec![F::ZERO; 4 * width],
+        |scratch, group| {
+            let source_start = 4 * group;
+            let (row_0, rest) = scratch.split_at_mut(width);
+            let (row_1, rest) = rest.split_at_mut(width);
+            let (row_2, row_3) = rest.split_at_mut(width);
+
+            // Read four adjacent values while each column is active. The hashes
+            // are scattered into tree order only after all four rows are ready.
+            for (j, column) in columns.iter().enumerate() {
+                let source = unsafe { column.as_ptr().add(source_start) };
+                row_0[j] = unsafe { *source };
+                row_1[j] = unsafe { *source.add(1) };
+                row_2[j] = unsafe { *source.add(2) };
+                row_3[j] = unsafe { *source.add(3) };
+            }
+
+            let hashes = H::hash_or_noop_quad(row_0, row_1, row_2, row_3);
+            for (offset, hash) in [hashes.0, hashes.1, hashes.2, hashes.3]
+                .into_iter()
+                .enumerate()
+            {
+                let tree_index = crate::util::reverse_bits(source_start + offset, log_rows);
+                // SAFETY: bit reversal is a bijection over `0..rows`, so each
+                // initialized slot is distinct and within the allocated capacity.
+                unsafe { output.get().add(tree_index).write(hash) };
+            }
+        },
+    );
+
+    // SAFETY: the parallel loop initialized every bit-reversed output slot once.
+    unsafe { leaf_hashes.set_len(rows) };
+    leaf_hashes
+}
+
+fn fill_subtree_hashes<F: RichField, H: Hasher<F>>(
+    digests_buf: &mut [MaybeUninit<H::Hash>],
+    leaf_hashes: &[H::Hash],
+) -> H::Hash {
+    let num_leaves = leaf_hashes.len();
+    debug_assert_eq!(num_leaves, digests_buf.len() / 2 + 1);
+    if digests_buf.is_empty() {
+        return leaf_hashes[0];
+    }
+
+    let (left_digests_buf, right_digests_buf) = digests_buf.split_at_mut(digests_buf.len() / 2);
+    let (left_digest_mem, left_digests_buf) = left_digests_buf.split_last_mut().unwrap();
+    let (right_digest_mem, right_digests_buf) = right_digests_buf.split_first_mut().unwrap();
+    let (left_hashes, right_hashes) = leaf_hashes.split_at(num_leaves / 2);
+
+    if num_leaves == 2 {
+        let left_digest = left_hashes[0];
+        let right_digest = right_hashes[0];
+        left_digest_mem.write(left_digest);
+        right_digest_mem.write(right_digest);
+        return H::two_to_one(left_digest, right_digest);
+    }
+
+    if num_leaves == 4 {
+        let h0 = left_hashes[0];
+        let h1 = left_hashes[1];
+        let h2 = right_hashes[0];
+        let h3 = right_hashes[1];
+        left_digests_buf[0].write(h0);
+        left_digests_buf[1].write(h1);
+        right_digests_buf[0].write(h2);
+        right_digests_buf[1].write(h3);
+        let (left_digest, right_digest) = H::two_to_one_pair(h0, h1, h2, h3);
+        left_digest_mem.write(left_digest);
+        right_digest_mem.write(right_digest);
+        return H::two_to_one(left_digest, right_digest);
+    }
+
+    let (left_digest, right_digest) = if num_leaves > 16 {
+        plonky2_maybe_rayon::join(
+            || fill_subtree_hashes::<F, H>(left_digests_buf, left_hashes),
+            || fill_subtree_hashes::<F, H>(right_digests_buf, right_hashes),
+        )
+    } else {
+        (
+            fill_subtree_hashes::<F, H>(left_digests_buf, left_hashes),
+            fill_subtree_hashes::<F, H>(right_digests_buf, right_hashes),
+        )
+    };
+
+    left_digest_mem.write(left_digest);
+    right_digest_mem.write(right_digest);
+    H::two_to_one(left_digest, right_digest)
+}
+
+fn fill_digests_buf_hashes<F: RichField, H: Hasher<F>>(
+    digests_buf: &mut [MaybeUninit<H::Hash>],
+    cap_buf: &mut [MaybeUninit<H::Hash>],
+    leaf_hashes: &[H::Hash],
+    cap_height: usize,
+) {
+    if digests_buf.is_empty() {
+        debug_assert_eq!(cap_buf.len(), leaf_hashes.len());
+        cap_buf
+            .par_iter_mut()
+            .zip(leaf_hashes)
+            .for_each(|(cap, hash)| {
+                cap.write(*hash);
+            });
+        return;
+    }
+
+    let subtree_digests_len = digests_buf.len() >> cap_height;
+    let subtree_leaves_len = leaf_hashes.len() >> cap_height;
+    let digests_chunks = digests_buf.par_chunks_exact_mut(subtree_digests_len);
+    let leaf_chunks = leaf_hashes.par_chunks_exact(subtree_leaves_len);
+    debug_assert_eq!(digests_chunks.len(), cap_buf.len());
+    debug_assert_eq!(digests_chunks.len(), leaf_chunks.len());
+    digests_chunks.zip(cap_buf).zip(leaf_chunks).for_each(
+        |((subtree_digests, subtree_cap), subtree_hashes)| {
+            subtree_cap.write(fill_subtree_hashes::<F, H>(subtree_digests, subtree_hashes));
         },
     );
 }
@@ -397,10 +553,9 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             };
         }
 
-        // CPU fallback: materialize the bit-reversed row-major matrix and hash it.
-        let flat = crate::util::transpose_to_bitrev_flat(&columns);
-        let (digests, cap) =
-            Self::cpu_digests(&flat, columns.len(), num_leaves, cap_height);
+        // CPU fallback: hash bit-reversed column rows directly, avoiding the
+        // full row-major transpose buffer and its subsequent read pass.
+        let (digests, cap) = Self::cpu_digests_columns(&columns, log_rows, cap_height);
         Self {
             leaves: MerkleLeaves::Columns {
                 columns: ColumnStore::Owned(columns),
@@ -456,6 +611,30 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         unsafe {
             // SAFETY: `fill_digests_buf_flat` and `cap` initialized the spare capacity up to
             // `num_digests` and `len_cap`, resp.
+            digests.set_len(num_digests);
+            cap.set_len(len_cap);
+        }
+        (digests, cap)
+    }
+    fn cpu_digests_columns(
+        columns: &[Vec<F>],
+        log_rows: usize,
+        cap_height: usize,
+    ) -> (Vec<H::Hash>, Vec<H::Hash>) {
+        let leaf_hashes = hash_column_leaves::<F, H>(columns, log_rows);
+        let num_leaves = leaf_hashes.len();
+        let num_digests = 2 * (num_leaves - (1 << cap_height));
+        let mut digests = Vec::with_capacity(num_digests);
+
+        let len_cap = 1 << cap_height;
+        let mut cap = Vec::with_capacity(len_cap);
+
+        let digests_buf = capacity_up_to_mut(&mut digests, num_digests);
+        let cap_buf = capacity_up_to_mut(&mut cap, len_cap);
+        fill_digests_buf_hashes::<F, H>(digests_buf, cap_buf, &leaf_hashes, cap_height);
+
+        unsafe {
+            // SAFETY: `fill_digests_buf_hashes` initialized both spare-capacity slices.
             digests.set_len(num_digests);
             cap.set_len(len_cap);
         }
@@ -552,7 +731,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::field::extension::Extendable;
     use crate::hash::merkle_proofs::verify_merkle_proof_to_cap;
-    use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
+    use crate::plonk::config::{
+        GenericConfig, Poseidon2GoldilocksConfig, PoseidonGoldilocksConfig,
+    };
 
     pub(crate) fn random_data<F: RichField>(n: usize, k: usize) -> Vec<Vec<F>> {
         (0..n).map(|_| F::rand_vec(k)).collect()
@@ -616,5 +797,29 @@ pub(crate) mod tests {
         verify_all_leaves::<F, C, D>(leaves, 1)?;
 
         Ok(())
+    }
+    #[test]
+    fn column_cpu_digests_match_flat_reference() {
+        const D: usize = 2;
+        type C = Poseidon2GoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        for log_rows in 0..=5 {
+            let rows = 1 << log_rows;
+            for width in [1, 4, 5, 16] {
+                let columns = random_data::<F>(width, rows);
+                let flat = crate::util::transpose_to_bitrev_flat(&columns);
+                for cap_height in 0..=log_rows {
+                    let expected = MerkleTree::<F, H>::cpu_digests(&flat, width, rows, cap_height);
+                    let actual =
+                        MerkleTree::<F, H>::cpu_digests_columns(&columns, log_rows, cap_height);
+                    assert_eq!(
+                        actual, expected,
+                        "rows={rows}, width={width}, cap_height={cap_height}"
+                    );
+                }
+            }
+        }
     }
 }
