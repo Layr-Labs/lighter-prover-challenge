@@ -8,7 +8,6 @@ use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
-use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
 use crate::gates::selectors::LookupSelectors;
@@ -21,7 +20,7 @@ use crate::plonk::plonk_common;
 use crate::plonk::plonk_common::eval_l_0_circuit;
 use crate::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBaseBatch};
 use crate::util::partial_products::{
-    check_partial_products, check_partial_products_circuit, check_partial_products_into,
+    check_partial_products, check_partial_products_circuit, check_permutation_partial_products_into,
 };
 use crate::util::reducing::ReducingFactorTarget;
 use crate::with_context;
@@ -168,8 +167,6 @@ pub(crate) fn eval_vanishing_poly<F: RichField + Extendable<D>, const D: usize>(
 /// once per 32-point batch.
 #[derive(Default)]
 pub(crate) struct VanishingScratch<F> {
-    pub numerator_values: Vec<F>,
-    pub denominator_values: Vec<F>,
     pub vanishing_z_1_terms: Vec<F>,
     pub vanishing_partial_products_terms: Vec<F>,
     pub vanishing_all_lookup_terms: Vec<F>,
@@ -205,8 +202,8 @@ fn reduce_gate_constraints_base_batch<F: Field>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
-    indices_batch: &[usize],
     xs_batch: &[F],
+    l_0_batch: &[F],
     vars_batch: EvaluationVarsBaseBatch<F>,
     local_zs_batch: &[&[F]],
     next_zs_batch: &[&[F]],
@@ -219,15 +216,14 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     beta_k_is: &[F],
     deltas: &[F],
     alphas: &[F],
-    z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
     scratch: &mut VanishingScratch<F>,
     res_out: &mut [F],
 ) {
     let has_lookup = common_data.num_lookup_polys != 0;
 
-    let n = indices_batch.len();
-    assert_eq!(xs_batch.len(), n);
+    let n = xs_batch.len();
+    assert_eq!(l_0_batch.len(), n);
     assert_eq!(vars_batch.len(), n);
     assert_eq!(local_zs_batch.len(), n);
     assert_eq!(next_zs_batch.len(), n);
@@ -261,11 +257,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
     reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out);
 
-    let numerator_values = &mut scratch.numerator_values;
-    let denominator_values = &mut scratch.denominator_values;
-    numerator_values.clear();
-    denominator_values.clear();
-
     // The L_0(x) (Z(x) - 1) vanishing terms.
     let vanishing_z_1_terms = &mut scratch.vanishing_z_1_terms;
     // The terms checking the partial products.
@@ -278,7 +269,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     debug_assert_eq!(res_out.len(), n * num_challenges);
     for k in 0..n {
-        let index = indices_batch[k];
         let x = xs_batch[k];
         let vars = vars_batch.view(k);
 
@@ -306,7 +296,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         let partial_products = partial_products_batch[k];
         let s_sigmas = s_sigmas_batch[k];
 
-        let l_0_x = z_h_on_coset.eval_l_0(index, x);
+        let l_0_x = l_0_batch[k];
         for i in 0..num_challenges {
             let z_x = local_zs[i];
             let z_gx = next_zs[i];
@@ -333,35 +323,25 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 vanishing_all_lookup_terms.extend(lookup_constraints);
             }
 
-            numerator_values.extend((0..num_routed_wires).map(|j| {
-                let wire_value = vars.local_wires[j];
-                let beta_k_i = beta_k_is[i * num_routed_wires + j];
-                wire_value + beta_k_i * x + gammas[i]
-            }));
-            denominator_values.extend((0..num_routed_wires).map(|j| {
-                let wire_value = vars.local_wires[j];
-                let s_sigma = s_sigmas[j];
-                wire_value + betas[i] * s_sigma + gammas[i]
-            }));
-
             // The partial products considered for this iteration of `i`.
             let current_partial_products = &partial_products[i * num_prods..(i + 1) * num_prods];
-            // Check the numerator partial products, appending the terms directly to the
-            // worker-local scratch vector instead of collecting a fresh ten-element `Vec`
-            // per point and challenge. Not cleared between challenges: challenge `i + 1`
-            // must append after challenge `i` for the same point.
-            check_partial_products_into(
-                numerator_values,
-                denominator_values,
+            let current_beta_k_is = &beta_k_is[i * num_routed_wires..(i + 1) * num_routed_wires];
+            // Build each numerator/denominator chunk product directly from the wire and
+            // sigma evaluations, avoiding two materialized routed-wire arrays.
+            check_permutation_partial_products_into(
+                num_routed_wires,
+                |j| vars.local_wires[j],
+                s_sigmas,
+                current_beta_k_is,
+                betas[i],
+                gammas[i],
+                x,
                 current_partial_products,
                 z_x,
                 z_gx,
                 max_degree,
                 vanishing_partial_products_terms,
             );
-
-            numerator_values.clear();
-            denominator_values.clear();
         }
 
         let vanishing_terms = vanishing_z_1_terms
