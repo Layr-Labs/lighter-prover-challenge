@@ -197,6 +197,14 @@ unsafe impl PackedField for WideGoldilocksField {
     }
 
     #[inline]
+    fn multiply_accumulate_packed(&self, x: Self, y: Self) -> Self {
+        let accumulator = self.lanes().map(|value| value.0);
+        let lhs = x.lanes().map(|value| value.0);
+        let rhs = y.lanes().map(|value| value.0);
+        Self::from_lanes(mul_add_reduce_quad(accumulator, lhs, rhs).map(GoldilocksField))
+    }
+
+    #[inline]
     fn interleave(&self, other: Self, block_len: usize) -> (Self, Self) {
         let a = self.lanes();
         let b = other.lanes();
@@ -350,6 +358,96 @@ fn mul_reduce_quad(lhs: [u64; 4], rhs: [u64; 4]) -> [u64; 4] {
     [result0, result1, result2, result3]
 }
 
+/// Multiply four independent lane pairs, add four accumulators, and reduce modulo
+/// `2^64 - 2^32 + 1`.
+#[inline(always)]
+fn mul_add_reduce_quad(accumulator: [u64; 4], lhs: [u64; 4], rhs: [u64; 4]) -> [u64; 4] {
+    let [accumulator0, accumulator1, accumulator2, accumulator3] = accumulator;
+    let [mut result0, mut result1, mut result2, mut result3] = lhs;
+    let [scratch0, scratch1, scratch2, scratch3] = rhs;
+
+    unsafe {
+        asm!(
+            "umulh {hi0}, {result0}, {scratch0}",
+            "umulh {hi1}, {result1}, {scratch1}",
+            "umulh {hi2}, {result2}, {scratch2}",
+            "umulh {hi3}, {result3}, {scratch3}",
+            "mul   {result0}, {result0}, {scratch0}",
+            "mul   {result1}, {result1}, {scratch1}",
+            "mul   {result2}, {result2}, {scratch2}",
+            "mul   {result3}, {result3}, {scratch3}",
+            "adds  {result0}, {result0}, {accumulator0}",
+            "adc   {hi0}, {hi0}, xzr",
+            "adds  {result1}, {result1}, {accumulator1}",
+            "adc   {hi1}, {hi1}, xzr",
+            "adds  {result2}, {result2}, {accumulator2}",
+            "adc   {hi2}, {hi2}, xzr",
+            "adds  {result3}, {result3}, {accumulator3}",
+            "adc   {hi3}, {hi3}, xzr",
+            "lsr   {scratch0}, {hi0}, #32",
+            "lsr   {scratch1}, {hi1}, #32",
+            "lsr   {scratch2}, {hi2}, #32",
+            "lsr   {scratch3}, {hi3}, #32",
+            "subs  {result0}, {result0}, {scratch0}",
+            "csetm {scratch0:w}, cc",
+            "subs  {result1}, {result1}, {scratch1}",
+            "csetm {scratch1:w}, cc",
+            "subs  {result2}, {result2}, {scratch2}",
+            "csetm {scratch2:w}, cc",
+            "subs  {result3}, {result3}, {scratch3}",
+            "csetm {scratch3:w}, cc",
+            "sub   {result0}, {result0}, {scratch0}",
+            "sub   {result1}, {result1}, {scratch1}",
+            "sub   {result2}, {result2}, {scratch2}",
+            "sub   {result3}, {result3}, {scratch3}",
+            "and   {scratch0}, {hi0}, {epsilon}",
+            "and   {scratch1}, {hi1}, {epsilon}",
+            "and   {scratch2}, {hi2}, {epsilon}",
+            "and   {scratch3}, {hi3}, {epsilon}",
+            "lsl   {hi0}, {scratch0}, #32",
+            "lsl   {hi1}, {scratch1}, #32",
+            "lsl   {hi2}, {scratch2}, #32",
+            "lsl   {hi3}, {scratch3}, #32",
+            "sub   {hi0}, {hi0}, {scratch0}",
+            "sub   {hi1}, {hi1}, {scratch1}",
+            "sub   {hi2}, {hi2}, {scratch2}",
+            "sub   {hi3}, {hi3}, {scratch3}",
+            "adds  {result0}, {result0}, {hi0}",
+            "csetm {scratch0:w}, cs",
+            "adds  {result1}, {result1}, {hi1}",
+            "csetm {scratch1:w}, cs",
+            "adds  {result2}, {result2}, {hi2}",
+            "csetm {scratch2:w}, cs",
+            "adds  {result3}, {result3}, {hi3}",
+            "csetm {scratch3:w}, cs",
+            "add   {result0}, {result0}, {scratch0}",
+            "add   {result1}, {result1}, {scratch1}",
+            "add   {result2}, {result2}, {scratch2}",
+            "add   {result3}, {result3}, {scratch3}",
+            result0 = inout(reg) result0,
+            result1 = inout(reg) result1,
+            result2 = inout(reg) result2,
+            result3 = inout(reg) result3,
+            scratch0 = inout(reg) scratch0 => _,
+            scratch1 = inout(reg) scratch1 => _,
+            scratch2 = inout(reg) scratch2 => _,
+            scratch3 = inout(reg) scratch3 => _,
+            hi0 = out(reg) _,
+            hi1 = out(reg) _,
+            hi2 = out(reg) _,
+            hi3 = out(reg) _,
+            accumulator0 = in(reg) accumulator0,
+            accumulator1 = in(reg) accumulator1,
+            accumulator2 = in(reg) accumulator2,
+            accumulator3 = in(reg) accumulator3,
+            epsilon = in(reg) GoldilocksField::ORDER.wrapping_neg(),
+            options(pure, nomem, nostack),
+        );
+    }
+
+    [result0, result1, result2, result3]
+}
+
 #[cfg(test)]
 mod tests {
     use super::WideGoldilocksField;
@@ -434,6 +532,35 @@ mod tests {
                     packed_a.square().as_slice(),
                     core::array::from_fn::<_, 4, _>(|lane| a[lane].square())
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn fused_multiply_accumulate_matches_scalar_boundaries() {
+        let values = boundary_values();
+        for i in 0..values.len() {
+            for j in 0..values.len() {
+                for k in 0..values.len() {
+                    let accumulator: [GoldilocksField; 4] =
+                        core::array::from_fn(|lane| values[(i + lane) % values.len()]);
+                    let a: [GoldilocksField; 4] =
+                        core::array::from_fn(|lane| values[(j + 2 * lane) % values.len()]);
+                    let b: [GoldilocksField; 4] =
+                        core::array::from_fn(|lane| values[(k + 3 * lane) % values.len()]);
+                    let packed_accumulator = *WideGoldilocksField::from_slice(&accumulator);
+                    let packed_a = *WideGoldilocksField::from_slice(&a);
+                    let packed_b = *WideGoldilocksField::from_slice(&b);
+
+                    assert_eq!(
+                        packed_accumulator
+                            .multiply_accumulate_packed(packed_a, packed_b)
+                            .as_slice(),
+                        core::array::from_fn::<_, 4, _>(|lane| {
+                            Field::multiply_accumulate(&accumulator[lane], a[lane], b[lane])
+                        })
+                    );
+                }
             }
         }
     }
