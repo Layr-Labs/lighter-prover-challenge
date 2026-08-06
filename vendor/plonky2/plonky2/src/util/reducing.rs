@@ -107,6 +107,39 @@ impl<F: Field> ReducingFactor<F> {
         PolynomialCoeffs::new(acc)
     }
 
+    /// Reduce base-field polynomials and divide the result by `(X - z)` in a
+    /// single coefficient pass. This avoids materializing the intermediate
+    /// extension-valued composition polynomial and then scanning it again for
+    /// synthetic division.
+    pub fn reduce_polys_base_divide_by_linear<BF: Extendable<D, Extension = F>, const D: usize>(
+        &mut self,
+        polys: &[&PolynomialCoeffs<BF>],
+        z: F,
+    ) -> PolynomialCoeffs<F>
+    where
+        F: FieldExtension<D, BaseField = BF>,
+    {
+        let max_len = polys.iter().map(|p| p.coeffs.len()).max().unwrap_or(0);
+        if max_len <= 1 {
+            return PolynomialCoeffs::empty();
+        }
+        let powers: Vec<F> = self.base.powers().take(polys.len()).collect();
+        self.count += polys.len() as u64;
+        let mut quotient = vec![F::ZERO; max_len - 1];
+        let mut carry = F::ZERO;
+        for coeff_index in (1..max_len).rev() {
+            let mut coeff = F::ZERO;
+            for (power, poly) in powers.iter().zip(polys.iter()) {
+                if let Some(&c) = poly.coeffs.get(coeff_index) {
+                    coeff += <F as FieldExtension<D>>::scalar_mul(power, c);
+                }
+            }
+            carry = coeff + carry * z;
+            quotient[coeff_index - 1] = carry;
+        }
+        PolynomialCoeffs::new(quotient)
+    }
+
     pub fn shift(&mut self, x: F) -> F {
         let tmp = self.base.exp_u64(self.count) * x;
         self.count = 0;
@@ -116,14 +149,6 @@ impl<F: Field> ReducingFactor<F> {
     pub fn shift_poly(&mut self, p: &mut PolynomialCoeffs<F>) {
         *p *= self.base.exp_u64(self.count);
         self.count = 0;
-    }
-
-    /// Returns the factor `shift_poly` would multiply by (`base^count`) and
-    /// resets the count, letting callers fuse the multiply into another pass.
-    pub fn shift_factor(&mut self) -> F {
-        let tmp = self.base.exp_u64(self.count);
-        self.count = 0;
-        tmp
     }
 
     pub fn reset(&mut self) {
@@ -299,6 +324,7 @@ mod tests {
 
     use super::*;
     use crate::field::types::Sample;
+    use crate::field::polynomial::PolynomialCoeffs;
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
@@ -364,6 +390,30 @@ mod tests {
         let proof = data.prove(pw)?;
 
         verify(proof, &data.verifier_only, &data.common)
+    }
+
+    #[test]
+    fn test_fused_reduce_divide_matches_reference() {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type FE = <C as GenericConfig<D>>::FE;
+
+        let alpha = FE::rand();
+        let polys = vec![
+            PolynomialCoeffs::new(F::rand_vec(9)),
+            PolynomialCoeffs::new(F::rand_vec(6)),
+            PolynomialCoeffs::new(F::rand_vec(4)),
+        ];
+        let refs: Vec<&PolynomialCoeffs<F>> = polys.iter().collect();
+        let point = FE::rand();
+        let mut reference_factor = ReducingFactor::new(alpha);
+        let reference_composition = reference_factor.reduce_polys_base::<F, D>(refs.iter().copied());
+        let reference = reference_composition.divide_by_linear(point);
+        let mut fused_factor = ReducingFactor::new(alpha);
+        let fused = fused_factor
+            .reduce_polys_base_divide_by_linear::<F, D>(&refs, point);
+        assert_eq!(fused.coeffs, reference.coeffs);
     }
 
     #[test]

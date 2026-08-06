@@ -31,13 +31,6 @@ pub trait GenericHashOut<F: RichField>:
     fn from_bytes(bytes: &[u8]) -> Self;
 
     fn to_vec(&self) -> Vec<F>;
-
-    /// Visit the hash's field elements in `to_vec` order without requiring an
-    /// allocation. The default preserves `to_vec` exactly; element-backed
-    /// hashes override it to iterate their storage directly.
-    fn for_each_element(&self, f: impl FnMut(F)) {
-        self.to_vec().into_iter().for_each(f);
-    }
 }
 
 /// Trait for hash functions.
@@ -79,42 +72,6 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
         } else {
             Self::hash_no_pad(inputs)
         }
-    }
-
-    /// Hash two equal-length inputs, allowing implementations to interleave
-    /// the two computations. Must return exactly
-    /// `(Self::hash_or_noop(input_a), Self::hash_or_noop(input_b))`.
-    fn hash_or_noop_pair(input_a: &[F], input_b: &[F]) -> (Self::Hash, Self::Hash) {
-        (Self::hash_or_noop(input_a), Self::hash_or_noop(input_b))
-    }
-
-    /// Hash four equal-length inputs, allowing implementations to interleave
-    /// the four computations. Must return exactly the four individual
-    /// `Self::hash_or_noop` results.
-    fn hash_or_noop_quad(
-        input_a: &[F],
-        input_b: &[F],
-        input_c: &[F],
-        input_d: &[F],
-    ) -> (Self::Hash, Self::Hash, Self::Hash, Self::Hash) {
-        (
-            Self::hash_or_noop(input_a),
-            Self::hash_or_noop(input_b),
-            Self::hash_or_noop(input_c),
-            Self::hash_or_noop(input_d),
-        )
-    }
-
-    /// Two independent `two_to_one` compressions, allowing implementations to
-    /// interleave them. Must return exactly
-    /// `(Self::two_to_one(x0, y0), Self::two_to_one(x1, y1))`.
-    fn two_to_one_pair(
-        x0: Self::Hash,
-        y0: Self::Hash,
-        x1: Self::Hash,
-        y1: Self::Hash,
-    ) -> (Self::Hash, Self::Hash) {
-        (Self::two_to_one(x0, y0), Self::two_to_one(x1, y1))
     }
 
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash;

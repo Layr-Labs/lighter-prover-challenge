@@ -153,15 +153,15 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // The oracles used in Plonky2 are given in `FRI_ORACLES` in `plonky2/src/plonk/plonk_common.rs`.
             for FriBatchInfo { point, polynomials } in &instance.batches {
                 // Collect the coefficients of all the polynomials in `polynomials`.
-                let polys_coeff = polynomials.iter().map(|fri_poly| {
+                let polys_coeff: Vec<_> = polynomials.iter().map(|fri_poly| {
                     &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
-                });
+                }).collect();
                 let composition_poly = timed!(
                     timing,
                     &format!("reduce batch of {} polynomials", polynomials.len()),
-                    alpha.reduce_polys_base(polys_coeff)
+                    alpha.reduce_polys_base_divide_by_linear(&polys_coeff, *point)
                 );
-                let mut quotient = composition_poly.divide_by_linear(*point);
+                let mut quotient = composition_poly;
                 quotient.coeffs.push(F::Extension::ZERO); // pad back to power of two
                 alpha.shift_poly(&mut final_poly);
                 final_poly += quotient;
