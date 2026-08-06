@@ -68,7 +68,9 @@ impl Target {
 }
 
 /// A `Target` which has already been constrained such that it can only be 0 or 1.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+// Deserialize bypasses `new_unsafe`; only bytes serialized from a real define
+// are ever deserialized, so the 0/1 constraint holds by construction.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::manual_non_exhaustive)]
 pub struct BoolTarget {
     pub target: Target,

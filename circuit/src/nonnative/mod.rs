@@ -32,7 +32,7 @@ use crate::uint::u32::witness::GeneratedValuesU32;
 use crate::utils::ceil_div_usize;
 pub mod split_nonnative;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct NonNativeTarget<FF: Field> {
     pub value: BigUintTarget,
     pub _phantom: PhantomData<FF>,

@@ -90,7 +90,7 @@ pub struct BlockTxChainCircuit {
     pub block_tx_witness_size: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct BlockTxChainTarget {
     pub cyclic_proof: ProofWithPublicInputsTarget<D>, // proof of previous iteration
     pub self_verifier_data: VerifierCircuitTarget,    // Verifier Circuit Data for this circuit
@@ -672,6 +672,24 @@ fn select_on_chain_pub_data(
     });
 }
 
+static RECURSION_COMMON_DATA_CACHE: std::sync::OnceLock<(usize, CommonCircuitData<F, D>)> =
+    std::sync::OnceLock::new();
+
+/// Returns the `common_data_for_recursion` result for the production chain
+/// size, so build tooling can serialize it ahead of time.
+pub fn recursion_common_data() -> CommonCircuitData<F, D> {
+    common_data_for_recursion(CHAIN_LOG_GATES)
+}
+
+/// Installs a precomputed `common_data_for_recursion` result (for example one
+/// deserialized from build-script output) so the first chain-circuit `define`
+/// skips the three-stage throwaway build. Must run before any chain circuit is
+/// defined to have an effect; installing after the cache is populated is a
+/// no-op.
+pub fn install_recursion_common_data(common: CommonCircuitData<F, D>) {
+    let _ = RECURSION_COMMON_DATA_CACHE.set((CHAIN_LOG_GATES, common));
+}
+
 // Generates `CommonCircuitData` usable for recursion.
 //
 // The result depends only on `log_gates` and compile-time constants, and both
@@ -679,10 +697,8 @@ fn select_on_chain_pub_data(
 // three-stage throwaway build (including a full 2^log_gates-gate `build`) runs
 // once and later callers clone the cached result.
 fn common_data_for_recursion(log_gates: usize) -> CommonCircuitData<F, D> {
-    static CACHE: std::sync::OnceLock<(usize, CommonCircuitData<F, D>)> =
-        std::sync::OnceLock::new();
-    let (cached_log_gates, common) =
-        CACHE.get_or_init(|| (log_gates, build_common_data_for_recursion(log_gates)));
+    let (cached_log_gates, common) = RECURSION_COMMON_DATA_CACHE
+        .get_or_init(|| (log_gates, build_common_data_for_recursion(log_gates)));
     assert_eq!(
         *cached_log_gates, log_gates,
         "common_data_for_recursion cached at a different size"

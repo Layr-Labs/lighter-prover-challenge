@@ -32,7 +32,7 @@ use crate::uint::u32::gadgets::arithmetic_u32::U32Target;
 const SIX: F = const_f(6);
 const THREE: F = const_f(3);
 
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Deserialize)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Deserialize, serde::Serialize)]
 #[repr(transparent)]
 pub struct QuinticExtensionTarget(pub [Target; 5]);
 

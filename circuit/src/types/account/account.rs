@@ -11,6 +11,7 @@ use plonky2::hash::hash_types::{HashOut, HashOutTarget, NUM_HASH_OUT_ELTS, RichF
 use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::iop::witness::Witness;
 use serde::Deserialize;
+use serde_with::serde_as;
 
 use crate::bigint::bigint::{BigIntTarget, CircuitBuilderBigInt, WitnessBigInt};
 use crate::bigint::biguint::{BigUintTarget, CircuitBuilderBiguint, WitnessBigUint};
@@ -157,7 +158,8 @@ where
         }
     }
 }
-#[derive(Debug, Clone)]
+#[serde_as]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AccountTarget {
     pub master_account_index: Target,
     pub account_index: Target,
@@ -167,6 +169,7 @@ pub struct AccountTarget {
 
     pub margined_assets: [AccountMarginedAssetTarget; MARGINED_ASSET_LIST_SIZE],
     pub aggregated_balances: [BigIntTarget; NB_ASSETS_PER_TX],
+    #[serde_as(as = "[_; POSITION_LIST_SIZE]")]
     pub positions: [AccountPositionTarget; POSITION_LIST_SIZE],
 
     pub approved_integrators: [ApprovedIntegratorTarget; MAX_APPROVED_INTEGRATORS],

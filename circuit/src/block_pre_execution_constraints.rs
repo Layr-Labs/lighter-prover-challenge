@@ -15,6 +15,7 @@ use plonky2::plonk::proof::ProofWithPublicInputs;
 use plonky2::plonk::prover::prove;
 use plonky2::timed;
 use plonky2::util::timing::TimingTree;
+use serde_with::serde_as;
 
 use crate::bigint::big_u16::{BigIntU16Target, CircuitBuilderBigIntU16, CircuitBuilderBiguint16};
 use crate::bigint::bigint::SignTarget;
@@ -79,7 +80,8 @@ pub struct BlockPreExecutionCircuit {
     pub target: BlockPreExecutionTarget,
 }
 
-#[derive(Debug)]
+#[serde_as]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct BlockPreExecutionTarget {
     pub block_number: Target,
     pub created_at: Target, // 48 bits
@@ -89,9 +91,12 @@ pub struct BlockPreExecutionTarget {
     /***********************/
     pub old_system_config: SystemConfigTarget,
     pub register_stack_before: RegisterStackTarget,
+    #[serde_as(as = "[_; ASSET_LIST_SIZE]")]
     pub all_assets_before: [AssetTarget; ASSET_LIST_SIZE],
     pub all_margined_assets_before: [MarginedAssetTarget; MARGINED_ASSET_LIST_SIZE],
+    #[serde_as(as = "[_; POSITION_LIST_SIZE]")]
     pub all_market_details_before: [MarketDetailsTarget; POSITION_LIST_SIZE],
+    #[serde_as(as = "[_; POSITION_LIST_SIZE]")]
     pub all_market_risk_details_before: [MarketRiskDetailsTarget; POSITION_LIST_SIZE],
     pub state_metadata_target: StateMetadataTarget,
 
@@ -111,6 +116,7 @@ pub struct BlockPreExecutionTarget {
     pub old_market_tree_root: HashOutTarget,
     pub old_state_root: HashOutTarget,
 
+    #[serde_as(as = "[_; POSITION_LIST_SIZE]")]
     pub all_market_risk_details_after: [MarketRiskDetailsTarget; POSITION_LIST_SIZE], // Public
     pub all_margined_assets_after: [MarginedAssetTarget; MARGINED_ASSET_LIST_SIZE],   // Public
     pub new_state_metadata_target: StateMetadataTarget,                               // Public
