@@ -162,21 +162,16 @@ where
         partition_witness.full_witness()
     );
 
-    let wires_values: Vec<PolynomialValues<F>> = timed!(
-        timing,
-        "compute wire polynomials",
-        witness
-            .wire_values
-            .par_iter()
-            .map(|column| PolynomialValues::new(column.clone()))
-            .collect()
-    );
-
+    // The wire matrix is committed straight from `witness.wire_values`
+    // (already wire-major): `from_value_columns` clones each column inside
+    // its IFFT task, replacing the former standalone "compute wire
+    // polynomials" whole-matrix clone pass. `witness` stays alive for the
+    // partial-product and lookup computations below.
     let wires_commitment = timed!(
         timing,
         "compute wires commitment",
-        PolynomialBatch::<F, C, D>::from_values(
-            wires_values,
+        PolynomialBatch::<F, C, D>::from_value_columns(
+            &witness.wire_values,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::WIRES.blinding,
             config.fri_config.cap_height,

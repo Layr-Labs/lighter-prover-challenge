@@ -83,27 +83,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         if GPU_NTT_COMMITMENTS && !blinding {
             let value_columns: Vec<&[F]> =
                 values.iter().map(|v| v.values.as_slice()).collect();
-            if let Some((columns, digests, cap, coeff_columns)) = timed!(
-                timing,
-                "build Merkle tree",
-                C::Hasher::try_build_commitment_from_values(
-                    &value_columns,
-                    rate_bits,
-                    cap_height,
-                )
-            ) {
-                let degree = values[0].len();
-                let merkle_tree = MerkleTree::from_prebuilt_columns(columns, digests, cap);
-                return Self {
-                    polynomials: coeff_columns
-                        .into_iter()
-                        .map(PolynomialCoeffs::new)
-                        .collect(),
-                    merkle_tree,
-                    degree_log: log2_strict(degree),
-                    rate_bits,
-                    blinding,
-                };
+            if let Some(batch) =
+                Self::try_gpu_commitment_from_values(&value_columns, rate_bits, cap_height, timing)
+            {
+                return batch;
             }
         }
 
@@ -121,6 +104,79 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             timing,
             fft_root_table,
         )
+    }
+
+    /// Like [`Self::from_values`], but borrows the value columns. For callers
+    /// that must keep the same values alive after committing — e.g. the
+    /// prover's wire matrix, which is still read for partial products and
+    /// lookup polynomials after the wires commitment. Each column is cloned
+    /// directly inside its IFFT task (the identical per-column vector that
+    /// `from_values` callers would otherwise materialize up front as a
+    /// separate whole-matrix clone pass), so the resulting polynomials and
+    /// Merkle tree are exactly those of `from_values` on cloned input.
+    pub fn from_value_columns(
+        value_columns: &[Vec<F>],
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Self {
+        if GPU_NTT_COMMITMENTS && !blinding {
+            let columns: Vec<&[F]> = value_columns.iter().map(|v| v.as_slice()).collect();
+            if let Some(batch) =
+                Self::try_gpu_commitment_from_values(&columns, rate_bits, cap_height, timing)
+            {
+                return batch;
+            }
+        }
+
+        let coeffs = timed!(
+            timing,
+            "IFFT",
+            value_columns
+                .par_iter()
+                .map(|v| PolynomialValues::new(v.clone()).ifft())
+                .collect::<Vec<_>>()
+        );
+
+        Self::from_coeffs(
+            coeffs,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+        )
+    }
+
+    /// GPU commitment attempt over borrowed value columns (non-blinding
+    /// only; the caller gates on `GPU_NTT_COMMITMENTS && !blinding`).
+    /// Returns `None` when the GPU backend declines, in which case the
+    /// caller falls back to the CPU IFFT + [`Self::from_coeffs`] pipeline.
+    fn try_gpu_commitment_from_values(
+        value_columns: &[&[F]],
+        rate_bits: usize,
+        cap_height: usize,
+        timing: &mut TimingTree,
+    ) -> Option<Self> {
+        let (columns, digests, cap, coeff_columns) = timed!(
+            timing,
+            "build Merkle tree",
+            C::Hasher::try_build_commitment_from_values(value_columns, rate_bits, cap_height)
+        )?;
+        let degree = value_columns[0].len();
+        let merkle_tree = MerkleTree::from_prebuilt_columns(columns, digests, cap);
+        Some(Self {
+            polynomials: coeff_columns
+                .into_iter()
+                .map(PolynomialCoeffs::new)
+                .collect(),
+            merkle_tree,
+            degree_log: log2_strict(degree),
+            rate_bits,
+            blinding: false,
+        })
     }
 
     /// Creates a list polynomial commitment for the polynomials `polynomials`.
@@ -360,13 +416,24 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 &format!("reduce batch of {} polynomials", polynomials.len()),
                 alpha.reduce_polys_base(polys_coeff)
             );
-            let mut quotient = composition_poly.divide_by_linear(*point);
-            quotient.coeffs.push(F::Extension::ZERO); // pad back to power of two
-            alpha.shift_poly(&mut final_poly);
-            final_poly += quotient;
+            // Fused (value-exact) form of:
+            //   let mut quotient = composition_poly.divide_by_linear(*point);
+            //   quotient.coeffs.push(F::Extension::ZERO); // pad to power of two
+            //   alpha.shift_poly(&mut final_poly);
+            //   final_poly += quotient;
+            // writing straight into `final_poly`'s reusable buffer instead of
+            // collect + pop + reverse + shift pass + add pass.
+            let shift = alpha.shift_factor();
+            accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
         }
 
-        let lde_final_poly = final_poly.lde(fri_params.config.rate_bits);
+        // Pad to the LDE length in place: `final_poly` is dead after this, so
+        // `lde()`'s clone + pad would copy the coefficients for nothing.
+        let mut lde_final_poly = final_poly;
+        lde_final_poly.coeffs.resize(
+            lde_final_poly.len() << fri_params.config.rate_bits,
+            F::Extension::ZERO,
+        );
         let lde_final_values = timed!(
             timing,
             &format!("perform final FFT {}", lde_final_poly.len()),
@@ -394,6 +461,49 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         );
 
         fri_proof
+    }
+}
+
+/// Folds one batch's quotient `(p(X) - p(z))/(X - z)` into the running FRI
+/// `final_poly`, fusing four passes of the previous code into one serial
+/// sweep with no per-batch allocation:
+/// `divide_by_linear` (collect + pop + reverse), the zero pad back to power
+/// of two, `shift_poly`'s `final_poly *= shift`, and `final_poly += quotient`.
+///
+/// Value-exact: `divide_by_linear`'s Horner recurrence (`acc = acc * z + c`)
+/// produces the quotient's coefficients highest-first, so a descending sweep
+/// can emit each coefficient in the same multiply-add order and combine it
+/// with the shifted accumulator entry (`old * shift + q_i`) immediately. The
+/// only dropped work is the recurrence's final step (the remainder `p(z)`,
+/// which `divide_by_linear` pops) and the reference's `+ ZERO` on the pad
+/// slot / `ZERO * shift` on fresh slots, all of which leave values unchanged.
+fn accumulate_linear_quotient<F: Field>(
+    final_poly: &mut PolynomialCoeffs<F>,
+    composition_poly: &PolynomialCoeffs<F>,
+    z: F,
+    shift: F,
+) {
+    let d = composition_poly.len();
+    let coeffs = &composition_poly.coeffs;
+    let buf = &mut final_poly.coeffs;
+    // Entries past the padded quotient's length only see the shift.
+    for l in buf.iter_mut().skip(d) {
+        *l *= shift;
+    }
+    if buf.len() < d {
+        buf.resize(d, F::ZERO);
+    }
+    if d == 0 {
+        return;
+    }
+    // Highest slot: the quotient coefficient there is the explicit zero pad.
+    buf[d - 1] *= shift;
+    // Synthetic division, highest coefficient first: the quotient's
+    // coefficient at `x^i` is the accumulator after absorbing `coeffs[i + 1]`.
+    let mut acc = F::ZERO;
+    for i in (0..d - 1).rev() {
+        acc = acc * z + coeffs[i + 1];
+        buf[i] = buf[i] * shift + acc;
     }
 }
 
@@ -426,5 +536,40 @@ mod tests {
         let actual = PolynomialBatch::<F, C, D>::lde_values(&polynomials, RATE_BITS, false, None);
 
         assert_eq!(actual, expected);
+    }
+
+    /// The fused quotient accumulation must be bit-identical to the reference
+    /// sequence it replaces (divide_by_linear + pad + shift_poly + add),
+    /// including the empty-accumulator first batch and mismatched lengths.
+    #[test]
+    fn fused_quotient_accumulation_matches_reference() {
+        type F = <GoldilocksField as Extendable<2>>::Extension;
+
+        for &(old_len, d) in &[
+            (0usize, 1usize),
+            (0, 8),
+            (1, 1),
+            (8, 8),
+            (4, 8),
+            (8, 4),
+            (256, 256),
+        ] {
+            let initial = PolynomialCoeffs::new(F::rand_vec(old_len));
+            let composition_poly = PolynomialCoeffs::new(F::rand_vec(d));
+            let z = F::rand();
+            let shift = F::rand();
+
+            // Reference: the exact op sequence previously in `prove_openings`.
+            let mut expected = initial.clone();
+            let mut quotient = composition_poly.divide_by_linear(z);
+            quotient.coeffs.push(F::ZERO); // pad back to power of two
+            expected *= shift; // shift_poly
+            expected += quotient;
+
+            let mut actual = initial;
+            accumulate_linear_quotient(&mut actual, &composition_poly, z, shift);
+
+            assert_eq!(actual.coeffs, expected.coeffs);
+        }
     }
 }
