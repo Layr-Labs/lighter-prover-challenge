@@ -29,13 +29,26 @@ impl Legendre<F> for QuinticExtension<F> {
         let xr_ext = *self * frob1_times_frob2 * frob2_frob1_times_frob2;
         let xr: F = <QuinticExtension<F> as FieldExtension<5>>::to_basefield_array(&xr_ext)[0];
 
-        let xr_31 = xr.exp_power_of_2(31);
-        let xr_63 = xr_31.exp_power_of_2(32);
-
-        // only way `xr_31` can be zero is if `xr` is zero, in which case `self` is zero, in which case we want to return zero.
-        let xr_31_inv_or_zero = xr_31.inverse_or_zero();
-        xr_63 * xr_31_inv_or_zero
+        legendre_symbol_goldilocks(xr)
     }
+}
+
+/// Computes `x^((p - 1) / 2)` for the Goldilocks prime
+/// `p = 2^64 - 2^32 + 1` without a field inversion.
+#[inline]
+fn legendre_symbol_goldilocks(x: F) -> F {
+    // Build x^(2^32 - 1) with the same short addition chain used by the
+    // Goldilocks inverse, then square 31 times:
+    // (2^32 - 1) * 2^31 = (p - 1) / 2.
+    let t2 = x.square() * x;
+    let t3 = t2.square() * x;
+    let t6 = t3.exp_power_of_2(3) * t3;
+    let t12 = t6.exp_power_of_2(6) * t6;
+    let t24 = t12.exp_power_of_2(12) * t12;
+    let t30 = t24.exp_power_of_2(6) * t6;
+    let t31 = t30.square() * x;
+    let t32 = t31.square() * x;
+    t32.exp_power_of_2(31)
 }
 
 pub trait SquareRoot: Sized {
@@ -162,6 +175,27 @@ mod tests {
         let square = x * x;
         let legendre_sym = square.legendre();
         assert_eq!(legendre_sym, F::ZERO);
+    }
+
+    #[test]
+    fn legendre_symbol_matches_inverse_reference() {
+        let reference = |x: F| {
+            let x_31 = x.exp_power_of_2(31);
+            x_31.exp_power_of_2(32) * x_31.inverse_or_zero()
+        };
+        let check = |x| assert_eq!(legendre_symbol_goldilocks(x), reference(x));
+
+        for x in [F::ZERO, F::ONE, F::TWO, F::NEG_ONE] {
+            check(x);
+        }
+
+        let mut state = 0x6A09_E667_F3BC_C909u64;
+        for _ in 0..10_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            check(F::from_noncanonical_u64(state));
+        }
     }
 
     #[test]
