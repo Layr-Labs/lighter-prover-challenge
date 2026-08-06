@@ -96,6 +96,14 @@ where
     fn doubles(&self) -> Self {
         *self * Self::Scalar::TWO
     }
+
+    /// Compute `self + x * y` in one packed operation when the backend can
+    /// fuse the product and reduction. The default preserves the algebraic
+    /// behavior for every packed field implementation.
+    #[inline]
+    fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
+        *self + x * y
+    }
 }
 
 unsafe impl<F: Field> PackedField for F {
