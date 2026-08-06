@@ -20,7 +20,9 @@ use crate::plonk::circuit_data::CommonCircuitData;
 use crate::plonk::plonk_common;
 use crate::plonk::plonk_common::eval_l_0_circuit;
 use crate::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBaseBatch};
-use crate::util::partial_products::{check_partial_products, check_partial_products_circuit};
+use crate::util::partial_products::{
+    check_partial_products, check_partial_products_circuit, check_partial_products_into,
+};
 use crate::util::reducing::ReducingFactorTarget;
 use crate::with_context;
 
@@ -345,15 +347,15 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             // The partial products considered for this iteration of `i`.
             let current_partial_products = &partial_products[i * num_prods..(i + 1) * num_prods];
             // Check the numerator partial products.
-            let partial_product_checks = check_partial_products(
+            check_partial_products_into(
                 &numerator_values,
                 &denominator_values,
                 current_partial_products,
                 z_x,
                 z_gx,
                 max_degree,
+                vanishing_partial_products_terms,
             );
-            vanishing_partial_products_terms.extend(partial_product_checks);
 
             numerator_values.clear();
             denominator_values.clear();

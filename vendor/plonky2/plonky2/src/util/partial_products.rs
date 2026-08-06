@@ -57,22 +57,54 @@ pub(crate) fn check_partial_products<F: Field>(
     z_gx: F,
     max_degree: usize,
 ) -> Vec<F> {
+    let mut result = Vec::with_capacity(numerators.len().div_ceil(max_degree));
+    check_partial_products_into(
+        numerators,
+        denominators,
+        partials,
+        z_x,
+        z_gx,
+        max_degree,
+        &mut result,
+    );
+    result
+}
+
+/// Append the partial-product constraints to an existing allocation.
+pub(crate) fn check_partial_products_into<F: Field>(
+    numerators: &[F],
+    denominators: &[F],
+    partials: &[F],
+    z_x: F,
+    z_gx: F,
+    max_degree: usize,
+    result: &mut Vec<F>,
+) {
     debug_assert!(max_degree > 1);
-    let product_accs = iter::once(&z_x)
-        .chain(partials.iter())
-        .chain(iter::once(&z_gx));
     let chunk_size = max_degree;
-    numerators
+    debug_assert_eq!(numerators.len(), denominators.len());
+    debug_assert_eq!(partials.len() + 1, numerators.len().div_ceil(chunk_size));
+
+    for (chunk_index, (nume_chunk, deno_chunk)) in numerators
         .chunks(chunk_size)
-        .zip_eq(denominators.chunks(chunk_size))
-        .zip_eq(product_accs.tuple_windows())
-        .map(|((nume_chunk, deno_chunk), (&prev_acc, &next_acc))| {
-            let num_chunk_product = nume_chunk.iter().copied().product();
-            let den_chunk_product = deno_chunk.iter().copied().product();
-            // Assert that next_acc * deno_product = prev_acc * nume_product.
-            prev_acc * num_chunk_product - next_acc * den_chunk_product
-        })
-        .collect()
+        .zip(denominators.chunks(chunk_size))
+        .enumerate()
+    {
+        let prev_acc = if chunk_index == 0 {
+            z_x
+        } else {
+            partials[chunk_index - 1]
+        };
+        let next_acc = if chunk_index == partials.len() {
+            z_gx
+        } else {
+            partials[chunk_index]
+        };
+        let num_chunk_product = nume_chunk.iter().copied().product();
+        let den_chunk_product = deno_chunk.iter().copied().product();
+        // Assert that next_acc * deno_product = prev_acc * nume_product.
+        result.push(prev_acc * num_chunk_product - next_acc * den_chunk_product);
+    }
 }
 
 /// Checks the relationship between each pair of partial product accumulators. In particular, this
