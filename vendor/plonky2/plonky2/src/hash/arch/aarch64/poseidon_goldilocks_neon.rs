@@ -183,16 +183,10 @@ unsafe fn mds_reduce(
     lo = vsliq_n_u64::<16>(lo, hi);
     // At this point, result `== lo + hi.bits[48..64] * 2**64 (mod Goldilocks)`.
     // It remains to fold `hi.bits[48..64]` into `lo`.
-    let top = {
-        // Extract the top 16 bits of `hi` as a `u32`.
-        // Interpret `hi` as a vector of bytes, so we can use a table lookup instruction.
-        let hi_u8 = vreinterpretq_u8_u64(hi);
-        // Indices defining the permutation. `0xff` is out of bounds, producing `0`.
-        let top_idx =
-            transmute::<[u8; 8], uint8x8_t>([0x06, 0x07, 0xff, 0xff, 0x0e, 0x0f, 0xff, 0xff]);
-        let top_u8 = vqtbl1_u8(hi_u8, top_idx);
-        vreinterpret_u32_u8(top_u8)
-    };
+    // Narrowing after the shift extracts both top-16-bit lanes directly. This
+    // replaces the byte-table permutation (and its index materialization) with
+    // one NEON shift/narrow instruction.
+    let top = vmovn_u64(vshrq_n_u64::<48>(hi));
     // result `== lo + top * 2**64 (mod Goldilocks)`.
     let adj_lo = vmlal_n_u32(lo, top, EPSILON as u32);
     let wraparound_mask = vcgtq_u64(lo, adj_lo);

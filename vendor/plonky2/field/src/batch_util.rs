@@ -66,7 +66,7 @@ pub fn batch_multiply_add_inplace<F: Field>(out: &mut [F], a: &[F], b: &[F]) {
         *x_out = x_out.multiply_accumulate(*x_a, *x_b);
     }
     for ((x_out, x_a), x_b) in out_leftovers.iter_mut().zip(a_leftovers).zip(b_leftovers) {
-        *x_out += *x_a * *x_b;
+        *x_out = x_out.multiply_accumulate(*x_a, *x_b);
     }
 }
 

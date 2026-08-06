@@ -184,6 +184,20 @@ unsafe impl PackedField for NeonGoldilocksField {
     }
 
     #[inline]
+    fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
+        let (lane0, lane1) = mul_reduce_pair(
+            x.0[0].0,
+            y.0[0].0,
+            x.0[1].0,
+            y.0[1].0,
+        );
+        Self([
+            GoldilocksField(lane0) + self.0[0],
+            GoldilocksField(lane1) + self.0[1],
+        ])
+    }
+
+    #[inline]
     fn interleave(&self, other: Self, block_len: usize) -> (Self, Self) {
         match block_len {
             1 => (Self([self.0[0], other.0[0]]), Self([self.0[1], other.0[1]])),
