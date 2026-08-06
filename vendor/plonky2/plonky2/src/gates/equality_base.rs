@@ -114,7 +114,39 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EqualityGate {
     }
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        self.eval_unfiltered_base_batch_packed(vars_base)
+        let n = vars_base.len();
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        let const_0 = &vars_base.local_constants[..n]; //"one" value
+        let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
+        let mut chunks = res.chunks_exact_mut(n);
+
+        for i in 0..self.num_ops {
+            let x = col(self.wire_ith_element_0(i));
+            let y = col(self.wire_ith_element_1(i));
+            let equal = col(self.wire_ith_output(i));
+            let diff = col(self.wire_ith_temporary(i, 0));
+            let invdiff = col(self.wire_ith_temporary(i, 1));
+            let prod = col(self.wire_ith_temporary(i, 2));
+
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                out[p] = (x[p] - y[p]) - diff[p];
+            }
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                out[p] = (diff[p] * invdiff[p]) - prod[p];
+            }
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                out[p] = (prod[p] * diff[p]) - diff[p];
+            }
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                out[p] = (const_0[p] - prod[p]) - equal[p];
+            }
+        }
+        res
     }
 
     fn eval_unfiltered_circuit(

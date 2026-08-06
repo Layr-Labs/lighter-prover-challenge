@@ -32,16 +32,66 @@ pub fn fft_root_table<F: Field>(n: usize) -> FftRootTable<F> {
     root_table
 }
 
+/// Process-wide cache of FFT root tables, keyed by field type and log-size
+/// (`LazyLock<Mutex<HashMap>>`, the same pattern as the Metal backend's
+/// `ntt_roots` cache). `fft_root_table` is deterministic per (field, size),
+/// so a cache hit returns exactly the values a fresh computation would; the
+/// cache only avoids recomputing the table on every table-less FFT (FRI fold
+/// rounds, the final-polynomial coset FFT, IFFT/LDE calls without a
+/// precomputed table).
+#[cfg(feature = "std")]
+mod root_table_cache {
+    use core::any::{Any, TypeId};
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    use super::{fft_root_table, FftRootTable};
+    use crate::types::Field;
+
+    static ROOT_TABLES: LazyLock<Mutex<HashMap<(TypeId, usize), Arc<dyn Any + Send + Sync>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) fn get<F: Field>(lg_n: usize) -> Arc<FftRootTable<F>> {
+        let key = (TypeId::of::<F>(), lg_n);
+        if let Ok(cache) = ROOT_TABLES.lock() {
+            if let Some(table) = cache
+                .get(&key)
+                .and_then(|entry| Arc::clone(entry).downcast::<FftRootTable<F>>().ok())
+            {
+                return table;
+            }
+        }
+        // Miss: build the table outside the lock so concurrent first-time
+        // FFTs don't serialize behind table construction. If several threads
+        // race, they compute identical tables; the first insert wins and the
+        // rest share it.
+        let table = Arc::new(fft_root_table::<F>(1 << lg_n));
+        if let Ok(mut cache) = ROOT_TABLES.lock() {
+            let erased: Arc<dyn Any + Send + Sync> = table.clone();
+            if let Ok(table) = Arc::clone(cache.entry(key).or_insert(erased)).downcast() {
+                return table;
+            }
+        }
+        table
+    }
+}
+
 #[inline]
 fn fft_dispatch<F: Field>(
     input: &mut [F],
     zero_factor: Option<usize>,
     root_table: Option<&FftRootTable<F>>,
 ) {
-    let computed_root_table = root_table.is_none().then(|| fft_root_table(input.len()));
-    let used_root_table = root_table.or(computed_root_table.as_ref()).unwrap();
+    if let Some(table) = root_table {
+        fft_classic(input, zero_factor.unwrap_or(0), table);
+        return;
+    }
+    #[cfg(feature = "std")]
+    let computed_root_table = root_table_cache::get::<F>(log2_strict(input.len()));
+    #[cfg(not(feature = "std"))]
+    let computed_root_table = fft_root_table::<F>(input.len());
 
-    fft_classic(input, zero_factor.unwrap_or(0), used_root_table);
+    fft_classic(input, zero_factor.unwrap_or(0), &computed_root_table);
 }
 
 #[inline]
@@ -163,6 +213,8 @@ fn fft_classic_simd<P: PackedField>(
 /// input may be non-zero, but the last 1 - 1/2^r entries are
 /// definitely zero.
 pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &FftRootTable<F>) {
+    reverse_index_bits_in_place(values);
+
     let n = values.len();
     let lg_n = log2_strict(n);
 
@@ -174,18 +226,18 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
         );
     }
 
-    // After bit reversal, a zero-extended input consists of 2^r copies of each
-    // value in the bit-reversed nonzero prefix. Reverse only that prefix, then
-    // expand it backwards so unread values are never overwritten.
-    if r == 0 {
-        reverse_index_bits_in_place(values);
-    } else {
-        let repeat = 1 << r;
-        let nonzero_len = n >> r;
-        reverse_index_bits_in_place(&mut values[..nonzero_len]);
-        for i in (0..nonzero_len).rev() {
-            let value = values[i];
-            values[i * repeat..(i + 1) * repeat].fill(value);
+    // After reverse_index_bits, the only non-zero elements of values
+    // are at indices i*2^r for i = 0..n/2^r.  The loop below copies
+    // the value at i*2^r to the positions [i*2^r + 1, i*2^r + 2, ...,
+    // (i+1)*2^r - 1]; i.e. it replaces the 2^r - 1 zeros following
+    // element i*2^r with the value at i*2^r.  This corresponds to the
+    // first r rounds of the FFT when there are 2^r zeros at the end
+    // of the original input.
+    if r > 0 {
+        // if r == 0 then this loop is a noop.
+        let mask = !((1 << r) - 1);
+        for i in 0..n {
+            values[i] = values[i & mask];
         }
     }
 
@@ -209,6 +261,34 @@ mod tests {
     use crate::goldilocks_field::GoldilocksField;
     use crate::polynomial::{PolynomialCoeffs, PolynomialValues};
     use crate::types::Field;
+
+    /// The cached-table dispatch path (no caller-supplied table) must return
+    /// bit-identical results to an explicitly computed fresh table, on both
+    /// cold and warm cache, for base and extension fields.
+    #[cfg(feature = "std")]
+    #[test]
+    fn cached_root_table_matches_fresh_table() {
+        use crate::extension::quadratic::QuadraticExtension;
+        use crate::fft::fft_root_table;
+        use crate::types::Sample;
+
+        fn check<F: Field + Sample>() {
+            for lg_n in [1usize, 3, 7] {
+                let n = 1 << lg_n;
+                let table = fft_root_table::<F>(n);
+                let poly = PolynomialCoeffs::new(F::rand_vec(n));
+                let expected = fft_with_options(poly.clone(), None, Some(&table));
+                // First call may populate the cache, second one must hit it.
+                let cold = fft_with_options(poly.clone(), None, None);
+                let warm = fft_with_options(poly, None, None);
+                assert_eq!(expected.values, cold.values);
+                assert_eq!(expected.values, warm.values);
+            }
+        }
+
+        check::<GoldilocksField>();
+        check::<QuadraticExtension<GoldilocksField>>();
+    }
 
     #[test]
     fn fft_and_ifft() {

@@ -516,7 +516,10 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
         num_leaves: usize,
         cap_height: usize,
     ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
+        // The GPU path declines trees below `MIN_GPU_PERMUTATIONS` (and any it
+        // cannot build); those fall through to the packed 4-lane CPU builder.
         super::metal::build_merkle_tree(leaves, leaf_width, num_leaves, cap_height)
+            .or_else(|| super::packed::build_merkle_tree(leaves, leaf_width, num_leaves, cap_height))
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -525,6 +528,7 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
         cap_height: usize,
     ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
         super::metal::build_merkle_tree_columns(columns, cap_height)
+            .or_else(|| super::packed::build_merkle_tree_columns(columns, cap_height))
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]

@@ -191,7 +191,56 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32InterleaveG
     }
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        self.eval_unfiltered_base_batch_packed(vars_base)
+        debug_assert_eq!(Self::B, 2);
+        let n = vars_base.len();
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        let four = F::from_canonical_usize(Self::B * Self::B);
+        let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
+        let mut chunks = res.chunks_exact_mut(n);
+
+        for i in 0..self.num_ops {
+            let bits = self.wires_ith_bit_decomposition(i);
+
+            // Check 1: the big-endian bits combine (base 2, Horner from the
+            // most significant bit, which comes first) to the input.
+            let out = chunks.next().unwrap();
+            out.copy_from_slice(col(bits.start));
+            for w in bits.start + 1..bits.end {
+                let bit = col(w);
+                for p in 0..n {
+                    out[p] = out[p].double() + bit[p];
+                }
+            }
+            let x = col(self.wire_ith_x(i));
+            for p in 0..n {
+                out[p] -= x[p];
+            }
+
+            // Check 2: the same bits combine base 4 to the interleaved value.
+            let out = chunks.next().unwrap();
+            out.copy_from_slice(col(bits.start));
+            for w in bits.start + 1..bits.end {
+                let bit = col(w);
+                for p in 0..n {
+                    out[p] = out[p] * four + bit[p];
+                }
+            }
+            let x_interleaved = col(self.wire_ith_x_interleaved(i));
+            for p in 0..n {
+                out[p] -= x_interleaved[p];
+            }
+
+            // Check 3: range check the bits: b(b-1).
+            for w in bits {
+                let bit = col(w);
+                let out = chunks.next().unwrap();
+                for p in 0..n {
+                    out[p] = bit[p] * (bit[p] - F::ONE);
+                }
+            }
+        }
+        res
     }
 
     fn generators(&self, row: usize, _local_constants: &[F]) -> Vec<WitnessGeneratorRef<F, D>> {
@@ -390,5 +439,19 @@ mod tests {
         type C = PoseidonGoldilocksConfig;
         type F = <C as GenericConfig<D>>::F;
         test_eval_fns::<F, C, _, D>(U32InterleaveGate { num_ops: 2 })
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use crate::gate_batch_testing::assert_base_batch_matches_eval_unfiltered;
+
+    #[test]
+    fn base_batch_matches_eval_unfiltered_across_batch() {
+        for num_ops in [1, 2] {
+            let gate = U32InterleaveGate { num_ops };
+            assert_base_batch_matches_eval_unfiltered(&gate);
+        }
     }
 }

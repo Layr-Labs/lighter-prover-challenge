@@ -89,7 +89,58 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> Gate<F, D> fo
     }
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        self.eval_unfiltered_base_batch_packed(vars_base)
+        let n = vars_base.len();
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        let base = F::from_canonical_usize(B);
+        let three = F::from_canonical_usize(3);
+        let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
+        let mut chunks = res.chunks_exact_mut(n);
+
+        // The limbs combine (by powers of B, Horner from the most significant
+        // limb) to the sum.
+        let limbs = self.limbs();
+        let out = chunks.next().unwrap();
+        if self.num_limbs > 0 {
+            out.copy_from_slice(col(limbs.end - 1));
+            for w in (limbs.start..limbs.end - 1).rev() {
+                let limb = col(w);
+                for p in 0..n {
+                    out[p] = out[p] * base + limb[p];
+                }
+            }
+        }
+        let sum = col(Self::WIRE_SUM);
+        for p in 0..n {
+            out[p] -= sum[p];
+        }
+
+        // Range products per limb: x(x-1)...(x-(B-1)). For B = 4 this factors
+        // as y(y+2) with y = x(x-3); otherwise take the product directly.
+        for w in limbs {
+            let limb = col(w);
+            let out = chunks.next().unwrap();
+            if B == 4 {
+                for p in 0..n {
+                    let x = limb[p];
+                    let y = x * (x - three);
+                    out[p] = y * (y + F::TWO);
+                }
+            } else if B == 2 {
+                for p in 0..n {
+                    out[p] = limb[p] * (limb[p] - F::ONE);
+                }
+            } else {
+                out.copy_from_slice(limb);
+                for x in 1..B {
+                    let x_f = F::from_canonical_usize(x);
+                    for p in 0..n {
+                        out[p] *= limb[p] - x_f;
+                    }
+                }
+            }
+        }
+        res
     }
 
     fn eval_unfiltered_circuit(
