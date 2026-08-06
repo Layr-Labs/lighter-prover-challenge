@@ -25,6 +25,12 @@ use crate::plonk::vars::{
 };
 use crate::util::serialization::{Buffer, IoResult};
 
+const STACK_SELECTOR_FILTERS: usize = 32;
+
+const fn selector_filters_use_stack(batch_size: usize) -> bool {
+    batch_size <= STACK_SELECTOR_FILTERS
+}
+
 /// A custom gate.
 ///
 /// Vanilla Plonk arithmetization only supports basic fan-in 2 / fan-out 1 arithmetic gates,
@@ -169,24 +175,29 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
     ) {
         let batch_size = vars_batch.len();
         debug_assert!(self.num_constraints() * batch_size <= combined_gate_constraints.len());
-        let filters: Vec<_> = vars_batch
-            .iter()
-            .map(|vars| {
-                compute_filter(
-                    row,
-                    group_range.clone(),
-                    vars.local_constants[selector_index],
-                    num_selectors > 1,
-                )
-            })
-            .collect();
+        let mut stack_filters = [F::ZERO; STACK_SELECTOR_FILTERS];
+        let mut heap_filters = Vec::new();
+        let filters = if selector_filters_use_stack(batch_size) {
+            &mut stack_filters[..batch_size]
+        } else {
+            heap_filters.resize(batch_size, F::ZERO);
+            &mut heap_filters
+        };
+        for (filter, vars) in filters.iter_mut().zip(vars_batch.iter()) {
+            *filter = compute_filter(
+                row,
+                group_range.clone(),
+                vars.local_constants[selector_index],
+                num_selectors > 1,
+            );
+        }
         vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
         let res_batch = self.eval_unfiltered_base_batch(vars_batch);
         for (combined, res) in combined_gate_constraints
             .chunks_exact_mut(batch_size)
             .zip(res_batch.chunks_exact(batch_size))
         {
-            batch_multiply_add_inplace(combined, res, &filters);
+            batch_multiply_add_inplace(combined, res, filters);
         }
     }
 
@@ -361,4 +372,99 @@ fn compute_filter_circuit<F: RichField + Extendable<D>, const D: usize>(
         })
         .collect::<Vec<_>>();
     builder.mul_many_extension(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::gates::arithmetic_base::ArithmeticGate;
+    use crate::hash::hash_types::HashOut;
+    use crate::plonk::circuit_data::CircuitConfig;
+
+    #[test]
+    fn filtered_base_batch_matches_legacy_and_selects_filter_storage() {
+        const D: usize = 2;
+        const NUM_SELECTORS: usize = 2;
+        const NUM_LOOKUP_SELECTORS: usize = 1;
+        const SELECTOR_INDEX: usize = 1;
+        const ROW: usize = 2;
+        type F = GoldilocksField;
+
+        let gate_ref: GateRef<F, D> = GateRef::new(ArithmeticGate::new_from_config(
+            &CircuitConfig::standard_recursion_config(),
+        ));
+
+        for batch_size in [1, 4, 11, 32, 33] {
+            assert_eq!(selector_filters_use_stack(batch_size), batch_size <= 32);
+
+            let gate_constants = (0..gate_ref.0.num_constants() * batch_size)
+                .map(|i| F::from_canonical_usize(11 * i + 3))
+                .collect::<Vec<_>>();
+            let mut local_constants = (0..(NUM_SELECTORS + NUM_LOOKUP_SELECTORS) * batch_size)
+                .map(|i| F::from_canonical_usize(17 * i + 5))
+                .collect::<Vec<_>>();
+            for point in 0..batch_size {
+                local_constants[SELECTOR_INDEX * batch_size + point] =
+                    F::from_canonical_usize(point % 5);
+            }
+            local_constants.extend_from_slice(&gate_constants);
+
+            let local_wires = (0..gate_ref.0.num_wires() * batch_size)
+                .map(|i| F::from_canonical_usize(13 * i + 7))
+                .collect::<Vec<_>>();
+            let public_inputs_hash = HashOut::ZERO;
+            let prefixed_vars = EvaluationVarsBaseBatch::new(
+                batch_size,
+                &local_constants,
+                &local_wires,
+                &public_inputs_hash,
+            );
+            let stripped_vars = EvaluationVarsBaseBatch::new(
+                batch_size,
+                &gate_constants,
+                &local_wires,
+                &public_inputs_hash,
+            );
+            let filters = (0..batch_size)
+                .map(|point| {
+                    compute_filter(
+                        ROW,
+                        1..4,
+                        local_constants[SELECTOR_INDEX * batch_size + point],
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            let total_constraint_rows = gate_ref.0.num_constraints() + 2;
+            let mut expected = seeded_accumulator(total_constraint_rows, batch_size);
+            let mut actual = expected.clone();
+            let unfiltered = gate_ref.0.eval_unfiltered_base_batch(stripped_vars);
+            for (combined, res) in expected
+                .chunks_exact_mut(batch_size)
+                .zip(unfiltered.chunks_exact(batch_size))
+            {
+                batch_multiply_add_inplace(combined, res, &filters);
+            }
+
+            gate_ref.0.eval_filtered_base_batch(
+                prefixed_vars,
+                ROW,
+                SELECTOR_INDEX,
+                1..4,
+                NUM_SELECTORS,
+                NUM_LOOKUP_SELECTORS,
+                &mut actual,
+            );
+
+            assert_eq!(actual, expected, "batch size {batch_size}");
+        }
+    }
+
+    fn seeded_accumulator<F: Field>(rows: usize, batch_size: usize) -> Vec<F> {
+        (0..rows * batch_size)
+            .map(|i| F::from_canonical_usize(7 * i + 11))
+            .collect()
+    }
 }
