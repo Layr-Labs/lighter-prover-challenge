@@ -152,12 +152,27 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32Subtraction
     }
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
+        let mut res = Vec::new();
+        self.eval_unfiltered_base_batch_into(vars_base, &mut res);
+        res
+    }
+
+    fn eval_unfiltered_base_batch_into(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        res: &mut Vec<F>,
+    ) {
         let n = vars_base.len();
         let wires = vars_base.local_wires;
         let three = F::from_canonical_usize(3);
         let limb_base = F::from_canonical_u64(1u64 << Self::limb_bits());
         let base32 = F::from_canonical_u64(1 << 32u64);
-        let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
+        let required_len = n * <Self as Gate<F, D>>::num_constraints(self);
+        if res.len() < required_len {
+            res.resize(required_len, F::ZERO);
+        } else {
+            res.truncate(required_len);
+        }
         let mut chunks = res.chunks_exact_mut(n);
         let mut combined_limbs = vec![F::ZERO; n];
 
@@ -201,7 +216,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32Subtraction
                 out[p] = output_borrow[p] * (F::ONE - output_borrow[p]);
             }
         }
-        res
     }
 
     fn eval_unfiltered_circuit(

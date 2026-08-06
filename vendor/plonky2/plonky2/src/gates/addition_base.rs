@@ -97,6 +97,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for AdditionGate {
         self.eval_unfiltered_base_batch_packed(vars_base)
     }
 
+    fn eval_unfiltered_base_batch_into(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        res: &mut Vec<F>,
+    ) {
+        self.eval_unfiltered_base_batch_packed_into(vars_base, res)
+    }
+
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,
@@ -243,11 +251,15 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
 mod tests {
     use anyhow::Result;
 
+    use crate::field::types::Field;
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::gates::addition_base::AdditionGate;
+    use crate::gates::gate::Gate;
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
+    use crate::hash::hash_types::HashOut;
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
+    use crate::plonk::vars::EvaluationVarsBaseBatch;
 
     #[test]
     fn low_degree() {
@@ -262,5 +274,45 @@ mod tests {
         type F = <C as GenericConfig<D>>::F;
         let gate = AdditionGate::new_from_config(&CircuitConfig::standard_recursion_config());
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    #[test]
+    fn base_batch_into_reuses_allocation_and_overwrites_values() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+
+        let gate = AdditionGate { num_ops: 2 };
+        let constants = [2, 2, 2, 2, 3, 3, 3, 3].map(F::from_canonical_u64);
+        let wires = [
+            1, 2, 3, 4, // First operation, left addend.
+            5, 6, 7, 8, // First operation, right addend.
+            27, 33, 39, 45, // First operation, output.
+            9, 10, 11, 12, // Second operation, left addend.
+            13, 14, 15, 16, // Second operation, right addend.
+            77, 83, 89, 95, // Second operation, output.
+        ]
+        .map(F::from_canonical_u64);
+        let public_inputs_hash = HashOut::<F>::ZERO;
+        let vars = EvaluationVarsBaseBatch::new(4, &constants, &wires, &public_inputs_hash);
+        let expected = [10, 11, 12, 13, 20, 21, 22, 23].map(F::from_canonical_u64);
+
+        let mut scratch = vec![F::ONE; expected.len()];
+        let allocation = scratch.as_ptr();
+        <AdditionGate as Gate<F, D>>::eval_unfiltered_base_batch_into(
+            &gate,
+            vars,
+            &mut scratch,
+        );
+        assert_eq!(scratch, expected);
+        assert_eq!(scratch.as_ptr(), allocation);
+
+        scratch.fill(F::from_canonical_u64(99));
+        <AdditionGate as Gate<F, D>>::eval_unfiltered_base_batch_into(
+            &gate,
+            vars,
+            &mut scratch,
+        );
+        assert_eq!(scratch, expected);
+        assert_eq!(scratch.as_ptr(), allocation);
     }
 }

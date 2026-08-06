@@ -197,12 +197,27 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
     }
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
+        let mut res = Vec::new();
+        self.eval_unfiltered_base_batch_into(vars_base, &mut res);
+        res
+    }
+
+    fn eval_unfiltered_base_batch_into(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        res: &mut Vec<F>,
+    ) {
         let n = vars_base.len();
         let wires = vars_base.local_wires;
         let constants = vars_base.local_constants;
         let col = |w: usize| &wires[w * n..][..n];
         let vec_size = self.vec_size();
-        let mut res = vec![F::ZERO; n * self.num_constraints()];
+        let required_len = n * self.num_constraints();
+        if res.len() < required_len {
+            res.resize(required_len, F::ZERO);
+        } else {
+            res.truncate(required_len);
+        }
         let mut chunks = res.chunks_exact_mut(n);
         // `items` holds vec_size columns of n points, folded in place; the
         // write index k always trails the read indices 2k, 2k+1, which were
@@ -266,7 +281,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
                 out[p] = constant[p] - wire[p];
             }
         }
-        res
     }
 
     fn eval_unfiltered_circuit(

@@ -119,15 +119,28 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         res
     }
 
+    /// Like [`Gate::eval_unfiltered_base_batch`], but allows implementations to reuse the
+    /// caller's allocation. The default preserves the existing implementation for gates that do
+    /// not provide an in-place evaluation path.
+    fn eval_unfiltered_base_batch_into(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        res: &mut Vec<F>,
+    ) {
+        *res = self.eval_unfiltered_base_batch(vars_base);
+    }
+
     fn eval_unfiltered_base_batch_accumulate(
         &self,
         vars_base: EvaluationVarsBaseBatch<F>,
         filters: &[F],
+        gate_result_scratch: &mut Vec<F>,
         combined_gate_constraints: &mut [F],
     ) {
         let batch_size = vars_base.len();
         assert_eq!(filters.len(), batch_size);
-        let res_batch = self.eval_unfiltered_base_batch(vars_base);
+        self.eval_unfiltered_base_batch_into(vars_base, gate_result_scratch);
+        let res_batch = gate_result_scratch;
         for (combined, res) in combined_gate_constraints
             .chunks_exact_mut(batch_size)
             .zip(res_batch.chunks_exact(batch_size))
@@ -182,6 +195,7 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         group_range: Range<usize>,
         num_selectors: usize,
         num_lookup_selectors: usize,
+        gate_result_scratch: &mut Vec<F>,
         combined_gate_constraints: &mut [F],
     ) {
         let batch_size = vars_batch.len();
@@ -198,7 +212,12 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
             })
             .collect();
         vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
-        self.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, combined_gate_constraints);
+        self.eval_unfiltered_base_batch_accumulate(
+            vars_batch,
+            &filters,
+            gate_result_scratch,
+            combined_gate_constraints,
+        );
     }
 
     /// Adds this gate's filtered constraints into the `combined_gate_constraints` buffer.

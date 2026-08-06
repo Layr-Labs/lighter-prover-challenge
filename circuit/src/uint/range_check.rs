@@ -344,6 +344,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
         &self,
         vars_base: EvaluationVarsBaseBatch<F>,
         filters: &[F],
+        _gate_result_scratch: &mut Vec<F>,
         combined_gate_constraints: &mut [F],
     ) {
         let n = vars_base.len();
@@ -635,7 +636,13 @@ mod tests {
             batch_multiply_add_inplace(acc, constraints, &filters);
         }
         let mut actual = vec![F::ZERO; expected.len()];
-        gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+        let mut gate_result_scratch = Vec::new();
+        gate.eval_unfiltered_base_batch_accumulate(
+            vars,
+            &filters,
+            &mut gate_result_scratch,
+            &mut actual,
+        );
         assert_eq!(actual, expected);
     }
 

@@ -173,6 +173,7 @@ pub(crate) struct VanishingScratch<F> {
     pub vanishing_all_lookup_terms: Vec<F>,
     pub lookup_selectors: Vec<F>,
     pub constraint_terms_batch: Vec<F>,
+    pub gate_result_batch: Vec<F>,
 }
 
 fn reduce_gate_constraints_base_batch<F: Field>(
@@ -244,10 +245,11 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     let num_gate_constraints = common_data.num_gate_constraints;
 
-    evaluate_gate_constraints_base_batch_into::<F, D>(
+    evaluate_gate_constraints_base_batch_into_reusing::<F, D>(
         common_data,
         vars_batch,
         &mut scratch.constraint_terms_batch,
+        &mut scratch.gate_result_batch,
     );
     let constraint_terms_batch = &scratch.constraint_terms_batch;
     debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
@@ -756,10 +758,29 @@ pub fn evaluate_gate_constraints_base_batch<F: RichField + Extendable<D>, const 
 }
 
 /// Like [`evaluate_gate_constraints_base_batch`], but reuses the caller's buffer.
+#[allow(dead_code)]
 pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
     vars_batch: EvaluationVarsBaseBatch<F>,
     constraints_batch: &mut Vec<F>,
+) {
+    let mut gate_result_batch = Vec::new();
+    evaluate_gate_constraints_base_batch_into_reusing::<F, D>(
+        common_data,
+        vars_batch,
+        constraints_batch,
+        &mut gate_result_batch,
+    );
+}
+
+fn evaluate_gate_constraints_base_batch_into_reusing<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    vars_batch: EvaluationVarsBaseBatch<F>,
+    constraints_batch: &mut Vec<F>,
+    gate_result_batch: &mut Vec<F>,
 ) {
     constraints_batch.clear();
     constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
@@ -772,6 +793,7 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
             common_data.selectors_info.groups[selector_index].clone(),
             common_data.selectors_info.num_selectors(),
             common_data.num_lookup_selectors,
+            gate_result_batch,
             constraints_batch,
         );
     }

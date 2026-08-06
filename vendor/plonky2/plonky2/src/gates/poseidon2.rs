@@ -196,10 +196,25 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
         &self,
         vars_base: crate::plonk::vars::EvaluationVarsBaseBatch<F>,
     ) -> Vec<F> {
+        let mut res = Vec::new();
+        self.eval_unfiltered_base_batch_into(vars_base, &mut res);
+        res
+    }
+
+    fn eval_unfiltered_base_batch_into(
+        &self,
+        vars_base: crate::plonk::vars::EvaluationVarsBaseBatch<F>,
+        res: &mut Vec<F>,
+    ) {
         let n = vars_base.len();
         let wires = vars_base.local_wires;
         let col = |w: usize| &wires[w * n..][..n];
-        let mut res = vec![F::ZERO; n * self.num_constraints()];
+        let required_len = n * self.num_constraints();
+        if res.len() < required_len {
+            res.resize(required_len, F::ZERO);
+        } else {
+            res.truncate(required_len);
+        }
         let mut chunks = res.chunks_exact_mut(n);
 
         // Per-point state rows, contiguous per point so the existing scalar
@@ -309,7 +324,6 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
             }
         }
 
-        res
     }
 
     fn eval_unfiltered_base_one(
