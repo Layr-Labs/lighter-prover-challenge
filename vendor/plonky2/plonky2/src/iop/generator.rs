@@ -331,18 +331,22 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &prover_data.representative_map,
         );
 
+        let mut populated_input_reps = Vec::with_capacity(inputs.target_values.len());
         for (t, v) in inputs.target_values.into_iter() {
-            witness.set_target(t, v)?;
+            if let Some(rep) = witness.set_target_returning_rep(t, v)? {
+                populated_input_reps.push(rep);
+            }
         }
 
         // A simple generator can run once all of the distinct representatives it watches have
-        // values. Derive those unresolved counts from the existing watcher index so this remains
-        // local witness state and does not add anything to serialized prover data.
-        let mut unresolved_watches = vec![0usize; generators.len()];
-        for (&watch, watchers) in generator_indices_by_watches {
-            if witness.values[watch].is_none() {
+        // values. Start from the build-time totals and subtract only representatives populated by
+        // this witness's inputs, avoiding a full watcher-edge traversal for every start phase.
+        let mut unresolved_watches = prover_data.generator_watch_counts.clone();
+        for rep in populated_input_reps {
+            if let Some(watchers) = generator_indices_by_watches.get(&rep) {
                 for &generator_idx in watchers {
-                    unresolved_watches[generator_idx] += 1;
+                    debug_assert_ne!(unresolved_watches[generator_idx], 0);
+                    unresolved_watches[generator_idx] -= 1;
                 }
             }
         }
