@@ -32,16 +32,63 @@ pub fn fft_root_table<F: Field>(n: usize) -> FftRootTable<F> {
     root_table
 }
 
+/// Process-global cache of root tables, keyed by field type and size.
+///
+/// Callers that don't thread a precomputed `FftRootTable` through (wire-batch
+/// `ifft`s, quotient-chunk `coset_ifft`s, FRI reductions) previously
+/// regenerated the table — `n/2` field exponentiations — on every call. The
+/// table for a given `(F, n)` is a pure function of both, so memoizing is
+/// observationally identical.
+#[cfg(feature = "std")]
+fn cached_fft_root_table<F: Field>(n: usize) -> std::sync::Arc<FftRootTable<F>> {
+    use core::any::{Any, TypeId};
+    use std::collections::HashMap;
+    use std::sync::{Arc, OnceLock, RwLock};
+
+    type Cache = RwLock<HashMap<(TypeId, usize), Arc<dyn Any + Send + Sync>>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+
+    let cache = CACHE.get_or_init(Cache::default);
+    let key = (TypeId::of::<F>(), n);
+    if let Some(hit) = cache.read().expect("fft root cache poisoned").get(&key) {
+        return hit
+            .clone()
+            .downcast::<FftRootTable<F>>()
+            .expect("fft root cache entry has wrong type");
+    }
+    let table = Arc::new(fft_root_table::<F>(n));
+    // A racing thread may have inserted the same (deterministic) table; either
+    // copy is correct, so keep whichever landed first.
+    cache
+        .write()
+        .expect("fft root cache poisoned")
+        .entry(key)
+        .or_insert_with(|| table.clone())
+        .clone()
+        .downcast::<FftRootTable<F>>()
+        .expect("fft root cache entry has wrong type")
+}
+
 #[inline]
 fn fft_dispatch<F: Field>(
     input: &mut [F],
     zero_factor: Option<usize>,
     root_table: Option<&FftRootTable<F>>,
 ) {
-    let computed_root_table = root_table.is_none().then(|| fft_root_table(input.len()));
-    let used_root_table = root_table.or(computed_root_table.as_ref()).unwrap();
-
-    fft_classic(input, zero_factor.unwrap_or(0), used_root_table);
+    #[cfg(feature = "std")]
+    {
+        let cached = root_table
+            .is_none()
+            .then(|| cached_fft_root_table::<F>(input.len()));
+        let used_root_table = root_table.or(cached.as_deref()).unwrap();
+        fft_classic(input, zero_factor.unwrap_or(0), used_root_table);
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let computed_root_table = root_table.is_none().then(|| fft_root_table(input.len()));
+        let used_root_table = root_table.or(computed_root_table.as_ref()).unwrap();
+        fft_classic(input, zero_factor.unwrap_or(0), used_root_table);
+    }
 }
 
 #[inline]
