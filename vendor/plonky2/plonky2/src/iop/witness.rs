@@ -394,24 +394,70 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     }
 
     pub fn full_witness(self) -> MatrixWitness<F> {
-        // Redraw ticket 5.
-        // Single fused pass. Cell (column j, row i) is
-        // `values[representative_map[i * num_wires + j]]` or zero — the same
-        // lookup `try_get_target(Target::Wire { row: i, column: j })` resolved
-        // to, with `Target::index`'s `row * num_wires + column` inlined as a
-        // running cursor. This deletes the full zero-prefill pass over the
-        // matrix and the per-cell Target construction and index arithmetic of
-        // the second pass, while reading `representative_map` sequentially.
-        let mut wire_values: Vec<Vec<F>> = (0..self.num_wires)
-            .map(|_| Vec::with_capacity(self.degree))
-            .collect();
-        let mut wire_index = 0;
-        for _ in 0..self.degree {
-            for column in wire_values.iter_mut() {
-                // Unset slots hold `F::ZERO` in the dense `values` vector, so this is exactly
-                // the old `values[rep].unwrap_or(F::ZERO)` without touching the bitmap.
-                column.push(self.values[self.representative_map[wire_index]]);
-                wire_index += 1;
+        // Split the fused row-major read / column-major write across disjoint row chunks.
+        // Every task owns one row range in every column; the vectors keep length zero until all
+        // tasks finish, so unwinding before `set_len` drops no uninitialized elements.
+        let num_wires = self.num_wires;
+        let degree = self.degree;
+        let mut wire_values: Vec<Vec<F>> =
+            (0..num_wires).map(|_| Vec::with_capacity(degree)).collect();
+
+        #[cfg(feature = "parallel")]
+        let use_parallel = degree.saturating_mul(num_wires) >= 1 << 15
+            && plonky2_maybe_rayon::rayon::current_num_threads() > 1;
+        #[cfg(not(feature = "parallel"))]
+        let use_parallel = false;
+        if !use_parallel {
+            let mut wire_index = 0;
+            for _ in 0..degree {
+                for column in &mut wire_values {
+                    column.push(self.values[self.representative_map[wire_index]]);
+                    wire_index += 1;
+                }
+            }
+            return MatrixWitness { wire_values };
+        }
+
+        let num_chunks = 16.min(degree.max(1));
+        let chunk_rows = degree.div_ceil(num_chunks);
+        {
+            let mut segments: Vec<Vec<&mut [core::mem::MaybeUninit<F>]>> = (0..num_chunks)
+                .map(|_| Vec::with_capacity(num_wires))
+                .collect();
+            for column in &mut wire_values {
+                let mut rest = &mut column.spare_capacity_mut()[..degree];
+                for chunk_columns in &mut segments {
+                    let take = chunk_rows.min(rest.len());
+                    let (head, tail) = rest.split_at_mut(take);
+                    chunk_columns.push(head);
+                    rest = tail;
+                }
+                debug_assert!(rest.is_empty());
+            }
+
+            use plonky2_maybe_rayon::*;
+            segments
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(chunk, columns)| {
+                    let rows = columns.first().map_or(0, |column| column.len());
+                    debug_assert!(columns.iter().all(|column| column.len() == rows));
+                    let mut wire_index = chunk * chunk_rows * num_wires;
+                    for row in 0..rows {
+                        for column in columns.iter_mut() {
+                            column[row].write(self.values[self.representative_map[wire_index]]);
+                            wire_index += 1;
+                        }
+                    }
+                    debug_assert_eq!(wire_index, (chunk * chunk_rows + rows) * num_wires);
+                });
+        }
+
+        for column in &mut wire_values {
+            // SAFETY: the disjoint segments cover exactly `degree` slots in every column, and the
+            // completed parallel traversal writes every slot exactly once before this point.
+            unsafe {
+                column.set_len(degree);
             }
         }
 
@@ -433,5 +479,106 @@ impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    fn serial_full_witness_reference<F: Field>(witness: &PartitionWitness<F>) -> Vec<Vec<F>> {
+        let mut wire_values: Vec<Vec<F>> = (0..witness.num_wires)
+            .map(|_| Vec::with_capacity(witness.degree))
+            .collect();
+        let mut wire_index = 0;
+        for _ in 0..witness.degree {
+            for column in &mut wire_values {
+                column.push(witness.values[witness.representative_map[wire_index]]);
+                wire_index += 1;
+            }
+        }
+        wire_values
+    }
+
+    #[test]
+    fn full_witness_matches_serial_reference_across_chunk_boundaries() {
+        type F = GoldilocksField;
+
+        let run_cases = || {
+            for &degree in &[0usize, 1, 2, 15, 16, 17, 31, 32, 33, 257, 8_192, 8_193] {
+                for &num_wires in &[0usize, 1, 2, 5] {
+                    let num_wire_targets = degree * num_wires;
+                    let num_targets = num_wire_targets + usize::from(num_wire_targets != 0) * 3;
+                    let num_representatives = num_targets.div_ceil(2).max(1);
+                    let representative_map = (0..num_targets)
+                        .map(|i| (i.wrapping_mul(7).wrapping_add(3)) % num_representatives)
+                        .collect::<Vec<_>>();
+                    let mut witness =
+                        PartitionWitness::<F>::new(num_wires, degree, &representative_map);
+                    for (i, value) in witness.values.iter_mut().enumerate() {
+                        // Leave every third representative at its unset zero value. The remaining
+                        // representatives deliberately alias many wire cells through the map.
+                        if i % 3 != 0 {
+                            *value = F::from_canonical_usize(i.wrapping_mul(11).wrapping_add(5));
+                        }
+                    }
+
+                    let expected = serial_full_witness_reference(&witness);
+                    let actual = witness.full_witness().wire_values;
+
+                    assert_eq!(actual, expected, "degree={degree}, num_wires={num_wires}");
+                    assert_eq!(actual.len(), num_wires);
+                    assert!(actual.iter().all(|column| column.len() == degree));
+                }
+            }
+        };
+
+        #[cfg(feature = "parallel")]
+        for threads in [1, 2, 4, 16] {
+            plonky2_maybe_rayon::rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(run_cases);
+        }
+        #[cfg(not(feature = "parallel"))]
+        run_cases();
+    }
+
+    #[test]
+    fn full_witness_panic_paths_drop_partially_initialized_storage_safely() {
+        type F = GoldilocksField;
+
+        let run_cases = || {
+            for malformed_map in ["short", "out-of-range"] {
+                let degree = 8_192;
+                let num_wires = 5;
+                let required = degree * num_wires;
+                let mut representative_map = (0..required).collect::<Vec<_>>();
+                if malformed_map == "short" {
+                    representative_map.pop();
+                } else {
+                    representative_map[required - 1] = required;
+                }
+                let mut witness =
+                    PartitionWitness::<F>::new(num_wires, degree, &representative_map);
+                witness.values.fill(F::ONE);
+
+                let result = std::panic::catch_unwind(|| witness.full_witness());
+                assert!(result.is_err(), "malformed_map={malformed_map}");
+            }
+        };
+
+        #[cfg(feature = "parallel")]
+        for threads in [1, 2, 4, 16] {
+            plonky2_maybe_rayon::rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(run_cases);
+        }
+        #[cfg(not(feature = "parallel"))]
+        run_cases();
     }
 }
