@@ -670,6 +670,25 @@ fn compute_quotient_polys<
 
     let z_h_on_coset = ZeroPolyOnCoset::new(common_data.degree_bits(), quotient_degree_bits);
 
+    // `eval_vanishing_poly_base_batch` needs L_0(x) at every quotient point.
+    // Computing each denominator inverse inside the Rayon batch loop repeats one
+    // expensive field inversion per point. The quotient domain is fixed for this
+    // proof, so Montgomery's batch inversion gives the same exact values with a
+    // single inversion and a linear number of field multiplications.
+    let l_0_denominators: Vec<F> = points
+        .iter()
+        .map(|&point| {
+            F::from_canonical_usize(common_data.degree())
+                * (F::coset_shift() * point - F::ONE)
+        })
+        .collect();
+    let l_0_denominator_inverses = F::batch_multiplicative_inverse(&l_0_denominators);
+    let l_0_values: Vec<F> = points
+        .iter()
+        .enumerate()
+        .map(|(i, _)| z_h_on_coset.eval(i) * l_0_denominator_inverses[i])
+        .collect();
+
     // Precompute the lookup table evals on the challenges in delta
     // These values are used to produce the final RE constraints for each lut,
     // and are the same each time in check_lookup_constraints_batched.
@@ -860,7 +879,7 @@ fn compute_quotient_polys<
                     beta_k_is,
                     deltas,
                     alphas,
-                    &z_h_on_coset,
+                    &l_0_values,
                     &lut_re_poly_evals_refs,
                     &mut scratch.vanishing,
                     quotient_values_batch,

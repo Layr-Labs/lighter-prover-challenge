@@ -8,7 +8,6 @@ use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
-use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
 use crate::gates::selectors::LookupSelectors;
@@ -198,7 +197,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     beta_k_is: &[F],
     deltas: &[F],
     alphas: &[F],
-    z_h_on_coset: &ZeroPolyOnCoset<F>,
+    l_0_values: &[F],
     lut_re_poly_evals: &[&[F]],
     scratch: &mut VanishingScratch<F>,
     res_out: &mut [F],
@@ -238,6 +237,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(betas.len(), num_challenges);
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
+    debug_assert!(l_0_values.len() >= indices_batch.iter().copied().max().unwrap_or(0) + 1);
 
     let numerator_values = &mut scratch.numerator_values;
     let denominator_values = &mut scratch.denominator_values;
@@ -286,7 +286,10 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
         let constraint_terms = PackedStridedView::new(constraint_terms_batch, n, k);
 
-        let l_0_x = z_h_on_coset.eval_l_0(index, x);
+        // `L_0(x)` values were batch-inverted once for the whole quotient domain
+        // by `compute_quotient_polys`; indexing here avoids one field inverse per
+        // point while preserving the exact formula.
+        let l_0_x = l_0_values[index];
         for i in 0..num_challenges {
             let z_x = local_zs[i];
             let z_gx = next_zs[i];

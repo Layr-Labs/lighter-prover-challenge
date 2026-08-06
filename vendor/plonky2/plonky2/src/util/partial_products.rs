@@ -58,21 +58,34 @@ pub(crate) fn check_partial_products<F: Field>(
     max_degree: usize,
 ) -> Vec<F> {
     debug_assert!(max_degree > 1);
-    let product_accs = iter::once(&z_x)
-        .chain(partials.iter())
-        .chain(iter::once(&z_gx));
     let chunk_size = max_degree;
-    numerators
-        .chunks(chunk_size)
-        .zip_eq(denominators.chunks(chunk_size))
-        .zip_eq(product_accs.tuple_windows())
-        .map(|((nume_chunk, deno_chunk), (&prev_acc, &next_acc))| {
-            let num_chunk_product = nume_chunk.iter().copied().product();
-            let den_chunk_product = deno_chunk.iter().copied().product();
-            // Assert that next_acc * deno_product = prev_acc * nume_product.
-            prev_acc * num_chunk_product - next_acc * den_chunk_product
-        })
-        .collect()
+    let mut result = Vec::with_capacity(partials.len());
+    for (chunk_i, nume_chunk) in numerators.chunks(chunk_size).enumerate() {
+        let deno_start = chunk_i * chunk_size;
+        let deno_chunk = &denominators[deno_start..deno_start + nume_chunk.len()];
+        debug_assert_eq!(nume_chunk.len(), deno_chunk.len());
+
+        let mut num_chunk_product = F::ONE;
+        let mut den_chunk_product = F::ONE;
+        for (&numerator, &denominator) in nume_chunk.iter().zip(deno_chunk) {
+            num_chunk_product *= numerator;
+            den_chunk_product *= denominator;
+        }
+
+        let prev_acc = if chunk_i == 0 {
+            z_x
+        } else {
+            partials[chunk_i - 1]
+        };
+        let next_acc = if chunk_i < partials.len() {
+            partials[chunk_i]
+        } else {
+            z_gx
+        };
+        // Assert that next_acc * deno_product = prev_acc * nume_product.
+        result.push(prev_acc * num_chunk_product - next_acc * den_chunk_product);
+    }
+    result
 }
 
 /// Checks the relationship between each pair of partial product accumulators. In particular, this
