@@ -167,11 +167,16 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32AddManyGate
         let base_limb = F::from_canonical_u64(1u64 << Self::limb_bits());
         let base32 = F::from_canonical_u64(1 << 32u64);
         let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
-        let mut chunks = res.chunks_exact_mut(n);
-        let mut combined_result = vec![F::ZERO; n];
-        let mut combined_carry = vec![F::ZERO; n];
+        let constraints_per_op = 3 + Self::num_limbs();
+        let mut op_chunks = res.chunks_exact_mut(n * constraints_per_op);
 
         for i in 0..self.num_ops {
+            let op_constraints = op_chunks.next().unwrap();
+            let (constraint_rows, recomposition_rows) =
+                op_constraints.split_at_mut(n * (1 + Self::num_limbs()));
+            let (combined_result, combined_carry) = recomposition_rows.split_at_mut(n);
+            let mut chunks = constraint_rows.chunks_exact_mut(n);
+
             let output_result = &wires[self.wire_ith_output_result(i) * n..][..n];
             let output_carry = &wires[self.wire_ith_output_carry(i) * n..][..n];
 
@@ -191,8 +196,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32AddManyGate
             // Limb range products (base-4: x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3))
             // in the same descending order as `eval_unfiltered`, accumulating
             // the result/carry recompositions along the way.
-            combined_result.fill(F::ZERO);
-            combined_carry.fill(F::ZERO);
             for j in (0..Self::num_limbs()).rev() {
                 let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
                 let out = chunks.next().unwrap();
@@ -203,22 +206,20 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32AddManyGate
                     out[p] = y * (y + F::TWO);
                 }
                 let combined = if j < Self::num_result_limbs() {
-                    &mut combined_result
+                    &mut combined_result[..]
                 } else {
-                    &mut combined_carry
+                    &mut combined_carry[..]
                 };
                 for p in 0..n {
                     combined[p] = combined[p] * base_limb + limb[p];
                 }
             }
 
-            let out = chunks.next().unwrap();
             for p in 0..n {
-                out[p] = combined_result[p] - output_result[p];
+                combined_result[p] = combined_result[p] - output_result[p];
             }
-            let out = chunks.next().unwrap();
             for p in 0..n {
-                out[p] = combined_carry[p] - output_carry[p];
+                combined_carry[p] = combined_carry[p] - output_carry[p];
             }
         }
         res
