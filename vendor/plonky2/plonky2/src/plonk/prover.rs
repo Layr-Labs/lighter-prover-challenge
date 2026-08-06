@@ -865,16 +865,6 @@ fn compute_quotient_polys<
                     &mut scratch.vanishing,
                     quotient_values_batch,
                 );
-
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
-                }
             },
         );
 
