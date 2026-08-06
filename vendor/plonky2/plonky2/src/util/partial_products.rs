@@ -1,6 +1,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 use core::iter;
+use core::mem::MaybeUninit;
 
 use itertools::Itertools;
 
@@ -21,6 +22,25 @@ pub(crate) fn quotient_chunk_products<F: Field>(
         .chunks(chunk_size)
         .map(|chunk| chunk.iter().copied().product())
         .collect()
+}
+
+/// Write the same products as [`quotient_chunk_products`] into caller-owned,
+/// uninitialized storage.
+///
+/// Every output slot is initialized before this function returns. The caller
+/// must not treat the storage as initialized if this function unwinds.
+pub(crate) fn quotient_chunk_products_into<F: Field>(
+    quotient_values: &[F],
+    max_degree: usize,
+    output: &mut [MaybeUninit<F>],
+) {
+    assert!(max_degree > 1);
+    assert!(!quotient_values.is_empty());
+    assert_eq!(output.len(), quotient_values.len().div_ceil(max_degree));
+
+    for (out, quotient_chunk) in output.iter_mut().zip(quotient_values.chunks(max_degree)) {
+        out.write(quotient_chunk.iter().copied().product());
+    }
 }
 
 /// Compute partial products of the original vector `v` such that all products consist of `max_degree`
@@ -143,6 +163,36 @@ mod tests {
         assert!(check_partial_products(&v, &denominators, pps, z_x, z_gx, 3)
             .iter()
             .all(|x| x.is_zero()));
+    }
+
+    #[test]
+    fn test_flat_quotient_chunk_products_match_nested_output() {
+        type F = GoldilocksField;
+
+        // Include exact and partial final chunks, as well as the production
+        // 80-routed-wire / degree-8 shape.
+        for len in [1, 2, 3, 7, 8, 9, 17, 79, 80, 81, 159, 160, 161] {
+            let values: Vec<F> = (0..len)
+                .map(|i| {
+                    let deterministic = (i as u64 + 17).wrapping_mul(0x9e37_79b9);
+                    F::from_canonical_u64(deterministic)
+                })
+                .collect();
+
+            for degree in [2, 3, 4, 7, 8, 11] {
+                let expected = quotient_chunk_products(&values, degree);
+                let mut flat = Vec::with_capacity(expected.len());
+                quotient_chunk_products_into(
+                    &values,
+                    degree,
+                    &mut flat.spare_capacity_mut()[..expected.len()],
+                );
+                // SAFETY: `quotient_chunk_products_into` checked the exact
+                // output length and initialized every slot before returning.
+                unsafe { flat.set_len(expected.len()) };
+                assert_eq!(flat, expected, "len={len}, degree={degree}");
+            }
+        }
     }
 
     fn field_vec<F: Field>(xs: &[usize]) -> Vec<F> {
