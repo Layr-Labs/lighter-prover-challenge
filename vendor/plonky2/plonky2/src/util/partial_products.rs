@@ -75,6 +75,32 @@ pub(crate) fn check_partial_products<F: Field>(
         .collect()
 }
 
+pub(crate) fn append_partial_product_checks<F: Field>(
+    num_values: usize,
+    mut values: impl FnMut(usize) -> (F, F),
+    partials: &[F],
+    z_x: F,
+    z_gx: F,
+    max_degree: usize,
+    checks: &mut Vec<F>,
+) {
+    debug_assert!(max_degree > 1);
+    debug_assert_eq!(partials.len() + 1, num_values.div_ceil(max_degree));
+    let mut prev_acc = z_x;
+    for (chunk, start) in (0..num_values).step_by(max_degree).enumerate() {
+        let mut num_chunk_product = F::ONE;
+        let mut den_chunk_product = F::ONE;
+        for i in start..core::cmp::min(start + max_degree, num_values) {
+            let (numerator, denominator) = values(i);
+            num_chunk_product *= numerator;
+            den_chunk_product *= denominator;
+        }
+        let next_acc = partials.get(chunk).copied().unwrap_or(z_gx);
+        checks.push(prev_acc * num_chunk_product - next_acc * den_chunk_product);
+        prev_acc = next_acc;
+    }
+}
+
 /// Checks the relationship between each pair of partial product accumulators. In particular, this
 /// sequence of accumulators starts with `Z(x)`, then contains each partial product polynomials
 /// `p_i(x)`, and finally `Z(g x)`. See the partial products section of the Plonky2 paper.
@@ -143,6 +169,22 @@ mod tests {
         assert!(check_partial_products(&v, &denominators, pps, z_x, z_gx, 3)
             .iter()
             .all(|x| x.is_zero()));
+
+        let quotient_chunks_prods = quotient_chunk_products(&v, 4);
+        let pps_and_z_gx = partial_products_and_z_gx(z_x, &quotient_chunks_prods);
+        let pps = &pps_and_z_gx[..pps_and_z_gx.len() - 1];
+        let expected = check_partial_products(&v, &denominators, pps, z_x, z_gx, 4);
+        let mut fused = Vec::new();
+        append_partial_product_checks(
+            v.len(),
+            |i| (v[i], denominators[i]),
+            pps,
+            z_x,
+            z_gx,
+            4,
+            &mut fused,
+        );
+        assert_eq!(fused, expected);
     }
 
     fn field_vec<F: Field>(xs: &[usize]) -> Vec<F> {

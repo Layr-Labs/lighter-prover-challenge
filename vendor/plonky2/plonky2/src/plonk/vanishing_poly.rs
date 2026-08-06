@@ -20,7 +20,9 @@ use crate::plonk::circuit_data::CommonCircuitData;
 use crate::plonk::plonk_common;
 use crate::plonk::plonk_common::eval_l_0_circuit;
 use crate::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBaseBatch};
-use crate::util::partial_products::{check_partial_products, check_partial_products_circuit};
+use crate::util::partial_products::{
+    append_partial_product_checks, check_partial_products, check_partial_products_circuit,
+};
 use crate::util::reducing::ReducingFactorTarget;
 use crate::with_context;
 
@@ -166,8 +168,6 @@ pub(crate) fn eval_vanishing_poly<F: RichField + Extendable<D>, const D: usize>(
 /// once per 32-point batch.
 #[derive(Default)]
 pub(crate) struct VanishingScratch<F> {
-    pub numerator_values: Vec<F>,
-    pub denominator_values: Vec<F>,
     pub vanishing_z_1_terms: Vec<F>,
     pub vanishing_partial_products_terms: Vec<F>,
     pub vanishing_all_lookup_terms: Vec<F>,
@@ -259,11 +259,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
     reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out);
 
-    let numerator_values = &mut scratch.numerator_values;
-    let denominator_values = &mut scratch.denominator_values;
-    numerator_values.clear();
-    denominator_values.clear();
-
     // The L_0(x) (Z(x) - 1) vanishing terms.
     let vanishing_z_1_terms = &mut scratch.vanishing_z_1_terms;
     // The terms checking the partial products.
@@ -331,32 +326,23 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 vanishing_all_lookup_terms.extend(lookup_constraints);
             }
 
-            numerator_values.extend((0..num_routed_wires).map(|j| {
-                let wire_value = vars.local_wires[j];
-                let beta_k_i = beta_k_is[i * num_routed_wires + j];
-                wire_value + beta_k_i * x + gammas[i]
-            }));
-            denominator_values.extend((0..num_routed_wires).map(|j| {
-                let wire_value = vars.local_wires[j];
-                let s_sigma = s_sigmas[j];
-                wire_value + betas[i] * s_sigma + gammas[i]
-            }));
-
             // The partial products considered for this iteration of `i`.
             let current_partial_products = &partial_products[i * num_prods..(i + 1) * num_prods];
-            // Check the numerator partial products.
-            let partial_product_checks = check_partial_products(
-                &numerator_values,
-                &denominator_values,
+            append_partial_product_checks(
+                num_routed_wires,
+                |j| {
+                    let wire_value = vars.local_wires[j];
+                    (
+                        wire_value + beta_k_is[i * num_routed_wires + j] * x + gammas[i],
+                        wire_value + betas[i] * s_sigmas[j] + gammas[i],
+                    )
+                },
                 current_partial_products,
                 z_x,
                 z_gx,
                 max_degree,
+                vanishing_partial_products_terms,
             );
-            vanishing_partial_products_terms.extend(partial_product_checks);
-
-            numerator_values.clear();
-            denominator_values.clear();
         }
 
         let vanishing_terms = vanishing_z_1_terms
