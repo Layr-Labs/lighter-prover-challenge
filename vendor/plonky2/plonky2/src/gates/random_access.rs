@@ -10,6 +10,7 @@ use core::marker::PhantomData;
 use anyhow::Result;
 use itertools::Itertools;
 
+use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::Extendable;
 use crate::field::packed::PackedField;
 use crate::field::types::Field;
@@ -269,6 +270,100 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
         res
     }
 
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= self.num_constraints() * n);
+
+        let wires = vars_base.local_wires;
+        let constants = vars_base.local_constants;
+        let col = |w: usize| &wires[w * n..][..n];
+        let vec_size = self.vec_size();
+        // `items` holds vec_size columns of n points, folded in place; the
+        // write index k always trails the read indices 2k, 2k+1, which were
+        // consumed at an earlier k of the same level.
+        let mut items = vec![F::ZERO; vec_size * n];
+        let mut acc = vec![F::ZERO; n];
+        let mut scratch = vec![F::ZERO; n];
+        let mut constraint_index = 0;
+
+        for copy in 0..self.num_copies {
+            // Assert that each bit wire value is indeed boolean.
+            for i in 0..self.bits {
+                let b = col(self.wire_bit(i, copy));
+                for p in 0..n {
+                    scratch[p] = b[p] * (b[p] - F::ONE);
+                }
+                let combined = &mut combined_gate_constraints
+                    [constraint_index * n..(constraint_index + 1) * n];
+                batch_multiply_add_inplace(combined, &scratch, filters);
+                constraint_index += 1;
+            }
+
+            // Assert that the binary decomposition was correct.
+            acc.fill(F::ZERO);
+            for i in (0..self.bits).rev() {
+                let b = col(self.wire_bit(i, copy));
+                for p in 0..n {
+                    acc[p] = acc[p].double() + b[p];
+                }
+            }
+            let access_index = col(self.wire_access_index(copy));
+            for p in 0..n {
+                scratch[p] = acc[p] - access_index[p];
+            }
+            let combined =
+                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
+            batch_multiply_add_inplace(combined, &scratch, filters);
+            constraint_index += 1;
+
+            // Repeatedly fold the list, selecting the left or right item from
+            // each pair based on the corresponding bit.
+            for i in 0..vec_size {
+                items[i * n..][..n].copy_from_slice(col(self.wire_list_item(i, copy)));
+            }
+            let mut level_size = vec_size;
+            for i in 0..self.bits {
+                let b = col(self.wire_bit(i, copy));
+                for k in 0..level_size / 2 {
+                    for p in 0..n {
+                        let x = items[2 * k * n + p];
+                        let y = items[(2 * k + 1) * n + p];
+                        items[k * n + p] = x + b[p] * (y - x);
+                    }
+                }
+                level_size /= 2;
+            }
+            let claimed_element = col(self.wire_claimed_element(copy));
+            for p in 0..n {
+                scratch[p] = items[p] - claimed_element[p];
+            }
+            let combined =
+                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
+            batch_multiply_add_inplace(combined, &scratch, filters);
+            constraint_index += 1;
+        }
+
+        for i in 0..self.num_extra_constants {
+            let constant = &constants[i * n..][..n];
+            let wire = col(self.wire_extra_constant(i));
+            for p in 0..n {
+                scratch[p] = constant[p] - wire[p];
+            }
+            let combined =
+                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
+            batch_multiply_add_inplace(combined, &scratch, filters);
+            constraint_index += 1;
+        }
+
+        debug_assert_eq!(constraint_index, self.num_constraints());
+    }
+
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,
@@ -512,6 +607,40 @@ mod tests {
         type C = PoseidonGoldilocksConfig;
         type F = <C as GenericConfig<D>>::F;
         test_eval_fns::<F, C, _, D>(RandomAccessGate::new(4, 4, 1))
+    }
+
+    #[test]
+    fn direct_filtered_accumulation_matches_materialized_batch() {
+        const D: usize = 2;
+        const N: usize = 11;
+        type F = GoldilocksField;
+
+        let gate = RandomAccessGate::<F, D>::new_from_config(
+            &CircuitConfig::standard_recursion_config(),
+            4,
+        );
+        let wires = (0..gate.num_wires() * N)
+            .map(|i| F::from_canonical_usize(3 * i + 5))
+            .collect::<Vec<_>>();
+        let constants = (0..gate.num_constants() * N)
+            .map(|i| F::from_canonical_usize(7 * i + 4))
+            .collect::<Vec<_>>();
+        let hash = HashOut::ZERO;
+        let vars = EvaluationVarsBaseBatch::new(N, &constants, &wires, &hash);
+        let filters = (0..N)
+            .map(|i| F::from_canonical_usize(2 * i + 1))
+            .collect::<Vec<_>>();
+        let mut expected = vec![F::ZERO; gate.num_constraints() * N];
+        let materialized = gate.eval_unfiltered_base_batch(vars);
+        for (acc, constraints) in expected
+            .chunks_exact_mut(N)
+            .zip(materialized.chunks_exact(N))
+        {
+            batch_multiply_add_inplace(acc, constraints, &filters);
+        }
+        let mut actual = vec![F::ZERO; expected.len()];
+        gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+        assert_eq!(actual, expected);
     }
 
     #[test]
