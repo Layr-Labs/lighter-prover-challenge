@@ -43,6 +43,11 @@ pub(crate) enum BatchLayout {
     PolyMajor,
 }
 
+#[inline]
+fn resize_for_overwrite<F: Field>(out: &mut Vec<F>, len: usize) {
+    out.resize(len, F::ZERO);
+}
+
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
 #[derive(Eq, PartialEq, Debug)]
 pub struct PolynomialBatch<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
@@ -246,8 +251,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let n = indices.len();
         let start = col_range.start;
         let w = col_range.len();
-        out.clear();
-        out.resize(n * w, F::ZERO);
+        resize_for_overwrite(out, n * w);
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
                 for (ci, c) in col_range.enumerate() {
@@ -402,6 +406,7 @@ mod tests {
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::Sample;
+    use crate::hash::merkle_tree::MerkleTree;
     use crate::plonk::config::Poseidon2GoldilocksConfig;
 
     #[test]
@@ -426,5 +431,65 @@ mod tests {
         let actual = PolynomialBatch::<F, C, D>::lde_values(&polynomials, RATE_BITS, false, None);
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn fill_lde_batch_reuses_and_fully_overwrites_output() {
+        const D: usize = 2;
+        const LOG_ROWS: usize = 5;
+        const ROWS: usize = 1 << LOG_ROWS;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let columns = (0..5)
+            .map(|column| {
+                (0..ROWS)
+                    .map(|row| F::from_canonical_usize(100 * column + row + 1))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut row_data = Vec::with_capacity(ROWS * columns.len());
+        for leaf_index in 0..ROWS {
+            let natural_index = reverse_bits(leaf_index, LOG_ROWS);
+            row_data.extend(columns.iter().map(|column| column[natural_index]));
+        }
+
+        let row_batch = PolynomialBatch::<F, C, D> {
+            polynomials: Vec::new(),
+            merkle_tree: MerkleTree::new_flat(row_data, columns.len(), 1),
+            degree_log: LOG_ROWS,
+            rate_bits: 0,
+            blinding: false,
+        };
+        let column_batch = PolynomialBatch::<F, C, D> {
+            polynomials: Vec::new(),
+            merkle_tree: MerkleTree::new_columns(columns, 1),
+            degree_log: LOG_ROWS,
+            rate_bits: 0,
+            blinding: false,
+        };
+
+        let garbage = F::from_canonical_usize(0xdead_beef);
+        let mut prepared = vec![garbage; 7];
+        resize_for_overwrite(&mut prepared, 7);
+        assert_eq!(prepared, vec![garbage; 7]);
+        resize_for_overwrite(&mut prepared, 3);
+        assert_eq!(prepared, vec![garbage; 3]);
+        resize_for_overwrite(&mut prepared, 7);
+        assert_eq!(&prepared[..3], &[garbage; 3]);
+        assert_eq!(&prepared[3..], &[F::ZERO; 4]);
+
+        for batch in [&row_batch, &column_batch] {
+            for layout in [BatchLayout::PointMajor, BatchLayout::PolyMajor] {
+                let mut reused = vec![garbage; 3];
+                for n in [1, 32, 32, 31, 32] {
+                    let indices = (0..n).collect::<Vec<_>>();
+                    let mut expected = Vec::new();
+                    batch.fill_lde_batch(&indices, 1, 1..4, layout, &mut expected);
+                    batch.fill_lde_batch(&indices, 1, 1..4, layout, &mut reused);
+                    assert_eq!(reused, expected, "layout={layout:?}, n={n}");
+                }
+            }
+        }
     }
 }

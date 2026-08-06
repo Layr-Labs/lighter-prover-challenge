@@ -609,6 +609,42 @@ fn compute_all_lookup_polys<
 
 const BATCH_SIZE: usize = 32;
 
+fn fixed_batch_row_slices<'a, T, R>(
+    flat: &'a [T],
+    row_width: usize,
+    range: R,
+    n: usize,
+) -> [&'a [T]; BATCH_SIZE]
+where
+    R: core::ops::RangeBounds<usize>,
+{
+    use core::ops::Bound;
+
+    let range_start = match range.start_bound() {
+        Bound::Included(&start) => start,
+        Bound::Excluded(&start) => start.checked_add(1).expect("row range start overflow"),
+        Bound::Unbounded => 0,
+    };
+    let range_end = match range.end_bound() {
+        Bound::Included(&end) => end.checked_add(1).expect("row range end overflow"),
+        Bound::Excluded(&end) => end,
+        Bound::Unbounded => row_width,
+    };
+    assert!(n <= BATCH_SIZE);
+    assert!(range_start <= range_end);
+    assert!(range_end <= row_width);
+    assert!(flat.len() >= n * row_width);
+    core::array::from_fn(|row| {
+        if row < n {
+            let start = row * row_width + range_start;
+            let end = row * row_width + range_end;
+            &flat[start..end]
+        } else {
+            &[]
+        }
+    })
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -779,40 +815,50 @@ fn compute_quotient_polys<
                 );
 
                 let indices_batch = &scratch.indices;
-                let local_zs_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.zs_local_flat[k * zs_row_width..][common_data.zs_range()])
-                    .collect();
-                let next_zs_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.zs_next_flat[k * zs_row_width..][common_data.zs_range()])
-                    .collect();
-                let partial_products_batch: Vec<&[F]> = (0..n)
-                    .map(|k| {
-                        &scratch.zs_local_flat[k * zs_row_width..]
-                            [common_data.partial_products_range()]
-                    })
-                    .collect();
-                let s_sigmas_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires])
-                    .collect();
-                let (local_lookup_batch, next_lookup_batch): (Vec<&[F]>, Vec<&[F]>) = if has_lookup
-                {
+                let local_zs_batch = fixed_batch_row_slices(
+                    &scratch.zs_local_flat,
+                    zs_row_width,
+                    common_data.zs_range(),
+                    n,
+                );
+                let next_zs_batch = fixed_batch_row_slices(
+                    &scratch.zs_next_flat,
+                    zs_row_width,
+                    common_data.zs_range(),
+                    n,
+                );
+                let partial_products_batch = fixed_batch_row_slices(
+                    &scratch.zs_local_flat,
+                    zs_row_width,
+                    common_data.partial_products_range(),
+                    n,
+                );
+                let s_sigmas_batch = fixed_batch_row_slices(
+                    &scratch.s_sigmas_flat,
+                    num_routed_wires,
+                    0..num_routed_wires,
+                    n,
+                );
+                let empty_batch: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
+                let (local_lookup_batch, next_lookup_batch) = if has_lookup {
                     (
-                        (0..n)
-                            .map(|k| {
-                                &scratch.zs_local_flat[k * zs_row_width..]
-                                    [common_data.lookup_range()]
-                            })
-                            .collect(),
-                        (0..n)
-                            .map(|k| {
-                                &scratch.zs_next_flat[k * zs_row_width..]
-                                    [common_data.lookup_range()]
-                            })
-                            .collect(),
+                        fixed_batch_row_slices(
+                            &scratch.zs_local_flat,
+                            zs_row_width,
+                            common_data.lookup_range(),
+                            n,
+                        ),
+                        fixed_batch_row_slices(
+                            &scratch.zs_next_flat,
+                            zs_row_width,
+                            common_data.lookup_range(),
+                            n,
+                        ),
                     )
                 } else {
-                    (Vec::new(), Vec::new())
+                    (empty_batch, empty_batch)
                 };
+                let lookup_batch_len = if has_lookup { n } else { 0 };
 
                 let vars_batch = EvaluationVarsBaseBatch::new(
                     n,
@@ -827,12 +873,12 @@ fn compute_quotient_polys<
                     indices_batch,
                     &scratch.shifted_xs,
                     vars_batch,
-                    &local_zs_batch,
-                    &next_zs_batch,
-                    &local_lookup_batch,
-                    &next_lookup_batch,
-                    &partial_products_batch,
-                    &s_sigmas_batch,
+                    &local_zs_batch[..n],
+                    &next_zs_batch[..n],
+                    &local_lookup_batch[..lookup_batch_len],
+                    &next_lookup_batch[..lookup_batch_len],
+                    &partial_products_batch[..n],
+                    &s_sigmas_batch[..n],
                     betas,
                     gammas,
                     deltas,
@@ -868,4 +914,38 @@ fn compute_quotient_polys<
         })
         .map(|values| values.coset_ifft(F::coset_shift()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_batch_row_slices_match_vec_reference_for_full_tail_and_lookup_modes() {
+        const ROW_WIDTH: usize = 9;
+        let flat: Vec<usize> = (0..BATCH_SIZE * ROW_WIDTH).collect();
+
+        for n in [1, BATCH_SIZE - 1, BATCH_SIZE] {
+            for lookup_enabled in [false, true] {
+                let range = 3..7;
+                let expected: Vec<&[usize]> = if lookup_enabled {
+                    (0..n)
+                        .map(|row| &flat[row * ROW_WIDTH..][range.clone()])
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                let rows = if lookup_enabled {
+                    fixed_batch_row_slices(&flat, ROW_WIDTH, range, n)
+                } else {
+                    [&[][..]; BATCH_SIZE]
+                };
+                let actual = &rows[..if lookup_enabled { n } else { 0 }];
+
+                assert_eq!(actual, expected.as_slice());
+                assert!(rows[n..].iter().all(|row| row.is_empty()));
+            }
+        }
+    }
 }

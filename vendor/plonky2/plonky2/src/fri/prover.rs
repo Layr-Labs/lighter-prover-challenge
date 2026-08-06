@@ -81,6 +81,15 @@ pub fn final_poly_coeff_len(mut degree_bits: usize, reduction_arity_bits: &Vec<u
     1 << degree_bits
 }
 
+#[inline]
+fn maybe_recompute_next_fri_codeword<T>(
+    round_index: usize,
+    num_reductions: usize,
+    recompute: impl FnOnce() -> T,
+) -> Option<T> {
+    (round_index + 1 < num_reductions).then(recompute)
+}
+
 fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     mut coeffs: PolynomialCoeffs<F::Extension>,
     mut values: PolynomialValues<F::Extension>,
@@ -92,7 +101,7 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     let mut trees = Vec::with_capacity(fri_params.reduction_arity_bits.len());
 
     let mut shift = F::MULTIPLICATIVE_GROUP_GENERATOR;
-    for arity_bits in &fri_params.reduction_arity_bits {
+    for (round_index, arity_bits) in fri_params.reduction_arity_bits.iter().enumerate() {
         let arity = 1 << arity_bits;
 
         // Fused bit-reversal + flatten: one gather pass writes the flat leaf
@@ -125,15 +134,25 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
                 .map(|chunk| reduce_with_powers(chunk, beta))
                 .collect::<Vec<_>>(),
         );
-        shift = shift.exp_u64(arity as u64);
-        // Chunk-wise folding preserves the zero tail: the coefficient vector
-        // keeps `1/2^rate_bits` support every round (asserted by the
-        // truncation below), so the FFT's zero-run shortcut always applies.
-        values = coeffs.coset_fft_with_options(
-            shift.into(),
-            Some(fri_params.config.rate_bits),
-            None,
-        )
+        if let Some((next_shift, next_values)) = maybe_recompute_next_fri_codeword(
+            round_index,
+            fri_params.reduction_arity_bits.len(),
+            || {
+                let next_shift = shift.exp_u64(arity as u64);
+                // Chunk-wise folding preserves the zero tail: the coefficient vector
+                // keeps `1/2^rate_bits` support every round (asserted by the
+                // truncation below), so the FFT's zero-run shortcut always applies.
+                let next_values = coeffs.coset_fft_with_options(
+                    next_shift.into(),
+                    Some(fri_params.config.rate_bits),
+                    None,
+                );
+                (next_shift, next_values)
+            },
+        ) {
+            shift = next_shift;
+            values = next_values;
+        }
     }
 
     // When verifying this proof in a circuit with a different number of query steps,
@@ -164,6 +183,34 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     }
 
     (trees, coeffs)
+}
+
+#[cfg(test)]
+mod tests {
+    use core::cell::Cell;
+
+    use super::maybe_recompute_next_fri_codeword;
+
+    #[test]
+    fn interpolation_runs_only_when_another_reduction_needs_the_codeword() {
+        for num_reductions in [0, 1, 3] {
+            let recomputations = Cell::new(0);
+            let outputs = (0..num_reductions)
+                .map(|round_index| {
+                    maybe_recompute_next_fri_codeword(round_index, num_reductions, || {
+                        recomputations.set(recomputations.get() + 1);
+                        round_index
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let mut expected = (0..num_reductions).map(Some).collect::<Vec<_>>();
+            expected.pop();
+            expected.resize(num_reductions, None);
+            assert_eq!(outputs, expected);
+            assert_eq!(recomputations.get(), num_reductions.saturating_sub(1),);
+        }
+    }
 }
 
 /// Performs the proof-of-work (a.k.a. grinding) step of the FRI protocol. Returns the PoW witness.

@@ -1,6 +1,6 @@
 use core::ffi::c_void;
 use core::marker::PhantomData;
-use core::mem::{size_of, size_of_val};
+use core::mem::{size_of, size_of_val, MaybeUninit};
 use core::slice;
 use std::collections::HashMap;
 use std::sync::{Condvar, LazyLock, Mutex};
@@ -744,7 +744,12 @@ impl MetalShared {
             let nodes = unsafe {
                 slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
             };
-            Ok(tree_from_levels(nodes, &level_offsets, lde_size, cap_height))
+            Ok(tree_from_levels_uninit(
+                nodes,
+                &level_offsets,
+                lde_size,
+                cap_height,
+            ))
         })();
         self.release_set(set);
         let (digests, cap) = result?;
@@ -1000,7 +1005,12 @@ impl MetalShared {
         let nodes = unsafe {
             slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
         };
-        Ok(tree_from_levels(nodes, &level_offsets, lde_size, cap_height))
+        Ok(tree_from_levels_uninit(
+            nodes,
+            &level_offsets,
+            lde_size,
+            cap_height,
+        ))
     }
 
     fn build<F: RichField>(
@@ -1201,7 +1211,7 @@ impl MetalShared {
 
         let nodes =
             unsafe { slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len) };
-        Ok(tree_from_levels(
+        Ok(tree_from_levels_uninit(
             nodes,
             &level_offsets,
             leaf_count,
@@ -1267,44 +1277,100 @@ fn dispatch(
     );
 }
 
-fn tree_from_levels<F: RichField>(
+fn tree_from_levels_uninit<F: RichField>(
     nodes: &[u64],
     level_offsets: &[usize],
     leaf_count: usize,
     cap_height: usize,
 ) -> (Vec<HashOut<F>>, Vec<HashOut<F>>) {
-    let cap_count = 1usize << cap_height;
-    let subtree_leaf_count = leaf_count / cap_count;
-    let subtree_digest_count = 2 * (subtree_leaf_count - 1);
-    let mut digests = vec![HashOut::ZERO; 2 * (leaf_count - cap_count)];
-    let mut cap = vec![HashOut::ZERO; cap_count];
+    assert!(
+        leaf_count.is_power_of_two(),
+        "leaf count must be a nonzero power of two"
+    );
+    let tree_height = leaf_count.ilog2() as usize;
+    assert!(
+        cap_height <= tree_height,
+        "cap height must not exceed tree height"
+    );
+    let cap_count = 1usize
+        .checked_shl(cap_height as u32)
+        .expect("validated cap height must fit usize");
+    assert!(cap_count <= leaf_count, "cap must fit within the tree");
 
-    if subtree_digest_count == 0 {
-        cap.par_iter_mut()
-            .enumerate()
-            .for_each(|(cap_index, root)| {
-                *root = read_node(nodes, level_offsets[0], cap_index);
-            });
-    } else {
-        digests
-            .par_chunks_exact_mut(subtree_digest_count)
-            .zip(cap.par_iter_mut())
-            .enumerate()
-            .for_each(|(cap_index, (subtree_digests, root))| {
-                *root = fill_subtree_layout(
-                    subtree_digests,
-                    nodes,
-                    level_offsets,
-                    cap_index * subtree_leaf_count,
-                    subtree_leaf_count,
-                );
-            });
+    let subtree_leaf_count = leaf_count / cap_count;
+    let subtree_digest_count = subtree_leaf_count
+        .checked_sub(1)
+        .and_then(|count| count.checked_mul(2))
+        .expect("validated subtree digest count must fit usize");
+    let digest_count = leaf_count
+        .checked_sub(cap_count)
+        .and_then(|count| count.checked_mul(2))
+        .expect("validated tree digest count must fit usize");
+    let chunked_digest_count = cap_count
+        .checked_mul(subtree_digest_count)
+        .expect("subtree digest chunks must fit usize");
+    assert_eq!(
+        digest_count, chunked_digest_count,
+        "each cap subtree must own an exact digest chunk"
+    );
+
+    let mut digests = Vec::with_capacity(digest_count);
+    let mut cap = Vec::with_capacity(cap_count);
+
+    {
+        let digest_slots = &mut digests.spare_capacity_mut()[..digest_count];
+        let cap_slots = &mut cap.spare_capacity_mut()[..cap_count];
+
+        if subtree_digest_count == 0 {
+            cap_slots
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(cap_index, root)| {
+                    root.write(read_node(nodes, level_offsets[0], cap_index));
+                });
+        } else {
+            assert_eq!(
+                digest_count % subtree_digest_count,
+                0,
+                "digest storage must split into exact subtree chunks"
+            );
+            let digest_chunks = digest_slots.par_chunks_exact_mut(subtree_digest_count);
+            assert_eq!(
+                digest_chunks.len(),
+                cap_slots.len(),
+                "one exact digest chunk is required per cap root"
+            );
+            digest_chunks
+                .zip(cap_slots.par_iter_mut())
+                .enumerate()
+                .for_each(|(cap_index, (subtree_digests, root))| {
+                    root.write(fill_subtree_layout_uninit(
+                        subtree_digests,
+                        nodes,
+                        level_offsets,
+                        cap_index * subtree_leaf_count,
+                        subtree_leaf_count,
+                    ));
+                });
+        }
+    }
+
+    unsafe {
+        // SAFETY: Both vectors retain length zero until all parallel work returns successfully, so
+        // a panic cannot expose partially initialized elements. The validated power-of-two tree
+        // and cap bounds make every subtree a power of two. The checked count equality and exact
+        // chunk assertions give every cap root one disjoint `2 * (subtree_leaf_count - 1)` slice.
+        // `fill_subtree_layout_uninit` writes the two child roots, then recursively covers the two
+        // disjoint descendant slices; the leaf case receives an empty slice. Thus every published
+        // slot is initialized exactly once before these lengths become observable.
+        digests.set_len(digest_count);
+        cap.set_len(cap_count);
     }
     (digests, cap)
 }
 
-fn fill_subtree_layout<F: RichField>(
-    digests: &mut [HashOut<F>],
+fn fill_subtree_layout_uninit<F: RichField>(
+    digests: &mut [MaybeUninit<HashOut<F>>],
     nodes: &[u64],
     level_offsets: &[usize],
     start_leaf: usize,
@@ -1318,8 +1384,20 @@ fn fill_subtree_layout<F: RichField>(
     let (left_root, left_digests) = left_half.split_last_mut().unwrap();
     let (right_root, right_digests) = right_half.split_first_mut().unwrap();
     let half = leaf_count / 2;
-    *left_root = fill_subtree_layout(left_digests, nodes, level_offsets, start_leaf, half);
-    *right_root = fill_subtree_layout(right_digests, nodes, level_offsets, start_leaf + half, half);
+    left_root.write(fill_subtree_layout_uninit(
+        left_digests,
+        nodes,
+        level_offsets,
+        start_leaf,
+        half,
+    ));
+    right_root.write(fill_subtree_layout_uninit(
+        right_digests,
+        nodes,
+        level_offsets,
+        start_leaf + half,
+        half,
+    ));
 
     let level = leaf_count.ilog2() as usize;
     read_node(nodes, level_offsets[level], start_leaf / leaf_count)
@@ -1344,6 +1422,116 @@ mod tests {
     use crate::field::types::{Field64, PrimeField64};
     use crate::hash::merkle_tree::{capacity_up_to_mut, fill_digests_buf};
     use crate::hash::poseidon2::hash::Poseidon2Hash;
+
+    #[test]
+    fn level_order_conversion_matches_recursive_layout_without_prefill() {
+        let (nodes, level_offsets) = synthetic_level_nodes(8);
+
+        let (digests, cap) = tree_from_levels_uninit::<GoldilocksField>(
+            &nodes,
+            &level_offsets,
+            8,
+            0,
+        );
+        assert_eq!(
+            digests,
+            vec![
+                synthetic_hash(0, 0),
+                synthetic_hash(0, 1),
+                synthetic_hash(1, 0),
+                synthetic_hash(1, 1),
+                synthetic_hash(0, 2),
+                synthetic_hash(0, 3),
+                synthetic_hash(2, 0),
+                synthetic_hash(2, 1),
+                synthetic_hash(0, 4),
+                synthetic_hash(0, 5),
+                synthetic_hash(1, 2),
+                synthetic_hash(1, 3),
+                synthetic_hash(0, 6),
+                synthetic_hash(0, 7),
+            ]
+        );
+        assert_eq!(cap, vec![synthetic_hash(3, 0)]);
+
+        let (digests, cap) = tree_from_levels_uninit::<GoldilocksField>(
+            &nodes,
+            &level_offsets,
+            8,
+            1,
+        );
+        assert_eq!(
+            digests,
+            vec![
+                synthetic_hash(0, 0),
+                synthetic_hash(0, 1),
+                synthetic_hash(1, 0),
+                synthetic_hash(1, 1),
+                synthetic_hash(0, 2),
+                synthetic_hash(0, 3),
+                synthetic_hash(0, 4),
+                synthetic_hash(0, 5),
+                synthetic_hash(1, 2),
+                synthetic_hash(1, 3),
+                synthetic_hash(0, 6),
+                synthetic_hash(0, 7),
+            ]
+        );
+        assert_eq!(cap, vec![synthetic_hash(2, 0), synthetic_hash(2, 1)]);
+
+        let (digests, cap) = tree_from_levels_uninit::<GoldilocksField>(
+            &nodes,
+            &level_offsets,
+            8,
+            3,
+        );
+        assert!(digests.is_empty());
+        assert_eq!(
+            cap,
+            (0..8).map(|index| synthetic_hash(0, index)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "leaf count must be a nonzero power of two")]
+    fn level_order_conversion_rejects_zero_leaf_count() {
+        let _ = tree_from_levels_uninit::<GoldilocksField>(&[], &[], 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "leaf count must be a nonzero power of two")]
+    fn level_order_conversion_rejects_non_power_of_two_leaf_count() {
+        let _ = tree_from_levels_uninit::<GoldilocksField>(&[], &[], 6, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "cap height must not exceed tree height")]
+    fn level_order_conversion_rejects_cap_above_tree() {
+        let _ = tree_from_levels_uninit::<GoldilocksField>(&[], &[], 8, 4);
+    }
+
+    fn synthetic_level_nodes(leaf_count: usize) -> (Vec<u64>, Vec<usize>) {
+        let mut nodes = Vec::new();
+        let mut level_offsets = Vec::new();
+        let mut level_count = leaf_count;
+        let mut level = 0;
+        while level_count != 0 {
+            level_offsets.push(nodes.len());
+            for index in 0..level_count {
+                nodes.extend(synthetic_hash(level, index).elements.map(|value| value.0));
+            }
+            level_count /= 2;
+            level += 1;
+        }
+        (nodes, level_offsets)
+    }
+
+    fn synthetic_hash(level: usize, index: usize) -> HashOut<GoldilocksField> {
+        let tag = (level * 100 + index * 10) as u64;
+        HashOut {
+            elements: core::array::from_fn(|element| GoldilocksField(tag + element as u64 + 1)),
+        }
+    }
 
     #[test]
     fn metal_ntt_commitment_matches_cpu() {

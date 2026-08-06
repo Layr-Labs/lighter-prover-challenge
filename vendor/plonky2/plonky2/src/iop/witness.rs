@@ -303,6 +303,24 @@ impl<F: Field> PartialWitness<F> {
     }
 }
 
+fn materialize_wire_values<F: Field>(
+    values: &[Option<F>],
+    representative_map: &[usize],
+    num_wires: usize,
+    degree: usize,
+) -> Vec<Vec<F>> {
+    let mut wire_values = (0..num_wires)
+        .map(|_| Vec::with_capacity(degree))
+        .collect::<Vec<_>>();
+    for row in 0..degree {
+        for column in 0..num_wires {
+            let representative = representative_map[row * num_wires + column];
+            wire_values[column].push(values[representative].unwrap_or(F::ZERO));
+        }
+    }
+    wire_values
+}
+
 impl<F: Field> WitnessWrite<F> for PartialWitness<F> {
     fn set_target(&mut self, target: Target, value: F) -> Result<()> {
         let opt_old_value = self.target_values.insert(target, value);
@@ -374,17 +392,14 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     }
 
     pub fn full_witness(self) -> MatrixWitness<F> {
-        let mut wire_values = vec![vec![F::ZERO; self.degree]; self.num_wires];
-        for i in 0..self.degree {
-            for j in 0..self.num_wires {
-                let t = Target::Wire(Wire { row: i, column: j });
-                if let Some(x) = self.try_get_target(t) {
-                    wire_values[j][i] = x;
-                }
-            }
+        MatrixWitness {
+            wire_values: materialize_wire_values(
+                &self.values,
+                self.representative_map,
+                self.num_wires,
+                self.degree,
+            ),
         }
-
-        MatrixWitness { wire_values }
     }
 }
 
@@ -398,5 +413,79 @@ impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
     fn try_get_target(&self, target: Target) -> Option<F> {
         let rep_index = self.representative_map[self.target_index(target)];
         self.values[rep_index]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    #[test]
+    fn materialized_wire_values_match_legacy_for_dense_aliased_and_missing_representatives() {
+        type F = GoldilocksField;
+
+        for (num_wires, degree) in [(1, 1), (4, 3), (2, 7)] {
+            let wire_count = num_wires * degree;
+            let value_count = wire_count + 3;
+
+            let dense_map = (0..value_count).collect::<Vec<_>>();
+            let dense_values = (0..value_count)
+                .map(|i| Some(F::from_canonical_usize(i + 1)))
+                .collect::<Vec<_>>();
+
+            let mut aliased_map = (0..value_count).collect::<Vec<_>>();
+            for (i, representative) in aliased_map[..wire_count].iter_mut().enumerate() {
+                *representative = wire_count + i % 2;
+            }
+            let mut aliased_values = vec![None; value_count];
+            aliased_values[wire_count] = Some(F::from_canonical_usize(101));
+            aliased_values[wire_count + 1] = Some(F::from_canonical_usize(202));
+
+            let mut missing_map = aliased_map.clone();
+            for (i, representative) in missing_map[..wire_count].iter_mut().enumerate() {
+                *representative = wire_count + i % 3;
+            }
+            let mut missing_values = vec![None; value_count];
+            missing_values[wire_count] = Some(F::from_canonical_usize(303));
+            missing_values[wire_count + 2] = Some(F::from_canonical_usize(505));
+
+            for (representative_map, values) in [
+                (dense_map, dense_values),
+                (aliased_map, aliased_values),
+                (missing_map, missing_values),
+            ] {
+                let witness = PartitionWitness {
+                    values,
+                    representative_map: &representative_map,
+                    num_wires,
+                    degree,
+                };
+                let expected = legacy_wire_values(&witness);
+                let actual = materialize_wire_values(
+                    &witness.values,
+                    witness.representative_map,
+                    num_wires,
+                    degree,
+                );
+                let full_witness = witness.full_witness();
+
+                assert_eq!(actual, expected);
+                assert_eq!(full_witness.wire_values, expected);
+            }
+        }
+    }
+
+    fn legacy_wire_values<F: Field>(witness: &PartitionWitness<F>) -> Vec<Vec<F>> {
+        let mut wire_values = vec![vec![F::ZERO; witness.degree]; witness.num_wires];
+        for row in 0..witness.degree {
+            for column in 0..witness.num_wires {
+                let target = Target::Wire(Wire { row, column });
+                if let Some(value) = witness.try_get_target(target) {
+                    wire_values[column][row] = value;
+                }
+            }
+        }
+        wire_values
     }
 }
