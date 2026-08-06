@@ -331,13 +331,7 @@ impl<F: Field> Witness<F> for PartialWitness<F> {
 /// The value of a target is defined to be the value of its root in the forest.
 #[derive(Clone, Debug)]
 pub struct PartitionWitness<'a, F: Field> {
-    /// Value of each representative slot. Unset slots hold `F::ZERO`; whether a slot has actually
-    /// been set is tracked by the 1-bit-per-slot `set_bitmap`. Storing the values densely (8 bytes
-    /// per slot instead of 16 for `Option<F>`) halves memory traffic during witness generation.
-    pub values: Vec<F>,
-    /// Bitmap with one bit per slot of `values`; bit `i` of word `i / 64` is set iff slot `i` has
-    /// been assigned a value.
-    pub set_bitmap: Vec<u64>,
+    pub values: Vec<Option<F>>,
     pub representative_map: &'a [usize],
     pub num_wires: usize,
     pub degree: usize,
@@ -345,33 +339,20 @@ pub struct PartitionWitness<'a, F: Field> {
 
 impl<'a, F: Field> PartitionWitness<'a, F> {
     pub fn new(num_wires: usize, degree: usize, representative_map: &'a [usize]) -> Self {
-        let len = representative_map.len();
         Self {
-            values: vec![F::ZERO; len],
-            set_bitmap: vec![0u64; len.div_ceil(64)],
+            values: vec![None; representative_map.len()],
             representative_map,
             num_wires,
             degree,
         }
     }
 
-    /// Returns whether the slot at the given representative index has been set.
-    #[inline]
-    pub fn is_set_by_rep_index(&self, rep_index: usize) -> bool {
-        (self.set_bitmap[rep_index >> 6] >> (rep_index & 63)) & 1 != 0
-    }
-
-    #[inline]
-    fn mark_set(&mut self, rep_index: usize) {
-        self.set_bitmap[rep_index >> 6] |= 1u64 << (rep_index & 63);
-    }
-
     /// Set a `Target`. On success, returns the representative index of the newly-set target. If the
     /// target was already set, returns `None`.
     pub fn set_target_returning_rep(&mut self, target: Target, value: F) -> Result<Option<usize>> {
         let rep_index = self.representative_map[self.target_index(target)];
-        if self.is_set_by_rep_index(rep_index) {
-            let old_value = self.values[rep_index];
+        let rep_value = &mut self.values[rep_index];
+        if let Some(old_value) = *rep_value {
             if value != old_value {
                 return Err(anyhow!(
                     "Partition containing {:?} was set twice with different values: {} != {}",
@@ -383,8 +364,7 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
 
             Ok(None)
         } else {
-            self.values[rep_index] = value;
-            self.mark_set(rep_index);
+            *rep_value = Some(value);
             Ok(Some(rep_index))
         }
     }
@@ -394,24 +374,13 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     }
 
     pub fn full_witness(self) -> MatrixWitness<F> {
-        // Redraw ticket 5.
-        // Single fused pass. Cell (column j, row i) is
-        // `values[representative_map[i * num_wires + j]]` or zero — the same
-        // lookup `try_get_target(Target::Wire { row: i, column: j })` resolved
-        // to, with `Target::index`'s `row * num_wires + column` inlined as a
-        // running cursor. This deletes the full zero-prefill pass over the
-        // matrix and the per-cell Target construction and index arithmetic of
-        // the second pass, while reading `representative_map` sequentially.
-        let mut wire_values: Vec<Vec<F>> = (0..self.num_wires)
-            .map(|_| Vec::with_capacity(self.degree))
-            .collect();
-        let mut wire_index = 0;
-        for _ in 0..self.degree {
-            for column in wire_values.iter_mut() {
-                // Unset slots hold `F::ZERO` in the dense `values` vector, so this is exactly
-                // the old `values[rep].unwrap_or(F::ZERO)` without touching the bitmap.
-                column.push(self.values[self.representative_map[wire_index]]);
-                wire_index += 1;
+        let mut wire_values = vec![vec![F::ZERO; self.degree]; self.num_wires];
+        for i in 0..self.degree {
+            for j in 0..self.num_wires {
+                let t = Target::Wire(Wire { row: i, column: j });
+                if let Some(x) = self.try_get_target(t) {
+                    wire_values[j][i] = x;
+                }
             }
         }
 
@@ -428,10 +397,6 @@ impl<F: Field> WitnessWrite<F> for PartitionWitness<'_, F> {
 impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
     fn try_get_target(&self, target: Target) -> Option<F> {
         let rep_index = self.representative_map[self.target_index(target)];
-        if self.is_set_by_rep_index(rep_index) {
-            Some(self.values[rep_index])
-        } else {
-            None
-        }
+        self.values[rep_index]
     }
 }

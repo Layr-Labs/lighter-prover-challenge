@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
-use crate::field::extension::{unflatten, Extendable, FieldExtension};
+use crate::field::extension::{flatten, unflatten, Extendable};
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQueryStep};
 use crate::fri::{FriConfig, FriParams};
@@ -17,8 +17,8 @@ use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
+use crate::util::reverse_index_bits_in_place;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_strict, reverse_bits};
 
 /// Builds a FRI proof.
 pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
@@ -95,51 +95,28 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     for arity_bits in &fri_params.reduction_arity_bits {
         let arity = 1 << arity_bits;
 
-        // Fused bit-reversal + flatten: one gather pass writes the flat leaf
-        // buffer directly (leaf `i` is the `arity`-chunk of the bit-reversed
-        // codeword starting at `i * arity`), instead of a random-access
-        // in-place permutation followed by a separate flattening pass with a
-        // heap allocation per element.
-        let n = values.values.len();
-        let log_n = log2_strict(n);
-        let mut flat_values: Vec<F> = Vec::with_capacity(n * D);
-        for i in 0..n {
-            let x = values.values[reverse_bits(i, log_n)];
-            flat_values.extend_from_slice(&x.to_basefield_array());
-        }
-        let tree = MerkleTree::<F, C::Hasher>::new_flat(
-            flat_values,
-            arity * D,
-            fri_params.config.cap_height,
-        );
+        reverse_index_bits_in_place(&mut values.values);
+        let chunked_values = values
+            .values
+            .par_chunks(arity)
+            .map(|chunk: &[F::Extension]| flatten(chunk))
+            .collect();
+        let tree = MerkleTree::<F, C::Hasher>::new(chunked_values, fri_params.config.cap_height);
 
         challenger.observe_cap(&tree.cap);
         trees.push(tree);
 
         let beta = challenger.get_extension_challenge::<D>();
         // P(x) = sum_{i<r} x^i * P_i(x^r) becomes sum_{i<r} beta^i * P_i(x).
-        // Only `1/2^rate_bits` of the coefficients are nonzero every round
-        // (the zero-tail invariant asserted by the final truncation), and the
-        // Horner fold of an all-zero chunk is exactly zero, so fold only the
-        // live prefix and extend with the zeros those chunks would produce.
-        let n_chunks = coeffs.coeffs.len() / arity;
-        let support = coeffs.coeffs.len() >> fri_params.config.rate_bits;
-        let live_chunks = support.div_ceil(arity).min(n_chunks);
-        let mut folded = coeffs.coeffs[..live_chunks * arity]
-            .par_chunks_exact(arity)
-            .map(|chunk| reduce_with_powers(chunk, beta))
-            .collect::<Vec<_>>();
-        folded.resize(n_chunks, F::Extension::ZERO);
-        coeffs = PolynomialCoeffs::new(folded);
+        coeffs = PolynomialCoeffs::new(
+            coeffs
+                .coeffs
+                .par_chunks_exact(arity)
+                .map(|chunk| reduce_with_powers(chunk, beta))
+                .collect::<Vec<_>>(),
+        );
         shift = shift.exp_u64(arity as u64);
-        // Chunk-wise folding preserves the zero tail: the coefficient vector
-        // keeps `1/2^rate_bits` support every round (asserted by the
-        // truncation below), so the FFT's zero-run shortcut always applies.
-        values = coeffs.coset_fft_with_options(
-            shift.into(),
-            Some(fri_params.config.rate_bits),
-            None,
-        )
+        values = coeffs.coset_fft(shift.into())
     }
 
     // When verifying this proof in a circuit with a different number of query steps,
@@ -258,7 +235,7 @@ fn fri_prover_query_round<
     let mut query_steps = Vec::new();
     let initial_proof = initial_merkle_trees
         .iter()
-        .map(|t| (t.leaf_vec(x_index), t.prove(x_index)))
+        .map(|t| (t.get(x_index).to_vec(), t.prove(x_index)))
         .collect::<Vec<_>>();
     for (i, tree) in trees.iter().enumerate() {
         let arity_bits = fri_params.reduction_arity_bits[i];

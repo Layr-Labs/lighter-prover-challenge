@@ -134,229 +134,25 @@ fn fft_classic_simd<P: PackedField>(
 
     // We've already done the first lg_packed_width (if they were required) iterations.
     let s = max(r, lg_packed_width);
-    fft_classic_simd_layers(packed_values, s, lg_n, root_table);
-}
 
-#[inline(always)]
-fn fft_classic_simd_single_layer<P: PackedField>(
-    packed_values: &mut [P],
-    lg_half_m: usize,
-    lg_packed_width: usize,
-    root_table: &FftRootTable<P::Scalar>,
-) {
-    let lg_m = lg_half_m + 1;
-    let m = 1 << lg_m; // Subarray size (in field elements).
-    let packed_m = m >> lg_packed_width; // Subarray size (in vectors).
-    let half_packed_m = packed_m / 2;
-    debug_assert!(half_packed_m != 0);
+    for lg_half_m in s..lg_n {
+        let lg_m = lg_half_m + 1;
+        let m = 1 << lg_m; // Subarray size (in field elements).
+        let packed_m = m >> lg_packed_width; // Subarray size (in vectors).
+        let half_packed_m = packed_m / 2;
+        debug_assert!(half_packed_m != 0);
 
-    // Omega values for this iteration, as a slice of vectors.
-    let omega_table = P::pack_slice(&root_table[lg_half_m]);
-    for k in (0..packed_values.len()).step_by(packed_m) {
-        for j in 0..half_packed_m {
-            let omega = omega_table[j];
-            let t = omega * packed_values[k + half_packed_m + j];
-            let u = packed_values[k + j];
-            packed_values[k + j] = u + t;
-            packed_values[k + half_packed_m + j] = u - t;
+        // omega values for this iteration, as slice of vectors
+        let omega_table = P::pack_slice(&root_table[lg_half_m][..]);
+        for k in (0..packed_n).step_by(packed_m) {
+            for j in 0..half_packed_m {
+                let omega = omega_table[j];
+                let t = omega * packed_values[k + half_packed_m + j];
+                let u = packed_values[k + j];
+                packed_values[k + j] = u + t;
+                packed_values[k + half_packed_m + j] = u - t;
+            }
         }
-    }
-}
-
-/// Two consecutive stages fused into one radix-4-style traversal: the exact
-/// same butterflies with the exact same `root_table` twiddles, but each
-/// quarter-block element is loaded and stored once per stage *pair* instead
-/// of once per stage, halving whole-array memory passes for these layers.
-#[inline(always)]
-fn fft_classic_simd_fused_two_layers<P: PackedField>(
-    packed_values: &mut [P],
-    lg_half_m: usize,
-    lg_packed_width: usize,
-    root_table: &FftRootTable<P::Scalar>,
-) {
-    // Quarter size in vectors for the size-2^(lg_half_m + 2) fused block.
-    let q = (1usize << lg_half_m) >> lg_packed_width;
-    debug_assert!(q != 0);
-    let stage1_omegas = P::pack_slice(&root_table[lg_half_m]);
-    let stage2_omegas = P::pack_slice(&root_table[lg_half_m + 1]);
-
-    for k in (0..packed_values.len()).step_by(4 * q) {
-        for j in 0..q {
-            let w1 = stage1_omegas[j];
-            let a = packed_values[k + j];
-            let b = packed_values[k + q + j];
-            let c = packed_values[k + 2 * q + j];
-            let d = packed_values[k + 3 * q + j];
-
-            // First stage: butterflies within [a,b] and within [c,d].
-            let t = w1 * b;
-            let (ab0, ab1) = (a + t, a - t);
-            let t = w1 * d;
-            let (cd0, cd1) = (c + t, c - t);
-
-            // Second stage: butterflies pairing positions j and j + 2q.
-            let t = stage2_omegas[j] * cd0;
-            packed_values[k + j] = ab0 + t;
-            packed_values[k + 2 * q + j] = ab0 - t;
-            let t = stage2_omegas[q + j] * cd1;
-            packed_values[k + q + j] = ab1 + t;
-            packed_values[k + 3 * q + j] = ab1 - t;
-        }
-    }
-}
-
-#[inline(always)]
-fn fft_classic_simd_layers<P: PackedField>(
-    packed_values: &mut [P],
-    start: usize,
-    end: usize,
-    root_table: &FftRootTable<P::Scalar>,
-) {
-    let lg_packed_width = log2_strict(P::WIDTH);
-    let mut lg_half_m = start;
-    // Odd stage count: run the first stage unfused so the remainder pairs up.
-    if (end - start) % 2 == 1 {
-        fft_classic_simd_single_layer(packed_values, lg_half_m, lg_packed_width, root_table);
-        lg_half_m += 1;
-    }
-    while lg_half_m < end {
-        fft_classic_simd_fused_two_layers(
-            packed_values,
-            lg_half_m,
-            lg_packed_width,
-            root_table,
-        );
-        lg_half_m += 2;
-    }
-}
-
-#[inline(always)]
-fn fft_zero_padded_first_layer_block<P: PackedField>(
-    packed_values: &mut [P],
-    source_start: usize,
-    nonzero_len: usize,
-    destination: usize,
-    packed_repeat: usize,
-    omega_table: &[P],
-) {
-    debug_assert!(nonzero_len >= 2);
-
-    // Expanding backwards ensures that every source pair is read before an earlier destination
-    // can overwrite it. Destinations are vector-aligned because repeat >= the packed width.
-    for pair in (0..nonzero_len / 2).rev() {
-        let source = source_start + pair * 2;
-        let u = packed_values[source / P::WIDTH].as_slice()[source % P::WIDTH];
-        let v = packed_values[(source + 1) / P::WIDTH].as_slice()[(source + 1) % P::WIDTH];
-        let u = P::from(u);
-        let v = P::from(v);
-        let pair_destination = destination + pair * 2 * packed_repeat;
-
-        for j in 0..packed_repeat {
-            let t = omega_table[j] * v;
-            packed_values[pair_destination + j] = u + t;
-            packed_values[pair_destination + packed_repeat + j] = u - t;
-        }
-    }
-}
-
-/// Expand a bit-reversed nonzero prefix and perform its first nontrivial FFT layer in one pass.
-///
-/// This is called only when each repeated run contains at least one packed vector.
-fn fft_zero_padded_first_layer<P: PackedField>(
-    values: &mut [P::Scalar],
-    r: usize,
-    root_table: &FftRootTable<P::Scalar>,
-) {
-    let repeat = 1 << r;
-    let nonzero_len = values.len() >> r;
-    debug_assert!(repeat >= P::WIDTH);
-
-    let packed_repeat = repeat / P::WIDTH;
-    let packed_values = P::pack_slice_mut(values);
-    let omega_table = P::pack_slice(&root_table[r]);
-    fft_zero_padded_first_layer_block(packed_values, 0, nonzero_len, 0, packed_repeat, omega_table);
-}
-
-fn fft_zero_padded_cache_blocks<P: PackedField>(
-    values: &mut [P::Scalar],
-    r: usize,
-    lg_block_n: usize,
-    root_table: &FftRootTable<P::Scalar>,
-) {
-    let repeat = 1 << r;
-    let block_len = 1 << lg_block_n;
-    let nonzero_per_block = block_len >> r;
-    let packed_repeat = repeat / P::WIDTH;
-    let packed_block_len = block_len / P::WIDTH;
-    let num_blocks = values.len() / block_len;
-    let packed_values = P::pack_slice_mut(values);
-    let omega_table = P::pack_slice(&root_table[r]);
-
-    // Expand blocks from the end of the buffer so their output cannot clobber unread prefix
-    // coefficients. Complete every block-local layer immediately while the block is still hot.
-    for block in (0..num_blocks).rev() {
-        let source_start = block * nonzero_per_block;
-        let destination = block * packed_block_len;
-        fft_zero_padded_first_layer_block(
-            packed_values,
-            source_start,
-            nonzero_per_block,
-            destination,
-            packed_repeat,
-            omega_table,
-        );
-        fft_classic_simd_layers(
-            &mut packed_values[destination..destination + packed_block_len],
-            r + 1,
-            lg_block_n,
-            root_table,
-        );
-    }
-}
-
-#[inline(never)]
-fn prepare_zero_padded_fft<F: Field>(
-    values: &mut [F],
-    r: usize,
-    lg_n: usize,
-    lg_packed_width: usize,
-    root_table: &FftRootTable<F>,
-) -> usize {
-    debug_assert!(r > 0 && r <= lg_n);
-
-    // A zero-padded input only has n/2^r live coefficients. Bit-reversing the full buffer would
-    // place those coefficients at multiples of 2^r, after which the skipped FFT layers copy each
-    // one across its following 2^r-element run. Produce that exact state directly by reversing
-    // just the live prefix.
-    let repeat = 1 << r;
-    let nonzero_len = values.len() >> r;
-    reverse_index_bits_in_place(&mut values[..nonzero_len]);
-
-    if r >= lg_packed_width && r < lg_n {
-        // Keep values plus the largest local twiddle row within Apple Silicon's 128 KiB L1D.
-        // Both 2^13 base-field and 2^12 quadratic-extension blocks use about 96 KiB.
-        let lg_block_n = match core::mem::size_of::<F>() {
-            0..=8 => 13,
-            9..=16 => 12,
-            _ => 11,
-        };
-        if r + 1 < lg_block_n && lg_block_n <= lg_n {
-            fft_zero_padded_cache_blocks::<<F as Packable>::Packing>(
-                values, r, lg_block_n, root_table,
-            );
-            lg_block_n
-        } else {
-            // Fuse the expansion with the first nontrivial layer, eliminating one full-buffer
-            // write/read cycle while retaining the existing skipped-layer semantics.
-            fft_zero_padded_first_layer::<<F as Packable>::Packing>(values, r, root_table);
-            r + 1
-        }
-    } else {
-        for i in (0..nonzero_len).rev() {
-            let value = values[i];
-            values[i * repeat..(i + 1) * repeat].fill(value);
-        }
-        r
     }
 }
 
@@ -367,6 +163,8 @@ fn prepare_zero_padded_fft<F: Field>(
 /// input may be non-zero, but the last 1 - 1/2^r entries are
 /// definitely zero.
 pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &FftRootTable<F>) {
+    reverse_index_bits_in_place(values);
+
     let n = values.len();
     let lg_n = log2_strict(n);
 
@@ -378,36 +176,39 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
         );
     }
 
-    let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
-    let first_layer = if r == 0 {
-        reverse_index_bits_in_place(values);
-        0
-    } else {
-        prepare_zero_padded_fft(values, r, lg_n, lg_packed_width, root_table)
-    };
+    // After reverse_index_bits, the only non-zero elements of values
+    // are at indices i*2^r for i = 0..n/2^r.  The loop below copies
+    // the value at i*2^r to the positions [i*2^r + 1, i*2^r + 2, ...,
+    // (i+1)*2^r - 1]; i.e. it replaces the 2^r - 1 zeros following
+    // element i*2^r with the value at i*2^r.  This corresponds to the
+    // first r rounds of the FFT when there are 2^r zeros at the end
+    // of the original input.
+    if r > 0 {
+        // if r == 0 then this loop is a noop.
+        let mask = !((1 << r) - 1);
+        for i in 0..n {
+            values[i] = values[i & mask];
+        }
+    }
 
+    let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
     if lg_n <= lg_packed_width {
         // Need the slice to be at least the width of two packed vectors for the vectorized version
         // to work. Do this tiny problem in scalar.
-        fft_classic_simd::<F>(values, first_layer, lg_n, root_table);
+        fft_classic_simd::<F>(values, r, lg_n, root_table);
     } else {
-        fft_classic_simd::<<F as Packable>::Packing>(values, first_layer, lg_n, root_table);
+        fft_classic_simd::<<F as Packable>::Packing>(values, r, lg_n, root_table);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use alloc::vec::Vec;
-    use core::cmp::{max, min};
 
-    use plonky2_util::{log2_ceil, log2_strict, reverse_index_bits_in_place};
-    use unroll::unroll_for_loops;
+    use plonky2_util::{log2_ceil, log2_strict};
 
-    use crate::extension::quadratic::QuadraticExtension;
-    use crate::fft::{FftRootTable, fft, fft_classic, fft_root_table, fft_with_options, ifft};
+    use crate::fft::{fft, fft_with_options, ifft};
     use crate::goldilocks_field::GoldilocksField;
-    use crate::packable::Packable;
-    use crate::packed::PackedField;
     use crate::polynomial::{PolynomialCoeffs, PolynomialValues};
     use crate::types::Field;
 
@@ -479,222 +280,4 @@ mod tests {
         }
         sum
     }
-
-    /// The original stage-major SIMD kernel, retained only as a differential-test oracle.
-    #[unroll_for_loops]
-    fn fft_classic_simd_reference<P: PackedField>(
-        values: &mut [P::Scalar],
-        r: usize,
-        lg_n: usize,
-        root_table: &FftRootTable<P::Scalar>,
-    ) {
-        let lg_packed_width = log2_strict(P::WIDTH);
-        let packed_values = P::pack_slice_mut(values);
-        let packed_n = packed_values.len();
-
-        assert!(lg_packed_width <= 4);
-        for lg_half_m in 0..4 {
-            if (r..min(lg_n, lg_packed_width)).contains(&lg_half_m) {
-                let half_m = 1 << lg_half_m;
-                let mut omega = P::default();
-                for (j, omega_j) in omega.as_slice_mut().iter_mut().enumerate() {
-                    *omega_j = root_table[lg_half_m][j % half_m];
-                }
-
-                for k in (0..packed_n).step_by(2) {
-                    let (u, v) = packed_values[k].interleave(packed_values[k + 1], half_m);
-                    let t = omega * v;
-                    (packed_values[k], packed_values[k + 1]) = (u + t).interleave(u - t, half_m);
-                }
-            }
-        }
-
-        let s = max(r, lg_packed_width);
-        for lg_half_m in s..lg_n {
-            let packed_m = 1 << (lg_half_m + 1 - lg_packed_width);
-            let half_packed_m = packed_m / 2;
-            let omega_table = P::pack_slice(&root_table[lg_half_m]);
-
-            for k in (0..packed_n).step_by(packed_m) {
-                for j in 0..half_packed_m {
-                    let omega = omega_table[j];
-                    let t = omega * packed_values[k + half_packed_m + j];
-                    let u = packed_values[k + j];
-                    packed_values[k + j] = u + t;
-                    packed_values[k + half_packed_m + j] = u - t;
-                }
-            }
-        }
-    }
-
-    fn fft_classic_reference<F: Field>(values: &mut [F], r: usize, root_table: &FftRootTable<F>) {
-        reverse_index_bits_in_place(values);
-        let n = values.len();
-        let lg_n = log2_strict(n);
-
-        if r > 0 {
-            let mask = !((1 << r) - 1);
-            for i in 0..n {
-                values[i] = values[i & mask];
-            }
-        }
-
-        let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
-        if lg_n <= lg_packed_width {
-            fft_classic_simd_reference::<F>(values, r, lg_n, root_table);
-        } else {
-            fft_classic_simd_reference::<<F as Packable>::Packing>(values, r, lg_n, root_table);
-        }
-    }
-
-    fn deterministic_value(i: usize) -> GoldilocksField {
-        GoldilocksField::from_canonical_u64(
-            (i as u64).wrapping_mul(0x9e37_79b9).rotate_left(13) % 1_000_000_007,
-        )
-    }
-
-    fn deterministic_values(n: usize) -> Vec<GoldilocksField> {
-        (0..n).map(deterministic_value).collect()
-    }
-
-    fn ifft_reference(
-        mut values: Vec<GoldilocksField>,
-        root_table: &FftRootTable<GoldilocksField>,
-    ) -> Vec<GoldilocksField> {
-        let n = values.len();
-        let lg_n = log2_strict(n);
-        let n_inv = GoldilocksField::inverse_2exp(lg_n);
-        fft_classic_reference(&mut values, 0, root_table);
-
-        values[0] *= n_inv;
-        values[n / 2] *= n_inv;
-        for i in 1..n / 2 {
-            let j = n - i;
-            let coeff_i = values[j] * n_inv;
-            let coeff_j = values[i] * n_inv;
-            values[i] = coeff_i;
-            values[j] = coeff_j;
-        }
-        values
-    }
-
-    #[test]
-    fn fft_matches_stage_major_reference_across_sizes() {
-        for lg_n in [0, 1, 2, 3, 4, 5, 8, 11, 12, 13, 14, 16, 18] {
-            let n = 1 << lg_n;
-            let roots = fft_root_table(n);
-            let mut expected = deterministic_values(n);
-            let mut actual = expected.clone();
-
-            fft_classic_reference(&mut expected, 0, &roots);
-            fft_classic(&mut actual, 0, &roots);
-            assert_eq!(actual, expected, "FFT mismatch at 2^{lg_n}");
-        }
-    }
-
-    #[test]
-    fn coset_fft_and_ifft_match_stage_major_reference() {
-        type F = GoldilocksField;
-        let shift = F::coset_shift();
-
-        for lg_n in [3, 8, 12, 15] {
-            let n = 1 << lg_n;
-            let roots = fft_root_table(n);
-            let coeffs = deterministic_values(n);
-
-            let mut expected_fft = coeffs
-                .iter()
-                .copied()
-                .zip(shift.powers())
-                .map(|(coefficient, power)| coefficient * power)
-                .collect::<Vec<_>>();
-            fft_classic_reference(&mut expected_fft, 0, &roots);
-            let actual_fft = PolynomialCoeffs::new(coeffs).coset_fft(shift).values;
-            assert_eq!(actual_fft, expected_fft, "coset FFT mismatch at 2^{lg_n}");
-
-            let values = deterministic_values(n);
-            let expected_ifft = ifft_reference(values.clone(), &roots)
-                .into_iter()
-                .zip(shift.inverse().powers())
-                .map(|(coefficient, power)| coefficient * power)
-                .collect::<Vec<_>>();
-            let actual_ifft = PolynomialValues::new(values).coset_ifft(shift).coeffs;
-            assert_eq!(
-                actual_ifft, expected_ifft,
-                "coset IFFT mismatch at 2^{lg_n}"
-            );
-        }
-    }
-
-    #[test]
-    fn zero_padded_lde_shapes_match_full_and_shortcut_references() {
-        type F = GoldilocksField;
-        let shift = F::coset_shift();
-
-        for (base_lg_n, r) in [(3, 1), (8, 2), (10, 3), (12, 3), (13, 3), (15, 3)] {
-            let lg_n = base_lg_n + r;
-            let n = 1 << lg_n;
-            let nonzero_len = 1 << base_lg_n;
-            let roots = fft_root_table(n);
-            let padded = deterministic_values(nonzero_len)
-                .into_iter()
-                .chain(core::iter::repeat_n(F::ZERO, n - nonzero_len))
-                .collect::<Vec<_>>();
-
-            let mut expected_shortcut = padded.clone();
-            fft_classic_reference(&mut expected_shortcut, r, &roots);
-            let mut expected_full = padded.clone();
-            fft_classic_reference(&mut expected_full, 0, &roots);
-            assert_eq!(
-                expected_shortcut, expected_full,
-                "reference shortcut mismatch for 2^{base_lg_n} -> 2^{lg_n}"
-            );
-
-            let mut actual = padded.clone();
-            fft_classic(&mut actual, r, &roots);
-            assert_eq!(
-                actual, expected_full,
-                "zero-padded FFT mismatch for 2^{base_lg_n} -> 2^{lg_n}"
-            );
-
-            let mut expected_coset = padded
-                .iter()
-                .copied()
-                .zip(shift.powers())
-                .map(|(coefficient, power)| coefficient * power)
-                .collect::<Vec<_>>();
-            fft_classic_reference(&mut expected_coset, 0, &roots);
-            let actual_coset = PolynomialCoeffs::new(padded)
-                .coset_fft_with_options(shift, Some(r), Some(&roots))
-                .values;
-            assert_eq!(
-                actual_coset, expected_coset,
-                "zero-padded coset FFT mismatch for 2^{base_lg_n} -> 2^{lg_n}"
-            );
-        }
-    }
-
-    #[test]
-    fn zero_padded_extension_fft_matches_reference() {
-        type F = GoldilocksField;
-        type FE = QuadraticExtension<F>;
-
-        let base_lg_n = 10;
-        let r = 3;
-        let n = 1 << (base_lg_n + r);
-        let nonzero_len = 1 << base_lg_n;
-        let roots = fft_root_table(n);
-        let mut actual = (0..nonzero_len)
-            .map(|i| {
-                QuadraticExtension([deterministic_value(i), deterministic_value(i + nonzero_len)])
-            })
-            .chain(core::iter::repeat_n(FE::ZERO, n - nonzero_len))
-            .collect::<Vec<_>>();
-        let mut expected = actual.clone();
-
-        fft_classic_reference(&mut expected, r, &roots);
-        fft_classic(&mut actual, r, &roots);
-        assert_eq!(actual, expected);
-    }
-
 }

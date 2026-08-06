@@ -83,28 +83,15 @@ impl<F: Field> ReducingFactor<F> {
     pub fn reduce_polys_base<BF: Extendable<D, Extension = F>, const D: usize>(
         &mut self,
         polys: impl IntoIterator<Item = impl Borrow<PolynomialCoeffs<BF>>>,
-    ) -> PolynomialCoeffs<F>
-    where
-        F: FieldExtension<D, BaseField = BF>,
-    {
-        // Fused multiply-accumulate: one extension accumulator, each base
-        // coefficient read exactly once. Equivalent to the old
-        // `map(mul_extension).sum()` (field arithmetic is exact and the
-        // per-power scalar products are accumulated in the same order), but
-        // without one degree-sized temporary allocation + two clone passes per
-        // polynomial.
-        let mut acc: Vec<F> = Vec::new();
-        for (base_power, poly) in self.base.powers().zip(polys) {
-            self.count += 1;
-            let coeffs = &poly.borrow().coeffs;
-            if coeffs.len() > acc.len() {
-                acc.resize(coeffs.len(), F::ZERO);
-            }
-            for (a, &c) in acc.iter_mut().zip(coeffs.iter()) {
-                *a += <F as FieldExtension<D>>::scalar_mul(&base_power, c);
-            }
-        }
-        PolynomialCoeffs::new(acc)
+    ) -> PolynomialCoeffs<F> {
+        self.base
+            .powers()
+            .zip(polys)
+            .map(|(base_power, poly)| {
+                self.count += 1;
+                poly.borrow().mul_extension(base_power)
+            })
+            .sum()
     }
 
     pub fn shift(&mut self, x: F) -> F {
@@ -116,14 +103,6 @@ impl<F: Field> ReducingFactor<F> {
     pub fn shift_poly(&mut self, p: &mut PolynomialCoeffs<F>) {
         *p *= self.base.exp_u64(self.count);
         self.count = 0;
-    }
-
-    /// Returns the factor `shift_poly` would multiply by (`base^count`) and
-    /// resets the count, letting callers fuse the multiply into another pass.
-    pub fn shift_factor(&mut self) -> F {
-        let tmp = self.base.exp_u64(self.count);
-        self.count = 0;
-        tmp
     }
 
     pub fn reset(&mut self) {

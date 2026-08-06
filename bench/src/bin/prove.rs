@@ -27,7 +27,6 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
-    env_logger::init();
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()

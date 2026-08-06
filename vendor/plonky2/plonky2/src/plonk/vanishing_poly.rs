@@ -6,6 +6,7 @@ use plonky2_field::polynomial::PolynomialCoeffs;
 
 use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
+use crate::field::batch_util::batch_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
@@ -20,10 +21,9 @@ use crate::plonk::circuit_data::CommonCircuitData;
 use crate::plonk::plonk_common;
 use crate::plonk::plonk_common::eval_l_0_circuit;
 use crate::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBaseBatch};
-use crate::util::partial_products::{
-    check_partial_products, check_partial_products_circuit, check_partial_products_into,
-};
+use crate::util::partial_products::{check_partial_products, check_partial_products_circuit};
 use crate::util::reducing::ReducingFactorTarget;
+use crate::util::strided_view::PackedStridedView;
 use crate::with_context;
 
 /// Get the polynomial associated to a lookup table with current challenges.
@@ -163,46 +163,10 @@ pub(crate) fn eval_vanishing_poly<F: RichField + Extendable<D>, const D: usize>(
     plonk_common::reduce_with_powers_multi(&vanishing_terms, alphas)
 }
 
-/// Reusable buffers for [`eval_vanishing_poly_base_batch`], hoisted out of the
-/// per-batch hot loop so a rayon worker allocates them once per proof instead of
-/// once per 32-point batch.
-#[derive(Default)]
-pub(crate) struct VanishingScratch<F> {
-    pub numerator_values: Vec<F>,
-    pub denominator_values: Vec<F>,
-    pub vanishing_z_1_terms: Vec<F>,
-    pub vanishing_partial_products_terms: Vec<F>,
-    pub vanishing_all_lookup_terms: Vec<F>,
-    pub lookup_selectors: Vec<F>,
-    pub constraint_terms_batch: Vec<F>,
-}
-
-fn reduce_gate_constraints_base_batch<F: Field>(
-    constraint_terms_batch: &[F],
-    batch_size: usize,
-    alphas: &[F],
-    res_out: &mut [F],
-) {
-    debug_assert!(batch_size > 0);
-    debug_assert_eq!(constraint_terms_batch.len() % batch_size, 0);
-    debug_assert_eq!(res_out.len(), batch_size * alphas.len());
-
-    for constraint_row in constraint_terms_batch.chunks_exact(batch_size).rev() {
-        for (point, &term) in constraint_row.iter().enumerate() {
-            let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
-            for (value, &alpha) in result.iter_mut().zip(alphas) {
-                *value = term.multiply_accumulate(*value, alpha);
-            }
-        }
-    }
-}
-
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
 ///
 /// Results are stored point-major: the challenges for point `k` occupy
-/// `res_out[k * num_challenges..(k + 1) * num_challenges]`. `res_out` must be
-/// zero-initialized by the caller.
-#[allow(clippy::too_many_arguments)]
+/// `result[k * num_challenges..(k + 1) * num_challenges]`.
 pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
     indices_batch: &[usize],
@@ -216,14 +180,11 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     s_sigmas_batch: &[&[F]],
     betas: &[F],
     gammas: &[F],
-    beta_k_is: &[F],
     deltas: &[F],
     alphas: &[F],
     z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
-    scratch: &mut VanishingScratch<F>,
-    res_out: &mut [F],
-) {
+) -> Vec<F> {
     let has_lookup = common_data.num_lookup_polys != 0;
 
     let n = indices_batch.len();
@@ -246,48 +207,40 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     let num_gate_constraints = common_data.num_gate_constraints;
 
-    evaluate_gate_constraints_base_batch_into::<F, D>(
-        common_data,
-        vars_batch,
-        &mut scratch.constraint_terms_batch,
-    );
-    let constraint_terms_batch = &scratch.constraint_terms_batch;
+    let constraint_terms_batch =
+        evaluate_gate_constraints_base_batch::<F, D>(common_data, vars_batch);
     debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
 
     let num_challenges = common_data.config.num_challenges;
     let num_routed_wires = common_data.config.num_routed_wires;
-    debug_assert_eq!(betas.len(), num_challenges);
-    debug_assert_eq!(gammas.len(), num_challenges);
-    debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
-    reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out);
 
-    let numerator_values = &mut scratch.numerator_values;
-    let denominator_values = &mut scratch.denominator_values;
-    numerator_values.clear();
-    denominator_values.clear();
+    let mut numerator_values = Vec::with_capacity(num_routed_wires);
+    let mut denominator_values = Vec::with_capacity(num_routed_wires);
 
     // The L_0(x) (Z(x) - 1) vanishing terms.
-    let vanishing_z_1_terms = &mut scratch.vanishing_z_1_terms;
+    let mut vanishing_z_1_terms = Vec::with_capacity(num_challenges);
     // The terms checking the partial products.
-    let vanishing_partial_products_terms = &mut scratch.vanishing_partial_products_terms;
-    // The terms checking the lookup constraints.
-    let vanishing_all_lookup_terms = &mut scratch.vanishing_all_lookup_terms;
-    vanishing_z_1_terms.clear();
-    vanishing_partial_products_terms.clear();
-    vanishing_all_lookup_terms.clear();
+    let mut vanishing_partial_products_terms = Vec::new();
 
-    debug_assert_eq!(res_out.len(), n * num_challenges);
+    // The terms checking the lookup constraints.
+    let mut vanishing_all_lookup_terms = if has_lookup {
+        let num_sldc_polys = common_data.num_lookup_polys - 1;
+        Vec::with_capacity(
+            common_data.config.num_challenges * (4 + common_data.luts.len() + 2 * num_sldc_polys),
+        )
+    } else {
+        Vec::new()
+    };
+
+    let mut res_batch = vec![F::ZERO; n * num_challenges];
     for k in 0..n {
         let index = indices_batch[k];
         let x = xs_batch[k];
         let vars = vars_batch.view(k);
 
-        let lookup_selectors = &mut scratch.lookup_selectors;
-        lookup_selectors.clear();
-        lookup_selectors.extend(
-            (0..common_data.num_lookup_selectors)
-                .map(|i| vars.local_constants[common_data.selectors_info.num_selectors() + i]),
-        );
+        let lookup_selectors: Vec<F> = (0..common_data.num_lookup_selectors)
+            .map(|i| vars.local_constants[common_data.selectors_info.num_selectors() + i])
+            .collect();
 
         let local_zs = local_zs_batch[k];
         let next_zs = next_zs_batch[k];
@@ -305,6 +258,8 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
         let partial_products = partial_products_batch[k];
         let s_sigmas = s_sigmas_batch[k];
+
+        let constraint_terms = PackedStridedView::new(&constraint_terms_batch, n, k);
 
         let l_0_x = z_h_on_coset.eval_l_0(index, x);
         for i in 0..num_challenges {
@@ -326,7 +281,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     vars,
                     cur_local_lookup_zs,
                     cur_next_lookup_zs,
-                    lookup_selectors,
+                    &lookup_selectors,
                     cur_deltas.try_into().unwrap(),
                     lut_re_poly_evals[i],
                 );
@@ -335,8 +290,9 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
             numerator_values.extend((0..num_routed_wires).map(|j| {
                 let wire_value = vars.local_wires[j];
-                let beta_k_i = beta_k_is[i * num_routed_wires + j];
-                wire_value + beta_k_i * x + gammas[i]
+                let k_i = common_data.k_is[j];
+                let s_id = k_i * x;
+                wire_value + betas[i] * s_id + gammas[i]
             }));
             denominator_values.extend((0..num_routed_wires).map(|j| {
                 let wire_value = vars.local_wires[j];
@@ -346,19 +302,16 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
             // The partial products considered for this iteration of `i`.
             let current_partial_products = &partial_products[i * num_prods..(i + 1) * num_prods];
-            // Check the numerator partial products, appending the terms directly to the
-            // worker-local scratch vector instead of collecting a fresh ten-element `Vec`
-            // per point and challenge. Not cleared between challenges: challenge `i + 1`
-            // must append after challenge `i` for the same point.
-            check_partial_products_into(
-                numerator_values,
-                denominator_values,
+            // Check the numerator partial products.
+            let partial_product_checks = check_partial_products(
+                &numerator_values,
+                &denominator_values,
                 current_partial_products,
                 z_x,
                 z_gx,
                 max_degree,
-                vanishing_partial_products_terms,
             );
+            vanishing_partial_products_terms.extend(partial_product_checks);
 
             numerator_values.clear();
             denominator_values.clear();
@@ -367,8 +320,9 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         let vanishing_terms = vanishing_z_1_terms
             .iter()
             .chain(vanishing_partial_products_terms.iter())
-            .chain(vanishing_all_lookup_terms.iter());
-        let res = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
+            .chain(vanishing_all_lookup_terms.iter())
+            .chain(constraint_terms);
+        let res = &mut res_batch[k * num_challenges..(k + 1) * num_challenges];
         for &term in vanishing_terms.rev() {
             for (c, &alpha) in res.iter_mut().zip(alphas) {
                 *c = term.multiply_accumulate(*c, alpha);
@@ -379,6 +333,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         vanishing_partial_products_terms.clear();
         vanishing_all_lookup_terms.clear();
     }
+    res_batch
 }
 
 /// Evaluates all lookup constraints, based on the logarithmic derivatives paper (<https://eprint.iacr.org/2022/1530.pdf>),
@@ -755,31 +710,28 @@ pub fn evaluate_gate_constraints_base_batch<F: RichField + Extendable<D>, const 
     common_data: &CommonCircuitData<F, D>,
     vars_batch: EvaluationVarsBaseBatch<F>,
 ) -> Vec<F> {
-    let mut constraints_batch = Vec::new();
-    evaluate_gate_constraints_base_batch_into::<F, D>(common_data, vars_batch, &mut constraints_batch);
-    constraints_batch
-}
-
-/// Like [`evaluate_gate_constraints_base_batch`], but reuses the caller's buffer.
-pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, const D: usize>(
-    common_data: &CommonCircuitData<F, D>,
-    vars_batch: EvaluationVarsBaseBatch<F>,
-    constraints_batch: &mut Vec<F>,
-) {
-    constraints_batch.clear();
-    constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
+    let mut constraints_batch = vec![F::ZERO; common_data.num_gate_constraints * vars_batch.len()];
     for (i, gate) in common_data.gates.iter().enumerate() {
         let selector_index = common_data.selectors_info.selector_indices[i];
-        gate.0.eval_filtered_base_batch(
+        let gate_constraints_batch = gate.0.eval_filtered_base_batch(
             vars_batch,
             i,
             selector_index,
             common_data.selectors_info.groups[selector_index].clone(),
             common_data.selectors_info.num_selectors(),
             common_data.num_lookup_selectors,
-            constraints_batch,
+        );
+        debug_assert!(
+            gate_constraints_batch.len() <= constraints_batch.len(),
+            "num_constraints() gave too low of a number"
+        );
+        // below adds all constraints for all points
+        batch_add_inplace(
+            &mut constraints_batch[..gate_constraints_batch.len()],
+            &gate_constraints_batch,
         );
     }
+    constraints_batch
 }
 
 pub fn evaluate_gate_constraints_circuit<F: RichField + Extendable<D>, const D: usize>(
@@ -986,62 +938,6 @@ pub(crate) fn eval_vanishing_poly_circuit<F: RichField + Extendable<D>, const D:
             alpha.reduce(&vanishing_terms, builder)
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use plonky2_field::goldilocks_field::GoldilocksField;
-
-    use super::*;
-
-    #[test]
-    fn constraint_major_reduction_preserves_pointwise_horner_order() {
-        type F = GoldilocksField;
-
-        let alphas = [F::from_canonical_u64(3), F::from_canonical_u64(5)];
-
-        // Hand-checked two-point fixture. For the first challenge at point zero,
-        // the expected Horner chain is 7 + 3 * (13 + 3 * 5) = 91.
-        let terms = [
-            F::from_canonical_u64(7),
-            F::from_canonical_u64(11),
-            F::from_canonical_u64(13),
-            F::from_canonical_u64(17),
-        ];
-        let mut actual = [
-            F::from_canonical_u64(5),
-            F::from_canonical_u64(5),
-            F::from_canonical_u64(6),
-            F::from_canonical_u64(6),
-        ];
-        reduce_gate_constraints_base_batch(&terms, 2, &alphas, &mut actual);
-        assert_eq!(actual[0], F::from_canonical_u64(91));
-        assert_eq!(actual[2], F::from_canonical_u64(116));
-
-        for batch_size in [1, 11, 31, 32] {
-            let num_constraints = 7;
-            let terms = (0..batch_size * num_constraints)
-                .map(|i| F::from_canonical_usize(i * 17 + 3))
-                .collect::<Vec<_>>();
-            let initial = (0..batch_size * alphas.len())
-                .map(|i| F::from_canonical_usize(i * 19 + 7))
-                .collect::<Vec<_>>();
-            let mut expected = initial.clone();
-            for point in 0..batch_size {
-                let point_result = &mut expected[point * alphas.len()..(point + 1) * alphas.len()];
-                for constraint_row in terms.chunks_exact(batch_size).rev() {
-                    let term = constraint_row[point];
-                    for (result, &alpha) in point_result.iter_mut().zip(&alphas) {
-                        *result = term.multiply_accumulate(*result, alpha);
-                    }
-                }
-            }
-
-            let mut actual = initial;
-            reduce_gate_constraints_base_batch(&terms, batch_size, &alphas, &mut actual);
-            assert_eq!(actual, expected, "batch size {batch_size}");
-        }
-    }
 }
 
 /// Same as `check_lookup_constraints`, but for the recursive case.
