@@ -370,9 +370,9 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
     let n = values.len();
     let lg_n = log2_strict(n);
 
-    if root_table.len() != lg_n {
+    if root_table.len() < lg_n {
         panic!(
-            "Expected root table of length {}, but it was {}.",
+            "Expected root table of length at least {}, but it was {}.",
             lg_n,
             root_table.len()
         );
@@ -404,7 +404,9 @@ mod tests {
     use unroll::unroll_for_loops;
 
     use crate::extension::quadratic::QuadraticExtension;
-    use crate::fft::{FftRootTable, fft, fft_classic, fft_root_table, fft_with_options, ifft};
+    use crate::fft::{
+        fft, fft_classic, fft_root_table, fft_with_options, ifft, ifft_with_options, FftRootTable,
+    };
     use crate::goldilocks_field::GoldilocksField;
     use crate::packable::Packable;
     use crate::packed::PackedField;
@@ -445,6 +447,20 @@ mod tests {
                 fft_with_options(zero_tail, Some(r), None)
             );
         }
+    }
+
+    #[test]
+    fn ifft_accepts_superset_root_table() {
+        type F = GoldilocksField;
+        let values = PolynomialValues::new(
+            (0..256)
+                .map(|i| F::from_canonical_usize(i * 1337 % 1009))
+                .collect(),
+        );
+        let expected = ifft(values.clone());
+        let superset = fft_root_table::<F>(2048);
+
+        assert_eq!(ifft_with_options(values, None, Some(&superset)), expected);
     }
 
     fn evaluate_naive<F: Field>(coefficients: &PolynomialCoeffs<F>) -> PolynomialValues<F> {
