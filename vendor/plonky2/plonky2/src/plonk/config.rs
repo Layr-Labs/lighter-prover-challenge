@@ -10,6 +10,7 @@
 use alloc::{vec, vec::Vec};
 use core::fmt::Debug;
 
+use plonky2_maybe_rayon::*;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -31,13 +32,6 @@ pub trait GenericHashOut<F: RichField>:
     fn from_bytes(bytes: &[u8]) -> Self;
 
     fn to_vec(&self) -> Vec<F>;
-
-    /// Visit the hash's field elements in `to_vec` order without requiring an
-    /// allocation. The default preserves `to_vec` exactly; element-backed
-    /// hashes override it to iterate their storage directly.
-    fn for_each_element(&self, f: impl FnMut(F)) {
-        self.to_vec().into_iter().for_each(f);
-    }
 }
 
 /// Trait for hash functions.
@@ -81,43 +75,26 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
         }
     }
 
-    /// Hash two equal-length inputs, allowing implementations to interleave
-    /// the two computations. Must return exactly
-    /// `(Self::hash_or_noop(input_a), Self::hash_or_noop(input_b))`.
-    fn hash_or_noop_pair(input_a: &[F], input_b: &[F]) -> (Self::Hash, Self::Hash) {
-        (Self::hash_or_noop(input_a), Self::hash_or_noop(input_b))
-    }
-
-    /// Hash four equal-length inputs, allowing implementations to interleave
-    /// the four computations. Must return exactly the four individual
-    /// `Self::hash_or_noop` results.
-    fn hash_or_noop_quad(
-        input_a: &[F],
-        input_b: &[F],
-        input_c: &[F],
-        input_d: &[F],
-    ) -> (Self::Hash, Self::Hash, Self::Hash, Self::Hash) {
-        (
-            Self::hash_or_noop(input_a),
-            Self::hash_or_noop(input_b),
-            Self::hash_or_noop(input_c),
-            Self::hash_or_noop(input_d),
-        )
-    }
-
-    /// Two independent `two_to_one` compressions, allowing implementations to
-    /// interleave them. Must return exactly
-    /// `(Self::two_to_one(x0, y0), Self::two_to_one(x1, y1))`.
-    fn two_to_one_pair(
-        x0: Self::Hash,
-        y0: Self::Hash,
-        x1: Self::Hash,
-        y1: Self::Hash,
-    ) -> (Self::Hash, Self::Hash) {
-        (Self::two_to_one(x0, y0), Self::two_to_one(x1, y1))
-    }
-
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash;
+
+    /// Search for a FRI proof-of-work witness using this hash function's
+    /// native permutation implementation.
+    fn find_pow_witness(
+        duplex_intermediate_state: Self::Permutation,
+        witness_input_pos: usize,
+        min_leading_zeros: u32,
+    ) -> Option<F> {
+        (0..=F::NEG_ONE.to_canonical_u64())
+            .into_par_iter()
+            .find_any(|&candidate| {
+                let mut duplex_state = duplex_intermediate_state;
+                duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+                duplex_state.permute();
+                let pow_response = duplex_state.squeeze().iter().last().unwrap();
+                pow_response.to_canonical_u64().leading_zeros() >= min_leading_zeros
+            })
+            .map(F::from_canonical_u64)
+    }
 
     /// Build the native Merkle digests and cap with a specialized backend, when available.
     ///
@@ -130,6 +107,24 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
         _num_leaves: usize,
         _cap_height: usize,
     ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
+        None
+    }
+
+    /// Allocate specialized row-major leaf storage, let a CPU producer fill
+    /// it exactly once, and build the Merkle tree without another staging copy.
+    fn try_build_merkle_tree_from_rows<Fill>(
+        _leaf_width: usize,
+        _num_leaves: usize,
+        _cap_height: usize,
+        _fill: Fill,
+    ) -> Option<(
+        crate::hash::merkle_tree::RowStore<F>,
+        Vec<Self::Hash>,
+        Vec<Self::Hash>,
+    )>
+    where
+        Fill: FnOnce(&mut crate::hash::merkle_tree::MerkleRowWriter<'_, F>),
+    {
         None
     }
 

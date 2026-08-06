@@ -1,6 +1,6 @@
 use core::ffi::c_void;
 use core::marker::PhantomData;
-use core::mem::{size_of, size_of_val};
+use core::mem::{size_of, size_of_val, MaybeUninit};
 use core::slice;
 use std::collections::HashMap;
 use std::sync::{Condvar, LazyLock, Mutex};
@@ -14,6 +14,7 @@ use plonky2_maybe_rayon::*;
 
 use crate::field::types::{Field, PrimeField64};
 use crate::hash::hash_types::{HashOut, RichField};
+use crate::hash::merkle_tree::MerkleRowWriter;
 use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
@@ -22,15 +23,31 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
 /// window and is treated as contaminated evidence.
 const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
-/// Lower routing threshold used only while an exclusive serial proving phase
-/// is active (see [`set_exclusive_gpu_phase`]). During the pre-execution and
-/// final block proofs nothing else can contend for the serialized GPU stream,
-/// so the mid-size column trees those proofs commit (their Zs/partial-products
-/// tree at 524,272 estimated permutations and quotient tree at 393,200 miss
-/// the default 1<<19 cutoff) hash on an otherwise idle GPU. The global cutoff
-/// stays untouched for the pipelined phases, where lowering it is the
-/// documented priority-inversion regression.
-const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 18;
+/// Below this difficulty the CPU avoids the fixed Metal command overhead.
+const MIN_GPU_POW_BITS: u32 = 12;
+/// Small sequential dispatches let later batches cheaply skip once an earlier
+/// batch has found the first valid witness.
+const POW_BATCH_SIZE: usize = 1 << 15;
+const POW_BATCHES_PER_COMMAND: usize = 4;
+/// A nonzero Goldilocks multiplier permutes the canonical witness range. This
+/// keeps the search exhaustive while avoiding unlucky long zero-based prefixes
+/// for a random-oracle predicate.
+const POW_CANDIDATE_STRIDE: u64 = 0x9e37_79b9_7f4a_7c15;
+/// Shared-row allocation has its own gate because it removes the ordinary
+/// row staging copy and may break even at a different tree size.
+const MIN_SHARED_ROW_WORK: usize = 1 << 17;
+const MAX_SHARED_ROW_WORK: usize = 1 << 19;
+#[cfg(test)]
+static TEST_MIN_SHARED_ROW_WORK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(MIN_SHARED_ROW_WORK);
+#[cfg(test)]
+static TEST_SHARED_ROW_BUILDS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_METAL_POW_SEARCHES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_SHARED_ROWS_LOCK: Mutex<()> = Mutex::new(());
 /// Upper bound on concurrently in-flight GPU tree builds. One set serializes
 /// GPU tree builds exactly like the promoted base's global context mutex: a
 /// 3-set experiment measured 13-18% faster locally but scored -21.6% on the
@@ -46,6 +63,7 @@ struct MetalShared {
     leaf_pipeline: ComputePipelineState,
     leaf_colmajor_pipeline: ComputePipelineState,
     parent_pipeline: ComputePipelineState,
+    pow_pipeline: ComputePipelineState,
     ntt_prepare_pipeline: ComputePipelineState,
     ntt_stage_pipeline: ComputePipelineState,
     ifft_finalize_pipeline: ComputePipelineState,
@@ -135,6 +153,55 @@ impl<F> PartialEq for MetalColumns<F> {
 
 impl<F> Eq for MetalColumns<F> {}
 
+/// Immutable row-major leaves in a CPU-visible Metal shared allocation.
+/// The CPU producer fully initializes it before the command buffer is committed;
+/// the GPU and all later query readers only observe it immutably.
+pub struct MetalRows<F> {
+    buffer: Buffer,
+    len: usize,
+    _phantom: PhantomData<F>,
+}
+
+impl<F> Clone for MetalRows<F> {
+    fn clone(&self) -> Self {
+        Self {
+            buffer: self.buffer.clone(),
+            len: self.len,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<F: RichField> MetalRows<F> {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_slice(&self) -> &[F] {
+        // SAFETY: construction only returns after `MerkleRowWriter` has
+        // initialized all `len` elements; the buffer is never mutated later.
+        unsafe { slice::from_raw_parts(self.buffer.contents().cast::<F>(), self.len) }
+    }
+}
+
+impl<F> core::fmt::Debug for MetalRows<F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MetalRows").field("len", &self.len).finish()
+    }
+}
+
+impl<F: RichField> PartialEq for MetalRows<F> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<F: RichField> Eq for MetalRows<F> {}
+
 struct BufferSet {
     input: Option<Buffer>,
     output: Option<Buffer>,
@@ -147,21 +214,6 @@ struct BufferPool {
 
 static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShared::new);
 
-/// True while the prover is inside an exclusive serial phase (pre-execution
-/// or final block proof) where no concurrent proof can contend for the
-/// serialized GPU stream. Process-global on purpose: the phases it brackets
-/// are the only proving work alive, and tree builds may run on rayon workers,
-/// which a thread-local would not reach.
-static EXCLUSIVE_GPU_PHASE: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Marks the start/end of an exclusive serial proving phase during which the
-/// GPU routing cutoff drops to [`EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS`].
-/// Callers must guarantee no other proof runs concurrently while enabled.
-pub fn set_exclusive_gpu_phase(enabled: bool) {
-    EXCLUSIVE_GPU_PHASE.store(enabled, core::sync::atomic::Ordering::Relaxed);
-}
-
 fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bool {
     let leaf_permutations = if leaf_width <= 4 {
         0
@@ -169,12 +221,29 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
         leaf_width.div_ceil(8) * leaf_count
     };
     let parent_permutations = leaf_count - (1usize << cap_height);
-    let min_permutations = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
-        EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS
+    leaf_permutations + parent_permutations >= MIN_GPU_PERMUTATIONS
+}
+
+fn shared_rows_worthwhile(leaf_width: usize, leaf_count: usize, _cap_height: usize) -> bool {
+    let leaf_permutations = if leaf_width <= 4 {
+        0
     } else {
-        MIN_GPU_PERMUTATIONS
+        leaf_width.div_ceil(8) * leaf_count
     };
-    leaf_permutations + parent_permutations >= min_permutations
+    // Count the full leaf level rather than subtracting the cap. This keeps
+    // the gate stable across cap heights and aligns power-of-two FRI shapes.
+    let work = leaf_permutations + leaf_count;
+    let minimum = {
+        #[cfg(test)]
+        {
+            TEST_MIN_SHARED_ROW_WORK.load(core::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(test))]
+        {
+            MIN_SHARED_ROW_WORK
+        }
+    };
+    work >= minimum && work <= MAX_SHARED_ROW_WORK
 }
 
 fn shared_context() -> Option<&'static MetalShared> {
@@ -185,6 +254,12 @@ fn shared_context() -> Option<&'static MetalShared> {
             None
         }
     }
+}
+
+#[inline]
+fn pow_candidate<F: RichField>(logical_index: u64) -> u64 {
+    (F::from_canonical_u64(logical_index) * F::from_canonical_u64(POW_CANDIDATE_STRIDE))
+        .to_canonical_u64()
 }
 
 pub(crate) fn build_merkle_tree<F: RichField>(
@@ -211,6 +286,73 @@ pub(crate) fn build_merkle_tree<F: RichField>(
             None
         }
     }
+}
+
+pub(crate) fn build_merkle_tree_from_rows<F: RichField, Fill>(
+    leaf_width: usize,
+    leaf_count: usize,
+    cap_height: usize,
+    fill: Fill,
+) -> Option<(MetalRows<F>, Vec<HashOut<F>>, Vec<HashOut<F>>)>
+where
+    Fill: FnOnce(&mut MerkleRowWriter<'_, F>),
+{
+    if F::ORDER != 0xffff_ffff_0000_0001
+        || size_of::<F>() != size_of::<u64>()
+        || leaf_width == 0
+        || leaf_count == 0
+        || !leaf_count.is_power_of_two()
+        || cap_height > leaf_count.ilog2() as usize
+        || leaf_count > u32::MAX as usize
+        || leaf_width > u32::MAX as usize
+        || !shared_rows_worthwhile(leaf_width, leaf_count, cap_height)
+    {
+        return None;
+    }
+    let len = leaf_count.checked_mul(leaf_width)?;
+    let context = shared_context()?;
+    let rows = allocate_and_fill_rows(context, len, fill)?;
+
+    match context.build_shared_rows(&rows, leaf_width, leaf_count, cap_height) {
+        Ok((digests, cap)) => {
+            #[cfg(test)]
+            TEST_SHARED_ROW_BUILDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Some((rows, digests, cap))
+        }
+        Err(error) => {
+            log::warn!("Metal shared-row Merkle failed; using Vec fallback: {error}");
+            None
+        }
+    }
+}
+
+fn allocate_and_fill_rows<F: RichField, Fill>(
+    context: &MetalShared,
+    len: usize,
+    fill: Fill,
+) -> Option<MetalRows<F>>
+where
+    Fill: FnOnce(&mut MerkleRowWriter<'_, F>),
+{
+    let bytes = len.checked_mul(size_of::<F>())?;
+    let buffer = autoreleasepool(|| {
+        context
+            .device
+            .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+    });
+    let destination = unsafe {
+        // SAFETY: Metal shared buffers are suitably aligned. `MaybeUninit`
+        // permits the producer to initialize the fresh allocation safely.
+        slice::from_raw_parts_mut(buffer.contents().cast::<MaybeUninit<F>>(), len)
+    };
+    let mut writer = MerkleRowWriter::new(destination);
+    fill(&mut writer);
+    assert!(writer.is_full(), "shared Merkle-row producer underfilled its buffer");
+    Some(MetalRows {
+        buffer,
+        len,
+        _phantom: PhantomData,
+    })
 }
 
 pub(crate) fn build_merkle_tree_columns<F: RichField>(
@@ -241,6 +383,38 @@ pub(crate) fn build_merkle_tree_columns<F: RichField>(
         Ok(tree) => Some(tree),
         Err(error) => {
             log::warn!("Metal Poseidon2 failed; using CPU Merkle hashing: {error}");
+            None
+        }
+    }
+}
+
+/// Search a fixed exhaustive permutation of the canonical witness range on
+/// Metal, returning the first valid logical slot. The caller replays the
+/// mapped witness through the scalar Challenger, so a backend failure or
+/// unsupported configuration can safely use the CPU path.
+pub(crate) fn find_pow_witness<F: RichField>(
+    base_state: &[F],
+    witness_input_pos: usize,
+    min_leading_zeros: u32,
+) -> Option<u64> {
+    if F::ORDER != 0xffff_ffff_0000_0001
+        || size_of::<F>() != size_of::<u64>()
+        || base_state.len() != 12
+        || witness_input_pos >= 8
+        || !(MIN_GPU_POW_BITS..=64).contains(&min_leading_zeros)
+    {
+        return None;
+    }
+
+    let context = shared_context()?;
+    match context.find_pow(base_state, witness_input_pos, min_leading_zeros) {
+        Ok(witness) => {
+            #[cfg(test)]
+            TEST_METAL_POW_SEARCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Some(witness)
+        }
+        Err(error) => {
+            log::warn!("Metal Poseidon2 PoW failed; using CPU search: {error}");
             None
         }
     }
@@ -355,6 +529,9 @@ impl MetalShared {
             let parent_function = library
                 .get_function("poseidon2_hash_parents", None)
                 .map_err(|error| format!("parent kernel unavailable: {error}"))?;
+            let pow_function = library
+                .get_function("poseidon2_find_pow", None)
+                .map_err(|error| format!("PoW kernel unavailable: {error}"))?;
             let ntt_prepare_function = library
                 .get_function("ntt_prepare", None)
                 .map_err(|error| format!("ntt prepare kernel unavailable: {error}"))?;
@@ -370,6 +547,9 @@ impl MetalShared {
             let parent_pipeline = device
                 .new_compute_pipeline_state_with_function(&parent_function)
                 .map_err(|error| format!("parent pipeline creation failed: {error}"))?;
+            let pow_pipeline = device
+                .new_compute_pipeline_state_with_function(&pow_function)
+                .map_err(|error| format!("PoW pipeline creation failed: {error}"))?;
             let ntt_prepare_pipeline = device
                 .new_compute_pipeline_state_with_function(&ntt_prepare_function)
                 .map_err(|error| format!("ntt prepare pipeline creation failed: {error}"))?;
@@ -400,6 +580,7 @@ impl MetalShared {
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
                 parent_pipeline,
+                pow_pipeline,
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
@@ -414,6 +595,93 @@ impl MetalShared {
                 ntt_ones: Mutex::new(HashMap::new()),
             })
         })
+    }
+
+    fn find_pow<F: RichField>(
+        &self,
+        base_state: &[F],
+        witness_input_pos: usize,
+        min_leading_zeros: u32,
+    ) -> Result<u64, String> {
+        let set = self.acquire_set()?;
+        let result = self.find_pow_inner(base_state, witness_input_pos, min_leading_zeros);
+        self.release_set(set);
+        result
+    }
+
+    fn find_pow_inner<F: RichField>(
+        &self,
+        base_state: &[F],
+        witness_input_pos: usize,
+        min_leading_zeros: u32,
+    ) -> Result<u64, String> {
+        let base_state = core::array::from_fn::<u64, 12, _>(|i| {
+            base_state[i].to_noncanonical_u64()
+        });
+        let witness_input_pos = witness_input_pos as u32;
+        let max_witness = F::NEG_ONE.to_canonical_u64();
+        const COMMAND_CAPACITY: usize = POW_BATCH_SIZE * POW_BATCHES_PER_COMMAND;
+        let winner = autoreleasepool(|| {
+            self.device.new_buffer(
+                size_of::<u32>() as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+        let mut candidate_start = 0u64;
+
+        loop {
+            let remaining = max_witness - candidate_start + 1;
+            let command_candidate_count = remaining.min(COMMAND_CAPACITY as u64) as usize;
+            unsafe {
+                winner.contents().cast::<u32>().write(u32::MAX);
+            }
+
+            let command_buffer = autoreleasepool(|| -> CommandBuffer {
+                let command_buffer = self.queue.new_command_buffer();
+                for candidate_offset in (0..command_candidate_count).step_by(POW_BATCH_SIZE) {
+                    let candidate_count =
+                        (command_candidate_count - candidate_offset).min(POW_BATCH_SIZE) as u32;
+                    let encoder = command_buffer.new_compute_command_encoder();
+                    encoder.set_compute_pipeline_state(&self.pow_pipeline);
+                    encoder.set_bytes(
+                        0,
+                        size_of_val(&base_state) as NSUInteger,
+                        base_state.as_ptr().cast::<c_void>(),
+                    );
+                    encoder.set_buffer(1, Some(&winner), 0);
+                    encoder.set_buffer(2, Some(&self.parameters), 0);
+                    encoder.set_bytes(
+                        3,
+                        size_of::<u64>() as NSUInteger,
+                        (&candidate_start as *const u64).cast::<c_void>(),
+                    );
+                    set_u32(encoder, 4, witness_input_pos);
+                    set_u32(encoder, 5, min_leading_zeros);
+                    set_u32(encoder, 6, candidate_count);
+                    set_u32(encoder, 7, candidate_offset as u32);
+                    dispatch(encoder, &self.pow_pipeline, candidate_count as usize);
+                    encoder.end_encoding();
+                }
+                command_buffer.commit();
+                command_buffer.to_owned()
+            });
+
+            command_buffer.wait_until_completed();
+            if command_buffer.status() != MTLCommandBufferStatus::Completed {
+                return Err(format!(
+                    "PoW command buffer ended with status {:?}",
+                    command_buffer.status()
+                ));
+            }
+            let winner_offset = unsafe { winner.contents().cast::<u32>().read() };
+            if winner_offset != u32::MAX {
+                return Ok(pow_candidate::<F>(candidate_start + winner_offset as u64));
+            }
+            if command_candidate_count as u64 == remaining {
+                return Err("Metal PoW exhausted the canonical field range".into());
+            }
+            candidate_start += command_candidate_count as u64;
+        }
     }
 
     fn acquire_set(&self) -> Result<BufferSet, String> {
@@ -1032,6 +1300,118 @@ impl MetalShared {
         Ok(tree_from_levels(nodes, &level_offsets, lde_size, cap_height))
     }
 
+    fn build_shared_rows<F: RichField>(
+        &self,
+        rows: &MetalRows<F>,
+        leaf_width: usize,
+        leaf_count: usize,
+        cap_height: usize,
+    ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
+        debug_assert_eq!(rows.len(), leaf_count * leaf_width);
+        let cap_count = 1usize << cap_height;
+        let total_node_count = 2 * leaf_count - cap_count;
+        let output_len = total_node_count
+            .checked_mul(4)
+            .ok_or("Metal shared-row output length overflow")?;
+        let output_bytes = output_len
+            .checked_mul(size_of::<u64>())
+            .ok_or("Metal shared-row output size overflow")?;
+
+        let mut set = self.acquire_set()?;
+        let result = (|| -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
+            if set
+                .output
+                .as_ref()
+                .map_or(true, |buffer| buffer.length() < output_bytes as u64)
+            {
+                set.output = Some(autoreleasepool(|| {
+                    self.device
+                        .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
+                }));
+            }
+            let output_buffer = set.output.as_ref().unwrap();
+            let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
+            let command_buffer = autoreleasepool(|| -> CommandBuffer {
+                let leaf_count_u32 = leaf_count as u32;
+                let leaf_width_u32 = leaf_width as u32;
+                let command_buffer = self.queue.new_command_buffer();
+                let leaf_encoder = command_buffer.new_compute_command_encoder();
+                leaf_encoder.set_compute_pipeline_state(&self.leaf_pipeline);
+                leaf_encoder.set_buffer(0, Some(&rows.buffer), 0);
+                leaf_encoder.set_buffer(1, Some(output_buffer), 0);
+                leaf_encoder.set_buffer(2, Some(&self.parameters), 0);
+                leaf_encoder.set_bytes(
+                    3,
+                    size_of::<u32>() as NSUInteger,
+                    (&leaf_width_u32 as *const u32).cast::<c_void>(),
+                );
+                leaf_encoder.set_bytes(
+                    4,
+                    size_of::<u32>() as NSUInteger,
+                    (&leaf_count_u32 as *const u32).cast::<c_void>(),
+                );
+                dispatch(leaf_encoder, &self.leaf_pipeline, leaf_count);
+                leaf_encoder.end_encoding();
+
+                let mut level_offset = 0usize;
+                let mut child_count = leaf_count;
+                level_offsets.push(level_offset);
+                while child_count > cap_count {
+                    let parent_count = child_count / 2;
+                    let child_offset = level_offset;
+                    level_offset += child_count * 4;
+                    level_offsets.push(level_offset);
+
+                    let parent_count_u32 = parent_count as u32;
+                    let parent_encoder = command_buffer.new_compute_command_encoder();
+                    parent_encoder.set_compute_pipeline_state(&self.parent_pipeline);
+                    parent_encoder.set_buffer(
+                        0,
+                        Some(output_buffer),
+                        (child_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    parent_encoder.set_buffer(
+                        1,
+                        Some(output_buffer),
+                        (level_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    parent_encoder.set_buffer(2, Some(&self.parameters), 0);
+                    parent_encoder.set_bytes(
+                        3,
+                        size_of::<u32>() as NSUInteger,
+                        (&parent_count_u32 as *const u32).cast::<c_void>(),
+                    );
+                    dispatch(parent_encoder, &self.parent_pipeline, parent_count);
+                    parent_encoder.end_encoding();
+
+                    child_count = parent_count;
+                }
+
+                command_buffer.commit();
+                command_buffer.to_owned()
+            });
+
+            command_buffer.wait_until_completed();
+            if command_buffer.status() != MTLCommandBufferStatus::Completed {
+                return Err(format!(
+                    "command buffer ended with status {:?}",
+                    command_buffer.status()
+                ));
+            }
+            let nodes = unsafe {
+                slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
+            };
+            Ok(tree_from_levels(
+                nodes,
+                &level_offsets,
+                leaf_count,
+                cap_height,
+            ))
+        })();
+        self.release_set(set);
+        result
+    }
+
     fn build<F: RichField>(
         &self,
         source: LeafSource<'_, F>,
@@ -1373,9 +1753,57 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::{Field64, PrimeField64};
-    use crate::hash::merkle_tree::{capacity_up_to_mut, fill_digests_buf};
-    use crate::hash::poseidon2::hash::Poseidon2Hash;
+    use crate::field::types::{Field, Field64, PrimeField64};
+    use crate::hash::hashing::PlonkyPermutation;
+    use crate::hash::merkle_tree::{
+        capacity_up_to_mut, fill_digests_buf, merkle_tree_prove, MerkleLeaves, MerkleTree,
+        RowStore,
+    };
+    use crate::hash::poseidon2::hash::{Poseidon2Hash, Poseidon2Permutation};
+    use crate::util::serialization::{Buffer as ReadBuffer, Read, Write};
+
+    #[test]
+    fn metal_pow_matches_first_mapped_witness() {
+        CONTEXT
+            .as_ref()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let below_threshold = core::array::from_fn::<GoldilocksField, 12, _>(|i| {
+            GoldilocksField::from_canonical_u64((i as u64 + 1) * 0x12345)
+        });
+        assert!(find_pow_witness(&below_threshold, 3, MIN_GPU_POW_BITS - 1).is_none());
+
+        for (seed, witness_input_pos, min_leading_zeros) in
+            [(1u64, 0usize, 12u32), (2, 7, 14), (3, 3, 16)]
+        {
+            let base_state = core::array::from_fn::<GoldilocksField, 12, _>(|i| {
+                GoldilocksField::from_canonical_u64(
+                    (i as u64 + 1)
+                        .wrapping_mul(0x12345)
+                        .wrapping_add(seed.wrapping_mul(0x9e37_79b9)),
+                )
+            });
+            let valid = |candidate| {
+                let mut state = Poseidon2Permutation::new(base_state);
+                state.set_elt(
+                    GoldilocksField::from_canonical_u64(candidate),
+                    witness_input_pos,
+                );
+                state.permute();
+                state.squeeze()[7].to_canonical_u64().leading_zeros() >= min_leading_zeros
+            };
+
+            let gpu = find_pow_witness(&base_state, witness_input_pos, min_leading_zeros)
+                .expect("Metal PoW unavailable");
+            let gpu_repeat = find_pow_witness(&base_state, witness_input_pos, min_leading_zeros)
+                .expect("Metal PoW unavailable on repeat");
+            let first_logical = (0..=GoldilocksField::NEG_ONE.to_canonical_u64())
+                .find(|&logical| valid(pow_candidate::<GoldilocksField>(logical)))
+                .unwrap();
+            assert_eq!(gpu, pow_candidate::<GoldilocksField>(first_logical));
+            assert_eq!(gpu_repeat, gpu);
+            assert!(valid(gpu));
+        }
+    }
 
     fn gpu_duration(command_buffer: &CommandBuffer, wall: Duration) -> Duration {
         let gpu_start: f64 = unsafe {
@@ -1992,6 +2420,181 @@ kernel void goldilocks_mul_bench_native(
         );
     }
 
+    fn fri_like_values(leaf_count: usize, arity: usize) -> Vec<[GoldilocksField; 2]> {
+        (0..leaf_count * arity)
+            .map(|index| {
+                let value = (index as u64)
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    .rotate_left((index & 63) as u32);
+                [
+                    GoldilocksField(value % GoldilocksField::ORDER),
+                    GoldilocksField(
+                        value.wrapping_add(0xd1b5_4a32_d192_ed03) % GoldilocksField::ORDER,
+                    ),
+                ]
+            })
+            .collect()
+    }
+
+    fn fill_fri_rows_owned(values: &[[GoldilocksField; 2]]) -> Vec<GoldilocksField> {
+        let log_n = crate::util::log2_strict(values.len());
+        let mut flat = Vec::with_capacity(values.len() * 2);
+        for index in 0..values.len() {
+            flat.extend_from_slice(&values[crate::util::reverse_bits(index, log_n)]);
+        }
+        flat
+    }
+
+    fn build_fri_rows_policy(
+        values: &[[GoldilocksField; 2]],
+        arity: usize,
+        cap_height: usize,
+    ) -> MerkleTree<GoldilocksField, Poseidon2Hash> {
+        let leaf_count = values.len() / arity;
+        let leaf_width = arity * 2;
+        let log_n = crate::util::log2_strict(values.len());
+        if let Some((rows, digests, cap)) = build_merkle_tree_from_rows(
+            leaf_width,
+            leaf_count,
+            cap_height,
+            |writer| {
+                for index in 0..values.len() {
+                    writer.extend_from_slice(
+                        &values[crate::util::reverse_bits(index, log_n)],
+                    );
+                }
+            },
+        ) {
+            MerkleTree::from_prebuilt_rows(
+                RowStore::Shared(rows),
+                leaf_width,
+                leaf_count,
+                digests,
+                cap,
+            )
+        } else {
+            MerkleTree::new_flat(
+                fill_fri_rows_owned(values),
+                leaf_width,
+                cap_height,
+            )
+        }
+    }
+
+    #[test]
+    #[ignore = "manual shared-row production-window confirmation"]
+    fn benchmark_shared_fri_rows_window() {
+        use std::hint::black_box;
+
+        let _shared_rows_guard = TEST_SHARED_ROWS_LOCK.lock().unwrap();
+        TEST_MIN_SHARED_ROW_WORK.store(MIN_SHARED_ROW_WORK, core::sync::atomic::Ordering::Relaxed);
+        let cap_height = 4;
+        let shapes = [
+            (1usize << 17, 2usize, true),
+            (1usize << 17, 8usize, true),
+            (1usize << 18, 4usize, true),
+            (1usize << 19, 4usize, false),
+        ];
+        let median = |values: &[Duration]| {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        };
+
+        for (leaf_count, arity, expect_shared) in shapes {
+            let leaf_width = arity * 2;
+            let values = fri_like_values(leaf_count, arity);
+            let baseline_tree = MerkleTree::<GoldilocksField, Poseidon2Hash>::new_flat(
+                fill_fri_rows_owned(&values),
+                leaf_width,
+                cap_height,
+            );
+            let policy_tree = build_fri_rows_policy(&values, arity, cap_height);
+            assert_tree_eq(
+                &(policy_tree.digests.clone(), policy_tree.cap.0.clone()),
+                &(baseline_tree.digests.clone(), baseline_tree.cap.0.clone()),
+                leaf_width,
+                cap_height,
+            );
+            assert_sample_proofs_eq(
+                &policy_tree.digests,
+                &baseline_tree.digests,
+                leaf_count,
+                cap_height,
+            );
+            assert_eq!(
+                matches!(
+                    policy_tree.leaves,
+                    MerkleLeaves::Rows {
+                        data: RowStore::Shared(_),
+                        ..
+                    }
+                ),
+                expect_shared,
+            );
+
+            let builds_before = TEST_SHARED_ROW_BUILDS.load(core::sync::atomic::Ordering::Relaxed);
+            let mut baseline_times = Vec::with_capacity(14);
+            let mut policy_times = Vec::with_capacity(14);
+            black_box(MerkleTree::<GoldilocksField, Poseidon2Hash>::new_flat(
+                fill_fri_rows_owned(&values),
+                leaf_width,
+                cap_height,
+            ));
+            black_box(build_fri_rows_policy(&values, arity, cap_height));
+            for _ in 0..7 {
+                let start = Instant::now();
+                black_box(MerkleTree::<GoldilocksField, Poseidon2Hash>::new_flat(
+                    fill_fri_rows_owned(&values),
+                    leaf_width,
+                    cap_height,
+                ));
+                baseline_times.push(start.elapsed());
+                let start = Instant::now();
+                black_box(build_fri_rows_policy(&values, arity, cap_height));
+                policy_times.push(start.elapsed());
+
+                let start = Instant::now();
+                black_box(build_fri_rows_policy(&values, arity, cap_height));
+                policy_times.push(start.elapsed());
+                let start = Instant::now();
+                black_box(MerkleTree::<GoldilocksField, Poseidon2Hash>::new_flat(
+                    fill_fri_rows_owned(&values),
+                    leaf_width,
+                    cap_height,
+                ));
+                baseline_times.push(start.elapsed());
+            }
+            let builds_after = TEST_SHARED_ROW_BUILDS.load(core::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                builds_after - builds_before,
+                if expect_shared { 15 } else { 0 },
+            );
+            let baseline_median = median(&baseline_times);
+            let policy_median = median(&policy_times);
+            let wins = policy_times
+                .iter()
+                .zip(&baseline_times)
+                .filter(|(policy, baseline)| policy < baseline)
+                .count();
+            eprintln!(
+                "FSR confirm 2^{} width={leaf_width} shared={expect_shared}: \
+                 Vec={baseline_median:?} policy={policy_median:?} speedup={:.4}x \
+                 wins={wins}/14\n  Vec us={:?}\n  policy us={:?}",
+                leaf_count.ilog2(),
+                baseline_median.as_secs_f64() / policy_median.as_secs_f64(),
+                baseline_times
+                    .iter()
+                    .map(Duration::as_micros)
+                    .collect::<Vec<_>>(),
+                policy_times
+                    .iter()
+                    .map(Duration::as_micros)
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+
     #[test]
     fn metal_ntt_commitment_matches_cpu() {
         use crate::field::polynomial::PolynomialCoeffs;
@@ -2194,6 +2797,153 @@ kernel void goldilocks_mul_bench_native(
         }
     }
 
+    #[test]
+    fn metal_shared_rows_match_cpu_and_retain_values() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<MetalRows<GoldilocksField>>();
+
+        let _shared_rows_guard = TEST_SHARED_ROWS_LOCK.lock().unwrap();
+        TEST_MIN_SHARED_ROW_WORK.store(0, core::sync::atomic::Ordering::Relaxed);
+        for width in [4usize, 8, 16] {
+            let leaf_count = 256usize;
+            let flat = (0..leaf_count * width)
+                .map(|index| {
+                    GoldilocksField(
+                        (index as u64)
+                            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                            .rotate_left((index & 63) as u32)
+                            % GoldilocksField::ORDER,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let leaves = flat
+                .chunks_exact(width)
+                .map(<[GoldilocksField]>::to_vec)
+                .collect::<Vec<_>>();
+            for cap_height in [0, 3] {
+                let (rows, digests, cap) = build_merkle_tree_from_rows(
+                    width,
+                    leaf_count,
+                    cap_height,
+                    |writer| writer.extend_from_slice(&flat),
+                )
+                .unwrap();
+                assert_eq!(rows.as_slice(), flat);
+                assert_eq!(rows, rows.clone());
+                assert!(format!("{rows:?}").contains("MetalRows"));
+                assert_eq!(
+                    RowStore::Shared(rows.clone()),
+                    RowStore::Owned(flat.clone()),
+                );
+
+                let tree = MerkleTree::<GoldilocksField, Poseidon2Hash>::from_prebuilt_rows(
+                    RowStore::Shared(rows),
+                    width,
+                    leaf_count,
+                    digests,
+                    cap,
+                );
+                let cpu = cpu_tree(&leaves, cap_height);
+                assert_tree_eq(
+                    &(tree.digests.clone(), tree.cap.0.clone()),
+                    &cpu,
+                    width,
+                    cap_height,
+                );
+                for leaf_index in [0, 1, leaf_count / 2 - 1, leaf_count - 1] {
+                    assert_eq!(tree.get(leaf_index), leaves[leaf_index]);
+                    assert_eq!(tree.leaf_vec(leaf_index), leaves[leaf_index]);
+                }
+                assert_sample_proofs_eq(
+                    &tree.digests,
+                    &cpu.0,
+                    leaf_count,
+                    cap_height,
+                );
+
+                let mut encoded = Vec::new();
+                encoded.write_merkle_tree(&tree).unwrap();
+                let mut input = ReadBuffer::new(&encoded);
+                let decoded: MerkleTree<GoldilocksField, Poseidon2Hash> =
+                    input.read_merkle_tree().unwrap();
+                assert_eq!(decoded, tree);
+            }
+        }
+        TEST_MIN_SHARED_ROW_WORK.store(
+            MIN_SHARED_ROW_WORK,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    #[test]
+    fn metal_shared_rows_fri_proof_verifies() {
+        use crate::gates::noop::NoopGate;
+        use crate::iop::witness::PartialWitness;
+        use crate::plonk::circuit_builder::CircuitBuilder;
+        use crate::plonk::circuit_data::CircuitConfig;
+        use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+        const D: usize = 2;
+        type C = Poseidon2GoldilocksConfig;
+        let _shared_rows_guard = TEST_SHARED_ROWS_LOCK.lock().unwrap();
+        TEST_MIN_SHARED_ROW_WORK.store(0, core::sync::atomic::Ordering::Relaxed);
+        let builds_before = TEST_SHARED_ROW_BUILDS.load(core::sync::atomic::Ordering::Relaxed);
+        let pow_searches_before =
+            TEST_METAL_POW_SEARCHES.load(core::sync::atomic::Ordering::Relaxed);
+
+        let mut builder = CircuitBuilder::<GoldilocksField, D>::new(
+            CircuitConfig::standard_recursion_config(),
+        );
+        let left = builder.constant(GoldilocksField::from_canonical_u64(7));
+        let right = builder.constant(GoldilocksField::from_canonical_u64(9));
+        let product = builder.mul(left, right);
+        builder.register_public_input(product);
+        for _ in 0..100 {
+            builder.add_gate(NoopGate, vec![]);
+        }
+        let data = builder.build::<C>();
+        let proof = data.prove(PartialWitness::new()).unwrap();
+        data.verify(proof).unwrap();
+        assert!(
+            TEST_SHARED_ROW_BUILDS.load(core::sync::atomic::Ordering::Relaxed) > builds_before,
+            "the proof must exercise the shared-row FRI path"
+        );
+        assert!(
+            TEST_METAL_POW_SEARCHES.load(core::sync::atomic::Ordering::Relaxed)
+                > pow_searches_before,
+            "the same proof must exercise the Metal PoW path"
+        );
+
+        TEST_MIN_SHARED_ROW_WORK.store(
+            MIN_SHARED_ROW_WORK,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    #[test]
+    fn metal_shared_rows_small_shape_falls_back_before_fill() {
+        use core::cell::Cell;
+
+        let _shared_rows_guard = TEST_SHARED_ROWS_LOCK.lock().unwrap();
+        TEST_MIN_SHARED_ROW_WORK.store(MIN_SHARED_ROW_WORK, core::sync::atomic::Ordering::Relaxed);
+        let producer_called = Cell::new(false);
+        let result = build_merkle_tree_from_rows::<GoldilocksField, _>(4, 64, 3, |_| {
+            producer_called.set(true);
+        });
+        assert!(result.is_none());
+        assert!(!producer_called.get());
+
+        let flat = vec![GoldilocksField::ONE; 64 * 4];
+        let tree = MerkleTree::<GoldilocksField, Poseidon2Hash>::new_flat(flat, 4, 3);
+        assert!(matches!(
+            tree.leaves,
+            MerkleLeaves::Rows {
+                data: RowStore::Owned(_),
+                ..
+            }
+        ));
+    }
+
     fn cpu_tree(
         leaves: &[Vec<GoldilocksField>],
         cap_height: usize,
@@ -2240,6 +2990,42 @@ kernel void goldilocks_mul_bench_native(
                 actual, expected,
                 "width {width}, cap height {cap_height}, node {index}"
             );
+        }
+    }
+
+    fn assert_sample_proofs_eq(
+        actual: &[HashOut<GoldilocksField>],
+        expected: &[HashOut<GoldilocksField>],
+        leaf_count: usize,
+        cap_height: usize,
+    ) {
+        for leaf_index in [0, 1, leaf_count / 2 - 1, leaf_count - 1] {
+            let actual_proof = merkle_tree_prove::<GoldilocksField, Poseidon2Hash>(
+                leaf_index,
+                leaf_count,
+                cap_height,
+                actual,
+            );
+            let expected_proof = merkle_tree_prove::<GoldilocksField, Poseidon2Hash>(
+                leaf_index,
+                leaf_count,
+                cap_height,
+                expected,
+            );
+            assert_eq!(actual_proof.len(), expected_proof.len());
+            for (level, (actual_sibling, expected_sibling)) in
+                actual_proof.iter().zip(&expected_proof).enumerate()
+            {
+                assert_eq!(
+                    actual_sibling
+                        .elements
+                        .map(|value| value.to_canonical_u64()),
+                    expected_sibling
+                        .elements
+                        .map(|value| value.to_canonical_u64()),
+                    "leaf {leaf_index}, cap height {cap_height}, proof level {level}"
+                );
+            }
         }
     }
 }

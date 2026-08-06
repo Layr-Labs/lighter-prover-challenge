@@ -159,6 +159,17 @@ impl<F: Field> PolynomialCoeffs<F> {
             .fold(F::ZERO, |acc, &c| acc * x + c)
     }
 
+    /// Evaluate a base-field polynomial directly at an extension-field point.
+    pub fn eval_extension<const D: usize>(&self, x: F::Extension) -> F::Extension
+    where
+        F: Extendable<D>,
+    {
+        self.coeffs
+            .iter()
+            .rev()
+            .fold(F::Extension::ZERO, |acc, &c| acc * x + c.into())
+    }
+
     /// Evaluate the polynomial at a point given its powers. The first power is the point itself, not 1.
     pub fn eval_with_powers(&self, powers: &[F]) -> F {
         debug_assert_eq!(self.coeffs.len(), powers.len() + 1);
@@ -444,6 +455,7 @@ mod tests {
     use rand::rngs::OsRng;
 
     use super::*;
+    use crate::extension::quadratic::QuadraticExtension;
     use crate::goldilocks_field::GoldilocksField;
     use crate::types::Sample;
 
@@ -513,6 +525,30 @@ mod tests {
 
         let fft_evals = coeffs.coset_fft(shift);
         assert_eq!(evals, fft_evals);
+    }
+
+    #[test]
+    fn eval_extension_matches_materialized_extension_for_raw_values() {
+        type F = GoldilocksField;
+        type EF = QuadraticExtension<F>;
+
+        let mut rng = OsRng;
+        for len in [0, 1, 2, 3, 4, 8, 16, 32, 64, 256, 1024] {
+            for sample in 0..4 {
+                let poly = PolynomialCoeffs::new(
+                    (0..len)
+                        .map(|_| GoldilocksField(rng.gen::<u64>()))
+                        .collect(),
+                );
+                let z: EF = QuadraticExtension([
+                    GoldilocksField(rng.gen::<u64>()),
+                    GoldilocksField(rng.gen::<u64>()),
+                ]);
+                let reference = poly.to_extension::<2>().eval(z);
+                let actual = poly.eval_extension::<2>(z);
+                assert_eq!(actual, reference, "len={len}, sample={sample}");
+            }
+        }
     }
 
     #[test]

@@ -51,6 +51,91 @@ pub enum ColumnStore<F> {
     Shared(crate::hash::poseidon2::metal::MetalColumns<F>),
 }
 
+/// Contiguous row-major leaves. A specialized backend may retain the same
+/// shared allocation that the CPU producer filled and the GPU hashed.
+#[derive(Clone, Debug)]
+pub enum RowStore<F: RichField> {
+    Owned(Vec<F>),
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    Shared(crate::hash::poseidon2::metal::MetalRows<F>),
+}
+
+impl<F: RichField> PartialEq for RowStore<F> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<F: RichField> Eq for RowStore<F> {}
+
+impl<F: RichField> RowStore<F> {
+    pub fn as_slice(&self) -> &[F] {
+        match self {
+            Self::Owned(values) => values,
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            Self::Shared(values) => values.as_slice(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Owned(values) => values.len(),
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            Self::Shared(values) => values.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Safe, fully bounded initializer for an uninitialized row-store allocation.
+/// The backing memory cannot be read through this API.
+#[derive(Debug)]
+pub struct MerkleRowWriter<'a, F> {
+    destination: &'a mut [MaybeUninit<F>],
+    initialized: usize,
+}
+
+impl<'a, F: Copy> MerkleRowWriter<'a, F> {
+    pub(crate) fn new(destination: &'a mut [MaybeUninit<F>]) -> Self {
+        Self {
+            destination,
+            initialized: 0,
+        }
+    }
+
+    pub fn push(&mut self, value: F) {
+        assert!(self.initialized < self.destination.len());
+        self.destination[self.initialized].write(value);
+        self.initialized += 1;
+    }
+
+    pub fn extend_from_slice(&mut self, values: &[F]) {
+        let end = self
+            .initialized
+            .checked_add(values.len())
+            .expect("Merkle row writer length overflow");
+        assert!(end <= self.destination.len());
+        for (destination, &value) in self.destination[self.initialized..end]
+            .iter_mut()
+            .zip(values)
+        {
+            destination.write(value);
+        }
+        self.initialized = end;
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.destination.len() - self.initialized
+    }
+
+    pub(crate) fn is_full(&self) -> bool {
+        self.initialized == self.destination.len()
+    }
+}
+
 impl<F: RichField> ColumnStore<F> {
     pub fn num_cols(&self) -> usize {
         match self {
@@ -79,9 +164,9 @@ impl<F: RichField> ColumnStore<F> {
 
 /// Backing storage for the Merkle tree leaves.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MerkleLeaves<F> {
+pub enum MerkleLeaves<F: RichField> {
     /// One flat row-major buffer: leaf `i` occupies `data[i * width..(i + 1) * width]`.
-    Rows { data: Vec<F>, width: usize },
+    Rows { data: RowStore<F>, width: usize },
     /// Natural-order poly-major columns: leaf `i` holds
     /// `columns.col(j)[reverse_bits(i, log_rows)]` for each column `j`. This is
     /// the layout LDEs are produced in, so committing to them requires no
@@ -118,7 +203,7 @@ impl<F: RichField, H: Hasher<F>> Default for MerkleTree<F, H> {
     fn default() -> Self {
         Self {
             leaves: MerkleLeaves::Rows {
-                data: Vec::new(),
+                data: RowStore::Owned(Vec::new()),
                 width: 0,
             },
             num_leaves: 0,
@@ -222,31 +307,6 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
         let (right_digest_mem, right_digests_buf) = right_digests_buf.split_first_mut().unwrap();
         let half = num_leaves / 2;
         let (left_leaves, right_leaves) = leaves.split_at(half * leaf_width);
-
-        // Sibling leaves are independent; hash them as one interleaved pair so
-        // the two permutation dependency chains overlap in the pipeline.
-        if num_leaves == 2 {
-            let (left_digest, right_digest) = H::hash_or_noop_pair(left_leaves, right_leaves);
-            left_digest_mem.write(left_digest);
-            right_digest_mem.write(right_digest);
-            return H::two_to_one(left_digest, right_digest);
-        }
-
-        // Same idea one level up: hash the four leaves as one interleaved
-        // quad, then compress the two sibling parent nodes as a pair.
-        if num_leaves == 4 {
-            let (leaf_0, leaf_1) = left_leaves.split_at(leaf_width);
-            let (leaf_2, leaf_3) = right_leaves.split_at(leaf_width);
-            let (h0, h1, h2, h3) = H::hash_or_noop_quad(leaf_0, leaf_1, leaf_2, leaf_3);
-            left_digests_buf[0].write(h0);
-            left_digests_buf[1].write(h1);
-            right_digests_buf[0].write(h2);
-            right_digests_buf[1].write(h3);
-            let (left_digest, right_digest) = H::two_to_one_pair(h0, h1, h2, h3);
-            left_digest_mem.write(left_digest);
-            right_digest_mem.write(right_digest);
-            return H::two_to_one(left_digest, right_digest);
-        }
 
         // Rayon task creation dominates the tiny subtrees near the leaves. Keep
         // enough parallelism at the upper levels, then recurse synchronously.
@@ -483,7 +543,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             debug_assert_eq!(cap.len(), 1 << cap_height);
             return Self {
                 leaves: MerkleLeaves::Rows {
-                    data: leaves,
+                    data: RowStore::Owned(leaves),
                     width: leaf_width,
                 },
                 num_leaves,
@@ -495,7 +555,28 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         let (digests, cap) = Self::cpu_digests(&leaves, leaf_width, num_leaves, cap_height);
         Self {
             leaves: MerkleLeaves::Rows {
-                data: leaves,
+                data: RowStore::Owned(leaves),
+                width: leaf_width,
+            },
+            num_leaves,
+            digests,
+            cap: MerkleCap(cap),
+        }
+    }
+
+    /// Wrap an already-filled row store and its prebuilt native Merkle tree.
+    pub fn from_prebuilt_rows(
+        rows: RowStore<F>,
+        leaf_width: usize,
+        num_leaves: usize,
+        digests: Vec<H::Hash>,
+        cap: Vec<H::Hash>,
+    ) -> Self {
+        debug_assert_eq!(rows.len(), num_leaves * leaf_width);
+        debug_assert_eq!(digests.len(), 2 * (num_leaves - cap.len()));
+        Self {
+            leaves: MerkleLeaves::Rows {
+                data: rows,
                 width: leaf_width,
             },
             num_leaves,
@@ -515,7 +596,9 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     /// Borrow leaf `i`. Only available for row-major storage.
     pub fn get(&self, i: usize) -> &[F] {
         match &self.leaves {
-            MerkleLeaves::Rows { data, width } => &data[i * width..(i + 1) * width],
+            MerkleLeaves::Rows { data, width } => {
+                &data.as_slice()[i * width..(i + 1) * width]
+            }
             MerkleLeaves::Columns { .. } => {
                 panic!("MerkleTree::get is unavailable for column-major leaves")
             }
@@ -525,7 +608,9 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     /// Copy leaf `i` out of either storage layout.
     pub fn leaf_vec(&self, i: usize) -> Vec<F> {
         match &self.leaves {
-            MerkleLeaves::Rows { data, width } => data[i * width..(i + 1) * width].to_vec(),
+            MerkleLeaves::Rows { data, width } => {
+                data.as_slice()[i * width..(i + 1) * width].to_vec()
+            }
             MerkleLeaves::Columns { columns, log_rows } => {
                 let natural = crate::util::reverse_bits(i, *log_rows);
                 (0..columns.num_cols())

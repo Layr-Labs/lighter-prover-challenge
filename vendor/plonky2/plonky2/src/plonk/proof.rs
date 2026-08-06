@@ -323,7 +323,7 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         let eval_commitment = |z: F::Extension, c: &PolynomialBatch<F, C, D>| {
             c.polynomials
                 .par_iter()
-                .map(|p| p.to_extension().eval(z))
+                .map(|p| p.eval_extension::<D>(z))
                 .collect::<Vec<_>>()
         };
         let constants_sigmas_eval = eval_commitment(zeta, constants_sigmas_commitment);
@@ -334,11 +334,44 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         let zs_partial_products_lookup_next_eval =
             eval_commitment(g * zeta, zs_partial_products_lookup_commitment);
         let quotient_polys = eval_commitment(zeta, quotient_polys_commitment);
+        let wires = eval_commitment(zeta, wires_commitment);
 
+        let result = Self::from_evaluations(
+            constants_sigmas_eval,
+            wires,
+            zs_partial_products_lookup_eval,
+            zs_partial_products_lookup_next_eval,
+            quotient_polys,
+            common_data,
+        );
+        #[cfg(test)]
+        assert_eq!(
+            result,
+            Self::new_materialized_reference(
+                zeta,
+                g,
+                constants_sigmas_commitment,
+                wires_commitment,
+                zs_partial_products_lookup_commitment,
+                quotient_polys_commitment,
+                common_data,
+            ),
+        );
+        result
+    }
+
+    fn from_evaluations(
+        constants_sigmas_eval: Vec<F::Extension>,
+        wires: Vec<F::Extension>,
+        zs_partial_products_lookup_eval: Vec<F::Extension>,
+        zs_partial_products_lookup_next_eval: Vec<F::Extension>,
+        quotient_polys: Vec<F::Extension>,
+        common_data: &CommonCircuitData<F, D>,
+    ) -> Self {
         Self {
             constants: constants_sigmas_eval[common_data.constants_range()].to_vec(),
             plonk_sigmas: constants_sigmas_eval[common_data.sigmas_range()].to_vec(),
-            wires: eval_commitment(zeta, wires_commitment),
+            wires,
             plonk_zs: zs_partial_products_lookup_eval[common_data.zs_range()].to_vec(),
             plonk_zs_next: zs_partial_products_lookup_next_eval[common_data.zs_range()].to_vec(),
             partial_products: zs_partial_products_lookup_eval[common_data.partial_products_range()]
@@ -349,6 +382,33 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
                 .to_vec(),
         }
     }
+
+    #[cfg(test)]
+    fn new_materialized_reference<C: GenericConfig<D, F = F>>(
+        zeta: F::Extension,
+        g: F::Extension,
+        constants_sigmas_commitment: &PolynomialBatch<F, C, D>,
+        wires_commitment: &PolynomialBatch<F, C, D>,
+        zs_partial_products_lookup_commitment: &PolynomialBatch<F, C, D>,
+        quotient_polys_commitment: &PolynomialBatch<F, C, D>,
+        common_data: &CommonCircuitData<F, D>,
+    ) -> Self {
+        let eval_commitment = |z: F::Extension, c: &PolynomialBatch<F, C, D>| {
+            c.polynomials
+                .par_iter()
+                .map(|p| p.to_extension().eval(z))
+                .collect::<Vec<_>>()
+        };
+        Self::from_evaluations(
+            eval_commitment(zeta, constants_sigmas_commitment),
+            eval_commitment(zeta, wires_commitment),
+            eval_commitment(zeta, zs_partial_products_lookup_commitment),
+            eval_commitment(g * zeta, zs_partial_products_lookup_commitment),
+            eval_commitment(zeta, quotient_polys_commitment),
+            common_data,
+        )
+    }
+
     pub(crate) fn to_fri_openings(&self) -> FriOpenings<F, D> {
         let has_lookup = !self.lookup_zs.is_empty();
         let zeta_batch = if has_lookup {

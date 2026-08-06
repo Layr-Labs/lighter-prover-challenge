@@ -1,4 +1,3 @@
-use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display};
 use core::hash::Hash;
@@ -131,6 +130,16 @@ pub trait Field:
     }
 
     fn batch_multiplicative_inverse(x: &[Self]) -> Vec<Self> {
+        let mut output = Vec::with_capacity(x.len());
+        Self::batch_multiplicative_inverse_into(x, &mut output);
+        output
+    }
+
+    /// Compute multiplicative inverses into a reusable output buffer.
+    fn batch_multiplicative_inverse_into(x: &[Self], output: &mut Vec<Self>) {
+        output.clear();
+        output.reserve(x.len());
+
         // This is Montgomery's trick. At a high level, we invert the product of the given field
         // elements, then derive the individual inverses from that via multiplication.
 
@@ -149,24 +158,27 @@ pub trait Field:
         // The branches should be very predictable.
         let n = x.len();
         if n == 0 {
-            return Vec::new();
+            return;
         } else if n == 1 {
-            return vec![x[0].inverse()];
+            output.push(x[0].inverse());
+            return;
         } else if n == 2 {
             let x01 = x[0] * x[1];
             let x01inv = x01.inverse();
-            return vec![x01inv * x[1], x01inv * x[0]];
+            output.extend([x01inv * x[1], x01inv * x[0]]);
+            return;
         } else if n == 3 {
             let x01 = x[0] * x[1];
             let x012 = x01 * x[2];
             let x012inv = x012.inverse();
             let x01inv = x012inv * x[2];
-            return vec![x01inv * x[1], x01inv * x[0], x012inv * x01];
+            output.extend([x01inv * x[1], x01inv * x[0], x012inv * x01]);
+            return;
         }
         debug_assert!(n >= WIDTH);
 
-        // Buf is reused for a few things to save allocations.
-        // Fill buf with cumulative product of x, only taking every 4th value. Concretely, buf will
+        // The output is reused for a few things to save allocations.
+        // Fill it with cumulative products of x, only taking every 4th value. Concretely, it will
         // be [
         //   x[0], x[1], x[2], x[3],
         //   x[0] * x[4], x[1] * x[5], x[2] * x[6], x[3] * x[7],
@@ -175,16 +187,15 @@ pub trait Field:
         // ].
         // If n is not a multiple of WIDTH, the result is truncated from the end. For example,
         // for n == 5, we get [x[0], x[1], x[2], x[3], x[0] * x[4]].
-        let mut buf: Vec<Self> = Vec::with_capacity(n);
-        // cumul_prod holds the last WIDTH elements of buf. This is redundant, but it's how we
+        // cumul_prod holds the last WIDTH elements of output. This is redundant, but it's how we
         // convince LLVM to keep the values in the registers.
         let mut cumul_prod: [Self; WIDTH] = x[..WIDTH].try_into().unwrap();
-        buf.extend(cumul_prod);
+        output.extend(cumul_prod);
         for (i, &xi) in x[WIDTH..].iter().enumerate() {
             cumul_prod[i % WIDTH] *= xi;
-            buf.push(cumul_prod[i % WIDTH]);
+            output.push(cumul_prod[i % WIDTH]);
         }
-        debug_assert_eq!(buf.len(), n);
+        debug_assert_eq!(output.len(), n);
 
         let mut a_inv = {
             // This is where the four dependency chains meet.
@@ -204,22 +215,20 @@ pub trait Field:
         };
 
         for i in (WIDTH..n).rev() {
-            // buf[i - WIDTH] has not been written to by this loop, so it equals
+            // output[i - WIDTH] has not been written to by this loop, so it equals
             // x[i % WIDTH] * x[i % WIDTH + WIDTH] * ... * x[i - WIDTH].
-            buf[i] = buf[i - WIDTH] * a_inv[i % WIDTH];
-            // buf[i] now holds the inverse of x[i].
+            output[i] = output[i - WIDTH] * a_inv[i % WIDTH];
+            // output[i] now holds the inverse of x[i].
             a_inv[i % WIDTH] *= x[i];
         }
         for i in (0..WIDTH).rev() {
-            buf[i] = a_inv[i];
+            output[i] = a_inv[i];
         }
 
-        for (&bi, &xi) in buf.iter().zip(x) {
+        for (&bi, &xi) in output.iter().zip(x) {
             // Sanity check only.
             debug_assert_eq!(bi * xi, Self::ONE);
         }
-
-        buf
     }
 
     /// Compute the inverse of 2^exp in this field.

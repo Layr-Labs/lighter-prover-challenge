@@ -3,6 +3,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
 use core::cmp::min;
+use core::mem::swap;
 
 use anyhow::{ensure, Result};
 use hashbrown::HashMap;
@@ -32,9 +33,9 @@ use crate::plonk::vanishing_poly::{
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
-use crate::util::partial_products::quotient_chunk_products;
+use crate::util::partial_products::partial_products_and_z_gx;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil};
+use crate::util::{log2_ceil, transpose};
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -155,31 +156,19 @@ where
     let public_inputs = partition_witness.get_targets(&prover_data.public_inputs);
     let public_inputs_hash = C::InnerHasher::hash_no_pad(&public_inputs);
 
-    let mut witness = timed!(
+    let witness = timed!(
         timing,
         "compute full witness",
         partition_witness.full_witness()
     );
 
-    // Only the routed columns are read again after this point (the
-    // permutation argument covers wires `j < num_routed_wires`; nothing else
-    // consumes the matrix), so move the non-routed columns out instead of
-    // cloning them.
-    let num_routed_wires = common_data.config.num_routed_wires;
     let wires_values: Vec<PolynomialValues<F>> = timed!(
         timing,
         "compute wire polynomials",
         witness
             .wire_values
-            .par_iter_mut()
-            .enumerate()
-            .map(|(j, column)| {
-                if j < num_routed_wires {
-                    PolynomialValues::new(column.clone())
-                } else {
-                    PolynomialValues::new(core::mem::take(column))
-                }
-            })
+            .par_iter()
+            .map(|column| PolynomialValues::new(column.clone()))
             .collect()
     );
 
@@ -440,61 +429,118 @@ fn wires_permutation_partial_products_and_zs<
     let degree = common_data.quotient_degree_factor;
     let subgroup = &prover_data.subgroup;
     let num_prods = common_data.num_partial_products;
-    debug_assert_eq!(beta_k_is.len(), common_data.config.num_routed_wires);
     let num_routed_wires = common_data.config.num_routed_wires;
-    let all_quotient_chunk_products = subgroup
-        .par_iter()
+    debug_assert_eq!(beta_k_is.len(), num_routed_wires);
+    let num_quotient_chunks = num_prods + 1;
+    let mut all_quotient_chunk_products = vec![F::ZERO; subgroup.len() * num_quotient_chunks];
+    #[cfg(feature = "parallel")]
+    all_quotient_chunk_products
+        .par_chunks_exact_mut(num_quotient_chunks)
         .enumerate()
-        .map_init(
-            // One denominator scratch buffer per worker thread instead of a
-            // fresh Vec per subgroup point.
-            || vec![F::ZERO; num_routed_wires],
-            |denominators, (i, &x)| {
-                let s_sigmas = &prover_data.sigmas[i];
-                for (j, denominator) in denominators.iter_mut().enumerate() {
-                    let wire_value = witness.get_wire(i, j);
-                    *denominator = wire_value + beta * s_sigmas[j] + gamma;
-                }
-                let mut quotient_values = F::batch_multiplicative_inverse(denominators);
-                // Multiply the numerators into the inverse buffer in place;
-                // the per-point numerator and quotient Vecs are gone.
-                for (j, quotient_value) in quotient_values.iter_mut().enumerate() {
-                    let wire_value = witness.get_wire(i, j);
-                    let numerator = wire_value + beta_k_is[j] * x + gamma;
-                    *quotient_value *= numerator;
-                }
-
-                quotient_chunk_products(&quotient_values, degree)
+        .for_each_init(
+            || PermutationRowScratch::new(num_routed_wires),
+            |scratch, (i, products)| {
+                permutation_row_chunk_products_into(
+                    witness,
+                    &prover_data.sigmas[i],
+                    beta,
+                    beta_k_is,
+                    gamma,
+                    subgroup[i],
+                    i,
+                    degree,
+                    scratch,
+                    products,
+                );
             },
-        )
-        .collect::<Vec<_>>();
-
-    // Accumulate the sequential Z chain directly into the column-major output
-    // polynomials, deleting the per-point row Vec, the row-major intermediate,
-    // and the whole-phase transpose. Values and their order are identical: for
-    // each point, column k receives the k-th running product, and the last
-    // column receives the previous Z(x) exactly as the swap-based version did.
-    let n_points = all_quotient_chunk_products.len();
-    let mut columns: Vec<Vec<F>> = (0..num_prods + 1)
-        .map(|_| Vec::with_capacity(n_points))
-        .collect();
-    let mut z_x = F::ONE;
-    for quotient_chunk_products in all_quotient_chunk_products {
-        let mut acc = z_x;
-        for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
-            acc *= quotient_chunk_product;
-            if k == num_prods {
-                // The last term is Z(gx), but we store Z(x) in its place,
-                // otherwise Z would end up shifted.
-                columns[k].push(z_x);
-                z_x = acc;
-            } else {
-                columns[k].push(acc);
-            }
+        );
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut scratch = PermutationRowScratch::new(num_routed_wires);
+        for (i, products) in all_quotient_chunk_products
+            .chunks_exact_mut(num_quotient_chunks)
+            .enumerate()
+        {
+            permutation_row_chunk_products_into(
+                witness,
+                &prover_data.sigmas[i],
+                beta,
+                beta_k_is,
+                gamma,
+                subgroup[i],
+                i,
+                degree,
+                &mut scratch,
+                products,
+            );
         }
     }
 
-    columns.into_iter().map(PolynomialValues::new).collect()
+    let mut z_x = F::ONE;
+    let mut all_partial_products_and_zs = Vec::with_capacity(subgroup.len());
+    for quotient_chunk_products in all_quotient_chunk_products.chunks_exact(num_quotient_chunks) {
+        let mut partial_products_and_z_gx = partial_products_and_z_gx(z_x, quotient_chunk_products);
+        // The last term is Z(gx), but we replace it with Z(x), otherwise Z would end up shifted.
+        swap(&mut z_x, &mut partial_products_and_z_gx[num_prods]);
+        all_partial_products_and_zs.push(partial_products_and_z_gx);
+    }
+
+    transpose(&all_partial_products_and_zs)
+        .into_par_iter()
+        .map(PolynomialValues::new)
+        .collect()
+}
+
+struct PermutationRowScratch<F> {
+    denominators: Vec<F>,
+    denominator_inverses: Vec<F>,
+}
+
+impl<F> PermutationRowScratch<F> {
+    fn new(width: usize) -> Self {
+        Self {
+            denominators: Vec::with_capacity(width),
+            denominator_inverses: Vec::with_capacity(width),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn permutation_row_chunk_products_into<F: Field>(
+    witness: &MatrixWitness<F>,
+    s_sigmas: &[F],
+    beta: F,
+    beta_k_is: &[F],
+    gamma: F,
+    x: F,
+    row: usize,
+    chunk_size: usize,
+    scratch: &mut PermutationRowScratch<F>,
+    products: &mut [F],
+) {
+    let width = beta_k_is.len();
+    debug_assert_eq!(s_sigmas.len(), width);
+    debug_assert_eq!(products.len(), width.div_ceil(chunk_size));
+    scratch.denominators.clear();
+    scratch.denominators.extend((0..width).map(|j| {
+        let wire_value = witness.get_wire(row, j);
+        wire_value + beta * s_sigmas[j] + gamma
+    }));
+    F::batch_multiplicative_inverse_into(&scratch.denominators, &mut scratch.denominator_inverses);
+
+    for (chunk_index, (product, denominator_inverses)) in products
+        .iter_mut()
+        .zip(scratch.denominator_inverses.chunks(chunk_size))
+        .enumerate()
+    {
+        *product = F::ONE;
+        for (offset, &denominator_inverse) in denominator_inverses.iter().enumerate() {
+            let j = chunk_index * chunk_size + offset;
+            let wire_value = witness.get_wire(row, j);
+            let numerator = wire_value + beta_k_is[j] * x + gamma;
+            *product *= numerator * denominator_inverse;
+        }
+    }
 }
 
 /// Computes lookup polynomials for a given challenge.
@@ -504,6 +550,27 @@ fn wires_permutation_partial_products_and_zs<
 /// partial polynomials according to `max_quotient_degree_factor`.
 /// As another optimization, Sum and LDC polynomials are shared (in so called partial SLDC polynomials), and the last value
 /// of the last partial polynomial is Sum(end) - LDC(end). If the lookup argument is valid, then it must be equal to 0.
+fn batch_inverse_differences_into<F: Field, I: IntoIterator<Item = F>>(
+    alpha: F,
+    combos: I,
+    inverse_inputs: &mut Vec<F>,
+    inverses: &mut Vec<F>,
+) {
+    inverse_inputs.clear();
+    inverse_inputs.extend(combos.into_iter().map(|combo| alpha - combo));
+    F::batch_multiplicative_inverse_into(inverse_inputs, inverses);
+}
+
+fn fold_lookup_combos<F: Field, I: IntoIterator<Item = F>>(
+    initial: F,
+    delta: F,
+    combos: I,
+) -> F {
+    combos
+        .into_iter()
+        .fold(initial, |acc, combo| acc * delta + combo)
+}
+
 fn compute_lookup_polys<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -526,6 +593,9 @@ fn compute_lookup_polys<
     for _ in 0..num_partial_lookups + 1 {
         final_poly_vecs.push(PolynomialValues::<F>::new(vec![F::ZERO; degree]));
     }
+    let max_lookup_slots = num_lu_slots.max(num_lut_slots);
+    let mut inverse_inputs = Vec::with_capacity(max_lookup_slots);
+    let mut combo_inverses = Vec::with_capacity(max_lookup_slots);
 
     for LookupWire {
         last_lu_gate: last_lu_row,
@@ -535,38 +605,30 @@ fn compute_lookup_polys<
     {
         // Set values for partial Sums and RE.
         for row in (last_lut_row..(first_lut_row + 1)).rev() {
-            // Get combos for Sum.
-            let looked_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| {
+            batch_inverse_differences_into(
+                deltas[LookupChallenges::ChallengeAlpha as usize],
+                (0..num_lut_slots).map(|s| {
                     let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
                     let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
 
                     looked_inp + deltas[LookupChallenges::ChallengeA as usize] * looked_out
-                })
-                .collect();
-            // Get (alpha - combo).
-            let minus_looked_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| deltas[LookupChallenges::ChallengeAlpha as usize] - looked_combos[s])
-                .collect();
-            // Get 1/(alpha - combo).
-            let looked_combo_inverses = F::batch_multiplicative_inverse(&minus_looked_combos);
+                }),
+                &mut inverse_inputs,
+                &mut combo_inverses,
+            );
 
-            // Get lookup combos, used to check the well formation of the LUT.
-            let lookup_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| {
+            // Compute next row's first value of RE.
+            // If `row == first_lut_row`, then `final_poly_vecs[0].values[row + 1] == 0`.
+            let new_re = fold_lookup_combos(
+                final_poly_vecs[0].values[row + 1],
+                deltas[LookupChallenges::ChallengeDelta as usize],
+                (0..num_lut_slots).map(|s| {
                     let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
                     let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
 
                     looked_inp + deltas[LookupChallenges::ChallengeB as usize] * looked_out
-                })
-                .collect();
-
-            // Compute next row's first value of RE.
-            // If `row == first_lut_row`, then `final_poly_vecs[0].values[row + 1] == 0`.
-            let mut new_re = final_poly_vecs[0].values[row + 1];
-            for elt in &lookup_combos {
-                new_re = new_re * deltas[LookupChallenges::ChallengeDelta as usize] + *elt
-            }
+                }),
+            );
             final_poly_vecs[0].values[row] = new_re;
 
             for slot in 0..num_partial_lookups {
@@ -580,7 +642,7 @@ fn compute_lookup_polys<
                     ..min((slot + 1) * max_lookup_table_degree, num_lut_slots))
                     .fold(prev, |acc, s| {
                         acc + witness.get_wire(row, LookupTableGate::wire_ith_multiplicity(s))
-                            * looked_combo_inverses[s]
+                            * combo_inverses[s]
                     });
                 final_poly_vecs[slot + 1].values[row] = sum;
             }
@@ -588,21 +650,17 @@ fn compute_lookup_polys<
 
         // Set values for partial LDCs.
         for row in (last_lu_row..last_lut_row).rev() {
-            // Get looking combos.
-            let looking_combos: Vec<F> = (0..num_lu_slots)
-                .map(|s| {
+            batch_inverse_differences_into(
+                deltas[LookupChallenges::ChallengeAlpha as usize],
+                (0..num_lu_slots).map(|s| {
                     let looking_in = witness.get_wire(row, LookupGate::wire_ith_looking_inp(s));
                     let looking_out = witness.get_wire(row, LookupGate::wire_ith_looking_out(s));
 
                     looking_in + deltas[LookupChallenges::ChallengeA as usize] * looking_out
-                })
-                .collect();
-            // Get (alpha - combo).
-            let minus_looking_combos: Vec<F> = (0..num_lu_slots)
-                .map(|s| deltas[LookupChallenges::ChallengeAlpha as usize] - looking_combos[s])
-                .collect();
-            // Get 1 / (alpha - combo).
-            let looking_combo_inverses = F::batch_multiplicative_inverse(&minus_looking_combos);
+                }),
+                &mut inverse_inputs,
+                &mut combo_inverses,
+            );
 
             for slot in 0..num_partial_lookups {
                 let prev = if slot == 0 {
@@ -613,7 +671,7 @@ fn compute_lookup_polys<
                 };
                 let sum = (slot * max_lookup_degree
                     ..min((slot + 1) * max_lookup_degree, num_lu_slots))
-                    .fold(F::ZERO, |acc, s| acc + looking_combo_inverses[s]);
+                    .fold(F::ZERO, |acc, s| acc + combo_inverses[s]);
                 final_poly_vecs[slot + 1].values[row] = prev - sum;
             }
         }
@@ -826,40 +884,28 @@ fn compute_quotient_polys<
                 );
 
                 let indices_batch = &scratch.indices;
-                let local_zs_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.zs_local_flat[k * zs_row_width..][common_data.zs_range()])
-                    .collect();
-                let next_zs_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.zs_next_flat[k * zs_row_width..][common_data.zs_range()])
-                    .collect();
-                let partial_products_batch: Vec<&[F]> = (0..n)
-                    .map(|k| {
-                        &scratch.zs_local_flat[k * zs_row_width..]
-                            [common_data.partial_products_range()]
-                    })
-                    .collect();
-                let s_sigmas_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires])
-                    .collect();
-                let (local_lookup_batch, next_lookup_batch): (Vec<&[F]>, Vec<&[F]>) = if has_lookup
-                {
-                    (
-                        (0..n)
-                            .map(|k| {
-                                &scratch.zs_local_flat[k * zs_row_width..]
-                                    [common_data.lookup_range()]
-                            })
-                            .collect(),
-                        (0..n)
-                            .map(|k| {
-                                &scratch.zs_next_flat[k * zs_row_width..]
-                                    [common_data.lookup_range()]
-                            })
-                            .collect(),
-                    )
-                } else {
-                    (Vec::new(), Vec::new())
-                };
+                let mut local_zs_batch: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
+                let mut next_zs_batch: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
+                let mut partial_products_batch: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
+                let mut s_sigmas_batch: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
+                let mut local_lookup_batch: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
+                let mut next_lookup_batch: [&[F]; BATCH_SIZE] = [&[]; BATCH_SIZE];
+                for k in 0..n {
+                    let zs_local = &scratch.zs_local_flat[k * zs_row_width..(k + 1) * zs_row_width];
+                    let zs_next = &scratch.zs_next_flat[k * zs_row_width..(k + 1) * zs_row_width];
+                    local_zs_batch[k] = &zs_local[common_data.zs_range()];
+                    next_zs_batch[k] = &zs_next[common_data.zs_range()];
+                    partial_products_batch[k] = &zs_local[common_data.partial_products_range()];
+                    s_sigmas_batch[k] =
+                        &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires];
+                    if has_lookup {
+                        local_lookup_batch[k] =
+                            &scratch.zs_local_flat[k * zs_row_width..][common_data.lookup_range()];
+                        next_lookup_batch[k] =
+                            &scratch.zs_next_flat[k * zs_row_width..][common_data.lookup_range()];
+                    }
+                }
+                let lookup_batch_len = if has_lookup { n } else { 0 };
 
                 let vars_batch = EvaluationVarsBaseBatch::new(
                     n,
@@ -874,12 +920,12 @@ fn compute_quotient_polys<
                     indices_batch,
                     &scratch.shifted_xs,
                     vars_batch,
-                    &local_zs_batch,
-                    &next_zs_batch,
-                    &local_lookup_batch,
-                    &next_lookup_batch,
-                    &partial_products_batch,
-                    &s_sigmas_batch,
+                    &local_zs_batch[..n],
+                    &next_zs_batch[..n],
+                    &local_lookup_batch[..lookup_batch_len],
+                    &next_lookup_batch[..lookup_batch_len],
+                    &partial_products_batch[..n],
+                    &s_sigmas_batch[..n],
                     betas,
                     gammas,
                     beta_k_is,
@@ -916,4 +962,222 @@ fn compute_quotient_polys<
         })
         .map(|values| values.coset_ifft(F::coset_shift()))
         .collect()
+}
+
+#[cfg(test)]
+mod lookup_reuse_tests {
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    use super::*;
+
+    #[test]
+    fn reused_lookup_scratch_matches_materialized_reference_raw() {
+        let challenge_a = GoldilocksField::from_canonical_u64(17);
+        let challenge_b = GoldilocksField::from_canonical_u64(29);
+        let alpha = GoldilocksField::from_canonical_u64(1_000_000_007);
+        let delta = GoldilocksField::from_canonical_u64(41);
+        let mut inverse_inputs = vec![GoldilocksField::ONE; 97];
+        let mut inverses = vec![GoldilocksField::TWO; 113];
+
+        for (row, slots) in [26, 40, 1, 40, 26].into_iter().enumerate() {
+            let inputs = (0..slots)
+                .map(|slot| GoldilocksField::from_canonical_usize(row * 101 + slot + 1))
+                .collect::<Vec<_>>();
+            let outputs = (0..slots)
+                .map(|slot| GoldilocksField::from_canonical_usize(row * 211 + 2 * slot + 3))
+                .collect::<Vec<_>>();
+            let combos_a = inputs
+                .iter()
+                .copied()
+                .zip(outputs.iter().copied())
+                .map(|(input, output)| input + challenge_a * output)
+                .collect::<Vec<_>>();
+            let differences = combos_a
+                .iter()
+                .copied()
+                .map(|combo| alpha - combo)
+                .collect::<Vec<_>>();
+            let expected_inverses =
+                GoldilocksField::batch_multiplicative_inverse(&differences);
+            batch_inverse_differences_into(
+                alpha,
+                inputs
+                    .iter()
+                    .copied()
+                    .zip(outputs.iter().copied())
+                    .map(|(input, output)| input + challenge_a * output),
+                &mut inverse_inputs,
+                &mut inverses,
+            );
+            assert_eq!(
+                inverses.iter().map(|value| value.0).collect::<Vec<_>>(),
+                expected_inverses
+                    .iter()
+                    .map(|value| value.0)
+                    .collect::<Vec<_>>(),
+                "row={row}, slots={slots}",
+            );
+
+            let combos_b = inputs
+                .iter()
+                .copied()
+                .zip(outputs.iter().copied())
+                .map(|(input, output)| input + challenge_b * output)
+                .collect::<Vec<_>>();
+            let initial = GoldilocksField::from_canonical_usize(row + 1);
+            let mut expected_re = initial;
+            for &combo in &combos_b {
+                expected_re = expected_re * delta + combo;
+            }
+            let actual_re = fold_lookup_combos(
+                initial,
+                delta,
+                inputs
+                    .iter()
+                    .copied()
+                    .zip(outputs.iter().copied())
+                    .map(|(input, output)| input + challenge_b * output),
+            );
+            assert_eq!(actual_re.0, expected_re.0, "row={row}, slots={slots}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod permutation_scratch_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::{Field, Field64};
+    use crate::gates::noop::NoopGate;
+    use crate::iop::witness::{MatrixWitness, PartialWitness};
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::circuit_data::CircuitConfig;
+    use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    fn legacy_row(
+        witness: &MatrixWitness<GoldilocksField>,
+        s_sigmas: &[GoldilocksField],
+        beta: GoldilocksField,
+        beta_k_is: &[GoldilocksField],
+        gamma: GoldilocksField,
+        x: GoldilocksField,
+        row: usize,
+        chunk_size: usize,
+    ) -> Vec<GoldilocksField> {
+        let denominators = (0..beta_k_is.len())
+            .map(|j| witness.get_wire(row, j) + beta * s_sigmas[j] + gamma)
+            .collect::<Vec<_>>();
+        let denominator_inverses = GoldilocksField::batch_multiplicative_inverse(&denominators);
+        let quotient_values = denominator_inverses
+            .into_iter()
+            .enumerate()
+            .map(|(j, denominator_inverse)| {
+                let numerator = witness.get_wire(row, j) + beta_k_is[j] * x + gamma;
+                numerator * denominator_inverse
+            })
+            .collect::<Vec<_>>();
+        quotient_values
+            .chunks(chunk_size)
+            .map(|chunk| chunk.iter().copied().product())
+            .collect()
+    }
+
+    fn fixture(
+        rows: usize,
+        width: usize,
+    ) -> (
+        MatrixWitness<GoldilocksField>,
+        Vec<Vec<GoldilocksField>>,
+        Vec<GoldilocksField>,
+        Vec<GoldilocksField>,
+    ) {
+        let field = |index: usize, salt: u64| {
+            GoldilocksField(
+                (index as u64)
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    .wrapping_add(salt)
+                    .rotate_left((index & 63) as u32)
+                    % GoldilocksField::ORDER,
+            )
+        };
+        let wire_values = (0..width)
+            .map(|column| {
+                (0..rows)
+                    .map(|row| field(column * rows + row, 0x1111_2222_3333_4444))
+                    .collect()
+            })
+            .collect();
+        let sigmas = (0..rows)
+            .map(|row| {
+                (0..width)
+                    .map(|column| field(row * width + column, 0x5555_6666_7777_8888))
+                    .collect()
+            })
+            .collect();
+        let subgroup = (0..rows)
+            .map(|row| field(row, 0x1234_5678_9abc_def0))
+            .collect();
+        let beta_k_is = (0..width)
+            .map(|column| field(column, 0xfedc_ba98_7654_3210))
+            .collect();
+        (MatrixWitness { wire_values }, sigmas, subgroup, beta_k_is)
+    }
+
+    #[test]
+    fn permutation_row_scratch_matches_legacy_and_reuses_buffers() {
+        let beta = GoldilocksField::from_canonical_u64(7);
+        let gamma = GoldilocksField::from_canonical_u64(11);
+        for width in [1usize, 2, 3, 4, 5, 79, 80, 81] {
+            let (witness, sigmas, subgroup, beta_k_is) = fixture(17, width);
+            let mut scratch = PermutationRowScratch::new(width);
+            for chunk_size in [2usize, 8, 16] {
+                for row in 0..subgroup.len() {
+                    let mut actual = vec![GoldilocksField::ZERO; width.div_ceil(chunk_size)];
+                    permutation_row_chunk_products_into(
+                        &witness,
+                        &sigmas[row],
+                        beta,
+                        &beta_k_is,
+                        gamma,
+                        subgroup[row],
+                        row,
+                        chunk_size,
+                        &mut scratch,
+                        &mut actual,
+                    );
+                    let expected = legacy_row(
+                        &witness,
+                        &sigmas[row],
+                        beta,
+                        &beta_k_is,
+                        gamma,
+                        subgroup[row],
+                        row,
+                        chunk_size,
+                    );
+                    assert_eq!(actual, expected);
+                }
+            }
+            assert!(scratch.denominators.capacity() >= width);
+            assert!(scratch.denominator_inverses.capacity() >= width);
+        }
+    }
+
+    #[test]
+    fn permutation_scratch_real_proof_verifies() {
+        const D: usize = 2;
+        type C = Poseidon2GoldilocksConfig;
+        let mut builder =
+            CircuitBuilder::<GoldilocksField, D>::new(CircuitConfig::standard_recursion_config());
+        let left = builder.constant(GoldilocksField::from_canonical_u64(7));
+        let right = builder.constant(GoldilocksField::from_canonical_u64(9));
+        let product = builder.mul(left, right);
+        builder.register_public_input(product);
+        for _ in 0..(1 << 11) {
+            builder.add_gate(NoopGate, vec![]);
+        }
+        let data = builder.build::<C>();
+        let proof = data.prove(PartialWitness::new()).unwrap();
+        data.verify(proof).unwrap();
+    }
 }

@@ -14,7 +14,7 @@ use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
@@ -102,35 +102,52 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // heap allocation per element.
         let n = values.values.len();
         let log_n = log2_strict(n);
-        let mut flat_values: Vec<F> = Vec::with_capacity(n * D);
-        for i in 0..n {
-            let x = values.values[reverse_bits(i, log_n)];
-            flat_values.extend_from_slice(&x.to_basefield_array());
-        }
-        let tree = MerkleTree::<F, C::Hasher>::new_flat(
-            flat_values,
-            arity * D,
+        let leaf_width = arity * D;
+        let leaf_count = n / arity;
+        let shared_tree = C::Hasher::try_build_merkle_tree_from_rows(
+            leaf_width,
+            leaf_count,
             fri_params.config.cap_height,
+            |writer| {
+                for i in 0..n {
+                    let x = values.values[reverse_bits(i, log_n)];
+                    writer.extend_from_slice(&x.to_basefield_array());
+                }
+            },
         );
+        let tree = if let Some((rows, digests, cap)) = shared_tree {
+            MerkleTree::<F, C::Hasher>::from_prebuilt_rows(
+                rows,
+                leaf_width,
+                leaf_count,
+                digests,
+                cap,
+            )
+        } else {
+            let mut flat_values: Vec<F> = Vec::with_capacity(n * D);
+            for i in 0..n {
+                let x = values.values[reverse_bits(i, log_n)];
+                flat_values.extend_from_slice(&x.to_basefield_array());
+            }
+            MerkleTree::<F, C::Hasher>::new_flat(
+                flat_values,
+                leaf_width,
+                fri_params.config.cap_height,
+            )
+        };
 
         challenger.observe_cap(&tree.cap);
         trees.push(tree);
 
         let beta = challenger.get_extension_challenge::<D>();
         // P(x) = sum_{i<r} x^i * P_i(x^r) becomes sum_{i<r} beta^i * P_i(x).
-        // Only `1/2^rate_bits` of the coefficients are nonzero every round
-        // (the zero-tail invariant asserted by the final truncation), and the
-        // Horner fold of an all-zero chunk is exactly zero, so fold only the
-        // live prefix and extend with the zeros those chunks would produce.
-        let n_chunks = coeffs.coeffs.len() / arity;
-        let support = coeffs.coeffs.len() >> fri_params.config.rate_bits;
-        let live_chunks = support.div_ceil(arity).min(n_chunks);
-        let mut folded = coeffs.coeffs[..live_chunks * arity]
-            .par_chunks_exact(arity)
-            .map(|chunk| reduce_with_powers(chunk, beta))
-            .collect::<Vec<_>>();
-        folded.resize(n_chunks, F::Extension::ZERO);
-        coeffs = PolynomialCoeffs::new(folded);
+        coeffs = PolynomialCoeffs::new(
+            coeffs
+                .coeffs
+                .par_chunks_exact(arity)
+                .map(|chunk| reduce_with_powers(chunk, beta))
+                .collect::<Vec<_>>(),
+        );
         shift = shift.exp_u64(arity as u64);
         // Chunk-wise folding preserves the zero tail: the coefficient vector
         // keeps `1/2^rate_bits` support every round (asserted by the
@@ -203,18 +220,12 @@ pub(crate) fn fri_proof_of_work<
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
-        .into_par_iter()
-        .find_any(|&candidate| {
-            let mut duplex_state = duplex_intermediate_state;
-            duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-            duplex_state.permute();
-            let pow_response = duplex_state.squeeze().iter().last().unwrap();
-            let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-            leading_zeros >= min_leading_zeros
-        })
-        .map(F::from_canonical_u64)
-        .expect("Proof of work failed. This is highly unlikely!");
+    let pow_witness = C::Hasher::find_pow_witness(
+        duplex_intermediate_state,
+        witness_input_pos,
+        min_leading_zeros,
+    )
+    .expect("Proof of work failed. This is highly unlikely!");
 
     // Recompute pow_response using our normal Challenger code, and make sure it matches.
     challenger.observe_element(pow_witness);

@@ -1,13 +1,14 @@
 use core::fmt::Debug;
 
 use plonky2_field::ops::Square;
+use plonky2_maybe_rayon::*;
 
 use super::config::*;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::goldilocks_field::GoldilocksField as F;
 use crate::field::types::{Field, PrimeField64};
 use crate::gates::poseidon2::Poseidon2Gate;
-use crate::hash::hash_types::{HashOut, NUM_HASH_OUT_ELTS, RichField};
+use crate::hash::hash_types::{HashOut, RichField};
 use crate::hash::hashing::{PlonkyPermutation, compress, hash_n_to_hash_no_pad};
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::{BoolTarget, Target};
@@ -28,126 +29,17 @@ pub trait Poseidon2: PrimeField64 {
         state
     }
 
-    /// Permute two independent states together. The layers are applied to the
-    /// two states in alternation so the CPU can overlap the serial sbox and
-    /// linear-layer dependency chains of one state with the other's. Each
-    /// state's output is bit-identical to `Self::poseidon2` on that state.
     #[inline]
-    fn poseidon2_x2(
-        input_a: [Self; WIDTH],
-        input_b: [Self; WIDTH],
-    ) -> ([Self; WIDTH], [Self; WIDTH]) {
-        let mut a = input_a;
-        let mut b = input_b;
-
-        Self::external_linear_layer(&mut a);
-        Self::external_linear_layer(&mut b);
-
-        Self::full_rounds_x2(&mut a, &mut b, 0);
-        Self::partial_rounds_x2(&mut a, &mut b);
-        Self::full_rounds_x2(&mut a, &mut b, ROUNDS_F_HALF);
-
-        (a, b)
-    }
-
-    #[inline]
-    #[unroll::unroll_for_loops]
-    fn full_rounds_x2(a: &mut [Self; WIDTH], b: &mut [Self; WIDTH], start: usize) {
-        for r in start..(start + ROUNDS_F_HALF) {
-            Self::add_rc(a, r);
-            Self::add_rc(b, r);
-            Self::sbox(a);
-            Self::sbox(b);
-            Self::external_linear_layer(a);
-            Self::external_linear_layer(b);
+    #[cfg(test)]
+    fn poseidon2_after_first_full_round(mut state: [Self; WIDTH]) -> [Self; WIDTH] {
+        for r in 1..ROUNDS_F_HALF {
+            Self::add_rc(&mut state, r);
+            Self::sbox(&mut state);
+            Self::external_linear_layer(&mut state);
         }
-    }
-
-    #[inline]
-    #[unroll::unroll_for_loops]
-    fn partial_rounds_x2(a: &mut [Self; WIDTH], b: &mut [Self; WIDTH]) {
-        for r in 0..ROUNDS_P {
-            a[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
-            b[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
-            a[0] = Self::sbox_p(&a[0]);
-            b[0] = Self::sbox_p(&b[0]);
-            Self::internal_linear_layer(a);
-            Self::internal_linear_layer(b);
-        }
-    }
-
-    /// Four-state variant of `poseidon2_x2`; same bit-identity guarantee.
-    #[inline]
-    fn poseidon2_x4(
-        input_a: [Self; WIDTH],
-        input_b: [Self; WIDTH],
-        input_c: [Self; WIDTH],
-        input_d: [Self; WIDTH],
-    ) -> ([Self; WIDTH], [Self; WIDTH], [Self; WIDTH], [Self; WIDTH]) {
-        let mut a = input_a;
-        let mut b = input_b;
-        let mut c = input_c;
-        let mut d = input_d;
-
-        Self::external_linear_layer(&mut a);
-        Self::external_linear_layer(&mut b);
-        Self::external_linear_layer(&mut c);
-        Self::external_linear_layer(&mut d);
-
-        Self::full_rounds_x4(&mut a, &mut b, &mut c, &mut d, 0);
-        Self::partial_rounds_x4(&mut a, &mut b, &mut c, &mut d);
-        Self::full_rounds_x4(&mut a, &mut b, &mut c, &mut d, ROUNDS_F_HALF);
-
-        (a, b, c, d)
-    }
-
-    #[inline]
-    #[unroll::unroll_for_loops]
-    fn full_rounds_x4(
-        a: &mut [Self; WIDTH],
-        b: &mut [Self; WIDTH],
-        c: &mut [Self; WIDTH],
-        d: &mut [Self; WIDTH],
-        start: usize,
-    ) {
-        for r in start..(start + ROUNDS_F_HALF) {
-            Self::add_rc(a, r);
-            Self::add_rc(b, r);
-            Self::add_rc(c, r);
-            Self::add_rc(d, r);
-            Self::sbox(a);
-            Self::sbox(b);
-            Self::sbox(c);
-            Self::sbox(d);
-            Self::external_linear_layer(a);
-            Self::external_linear_layer(b);
-            Self::external_linear_layer(c);
-            Self::external_linear_layer(d);
-        }
-    }
-
-    #[inline]
-    #[unroll::unroll_for_loops]
-    fn partial_rounds_x4(
-        a: &mut [Self; WIDTH],
-        b: &mut [Self; WIDTH],
-        c: &mut [Self; WIDTH],
-        d: &mut [Self; WIDTH],
-    ) {
-        for r in 0..ROUNDS_P {
-            a[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
-            b[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
-            c[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
-            d[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
-            a[0] = Self::sbox_p(&a[0]);
-            b[0] = Self::sbox_p(&b[0]);
-            c[0] = Self::sbox_p(&c[0]);
-            d[0] = Self::sbox_p(&d[0]);
-            Self::internal_linear_layer(a);
-            Self::internal_linear_layer(b);
-            Self::internal_linear_layer(c);
-            Self::internal_linear_layer(d);
-        }
+        Self::partial_rounds(&mut state);
+        Self::full_rounds(&mut state, ROUNDS_F_HALF);
+        state
     }
 
     #[inline]
@@ -426,6 +318,152 @@ pub trait Poseidon2: PrimeField64 {
     }
 }
 
+const POW_SEARCH_BATCH_SIZE: u64 = 128;
+const POW_DIFFERENCE_COUNT: usize = D as usize + 1;
+
+#[inline]
+fn pow_first_round_affine<F: RichField + Poseidon2>(
+    state: &[F; WIDTH],
+    witness_input_pos: usize,
+) -> ([F; WIDTH], [F; WIDTH]) {
+    let mut base = *state;
+    base[witness_input_pos] = F::ZERO;
+    F::external_linear_layer(&mut base);
+    F::add_rc(&mut base, 0);
+
+    let mut step = [F::ZERO; WIDTH];
+    step[witness_input_pos] = F::ONE;
+    F::external_linear_layer(&mut step);
+    (base, step)
+}
+
+#[inline]
+#[unroll::unroll_for_loops]
+fn pow_first_round_differences<F: RichField + Poseidon2>(
+    base: &[F; WIDTH],
+    step: &[F; WIDTH],
+    first_candidate: F,
+) -> [[F; WIDTH]; POW_DIFFERENCE_COUNT] {
+    let mut differences = [[F::ZERO; WIDTH]; POW_DIFFERENCE_COUNT];
+    for lane in 0..WIDTH {
+        let mut samples = [F::ZERO; POW_DIFFERENCE_COUNT];
+        let mut input = base[lane] + step[lane] * first_candidate;
+        for sample in 0..POW_DIFFERENCE_COUNT {
+            samples[sample] = F::sbox_p(&input);
+            input += step[lane];
+        }
+
+        differences[0][lane] = samples[0];
+        for order in 1..POW_DIFFERENCE_COUNT {
+            for sample in 0..(POW_DIFFERENCE_COUNT - order) {
+                samples[sample] = samples[sample + 1] - samples[sample];
+            }
+            differences[order][lane] = samples[0];
+        }
+    }
+    differences
+}
+
+#[inline]
+#[unroll::unroll_for_loops]
+#[cfg(test)]
+fn pow_permute_from_differences<F: RichField + Poseidon2>(
+    differences: &mut [[F; WIDTH]; POW_DIFFERENCE_COUNT],
+) -> [F; WIDTH] {
+    let mut state = differences[0];
+    for order in 0..(POW_DIFFERENCE_COUNT - 1) {
+        for lane in 0..WIDTH {
+            differences[order][lane] += differences[order + 1][lane];
+        }
+    }
+    F::external_linear_layer(&mut state);
+    F::poseidon2_after_first_full_round(state)
+}
+
+#[inline]
+fn external_linear_layer_output_7<F: PrimeField64>(state: &[F; WIDTH]) -> F {
+    #[inline(always)]
+    fn mat4_output_3<F: PrimeField64>(group: &[F]) -> u128 {
+        3 * group[0].to_noncanonical_u64() as u128
+            + group[1].to_noncanonical_u64() as u128
+            + group[2].to_noncanonical_u64() as u128
+            + 2 * group[3].to_noncanonical_u64() as u128
+    }
+
+    let output_3 = mat4_output_3(&state[0..4]);
+    let output_7 = mat4_output_3(&state[4..8]);
+    let output_11 = mat4_output_3(&state[8..12]);
+    F::from_noncanonical_u128_with_96_bits(output_3 + 2 * output_7 + output_11)
+}
+
+#[inline]
+fn poseidon2_pow_response_after_first_full_round<F: RichField + Poseidon2>(
+    mut state: [F; WIDTH],
+) -> F {
+    for r in 1..ROUNDS_F_HALF {
+        F::add_rc(&mut state, r);
+        F::sbox(&mut state);
+        F::external_linear_layer(&mut state);
+    }
+    <F as Poseidon2>::partial_rounds(&mut state);
+    for r in ROUNDS_F_HALF..(ROUNDS_F - 1) {
+        F::add_rc(&mut state, r);
+        F::sbox(&mut state);
+        F::external_linear_layer(&mut state);
+    }
+    F::add_rc(&mut state, ROUNDS_F - 1);
+    F::sbox(&mut state);
+    external_linear_layer_output_7(&state)
+}
+
+#[inline]
+#[unroll::unroll_for_loops]
+fn pow_response_from_differences<F: RichField + Poseidon2>(
+    differences: &mut [[F; WIDTH]; POW_DIFFERENCE_COUNT],
+) -> F {
+    let mut state = differences[0];
+    for order in 0..(POW_DIFFERENCE_COUNT - 1) {
+        for lane in 0..WIDTH {
+            differences[order][lane] += differences[order + 1][lane];
+        }
+    }
+    F::external_linear_layer(&mut state);
+    poseidon2_pow_response_after_first_full_round(state)
+}
+
+fn find_poseidon2_pow_witness<F: RichField + Poseidon2>(
+    duplex_intermediate_state: Poseidon2Permutation<F>,
+    witness_input_pos: usize,
+    min_leading_zeros: u32,
+    batch_size: u64,
+) -> Option<F> {
+    debug_assert!(batch_size > 0);
+    let max_witness = F::NEG_ONE.to_canonical_u64();
+    let num_batches = max_witness / batch_size + 1;
+    let (base, step) = pow_first_round_affine(&duplex_intermediate_state.state, witness_input_pos);
+
+    (0..num_batches)
+        .into_par_iter()
+        .map(|batch| {
+            let first_candidate = batch * batch_size;
+            let mut differences =
+                pow_first_round_differences(&base, &step, F::from_canonical_u64(first_candidate));
+
+            (0..batch_size).find_map(|offset| {
+                let candidate = first_candidate.checked_add(offset)?;
+                if candidate > max_witness {
+                    return None;
+                }
+
+                let pow_response = pow_response_from_differences(&mut differences);
+                (pow_response.to_canonical_u64().leading_zeros() >= min_leading_zeros)
+                    .then_some(F::from_canonical_u64(candidate))
+            })
+        })
+        .find_any(Option::is_some)
+        .flatten()
+}
+
 #[inline]
 #[unroll::unroll_for_loops]
 fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
@@ -615,97 +653,6 @@ fn sum_12<F: PrimeField64>(inputs: &[F]) -> F {
     F::from_noncanonical_u128_with_96_bits(tmp)
 }
 
-/// Hash two equal-length inputs with two lockstep overwrite-mode sponges whose
-/// permutations run interleaved via `poseidon2_x2`. Each output is
-/// bit-identical to `hash_n_to_hash_no_pad` on the corresponding input.
-pub(crate) fn hash_pair_no_pad<F: RichField + Poseidon2>(
-    input_a: &[F],
-    input_b: &[F],
-) -> (HashOut<F>, HashOut<F>) {
-    debug_assert_eq!(input_a.len(), input_b.len());
-    let mut state_a = [F::ZERO; WIDTH];
-    let mut state_b = [F::ZERO; WIDTH];
-
-    for (chunk_a, chunk_b) in input_a.chunks(RATE).zip(input_b.chunks(RATE)) {
-        state_a[..chunk_a.len()].copy_from_slice(chunk_a);
-        state_b[..chunk_b.len()].copy_from_slice(chunk_b);
-        (state_a, state_b) = F::poseidon2_x2(state_a, state_b);
-    }
-
-    (
-        HashOut {
-            elements: state_a[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
-        },
-        HashOut {
-            elements: state_b[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
-        },
-    )
-}
-
-/// Four-input variant of `hash_pair_no_pad`: four lockstep overwrite-mode
-/// sponges over equal-length inputs, permuted via `poseidon2_x4`. Each output
-/// is bit-identical to `hash_n_to_hash_no_pad` on the corresponding input.
-pub(crate) fn hash_quad_no_pad<F: RichField + Poseidon2>(
-    input_a: &[F],
-    input_b: &[F],
-    input_c: &[F],
-    input_d: &[F],
-) -> (HashOut<F>, HashOut<F>, HashOut<F>, HashOut<F>) {
-    debug_assert_eq!(input_a.len(), input_b.len());
-    debug_assert_eq!(input_a.len(), input_c.len());
-    debug_assert_eq!(input_a.len(), input_d.len());
-    let mut state_a = [F::ZERO; WIDTH];
-    let mut state_b = [F::ZERO; WIDTH];
-    let mut state_c = [F::ZERO; WIDTH];
-    let mut state_d = [F::ZERO; WIDTH];
-
-    for (((chunk_a, chunk_b), chunk_c), chunk_d) in input_a
-        .chunks(RATE)
-        .zip(input_b.chunks(RATE))
-        .zip(input_c.chunks(RATE))
-        .zip(input_d.chunks(RATE))
-    {
-        state_a[..chunk_a.len()].copy_from_slice(chunk_a);
-        state_b[..chunk_b.len()].copy_from_slice(chunk_b);
-        state_c[..chunk_c.len()].copy_from_slice(chunk_c);
-        state_d[..chunk_d.len()].copy_from_slice(chunk_d);
-        (state_a, state_b, state_c, state_d) =
-            F::poseidon2_x4(state_a, state_b, state_c, state_d);
-    }
-
-    let out = |state: &[F; WIDTH]| HashOut {
-        elements: state[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
-    };
-    (out(&state_a), out(&state_b), out(&state_c), out(&state_d))
-}
-
-/// Two independent `compress` calls with their permutations interleaved via
-/// `poseidon2_x2`. Each output is bit-identical to `compress` on that pair.
-pub(crate) fn compress_pair<F: RichField + Poseidon2>(
-    x0: HashOut<F>,
-    y0: HashOut<F>,
-    x1: HashOut<F>,
-    y1: HashOut<F>,
-) -> (HashOut<F>, HashOut<F>) {
-    let mut state_a = [F::ZERO; WIDTH];
-    let mut state_b = [F::ZERO; WIDTH];
-    state_a[..NUM_HASH_OUT_ELTS].copy_from_slice(&x0.elements);
-    state_a[NUM_HASH_OUT_ELTS..2 * NUM_HASH_OUT_ELTS].copy_from_slice(&y0.elements);
-    state_b[..NUM_HASH_OUT_ELTS].copy_from_slice(&x1.elements);
-    state_b[NUM_HASH_OUT_ELTS..2 * NUM_HASH_OUT_ELTS].copy_from_slice(&y1.elements);
-
-    let (state_a, state_b) = F::poseidon2_x2(state_a, state_b);
-
-    (
-        HashOut {
-            elements: state_a[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
-        },
-        HashOut {
-            elements: state_b[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
-        },
-    )
-}
-
 /// Poseidon2 hash function.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Poseidon2Hash;
@@ -718,50 +665,30 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
         hash_n_to_hash_no_pad::<F, Self::Permutation>(input)
     }
 
-    fn hash_or_noop_pair(input_a: &[F], input_b: &[F]) -> (Self::Hash, Self::Hash) {
-        debug_assert_eq!(input_a.len(), input_b.len());
-        if input_a.len() * 8 <= <Self as Hasher<F>>::HASH_SIZE {
-            (
-                <Self as Hasher<F>>::hash_or_noop(input_a),
-                <Self as Hasher<F>>::hash_or_noop(input_b),
-            )
-        } else {
-            hash_pair_no_pad::<F>(input_a, input_b)
-        }
-    }
-
-    fn hash_or_noop_quad(
-        input_a: &[F],
-        input_b: &[F],
-        input_c: &[F],
-        input_d: &[F],
-    ) -> (Self::Hash, Self::Hash, Self::Hash, Self::Hash) {
-        debug_assert_eq!(input_a.len(), input_b.len());
-        debug_assert_eq!(input_a.len(), input_c.len());
-        debug_assert_eq!(input_a.len(), input_d.len());
-        if input_a.len() * 8 <= <Self as Hasher<F>>::HASH_SIZE {
-            (
-                <Self as Hasher<F>>::hash_or_noop(input_a),
-                <Self as Hasher<F>>::hash_or_noop(input_b),
-                <Self as Hasher<F>>::hash_or_noop(input_c),
-                <Self as Hasher<F>>::hash_or_noop(input_d),
-            )
-        } else {
-            hash_quad_no_pad::<F>(input_a, input_b, input_c, input_d)
-        }
-    }
-
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash {
         compress::<F, Self::Permutation>(left, right)
     }
 
-    fn two_to_one_pair(
-        x0: Self::Hash,
-        y0: Self::Hash,
-        x1: Self::Hash,
-        y1: Self::Hash,
-    ) -> (Self::Hash, Self::Hash) {
-        compress_pair::<F>(x0, y0, x1, y1)
+    fn find_pow_witness(
+        duplex_intermediate_state: Self::Permutation,
+        witness_input_pos: usize,
+        min_leading_zeros: u32,
+    ) -> Option<F> {
+        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+        if let Some(witness) = super::metal::find_pow_witness(
+            &duplex_intermediate_state.state,
+            witness_input_pos,
+            min_leading_zeros,
+        ) {
+            return Some(F::from_canonical_u64(witness));
+        }
+
+        find_poseidon2_pow_witness(
+            duplex_intermediate_state,
+            witness_input_pos,
+            min_leading_zeros,
+            POW_SEARCH_BATCH_SIZE,
+        )
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -772,6 +699,35 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
         cap_height: usize,
     ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
         super::metal::build_merkle_tree(leaves, leaf_width, num_leaves, cap_height)
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn try_build_merkle_tree_from_rows<Fill>(
+        leaf_width: usize,
+        num_leaves: usize,
+        cap_height: usize,
+        fill: Fill,
+    ) -> Option<(
+        crate::hash::merkle_tree::RowStore<F>,
+        Vec<Self::Hash>,
+        Vec<Self::Hash>,
+    )>
+    where
+        Fill: FnOnce(&mut crate::hash::merkle_tree::MerkleRowWriter<'_, F>),
+    {
+        super::metal::build_merkle_tree_from_rows(
+            leaf_width,
+            num_leaves,
+            cap_height,
+            fill,
+        )
+        .map(|(rows, digests, cap)| {
+            (
+                crate::hash::merkle_tree::RowStore::Shared(rows),
+                digests,
+                cap,
+            )
+        })
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -892,11 +848,61 @@ mod test {
 
     use super::*;
     use crate::field::types::PrimeField64;
+    use crate::gates::noop::NoopGate;
     use crate::hash::hashing::hash_n_to_m_no_pad;
     use crate::hash::poseidon2::p3::p3_poseidon2_hash_n_to_m_no_pad;
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_data::CircuitConfig;
-    use crate::plonk::config::PoseidonGoldilocksConfig;
+    use crate::plonk::config::{Poseidon2GoldilocksConfig, PoseidonGoldilocksConfig};
+
+    #[test]
+    fn test_pow_forward_differences_match_poseidon2() {
+        let state =
+            core::array::from_fn(|i| F::from_canonical_u64(0x1234_5678_u64 * (i as u64 + 1)));
+        let max_witness = F::NEG_ONE.to_canonical_u64();
+
+        for witness_input_pos in 0..RATE {
+            let (base, step) = pow_first_round_affine(&state, witness_input_pos);
+            for first_candidate in [
+                0,
+                1,
+                17,
+                65_536,
+                max_witness - (POW_SEARCH_BATCH_SIZE - 1),
+                max_witness,
+            ] {
+                let mut differences = pow_first_round_differences(
+                    &base,
+                    &step,
+                    F::from_canonical_u64(first_candidate),
+                );
+
+                let num_candidates = (max_witness - first_candidate + 1).min(POW_SEARCH_BATCH_SIZE);
+                for offset in 0..num_candidates {
+                    let candidate = first_candidate + offset;
+                    let mut response_differences = differences;
+                    let actual_response = pow_response_from_differences(&mut response_differences);
+                    let actual = pow_permute_from_differences(&mut differences);
+                    let mut expected_input = state;
+                    expected_input[witness_input_pos] = F::from_canonical_u64(candidate);
+                    let expected = F::poseidon2(expected_input);
+                    assert_eq!(actual, expected);
+                    assert_eq!(actual_response, expected[RATE - 1]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_pow_forward_differences_proof() -> Result<()> {
+        let config = CircuitConfig::standard_recursion_config();
+        assert_eq!(config.fri_config.proof_of_work_bits, 16);
+        let mut builder = CircuitBuilder::<F, 2>::new(config);
+        builder.add_gate(NoopGate, vec![]);
+        let data = builder.build::<Poseidon2GoldilocksConfig>();
+        let proof = data.prove(PartialWitness::new())?;
+        data.verify(proof)
+    }
 
     #[test]
     fn test_poseidon2_with_plonky3() {
@@ -989,62 +995,5 @@ mod test {
 
         let proof = circuit.prove(pw).unwrap();
         circuit.verify(proof.clone())
-    }
-}
-
-#[cfg(test)]
-mod pair_hash_tests {
-    use plonky2_field::types::Sample;
-
-    use super::*;
-    use crate::plonk::config::Hasher;
-
-    #[test]
-    fn pair_hash_matches_individual_across_widths() {
-        for width in [1, 2, 4, 5, 7, 8, 9, 16, 17, 24, 33, 87, 135] {
-            let a: Vec<F> = (0..width).map(|_| F::rand()).collect();
-            let b: Vec<F> = (0..width).map(|_| F::rand()).collect();
-            let (ha, hb) = Poseidon2Hash::hash_or_noop_pair(&a, &b);
-            assert_eq!(ha, <Poseidon2Hash as Hasher<F>>::hash_or_noop(&a), "width {width} a");
-            assert_eq!(hb, <Poseidon2Hash as Hasher<F>>::hash_or_noop(&b), "width {width} b");
-        }
-    }
-
-    // Not a correctness test: times sequential sibling-leaf hashing against the
-    // interleaved pair sponge. Run with --nocapture.
-    #[test]
-    fn time_sequential_vs_pair_leaf_hash() {
-        let width = 87;
-        let a: Vec<F> = (0..width).map(|_| F::rand()).collect();
-        let b: Vec<F> = (0..width).map(|_| F::rand()).collect();
-        let iters = 100_000;
-
-        let t0 = std::time::Instant::now();
-        let mut sink_old = F::ZERO;
-        for _ in 0..iters {
-            let ha = <Poseidon2Hash as Hasher<F>>::hash_or_noop(core::hint::black_box(&a));
-            let hb = <Poseidon2Hash as Hasher<F>>::hash_or_noop(core::hint::black_box(&b));
-            sink_old += ha.elements[0] + hb.elements[0];
-        }
-        let old_time = t0.elapsed();
-
-        let t1 = std::time::Instant::now();
-        let mut sink_new = F::ZERO;
-        for _ in 0..iters {
-            let (ha, hb) = Poseidon2Hash::hash_or_noop_pair(
-                core::hint::black_box(&a),
-                core::hint::black_box(&b),
-            );
-            sink_new += ha.elements[0] + hb.elements[0];
-        }
-        let new_time = t1.elapsed();
-
-        assert_eq!(sink_old, sink_new);
-        println!(
-            "sequential: {:?}  interleaved pair: {:?}  speedup: {:.2}x",
-            old_time,
-            new_time,
-            old_time.as_secs_f64() / new_time.as_secs_f64()
-        );
     }
 }

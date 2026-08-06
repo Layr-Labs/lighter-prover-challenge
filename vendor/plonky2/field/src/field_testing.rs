@@ -28,16 +28,29 @@ macro_rules! test_field_arithmetic {
 
             #[test]
             fn batch_inversion() {
-                for n in 0..20 {
+                let mut reusable = (0..97).map(|_| <$field>::ONE).collect::<Vec<_>>();
+                for n in [0, 1, 2, 3, 4, 19, 5, 80, 7, 1, 0, 79] {
                     let xs = (1..=n as u64)
                         .map(|i| <$field>::from_canonical_u64(i))
                         .collect::<Vec<_>>();
                     let invs = <$field>::batch_multiplicative_inverse(&xs);
+                    <$field>::batch_multiplicative_inverse_into(&xs, &mut reusable);
+                    assert_eq!(reusable, invs, "n={n}");
                     assert_eq!(invs.len(), n);
                     for (x, inv) in xs.into_iter().zip(invs) {
                         assert_eq!(x * inv, <$field>::ONE);
                     }
                 }
+            }
+
+            #[test]
+            #[should_panic(expected = "Tried to invert zero")]
+            fn batch_inversion_into_rejects_zero() {
+                let mut reusable = Vec::new();
+                <$field>::batch_multiplicative_inverse_into(
+                    &[<$field>::ONE, <$field>::ZERO],
+                    &mut reusable,
+                );
             }
 
             #[test]

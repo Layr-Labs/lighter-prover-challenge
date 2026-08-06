@@ -3,6 +3,7 @@ using namespace metal;
 
 constant ulong GOLDILOCKS_PRIME = 0xffffffff00000001UL;
 constant ulong GOLDILOCKS_EPSILON = 0xffffffffUL;
+constant ulong POW_CANDIDATE_STRIDE = 0x9e3779b97f4a7c15UL;
 
 inline void add_epsilon_u32(thread uint& lo, thread uint& hi, uint active) {
     uint old0 = lo;
@@ -387,5 +388,42 @@ kernel void poseidon2_hash_parents(
     device ulong* output = parents + (ulong)gid * 4;
     for (uint i = 0; i < 4; ++i) {
         output[i] = gl_canonicalize(state[i]);
+    }
+}
+
+// Tests one canonical FRI PoW witness per thread. Sequential batch encoders
+// share `winner`, so every batch after the first successful one exits without
+// doing a permutation; atomic min preserves the first witness in that batch.
+kernel void poseidon2_find_pow(
+    constant ulong* base_state [[buffer(0)]],
+    device atomic_uint* winner [[buffer(1)]],
+    constant ulong* parameters [[buffer(2)]],
+    constant ulong& candidate_start [[buffer(3)]],
+    constant uint& witness_input_pos [[buffer(4)]],
+    constant uint& min_leading_zeros [[buffer(5)]],
+    constant uint& candidate_count [[buffer(6)]],
+    constant uint& candidate_offset [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= candidate_count ||
+        atomic_load_explicit(winner, memory_order_relaxed) < candidate_offset) {
+        return;
+    }
+
+    ulong state[12];
+    for (uint i = 0; i < 12; ++i) {
+        state[i] = gl_canonicalize(base_state[i]);
+    }
+    ulong logical_index = candidate_start + (ulong)candidate_offset + (ulong)gid;
+    state[witness_input_pos] =
+        gl_canonicalize(gl_mul(logical_index, POW_CANDIDATE_STRIDE));
+    poseidon2(state, parameters);
+
+    ulong response = gl_canonicalize(state[7]);
+    if (clz(response) >= min_leading_zeros) {
+        atomic_fetch_min_explicit(
+            winner,
+            candidate_offset + gid,
+            memory_order_relaxed
+        );
     }
 }
