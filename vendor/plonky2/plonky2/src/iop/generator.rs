@@ -9,6 +9,7 @@ use core::fmt::Debug;
 use core::marker::PhantomData;
 
 use anyhow::{Result, anyhow};
+use plonky2_maybe_rayon::*;
 
 use crate::field::extension::Extendable;
 use crate::field::types::Field;
@@ -69,9 +70,80 @@ pub fn generate_partial_witness<
 
     let mut buffer = GeneratedValues::empty();
 
+    // Waves at least this large run their generators in parallel against the witness (and ready
+    // hints) as they stood at the start of the wave, then merge serially in wave order. Smaller
+    // waves keep the sequential immediate-merge path: on long dependency chains it propagates
+    // values within a single wave, which the frozen-witness parallel path cannot.
+    const PARALLEL_WAVE_MIN: usize = 512;
+    // Generators per parallel task; amortizes task overhead across the many near-free arithmetic
+    // generators.
+    const PARALLEL_WAVE_CHUNK: usize = 128;
+
     // Keep running generators until we fail to make progress.
     while !pending_generator_indices.is_empty() {
         let mut next_pending_generator_indices = Vec::new();
+
+        pending_generator_indices.retain(|&idx| !generator_is_expired[idx]);
+        if pending_generator_indices.len() >= PARALLEL_WAVE_MIN {
+            // A generator can be enqueued once per watched target; run it once.
+            pending_generator_indices.sort_unstable();
+            pending_generator_indices.dedup();
+
+            // Run the wave in parallel. Every generator sees the same frozen witness; one whose
+            // inputs are produced by this same wave returns unfinished and is re-enqueued by the
+            // merge below via its watch list, exactly as in the sequential path.
+            let wave_results: Vec<(Vec<bool>, GeneratedValues<F>)> = pending_generator_indices
+                .par_chunks(PARALLEL_WAVE_CHUNK)
+                .map(|chunk| {
+                    let mut finished = Vec::with_capacity(chunk.len());
+                    let mut chunk_buffer = GeneratedValues::empty();
+                    for &generator_idx in chunk {
+                        finished.push(generators[generator_idx].0.run_with_ready_hint(
+                            &witness,
+                            &mut chunk_buffer,
+                            unresolved_watches[generator_idx] == 0,
+                        ));
+                    }
+                    (finished, chunk_buffer)
+                })
+                .collect();
+
+            // Merge serially in wave order, so behavior (including duplicate-set checks and the
+            // unresolved-watch bookkeeping) is deterministic.
+            for (chunk, (finished_flags, mut chunk_buffer)) in pending_generator_indices
+                .chunks(PARALLEL_WAVE_CHUNK)
+                .zip(wave_results)
+            {
+                for (&generator_idx, finished) in chunk.iter().zip(finished_flags) {
+                    if finished {
+                        generator_is_expired[generator_idx] = true;
+                        remaining_generators -= 1;
+                    }
+                }
+
+                let mut new_target_reps = Vec::with_capacity(chunk_buffer.target_values.len());
+                for (t, v) in chunk_buffer.target_values.drain(..) {
+                    let reps = witness.set_target_returning_rep(t, v)?;
+                    new_target_reps.extend(reps);
+                }
+
+                for watch in new_target_reps {
+                    let opt_watchers = generator_indices_by_watches.get(&watch);
+                    if let Some(watchers) = opt_watchers {
+                        for &watching_generator_idx in watchers {
+                            if !generator_is_expired[watching_generator_idx] {
+                                debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
+                                unresolved_watches[watching_generator_idx] -= 1;
+                                next_pending_generator_indices.push(watching_generator_idx);
+                            }
+                        }
+                    }
+                }
+            }
+
+            pending_generator_indices = next_pending_generator_indices;
+            continue;
+        }
 
         for &generator_idx in &pending_generator_indices {
             if generator_is_expired[generator_idx] {

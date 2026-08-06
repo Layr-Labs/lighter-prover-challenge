@@ -27,6 +27,18 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
+    // Platforms differ in main-thread stack size (Windows defaults to 1 MB,
+    // far too small for circuit definition); run the worker on an explicit
+    // large stack everywhere.
+    std::thread::Builder::new()
+        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .spawn(worker_main)
+        .expect("worker thread must start")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+fn worker_main() {
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
@@ -38,12 +50,22 @@ fn main() {
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
     let json = fs::read(fixture).expect("cannot read prover fixture");
+    // Local profiling hooks; the ranked harness clears the environment, so
+    // these never fire there.
+    let heavy_count = env::var("LIGHTER_LOCAL_HEAVY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(PUBLIC_HEAVY_TX_COUNT);
+    let light_count = env::var("LIGHTER_LOCAL_LIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(PUBLIC_LIGHT_TX_COUNT);
     let block = Block::<F>::from_json_with_empty_txs(
         &json,
         HEAVY_TX_PER_PROOF,
         LIGHT_TX_PER_PROOF,
-        PUBLIC_HEAVY_TX_COUNT,
-        PUBLIC_LIGHT_TX_COUNT,
+        heavy_count,
+        light_count,
     )
     .expect("invalid prover fixture");
     let proof = prover::prove_block(block, &Circuits::new());

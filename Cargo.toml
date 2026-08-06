@@ -52,3 +52,12 @@ tiny-keccak = { version = "2.0.2", features = ["keccak"] }
 incremental = false
 lto = "fat"
 codegen-units = 1
+
+# The bench build script generates circuit data at compile time; without an
+# optimized build-override that generation runs unoptimized and dominates the
+# build.
+[profile.release.build-override]
+opt-level = 3
+
+[profile.dev.build-override]
+opt-level = 3

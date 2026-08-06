@@ -42,6 +42,7 @@ pub mod bool_utils;
 pub mod builder;
 pub mod byte;
 pub mod circuit_logger;
+pub mod circuit_cache;
 pub mod circuit_serializer;
 pub mod comparison;
 pub mod delta;

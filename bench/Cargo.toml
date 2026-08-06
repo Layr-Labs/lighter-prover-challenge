@@ -14,12 +14,17 @@ path = "src/bin/bench.rs"
 name = "prove"
 path = "src/bin/prove.rs"
 
+[[bin]]
+name = "sizes"
+path = "src/bin/sizes.rs"
+
 [features]
 default = ["parallel", "std"]
 parallel = ["plonky2/parallel"]
 std = ["plonky2/std"]
 
 [dependencies]
+zstd = "0.13"
 num = { workspace = true }
 itertools = { workspace = true }
 anyhow = { workspace = true }
@@ -42,6 +47,12 @@ clap_derive = { workspace = true }
 tiny-keccak =  { workspace = true }
 paste = { workspace = true }
 circuit = { path = "../circuit", default-features = true }
+
+[build-dependencies]
+circuit = { path = "../circuit", default-features = true }
+plonky2 = { workspace = true, default-features = false }
+rayon = { workspace = true }
+zstd = "0.13"
 
 [dev-dependencies]
 flate2 = "1.0"
