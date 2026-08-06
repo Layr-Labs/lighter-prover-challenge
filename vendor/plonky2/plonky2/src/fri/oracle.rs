@@ -360,19 +360,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 &format!("reduce batch of {} polynomials", polynomials.len()),
                 alpha.reduce_polys_base(polys_coeff)
             );
-            // In-place synthetic division reusing `composition_poly`'s buffer;
-            // its final zeroed slot is the power-of-two pad.
-            let quotient = composition_poly.divide_by_linear_padded_in_place(*point);
+            let mut quotient = composition_poly.divide_by_linear(*point);
+            quotient.coeffs.push(F::Extension::ZERO); // pad back to power of two
             alpha.shift_poly(&mut final_poly);
             final_poly += quotient;
         }
 
-        // `final_poly` is dead after this point, so pad it in place instead of
-        // the clone-then-resize that `lde(&self)` performs.
-        let mut lde_final_poly = final_poly;
-        lde_final_poly
-            .coeffs
-            .resize(lde_final_poly.len() << fri_params.config.rate_bits, F::Extension::ZERO);
+        let lde_final_poly = final_poly.lde(fri_params.config.rate_bits);
         let lde_final_values = timed!(
             timing,
             &format!("perform final FFT {}", lde_final_poly.len()),

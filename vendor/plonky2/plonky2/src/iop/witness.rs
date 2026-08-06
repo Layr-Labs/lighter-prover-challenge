@@ -374,24 +374,16 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     }
 
     pub fn full_witness(self) -> MatrixWitness<F> {
-        // Redraw ticket 5.
-        // Single fused pass. Cell (column j, row i) is
-        // `values[representative_map[i * num_wires + j]]` or zero — the same
-        // lookup `try_get_target(Target::Wire { row: i, column: j })` resolved
-        // to, with `Target::index`'s `row * num_wires + column` inlined as a
-        // running cursor. This deletes the full zero-prefill pass over the
-        // matrix and the per-cell Target construction and index arithmetic of
-        // the second pass, while reading `representative_map` sequentially.
         let mut wire_values: Vec<Vec<F>> = (0..self.num_wires)
             .map(|_| Vec::with_capacity(self.degree))
             .collect();
-        let mut wire_index = 0;
-        for _ in 0..self.degree {
-            for column in wire_values.iter_mut() {
-                column.push(
-                    self.values[self.representative_map[wire_index]].unwrap_or(F::ZERO),
-                );
-                wire_index += 1;
+        for row_representatives in self
+            .representative_map
+            .chunks_exact(self.num_wires)
+            .take(self.degree)
+        {
+            for (j, &rep_index) in row_representatives.iter().enumerate() {
+                wire_values[j].push(self.values[rep_index].unwrap_or(F::ZERO));
             }
         }
 

@@ -10,7 +10,6 @@ use plonky2::gates::constant::ConstantGate;
 use plonky2::gates::equality_base::EqualityGate;
 use plonky2::gates::select_base::SelectionGate;
 use plonky2::hash::hash_types::{HashOut, RichField};
-use plonky2::iop::generator::PendingPartitionWitness;
 use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::iop::witness::{PartialWitness, WitnessWrite};
 use plonky2::plonk::circuit_data::{
@@ -18,7 +17,6 @@ use plonky2::plonk::circuit_data::{
 };
 use plonky2::plonk::config::GenericConfig;
 use plonky2::plonk::proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget};
-use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::timed;
 use plonky2::util::timing::TimingTree;
 
@@ -195,67 +193,6 @@ impl BlockTxChainCircuit {
             BlockTxWitnessTarget::from_public_inputs(&self.target.tx_proof.public_inputs);
 
         (block, current_block_tx)
-    }
-
-    /// Chain-step witness inputs that do not depend on the cyclic (previous chain step) proof, so
-    /// they can be seeded and their generators run before that proof is available.
-    pub fn witness_inputs_early(
-        target: &BlockTxChainTarget,
-        circuit_data: &CircuitData<F, C, D>,
-        recursion_step: u64,
-        dummy_proof_cyclic: &ProofWithPublicInputs<F, C, D>,
-        current_block_tx_proof: &ProofWithPublicInputs<F, C, D>,
-    ) -> Result<PartialWitness<F>> {
-        let mut pw = PartialWitness::new();
-
-        pw.set_verifier_data_target(&target.self_verifier_data, &circuit_data.verifier_only)?;
-
-        pw.set_proof_with_pis_target(&target.tx_proof, current_block_tx_proof)?;
-
-        pw.set_target(target.recursion_step, F::from_canonical_u64(recursion_step))?;
-
-        // This will take place of `DummyProofGenerator`
-        pw.set_proof_with_pis_target(
-            &target.dummy_proof_with_pis_target_cyclic,
-            dummy_proof_cyclic,
-        )?;
-
-        Ok(pw)
-    }
-
-    /// The cyclic-proof witness inputs, fed once the previous chain step's proof is available.
-    pub fn witness_inputs_cyclic(
-        target: &BlockTxChainTarget,
-        cyclic_proof: &ProofWithPublicInputs<F, C, D>,
-    ) -> Result<PartialWitness<F>> {
-        let mut pw = PartialWitness::new();
-        pw.set_proof_with_pis_target(&target.cyclic_proof, cyclic_proof)?;
-        Ok(pw)
-    }
-
-    /// Proves a chain step whose witness inputs were supplied through a
-    /// [`PendingPartitionWitness`].
-    pub fn prove_prepared(
-        pending: PendingPartitionWitness<'_, F, C, D>,
-        circuit_data: &CircuitData<F, C, D>,
-    ) -> Result<ProofWithPublicInputs<F, C, D>> {
-        let partition_witness = pending.finish()?;
-        let proof = {
-            let mut prove_timing = TimingTree::new("BlockTxChainProve", Level::Debug);
-            let proof = prove_with_partition_witness(
-                &circuit_data.prover_only,
-                &circuit_data.common,
-                partition_witness,
-                &mut prove_timing,
-            )?;
-            prove_timing.print();
-            proof
-        };
-        // Recursive parents validate this proof in release builds; keep the eager check for tests.
-        #[cfg(debug_assertions)]
-        circuit_data.verify(proof.clone())?;
-
-        Ok(proof)
     }
 
     fn perform_sanity_checks(&mut self, block: &BlockTxChainWitnessTarget) {
@@ -564,15 +501,20 @@ impl Circuit<C, F, D> for BlockTxChainCircuit {
         dummy_proof_cyclic: &ProofWithPublicInputs<F, C, D>,
         current_block_tx_proof: &ProofWithPublicInputs<F, C, D>,
     ) -> Result<PartialWitness<F>> {
-        let mut pw = Self::witness_inputs_early(
-            target,
-            circuit_data,
-            recursion_step,
-            dummy_proof_cyclic,
-            current_block_tx_proof,
-        )?;
+        let mut pw = PartialWitness::new();
 
         pw.set_proof_with_pis_target(&target.cyclic_proof, cyclic_proof)?;
+        pw.set_verifier_data_target(&target.self_verifier_data, &circuit_data.verifier_only)?;
+
+        pw.set_proof_with_pis_target(&target.tx_proof, current_block_tx_proof)?;
+
+        pw.set_target(target.recursion_step, F::from_canonical_u64(recursion_step))?;
+
+        // This will take place of `DummyProofGenerator`
+        pw.set_proof_with_pis_target(
+            &target.dummy_proof_with_pis_target_cyclic,
+            dummy_proof_cyclic,
+        )?;
 
         Ok(pw)
     }
@@ -673,24 +615,7 @@ fn select_on_chain_pub_data(
 }
 
 // Generates `CommonCircuitData` usable for recursion.
-//
-// The result depends only on `log_gates` and compile-time constants, and both
-// chain paths request it with the same size during `Circuits::new`, so the
-// three-stage throwaway build (including a full 2^log_gates-gate `build`) runs
-// once and later callers clone the cached result.
 fn common_data_for_recursion(log_gates: usize) -> CommonCircuitData<F, D> {
-    static CACHE: std::sync::OnceLock<(usize, CommonCircuitData<F, D>)> =
-        std::sync::OnceLock::new();
-    let (cached_log_gates, common) =
-        CACHE.get_or_init(|| (log_gates, build_common_data_for_recursion(log_gates)));
-    assert_eq!(
-        *cached_log_gates, log_gates,
-        "common_data_for_recursion cached at a different size"
-    );
-    common.clone()
-}
-
-fn build_common_data_for_recursion(log_gates: usize) -> CommonCircuitData<F, D> {
     let builder = Builder::new(CIRCUIT_CONFIG);
     let data = builder.build::<C>();
 
