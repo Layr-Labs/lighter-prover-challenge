@@ -1,10 +1,13 @@
 #[cfg(not(feature = "std"))]
 use alloc::{
     boxed::Box,
+    collections::BTreeMap,
     string::{String, ToString},
     vec,
     vec::Vec,
 };
+#[cfg(feature = "std")]
+use std::collections::BTreeMap;
 use core::fmt::Debug;
 use core::marker::PhantomData;
 
@@ -105,6 +108,41 @@ fn parallel_rounds_enabled() -> bool {
     false
 }
 
+/// Merges all of one generator's outputs before enqueueing active generators watching the newly
+/// populated representatives. Keeping the phases separate preserves watcher state if a later
+/// output merge returns an error.
+fn merge_generated_values_and_enqueue<F: Field>(
+    witness: &mut PartitionWitness<F>,
+    generated: &mut GeneratedValues<F>,
+    new_target_reps: &mut Vec<usize>,
+    generator_indices_by_watches: &BTreeMap<usize, Vec<usize>>,
+    generator_is_expired: &[bool],
+    unresolved_watches: &mut [usize],
+    next_pending_generator_indices: &mut Vec<usize>,
+) -> Result<()> {
+    new_target_reps.clear();
+    for (target, value) in generated.target_values.drain(..) {
+        new_target_reps.extend(witness.set_target_returning_rep(target, value)?);
+    }
+    for &watch in new_target_reps.iter() {
+        if let Some(watchers) = generator_indices_by_watches.get(&watch) {
+            for &watching_generator_idx in watchers {
+                if !generator_is_expired[watching_generator_idx] {
+                    debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
+                    unresolved_watches[watching_generator_idx] -= 1;
+                    next_pending_generator_indices.push(watching_generator_idx);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn advance_worklist_wave(pending: &mut Vec<usize>, next: &mut Vec<usize>) {
+    core::mem::swap(pending, next);
+}
+
 /// Runs the given pending generators, and transitively any generator watching a newly populated
 /// representative, until no further progress can be made.
 ///
@@ -132,10 +170,13 @@ fn run_generator_worklist<
 
     let parallel_rounds = parallel_rounds_enabled();
     let mut buffer = GeneratedValues::empty();
+    let mut new_target_reps = Vec::new();
 
-    // Keep running generators until we fail to make progress.
+    // Keep running generators until we fail to make progress. The next wave's backing storage
+    // alternates with the current wave instead of being allocated and dropped on every round.
+    let mut next_pending_generator_indices = Vec::new();
     while !pending_generator_indices.is_empty() {
-        let mut next_pending_generator_indices = Vec::new();
+        next_pending_generator_indices.clear();
 
         if parallel_rounds && pending_generator_indices.len() >= parallel_threshold {
             // A generator can be enqueued once per newly populated watch, and may have expired
@@ -218,7 +259,10 @@ fn run_generator_worklist<
                 }
             }
 
-            pending_generator_indices = next_pending_generator_indices;
+            advance_worklist_wave(
+                &mut pending_generator_indices,
+                &mut next_pending_generator_indices,
+            );
             continue;
         }
 
@@ -237,30 +281,21 @@ fn run_generator_worklist<
                 *remaining_generators -= 1;
             }
 
-            // Merge any generated values into our witness, and get a list of newly-populated
-            // targets' representatives.
-            let mut new_target_reps = Vec::with_capacity(buffer.target_values.len());
-            for (t, v) in buffer.target_values.drain(..) {
-                let reps = witness.set_target_returning_rep(t, v)?;
-                new_target_reps.extend(reps);
-            }
-
-            // Enqueue unfinished generators that were watching one of the newly populated targets.
-            for watch in new_target_reps {
-                let opt_watchers = generator_indices_by_watches.get(&watch);
-                if let Some(watchers) = opt_watchers {
-                    for &watching_generator_idx in watchers {
-                        if !generator_is_expired[watching_generator_idx] {
-                            debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                            unresolved_watches[watching_generator_idx] -= 1;
-                            next_pending_generator_indices.push(watching_generator_idx);
-                        }
-                    }
-                }
-            }
+            merge_generated_values_and_enqueue(
+                witness,
+                &mut buffer,
+                &mut new_target_reps,
+                generator_indices_by_watches,
+                generator_is_expired,
+                unresolved_watches,
+                &mut next_pending_generator_indices,
+            )?;
         }
 
-        pending_generator_indices = next_pending_generator_indices;
+        advance_worklist_wave(
+            &mut pending_generator_indices,
+            &mut next_pending_generator_indices,
+        );
     }
 
     Ok(())
@@ -781,6 +816,7 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D> for Con
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1293,5 +1329,102 @@ mod tests {
         assert_eq!(witness.get_target(early_output), F::from_canonical_u64(7));
         assert_eq!(witness.get_target(final_output), F::from_canonical_u64(11));
         assert_eq!(run_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn fused_merge_preserves_first_population_and_enqueue_order() -> Result<()> {
+        let representative_map = vec![0, 1, 1, 3];
+        let mut witness = PartitionWitness::<F>::new(1, 1, &representative_map);
+        let first = Target::VirtualTarget { index: 0 };
+        let first_alias = Target::VirtualTarget { index: 1 };
+        let second = Target::VirtualTarget { index: 2 };
+
+        let mut generated = GeneratedValues::empty();
+        generated.set_target(first, F::from_canonical_u64(5))?;
+        generated.set_target(first_alias, F::from_canonical_u64(5))?;
+        generated.set_target(second, F::from_canonical_u64(7))?;
+
+        let watchers = BTreeMap::from([(1, vec![0, 1, 2]), (3, vec![2, 3])]);
+        let expired = [false, true, false, false];
+        let mut unresolved = [1, 1, 2, 1];
+        let mut next_pending = Vec::new();
+        let mut new_target_reps = Vec::new();
+
+        merge_generated_values_and_enqueue(
+            &mut witness,
+            &mut generated,
+            &mut new_target_reps,
+            &watchers,
+            &expired,
+            &mut unresolved,
+            &mut next_pending,
+        )?;
+
+        assert!(generated.target_values.is_empty());
+        assert_eq!(witness.get_target(first), F::from_canonical_u64(5));
+        assert_eq!(witness.get_target(first_alias), F::from_canonical_u64(5));
+        assert_eq!(witness.get_target(second), F::from_canonical_u64(7));
+        assert_eq!(unresolved, [0, 1, 0, 0]);
+        assert_eq!(next_pending, [0, 2, 2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn merge_error_does_not_enqueue_earlier_successful_outputs() -> Result<()> {
+        let representative_map = vec![0, 1, 2];
+        let mut witness = PartitionWitness::<F>::new(1, 1, &representative_map);
+        let first = Target::VirtualTarget { index: 0 };
+        let conflicting = Target::VirtualTarget { index: 1 };
+        witness.set_target(conflicting, F::from_canonical_u64(9))?;
+
+        let mut generated = GeneratedValues::empty();
+        generated.set_target(first, F::from_canonical_u64(5))?;
+        generated.set_target(conflicting, F::from_canonical_u64(7))?;
+
+        let watchers = BTreeMap::from([(1, vec![0, 1])]);
+        let expired = [false, false];
+        let mut unresolved = [1, 1];
+        let mut next_pending = vec![7];
+        let mut new_target_reps = Vec::new();
+
+        let result = merge_generated_values_and_enqueue(
+            &mut witness,
+            &mut generated,
+            &mut new_target_reps,
+            &watchers,
+            &expired,
+            &mut unresolved,
+            &mut next_pending,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(witness.get_target(first), F::from_canonical_u64(5));
+        assert_eq!(unresolved, [1, 1]);
+        assert_eq!(next_pending, [7]);
+        Ok(())
+    }
+
+    #[test]
+    fn wave_advance_preserves_order_and_reuses_both_backing_buffers() {
+        let mut pending = Vec::with_capacity(8);
+        pending.extend([9, 8]);
+        let mut next = Vec::with_capacity(16);
+        next.extend([4, 2, 7]);
+        let pending_ptr = pending.as_ptr();
+        let next_ptr = next.as_ptr();
+
+        advance_worklist_wave(&mut pending, &mut next);
+        assert_eq!(pending, [4, 2, 7]);
+        assert_eq!(pending.as_ptr(), next_ptr);
+        assert_eq!(next, [9, 8]);
+        assert_eq!(next.as_ptr(), pending_ptr);
+
+        next.clear();
+        next.extend([6, 5]);
+        advance_worklist_wave(&mut pending, &mut next);
+        assert_eq!(pending, [6, 5]);
+        assert_eq!(pending.as_ptr(), pending_ptr);
+        assert_eq!(next, [4, 2, 7]);
+        assert_eq!(next.as_ptr(), next_ptr);
     }
 }
