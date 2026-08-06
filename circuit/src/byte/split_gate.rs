@@ -5,6 +5,7 @@ use core::ops::Range;
 
 use anyhow::Result;
 use itertools::Itertools;
+use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
@@ -192,6 +193,83 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
             }
         }
         res
+    }
+
+    /// Same constraints, same order, folded into the shared accumulator one row
+    /// at a time instead of through a full `n * num_constraints` matrix.
+    ///
+    /// Each row is still built in scratch because the Horner recurrences use it
+    /// as working storage, but the scratch is a single `n`-element row that is
+    /// reused, so the matrix allocation, its zeroing, its read-back and its free
+    /// all disappear.
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        debug_assert_eq!(filters.len(), n);
+        let wires = vars_base.local_wires;
+        let three = F::from_canonical_usize(3);
+        let four = F::from_canonical_usize(4);
+        let base = F::from_canonical_usize(256);
+
+        let mut row = vec![F::ZERO; n];
+        let mut combined = combined_gate_constraints.chunks_exact_mut(n);
+        // Folds the freshly built row into the next accumulator row.
+        macro_rules! emit {
+            () => {
+                batch_multiply_add_inplace(combined.next().unwrap(), &row, filters)
+            };
+        }
+
+        for i in 0..self.num_ops {
+            let aux = self.i_th_aux_limbs(i);
+            // Range products per aux limb: x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3).
+            for limb_wire in aux.clone() {
+                let col = &wires[limb_wire * n..][..n];
+                for p in 0..n {
+                    let x = col[p];
+                    let y = x * (x - three);
+                    row[p] = y * (y + F::TWO);
+                }
+                emit!();
+            }
+
+            // Each byte equals its four aux limbs combined by powers of 4,
+            // accumulated per point by Horner from the most significant limb.
+            let bytes = self.i_th_limbs(i);
+            for (byte_index, byte_wire) in bytes.clone().enumerate() {
+                let chunk_start = aux.start + 4 * byte_index;
+                row.copy_from_slice(&wires[(chunk_start + 3) * n..][..n]);
+                for k in (0..3).rev() {
+                    let limb = &wires[(chunk_start + k) * n..][..n];
+                    for p in 0..n {
+                        row[p] = row[p] * four + limb[p];
+                    }
+                }
+                let byte_col = &wires[byte_wire * n..][..n];
+                for p in 0..n {
+                    row[p] -= byte_col[p];
+                }
+                emit!();
+            }
+
+            // The sum equals the bytes combined by powers of 256.
+            row.copy_from_slice(&wires[(bytes.end - 1) * n..][..n]);
+            for byte_wire in (bytes.start..bytes.end - 1).rev() {
+                let col = &wires[byte_wire * n..][..n];
+                for p in 0..n {
+                    row[p] = row[p] * base + col[p];
+                }
+            }
+            let sum_col = &wires[self.i_th_sum(i) * n..][..n];
+            for p in 0..n {
+                row[p] -= sum_col[p];
+            }
+            emit!();
+        }
     }
 
     fn eval_unfiltered_circuit(
@@ -409,6 +487,53 @@ mod tests {
     #[test]
     fn low_degree() {
         test_low_degree::<GoldilocksField, _, 4>(ByteDecompositionGate::new(1, 1))
+    }
+
+    /// The direct accumulation path must produce exactly what materializing the
+    /// batch matrix and folding it in afterwards produces, for every constraint
+    /// at every point.
+    #[test]
+    fn direct_filtered_accumulation_matches_materialized_batch() {
+        use plonky2::hash::hash_types::HashOut;
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+
+        // Several shapes: multiple limbs and multiple ops, plus a batch size
+        // that is not a multiple of the packing width.
+        for (num_limbs, num_ops, n) in [(1usize, 1usize, 4usize), (2, 1, 11), (3, 2, 8), (1, 3, 7)] {
+            let gate = ByteDecompositionGate::new(num_limbs, num_ops);
+            let num_wires = <ByteDecompositionGate as Gate<F, D>>::num_wires(&gate);
+            // Spread values across the field rather than using small ints, so a
+            // reduction discrepancy between the two paths would show up.
+            let wires = (0..num_wires * n)
+                .map(|i| F::from_noncanonical_u64(0x9e37_79b9_7f4a_7c15u64.wrapping_mul(i as u64 + 1)))
+                .collect::<Vec<_>>();
+            let constants = Vec::new();
+            let hash = HashOut::ZERO;
+            let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+            let filters = (0..n)
+                .map(|i| F::from_canonical_usize(2 * i + 1))
+                .collect::<Vec<_>>();
+
+            let num_constraints = <ByteDecompositionGate as Gate<F, D>>::num_constraints(&gate);
+            let mut expected = vec![F::ZERO; num_constraints * n];
+            let materialized =
+                <ByteDecompositionGate as Gate<F, D>>::eval_unfiltered_base_batch(&gate, vars);
+            for (acc, constraints) in expected.chunks_exact_mut(n).zip(materialized.chunks_exact(n))
+            {
+                batch_multiply_add_inplace(acc, constraints, &filters);
+            }
+
+            let mut actual = vec![F::ZERO; expected.len()];
+            <ByteDecompositionGate as Gate<F, D>>::eval_unfiltered_base_batch_accumulate(
+                &gate,
+                vars,
+                &filters,
+                &mut actual,
+            );
+            assert_eq!(actual, expected, "shape ({num_limbs}, {num_ops}, {n})");
+        }
     }
 
     #[test]

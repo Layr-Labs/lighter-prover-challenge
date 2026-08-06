@@ -223,31 +223,6 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
         let half = num_leaves / 2;
         let (left_leaves, right_leaves) = leaves.split_at(half * leaf_width);
 
-        // Sibling leaves are independent; hash them as one interleaved pair so
-        // the two permutation dependency chains overlap in the pipeline.
-        if num_leaves == 2 {
-            let (left_digest, right_digest) = H::hash_or_noop_pair(left_leaves, right_leaves);
-            left_digest_mem.write(left_digest);
-            right_digest_mem.write(right_digest);
-            return H::two_to_one(left_digest, right_digest);
-        }
-
-        // Same idea one level up: hash the four leaves as one interleaved
-        // quad, then compress the two sibling parent nodes as a pair.
-        if num_leaves == 4 {
-            let (leaf_0, leaf_1) = left_leaves.split_at(leaf_width);
-            let (leaf_2, leaf_3) = right_leaves.split_at(leaf_width);
-            let (h0, h1, h2, h3) = H::hash_or_noop_quad(leaf_0, leaf_1, leaf_2, leaf_3);
-            left_digests_buf[0].write(h0);
-            left_digests_buf[1].write(h1);
-            right_digests_buf[0].write(h2);
-            right_digests_buf[1].write(h3);
-            let (left_digest, right_digest) = H::two_to_one_pair(h0, h1, h2, h3);
-            left_digest_mem.write(left_digest);
-            right_digest_mem.write(right_digest);
-            return H::two_to_one(left_digest, right_digest);
-        }
-
         // Rayon task creation dominates the tiny subtrees near the leaves. Keep
         // enough parallelism at the upper levels, then recurse synchronously.
         let (left_digest, right_digest) = if num_leaves > 16 {
