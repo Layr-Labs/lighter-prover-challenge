@@ -22,6 +22,7 @@ use crate::plonk::plonk_common::eval_l_0_circuit;
 use crate::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBaseBatch};
 use crate::util::partial_products::{check_partial_products, check_partial_products_circuit};
 use crate::util::reducing::ReducingFactorTarget;
+use crate::util::strided_view::PackedStridedView;
 use crate::with_context;
 
 /// Get the polynomial associated to a lookup table with current challenges.
@@ -166,8 +167,6 @@ pub(crate) fn eval_vanishing_poly<F: RichField + Extendable<D>, const D: usize>(
 /// once per 32-point batch.
 #[derive(Default)]
 pub(crate) struct VanishingScratch<F> {
-    pub numerator_values: Vec<F>,
-    pub denominator_values: Vec<F>,
     pub vanishing_z_1_terms: Vec<F>,
     pub vanishing_partial_products_terms: Vec<F>,
     pub vanishing_all_lookup_terms: Vec<F>,
@@ -192,6 +191,46 @@ fn reduce_gate_constraints_base_batch<F: Field>(
                 *value = term.multiply_accumulate(*value, alpha);
             }
         }
+    }
+}
+
+fn append_permutation_checks<F: Field>(
+    constraints: &mut Vec<F>,
+    local_wires: PackedStridedView<'_, F>,
+    s_sigmas: &[F],
+    beta_k_is: &[F],
+    x: F,
+    beta: F,
+    gamma: F,
+    partial_products: &[F],
+    z_x: F,
+    z_gx: F,
+    max_degree: usize,
+) {
+    assert!(max_degree > 1);
+    let num_wires = s_sigmas.len();
+    assert_eq!(beta_k_is.len(), num_wires);
+    assert!(local_wires.len() >= num_wires);
+    let num_chunks = num_wires.div_ceil(max_degree);
+    assert_eq!(partial_products.len() + 1, num_chunks);
+
+    let mut previous_acc = z_x;
+    for chunk_index in 0..num_chunks {
+        let start = chunk_index * max_degree;
+        let end = min(start + max_degree, num_wires);
+        let mut numerator_product = F::ONE;
+        let mut denominator_product = F::ONE;
+        for j in start..end {
+            let wire_value = local_wires[j];
+            let numerator = wire_value + beta_k_is[j] * x + gamma;
+            let denominator = wire_value + beta * s_sigmas[j] + gamma;
+            numerator_product *= numerator;
+            denominator_product *= denominator;
+        }
+
+        let next_acc = partial_products.get(chunk_index).copied().unwrap_or(z_gx);
+        constraints.push(previous_acc * numerator_product - next_acc * denominator_product);
+        previous_acc = next_acc;
     }
 }
 
@@ -258,11 +297,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
     reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out);
-
-    let numerator_values = &mut scratch.numerator_values;
-    let denominator_values = &mut scratch.denominator_values;
-    numerator_values.clear();
-    denominator_values.clear();
 
     // The L_0(x) (Z(x) - 1) vanishing terms.
     let vanishing_z_1_terms = &mut scratch.vanishing_z_1_terms;
@@ -331,32 +365,21 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 vanishing_all_lookup_terms.extend(lookup_constraints);
             }
 
-            numerator_values.extend((0..num_routed_wires).map(|j| {
-                let wire_value = vars.local_wires[j];
-                let beta_k_i = beta_k_is[i * num_routed_wires + j];
-                wire_value + beta_k_i * x + gammas[i]
-            }));
-            denominator_values.extend((0..num_routed_wires).map(|j| {
-                let wire_value = vars.local_wires[j];
-                let s_sigma = s_sigmas[j];
-                wire_value + betas[i] * s_sigma + gammas[i]
-            }));
-
-            // The partial products considered for this iteration of `i`.
             let current_partial_products = &partial_products[i * num_prods..(i + 1) * num_prods];
-            // Check the numerator partial products.
-            let partial_product_checks = check_partial_products(
-                &numerator_values,
-                &denominator_values,
+            let current_beta_k_is = &beta_k_is[i * num_routed_wires..(i + 1) * num_routed_wires];
+            append_permutation_checks(
+                vanishing_partial_products_terms,
+                vars.local_wires,
+                s_sigmas,
+                current_beta_k_is,
+                x,
+                betas[i],
+                gammas[i],
                 current_partial_products,
                 z_x,
                 z_gx,
                 max_degree,
             );
-            vanishing_partial_products_terms.extend(partial_product_checks);
-
-            numerator_values.clear();
-            denominator_values.clear();
         }
 
         let vanishing_terms = vanishing_z_1_terms
@@ -988,6 +1011,7 @@ mod tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
 
     use super::*;
+    use crate::field::types::{Field64, PrimeField64};
 
     #[test]
     fn constraint_major_reduction_preserves_pointwise_horner_order() {
@@ -1035,6 +1059,80 @@ mod tests {
             let mut actual = initial;
             reduce_gate_constraints_base_batch(&terms, batch_size, &alphas, &mut actual);
             assert_eq!(actual, expected, "batch size {batch_size}");
+        }
+    }
+    #[test]
+    fn fused_permutation_checks_match_materialized_path() {
+        type F = GoldilocksField;
+        const MAX_DEGREE: usize = 8;
+
+        let x = F::from_canonical_u64(13);
+        let beta = F::from_canonical_u64(17);
+        let gamma = F::from_canonical_u64(19);
+        let z_x = F::from_canonical_u64(23);
+        let z_gx = F::from_canonical_u64(29);
+        let sentinel = F::from_canonical_u64(31);
+
+        for num_wires in [1, 7, 8, 9, 15, 16, 17, 80] {
+            let wires = (0..num_wires + 3)
+                .map(|i| GoldilocksField(F::ORDER + (i as u64 % 97)))
+                .collect::<Vec<_>>();
+            let k_is = (0..num_wires)
+                .map(|i| F::from_canonical_usize(2 * i + 1))
+                .collect::<Vec<_>>();
+            let beta_k_is = k_is.iter().map(|&k_i| beta * k_i).collect::<Vec<_>>();
+            let s_sigmas = (0..num_wires)
+                .map(|i| F::from_canonical_usize(3 * i + 2))
+                .collect::<Vec<_>>();
+            let partials = (0..num_wires.div_ceil(MAX_DEGREE) - 1)
+                .map(|i| F::from_canonical_usize(5 * i + 7))
+                .collect::<Vec<_>>();
+
+            let numerators = (0..num_wires)
+                .map(|j| wires[j] + beta_k_is[j] * x + gamma)
+                .collect::<Vec<_>>();
+            let denominators = (0..num_wires)
+                .map(|j| wires[j] + beta * s_sigmas[j] + gamma)
+                .collect::<Vec<_>>();
+            let expected = check_partial_products(
+                &numerators,
+                &denominators,
+                &partials,
+                z_x,
+                z_gx,
+                MAX_DEGREE,
+            );
+
+            let mut actual = vec![sentinel];
+            append_permutation_checks(
+                &mut actual,
+                PackedStridedView::new(&wires, 1, 0),
+                &s_sigmas,
+                &beta_k_is,
+                x,
+                beta,
+                gamma,
+                &partials,
+                z_x,
+                z_gx,
+                MAX_DEGREE,
+            );
+
+            assert_eq!(
+                actual[0].to_noncanonical_u64(),
+                sentinel.to_noncanonical_u64()
+            );
+            assert_eq!(
+                actual[1..]
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>(),
+                "num_wires={num_wires}",
+            );
         }
     }
 }
