@@ -22,6 +22,13 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
 /// window and is treated as contaminated evidence.
 const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
+/// Env-gated override for local A/B: LIGHTER_MIN_GPU_BITS=14..24 (ranked env cleared -> const).
+fn min_gpu_threshold() -> usize {
+    static THRESH: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("LIGHTER_MIN_GPU_BITS").ok().and_then(|s| s.parse::<usize>().ok()).filter(|&b| (10..=24).contains(&b)).map(|b| 1usize << b).unwrap_or(MIN_GPU_PERMUTATIONS)
+    });
+    *THRESH
+}
 /// Upper bound on concurrently in-flight GPU tree builds. One set serializes
 /// GPU tree builds exactly like the promoted base's global context mutex: a
 /// 3-set experiment measured 13-18% faster locally but scored -21.6% on the
@@ -145,7 +152,7 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
         leaf_width.div_ceil(8) * leaf_count
     };
     let parent_permutations = leaf_count - (1usize << cap_height);
-    leaf_permutations + parent_permutations >= MIN_GPU_PERMUTATIONS
+    leaf_permutations + parent_permutations >= min_gpu_threshold()
 }
 
 fn shared_context() -> Option<&'static MetalShared> {

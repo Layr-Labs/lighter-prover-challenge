@@ -292,6 +292,24 @@ impl<F: Field> PolynomialCoeffs<F> {
         modified_poly.fft_with_options(zero_factor, root_table)
     }
 
+    /// The low-degree extension of the coset evaluation: computes exactly
+    /// `self.lde(rate_bits).coset_fft_with_options(shift, Some(rate_bits), root_table)`
+    /// (bit-identical output), but with a single output allocation instead of
+    /// two, and without walking the shift-power chain over (or multiplying by)
+    /// the `(2^rate_bits - 1) * n` zeros of the padding.
+    pub fn coset_lde_fft(
+        &self,
+        shift: F,
+        rate_bits: usize,
+        root_table: Option<&FftRootTable<F>>,
+    ) -> PolynomialValues<F> {
+        let lde_len = self.len() << rate_bits;
+        let mut coeffs = Vec::with_capacity(lde_len);
+        coeffs.extend(shift.powers().zip(&self.coeffs).map(|(r, &c)| r * c));
+        coeffs.resize(lde_len, F::ZERO);
+        PolynomialCoeffs::new(coeffs).fft_with_options(Some(rate_bits), root_table)
+    }
+
     pub fn to_extension<const D: usize>(&self) -> PolynomialCoeffs<F::Extension>
     where
         F: Extendable<D>,
@@ -446,6 +464,26 @@ mod tests {
     use super::*;
     use crate::goldilocks_field::GoldilocksField;
     use crate::types::Sample;
+
+    #[test]
+    fn test_coset_lde_fft_matches_lde_then_coset_fft() {
+        type F = GoldilocksField;
+        let shift = F::coset_shift();
+        for lg_n in [0usize, 1, 4, 10] {
+            for rate_bits in [0usize, 1, 3] {
+                let poly = PolynomialCoeffs::new(F::rand_vec(1 << lg_n));
+                let expected = poly
+                    .lde(rate_bits)
+                    .coset_fft_with_options(shift, Some(rate_bits), None);
+                let actual = poly.coset_lde_fft(shift, rate_bits, None);
+                // Bit-identity, not just field equality: compare the raw
+                // (possibly noncanonical) representatives.
+                let expected_raw: Vec<u64> = expected.values.iter().map(|v| v.0).collect();
+                let actual_raw: Vec<u64> = actual.values.iter().map(|v| v.0).collect();
+                assert_eq!(expected_raw, actual_raw, "lg_n={lg_n} rate_bits={rate_bits}");
+            }
+        }
+    }
 
     #[test]
     fn test_trimmed() {
