@@ -194,6 +194,70 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
         res
     }
 
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        let wires = vars_base.local_wires;
+        let three = F::from_canonical_usize(3);
+        let four = F::from_canonical_usize(4);
+        let base = F::from_canonical_usize(256);
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
+        let mut chunks = combined_gate_constraints.chunks_exact_mut(n);
+        let mut scratch = vec![F::ZERO; n];
+
+        for i in 0..self.num_ops {
+            let aux = self.i_th_aux_limbs(i);
+            // Range products per aux limb: x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3).
+            for limb_wire in aux.clone() {
+                let col = &wires[limb_wire * n..][..n];
+                let out = chunks.next().unwrap();
+                for p in 0..n {
+                    let x = col[p];
+                    let y = x * (x - three);
+                    out[p] += filters[p] * (y * (y + F::TWO));
+                }
+            }
+
+            // Each byte equals its four aux limbs combined by powers of 4,
+            // accumulated per point by Horner from the most significant limb.
+            let bytes = self.i_th_limbs(i);
+            for (byte_index, byte_wire) in bytes.clone().enumerate() {
+                let chunk_start = aux.start + 4 * byte_index;
+                let out = chunks.next().unwrap();
+                scratch.copy_from_slice(&wires[(chunk_start + 3) * n..][..n]);
+                for k in (0..3).rev() {
+                    let limb = &wires[(chunk_start + k) * n..][..n];
+                    for p in 0..n {
+                        scratch[p] = scratch[p] * four + limb[p];
+                    }
+                }
+                let byte_col = &wires[byte_wire * n..][..n];
+                for p in 0..n {
+                    out[p] += filters[p] * (scratch[p] - byte_col[p]);
+                }
+            }
+
+            // The sum equals the bytes combined by powers of 256.
+            let out = chunks.next().unwrap();
+            scratch.copy_from_slice(&wires[(bytes.end - 1) * n..][..n]);
+            for byte_wire in (bytes.start..bytes.end - 1).rev() {
+                let col = &wires[byte_wire * n..][..n];
+                for p in 0..n {
+                    scratch[p] = scratch[p] * base + col[p];
+                }
+            }
+            let sum_col = &wires[self.i_th_sum(i) * n..][..n];
+            for p in 0..n {
+                out[p] += filters[p] * (scratch[p] - sum_col[p]);
+            }
+        }
+    }
+
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,
@@ -342,35 +406,23 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
             .to_canonical_u64();
 
         // Set bytes
-        let limbs = dummy_gate
-            .i_th_limbs(self.i)
-            .map(|i| Target::wire(self.row, i));
-        let limbs_value = (0..self.num_limbs)
-            .scan(sum_value, |acc, _| {
-                let tmp = *acc % (256_u64);
-                *acc /= 256_u64;
-                Some(F::from_canonical_u64(tmp))
-            })
-            .collect::<Vec<_>>();
-
-        for (b, b_value) in limbs.zip_eq(limbs_value) {
-            out_buffer.set_target(b, b_value)?;
+        let mut acc = sum_value;
+        for wire in dummy_gate.i_th_limbs(self.i) {
+            out_buffer.set_target(
+                Target::wire(self.row, wire),
+                F::from_canonical_u64(acc % 256_u64),
+            )?;
+            acc /= 256_u64;
         }
 
         // Set aux limbs
-        let limbs = dummy_gate
-            .i_th_aux_limbs(self.i)
-            .map(|i| Target::wire(self.row, i));
-        let limbs_value = (0..4 * self.num_limbs)
-            .scan(sum_value, |acc, _| {
-                let tmp = *acc % (4_u64);
-                *acc /= 4_u64;
-                Some(F::from_canonical_u64(tmp))
-            })
-            .collect::<Vec<_>>();
-
-        for (b, b_value) in limbs.zip_eq(limbs_value) {
-            out_buffer.set_target(b, b_value)?;
+        let mut acc = sum_value;
+        for wire in dummy_gate.i_th_aux_limbs(self.i) {
+            out_buffer.set_target(
+                Target::wire(self.row, wire),
+                F::from_canonical_u64(acc % 4_u64),
+            )?;
+            acc /= 4_u64;
         }
 
         Ok(())
