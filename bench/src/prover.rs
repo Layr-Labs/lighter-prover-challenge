@@ -22,7 +22,7 @@ use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::util::timing::TimingTree;
 
-use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
+use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, PathCircuits, Proof};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxPath {
@@ -190,21 +190,15 @@ fn prove_path(
         !chunks.is_empty(),
         "{path:?} transaction path must contain at least one chunk"
     );
-    let (tx_data, tx_target, chain_data, chain_target, dummy_proof) = match path {
-        TxPath::Light => (
-            &circuits.light_tx_data,
-            &circuits.light_tx_target,
-            &circuits.light_chain_data,
-            &circuits.light_chain_target,
-            &circuits.dummy_light_proof,
-        ),
-        TxPath::Heavy => (
-            &circuits.heavy_tx_data,
-            &circuits.heavy_tx_target,
-            &circuits.heavy_chain_data,
-            &circuits.heavy_chain_target,
-            &circuits.dummy_heavy_proof,
-        ),
+    let PathCircuits {
+        tx_target,
+        tx_data,
+        chain_target,
+        chain_data,
+        dummy_proof,
+    } = match path {
+        TxPath::Light => circuits.light(),
+        TxPath::Heavy => circuits.heavy(),
     };
 
     let base_proof = cyclic_base_witness(
@@ -358,15 +352,21 @@ fn prove_path(
 pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     // The pre-execution proof runs strictly before any other proving work, so
     // the serialized GPU stream is otherwise idle: route its mid-size column
-    // trees to the GPU for just this phase.
-    plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-    let pre_proof = BlockPreExecutionCircuit::prove(
-        &circuits.pre_data,
-        &BlockPreExec::from_block(&block),
-        &circuits.pre_target,
-    )
-    .expect("block pre-execution proof failed");
-    plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+    // trees to the GPU for just this phase. With deferred construction the
+    // path circuits may still be building here (their tree builds share the
+    // serialized GPU stream), so only enable the hint once they are done.
+    let pre_data = circuits.pre_data();
+    let pre_target = circuits.pre_target();
+    let gpu_stream_idle = circuits.paths_ready();
+    if gpu_stream_idle {
+        plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
+    }
+    let pre_proof =
+        BlockPreExecutionCircuit::prove(pre_data, &BlockPreExec::from_block(&block), pre_target)
+            .expect("block pre-execution proof failed");
+    if gpu_stream_idle {
+        plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+    }
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
