@@ -32,9 +32,8 @@ use crate::plonk::vanishing_poly::{
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
-use crate::util::partial_products::quotient_chunk_products;
+use crate::util::log2_ceil;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil};
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -442,45 +441,52 @@ fn wires_permutation_partial_products_and_zs<
     let num_prods = common_data.num_partial_products;
     debug_assert_eq!(beta_k_is.len(), common_data.config.num_routed_wires);
     let num_routed_wires = common_data.config.num_routed_wires;
-    // Group the denominator inversions across many subgroup points: one
-    // Montgomery-trick batch inversion per 64 points instead of one per
-    // point. Field inverses are unique, so every quotient value is identical
-    // to the per-point version.
+    let num_chunks = num_routed_wires.div_ceil(degree);
+    debug_assert_eq!(num_chunks, num_prods + 1);
+    // The next consumer observes only products of `degree` wire ratios. Form
+    // those products before inversion: product(numerators) / product(denominators)
+    // is the same field element as the product of individual ratios, while the
+    // Montgomery batch shrinks from routed-wire width to chunk width.
     const INV_BATCH: usize = 128;
-    let all_quotient_chunk_products = subgroup
+    let all_quotient_chunk_products_flat = subgroup
         .par_chunks(INV_BATCH)
         .enumerate()
         .map_init(
-            // One denominator scratch buffer per worker thread.
-            || vec![F::ZERO; num_routed_wires * INV_BATCH],
-            |denominators, (chunk_idx, xs)| {
+            || {
+                (
+                    vec![F::ZERO; num_chunks * INV_BATCH],
+                    vec![F::ZERO; num_chunks * INV_BATCH],
+                )
+            },
+            |(numerators, denominators), (chunk_idx, xs)| {
                 let base = chunk_idx * INV_BATCH;
-                let denoms = &mut denominators[..xs.len() * num_routed_wires];
+                let used = xs.len() * num_chunks;
+                let nums = &mut numerators[..used];
+                let denoms = &mut denominators[..used];
                 for t in 0..xs.len() {
                     let i = base + t;
+                    let x = xs[t];
                     let s_sigmas = &prover_data.sigmas[i];
-                    for j in 0..num_routed_wires {
-                        let wire_value = witness.get_wire(i, j);
-                        denoms[t * num_routed_wires + j] = wire_value + beta * s_sigmas[j] + gamma;
+                    for k in 0..num_chunks {
+                        let start = k * degree;
+                        let end = min(start + degree, num_routed_wires);
+                        let first_wire = witness.get_wire(i, start);
+                        let mut numerator = first_wire + beta_k_is[start] * x + gamma;
+                        let mut denominator = first_wire + beta * s_sigmas[start] + gamma;
+                        for j in start + 1..end {
+                            let wire_value = witness.get_wire(i, j);
+                            numerator *= wire_value + beta_k_is[j] * x + gamma;
+                            denominator *= wire_value + beta * s_sigmas[j] + gamma;
+                        }
+                        nums[t * num_chunks + k] = numerator;
+                        denoms[t * num_chunks + k] = denominator;
                     }
                 }
-                let mut quotient_values = F::batch_multiplicative_inverse(denoms);
-                xs.iter()
-                    .enumerate()
-                    .map(|(t, &x)| {
-                        let i = base + t;
-                        let point_quotients =
-                            &mut quotient_values[t * num_routed_wires..(t + 1) * num_routed_wires];
-                        // Multiply the numerators into the inverse buffer in
-                        // place; the per-point numerator Vecs are gone.
-                        for (j, quotient_value) in point_quotients.iter_mut().enumerate() {
-                            let wire_value = witness.get_wire(i, j);
-                            let numerator = wire_value + beta_k_is[j] * x + gamma;
-                            *quotient_value *= numerator;
-                        }
-                        quotient_chunk_products(point_quotients, degree)
-                    })
-                    .collect::<Vec<_>>()
+                let mut ratios = F::batch_multiplicative_inverse(denoms);
+                for (ratio, &numerator) in ratios.iter_mut().zip(nums.iter()) {
+                    *ratio *= numerator;
+                }
+                ratios
             },
         )
         .flatten()
@@ -491,12 +497,12 @@ fn wires_permutation_partial_products_and_zs<
     // and the whole-phase transpose. Values and their order are identical: for
     // each point, column k receives the k-th running product, and the last
     // column receives the previous Z(x) exactly as the swap-based version did.
-    let n_points = all_quotient_chunk_products.len();
+    let n_points = all_quotient_chunk_products_flat.len() / num_chunks;
     let mut columns: Vec<Vec<F>> = (0..num_prods + 1)
         .map(|_| Vec::with_capacity(n_points))
         .collect();
     let mut z_x = F::ONE;
-    for quotient_chunk_products in all_quotient_chunk_products {
+    for quotient_chunk_products in all_quotient_chunk_products_flat.chunks_exact(num_chunks) {
         let mut acc = z_x;
         for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
             acc *= quotient_chunk_product;
@@ -856,7 +862,9 @@ fn compute_quotient_polys<
                     })
                     .collect();
                 let s_sigmas_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires])
+                    .map(|k| {
+                        &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires]
+                    })
                     .collect();
                 let (local_lookup_batch, next_lookup_batch): (Vec<&[F]>, Vec<&[F]>) = if has_lookup
                 {

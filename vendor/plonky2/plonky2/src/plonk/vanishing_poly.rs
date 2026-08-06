@@ -374,8 +374,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     }
                 }
 
-                let row =
-                    &mut term_rows[(num_challenges + i * num_chunks + c) * n..][..n];
+                let row = &mut term_rows[(num_challenges + i * num_chunks + c) * n..][..n];
                 // The accumulator chain per challenge is laid out as columns
                 // [Z(x) | partials 0..num_prods | Z(gx)], so chunk c reads
                 // column c as prev and column c+1 as next — contiguously.
@@ -885,7 +884,11 @@ pub fn evaluate_gate_constraints_base_batch<F: RichField + Extendable<D>, const 
     vars_batch: EvaluationVarsBaseBatch<F>,
 ) -> Vec<F> {
     let mut constraints_batch = Vec::new();
-    evaluate_gate_constraints_base_batch_into::<F, D>(common_data, vars_batch, &mut constraints_batch);
+    evaluate_gate_constraints_base_batch_into::<F, D>(
+        common_data,
+        vars_batch,
+        &mut constraints_batch,
+    );
     constraints_batch
 }
 

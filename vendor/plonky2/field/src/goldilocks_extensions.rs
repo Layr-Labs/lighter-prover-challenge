@@ -103,9 +103,7 @@ impl Frobenius<5> for QuinticExtension<GoldilocksField> {
     fn repeated_frobenius(&self, count: usize) -> Self {
         // The code below assumes DTH_ROOT = W^((p - 1)/5) = 1041288259238279555,
         // which has multiplicative order 5.
-        const_assert!(
-            <GoldilocksField as Extendable<5>>::DTH_ROOT.0 == 1041288259238279555u64
-        );
+        const_assert!(<GoldilocksField as Extendable<5>>::DTH_ROOT.0 == 1041288259238279555u64);
 
         // FROB_COEFFS[c - 1][i - 1] = DTH_ROOT^(c * i mod 5), the coefficient of
         // limb i under the c-fold Frobenius automorphism.

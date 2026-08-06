@@ -10,10 +10,10 @@ use crate::field::extension::Extendable;
 use crate::field::fft::FftRootTable;
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
-use crate::fri::FriParams;
 use crate::fri::proof::FriProof;
 use crate::fri::prover::fri_proof;
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
+use crate::fri::FriParams;
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::{MerkleLeaves, MerkleTree};
 use crate::iop::challenger::Challenger;
@@ -81,16 +81,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
         if GPU_NTT_COMMITMENTS && !blinding {
-            let value_columns: Vec<&[F]> =
-                values.iter().map(|v| v.values.as_slice()).collect();
+            let value_columns: Vec<&[F]> = values.iter().map(|v| v.values.as_slice()).collect();
             if let Some((columns, digests, cap, coeff_columns)) = timed!(
                 timing,
                 "build Merkle tree",
-                C::Hasher::try_build_commitment_from_values(
-                    &value_columns,
-                    rate_bits,
-                    cap_height,
-                )
+                C::Hasher::try_build_commitment_from_values(&value_columns, rate_bits, cap_height,)
             ) {
                 let degree = values[0].len();
                 let merkle_tree = MerkleTree::from_prebuilt_columns(columns, digests, cap);
@@ -135,18 +130,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let degree = polynomials[0].len();
 
         if GPU_NTT_COMMITMENTS && !blinding {
-            let coeff_columns: Vec<&[F]> = polynomials
-                .iter()
-                .map(|p| p.coeffs.as_slice())
-                .collect();
+            let coeff_columns: Vec<&[F]> =
+                polynomials.iter().map(|p| p.coeffs.as_slice()).collect();
             if let Some((columns, digests, cap)) = timed!(
                 timing,
                 "build Merkle tree",
-                C::Hasher::try_build_commitment_from_coeffs(
-                    &coeff_columns,
-                    rate_bits,
-                    cap_height,
-                )
+                C::Hasher::try_build_commitment_from_coeffs(&coeff_columns, rate_bits, cap_height,)
             ) {
                 let merkle_tree = MerkleTree::from_prebuilt_columns(columns, digests, cap);
                 return Self {
@@ -375,9 +364,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // `final_poly` is dead after this point, so pad it in place instead of
         // the clone-then-resize that `lde(&self)` performs.
         let mut lde_final_poly = final_poly;
-        lde_final_poly
-            .coeffs
-            .resize(lde_final_poly.len() << fri_params.config.rate_bits, F::Extension::ZERO);
+        lde_final_poly.coeffs.resize(
+            lde_final_poly.len() << fri_params.config.rate_bits,
+            F::Extension::ZERO,
+        );
         let lde_final_values = timed!(
             timing,
             &format!("perform final FFT {}", lde_final_poly.len()),
@@ -529,9 +519,7 @@ mod tests {
             // This tree's exact pre-fusion sequence: the consuming in-place
             // division (top slot already the pad) + shift_poly + add.
             let mut expected_in_place = initial.clone();
-            let quotient_in_place = composition_poly
-                .clone()
-                .divide_by_linear_padded_in_place(z);
+            let quotient_in_place = composition_poly.clone().divide_by_linear_padded_in_place(z);
             expected_in_place *= shift; // shift_poly
             expected_in_place += quotient_in_place;
 

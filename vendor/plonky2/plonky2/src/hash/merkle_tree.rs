@@ -260,8 +260,7 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
 
             let (h0, h1, h2, h3) = H::hash_or_noop_quad(leaf_0, leaf_1, leaf_2, leaf_3);
             let (h4, h5, h6, h7) = H::hash_or_noop_quad(leaf_4, leaf_5, leaf_6, leaf_7);
-            let [n01, n23, n45, n67] =
-                H::two_to_one_quad([(h0, h1), (h2, h3), (h4, h5), (h6, h7)]);
+            let [n01, n23, n45, n67] = H::two_to_one_quad([(h0, h1), (h2, h3), (h4, h5), (h6, h7)]);
 
             left_digests_buf[0].write(h0);
             left_digests_buf[1].write(h1);
@@ -376,12 +375,11 @@ pub(crate) fn fill_digests_buf_flat<F: RichField, H: Hasher<F>>(
     // Special case of a tree that's all cap.
     if digests_buf.is_empty() {
         debug_assert_eq!(cap_buf.len(), num_leaves);
-        cap_buf
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, cap_buf)| {
-                cap_buf.write(H::hash_or_noop(&leaves[i * leaf_width..(i + 1) * leaf_width]));
-            });
+        cap_buf.par_iter_mut().enumerate().for_each(|(i, cap_buf)| {
+            cap_buf.write(H::hash_or_noop(
+                &leaves[i * leaf_width..(i + 1) * leaf_width],
+            ));
+        });
         return;
     }
 
@@ -496,8 +494,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
 
         // CPU fallback: materialize the bit-reversed row-major matrix and hash it.
         let flat = crate::util::transpose_to_bitrev_flat(&columns);
-        let (digests, cap) =
-            Self::cpu_digests(&flat, columns.len(), num_leaves, cap_height);
+        let (digests, cap) = Self::cpu_digests(&flat, columns.len(), num_leaves, cap_height);
         Self {
             leaves: MerkleLeaves::Columns {
                 columns: ColumnStore::Owned(columns),

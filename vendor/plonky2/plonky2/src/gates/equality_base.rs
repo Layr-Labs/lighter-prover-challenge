@@ -147,7 +147,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EqualityGate {
     }
 
     fn generators(&self, row: usize, local_constants: &[F]) -> Vec<WitnessGeneratorRef<F, D>> {
-        let result: Vec<WitnessGeneratorRef<F, D>> = (0..self.num_ops)
+        let mut result: Vec<WitnessGeneratorRef<F, D>> = (0..self.num_ops)
             .map(|i| {
                 WitnessGeneratorRef::new(
                     EqualityBaseGenerator {
@@ -160,8 +160,18 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EqualityGate {
                 )
             })
             .collect();
-        //println!("generators {:?}", result.len());
+        result.push(WitnessGeneratorRef::new(
+            EqualityRowInverseGenerator {
+                gate: self.clone(),
+                row,
+            }
+            .adapter(),
+        ));
         result
+    }
+
+    fn num_ops(&self) -> usize {
+        self.num_ops
     }
 
     fn num_wires(&self) -> usize {
@@ -247,16 +257,13 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         let y = get_wire(self.gate.wire_ith_element_1(self.i));
         let equal = Target::wire(self.row, self.gate.wire_ith_output(self.i));
         let diff = Target::wire(self.row, self.gate.wire_ith_temporary(self.i, 0));
-        let invdiff = Target::wire(self.row, self.gate.wire_ith_temporary(self.i, 1));
         let prod = Target::wire(self.row, self.gate.wire_ith_temporary(self.i, 2));
 
-        let inv_value = if x != y { (x - y).inverse() } else { F::ZERO };
         let prod_value = if x != y { F::ONE } else { F::ZERO };
 
         out_buffer.set_target(diff, x - y)?;
         out_buffer.set_bool_target(BoolTarget::new_unsafe(equal), x == y)?;
-        out_buffer.set_target(prod, prod_value)?;
-        out_buffer.set_target(invdiff, inv_value)
+        out_buffer.set_target(prod, prod_value)
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
@@ -276,6 +283,72 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
             row,
             const_0,
             i,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct EqualityRowInverseGenerator {
+    pub gate: EqualityGate,
+    pub row: usize,
+}
+
+impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
+    for EqualityRowInverseGenerator
+{
+    fn id(&self) -> String {
+        "EqualityRowInverseGenerator".to_string()
+    }
+
+    fn dependencies(&self) -> Vec<Target> {
+        (0..self.gate.num_ops)
+            .map(|i| Target::wire(self.row, self.gate.wire_ith_temporary(i, 0)))
+            .collect()
+    }
+
+    fn run_once(
+        &self,
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+    ) -> Result<()> {
+        let mut nonzero = Vec::with_capacity(self.gate.num_ops);
+        let mut positions = Vec::with_capacity(self.gate.num_ops);
+        for i in 0..self.gate.num_ops {
+            let diff =
+                witness.get_target(Target::wire(self.row, self.gate.wire_ith_temporary(i, 0)));
+            if !diff.is_zero() {
+                nonzero.push(diff);
+                positions.push(i);
+            }
+        }
+
+        let inverses = F::batch_multiplicative_inverse(&nonzero);
+        let mut next_nonzero = 0;
+        for i in 0..self.gate.num_ops {
+            let value = if next_nonzero < positions.len() && positions[next_nonzero] == i {
+                let inverse = inverses[next_nonzero];
+                next_nonzero += 1;
+                inverse
+            } else {
+                F::ZERO
+            };
+            out_buffer.set_target(
+                Target::wire(self.row, self.gate.wire_ith_temporary(i, 1)),
+                value,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
+        self.gate.serialize(dst, common_data)?;
+        dst.write_usize(self.row)
+    }
+
+    fn deserialize(src: &mut Buffer, common_data: &CommonCircuitData<F, D>) -> IoResult<Self> {
+        Ok(Self {
+            gate: EqualityGate::deserialize(src, common_data)?,
+            row: src.read_usize()?,
         })
     }
 }

@@ -220,12 +220,7 @@ fn fft_classic_simd_layers<P: PackedField>(
         lg_half_m += 1;
     }
     while lg_half_m < end {
-        fft_classic_simd_fused_two_layers(
-            packed_values,
-            lg_half_m,
-            lg_packed_width,
-            root_table,
-        );
+        fft_classic_simd_fused_two_layers(packed_values, lg_half_m, lg_packed_width, root_table);
         lg_half_m += 2;
     }
 }
@@ -404,7 +399,7 @@ mod tests {
     use unroll::unroll_for_loops;
 
     use crate::extension::quadratic::QuadraticExtension;
-    use crate::fft::{FftRootTable, fft, fft_classic, fft_root_table, fft_with_options, ifft};
+    use crate::fft::{fft, fft_classic, fft_root_table, fft_with_options, ifft, FftRootTable};
     use crate::goldilocks_field::GoldilocksField;
     use crate::packable::Packable;
     use crate::packed::PackedField;
@@ -696,5 +691,4 @@ mod tests {
         fft_classic(&mut actual, r, &roots);
         assert_eq!(actual, expected);
     }
-
 }

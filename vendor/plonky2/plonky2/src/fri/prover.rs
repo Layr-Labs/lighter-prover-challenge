@@ -135,11 +135,8 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // Chunk-wise folding preserves the zero tail: the coefficient vector
         // keeps `1/2^rate_bits` support every round (asserted by the
         // truncation below), so the FFT's zero-run shortcut always applies.
-        values = coeffs.coset_fft_with_options(
-            shift.into(),
-            Some(fri_params.config.rate_bits),
-            None,
-        )
+        values =
+            coeffs.coset_fft_with_options(shift.into(), Some(fri_params.config.rate_bits), None)
     }
 
     // When verifying this proof in a circuit with a different number of query steps,

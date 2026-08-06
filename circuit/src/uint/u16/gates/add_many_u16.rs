@@ -485,4 +485,3 @@ mod batch_tests {
         }
     }
 }
-

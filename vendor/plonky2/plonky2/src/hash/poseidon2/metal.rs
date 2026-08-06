@@ -596,10 +596,9 @@ impl MetalShared {
         let (roots_buffer, roots_offsets) = self.roots_for(log_lde)?;
         let shift_buffer = self.shift_powers_for(degree)?;
         let ones_buffer = self.ones_for(degree)?;
-        let n_inv = crate::field::goldilocks_field::GoldilocksField::inverse_2exp(
-            degree.ilog2() as usize,
-        )
-        .to_canonical_u64();
+        let n_inv =
+            crate::field::goldilocks_field::GoldilocksField::inverse_2exp(degree.ilog2() as usize)
+                .to_canonical_u64();
 
         let column_buffer = autoreleasepool(|| {
             self.device
@@ -633,9 +632,8 @@ impl MetalShared {
                     .par_chunks_mut(degree)
                     .zip(value_columns.par_iter())
                     .for_each(|(destination, column)| {
-                        let source = unsafe {
-                            slice::from_raw_parts(column.as_ptr().cast::<u64>(), degree)
-                        };
+                        let source =
+                            unsafe { slice::from_raw_parts(column.as_ptr().cast::<u64>(), degree) };
                         destination.copy_from_slice(source);
                     });
             }
@@ -792,15 +790,19 @@ impl MetalShared {
             let nodes = unsafe {
                 slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
             };
-            Ok(tree_from_levels(nodes, &level_offsets, lde_size, cap_height))
+            Ok(tree_from_levels(
+                nodes,
+                &level_offsets,
+                lde_size,
+                cap_height,
+            ))
         })();
         self.release_set(set);
         let (digests, cap) = result?;
 
         // Copy the coefficients out for the oracle's `polynomials` field.
-        let coeff_source = unsafe {
-            slice::from_raw_parts(coeffs_buffer.contents().cast::<F>(), value_len)
-        };
+        let coeff_source =
+            unsafe { slice::from_raw_parts(coeffs_buffer.contents().cast::<F>(), value_len) };
         let coeff_columns: Vec<Vec<F>> = coeff_source
             .par_chunks(degree)
             .map(|chunk| chunk.to_vec())
@@ -932,9 +934,8 @@ impl MetalShared {
                 .par_chunks_mut(degree)
                 .zip(coeff_columns.par_iter())
                 .for_each(|(destination, column)| {
-                    let source = unsafe {
-                        slice::from_raw_parts(column.as_ptr().cast::<u64>(), degree)
-                    };
+                    let source =
+                        unsafe { slice::from_raw_parts(column.as_ptr().cast::<u64>(), degree) };
                     destination.copy_from_slice(source);
                 });
         }
@@ -983,11 +984,7 @@ impl MetalShared {
                 );
                 set_u32(stage_encoder, 2, lde_size_u32);
                 set_u32(stage_encoder, 3, stage);
-                set_u32(
-                    stage_encoder,
-                    4,
-                    u32::from(stage == log_lde - 1),
-                );
+                set_u32(stage_encoder, 4, u32::from(stage == log_lde - 1));
                 dispatch2d(stage_encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
                 stage_encoder.end_encoding();
             }
@@ -1045,10 +1042,14 @@ impl MetalShared {
             ));
         }
 
-        let nodes = unsafe {
-            slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
-        };
-        Ok(tree_from_levels(nodes, &level_offsets, lde_size, cap_height))
+        let nodes =
+            unsafe { slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len) };
+        Ok(tree_from_levels(
+            nodes,
+            &level_offsets,
+            lde_size,
+            cap_height,
+        ))
     }
 
     fn build<F: RichField>(
@@ -1105,11 +1106,9 @@ impl MetalShared {
     ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
         let cap_count = 1usize << cap_height;
 
-        if set
-            .input
-            .as_ref()
-            .map_or(true, |buffer| buffer.length() < input_bytes.max(size_of::<u64>()) as u64)
-        {
+        if set.input.as_ref().map_or(true, |buffer| {
+            buffer.length() < input_bytes.max(size_of::<u64>()) as u64
+        }) {
             set.input = Some(autoreleasepool(|| {
                 self.device.new_buffer(
                     input_bytes.max(size_of::<u64>()) as u64,
@@ -1127,9 +1126,8 @@ impl MetalShared {
             };
             match &source {
                 LeafSource::Rows(leaves) => {
-                    let source = unsafe {
-                        slice::from_raw_parts(leaves.as_ptr().cast::<u64>(), input_len)
-                    };
+                    let source =
+                        unsafe { slice::from_raw_parts(leaves.as_ptr().cast::<u64>(), input_len) };
                     destination
                         .par_chunks_mut(STAGING_CHUNK)
                         .zip(source.par_chunks(STAGING_CHUNK))
@@ -1143,10 +1141,7 @@ impl MetalShared {
                         .zip(columns.par_iter())
                         .for_each(|(destination, column)| {
                             let source = unsafe {
-                                slice::from_raw_parts(
-                                    column.as_ptr().cast::<u64>(),
-                                    leaf_count,
-                                )
+                                slice::from_raw_parts(column.as_ptr().cast::<u64>(), leaf_count)
                             };
                             destination.copy_from_slice(source);
                         });
@@ -1585,7 +1580,9 @@ kernel void goldilocks_mul_bench_native(
                     let options = CompileOptions::new();
                     let library = device
                         .new_library_with_source(source, &options)
-                        .unwrap_or_else(|error| panic!("Poseidon2 benchmark shader failed: {error}"));
+                        .unwrap_or_else(|error| {
+                            panic!("Poseidon2 benchmark shader failed: {error}")
+                        });
                     let pipeline = |name| {
                         let function = library
                             .get_function(name, None)
@@ -1599,8 +1596,11 @@ kernel void goldilocks_mul_bench_native(
                         pipeline("poseidon2_hash_parents"),
                     )
                 };
-                let native_source =
-                    ["#define POSEIDON2_NATIVE_ARITHMETIC_REFERENCE 1\n", SHADER_SOURCE].concat();
+                let native_source = [
+                    "#define POSEIDON2_NATIVE_ARITHMETIC_REFERENCE 1\n",
+                    SHADER_SOURCE,
+                ]
+                .concat();
                 let (limb_leaf, limb) = pipelines(SHADER_SOURCE);
                 let (native_leaf, native) = pipelines(&native_source);
 
@@ -1764,8 +1764,7 @@ kernel void goldilocks_mul_bench_native(
             )
         });
         harness.run(&harness.differential, &input, &output, count);
-        let actual =
-            unsafe { slice::from_raw_parts(output.contents().cast::<u64>(), count * 6) };
+        let actual = unsafe { slice::from_raw_parts(output.contents().cast::<u64>(), count * 6) };
         for (index, (input, output)) in pairs
             .chunks_exact(2)
             .zip(actual.chunks_exact(6))
@@ -1786,10 +1785,16 @@ kernel void goldilocks_mul_bench_native(
             );
             let expected_add = ((a + b) % P) as u64;
             assert_eq!(output[2], expected_add, "limb add mismatch at pair {index}");
-            assert_eq!(output[3], expected_add, "native add mismatch at pair {index}");
+            assert_eq!(
+                output[3], expected_add,
+                "native add mismatch at pair {index}"
+            );
             let expected_sub = ((a + P - b) % P) as u64;
             assert_eq!(output[4], expected_sub, "limb sub mismatch at pair {index}");
-            assert_eq!(output[5], expected_sub, "native sub mismatch at pair {index}");
+            assert_eq!(
+                output[5], expected_sub,
+                "native sub mismatch at pair {index}"
+            );
         }
     }
 
@@ -1871,16 +1876,14 @@ kernel void goldilocks_mul_bench_native(
         });
         let output_bytes = count * 4 * size_of::<u64>();
         let limb_output = autoreleasepool(|| {
-            harness.device.new_buffer(
-                output_bytes as u64,
-                MTLResourceOptions::StorageModeShared,
-            )
+            harness
+                .device
+                .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
         });
         let native_output = autoreleasepool(|| {
-            harness.device.new_buffer(
-                output_bytes as u64,
-                MTLResourceOptions::StorageModeShared,
-            )
+            harness
+                .device
+                .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
         });
         harness.run(&harness.limb, &input, &limb_output, count);
         harness.run(&harness.native, &input, &native_output, count);
@@ -2043,11 +2046,8 @@ kernel void goldilocks_mul_bench_native(
                 })
                 .collect();
 
-            let context = CONTEXT
-                .as_ref()
-                .unwrap_or_else(|error| panic!("{error}"));
-            let coeff_refs: Vec<&[GoldilocksField]> =
-                coeffs.iter().map(|c| c.as_slice()).collect();
+            let context = CONTEXT.as_ref().unwrap_or_else(|error| panic!("{error}"));
+            let coeff_refs: Vec<&[GoldilocksField]> = coeffs.iter().map(|c| c.as_slice()).collect();
             for cap_height in [0, 3] {
                 let (gpu_columns, gpu_digests, gpu_cap) = context
                     .build_from_coeffs(&coeff_refs, degree, rate_bits, cap_height)
@@ -2066,10 +2066,8 @@ kernel void goldilocks_mul_bench_native(
 
                 // Tree must match the CPU tree over the bit-reversed transpose.
                 let flat = transpose_to_bitrev_flat(&cpu_columns);
-                let rows: Vec<Vec<GoldilocksField>> = flat
-                    .chunks(cols)
-                    .map(|row| row.to_vec())
-                    .collect();
+                let rows: Vec<Vec<GoldilocksField>> =
+                    flat.chunks(cols).map(|row| row.to_vec()).collect();
                 let cpu = cpu_tree(&rows, cap_height);
                 assert_tree_eq(&(gpu_digests, gpu_cap), &cpu, cols, cap_height);
             }
@@ -2111,11 +2109,8 @@ kernel void goldilocks_mul_bench_native(
                 })
                 .collect();
 
-            let context = CONTEXT
-                .as_ref()
-                .unwrap_or_else(|error| panic!("{error}"));
-            let value_refs: Vec<&[GoldilocksField]> =
-                values.iter().map(|v| v.as_slice()).collect();
+            let context = CONTEXT.as_ref().unwrap_or_else(|error| panic!("{error}"));
+            let value_refs: Vec<&[GoldilocksField]> = values.iter().map(|v| v.as_slice()).collect();
             let cap_height = 3;
             let (gpu_columns, gpu_digests, gpu_cap, gpu_coeffs) = context
                 .build_from_values(&value_refs, degree, rate_bits, cap_height)
@@ -2169,8 +2164,10 @@ kernel void goldilocks_mul_bench_native(
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>();
-            let flat: Vec<GoldilocksField> =
-                leaves.iter().flat_map(|leaf| leaf.iter().copied()).collect();
+            let flat: Vec<GoldilocksField> = leaves
+                .iter()
+                .flat_map(|leaf| leaf.iter().copied())
+                .collect();
 
             let log_rows = leaves.len().ilog2() as usize;
             let columns: Vec<Vec<GoldilocksField>> = (0..width)
@@ -2186,16 +2183,9 @@ kernel void goldilocks_mul_bench_native(
                 .collect();
 
             for cap_height in [0, 3, 6] {
-                let context = CONTEXT
-                    .as_ref()
-                    .unwrap_or_else(|error| panic!("{error}"));
+                let context = CONTEXT.as_ref().unwrap_or_else(|error| panic!("{error}"));
                 let gpu = context
-                    .build(
-                        LeafSource::Rows(&flat),
-                        width,
-                        leaves.len(),
-                        cap_height,
-                    )
+                    .build(LeafSource::Rows(&flat), width, leaves.len(), cap_height)
                     .unwrap();
                 let cpu = cpu_tree(&leaves, cap_height);
                 assert_tree_eq(&gpu, &cpu, width, cap_height);
