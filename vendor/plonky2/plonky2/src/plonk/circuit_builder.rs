@@ -1268,7 +1268,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         for (i, generator) in self.generators.iter().enumerate() {
             for watch in generator.0.watch_list() {
                 let watch_index = forest.target_index(watch);
-                let watch_rep_index = forest.parents[watch_index];
+                let watch_rep_index = forest.parents[watch_index] as usize;
                 generator_indices_by_watches
                     .entry(watch_rep_index)
                     .or_insert_with(Vec::new)

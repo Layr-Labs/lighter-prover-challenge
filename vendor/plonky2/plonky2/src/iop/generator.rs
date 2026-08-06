@@ -175,8 +175,9 @@ fn run_generator_worklist<
                         );
                         entries.push((generator_idx, finished, round_buffer.target_values.len()));
                         for (t, v) in round_buffer.target_values.drain(..) {
-                            let rep_index =
-                                round_witness.representative_map[round_witness.target_index(t)];
+                            let rep_index = round_witness.representative_map
+                                [round_witness.target_index(t)]
+                                as usize;
                             let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
                                 generator_indices_by_watches.get(&rep_index)
                             } else {

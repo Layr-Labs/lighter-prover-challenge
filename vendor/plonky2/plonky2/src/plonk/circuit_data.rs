@@ -381,7 +381,7 @@ pub struct ProverOnlyCircuitData<
     pub public_inputs: Vec<Target>,
     /// A map from each `Target`'s index to the index of its representative in the disjoint-set
     /// forest.
-    pub representative_map: Vec<usize>,
+    pub representative_map: Vec<u32>,
     /// Pre-computed roots for faster FFT.
     pub fft_root_table: Option<FftRootTable<F>>,
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to
@@ -701,4 +701,47 @@ pub struct VerifierCircuitTarget {
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to
     /// seed Fiat-Shamir.
     pub circuit_digest: HashOutTarget,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::Field;
+    use crate::iop::witness::WitnessWrite;
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+    use crate::util::serialization::{DefaultGateSerializer, DefaultGeneratorSerializer};
+
+    #[test]
+    fn serialized_copy_constraint_circuit_still_proves() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type C = PoseidonGoldilocksConfig;
+
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let left = builder.add_virtual_target();
+        let right = builder.add_virtual_target();
+        builder.connect(left, right);
+        builder.register_public_input(left);
+        let data = builder.build::<C>();
+
+        let gate_serializer = DefaultGateSerializer;
+        let generator_serializer = DefaultGeneratorSerializer::<C, D>::default();
+        let bytes = data
+            .to_bytes(&gate_serializer, &generator_serializer)
+            .unwrap();
+        let restored = CircuitData::<F, C, D>::from_bytes(
+            &bytes,
+            &gate_serializer,
+            &generator_serializer,
+        )
+        .unwrap();
+
+        let mut witness = PartialWitness::new();
+        witness.set_target(left, F::from_canonical_u64(7)).unwrap();
+        witness.set_target(right, F::from_canonical_u64(7)).unwrap();
+        let proof = restored.prove(witness).unwrap();
+        restored.verify(proof).unwrap();
+    }
 }

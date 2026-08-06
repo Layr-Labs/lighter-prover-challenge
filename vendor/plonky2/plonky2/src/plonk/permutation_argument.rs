@@ -11,7 +11,7 @@ use crate::iop::wire::Wire;
 /// Disjoint Set Forest data-structure following <https://en.wikipedia.org/wiki/Disjoint-set_data_structure>.
 pub struct Forest {
     /// A map of parent pointers, stored as indices.
-    pub(crate) parents: Vec<usize>,
+    pub(crate) parents: Vec<u32>,
 
     num_wires: usize,
     num_routed_wires: usize,
@@ -42,7 +42,7 @@ impl Forest {
     pub fn add(&mut self, t: Target) {
         let index = self.parents.len();
         debug_assert_eq!(self.target_index(t), index);
-        self.parents.push(index);
+        self.parents.push(index as u32);
     }
 
     /// Path compression method, see <https://en.wikipedia.org/wiki/Disjoint-set_data_structure#Finding_set_representatives>.
@@ -51,14 +51,14 @@ impl Forest {
 
         // First, find the representative of the set containing `x_index`.
         let mut representative = x_index;
-        while self.parents[representative] != representative {
-            representative = self.parents[representative];
+        while self.parents[representative] as usize != representative {
+            representative = self.parents[representative] as usize;
         }
 
         // Then, update each node in this chain to point directly to the representative.
-        while self.parents[x_index] != x_index {
-            let old_parent = self.parents[x_index];
-            self.parents[x_index] = representative;
+        while self.parents[x_index] as usize != x_index {
+            let old_parent = self.parents[x_index] as usize;
+            self.parents[x_index] = representative as u32;
             x_index = old_parent;
         }
 
@@ -74,7 +74,7 @@ impl Forest {
             return;
         }
 
-        self.parents[y_index] = x_index;
+        self.parents[y_index] = x_index as u32;
     }
 
     /// Compress all paths. After calling this, every `parent` value will point to the node's
@@ -94,7 +94,7 @@ impl Forest {
         for row in 0..self.degree {
             for column in 0..self.num_routed_wires {
                 let t = Target::Wire(Wire { row, column });
-                let parent = self.parents[self.target_index(t)];
+                let parent = self.parents[self.target_index(t)] as usize;
                 let index = (column * self.degree + row) as u32;
                 if first[parent] == u32::MAX {
                     first[parent] = index;

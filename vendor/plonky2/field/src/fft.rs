@@ -259,6 +259,54 @@ fn fft_zero_padded_first_layer_block<P: PackedField>(
     }
 }
 
+#[inline(always)]
+fn fft_zero_padded_first_two_layers_block<P: PackedField>(
+    packed_values: &mut [P],
+    source_start: usize,
+    nonzero_len: usize,
+    destination: usize,
+    packed_repeat: usize,
+    first_omegas: &[P],
+    second_omegas: &[P],
+) {
+    debug_assert!(nonzero_len >= 4);
+    debug_assert_eq!(first_omegas.len(), packed_repeat);
+    debug_assert_eq!(second_omegas.len(), 2 * packed_repeat);
+
+    // Four live coefficients expand into one complete block for the first two nontrivial layers.
+    // Reading the group before writing it and traversing backwards prevents expanded output from
+    // clobbering unread prefix coefficients.
+    for group in (0..nonzero_len / 4).rev() {
+        let source = source_start + group * 4;
+        let a = packed_values[source / P::WIDTH].as_slice()[source % P::WIDTH];
+        let b = packed_values[(source + 1) / P::WIDTH].as_slice()[(source + 1) % P::WIDTH];
+        let c = packed_values[(source + 2) / P::WIDTH].as_slice()[(source + 2) % P::WIDTH];
+        let d = packed_values[(source + 3) / P::WIDTH].as_slice()[(source + 3) % P::WIDTH];
+        let a = P::from(a);
+        let b = P::from(b);
+        let c = P::from(c);
+        let d = P::from(d);
+        let group_destination = destination + group * 4 * packed_repeat;
+
+        for j in 0..packed_repeat {
+            let ab_t = first_omegas[j] * b;
+            let cd_t = first_omegas[j] * d;
+            let ab_plus = a + ab_t;
+            let ab_minus = a - ab_t;
+            let cd_plus = c + cd_t;
+            let cd_minus = c - cd_t;
+
+            let plus_t = second_omegas[j] * cd_plus;
+            packed_values[group_destination + j] = ab_plus + plus_t;
+            packed_values[group_destination + 2 * packed_repeat + j] = ab_plus - plus_t;
+
+            let minus_t = second_omegas[packed_repeat + j] * cd_minus;
+            packed_values[group_destination + packed_repeat + j] = ab_minus + minus_t;
+            packed_values[group_destination + 3 * packed_repeat + j] = ab_minus - minus_t;
+        }
+    }
+}
+
 /// Expand a bit-reversed nonzero prefix and perform its first nontrivial FFT layer in one pass.
 ///
 /// This is called only when each repeated run contains at least one packed vector.
@@ -290,24 +338,26 @@ fn fft_zero_padded_cache_blocks<P: PackedField>(
     let packed_block_len = block_len / P::WIDTH;
     let num_blocks = values.len() / block_len;
     let packed_values = P::pack_slice_mut(values);
-    let omega_table = P::pack_slice(&root_table[r]);
+    let first_omegas = P::pack_slice(&root_table[r]);
+    let second_omegas = P::pack_slice(&root_table[r + 1]);
 
     // Expand blocks from the end of the buffer so their output cannot clobber unread prefix
     // coefficients. Complete every block-local layer immediately while the block is still hot.
     for block in (0..num_blocks).rev() {
         let source_start = block * nonzero_per_block;
         let destination = block * packed_block_len;
-        fft_zero_padded_first_layer_block(
+        fft_zero_padded_first_two_layers_block(
             packed_values,
             source_start,
             nonzero_per_block,
             destination,
             packed_repeat,
-            omega_table,
+            first_omegas,
+            second_omegas,
         );
         fft_classic_simd_layers(
             &mut packed_values[destination..destination + packed_block_len],
-            r + 1,
+            r + 2,
             lg_block_n,
             root_table,
         );
