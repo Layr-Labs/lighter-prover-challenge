@@ -2,6 +2,7 @@
 use alloc::{vec, vec::Vec};
 use core::ops::Range;
 
+use plonky2_maybe_rayon::*;
 use serde::Serialize;
 
 use crate::field::extension::Extendable;
@@ -119,7 +120,17 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     let num_gates = gates.len();
     let max_gate_degree = gates.last().expect("No gates?").0.degree();
 
-    let index = |id| gates.iter().position(|g| g.0.id() == id).unwrap();
+    // Precompute each gate's id once. The previous closure re-materialized every
+    // gate's id `String` for every instance (gates × instances allocations); the
+    // lookup below now allocates one id per instance and compares against the
+    // fixed table, which is the same position computation with identical output.
+    let gate_ids: Vec<String> = gates.iter().map(|g| g.0.id()).collect();
+    let index = |id: String| {
+        gate_ids
+            .iter()
+            .position(|gate_id| *gate_id == id)
+            .unwrap()
+    };
 
     // Special case if we can use only one selector polynomial.
     if max_gate_degree + num_gates - 1 <= max_degree {
@@ -129,7 +140,7 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
         return (
             vec![PolynomialValues::new(
                 instances
-                    .iter()
+                    .par_iter()
                     .map(|g| F::from_canonical_usize(index(g.gate_ref.0.id())))
                     .collect(),
             )],
@@ -167,19 +178,28 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     // Placeholder value to indicate that a gate doesn't use a selector polynomial.
     let unused = F::from_canonical_usize(UNUSED_SELECTOR);
 
+    // Resolve each instance's gate index and group once (same computation as the
+    // serial loop, instance-independent), then fill each selector polynomial with
+    // the identical values it received before.
+    let instance_indices: Vec<usize> = instances
+        .par_iter()
+        .map(|g| index(g.gate_ref.0.id()))
+        .collect();
+    let instance_groups: Vec<usize> = instance_indices.iter().map(|&i| group(i)).collect();
+
     let mut polynomials = vec![PolynomialValues::zero(n); groups.len()];
-    for (j, g) in instances.iter().enumerate() {
-        let GateInstance { gate_ref, .. } = g;
-        let i = index(gate_ref.0.id());
-        let gr = group(i);
-        for g in 0..groups.len() {
-            polynomials[g].values[j] = if g == gr {
-                F::from_canonical_usize(i)
-            } else {
-                unused
-            };
-        }
-    }
+    polynomials
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(g, polynomial)| {
+            for (j, values_j) in polynomial.values.iter_mut().enumerate() {
+                *values_j = if g == instance_groups[j] {
+                    F::from_canonical_usize(instance_indices[j])
+                } else {
+                    unused
+                };
+            }
+        });
 
     (
         polynomials,

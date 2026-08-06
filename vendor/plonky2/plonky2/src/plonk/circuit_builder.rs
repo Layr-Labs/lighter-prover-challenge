@@ -53,7 +53,9 @@ use crate::timed;
 use crate::util::context_tree::ContextTree;
 use crate::util::partial_products::num_partial_products;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil, log2_strict, transpose, transpose_poly_values};
+use plonky2_maybe_rayon::*;
+
+use crate::util::{log2_ceil, log2_strict, transpose_poly_values};
 
 /// Number of random coins needed for lookups (for each challenge).
 /// A coin is a randomly sampled extension field element from the verifier,
@@ -979,20 +981,23 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .map(|g| g.0.num_constants())
             .max()
             .unwrap();
-        transpose(
-            &self
-                .gate_instances
-                .iter()
-                .map(|g| {
-                    let mut consts = g.constants.clone();
-                    consts.resize(max_constants, F::ZERO);
-                    consts
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_iter()
-        .map(PolynomialValues::new)
-        .collect()
+        // Write each constant column directly instead of materializing a padded
+        // row-major copy of every instance's constants (one Vec clone + resize per
+        // instance) and then transposing it. Column `c`, row `j` receives exactly
+        // the value the transpose produced: `constants[c]` if present, else the
+        // `F::ZERO` padding.
+        let instances = &self.gate_instances;
+        (0..max_constants)
+            .into_par_iter()
+            .map(|c| {
+                PolynomialValues::new(
+                    instances
+                        .iter()
+                        .map(|g| g.constants.get(c).copied().unwrap_or(F::ZERO))
+                        .collect(),
+                )
+            })
+            .collect()
     }
 
     fn sigma_vecs(&self, k_is: &[F], subgroup: &[F]) -> (Vec<PolynomialValues<F>>, Forest) {
