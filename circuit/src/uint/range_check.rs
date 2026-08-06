@@ -8,8 +8,10 @@ use std::collections::HashSet;
 use anyhow::Result;
 use log::warn;
 use plonky2::field::extension::Extendable;
+use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
 use plonky2::gates::gate::Gate;
+use plonky2::gates::packed_util::PackedEvaluableBase;
 use plonky2::gates::util::StridedConstraintConsumer;
 use plonky2::hash::hash_types::RichField;
 use plonky2::iop::ext_target::ExtensionTarget;
@@ -19,7 +21,10 @@ use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
 use plonky2::plonk::plonk_common::{reduce_with_powers, reduce_with_powers_ext_circuit};
-use plonky2::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBase};
+use plonky2::plonk::vars::{
+    EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch,
+    EvaluationVarsBasePacked,
+};
 use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
 
 use crate::builder::Builder;
@@ -298,36 +303,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
 
     fn eval_unfiltered_base_one(
         &self,
-        vars: EvaluationVarsBase<F>,
-        mut yield_constr: StridedConstraintConsumer<F>,
+        _vars: EvaluationVarsBase<F>,
+        _yield_constr: StridedConstraintConsumer<F>,
     ) {
-        let base = F::from_canonical_usize(Self::BASE);
-        for i in 0..self.num_ops {
-            let input_limb = vars.local_wires[self.wire_ith_input(i)];
-            let aux_limbs: Vec<_> = (0..self.aux_limbs_per_input())
-                .map(|j| vars.local_wires[self.wire_ith_input_jth_aux_limb(i, j)])
-                .collect();
-            let computed_sum = reduce_with_powers(&aux_limbs, base);
+        panic!("use eval_unfiltered_base_packed instead");
+    }
 
-            yield_constr.one(computed_sum - input_limb);
-            for aux_limb in aux_limbs.iter().take(aux_limbs.len() - 1) {
-                yield_constr.one(
-                    (0..Self::BASE)
-                        .map(|i| *aux_limb - F::from_canonical_usize(i))
-                        .product(),
-                );
-            }
-            let iter = if self.bit_size % 2 == 1 {
-                Self::BASE / 2
-            } else {
-                Self::BASE
-            };
-            yield_constr.one(
-                (0..iter)
-                    .map(|i| *aux_limbs.last().unwrap() - F::from_canonical_usize(i))
-                    .product(),
-            );
-        }
+    fn eval_unfiltered_base_batch(&self, vars: EvaluationVarsBaseBatch<F>) -> Vec<F> {
+        self.eval_unfiltered_base_batch_packed(vars)
     }
 
     fn eval_unfiltered_circuit(
@@ -414,6 +397,48 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
     }
 }
 
+impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
+    for RangeCheckGate<F, D>
+{
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+        &self,
+        vars: EvaluationVarsBasePacked<P>,
+        mut yield_constr: StridedConstraintConsumer<P>,
+    ) {
+        let base = F::from_canonical_usize(Self::BASE);
+        let aux_limbs_per_input = self.aux_limbs_per_input();
+        let last_limb_range = if self.bit_size % Self::AUX_LIMB_BITS == 0 {
+            Self::BASE
+        } else {
+            1 << (self.bit_size % Self::AUX_LIMB_BITS)
+        };
+
+        for i in 0..self.num_ops {
+            let input_limb = vars.local_wires[self.wire_ith_input(i)];
+            let aux_start = self.wire_ith_input_jth_aux_limb(i, 0);
+            let aux_limbs = vars
+                .local_wires
+                .view(aux_start..aux_start + aux_limbs_per_input);
+            let computed_sum = reduce_with_powers(aux_limbs, base);
+
+            yield_constr.one(computed_sum - input_limb);
+            for &aux_limb in aux_limbs.iter().take(aux_limbs_per_input - 1) {
+                yield_constr.one(
+                    (0..Self::BASE)
+                        .map(|value| aux_limb - F::from_canonical_usize(value))
+                        .product::<P>(),
+                );
+            }
+            let last_limb = aux_limbs[aux_limbs_per_input - 1];
+            yield_constr.one(
+                (0..last_limb_range)
+                    .map(|value| last_limb - F::from_canonical_usize(value))
+                    .product::<P>(),
+            );
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RangeCheckGenerator<F: RichField + Extendable<D>, const D: usize> {
     pub gate: RangeCheckGate<F, D>,
@@ -476,11 +501,13 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
 mod tests {
     use anyhow::Result;
     use paste::paste;
+    use plonky2::field::extension::FieldExtension;
     use plonky2::field::goldilocks_field::GoldilocksField;
-    use plonky2::field::types::Field;
     #[allow(unused_imports)]
     use plonky2::field::types::Field64;
+    use plonky2::field::types::{Field, Sample};
     use plonky2::gates::gate_testing::{test_eval_fns, test_low_degree};
+    use plonky2::hash::hash_types::HashOut;
     use plonky2::iop::target::Target;
     use plonky2::iop::witness::{PartialWitness, WitnessWrite};
     use plonky2::plonk::circuit_data::CircuitConfig;
@@ -488,6 +515,51 @@ mod tests {
     use rand::Rng;
 
     use super::*;
+
+    #[test]
+    fn packed_base_batch_matches_extension_evaluation_with_leftovers() {
+        const D: usize = 2;
+        const BATCH_SIZE: usize = 11;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type EF = <F as Extendable<D>>::Extension;
+
+        let gate = RangeCheckGate::<F, D>::new_from_config(
+            &CircuitConfig::standard_recursion_config(),
+            32,
+        );
+        let wires = F::rand_vec(gate.num_wires() * BATCH_SIZE);
+        let public_inputs_hash = HashOut {
+            elements: [F::ZERO; 4],
+        };
+        let packed = gate.eval_unfiltered_base_batch(EvaluationVarsBaseBatch::new(
+            BATCH_SIZE,
+            &[],
+            &wires,
+            &public_inputs_hash,
+        ));
+
+        let mut expected = vec![F::ZERO; gate.num_constraints() * BATCH_SIZE];
+        for point in 0..BATCH_SIZE {
+            let point_wires = (0..gate.num_wires())
+                .map(|wire| {
+                    <EF as FieldExtension<D>>::from_basefield(wires[wire * BATCH_SIZE + point])
+                })
+                .collect::<Vec<_>>();
+            let point_constraints = gate.eval_unfiltered(EvaluationVars {
+                local_constants: &[],
+                local_wires: &point_wires,
+                public_inputs_hash: &public_inputs_hash,
+            });
+            for (constraint, value) in point_constraints.into_iter().enumerate() {
+                assert!(<EF as FieldExtension<D>>::is_in_basefield(&value));
+                expected[constraint * BATCH_SIZE + point] =
+                    <EF as FieldExtension<D>>::to_basefield_array(&value)[0];
+            }
+        }
+
+        assert_eq!(packed, expected);
+    }
 
     macro_rules! generate_low_degree_tests {
         ($bit_size:expr) => {
