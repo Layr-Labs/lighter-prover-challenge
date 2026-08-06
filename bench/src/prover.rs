@@ -1,6 +1,8 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
+use std::collections::VecDeque;
+
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
@@ -22,15 +24,19 @@ use plonky2::util::timing::TimingTree;
 
 use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
 
+/// Transaction proofs allowed to be in flight at once within a single transaction path.
+///
+/// Transaction proofs are independent of one another, so more than one can run at a time; the
+/// witnesses feeding them are not, and are still produced one chunk at a time on the path thread.
+/// Each in-flight proof owns a partition witness and the prover buffers derived from it, so this
+/// constant is what bounds peak memory. A depth of 1 reproduces the previous serial behaviour.
+const TX_PROOF_QUEUE_DEPTH: usize = 2;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxPath {
     Heavy,
     Light,
 }
-
-const LIGHT_TX_PROOF_WINDOW: usize = 2;
-// Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
-const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
 fn chunk_is_light(txs: &[Tx<F>]) -> bool {
     txs.first()
@@ -216,30 +222,46 @@ fn prove_path(
     std::thread::scope(|scope| {
         let base = &base_proof;
         let mut chain: Option<ChainState<'_>> = None;
-        let mut pending_tx: Option<(u64, Proof)> = None;
-        let mut in_flight = std::collections::VecDeque::new();
+        let mut in_flight: VecDeque<(u64, std::thread::ScopedJoinHandle<'_, Proof>)> =
+            VecDeque::with_capacity(TX_PROOF_QUEUE_DEPTH);
         let mut current_step = 0u64;
 
+        let spawn_chain_step = |chain_step: u64, tx_proof: Proof, previous_proof: Option<Proof>| {
+            std::thread::Builder::new()
+                .name(format!("{path:?}-chain-step-{chain_step}"))
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    chain_step_proof(
+                        path,
+                        chain_target,
+                        chain_data,
+                        chain_step,
+                        previous_proof.as_ref(),
+                        base,
+                        dummy_proof,
+                        &tx_proof,
+                    )
+                })
+                .expect("chain step pipeline thread must start")
+        };
+
         loop {
-            if let Some((chain_step, tx_proof)) = pending_tx.take() {
+            // Retire the oldest transaction proof before the queue can grow past its bound, so no
+            // more than `TX_PROOF_QUEUE_DEPTH` proofs are ever alive at once. Popping the front
+            // keeps chain steps fed in chunk order.
+            if in_flight.len() == TX_PROOF_QUEUE_DEPTH {
+                let (chain_step, handle) = in_flight
+                    .pop_front()
+                    .expect("full transaction proof queue must have an oldest entry");
+                let tx_proof = handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                 let previous_proof = chain.take().map(ChainState::wait);
-                let handle = std::thread::Builder::new()
-                    .name(format!("{path:?}-chain-step-{chain_step}"))
-                    .stack_size(PROVER_THREAD_STACK_BYTES)
-                    .spawn_scoped(scope, move || {
-                        chain_step_proof(
-                            path,
-                            chain_target,
-                            chain_data,
-                            chain_step,
-                            previous_proof.as_ref(),
-                            base,
-                            dummy_proof,
-                            &tx_proof,
-                        )
-                    })
-                    .expect("chain step pipeline thread must start");
-                chain = Some(ChainState::InFlight(handle));
+                chain = Some(ChainState::InFlight(spawn_chain_step(
+                    chain_step,
+                    tx_proof,
+                    previous_proof,
+                )));
             }
 
             let witness = current_witness;
@@ -250,6 +272,8 @@ fn prove_path(
                     prove_tx_witness(path, current_chunk_index, tx_data, witness)
                 })
                 .expect("transaction proof pipeline thread must start");
+            in_flight.push_back((current_step, proof_handle));
+            current_step += 1;
 
             let next_witness = chunks.next().map(|(chunk_index, txs)| {
                 let (witness, next_jump) = generate_tx_witness(
@@ -266,24 +290,6 @@ fn prove_path(
                 (chunk_index, witness)
             });
 
-            in_flight.push_back((current_step, proof_handle));
-            let max_in_flight =
-                if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
-                    LIGHT_TX_PROOF_WINDOW
-                } else {
-                    1
-                };
-            if in_flight.len() >= max_in_flight {
-                let (proof_step, proof_handle) = in_flight
-                    .pop_front()
-                    .expect("transaction proof window must not be empty");
-                let tx_proof = proof_handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                pending_tx = Some((proof_step, tx_proof));
-            }
-            current_step += 1;
-
             match next_witness {
                 Some((chunk_index, witness)) => {
                     current_chunk_index = chunk_index;
@@ -293,42 +299,27 @@ fn prove_path(
             }
         }
 
-        if let Some((chain_step, tx_proof)) = pending_tx.take() {
-            let previous_proof = chain.take().map(ChainState::wait);
-            let handle = std::thread::Builder::new()
-                .name(format!("{path:?}-chain-step-{chain_step}"))
-                .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, move || {
-                    chain_step_proof(
-                        path,
-                        chain_target,
-                        chain_data,
-                        chain_step,
-                        previous_proof.as_ref(),
-                        base,
-                        dummy_proof,
-                        &tx_proof,
-                    )
-                })
-                .expect("chain step pipeline thread must start");
-            chain = Some(ChainState::InFlight(handle));
-        }
-        while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
-            let tx_proof = proof_handle
+        while let Some((chain_step, handle)) = in_flight.pop_front() {
+            let tx_proof = handle
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             let previous_proof = chain.take().map(ChainState::wait);
-            chain = Some(ChainState::Ready(chain_step_proof(
-                path,
-                chain_target,
-                chain_data,
-                chain_step,
-                previous_proof.as_ref(),
-                base,
-                dummy_proof,
-                &tx_proof,
-            )));
+            chain = Some(if in_flight.is_empty() {
+                ChainState::Ready(chain_step_proof(
+                    path,
+                    chain_target,
+                    chain_data,
+                    chain_step,
+                    previous_proof.as_ref(),
+                    base,
+                    dummy_proof,
+                    &tx_proof,
+                ))
+            } else {
+                ChainState::InFlight(spawn_chain_step(chain_step, tx_proof, previous_proof))
+            });
         }
+
         chain
             .map(ChainState::wait)
             .expect("transaction path must produce a chain proof")
@@ -358,61 +349,44 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     block.tx_chunks = tx_chunks;
     block.tx_chunks.push(Vec::new());
 
-    let (light_chain_proof, heavy_chain_proof, block_target, block_data) =
-        std::thread::scope(|scope| {
-            // The final block circuit depends only on already-built circuit data
-            // and is not needed until the final proof, so it builds concurrently
-            // with the entire transaction/chain proving pipeline.
-            let block_circuit_handle = std::thread::Builder::new()
-                .name("block-circuit-build".into())
-                .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, || circuits.build_block_circuit())
-                .expect("block circuit build thread must start");
-            let heavy_handle = std::thread::Builder::new()
-                .name("heavy-tx-chain".into())
-                .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, || {
-                    prove_path(
-                        TxPath::Heavy,
-                        heavy_chunks,
-                        circuits,
-                        block.block_number,
-                        block.created_at,
-                        block.old_account_delta_tree_root,
-                        &pre_output,
-                        state_metadata_hash,
-                    )
-                })
-                .expect("heavy transaction chain thread must start");
-            let light_chain_proof = prove_path(
-                TxPath::Light,
-                light_chunks,
-                circuits,
-                block.block_number,
-                block.created_at,
-                block.old_account_delta_tree_root,
-                &pre_output,
-                state_metadata_hash,
-            );
-            let heavy_chain_proof = heavy_handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            let (block_target, block_data) = block_circuit_handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            (
-                light_chain_proof,
-                heavy_chain_proof,
-                block_target,
-                block_data,
-            )
-        });
+    let (light_chain_proof, heavy_chain_proof) = std::thread::scope(|scope| {
+        let heavy_handle = std::thread::Builder::new()
+            .name("heavy-tx-chain".into())
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, || {
+                prove_path(
+                    TxPath::Heavy,
+                    heavy_chunks,
+                    circuits,
+                    block.block_number,
+                    block.created_at,
+                    block.old_account_delta_tree_root,
+                    &pre_output,
+                    state_metadata_hash,
+                )
+            })
+            .expect("heavy transaction chain thread must start");
+        let light_chain_proof = prove_path(
+            TxPath::Light,
+            light_chunks,
+            circuits,
+            block.block_number,
+            block.created_at,
+            block.old_account_delta_tree_root,
+            &pre_output,
+            state_metadata_hash,
+        );
+        let heavy_chain_proof = heavy_handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (light_chain_proof, heavy_chain_proof)
+    });
 
     let (light_chain_input, heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
     BlockCircuit::prove(
-        &block_target,
-        &block_data,
+        &circuits.block_target,
+        &circuits.block_data,
         &block,
         &pre_proof,
         light_chain_input,

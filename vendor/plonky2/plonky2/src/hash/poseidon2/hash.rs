@@ -8,7 +8,7 @@ use crate::field::goldilocks_field::GoldilocksField as F;
 use crate::field::types::{Field, PrimeField64};
 use crate::gates::poseidon2::Poseidon2Gate;
 use crate::hash::hash_types::{HashOut, RichField};
-use crate::hash::hashing::{PlonkyPermutation, compress, hash_n_to_hash_no_pad};
+use crate::hash::hashing::{compress, hash_n_to_hash_no_pad, PlonkyPermutation};
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::{BoolTarget, Target};
 use crate::plonk::circuit_builder::CircuitBuilder;
@@ -511,64 +511,10 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     fn try_build_merkle_tree(
-        leaves: &[F],
-        leaf_width: usize,
-        num_leaves: usize,
+        leaves: &[Vec<F>],
         cap_height: usize,
     ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
-        super::metal::build_merkle_tree(leaves, leaf_width, num_leaves, cap_height)
-    }
-
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    fn try_build_merkle_tree_columns(
-        columns: &[Vec<F>],
-        cap_height: usize,
-    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
-        super::metal::build_merkle_tree_columns(columns, cap_height)
-    }
-
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    fn try_build_commitment_from_coeffs(
-        coeff_columns: &[&[F]],
-        rate_bits: usize,
-        cap_height: usize,
-    ) -> Option<(
-        crate::hash::merkle_tree::ColumnStore<F>,
-        Vec<Self::Hash>,
-        Vec<Self::Hash>,
-    )> {
-        super::metal::build_commitment_from_coeffs(coeff_columns, rate_bits, cap_height).map(
-            |(columns, digests, cap)| {
-                (
-                    crate::hash::merkle_tree::ColumnStore::Shared(columns),
-                    digests,
-                    cap,
-                )
-            },
-        )
-    }
-
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    fn try_build_commitment_from_values(
-        value_columns: &[&[F]],
-        rate_bits: usize,
-        cap_height: usize,
-    ) -> Option<(
-        crate::hash::merkle_tree::ColumnStore<F>,
-        Vec<Self::Hash>,
-        Vec<Self::Hash>,
-        Vec<Vec<F>>,
-    )> {
-        super::metal::build_commitment_from_values(value_columns, rate_bits, cap_height).map(
-            |(columns, digests, cap, coeffs)| {
-                (
-                    crate::hash::merkle_tree::ColumnStore::Shared(columns),
-                    digests,
-                    cap,
-                    coeffs,
-                )
-            },
-        )
+        super::metal::build_merkle_tree(leaves, cap_height)
     }
 }
 
@@ -633,7 +579,7 @@ mod test {
     use num::{BigUint, One};
     use p3_field::{AbstractField, PrimeField64 as _};
     use p3_goldilocks::Goldilocks;
-    use rand::{RngCore, thread_rng};
+    use rand::{thread_rng, RngCore};
 
     use super::*;
     use crate::field::types::PrimeField64;
