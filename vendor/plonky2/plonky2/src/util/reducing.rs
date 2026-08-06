@@ -118,14 +118,6 @@ impl<F: Field> ReducingFactor<F> {
         self.count = 0;
     }
 
-    /// Returns the factor `shift_poly` would multiply by (`base^count`) and
-    /// resets the count, letting callers fuse the multiply into another pass.
-    pub fn shift_factor(&mut self) -> F {
-        let tmp = self.base.exp_u64(self.count);
-        self.count = 0;
-        tmp
-    }
-
     pub fn reset(&mut self) {
         self.count = 0;
     }
