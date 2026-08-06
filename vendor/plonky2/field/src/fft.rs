@@ -269,12 +269,12 @@ fn prepare_zero_padded_fft<F: Field>(
     reverse_index_bits_in_place(&mut values[..nonzero_len]);
 
     if r >= lg_packed_width && r < lg_n {
-        // Keep values plus the largest local twiddle row within Apple Silicon's 128 KiB L1D:
-        // 2^13 Goldilocks elements use 64 KiB and their twiddles use 32 KiB.
-        let lg_block_n = if core::mem::size_of::<F>() <= 8 {
-            13
-        } else {
-            11
+        // Keep values plus the largest local twiddle row within Apple Silicon's 128 KiB L1D.
+        // Both 2^13 base-field and 2^12 quadratic-extension blocks use about 96 KiB.
+        let lg_block_n = match core::mem::size_of::<F>() {
+            0..=8 => 13,
+            9..=16 => 12,
+            _ => 11,
         };
         if r + 1 < lg_block_n && lg_block_n <= lg_n {
             fft_zero_padded_cache_blocks::<<F as Packable>::Packing>(

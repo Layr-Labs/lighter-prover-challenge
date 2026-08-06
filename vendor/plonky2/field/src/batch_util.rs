@@ -63,7 +63,7 @@ pub fn batch_multiply_add_inplace<F: Field>(out: &mut [F], a: &[F], b: &[F]) {
     let (b_packed, b_leftovers) = pack_slice_with_leftovers::<<F as Packable>::Packing>(b);
 
     for ((x_out, x_a), x_b) in out_packed.iter_mut().zip(a_packed).zip(b_packed) {
-        *x_out += *x_a * *x_b;
+        *x_out = x_out.multiply_accumulate(*x_a, *x_b);
     }
     for ((x_out, x_a), x_b) in out_leftovers.iter_mut().zip(a_leftovers).zip(b_leftovers) {
         *x_out += *x_a * *x_b;
