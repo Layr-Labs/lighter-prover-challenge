@@ -554,23 +554,18 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let sum_value = witness
+        let mut acc = witness
             .get_target(Target::wire(self.row, self.gate.wire_ith_input(self.i)))
             .to_canonical_u64();
 
         let base = RangeCheckGate::<F, D>::BASE as u64;
-        let limbs = (0..self.gate.aux_limbs_per_input())
-            .map(|j| Target::wire(self.row, self.gate.wire_ith_input_jth_aux_limb(self.i, j)));
-        let limbs_value = (0..self.gate.aux_limbs_per_input())
-            .scan(sum_value, |acc, _| {
-                let tmp = *acc % base;
-                *acc /= base;
-                Some(F::from_canonical_u64(tmp))
-            })
-            .collect::<Vec<_>>();
-
-        for (b, b_value) in limbs.zip(limbs_value) {
-            out_buffer.set_target(b, b_value)?;
+        // Stream limbs without intermediate Vec.
+        for j in 0..self.gate.aux_limbs_per_input() {
+            let limb = F::from_canonical_u64(acc % base);
+            acc /= base;
+            let target =
+                Target::wire(self.row, self.gate.wire_ith_input_jth_aux_limb(self.i, j));
+            out_buffer.set_target(target, limb)?;
         }
         Ok(())
     }
