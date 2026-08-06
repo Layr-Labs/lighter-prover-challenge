@@ -201,16 +201,14 @@ impl<F: RichField + Extendable<D>, const B: usize, const D: usize> SimpleGenerat
             "Integer too large to fit in given number of limbs"
         );
 
-        let limbs = (BaseSumGate::<B>::START_LIMBS..BaseSumGate::<B>::START_LIMBS + self.num_limbs)
-            .map(|i| Target::wire(self.row, i));
-        let limbs_value = (0..self.num_limbs).scan(sum_value, |acc, _| {
-            let tmp = *acc % (B as u64);
-            *acc /= B as u64;
-            Some(F::from_canonical_u64(tmp))
-        });
-
-        for (b, b_value) in limbs.zip(limbs_value) {
-            out_buffer.set_target(b, b_value)?;
+        let mut remaining = sum_value;
+        for i in 0..self.num_limbs {
+            let limb = remaining % (B as u64);
+            remaining /= B as u64;
+            out_buffer.set_target(
+                Target::wire(self.row, BaseSumGate::<B>::START_LIMBS + i),
+                F::from_canonical_u64(limb),
+            )?;
         }
 
         Ok(())

@@ -526,9 +526,10 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> SimpleGenerator<F
             column,
         };
 
-        let mut state: [F; WIDTH] = core::array::from_fn(|i| {
-            witness.get_wire(local_wire(Poseidon2Gate::<F, D>::wire_input(i)))
-        });
+        let mut state = [F::ZERO; WIDTH];
+        for i in 0..WIDTH {
+            state[i] = witness.get_wire(local_wire(Poseidon2Gate::<F, D>::wire_input(i)));
+        }
 
         let swap_value = witness.get_wire(local_wire(Poseidon2Gate::<F, D>::WIRE_SWAP));
         debug_assert!(swap_value == F::ZERO || swap_value == F::ONE);
@@ -543,6 +544,8 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> SimpleGenerator<F
                 state.swap(i, 4 + i);
             }
         }
+
+        let mut state: [F; WIDTH] = state.try_into().unwrap();
 
         <F as Poseidon2>::external_linear_layer(&mut state);
 
