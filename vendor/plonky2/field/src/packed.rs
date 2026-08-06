@@ -51,6 +51,11 @@ where
     fn as_slice(&self) -> &[Self::Scalar];
     fn as_slice_mut(&mut self) -> &mut [Self::Scalar];
 
+    #[inline]
+    fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
+        *self + x * y
+    }
+
     /// Take interpret two vectors as chunks of block_len elements. Unpack and interleave those
     /// chunks. This is best seen with an example. If we have:
     ///     A = [x0, y0, x1, y1],

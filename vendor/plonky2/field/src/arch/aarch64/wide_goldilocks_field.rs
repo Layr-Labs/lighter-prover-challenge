@@ -197,6 +197,24 @@ unsafe impl PackedField for WideGoldilocksField {
     }
 
     #[inline]
+    fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
+        let low = mul_add_reduce_pair(
+            [self.0[0].0[0].0, self.0[0].0[1].0],
+            [x.0[0].0[0].0, x.0[0].0[1].0],
+            [y.0[0].0[0].0, y.0[0].0[1].0],
+        );
+        let high = mul_add_reduce_pair(
+            [self.0[1].0[0].0, self.0[1].0[1].0],
+            [x.0[1].0[0].0, x.0[1].0[1].0],
+            [y.0[1].0[0].0, y.0[1].0[1].0],
+        );
+        Self([
+            NeonGoldilocksField(low.map(GoldilocksField)),
+            NeonGoldilocksField(high.map(GoldilocksField)),
+        ])
+    }
+
+    #[inline]
     fn interleave(&self, other: Self, block_len: usize) -> (Self, Self) {
         let a = self.lanes();
         let b = other.lanes();
@@ -350,6 +368,60 @@ fn mul_reduce_quad(lhs: [u64; 4], rhs: [u64; 4]) -> [u64; 4] {
     [result0, result1, result2, result3]
 }
 
+/// Reduce two independent `addend + lhs * rhs` expressions modulo
+/// `2^64 - 2^32 + 1`.
+#[inline(always)]
+fn mul_add_reduce_pair(addends: [u64; 2], lhs: [u64; 2], rhs: [u64; 2]) -> [u64; 2] {
+    let [mut result0, mut result1] = lhs;
+    let [scratch0, scratch1] = rhs;
+    let [addend0, addend1] = addends;
+
+    unsafe {
+        asm!(
+            "umulh {hi0}, {result0}, {scratch0}",
+            "umulh {hi1}, {result1}, {scratch1}",
+            "mul   {result0}, {result0}, {scratch0}",
+            "mul   {result1}, {result1}, {scratch1}",
+            "adds  {result0}, {result0}, {addend0}",
+            "adc   {hi0}, {hi0}, xzr",
+            "adds  {result1}, {result1}, {addend1}",
+            "adc   {hi1}, {hi1}, xzr",
+            "lsr   {scratch0}, {hi0}, #32",
+            "lsr   {scratch1}, {hi1}, #32",
+            "subs  {result0}, {result0}, {scratch0}",
+            "csetm {scratch0:w}, cc",
+            "subs  {result1}, {result1}, {scratch1}",
+            "csetm {scratch1:w}, cc",
+            "sub   {result0}, {result0}, {scratch0}",
+            "sub   {result1}, {result1}, {scratch1}",
+            "and   {scratch0}, {hi0}, {epsilon}",
+            "and   {scratch1}, {hi1}, {epsilon}",
+            "lsl   {hi0}, {scratch0}, #32",
+            "lsl   {hi1}, {scratch1}, #32",
+            "sub   {hi0}, {hi0}, {scratch0}",
+            "sub   {hi1}, {hi1}, {scratch1}",
+            "adds  {result0}, {result0}, {hi0}",
+            "csetm {scratch0:w}, cs",
+            "adds  {result1}, {result1}, {hi1}",
+            "csetm {scratch1:w}, cs",
+            "add   {result0}, {result0}, {scratch0}",
+            "add   {result1}, {result1}, {scratch1}",
+            result0 = inout(reg) result0,
+            result1 = inout(reg) result1,
+            scratch0 = inout(reg) scratch0 => _,
+            scratch1 = inout(reg) scratch1 => _,
+            addend0 = in(reg) addend0,
+            addend1 = in(reg) addend1,
+            hi0 = out(reg) _,
+            hi1 = out(reg) _,
+            epsilon = in(reg) GoldilocksField::ORDER.wrapping_neg(),
+            options(pure, nomem, nostack),
+        );
+    }
+
+    [result0, result1]
+}
+
 #[cfg(test)]
 mod tests {
     use super::WideGoldilocksField;
@@ -423,12 +495,24 @@ mod tests {
                     core::array::from_fn(|lane| values[(i + 2 * lane) % values.len()]);
                 let b: [GoldilocksField; 4] =
                     core::array::from_fn(|lane| values[(j + 3 * lane) % values.len()]);
+                let c: [GoldilocksField; 4] =
+                    core::array::from_fn(|lane| values[(i + j + 5 * lane) % values.len()]);
                 let packed_a = *WideGoldilocksField::from_slice(&a);
                 let packed_b = *WideGoldilocksField::from_slice(&b);
+                let packed_c = *WideGoldilocksField::from_slice(&c);
 
                 assert_eq!(
                     (packed_a * packed_b).as_slice(),
                     core::array::from_fn::<_, 4, _>(|lane| a[lane] * b[lane])
+                );
+                assert_eq!(
+                    <WideGoldilocksField as PackedField>::multiply_accumulate(
+                        &packed_c, packed_a, packed_b,
+                    )
+                    .as_slice(),
+                    core::array::from_fn::<_, 4, _>(|lane| {
+                        <GoldilocksField as Field>::multiply_accumulate(&c[lane], a[lane], b[lane])
+                    })
                 );
                 assert_eq!(
                     packed_a.square().as_slice(),
