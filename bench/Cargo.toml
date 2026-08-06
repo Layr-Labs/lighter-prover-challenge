@@ -43,6 +43,11 @@ tiny-keccak =  { workspace = true }
 paste = { workspace = true }
 circuit = { path = "../circuit", default-features = true }
 
+[build-dependencies]
+circuit = { path = "../circuit", default-features = true }
+plonky2 = { workspace = true, default-features = true }
+rayon = { workspace = true }
+
 [dev-dependencies]
 flate2 = "1.0"
 criterion = { version = "0.5.1", default-features = false }
