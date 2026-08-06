@@ -162,23 +162,23 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     let group = |i| groups.iter().position(|range| range.contains(&i)).unwrap();
 
     // `selector_indices[i] = j` iff the `i`-th gate uses the `j`-th selector polynomial.
-    let selector_indices = (0..num_gates).map(group).collect();
+    let selector_indices: Vec<usize> = (0..num_gates).map(group).collect();
 
     // Placeholder value to indicate that a gate doesn't use a selector polynomial.
     let unused = F::from_canonical_usize(UNUSED_SELECTOR);
 
-    let mut polynomials = vec![PolynomialValues::zero(n); groups.len()];
+    // Archive-unique selector retry after a transient workflow dispatch failure.
+    // Each selector is UNUSED_SELECTOR everywhere except at the rows belonging to
+    // its group. Initialize those constant tails once, then write only the one
+    // selected value per row instead of revisiting every group for every instance.
+    let mut polynomials = (0..groups.len())
+        .map(|_| PolynomialValues::new(vec![unused; n]))
+        .collect::<Vec<_>>();
     for (j, g) in instances.iter().enumerate() {
         let GateInstance { gate_ref, .. } = g;
         let i = index(gate_ref.0.id());
-        let gr = group(i);
-        for g in 0..groups.len() {
-            polynomials[g].values[j] = if g == gr {
-                F::from_canonical_usize(i)
-            } else {
-                unused
-            };
-        }
+        let gr = selector_indices[i];
+        polynomials[gr].values[j] = F::from_canonical_usize(i);
     }
 
     (
