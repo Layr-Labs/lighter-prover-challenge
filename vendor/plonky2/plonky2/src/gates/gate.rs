@@ -10,7 +10,7 @@ use std::sync::Arc;
 use hashbrown::HashMap;
 use serde::{Serialize, Serializer};
 
-use crate::field::batch_util::batch_multiply_add_inplace;
+use crate::field::batch_util::{batch_multiply_add_inplace, batch_multiply_add_rows_inplace};
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
 use crate::gates::selectors::UNUSED_SELECTOR;
@@ -128,11 +128,19 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         let batch_size = vars_base.len();
         assert_eq!(filters.len(), batch_size);
         let res_batch = self.eval_unfiltered_base_batch(vars_base);
-        for (combined, res) in combined_gate_constraints
-            .chunks_exact_mut(batch_size)
-            .zip(res_batch.chunks_exact(batch_size))
-        {
-            batch_multiply_add_inplace(combined, res, filters);
+        if res_batch.len() >= 3 * batch_size {
+            batch_multiply_add_rows_inplace(
+                &mut combined_gate_constraints[..res_batch.len()],
+                &res_batch,
+                filters,
+            );
+        } else {
+            for (combined, res) in combined_gate_constraints
+                .chunks_exact_mut(batch_size)
+                .zip(res_batch.chunks_exact(batch_size))
+            {
+                batch_multiply_add_inplace(combined, res, filters);
+            }
         }
     }
 
