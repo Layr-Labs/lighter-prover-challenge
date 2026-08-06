@@ -175,6 +175,9 @@ pub(crate) struct VanishingScratch<F> {
     pub vanishing_all_lookup_terms: Vec<F>,
     pub lookup_selectors: Vec<F>,
     pub constraint_terms_batch: Vec<F>,
+    /// Column-major [Z(x) | partials | Z(gx)] accumulator chain, reused
+    /// across batches by the no-lookup permutation path.
+    pub acc_cols: Vec<F>,
 }
 
 fn reduce_gate_constraints_base_batch<F: Field>(
@@ -329,8 +332,13 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         // transpose into contiguous columns kills the per-point double
         // dereferences in the accumulator-selection loop below.
         let acc_cols_len = num_challenges * (num_prods + 2) * n;
-        let mut acc_cols = vec![F::ZERO; acc_cols_len];
         let acc_stride = (num_prods + 2) * n;
+        // Reused across batches: every slot below is written before it is
+        // read, so no zeroing is needed.
+        let acc_cols = &mut scratch.acc_cols;
+        if acc_cols.len() < acc_cols_len {
+            acc_cols.resize(acc_cols_len, F::ZERO);
+        }
         for k in 0..n {
             let local_zs = local_zs_batch[k];
             let next_zs = next_zs_batch[k];
@@ -897,6 +905,9 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
 ) {
     constraints_batch.clear();
     constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
+    // One typed scratch buffer for every gate's materialized constraints,
+    // reused across gates and across batches by the caller's `Vec`.
+    let mut scratch: Vec<F> = Vec::new();
     for (i, gate) in common_data.gates.iter().enumerate() {
         let selector_index = common_data.selectors_info.selector_indices[i];
         gate.0.eval_filtered_base_batch(
@@ -906,6 +917,7 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
             common_data.selectors_info.groups[selector_index].clone(),
             common_data.selectors_info.num_selectors(),
             common_data.num_lookup_selectors,
+            &mut scratch,
             constraints_batch,
         );
     }
