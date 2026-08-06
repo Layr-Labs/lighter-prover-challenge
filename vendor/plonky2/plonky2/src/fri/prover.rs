@@ -118,18 +118,14 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
 
         let beta = challenger.get_extension_challenge::<D>();
         // P(x) = sum_{i<r} x^i * P_i(x^r) becomes sum_{i<r} beta^i * P_i(x).
-        // Only `1/2^rate_bits` of the coefficients are nonzero every round
-        // (the zero-tail invariant asserted by the final truncation), and the
-        // Horner fold of an all-zero chunk is exactly zero, so fold only the
-        // live prefix and extend with the zeros those chunks would produce.
-        let n_chunks = coeffs.coeffs.len() / arity;
         let support = coeffs.coeffs.len() >> fri_params.config.rate_bits;
-        let live_chunks = support.div_ceil(arity).min(n_chunks);
-        let mut folded = coeffs.coeffs[..live_chunks * arity]
+        let folded_len = coeffs.coeffs.len() / arity;
+        let mut folded = coeffs.coeffs[..support]
             .par_chunks_exact(arity)
             .map(|chunk| reduce_with_powers(chunk, beta))
             .collect::<Vec<_>>();
-        folded.resize(n_chunks, F::Extension::ZERO);
+        debug_assert_eq!(folded.len(), support / arity);
+        folded.resize(folded_len, F::Extension::ZERO);
         coeffs = PolynomialCoeffs::new(folded);
         shift = shift.exp_u64(arity as u64);
         // Chunk-wise folding preserves the zero tail: the coefficient vector
