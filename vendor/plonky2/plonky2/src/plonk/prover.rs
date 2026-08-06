@@ -410,11 +410,10 @@ fn wires_permutation_partial_products_and_zs<
         .enumerate()
         .map(|(i, &x)| {
             let s_sigmas = &prover_data.sigmas[i];
+            let beta_x = beta * x;
             let numerators = (0..common_data.config.num_routed_wires).map(|j| {
                 let wire_value = witness.get_wire(i, j);
-                let k_i = k_is[j];
-                let s_id = k_i * x;
-                wire_value + beta * s_id + gamma
+                wire_value + beta_x * k_is[j] + gamma
             });
             let denominators = (0..common_data.config.num_routed_wires)
                 .map(|j| {

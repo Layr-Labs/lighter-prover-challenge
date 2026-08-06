@@ -264,6 +264,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         for i in 0..num_challenges {
             let z_x = local_zs[i];
             let z_gx = next_zs[i];
+            let beta_x = betas[i] * x;
             vanishing_z_1_terms.push(l_0_x * z_x.sub_one());
 
             // If there are lookups in the circuit, then we add the lookup constraints.
@@ -289,9 +290,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
             numerator_values.extend((0..num_routed_wires).map(|j| {
                 let wire_value = vars.local_wires[j];
-                let k_i = common_data.k_is[j];
-                let s_id = k_i * x;
-                wire_value + betas[i] * s_id + gammas[i]
+                wire_value + beta_x * common_data.k_is[j] + gammas[i]
             }));
             denominator_values.extend((0..num_routed_wires).map(|j| {
                 let wire_value = vars.local_wires[j];
