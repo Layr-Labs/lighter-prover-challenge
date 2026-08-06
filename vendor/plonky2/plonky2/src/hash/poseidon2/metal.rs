@@ -80,22 +80,52 @@ impl MetalContext {
     fn new() -> Result<Mutex<Self>, String> {
         autoreleasepool(|| {
             let device = Device::system_default().ok_or("no Metal device")?;
-            let options = CompileOptions::new();
-            let library = device
-                .new_library_with_source(SHADER_SOURCE, &options)
-                .map_err(|error| format!("shader compilation failed: {error}"))?;
-            let leaf_function = library
-                .get_function("poseidon2_hash_leaves", None)
-                .map_err(|error| format!("leaf kernel unavailable: {error}"))?;
-            let parent_function = library
-                .get_function("poseidon2_hash_parents", None)
-                .map_err(|error| format!("parent kernel unavailable: {error}"))?;
-            let leaf_pipeline = device
-                .new_compute_pipeline_state_with_function(&leaf_function)
-                .map_err(|error| format!("leaf pipeline creation failed: {error}"))?;
-            let parent_pipeline = device
-                .new_compute_pipeline_state_with_function(&parent_function)
-                .map_err(|error| format!("parent pipeline creation failed: {error}"))?;
+            // Prefer the metallib precompiled by build.rs: it avoids the
+            // multi-second cold MTLCompilerService cache miss the first time a
+            // new shader source runs on a host, and any per-run MSL compile
+            // cost after that. Any failure along the precompiled path — the
+            // build host lacking the Metal toolchain, library load, function
+            // lookup, or pipeline creation — falls back to compiling the
+            // shader from source, which is the previously promoted behavior.
+            fn build_pipelines(
+                device: &Device,
+                library: &metal::Library,
+            ) -> Result<(ComputePipelineState, ComputePipelineState), String> {
+                let leaf_function = library
+                    .get_function("poseidon2_hash_leaves", None)
+                    .map_err(|error| format!("leaf kernel unavailable: {error}"))?;
+                let parent_function = library
+                    .get_function("poseidon2_hash_parents", None)
+                    .map_err(|error| format!("parent kernel unavailable: {error}"))?;
+                let leaf_pipeline = device
+                    .new_compute_pipeline_state_with_function(&leaf_function)
+                    .map_err(|error| format!("leaf pipeline creation failed: {error}"))?;
+                let parent_pipeline = device
+                    .new_compute_pipeline_state_with_function(&parent_function)
+                    .map_err(|error| format!("parent pipeline creation failed: {error}"))?;
+                Ok((leaf_pipeline, parent_pipeline))
+            }
+
+            #[cfg(poseidon2_metallib)]
+            let precompiled = device
+                .new_library_with_data(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/poseidon2.metallib"
+                )))
+                .ok()
+                .and_then(|library| build_pipelines(&device, &library).ok());
+            #[cfg(not(poseidon2_metallib))]
+            let precompiled: Option<(ComputePipelineState, ComputePipelineState)> = None;
+            let (leaf_pipeline, parent_pipeline) = match precompiled {
+                Some(pipelines) => pipelines,
+                None => {
+                    let options = CompileOptions::new();
+                    let library = device
+                        .new_library_with_source(SHADER_SOURCE, &options)
+                        .map_err(|error| format!("shader compilation failed: {error}"))?;
+                    build_pipelines(&device, &library)?
+                }
+            };
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -388,6 +418,41 @@ mod tests {
                 let cpu = cpu_tree(&leaves, cap_height);
                 assert_tree_eq(&gpu, &cpu, width, cap_height);
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "GPU timing microbenchmark; run explicitly with --ignored --nocapture"]
+    fn metal_merkle_gpu_microbench() {
+        use std::time::Instant;
+
+        let mut rng = StdRng::seed_from_u64(0x4249_4747_5055);
+        for (leaf_count, width) in [(1usize << 19, 136usize), (1 << 19, 16)] {
+            let leaves = (0..leaf_count)
+                .map(|_| {
+                    (0..width)
+                        .map(|_| GoldilocksField(rng.next_u64()))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let mut context = CONTEXT
+                .as_ref()
+                .as_ref()
+                .unwrap_or_else(|error| panic!("{error}"))
+                .lock()
+                .unwrap();
+            let _ = autoreleasepool(|| context.build(&leaves, 4)).unwrap();
+            let mut times = Vec::new();
+            for _ in 0..5 {
+                let start = Instant::now();
+                let _ = autoreleasepool(|| context.build(&leaves, 4)).unwrap();
+                times.push(start.elapsed().as_secs_f64());
+            }
+            times.sort_by(|left, right| left.partial_cmp(right).unwrap());
+            eprintln!(
+                "metal microbench {leaf_count} x {width}: min {:.4}s all {:?}",
+                times[0], times
+            );
         }
     }
 

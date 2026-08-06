@@ -12,21 +12,55 @@ inline ulong gl_add(ulong a, ulong b) {
     return sum + carry2 * GOLDILOCKS_EPSILON;
 }
 
-inline ulong gl_mul(ulong a, ulong b) {
-    ulong low = a * b;
-    ulong high = metal::mulhi(a, b);
-    ulong high_high = high >> 32;
-    ulong high_low = high & GOLDILOCKS_EPSILON;
-
-    // Since 2^64 = 2^32 - 1 and 2^32(2^32 - 1) = -1 modulo p,
-    // low + high * 2^64 reduces to low - high_high + high_low * (2^32 - 1).
-    ulong reduced = low - high_high;
-    if (reduced > low) {
+// Reduces a 128-bit product (lo + hi * 2^64) modulo the Goldilocks prime.
+// Uses 2^64 = 2^32 - 1 and 2^96 = -1 modulo p, so the result is
+// lo - hi_hi + hi_lo * (2^32 - 1) with branchless borrow/carry corrections.
+inline ulong gl_reduce128(ulong lo, ulong hi) {
+    uint hi_lo = (uint)hi;
+    uint hi_hi = (uint)(hi >> 32);
+    ulong reduced = lo - (ulong)hi_hi;
+    if (reduced > lo) {
         reduced -= GOLDILOCKS_EPSILON;
     }
-    ulong addend = high_low * GOLDILOCKS_EPSILON;
+    ulong addend = (ulong)hi_lo * GOLDILOCKS_EPSILON;
     ulong result = reduced + addend;
-    return result + (result < reduced) * GOLDILOCKS_EPSILON;
+    return result + (ulong)(result < reduced) * GOLDILOCKS_EPSILON;
+}
+
+// The Apple GPU ALU is 32-bit; a generic 64x64 multiply plus mulhi emulates
+// eight-plus 32x32 products because the compiler computes the low and high
+// halves independently. Building the full 128-bit product once from four
+// native 32x32->64 partials and reducing shares all the partial products.
+inline ulong gl_mul(ulong a, ulong b) {
+    uint a0 = (uint)a;
+    uint a1 = (uint)(a >> 32);
+    uint b0 = (uint)b;
+    uint b1 = (uint)(b >> 32);
+    ulong ll = (ulong)a0 * b0;
+    ulong lh = (ulong)a0 * b1;
+    ulong hl = (ulong)a1 * b0;
+    ulong hh = (ulong)a1 * b1;
+    ulong mid = lh + (ll >> 32);
+    ulong mid2 = mid + hl;
+    ulong carry = (ulong)(mid2 < hl) << 32;
+    ulong lo = (mid2 << 32) | (ll & GOLDILOCKS_EPSILON);
+    ulong hi = hh + (mid2 >> 32) + carry;
+    return gl_reduce128(lo, hi);
+}
+
+// Squaring drops one of the four 32x32 partial products (lh == hl).
+inline ulong gl_sqr(ulong a) {
+    uint a0 = (uint)a;
+    uint a1 = (uint)(a >> 32);
+    ulong ll = (ulong)a0 * a0;
+    ulong lh = (ulong)a0 * a1;
+    ulong hh = (ulong)a1 * a1;
+    ulong mid = lh + (ll >> 32);
+    ulong mid2 = mid + lh;
+    ulong carry = (ulong)(mid2 < lh) << 32;
+    ulong lo = (mid2 << 32) | (ll & GOLDILOCKS_EPSILON);
+    ulong hi = hh + (mid2 >> 32) + carry;
+    return gl_reduce128(lo, hi);
 }
 
 inline ulong gl_canonicalize(ulong value) {
@@ -34,8 +68,8 @@ inline ulong gl_canonicalize(ulong value) {
 }
 
 inline ulong pow7(ulong value) {
-    ulong value2 = gl_mul(value, value);
-    ulong value4 = gl_mul(value2, value2);
+    ulong value2 = gl_sqr(value);
+    ulong value4 = gl_sqr(value2);
     ulong value3 = gl_mul(value, value2);
     return gl_mul(value3, value4);
 }
@@ -140,11 +174,14 @@ kernel void poseidon2_hash_leaves(
         return;
     }
 
+    // The permutation is correct for any 64-bit residue and the digest is
+    // canonicalized on write-out, so absorbed elements need no per-element
+    // canonicalization here.
     ulong state[12] = { 0 };
     for (uint offset = 0; offset < leaf_width; offset += 8) {
         uint chunk_size = min(8u, leaf_width - offset);
         for (uint i = 0; i < chunk_size; ++i) {
-            state[i] = gl_canonicalize(input[offset + i]);
+            state[i] = input[offset + i];
         }
         poseidon2(state, parameters);
     }
