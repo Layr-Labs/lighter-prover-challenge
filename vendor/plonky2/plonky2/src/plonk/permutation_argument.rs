@@ -134,25 +134,66 @@ impl WirePartition {
     /// Generates sigma in the context of Plonk, which is a map from `[kn]` to `[kn]`, where `k` is
     /// the number of routed wires and `n` is the number of gates.
     fn get_sigma_map(&self, degree: usize, num_routed_wires: usize) -> Vec<usize> {
-        // Find a wire's "neighbor" in the context of Plonk's "extended copy constraints" check. In
-        // other words, find the next wire in the given wire's partition. If the given wire is last in
-        // its partition, this will loop around. If the given wire has a partition all to itself, it
-        // is considered its own neighbor.
-        let mut neighbors = HashMap::with_capacity(self.partition.len());
-        for subset in &self.partition {
+        let sigma_len = num_routed_wires * degree;
+        let mut sigma = Vec::with_capacity(sigma_len);
+        {
+            let sigma_spare = sigma.spare_capacity_mut();
+            let mut written = 0;
+            for subset in &self.partition {
+                for n in 0..subset.len() {
+                    let wire = subset[n];
+                    let neighbor = subset[(n + 1) % subset.len()];
+                    sigma_spare[wire.column * degree + wire.row]
+                        .write(neighbor.column * degree + neighbor.row);
+                    written += 1;
+                }
+            }
+            debug_assert_eq!(written, sigma_len);
+        }
+        // `Forest::wire_partition` places every routed wire in exactly one subset, so the loop
+        // above initializes every slot exactly once.
+        unsafe {
+            sigma.set_len(sigma_len);
+        }
+        sigma
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sigma_map_matches_neighbor_cycles() {
+        let degree = 8;
+        let num_routed_wires = 3;
+        let mut partition = vec![Vec::new(); 5];
+        for column in 0..num_routed_wires {
+            for row in 0..degree {
+                partition[(row + 2 * column) % 5].push(Wire { row, column });
+            }
+        }
+        let wire_partition = WirePartition { partition };
+
+        let mut neighbors = HashMap::new();
+        for subset in &wire_partition.partition {
             for n in 0..subset.len() {
                 neighbors.insert(subset[n], subset[(n + 1) % subset.len()]);
             }
         }
+        let expected = (0..num_routed_wires)
+            .flat_map(|column| {
+                let neighbors = &neighbors;
+                (0..degree).map(move |row| {
+                    let neighbor = neighbors[&Wire { row, column }];
+                    neighbor.column * degree + neighbor.row
+                })
+            })
+            .collect::<Vec<_>>();
 
-        let mut sigma = Vec::with_capacity(num_routed_wires * degree);
-        for column in 0..num_routed_wires {
-            for row in 0..degree {
-                let wire = Wire { row, column };
-                let neighbor = neighbors[&wire];
-                sigma.push(neighbor.column * degree + neighbor.row);
-            }
-        }
-        sigma
+        assert_eq!(
+            wire_partition.get_sigma_map(degree, num_routed_wires),
+            expected
+        );
     }
 }
