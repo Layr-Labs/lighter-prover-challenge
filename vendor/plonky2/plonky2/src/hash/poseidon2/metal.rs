@@ -1335,7 +1335,10 @@ fn read_node<F: RichField>(nodes: &[u64], level_offset: usize, index: usize) -> 
 #[cfg(test)]
 mod tests {
     use core::mem::MaybeUninit;
+    use std::time::{Duration, Instant};
 
+    use objc::runtime::Sel;
+    use objc::Message;
     use rand::rngs::StdRng;
     use rand::{RngCore, SeedableRng};
 
@@ -1344,6 +1347,621 @@ mod tests {
     use crate::field::types::{Field64, PrimeField64};
     use crate::hash::merkle_tree::{capacity_up_to_mut, fill_digests_buf};
     use crate::hash::poseidon2::hash::Poseidon2Hash;
+
+    fn gpu_duration(command_buffer: &CommandBuffer, wall: Duration) -> Duration {
+        let gpu_start: f64 = unsafe {
+            command_buffer
+                .as_ref()
+                .send_message(Sel::register("GPUStartTime"), ())
+        }
+        .expect("GPUStartTime unavailable");
+        let gpu_end: f64 = unsafe {
+            command_buffer
+                .as_ref()
+                .send_message(Sel::register("GPUEndTime"), ())
+        }
+        .expect("GPUEndTime unavailable");
+        if gpu_start.is_finite() && gpu_end.is_finite() && gpu_end >= gpu_start {
+            Duration::from_secs_f64(gpu_end - gpu_start)
+        } else {
+            wall
+        }
+    }
+
+    const ARITHMETIC_TEST_KERNELS: &str = r#"
+inline ulong gl_add_native_reference(ulong a, ulong b) {
+    ulong sum = a + b;
+    ulong carry = sum < a;
+    sum += carry * GOLDILOCKS_EPSILON;
+    ulong carry2 = (carry != 0UL) && (sum < GOLDILOCKS_EPSILON);
+    return sum + carry2 * GOLDILOCKS_EPSILON;
+}
+
+inline ulong gl_sub_native_reference(ulong a, ulong b) {
+    ulong diff = a - b;
+    ulong under = diff > a;
+    diff -= under * GOLDILOCKS_EPSILON;
+    ulong under2 = (under != 0UL) && (diff > (~0UL - GOLDILOCKS_EPSILON));
+    return diff - under2 * GOLDILOCKS_EPSILON;
+}
+
+inline ulong gl_mul_native_reference(ulong a, ulong b) {
+    ulong low = a * b;
+    ulong high = metal::mulhi(a, b);
+    ulong high_high = high >> 32;
+    ulong high_low = high & GOLDILOCKS_EPSILON;
+    ulong reduced = low - high_high;
+    if (reduced > low) {
+        reduced -= GOLDILOCKS_EPSILON;
+    }
+    ulong addend = high_low * GOLDILOCKS_EPSILON;
+    ulong result = reduced + addend;
+    return result + (result < reduced) * GOLDILOCKS_EPSILON;
+}
+
+kernel void goldilocks_mul_differential(
+    const device ulong* inputs [[buffer(0)]],
+    device ulong* outputs [[buffer(1)]],
+    constant uint& count [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) {
+        return;
+    }
+    ulong a = inputs[(ulong)gid * 2];
+    ulong b = inputs[(ulong)gid * 2 + 1];
+    outputs[(ulong)gid * 6] = gl_canonicalize(gl_mul(a, b));
+    outputs[(ulong)gid * 6 + 1] =
+        gl_canonicalize(gl_mul_native_reference(a, b));
+    outputs[(ulong)gid * 6 + 2] = gl_canonicalize(gl_add(a, b));
+    outputs[(ulong)gid * 6 + 3] =
+        gl_canonicalize(gl_add_native_reference(a, b));
+    outputs[(ulong)gid * 6 + 4] = gl_canonicalize(gl_sub(a, b));
+    outputs[(ulong)gid * 6 + 5] =
+        gl_canonicalize(gl_sub_native_reference(a, b));
+}
+
+kernel void goldilocks_mul_bench_limb(
+    const device ulong* inputs [[buffer(0)]],
+    device ulong* outputs [[buffer(1)]],
+    constant uint& count [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) {
+        return;
+    }
+    ulong value = inputs[(ulong)gid * 2];
+    ulong factor = inputs[(ulong)gid * 2 + 1];
+    for (uint i = 0; i < 64; ++i) {
+        value = gl_mul(gl_add(value, (ulong)i), factor);
+    }
+    outputs[gid] = value;
+}
+
+kernel void goldilocks_mul_bench_native(
+    const device ulong* inputs [[buffer(0)]],
+    device ulong* outputs [[buffer(1)]],
+    constant uint& count [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) {
+        return;
+    }
+    ulong value = inputs[(ulong)gid * 2];
+    ulong factor = inputs[(ulong)gid * 2 + 1];
+    for (uint i = 0; i < 64; ++i) {
+        value = gl_mul_native_reference(gl_add(value, (ulong)i), factor);
+    }
+    outputs[gid] = value;
+}
+"#;
+
+    struct ArithmeticHarness {
+        device: Device,
+        queue: CommandQueue,
+        differential: ComputePipelineState,
+        limb: ComputePipelineState,
+        native: ComputePipelineState,
+    }
+
+    impl ArithmeticHarness {
+        fn new() -> Self {
+            autoreleasepool(|| {
+                let device = Device::system_default().expect("no Metal device");
+                let source = [SHADER_SOURCE, ARITHMETIC_TEST_KERNELS].concat();
+                let options = CompileOptions::new();
+                let library = device
+                    .new_library_with_source(&source, &options)
+                    .unwrap_or_else(|error| panic!("arithmetic test shader failed: {error}"));
+                let pipeline = |name| {
+                    let function = library
+                        .get_function(name, None)
+                        .unwrap_or_else(|error| panic!("{name} unavailable: {error}"));
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .unwrap_or_else(|error| panic!("{name} pipeline failed: {error}"))
+                };
+                Self {
+                    queue: device.new_command_queue(),
+                    differential: pipeline("goldilocks_mul_differential"),
+                    limb: pipeline("goldilocks_mul_bench_limb"),
+                    native: pipeline("goldilocks_mul_bench_native"),
+                    device,
+                }
+            })
+        }
+
+        fn run(
+            &self,
+            pipeline: &ComputePipelineState,
+            input: &Buffer,
+            output: &Buffer,
+            count: usize,
+        ) -> Duration {
+            let start = Instant::now();
+            let command_buffer = autoreleasepool(|| {
+                let command_buffer = self.queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(pipeline);
+                encoder.set_buffer(0, Some(input), 0);
+                encoder.set_buffer(1, Some(output), 0);
+                set_u32(encoder, 2, count as u32);
+                dispatch(encoder, pipeline, count);
+                encoder.end_encoding();
+                command_buffer.commit();
+                command_buffer.to_owned()
+            });
+            command_buffer.wait_until_completed();
+            assert_eq!(
+                command_buffer.status(),
+                MTLCommandBufferStatus::Completed,
+                "arithmetic command failed with status {:?}",
+                command_buffer.status()
+            );
+            gpu_duration(&command_buffer, start.elapsed())
+        }
+    }
+
+    struct PoseidonBenchmarkHarness {
+        device: Device,
+        queue: CommandQueue,
+        parameters: Buffer,
+        limb_leaf: ComputePipelineState,
+        limb: ComputePipelineState,
+        native_leaf: ComputePipelineState,
+        native: ComputePipelineState,
+    }
+
+    impl PoseidonBenchmarkHarness {
+        fn new() -> Self {
+            autoreleasepool(|| {
+                let device = Device::system_default().expect("no Metal device");
+                let pipelines = |source: &str| {
+                    let options = CompileOptions::new();
+                    let library = device
+                        .new_library_with_source(source, &options)
+                        .unwrap_or_else(|error| panic!("Poseidon2 benchmark shader failed: {error}"));
+                    let pipeline = |name| {
+                        let function = library
+                            .get_function(name, None)
+                            .unwrap_or_else(|error| panic!("{name} unavailable: {error}"));
+                        device
+                            .new_compute_pipeline_state_with_function(&function)
+                            .unwrap_or_else(|error| panic!("{name} pipeline failed: {error}"))
+                    };
+                    (
+                        pipeline("poseidon2_hash_leaves"),
+                        pipeline("poseidon2_hash_parents"),
+                    )
+                };
+                let native_source =
+                    ["#define POSEIDON2_NATIVE_ARITHMETIC_REFERENCE 1\n", SHADER_SOURCE].concat();
+                let (limb_leaf, limb) = pipelines(SHADER_SOURCE);
+                let (native_leaf, native) = pipelines(&native_source);
+
+                let mut parameter_values = Vec::with_capacity(130);
+                parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
+                parameter_values.extend(INTERNAL_CONSTANTS);
+                parameter_values.extend(MATRIX_DIAG_12_U64);
+                let parameters = device.new_buffer_with_data(
+                    parameter_values.as_ptr().cast::<c_void>(),
+                    size_of_val(parameter_values.as_slice()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                Self {
+                    queue: device.new_command_queue(),
+                    device,
+                    parameters,
+                    limb_leaf,
+                    limb,
+                    native_leaf,
+                    native,
+                }
+            })
+        }
+
+        fn run(
+            &self,
+            pipeline: &ComputePipelineState,
+            input: &Buffer,
+            output: &Buffer,
+            count: usize,
+        ) -> Duration {
+            let start = Instant::now();
+            let command_buffer = autoreleasepool(|| {
+                let command_buffer = self.queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(pipeline);
+                encoder.set_buffer(0, Some(input), 0);
+                encoder.set_buffer(1, Some(output), 0);
+                encoder.set_buffer(2, Some(&self.parameters), 0);
+                set_u32(encoder, 3, count as u32);
+                dispatch(encoder, pipeline, count);
+                encoder.end_encoding();
+                command_buffer.commit();
+                command_buffer.to_owned()
+            });
+            command_buffer.wait_until_completed();
+            assert_eq!(
+                command_buffer.status(),
+                MTLCommandBufferStatus::Completed,
+                "Poseidon2 command failed with status {:?}",
+                command_buffer.status()
+            );
+            gpu_duration(&command_buffer, start.elapsed())
+        }
+
+        fn run_merkle(
+            &self,
+            leaf_pipeline: &ComputePipelineState,
+            parent_pipeline: &ComputePipelineState,
+            input: &Buffer,
+            output: &Buffer,
+            leaf_width: usize,
+            leaf_count: usize,
+            cap_height: usize,
+        ) -> Duration {
+            let start = Instant::now();
+            let command_buffer = autoreleasepool(|| {
+                let command_buffer = self.queue.new_command_buffer();
+                let leaf_encoder = command_buffer.new_compute_command_encoder();
+                leaf_encoder.set_compute_pipeline_state(leaf_pipeline);
+                leaf_encoder.set_buffer(0, Some(input), 0);
+                leaf_encoder.set_buffer(1, Some(output), 0);
+                leaf_encoder.set_buffer(2, Some(&self.parameters), 0);
+                set_u32(leaf_encoder, 3, leaf_width as u32);
+                set_u32(leaf_encoder, 4, leaf_count as u32);
+                dispatch(leaf_encoder, leaf_pipeline, leaf_count);
+                leaf_encoder.end_encoding();
+
+                let cap_count = 1usize << cap_height;
+                let mut level_offset = 0usize;
+                let mut child_count = leaf_count;
+                while child_count > cap_count {
+                    let parent_count = child_count / 2;
+                    let child_offset = level_offset;
+                    level_offset += child_count * 4;
+                    let parent_encoder = command_buffer.new_compute_command_encoder();
+                    parent_encoder.set_compute_pipeline_state(parent_pipeline);
+                    parent_encoder.set_buffer(
+                        0,
+                        Some(output),
+                        (child_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    parent_encoder.set_buffer(
+                        1,
+                        Some(output),
+                        (level_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    parent_encoder.set_buffer(2, Some(&self.parameters), 0);
+                    set_u32(parent_encoder, 3, parent_count as u32);
+                    dispatch(parent_encoder, parent_pipeline, parent_count);
+                    parent_encoder.end_encoding();
+                    child_count = parent_count;
+                }
+
+                command_buffer.commit();
+                command_buffer.to_owned()
+            });
+            command_buffer.wait_until_completed();
+            assert_eq!(
+                command_buffer.status(),
+                MTLCommandBufferStatus::Completed,
+                "Merkle command failed with status {:?}",
+                command_buffer.status()
+            );
+            gpu_duration(&command_buffer, start.elapsed())
+        }
+    }
+
+    #[test]
+    fn metal_goldilocks_arithmetic_matches_cpu_and_native() {
+        const P: u128 = 0xffff_ffff_0000_0001;
+        let boundaries = [
+            0,
+            1,
+            2,
+            (1u64 << 32) - 2,
+            (1u64 << 32) - 1,
+            1u64 << 32,
+            (1u64 << 32) + 1,
+            0xffff_fffe_ffff_ffff,
+            0xffff_ffff_0000_0000,
+            0xffff_ffff_0000_0001,
+            0xffff_ffff_0000_0002,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let mut pairs = Vec::with_capacity(boundaries.len() * boundaries.len() + (1 << 16));
+        for &a in &boundaries {
+            for &b in &boundaries {
+                pairs.extend([a, b]);
+            }
+        }
+        let mut rng = StdRng::seed_from_u64(0x474f_4c44_4c49_4d42);
+        for _ in 0..(1 << 16) {
+            pairs.extend([rng.next_u64(), rng.next_u64()]);
+        }
+        let count = pairs.len() / 2;
+
+        let harness = ArithmeticHarness::new();
+        let input = autoreleasepool(|| {
+            harness.device.new_buffer_with_data(
+                pairs.as_ptr().cast::<c_void>(),
+                size_of_val(pairs.as_slice()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+        let output = autoreleasepool(|| {
+            harness.device.new_buffer(
+                (count * 6 * size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+        harness.run(&harness.differential, &input, &output, count);
+        let actual =
+            unsafe { slice::from_raw_parts(output.contents().cast::<u64>(), count * 6) };
+        for (index, (input, output)) in pairs
+            .chunks_exact(2)
+            .zip(actual.chunks_exact(6))
+            .enumerate()
+        {
+            let a = input[0] as u128 % P;
+            let b = input[1] as u128 % P;
+            let expected_mul = (a * b % P) as u64;
+            assert_eq!(
+                output[0], expected_mul,
+                "limb reduction mismatch at pair {index}: {:#x} * {:#x}",
+                input[0], input[1]
+            );
+            assert_eq!(
+                output[1], expected_mul,
+                "native reduction mismatch at pair {index}: {:#x} * {:#x}",
+                input[0], input[1]
+            );
+            let expected_add = ((a + b) % P) as u64;
+            assert_eq!(output[2], expected_add, "limb add mismatch at pair {index}");
+            assert_eq!(output[3], expected_add, "native add mismatch at pair {index}");
+            let expected_sub = ((a + P - b) % P) as u64;
+            assert_eq!(output[4], expected_sub, "limb sub mismatch at pair {index}");
+            assert_eq!(output[5], expected_sub, "native sub mismatch at pair {index}");
+        }
+    }
+
+    #[test]
+    #[ignore = "manual focused Metal arithmetic benchmark"]
+    fn benchmark_metal_goldilocks_mul() {
+        let count = 1usize << 17;
+        let mut rng = StdRng::seed_from_u64(0x4d55_4c42_454e_4348);
+        let inputs: Vec<u64> = (0..count * 2).map(|_| rng.next_u64()).collect();
+        let harness = ArithmeticHarness::new();
+        let input = autoreleasepool(|| {
+            harness.device.new_buffer_with_data(
+                inputs.as_ptr().cast::<c_void>(),
+                size_of_val(inputs.as_slice()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+        let output = autoreleasepool(|| {
+            harness.device.new_buffer(
+                (count * size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+
+        harness.run(&harness.limb, &input, &output, count);
+        harness.run(&harness.native, &input, &output, count);
+        let mut limb = Vec::with_capacity(9);
+        let mut native = Vec::with_capacity(9);
+        for sample in 0..9 {
+            if sample & 1 == 0 {
+                limb.push(harness.run(&harness.limb, &input, &output, count));
+                native.push(harness.run(&harness.native, &input, &output, count));
+            } else {
+                native.push(harness.run(&harness.native, &input, &output, count));
+                limb.push(harness.run(&harness.limb, &input, &output, count));
+            }
+        }
+        limb.sort_unstable();
+        native.sort_unstable();
+        let limb_median = limb[limb.len() / 2];
+        let native_median = native[native.len() / 2];
+        eprintln!(
+            "Metal Goldilocks x64 dependent multiplies: limb={limb_median:?}, \
+             native={native_median:?}, speedup={:.3}x",
+            native_median.as_secs_f64() / limb_median.as_secs_f64()
+        );
+    }
+
+    #[test]
+    fn metal_poseidon2_parent_matches_native() {
+        let boundaries = [
+            0,
+            1,
+            (1u64 << 32) - 1,
+            1u64 << 32,
+            GoldilocksField::ORDER - 1,
+            GoldilocksField::ORDER,
+            GoldilocksField::ORDER + 1,
+            u64::MAX,
+        ];
+        let count = 1usize << 12;
+        let mut rng = StdRng::seed_from_u64(0x504f_5345_4944_4f4e);
+        let inputs: Vec<u64> = (0..count * 8)
+            .map(|i| {
+                if i & 3 == 0 {
+                    boundaries[(i / 4) % boundaries.len()]
+                } else {
+                    rng.next_u64()
+                }
+            })
+            .collect();
+        let harness = PoseidonBenchmarkHarness::new();
+        let input = autoreleasepool(|| {
+            harness.device.new_buffer_with_data(
+                inputs.as_ptr().cast::<c_void>(),
+                size_of_val(inputs.as_slice()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+        let output_bytes = count * 4 * size_of::<u64>();
+        let limb_output = autoreleasepool(|| {
+            harness.device.new_buffer(
+                output_bytes as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+        let native_output = autoreleasepool(|| {
+            harness.device.new_buffer(
+                output_bytes as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+        harness.run(&harness.limb, &input, &limb_output, count);
+        harness.run(&harness.native, &input, &native_output, count);
+        let limb =
+            unsafe { slice::from_raw_parts(limb_output.contents().cast::<u64>(), count * 4) };
+        let native =
+            unsafe { slice::from_raw_parts(native_output.contents().cast::<u64>(), count * 4) };
+        assert_eq!(limb, native);
+    }
+
+    #[test]
+    #[ignore = "manual focused Metal Poseidon2 benchmark"]
+    fn benchmark_metal_poseidon2_parents() {
+        let count = 1usize << 17;
+        let mut rng = StdRng::seed_from_u64(0x504f_5345_4245_4e43);
+        let inputs: Vec<u64> = (0..count * 8)
+            .map(|_| rng.next_u64() % GoldilocksField::ORDER)
+            .collect();
+        let harness = PoseidonBenchmarkHarness::new();
+        let input = autoreleasepool(|| {
+            harness.device.new_buffer_with_data(
+                inputs.as_ptr().cast::<c_void>(),
+                size_of_val(inputs.as_slice()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+        let output = autoreleasepool(|| {
+            harness.device.new_buffer(
+                (count * 4 * size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+
+        harness.run(&harness.limb, &input, &output, count);
+        harness.run(&harness.native, &input, &output, count);
+        let mut limb = Vec::with_capacity(9);
+        let mut native = Vec::with_capacity(9);
+        for sample in 0..9 {
+            if sample & 1 == 0 {
+                limb.push(harness.run(&harness.limb, &input, &output, count));
+                native.push(harness.run(&harness.native, &input, &output, count));
+            } else {
+                native.push(harness.run(&harness.native, &input, &output, count));
+                limb.push(harness.run(&harness.limb, &input, &output, count));
+            }
+        }
+        limb.sort_unstable();
+        native.sort_unstable();
+        let limb_median = limb[limb.len() / 2];
+        let native_median = native[native.len() / 2];
+        eprintln!(
+            "Metal Poseidon2 parents: limb={limb_median:?}, native={native_median:?}, \
+             speedup={:.3}x",
+            native_median.as_secs_f64() / limb_median.as_secs_f64()
+        );
+    }
+
+    #[test]
+    #[ignore = "manual focused Metal Merkle benchmark"]
+    fn benchmark_metal_poseidon2_merkle() {
+        let leaf_count = 1usize << 19;
+        let leaf_width = 8usize;
+        let cap_height = 4usize;
+        let cap_count = 1usize << cap_height;
+        let total_node_count = 2 * leaf_count - cap_count;
+        let mut rng = StdRng::seed_from_u64(0x4d45_524b_4c45_424e);
+        let inputs: Vec<u64> = (0..leaf_count * leaf_width)
+            .map(|_| rng.next_u64() % GoldilocksField::ORDER)
+            .collect();
+        let harness = PoseidonBenchmarkHarness::new();
+        let input = autoreleasepool(|| {
+            harness.device.new_buffer_with_data(
+                inputs.as_ptr().cast::<c_void>(),
+                size_of_val(inputs.as_slice()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+        let output = autoreleasepool(|| {
+            harness.device.new_buffer(
+                (total_node_count * 4 * size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+
+        let run_limb = || {
+            harness.run_merkle(
+                &harness.limb_leaf,
+                &harness.limb,
+                &input,
+                &output,
+                leaf_width,
+                leaf_count,
+                cap_height,
+            )
+        };
+        let run_native = || {
+            harness.run_merkle(
+                &harness.native_leaf,
+                &harness.native,
+                &input,
+                &output,
+                leaf_width,
+                leaf_count,
+                cap_height,
+            )
+        };
+        run_limb();
+        run_native();
+        let mut limb = Vec::with_capacity(7);
+        let mut native = Vec::with_capacity(7);
+        for sample in 0..7 {
+            if sample & 1 == 0 {
+                limb.push(run_limb());
+                native.push(run_native());
+            } else {
+                native.push(run_native());
+                limb.push(run_limb());
+            }
+        }
+        limb.sort_unstable();
+        native.sort_unstable();
+        let limb_median = limb[limb.len() / 2];
+        let native_median = native[native.len() / 2];
+        eprintln!(
+            "Metal Poseidon2 2^19x8 Merkle: limb={limb_median:?}, \
+             native={native_median:?}, speedup={:.3}x",
+            native_median.as_secs_f64() / limb_median.as_secs_f64()
+        );
+    }
 
     #[test]
     fn metal_ntt_commitment_matches_cpu() {
