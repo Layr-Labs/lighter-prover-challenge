@@ -117,13 +117,6 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
         (Self::two_to_one(x0, y0), Self::two_to_one(x1, y1))
     }
 
-    /// Four independent `two_to_one` compressions, allowing implementations
-    /// to interleave them. Must return exactly the four individual
-    /// `Self::two_to_one` results, in order.
-    fn two_to_one_quad(inputs: [(Self::Hash, Self::Hash); 4]) -> [Self::Hash; 4] {
-        inputs.map(|(x, y)| Self::two_to_one(x, y))
-    }
-
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash;
 
     /// Build the native Merkle digests and cap with a specialized backend, when available.
