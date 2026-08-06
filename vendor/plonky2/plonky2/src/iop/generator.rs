@@ -177,7 +177,7 @@ fn run_generator_worklist<
                         for (t, v) in round_buffer.target_values.drain(..) {
                             let rep_index =
                                 round_witness.representative_map[round_witness.target_index(t)];
-                            let watchers = if round_witness.values[rep_index].is_none() {
+                            let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
                                 generator_indices_by_watches.get(&rep_index)
                             } else {
                                 // The representative is populated in the snapshot, so the merge
@@ -340,7 +340,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         // local witness state and does not add anything to serialized prover data.
         let mut unresolved_watches = vec![0usize; generators.len()];
         for (&watch, watchers) in generator_indices_by_watches {
-            if witness.values[watch].is_none() {
+            if !witness.is_set_by_rep_index(watch) {
                 for &generator_idx in watchers {
                     unresolved_watches[generator_idx] += 1;
                 }
