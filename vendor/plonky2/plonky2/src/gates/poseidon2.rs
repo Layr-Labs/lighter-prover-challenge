@@ -501,6 +501,123 @@ pub struct Poseidon2Generator<F: RichField + Extendable<D> + Poseidon2, const D:
     _phantom: PhantomData<F>,
 }
 
+#[cfg(test)]
+static POSEIDON2_GENERATOR_BATCHES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Poseidon2Generator<F, D> {
+    fn run_rows<const N: usize>(
+        rows: [usize; N],
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+    ) -> Result<()> {
+        const GENERATED_VALUES_COUNT: usize =
+            4 + WIDTH * (ROUNDS_F_HALF - 1) + ROUNDS_P + WIDTH * ROUNDS_F_HALF + WIDTH;
+
+        let local_wire = |row, column| Wire { row, column };
+        let mut states: [[F; WIDTH]; N] = core::array::from_fn(|j| {
+            core::array::from_fn(|i| {
+                witness.get_wire(local_wire(rows[j], Poseidon2Gate::<F, D>::wire_input(i)))
+            })
+        });
+        let swap_values: [F; N] = core::array::from_fn(|j| {
+            witness.get_wire(local_wire(rows[j], Poseidon2Gate::<F, D>::WIRE_SWAP))
+        });
+        let mut generated = [[F::ZERO; GENERATED_VALUES_COUNT]; N];
+        let mut columns = [0usize; GENERATED_VALUES_COUNT];
+        let mut slot = 0;
+
+        for i in 0..4 {
+            columns[slot + i] = Poseidon2Gate::<F, D>::wire_delta(i);
+            for j in 0..N {
+                debug_assert!(swap_values[j] == F::ZERO || swap_values[j] == F::ONE);
+                generated[j][slot + i] = swap_values[j] * (states[j][i + 4] - states[j][i]);
+            }
+        }
+        slot += 4;
+
+        for j in 0..N {
+            if swap_values[j] == F::ONE {
+                for i in 0..4 {
+                    states[j].swap(i, 4 + i);
+                }
+            }
+            <F as Poseidon2>::external_linear_layer(&mut states[j]);
+        }
+
+        for r in 0..ROUNDS_F_HALF {
+            for state in &mut states {
+                <F as Poseidon2>::add_rc(state, r);
+            }
+            if r != 0 {
+                for i in 0..WIDTH {
+                    columns[slot + i] = Poseidon2Gate::<F, D>::wire_full_sbox_0(r, i);
+                    for j in 0..N {
+                        generated[j][slot + i] = states[j][i];
+                    }
+                }
+                slot += WIDTH;
+            }
+            for state in &mut states {
+                <F as Poseidon2>::sbox(state);
+            }
+            for state in &mut states {
+                <F as Poseidon2>::external_linear_layer(state);
+            }
+        }
+
+        for r in 0..ROUNDS_P {
+            columns[slot] = Poseidon2Gate::<F, D>::wire_partial_sbox(r);
+            for j in 0..N {
+                states[j][0] += F::from_canonical_u64(INTERNAL_CONSTANTS[r]);
+                generated[j][slot] = states[j][0];
+            }
+            slot += 1;
+            for state in &mut states {
+                state[0] = <F as Poseidon2>::sbox_p(&state[0]);
+            }
+            for state in &mut states {
+                <F as Poseidon2>::internal_linear_layer(state);
+            }
+        }
+
+        for r in ROUNDS_F_HALF..ROUNDS_F {
+            for state in &mut states {
+                <F as Poseidon2>::add_rc(state, r);
+            }
+            for i in 0..WIDTH {
+                columns[slot + i] = Poseidon2Gate::<F, D>::wire_full_sbox_1(r - ROUNDS_F_HALF, i);
+                for j in 0..N {
+                    generated[j][slot + i] = states[j][i];
+                }
+            }
+            slot += WIDTH;
+            for state in &mut states {
+                <F as Poseidon2>::sbox(state);
+            }
+            for state in &mut states {
+                <F as Poseidon2>::external_linear_layer(state);
+            }
+        }
+
+        for i in 0..WIDTH {
+            columns[slot + i] = Poseidon2Gate::<F, D>::wire_output(i);
+            for j in 0..N {
+                generated[j][slot + i] = states[j][i];
+            }
+        }
+        slot += WIDTH;
+        debug_assert_eq!(slot, GENERATED_VALUES_COUNT);
+
+        for j in 0..N {
+            for i in 0..GENERATED_VALUES_COUNT {
+                out_buffer.set_wire(local_wire(rows[j], columns[i]), generated[j][i])?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> SimpleGenerator<F, D>
     for Poseidon2Generator<F, D>
 {
@@ -521,80 +638,26 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> SimpleGenerator<F
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let local_wire = |column| Wire {
-            row: self.row,
-            column,
-        };
+        Self::run_rows([self.row], witness, out_buffer)
+    }
 
-        let mut state = (0..WIDTH)
-            .map(|i| witness.get_wire(local_wire(Poseidon2Gate::<F, D>::wire_input(i))))
-            .collect::<Vec<_>>();
+    fn batch_hint(&self) -> Option<(&'static str, usize)> {
+        Some(("Poseidon2Generator", self.row))
+    }
 
-        let swap_value = witness.get_wire(local_wire(Poseidon2Gate::<F, D>::WIRE_SWAP));
-        debug_assert!(swap_value == F::ZERO || swap_value == F::ONE);
-
-        for i in 0..4 {
-            let delta_i = swap_value * (state[i + 4] - state[i]);
-            out_buffer.set_wire(local_wire(Poseidon2Gate::<F, D>::wire_delta(i)), delta_i)?;
+    fn run_ready_batch(
+        &self,
+        items: &[usize],
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+    ) -> Option<Result<()>> {
+        #[cfg(test)]
+        POSEIDON2_GENERATOR_BATCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        match items {
+            &[a, b] => Some(Self::run_rows([a, b], witness, out_buffer)),
+            &[a, b, c, d] => Some(Self::run_rows([a, b, c, d], witness, out_buffer)),
+            _ => None,
         }
-
-        if swap_value == F::ONE {
-            for i in 0..4 {
-                state.swap(i, 4 + i);
-            }
-        }
-
-        let mut state: [F; WIDTH] = state.try_into().unwrap();
-
-        <F as Poseidon2>::external_linear_layer(&mut state);
-
-        // The first half of the external rounds.
-        for r in 0..ROUNDS_F_HALF {
-            <F as Poseidon2>::add_rc(&mut state, r);
-            if r != 0 {
-                for i in 0..WIDTH {
-                    out_buffer.set_wire(
-                        local_wire(Poseidon2Gate::<F, D>::wire_full_sbox_0(r, i)),
-                        state[i],
-                    )?;
-                }
-            }
-            <F as Poseidon2>::sbox(&mut state);
-            <F as Poseidon2>::external_linear_layer(&mut state);
-        }
-
-        // The internal rounds.
-        for r in 0..ROUNDS_P {
-            state[0] += F::from_canonical_u64(INTERNAL_CONSTANTS[r]);
-            out_buffer.set_wire(
-                local_wire(Poseidon2Gate::<F, D>::wire_partial_sbox(r)),
-                state[0],
-            )?;
-            state[0] = <F as Poseidon2>::sbox_p(&state[0]);
-            <F as Poseidon2>::internal_linear_layer(&mut state);
-        }
-
-        // The second half of the external rounds.
-        for r in ROUNDS_F_HALF..ROUNDS_F {
-            <F as Poseidon2>::add_rc(&mut state, r);
-            for i in 0..WIDTH {
-                out_buffer.set_wire(
-                    local_wire(Poseidon2Gate::<F, D>::wire_full_sbox_1(
-                        r - ROUNDS_F_HALF,
-                        i,
-                    )),
-                    state[i],
-                )?;
-            }
-            <F as Poseidon2>::sbox(&mut state);
-            <F as Poseidon2>::external_linear_layer(&mut state);
-        }
-
-        for i in 0..WIDTH {
-            out_buffer.set_wire(local_wire(Poseidon2Gate::<F, D>::wire_output(i)), state[i])?;
-        }
-
-        Ok(())
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
@@ -695,6 +758,75 @@ mod tests {
                 column: Gate::wire_output(i),
             });
             assert_eq!(out, expected_outputs[i]);
+        }
+    }
+
+    #[test]
+    fn generated_output_batches_four_adjacent_rows() {
+        const D: usize = 2;
+        type C = Poseidon2GoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type Gate = Poseidon2Gate<F, D>;
+
+        POSEIDON2_GENERATOR_BATCHES.store(0, core::sync::atomic::Ordering::Relaxed);
+        let config = CircuitConfig {
+            num_wires: 143,
+            ..CircuitConfig::standard_recursion_config()
+        };
+        let mut builder = CircuitBuilder::new(config);
+        let rows: [usize; 4] = core::array::from_fn(|_| builder.add_gate(Gate::new(), vec![]));
+        let circuit = builder.build_prover::<C>();
+        let mut inputs = PartialWitness::new();
+        let mut expected = [[F::ZERO; WIDTH]; 4];
+
+        for j in 0..4 {
+            let swap = if j % 2 == 0 { F::ZERO } else { F::ONE };
+            inputs
+                .set_wire(
+                    Wire {
+                        row: rows[j],
+                        column: Gate::WIRE_SWAP,
+                    },
+                    swap,
+                )
+                .unwrap();
+            for i in 0..WIDTH {
+                let value = F::from_canonical_usize(j * WIDTH + i);
+                expected[j][i] = value;
+                inputs
+                    .set_wire(
+                        Wire {
+                            row: rows[j],
+                            column: Gate::wire_input(i),
+                        },
+                        value,
+                    )
+                    .unwrap();
+            }
+            if swap == F::ONE {
+                for i in 0..4 {
+                    expected[j].swap(i, i + 4);
+                }
+            }
+            expected[j] = F::poseidon2(expected[j]);
+        }
+
+        let witness =
+            generate_partial_witness(inputs, &circuit.prover_only, &circuit.common).unwrap();
+        assert_eq!(
+            POSEIDON2_GENERATOR_BATCHES.load(core::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        for j in 0..4 {
+            for i in 0..WIDTH {
+                assert_eq!(
+                    witness.get_wire(Wire {
+                        row: rows[j],
+                        column: Gate::wire_output(i),
+                    }),
+                    expected[j][i]
+                );
+            }
         }
     }
 

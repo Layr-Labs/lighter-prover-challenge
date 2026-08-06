@@ -8,7 +8,7 @@ use alloc::{
 use core::fmt::Debug;
 use core::marker::PhantomData;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 
 use crate::field::extension::Extendable;
 use crate::field::types::Field;
@@ -73,19 +73,76 @@ pub fn generate_partial_witness<
     while !pending_generator_indices.is_empty() {
         let mut next_pending_generator_indices = Vec::new();
 
-        for &generator_idx in &pending_generator_indices {
+        let mut pending_idx = 0;
+        while pending_idx < pending_generator_indices.len() {
+            let generator_idx = pending_generator_indices[pending_idx];
             if generator_is_expired[generator_idx] {
+                pending_idx += 1;
                 continue;
             }
 
-            let finished = generators[generator_idx].0.run_with_ready_hint(
-                &witness,
-                &mut buffer,
-                unresolved_watches[generator_idx] == 0,
-            );
-            if finished {
-                generator_is_expired[generator_idx] = true;
-                remaining_generators -= 1;
+            let all_watches_populated = unresolved_watches[generator_idx] == 0;
+            let mut batch_indices = [generator_idx; 4];
+            let mut batch_items = [0usize; 4];
+            let mut batch_len = 1;
+
+            if all_watches_populated {
+                if let Some((batch_key, batch_item)) = generators[generator_idx].0.batch_hint() {
+                    batch_items[0] = batch_item;
+                    while batch_len < 4 && pending_idx + batch_len < pending_generator_indices.len()
+                    {
+                        let next_generator_idx = pending_generator_indices[pending_idx + batch_len];
+                        if batch_indices[..batch_len].contains(&next_generator_idx)
+                            || generator_is_expired[next_generator_idx]
+                            || unresolved_watches[next_generator_idx] != 0
+                        {
+                            break;
+                        }
+                        let Some((next_key, next_item)) =
+                            generators[next_generator_idx].0.batch_hint()
+                        else {
+                            break;
+                        };
+                        if next_key != batch_key {
+                            break;
+                        }
+                        batch_indices[batch_len] = next_generator_idx;
+                        batch_items[batch_len] = next_item;
+                        batch_len += 1;
+                    }
+                    if batch_len == 3 {
+                        batch_len = 2;
+                    }
+                }
+            }
+
+            let batch_finished = (batch_len > 1).then(|| {
+                generators[generator_idx].0.run_ready_batch(
+                    &batch_items[..batch_len],
+                    &witness,
+                    &mut buffer,
+                )
+            });
+
+            if let Some(Some(finished)) = batch_finished {
+                if finished {
+                    for &finished_idx in &batch_indices[..batch_len] {
+                        generator_is_expired[finished_idx] = true;
+                    }
+                    remaining_generators -= batch_len;
+                }
+                pending_idx += batch_len;
+            } else {
+                let finished = generators[generator_idx].0.run_with_ready_hint(
+                    &witness,
+                    &mut buffer,
+                    all_watches_populated,
+                );
+                if finished {
+                    generator_is_expired[generator_idx] = true;
+                    remaining_generators -= 1;
+                }
+                pending_idx += 1;
             }
 
             // Merge any generated values into our witness, and get a list of newly-populated
@@ -149,6 +206,23 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
         _all_watches_populated: bool,
     ) -> bool {
         self.run(witness, out_buffer)
+    }
+
+    /// Optional batching key and generator-specific item for ready generators.
+    #[doc(hidden)]
+    fn batch_hint(&self) -> Option<(&'static str, usize)> {
+        None
+    }
+
+    /// Run a homogeneous batch of ready generators. Returning `None` declines batching.
+    #[doc(hidden)]
+    fn run_ready_batch(
+        &self,
+        _items: &[usize],
+        _witness: &PartitionWitness<F>,
+        _out_buffer: &mut GeneratedValues<F>,
+    ) -> Option<bool> {
+        None
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()>;
@@ -249,6 +323,21 @@ pub trait SimpleGenerator<F: RichField + Extendable<D>, const D: usize>:
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()>;
 
+    #[doc(hidden)]
+    fn batch_hint(&self) -> Option<(&'static str, usize)> {
+        None
+    }
+
+    #[doc(hidden)]
+    fn run_ready_batch(
+        &self,
+        _items: &[usize],
+        _witness: &PartitionWitness<F>,
+        _out_buffer: &mut GeneratedValues<F>,
+    ) -> Option<Result<()>> {
+        None
+    }
+
     fn adapter(self) -> SimpleGeneratorAdapter<F, Self, D>
     where
         Self: Sized,
@@ -302,6 +391,21 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
         all_watches_populated: bool,
     ) -> bool {
         all_watches_populated && self.inner.run_once(witness, out_buffer).is_ok()
+    }
+
+    fn batch_hint(&self) -> Option<(&'static str, usize)> {
+        self.inner.batch_hint()
+    }
+
+    fn run_ready_batch(
+        &self,
+        items: &[usize],
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+    ) -> Option<bool> {
+        self.inner
+            .run_ready_batch(items, witness, out_buffer)
+            .map(|result| result.is_ok())
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
@@ -486,8 +590,8 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D> for Con
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
