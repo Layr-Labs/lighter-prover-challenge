@@ -70,7 +70,9 @@ impl<F: RichField, H: Hasher<F>> Challenger<F, H> {
     }
 
     pub fn observe_hash<OH: Hasher<F>>(&mut self, hash: OH::Hash) {
-        self.observe_elements(&hash.to_vec())
+        // Absorb the same elements in the same order without materializing
+        // the `to_vec` temporary.
+        hash.for_each_element(|element| self.observe_element(element));
     }
 
     pub fn observe_cap<OH: Hasher<F>>(&mut self, cap: &MerkleCap<F, OH>) {

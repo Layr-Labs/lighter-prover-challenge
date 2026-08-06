@@ -31,6 +31,13 @@ pub trait GenericHashOut<F: RichField>:
     fn from_bytes(bytes: &[u8]) -> Self;
 
     fn to_vec(&self) -> Vec<F>;
+
+    /// Visit the hash's field elements in `to_vec` order without requiring an
+    /// allocation. The default preserves `to_vec` exactly; element-backed
+    /// hashes override it to iterate their storage directly.
+    fn for_each_element(&self, f: impl FnMut(F)) {
+        self.to_vec().into_iter().for_each(f);
+    }
 }
 
 /// Trait for hash functions.
