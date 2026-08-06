@@ -356,17 +356,12 @@ fn prove_path(
 }
 
 pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
-    // The pre-execution proof runs strictly before any other proving work, so
-    // the serialized GPU stream is otherwise idle: route its mid-size column
-    // trees to the GPU for just this phase.
-    plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
     let pre_proof = BlockPreExecutionCircuit::prove(
         &circuits.pre_data,
         &BlockPreExec::from_block(&block),
         &circuits.pre_target,
     )
     .expect("block pre-execution proof failed");
-    plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
@@ -439,11 +434,7 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     // opts into parallel worklist rounds; tx-proof and chain witness generation run concurrently
     // with proving and stay sequential.
     let _parallel_block_witness = ParallelWitnessGuard::new();
-    // For the same reason the serialized GPU stream is otherwise idle here:
-    // route the final block proof's mid-size column trees to the GPU for just
-    // this phase.
-    plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-    let final_proof = BlockCircuit::prove(
+    BlockCircuit::prove(
         &block_target,
         &block_data,
         &block,
@@ -451,9 +442,7 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
         light_chain_input,
         heavy_chain_input,
     )
-    .expect("final block proof failed");
-    plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
-    final_proof
+    .expect("final block proof failed")
 }
 
 #[cfg(test)]
