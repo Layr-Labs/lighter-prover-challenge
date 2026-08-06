@@ -30,7 +30,10 @@ enum TxPath {
     Light,
 }
 
-const LIGHT_TX_PROOF_WINDOW: usize = 2;
+// A window of 2 leaves the chain consumer starved whenever one chunk proof
+// runs long; 3 keeps one extra producer ahead of the strictly sequential
+// chain at ~0.6 GB additional peak retention, well within the 48 GB runner.
+const LIGHT_TX_PROOF_WINDOW: usize = 3;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
@@ -287,9 +290,14 @@ fn prove_path(
             });
 
             in_flight.push_back((current_step, proof_handle));
+            // The heavy path's chain consumer benefits from the same
+            // one-extra-producer buffering as the light path; its chunks are
+            // few, so the added retention is bounded by a single proof.
             let max_in_flight =
                 if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
                     LIGHT_TX_PROOF_WINDOW
+                } else if path == TxPath::Heavy && current_step >= 1 {
+                    2
                 } else {
                     1
                 };
