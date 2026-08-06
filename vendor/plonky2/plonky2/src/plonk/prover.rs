@@ -779,21 +779,35 @@ fn compute_quotient_polys<
                 );
 
                 let indices_batch = &scratch.indices;
-                let local_zs_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.zs_local_flat[k * zs_row_width..][common_data.zs_range()])
-                    .collect();
-                let next_zs_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.zs_next_flat[k * zs_row_width..][common_data.zs_range()])
-                    .collect();
-                let partial_products_batch: Vec<&[F]> = (0..n)
-                    .map(|k| {
+                let local_zs_batch: [&[F]; BATCH_SIZE] = core::array::from_fn(|k| {
+                    if k < n {
+                        &scratch.zs_local_flat[k * zs_row_width..][common_data.zs_range()]
+                    } else {
+                        &[]
+                    }
+                });
+                let next_zs_batch: [&[F]; BATCH_SIZE] = core::array::from_fn(|k| {
+                    if k < n {
+                        &scratch.zs_next_flat[k * zs_row_width..][common_data.zs_range()]
+                    } else {
+                        &[]
+                    }
+                });
+                let partial_products_batch: [&[F]; BATCH_SIZE] = core::array::from_fn(|k| {
+                    if k < n {
                         &scratch.zs_local_flat[k * zs_row_width..]
                             [common_data.partial_products_range()]
-                    })
-                    .collect();
-                let s_sigmas_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires])
-                    .collect();
+                    } else {
+                        &[]
+                    }
+                });
+                let s_sigmas_batch: [&[F]; BATCH_SIZE] = core::array::from_fn(|k| {
+                    if k < n {
+                        &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires]
+                    } else {
+                        &[]
+                    }
+                });
                 let (local_lookup_batch, next_lookup_batch): (Vec<&[F]>, Vec<&[F]>) = if has_lookup
                 {
                     (
@@ -827,12 +841,12 @@ fn compute_quotient_polys<
                     indices_batch,
                     &scratch.shifted_xs,
                     vars_batch,
-                    &local_zs_batch,
-                    &next_zs_batch,
+                    &local_zs_batch[..n],
+                    &next_zs_batch[..n],
                     &local_lookup_batch,
                     &next_lookup_batch,
-                    &partial_products_batch,
-                    &s_sigmas_batch,
+                    &partial_products_batch[..n],
+                    &s_sigmas_batch[..n],
                     betas,
                     gammas,
                     deltas,
