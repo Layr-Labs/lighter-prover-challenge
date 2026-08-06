@@ -389,6 +389,25 @@ fn all_wires_permutation_partial_products<
         .collect()
 }
 
+fn multiply_inverse_denominators_by_numerators<F: Field>(
+    inverse_denominators: &mut [F],
+    wire_values: impl ExactSizeIterator<Item = F>,
+    k_is: &[F],
+    x: F,
+    beta: F,
+    gamma: F,
+) {
+    debug_assert_eq!(wire_values.len(), inverse_denominators.len());
+    debug_assert_eq!(k_is.len(), inverse_denominators.len());
+
+    for ((denominator_inv, wire_value), &k_i) in
+        inverse_denominators.iter_mut().zip(wire_values).zip(k_is)
+    {
+        let numerator = wire_value + beta * (k_i * x) + gamma;
+        *denominator_inv = numerator * *denominator_inv;
+    }
+}
+
 /// Compute the partial products used in the `Z` polynomial.
 /// Returns the polynomials interpolating `partial_products(f / g)`
 /// where `f, g` are the products in the definition of `Z`: `Z(g^i) = f / g`.
@@ -412,12 +431,6 @@ fn wires_permutation_partial_products_and_zs<
         .enumerate()
         .map(|(i, &x)| {
             let s_sigmas = &prover_data.sigmas[i];
-            let numerators = (0..common_data.config.num_routed_wires).map(|j| {
-                let wire_value = witness.get_wire(i, j);
-                let k_i = k_is[j];
-                let s_id = k_i * x;
-                wire_value + beta * s_id + gamma
-            });
             let denominators = (0..common_data.config.num_routed_wires)
                 .map(|j| {
                     let wire_value = witness.get_wire(i, j);
@@ -425,11 +438,15 @@ fn wires_permutation_partial_products_and_zs<
                     wire_value + beta * s_sigma + gamma
                 })
                 .collect::<Vec<_>>();
-            let denominator_invs = F::batch_multiplicative_inverse(&denominators);
-            let quotient_values = numerators
-                .zip(denominator_invs)
-                .map(|(num, den_inv)| num * den_inv)
-                .collect::<Vec<_>>();
+            let mut quotient_values = F::batch_multiplicative_inverse(&denominators);
+            multiply_inverse_denominators_by_numerators(
+                &mut quotient_values,
+                (0..common_data.config.num_routed_wires).map(|j| witness.get_wire(i, j)),
+                k_is,
+                x,
+                beta,
+                gamma,
+            );
 
             quotient_chunk_products(&quotient_values, degree)
         })
@@ -868,4 +885,62 @@ fn compute_quotient_polys<
         })
         .map(|values| values.coset_ifft(F::coset_shift()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use plonky2_field::goldilocks_field::GoldilocksField;
+    use plonky2_field::types::PrimeField64;
+
+    use super::*;
+
+    #[test]
+    fn inverse_denominator_buffer_matches_legacy_quotient_collection() {
+        type F = GoldilocksField;
+
+        let beta = F::from_canonical_u64(17);
+        let gamma = F::from_canonical_u64(29);
+        let x = F::from_canonical_u64(41);
+
+        for num_routed_wires in [0, 1, 31, 32, 136] {
+            let wire_values = (0..num_routed_wires)
+                .map(|j| F::from_canonical_usize(3 * j + 5))
+                .collect::<Vec<_>>();
+            let k_is = (0..num_routed_wires)
+                .map(|j| F::from_canonical_usize(5 * j + 7))
+                .collect::<Vec<_>>();
+            let denominators = (0..num_routed_wires)
+                .map(|j| F::from_canonical_usize(7 * j + 11))
+                .collect::<Vec<_>>();
+
+            let inverse_denominators = F::batch_multiplicative_inverse(&denominators);
+            let expected = wire_values
+                .iter()
+                .copied()
+                .zip(&k_is)
+                .map(|(wire_value, &k_i)| wire_value + beta * (k_i * x) + gamma)
+                .zip(inverse_denominators.iter().copied())
+                .map(|(numerator, denominator_inv)| numerator * denominator_inv)
+                .collect::<Vec<_>>();
+
+            let mut actual = inverse_denominators;
+            multiply_inverse_denominators_by_numerators(
+                &mut actual,
+                wire_values.iter().copied(),
+                &k_is,
+                x,
+                beta,
+                gamma,
+            );
+
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert_eq!(
+                    actual.to_noncanonical_u64(),
+                    expected.to_noncanonical_u64(),
+                    "raw field mismatch with {num_routed_wires} routed wires"
+                );
+            }
+        }
+    }
 }

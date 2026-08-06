@@ -206,6 +206,14 @@ pub struct CircuitBuilder<F: RichField + Extendable<D>, const D: usize> {
     pub(crate) verifier_data_public_input: Option<VerifierCircuitTarget>,
 }
 
+fn take_constants_to_targets_sorted<F: RichField>(
+    constants_to_targets: &mut HashMap<F, Target>,
+) -> impl Iterator<Item = (F, Target)> {
+    core::mem::take(constants_to_targets)
+        .into_iter()
+        .sorted_by_key(|(constant, _target)| constant.to_canonical_u64())
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
     /// Given a [`CircuitConfig`], generate a new [`CircuitBuilder`] instance.
     /// It will also check that the configuration provided is consistent, i.e.
@@ -1157,14 +1165,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         }
 
         // For each constant-target pair used in the circuit, use a constant generator to fill this target.
-        for ((c, t), mut const_gen) in self
-            .constants_to_targets
-            .clone()
-            .into_iter()
-            // We need to enumerate constants_to_targets in some deterministic order to ensure that
-            // building a circuit is deterministic.
-            .sorted_by_key(|(c, _t)| c.to_canonical_u64())
-            .zip(self.constant_generators.clone())
+        // We need to enumerate constants_to_targets in some deterministic order to ensure that
+        // building a circuit is deterministic.
+        for ((c, t), mut const_gen) in
+            take_constants_to_targets_sorted(&mut self.constants_to_targets)
+                .zip(self.constant_generators.clone())
         {
             // Set the constant in the constant polynomial.
             self.gate_instances[const_gen.row].constants[const_gen.constant_index] = c;
@@ -1391,5 +1396,63 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // TODO: Can skip parts of this.
         let circuit_data = self.build::<C>();
         circuit_data.verifier_data()
+    }
+}
+
+#[cfg(test)]
+mod constant_target_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::PrimeField64;
+
+    #[test]
+    fn taking_sorted_constants_preserves_pairs_and_empties_source() {
+        let insertion_orders = [
+            vec![],
+            vec![(7, 70), (2, 20), (11, 110), (5, 50)],
+            vec![(5, 50), (11, 110), (2, 20), (7, 70)],
+        ];
+        let mut nonempty_results = Vec::new();
+
+        for insertion_order in insertion_orders {
+            let mut constants_to_targets = insertion_order
+                .into_iter()
+                .map(|(constant, target)| {
+                    (field(constant), Target::VirtualTarget { index: target })
+                })
+                .collect::<HashMap<_, _>>();
+            let expected = constants_to_targets
+                .clone()
+                .into_iter()
+                .sorted_by_key(|(constant, _target)| constant.to_canonical_u64())
+                .collect::<Vec<_>>();
+
+            let actual =
+                take_constants_to_targets_sorted(&mut constants_to_targets).collect::<Vec<_>>();
+
+            assert!(constants_to_targets.is_empty());
+            assert_eq!(actual, expected);
+            assert!(actual
+                .windows(2)
+                .all(|pair| { pair[0].0.to_canonical_u64() < pair[1].0.to_canonical_u64() }));
+            if !actual.is_empty() {
+                assert_eq!(
+                    actual,
+                    vec![
+                        (field(2), Target::VirtualTarget { index: 20 }),
+                        (field(5), Target::VirtualTarget { index: 50 }),
+                        (field(7), Target::VirtualTarget { index: 70 }),
+                        (field(11), Target::VirtualTarget { index: 110 }),
+                    ]
+                );
+                nonempty_results.push(actual);
+            }
+        }
+
+        assert_eq!(nonempty_results[0], nonempty_results[1]);
+    }
+
+    fn field(value: usize) -> GoldilocksField {
+        GoldilocksField::from_canonical_usize(value)
     }
 }
