@@ -1,18 +1,79 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
 use circuit::block_constraints::{BlockCircuit, BlockTarget, Circuit as _};
 use circuit::block_pre_execution_constraints::{
     BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
 };
 use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, BlockTxChainTarget, Circuit as _};
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _};
+use circuit::circuit_serializer::{BlockGateSerializer, BlockGeneratorSerializer};
 use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
 use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::proof::ProofWithPublicInputs;
 
 pub type Proof = ProofWithPublicInputs<F, C, D>;
+
+type BlockGenSer = BlockGeneratorSerializer<C, D, circuit::ecdsa::curve::secp256k1::Secp256K1>;
+
+/// Directory for cached preprocessed circuit data, set once by the worker from
+/// its writable output directory before circuit construction. Circuit builds
+/// are deterministic per binary, so cache entries are keyed by a fingerprint of
+/// the running executable itself: any code change produces a different binary
+/// hash and therefore can never read a stale entry. When the directory is
+/// unset (tests) or entries are absent/unreadable (fresh run directory), every
+/// circuit is built exactly as before and, on a best-effort basis, stored for
+/// the next worker invocation in the same run directory.
+static CIRCUIT_CACHE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+pub fn set_circuit_cache_dir(dir: Option<PathBuf>) {
+    let _ = CIRCUIT_CACHE_DIR.set(dir);
+}
+
+fn binary_fingerprint() -> Option<&'static str> {
+    static FINGERPRINT: OnceLock<Option<String>> = OnceLock::new();
+    FINGERPRINT
+        .get_or_init(|| {
+            use sha2::{Digest, Sha256};
+            let exe = std::env::current_exe().ok()?;
+            let bytes = std::fs::read(exe).ok()?;
+            let digest = Sha256::digest(&bytes);
+            Some(digest[..8].iter().map(|b| format!("{b:02x}")).collect())
+        })
+        .as_deref()
+}
+
+fn circuit_cache_path(name: &str) -> Option<PathBuf> {
+    let dir = CIRCUIT_CACHE_DIR.get()?.as_ref()?;
+    Some(dir.join(format!("circuit-cache-{}-{name}.bin", binary_fingerprint()?)))
+}
+
+fn cached_build(name: &str, build: impl FnOnce() -> CircuitData<F, C, D>) -> CircuitData<F, C, D> {
+    let path = circuit_cache_path(name);
+    if let Some(path) = &path {
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Ok(data) =
+                CircuitData::from_bytes(&bytes, &BlockGateSerializer, &BlockGenSer::default())
+            {
+                return data;
+            }
+        }
+    }
+    let data = build();
+    if let Some(path) = path {
+        if let Ok(bytes) = data.to_bytes(&BlockGateSerializer, &BlockGenSer::default()) {
+            let tmp = path.with_extension("tmp");
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+    data
+}
 
 pub const CHAIN_ID: u32 = 304;
 pub const HEAVY_TX_PER_PROOF: usize = 4;
@@ -51,12 +112,12 @@ impl PathCircuits {
     fn new(tx_per_proof: usize, tx_mode: u8) -> Self {
         let tx = BlockTxCircuit::define(CIRCUIT_CONFIG, tx_per_proof, CHAIN_ID, tx_mode);
         let tx_target = tx.target;
-        let tx_data = tx.builder.build::<C>();
+        let tx_data = cached_build(&format!("tx-{tx_mode}"), || tx.builder.build::<C>());
 
         let chain =
             BlockTxChainCircuit::define(CIRCUIT_CONFIG, &tx_data, ON_CHAIN_OPERATIONS_LIMIT);
         let chain_target = chain.target;
-        let chain_data = chain.builder.build::<C>();
+        let chain_data = cached_build(&format!("chain-{tx_mode}"), || chain.builder.build::<C>());
 
         let proof_bytes: &[u8] = match tx_mode {
             TX_HEAVY => include_bytes!("../dummy-heavy-chain-proof.bin"),
@@ -81,7 +142,7 @@ impl Circuits {
         let ((pre_target, pre_data), (heavy, light)) = rayon::join(
             || {
                 let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
-                (pre.target, pre.builder.build::<C>())
+                (pre.target, cached_build("pre", || pre.builder.build::<C>()))
             },
             || {
                 rayon::join(
@@ -117,7 +178,10 @@ impl Circuits {
             &self.heavy_chain_data,
             ON_CHAIN_OPERATIONS_LIMIT,
         );
-        (block.target, block.builder.build::<C>())
+        (
+            block.target,
+            cached_build("block", || block.builder.build::<C>()),
+        )
     }
 }
 

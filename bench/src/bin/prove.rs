@@ -38,6 +38,18 @@ fn main() {
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
+    // The output file's directory is the one place the sandboxed worker can
+    // write; cache preprocessed circuit data there so later worker invocations
+    // in the same run directory (ranked mode proves several fixtures) skip
+    // rebuilding identical circuits. Entries are keyed by the binary's own
+    // hash, so a different candidate can never read them.
+    api::set_circuit_cache_dir(
+        std::path::Path::new(&output)
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.to_path_buf()),
+    );
+
     let json = fs::read(fixture).expect("cannot read prover fixture");
     let block = Block::<F>::from_json_with_empty_txs(
         &json,
