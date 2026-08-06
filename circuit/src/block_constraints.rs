@@ -7,7 +7,6 @@ use log::Level;
 use plonky2::field::extension::Extendable;
 use plonky2::field::types::Field;
 use plonky2::hash::hash_types::{HashOutTarget, RichField};
-use plonky2::iop::generator::PendingPartitionWitness;
 use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::iop::witness::{PartialWitness, WitnessWrite};
 use plonky2::plonk::circuit_data::{CircuitConfig, CircuitData, CommonCircuitData};
@@ -15,7 +14,6 @@ use plonky2::plonk::config::GenericConfig;
 use plonky2::plonk::proof::{
     CompressedProofWithPublicInputs, ProofWithPublicInputs, ProofWithPublicInputsTarget,
 };
-use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::timed;
 use plonky2::util::timing::TimingTree;
 
@@ -158,130 +156,6 @@ impl BlockCircuit {
             },
             builder,
         }
-    }
-
-    /// Block witness inputs that do not depend on the chain proofs, so they can be seeded and
-    /// their generators run while the transaction chains are still proving.
-    pub fn witness_inputs_early(
-        target: &BlockTarget,
-        block: &Block<F>,
-        pre_exec_proof: &ProofWithPublicInputs<F, C, D>,
-    ) -> Result<PartialWitness<F>> {
-        let mut pw = PartialWitness::new();
-
-        pw.set_proof_with_pis_target(&target.pre_exec_proof, pre_exec_proof)?;
-
-        let block_witness = BlockWitness::from_block(block, 1);
-
-        pw.set_target(
-            target.block.block_number,
-            F::from_canonical_u64(block.block_number),
-        )?;
-        pw.set_target(
-            target.block.created_at,
-            F::from_canonical_u64(block.created_at as u64),
-        )?;
-
-        pw.set_hash_target(target.block.old_state_root, block_witness.old_state_root)?;
-
-        pw.set_hash_target(
-            target.block.new_validium_root,
-            block_witness.new_validium_root,
-        )?;
-        pw.set_hash_target(target.block.new_state_root, block_witness.new_state_root)?;
-
-        pw.set_hash_target(
-            target.block.new_account_delta_tree_root,
-            block_witness.new_account_delta_tree_root,
-        )?;
-
-        pw.set_hash_target(
-            target.block.old_account_delta_tree_root,
-            block_witness.old_account_delta_tree_root,
-        )?;
-
-        pw.set_target(
-            target.block.priority_operations_count,
-            F::from_canonical_u64(block_witness.priority_operations_count),
-        )?;
-        for i in 0..KECCAK_HASH_OUT_BYTE_SIZE {
-            pw.set_target(
-                target.block.old_prefix_priority_operation_hash[i].0,
-                F::from_canonical_u8(block_witness.old_prefix_priority_operation_hash[i]),
-            )?;
-            pw.set_target(
-                target.block.new_prefix_priority_operation_hash[i].0,
-                F::from_canonical_u8(block_witness.new_prefix_priority_operation_hash[i]),
-            )?;
-        }
-
-        pw.set_target(
-            target.block.on_chain_operations_count,
-            F::from_canonical_u64(block_witness.on_chain_operations_count),
-        )?;
-        target
-            .block
-            .on_chain_operations_pub_data
-            .iter()
-            .zip_eq(block_witness.on_chain_operations_pub_data.iter())
-            .try_for_each(|(a, b)| {
-                a.iter()
-                    .zip_eq(b.iter())
-                    .try_for_each(|(&a, &b)| pw.set_target(a.0, F::from_canonical_u8(b)))
-            })?;
-
-        // At least one tx per block is must. If block only has pre-exec, then the only tx is the empty tx
-        assert!(!block.tx_chunks.is_empty());
-        target
-            .new_market_risk_details_partial
-            .iter()
-            .zip_eq(block.new_public_market_details.iter())
-            .try_for_each(|(t, mi)| pw.set_partial_market_risk_details_target(t, mi))?;
-
-        Ok(pw)
-    }
-
-    /// The light-chain witness inputs, fed once the light transaction chain proof is available.
-    pub fn witness_inputs_light_chain(
-        target: &BlockTarget,
-        light_tx_chain_proof: &ProofWithPublicInputs<F, C, D>,
-    ) -> Result<PartialWitness<F>> {
-        let mut pw = PartialWitness::new();
-        pw.set_proof_with_pis_target(&target.light_tx_chain_proof, light_tx_chain_proof)?;
-        Ok(pw)
-    }
-
-    /// The heavy-chain witness inputs, fed once the heavy transaction chain proof is available.
-    pub fn witness_inputs_heavy_chain(
-        target: &BlockTarget,
-        heavy_tx_chain_proof: &ProofWithPublicInputs<F, C, D>,
-    ) -> Result<PartialWitness<F>> {
-        let mut pw = PartialWitness::new();
-        pw.set_proof_with_pis_target(&target.heavy_tx_chain_proof, heavy_tx_chain_proof)?;
-        Ok(pw)
-    }
-
-    /// Proves the block whose witness inputs were supplied through a [`PendingPartitionWitness`].
-    pub fn prove_prepared(
-        pending: PendingPartitionWitness<'_, F, C, D>,
-        circuit_data: &CircuitData<F, C, D>,
-    ) -> Result<ProofWithPublicInputs<F, C, D>> {
-        let mut timing = TimingTree::new("BlockCircuit", Level::Debug);
-
-        let partition_witness = pending.finish()?;
-        let proof = prove_with_partition_witness(
-            &circuit_data.prover_only,
-            &circuit_data.common,
-            partition_witness,
-            &mut timing,
-        )?;
-        // The trusted benchmark verifies the final proof; keep the eager check for tests.
-        #[cfg(debug_assertions)]
-        timed!(timing, "verify", { circuit_data.verify(proof.clone())? });
-
-        timing.print();
-
-        Ok(proof)
     }
 
     fn handle_proofs(
@@ -536,6 +410,99 @@ impl BlockCircuit {
 
         is_end_with_heavy
     }
+
+    /// Fills the block inputs that do not depend on the transaction-chain proofs: the same
+    /// `set_*` calls as [`Circuit::generate_witness`], minus the two chain proofs.
+    pub fn witness_inputs_early(
+        pw: &mut PartialWitness<F>,
+        target: &BlockTarget,
+        block: &Block<F>,
+        pre_exec_proof: &ProofWithPublicInputs<F, C, D>,
+    ) -> Result<()> {
+        pw.set_proof_with_pis_target(&target.pre_exec_proof, pre_exec_proof)?;
+
+        let block_witness = BlockWitness::from_block(block, 1);
+
+        pw.set_target(
+            target.block.block_number,
+            F::from_canonical_u64(block.block_number),
+        )?;
+        pw.set_target(
+            target.block.created_at,
+            F::from_canonical_u64(block.created_at as u64),
+        )?;
+
+        pw.set_hash_target(target.block.old_state_root, block_witness.old_state_root)?;
+
+        pw.set_hash_target(
+            target.block.new_validium_root,
+            block_witness.new_validium_root,
+        )?;
+        pw.set_hash_target(target.block.new_state_root, block_witness.new_state_root)?;
+
+        pw.set_hash_target(
+            target.block.new_account_delta_tree_root,
+            block_witness.new_account_delta_tree_root,
+        )?;
+
+        pw.set_hash_target(
+            target.block.old_account_delta_tree_root,
+            block_witness.old_account_delta_tree_root,
+        )?;
+
+        pw.set_target(
+            target.block.priority_operations_count,
+            F::from_canonical_u64(block_witness.priority_operations_count),
+        )?;
+        for i in 0..KECCAK_HASH_OUT_BYTE_SIZE {
+            pw.set_target(
+                target.block.old_prefix_priority_operation_hash[i].0,
+                F::from_canonical_u8(block_witness.old_prefix_priority_operation_hash[i]),
+            )?;
+            pw.set_target(
+                target.block.new_prefix_priority_operation_hash[i].0,
+                F::from_canonical_u8(block_witness.new_prefix_priority_operation_hash[i]),
+            )?;
+        }
+
+        pw.set_target(
+            target.block.on_chain_operations_count,
+            F::from_canonical_u64(block_witness.on_chain_operations_count),
+        )?;
+        target
+            .block
+            .on_chain_operations_pub_data
+            .iter()
+            .zip_eq(block_witness.on_chain_operations_pub_data.iter())
+            .try_for_each(|(a, b)| {
+                a.iter()
+                    .zip_eq(b.iter())
+                    .try_for_each(|(&a, &b)| pw.set_target(a.0, F::from_canonical_u8(b)))
+            })?;
+
+        // At least one tx per block is must. If block only has pre-exec, then the only tx is the empty tx
+        assert!(!block.tx_chunks.is_empty());
+        target
+            .new_market_risk_details_partial
+            .iter()
+            .zip_eq(block.new_public_market_details.iter())
+            .try_for_each(|(t, mi)| pw.set_partial_market_risk_details_target(t, mi))?;
+
+        Ok(())
+    }
+
+    /// Fills the block inputs that depend on the transaction-chain proofs.
+    pub fn witness_inputs_chain(
+        pw: &mut PartialWitness<F>,
+        target: &BlockTarget,
+        light_tx_chain_proof: &ProofWithPublicInputs<F, C, D>,
+        heavy_tx_chain_proof: &ProofWithPublicInputs<F, C, D>,
+    ) -> Result<()> {
+        pw.set_proof_with_pis_target(&target.light_tx_chain_proof, light_tx_chain_proof)?;
+        pw.set_proof_with_pis_target(&target.heavy_tx_chain_proof, heavy_tx_chain_proof)?;
+
+        Ok(())
+    }
 }
 
 impl Circuit<C, F, D> for BlockCircuit {
@@ -760,10 +727,10 @@ impl Circuit<C, F, D> for BlockCircuit {
         light_tx_chain_proof: &ProofWithPublicInputs<F, C, D>,
         heavy_tx_chain_proof: &ProofWithPublicInputs<F, C, D>,
     ) -> Result<PartialWitness<F>> {
-        let mut pw = Self::witness_inputs_early(target, block, pre_exec_proof)?;
+        let mut pw = PartialWitness::new();
 
-        pw.set_proof_with_pis_target(&target.light_tx_chain_proof, light_tx_chain_proof)?;
-        pw.set_proof_with_pis_target(&target.heavy_tx_chain_proof, heavy_tx_chain_proof)?;
+        Self::witness_inputs_early(&mut pw, target, block, pre_exec_proof)?;
+        Self::witness_inputs_chain(&mut pw, target, light_tx_chain_proof, heavy_tx_chain_proof)?;
 
         Ok(pw)
     }

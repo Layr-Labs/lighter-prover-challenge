@@ -18,7 +18,6 @@ use plonky2::plonk::circuit_data::{
 };
 use plonky2::plonk::config::GenericConfig;
 use plonky2::plonk::proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget};
-use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::timed;
 use plonky2::util::timing::TimingTree;
 
@@ -197,67 +196,6 @@ impl BlockTxChainCircuit {
         (block, current_block_tx)
     }
 
-    /// Chain-step witness inputs that do not depend on the cyclic (previous chain step) proof, so
-    /// they can be seeded and their generators run before that proof is available.
-    pub fn witness_inputs_early(
-        target: &BlockTxChainTarget,
-        circuit_data: &CircuitData<F, C, D>,
-        recursion_step: u64,
-        dummy_proof_cyclic: &ProofWithPublicInputs<F, C, D>,
-        current_block_tx_proof: &ProofWithPublicInputs<F, C, D>,
-    ) -> Result<PartialWitness<F>> {
-        let mut pw = PartialWitness::new();
-
-        pw.set_verifier_data_target(&target.self_verifier_data, &circuit_data.verifier_only)?;
-
-        pw.set_proof_with_pis_target(&target.tx_proof, current_block_tx_proof)?;
-
-        pw.set_target(target.recursion_step, F::from_canonical_u64(recursion_step))?;
-
-        // This will take place of `DummyProofGenerator`
-        pw.set_proof_with_pis_target(
-            &target.dummy_proof_with_pis_target_cyclic,
-            dummy_proof_cyclic,
-        )?;
-
-        Ok(pw)
-    }
-
-    /// The cyclic-proof witness inputs, fed once the previous chain step's proof is available.
-    pub fn witness_inputs_cyclic(
-        target: &BlockTxChainTarget,
-        cyclic_proof: &ProofWithPublicInputs<F, C, D>,
-    ) -> Result<PartialWitness<F>> {
-        let mut pw = PartialWitness::new();
-        pw.set_proof_with_pis_target(&target.cyclic_proof, cyclic_proof)?;
-        Ok(pw)
-    }
-
-    /// Proves a chain step whose witness inputs were supplied through a
-    /// [`PendingPartitionWitness`].
-    pub fn prove_prepared(
-        pending: PendingPartitionWitness<'_, F, C, D>,
-        circuit_data: &CircuitData<F, C, D>,
-    ) -> Result<ProofWithPublicInputs<F, C, D>> {
-        let partition_witness = pending.finish()?;
-        let proof = {
-            let mut prove_timing = TimingTree::new("BlockTxChainProve", Level::Debug);
-            let proof = prove_with_partition_witness(
-                &circuit_data.prover_only,
-                &circuit_data.common,
-                partition_witness,
-                &mut prove_timing,
-            )?;
-            prove_timing.print();
-            proof
-        };
-        // Recursive parents validate this proof in release builds; keep the eager check for tests.
-        #[cfg(debug_assertions)]
-        circuit_data.verify(proof.clone())?;
-
-        Ok(proof)
-    }
-
     fn perform_sanity_checks(&mut self, block: &BlockTxChainWitnessTarget) {
         let is_first_recursion = self.builder.is_zero(self.target.recursion_step);
 
@@ -293,6 +231,66 @@ impl BlockTxChainCircuit {
                 self.builder
                     .conditional_assert_zero(is_first_recursion, pub_data.0);
             });
+    }
+
+    /// Fills the chain-step inputs that do not depend on the previous chain step's proof:
+    /// the same `set_*` calls as [`Circuit::generate_witness`], minus the cyclic proof.
+    pub fn witness_inputs_early(
+        pw: &mut PartialWitness<F>,
+        target: &BlockTxChainTarget,
+        circuit_data: &CircuitData<F, C, D>,
+        recursion_step: u64,
+        dummy_proof_cyclic: &ProofWithPublicInputs<F, C, D>,
+        current_block_tx_proof: &ProofWithPublicInputs<F, C, D>,
+    ) -> Result<()> {
+        pw.set_verifier_data_target(&target.self_verifier_data, &circuit_data.verifier_only)?;
+
+        pw.set_proof_with_pis_target(&target.tx_proof, current_block_tx_proof)?;
+
+        pw.set_target(target.recursion_step, F::from_canonical_u64(recursion_step))?;
+
+        // This will take place of `DummyProofGenerator`
+        pw.set_proof_with_pis_target(
+            &target.dummy_proof_with_pis_target_cyclic,
+            dummy_proof_cyclic,
+        )?;
+
+        Ok(())
+    }
+
+    /// Fills the only chain-step input that depends on the previous chain step's proof.
+    pub fn witness_inputs_cyclic(
+        pw: &mut PartialWitness<F>,
+        target: &BlockTxChainTarget,
+        cyclic_proof: &ProofWithPublicInputs<F, C, D>,
+    ) -> Result<()> {
+        pw.set_proof_with_pis_target(&target.cyclic_proof, cyclic_proof)?;
+
+        Ok(())
+    }
+
+    /// Completes a pending chain-step witness whose inputs have all been supplied, and proves it.
+    pub fn prove_prepared(
+        pending: PendingPartitionWitness<'_, F, C, D>,
+        circuit_data: &CircuitData<F, C, D>,
+    ) -> Result<ProofWithPublicInputs<F, C, D>> {
+        let proof = {
+            let mut prove_timing = TimingTree::new("BlockTxChainProve", Level::Debug);
+            let witness = pending.finish()?;
+            let proof = plonky2::plonk::prover::prove_with_partition_witness(
+                &circuit_data.prover_only,
+                &circuit_data.common,
+                witness,
+                &mut prove_timing,
+            )?;
+            prove_timing.print();
+            proof
+        };
+        // Recursive parents validate this proof in release builds; keep the eager check for tests.
+        #[cfg(debug_assertions)]
+        circuit_data.verify(proof.clone())?;
+
+        Ok(proof)
     }
 }
 fn cyclic_base_public_inputs(
@@ -564,15 +562,17 @@ impl Circuit<C, F, D> for BlockTxChainCircuit {
         dummy_proof_cyclic: &ProofWithPublicInputs<F, C, D>,
         current_block_tx_proof: &ProofWithPublicInputs<F, C, D>,
     ) -> Result<PartialWitness<F>> {
-        let mut pw = Self::witness_inputs_early(
+        let mut pw = PartialWitness::new();
+
+        Self::witness_inputs_cyclic(&mut pw, target, cyclic_proof)?;
+        Self::witness_inputs_early(
+            &mut pw,
             target,
             circuit_data,
             recursion_step,
             dummy_proof_cyclic,
             current_block_tx_proof,
         )?;
-
-        pw.set_proof_with_pis_target(&target.cyclic_proof, cyclic_proof)?;
 
         Ok(pw)
     }
