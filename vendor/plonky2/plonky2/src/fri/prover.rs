@@ -81,6 +81,40 @@ pub fn final_poly_coeff_len(mut degree_bits: usize, reduction_arity_bits: &Vec<u
     1 << degree_bits
 }
 
+/// Coset FFT of an extension-field polynomial over a base-field coset, computed
+/// as `D` independent base-field FFTs. Exact: the twiddles and the coset shift
+/// are base-field elements, so the transform is linear over each coordinate.
+/// The base-field FFTs use the packed (NEON/AVX) butterfly path, which has no
+/// extension-field counterpart.
+pub(crate) fn coset_fft_ext_split<F: RichField + Extendable<D>, const D: usize>(
+    poly: &PolynomialCoeffs<F::Extension>,
+    shift: F,
+    zero_factor: Option<usize>,
+) -> PolynomialValues<F::Extension> {
+    let n = poly.len();
+    let mut components: Vec<Vec<F>> = (0..D).map(|_| Vec::with_capacity(n)).collect();
+    for coeff in &poly.coeffs {
+        let array = coeff.to_basefield_array();
+        for (component, &value) in components.iter_mut().zip(array.iter()) {
+            component.push(value);
+        }
+    }
+    let transformed: Vec<Vec<F>> = components
+        .into_iter()
+        .map(|component| {
+            PolynomialCoeffs::new(component)
+                .coset_fft_with_options(shift, zero_factor, None)
+                .values
+        })
+        .collect();
+    let values = (0..n)
+        .map(|i| {
+            F::Extension::from_basefield_array(core::array::from_fn(|d| transformed[d][i]))
+        })
+        .collect();
+    PolynomialValues::new(values)
+}
+
 fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     mut coeffs: PolynomialCoeffs<F::Extension>,
     mut values: PolynomialValues<F::Extension>,
@@ -129,11 +163,7 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // Chunk-wise folding preserves the zero tail: the coefficient vector
         // keeps `1/2^rate_bits` support every round (asserted by the
         // truncation below), so the FFT's zero-run shortcut always applies.
-        values = coeffs.coset_fft_with_options(
-            shift.into(),
-            Some(fri_params.config.rate_bits),
-            None,
-        )
+        values = coset_fft_ext_split(&coeffs, shift, Some(fri_params.config.rate_bits))
     }
 
     // When verifying this proof in a circuit with a different number of query steps,
