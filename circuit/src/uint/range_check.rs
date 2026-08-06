@@ -336,7 +336,56 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
     }
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        self.eval_unfiltered_base_batch_packed(vars_base)
+        let n = vars_base.len();
+        let wires = vars_base.local_wires;
+        let num_aux = self.aux_limbs_per_input();
+        let base = F::from_canonical_usize(Self::BASE);
+        let three = F::from_canonical_usize(3);
+        let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
+        let mut chunks = res.chunks_exact_mut(n);
+
+        for i in 0..self.num_ops {
+            let input = &wires[self.wire_ith_input(i) * n..][..n];
+            let top = self.wire_ith_input_jth_aux_limb(i, num_aux - 1);
+
+            // computed_sum - input, with the sum accumulated per point by
+            // Horner over the limb columns from most to least significant.
+            let out = chunks.next().unwrap();
+            out.copy_from_slice(&wires[top * n..][..n]);
+            for j in (0..num_aux - 1).rev() {
+                let limb = &wires[self.wire_ith_input_jth_aux_limb(i, j) * n..][..n];
+                for p in 0..n {
+                    out[p] = out[p] * base + limb[p];
+                }
+            }
+            for p in 0..n {
+                out[p] -= input[p];
+            }
+
+            // Range products. For a full base-4 limb,
+            // x(x-1)(x-2)(x-3) = y(y+2) with y = x(x-3); for a half-range
+            // final limb (odd bit size), x(x-1).
+            for j in 0..num_aux {
+                let limb = &wires[self.wire_ith_input_jth_aux_limb(i, j) * n..][..n];
+                let half_range = j == num_aux - 1 && self.bit_size % 2 == 1;
+                let out = chunks.next().unwrap();
+                if half_range {
+                    debug_assert_eq!(Self::BASE / 2, 2);
+                    for p in 0..n {
+                        let x = limb[p];
+                        out[p] = x * (x - F::ONE);
+                    }
+                } else {
+                    debug_assert_eq!(Self::BASE, 4);
+                    for p in 0..n {
+                        let x = limb[p];
+                        let y = x * (x - three);
+                        out[p] = y * (y + F::TWO);
+                    }
+                }
+            }
+        }
+        res
     }
 
     fn eval_unfiltered_circuit(
