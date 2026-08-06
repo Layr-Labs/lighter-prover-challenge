@@ -7,7 +7,7 @@ use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::batch_multiply_inplace;
 use crate::field::extension::Extendable;
-use crate::field::fft::FftRootTable;
+use crate::field::fft::{fft_root_table as make_fft_root_table, ifft_with_options, FftRootTable};
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
@@ -107,11 +107,17 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             }
         }
 
-        let coeffs = timed!(
-            timing,
-            "IFFT",
-            values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
-        );
+        let coeffs = {
+            let ifft_root_table = make_fft_root_table(values[0].len());
+            timed!(
+                timing,
+                "IFFT",
+                values
+                    .into_par_iter()
+                    .map(|v| ifft_with_options(v, None, Some(&ifft_root_table)))
+                    .collect::<Vec<_>>()
+            )
+        };
 
         Self::from_coeffs(
             coeffs,
@@ -458,6 +464,67 @@ mod tests {
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::Sample;
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    #[test]
+    fn shared_ifft_roots_match_per_polynomial_tables() {
+        type F = GoldilocksField;
+
+        for log_degree in [1, 2, 8] {
+            let values = (0..7)
+                .map(|_| PolynomialValues::new(F::rand_vec(1 << log_degree)))
+                .collect::<Vec<_>>();
+            let expected = values
+                .iter()
+                .cloned()
+                .map(PolynomialValues::ifft)
+                .collect::<Vec<_>>();
+            let roots = make_fft_root_table(1 << log_degree);
+            let actual = values
+                .into_iter()
+                .map(|v| ifft_with_options(v, None, Some(&roots)))
+                .collect::<Vec<_>>();
+
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn from_values_with_shared_ifft_roots_matches_reference_commitment() {
+        use log::Level;
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let values = (0..7)
+            .map(|_| PolynomialValues::new(F::rand_vec(1 << 8)))
+            .collect::<Vec<_>>();
+        let reference_coeffs = values
+            .iter()
+            .cloned()
+            .map(PolynomialValues::ifft)
+            .collect::<Vec<_>>();
+        let mut reference_timing = TimingTree::new("reference commitment", Level::Debug);
+        let reference = PolynomialBatch::<F, C, D>::from_coeffs(
+            reference_coeffs,
+            1,
+            false,
+            1,
+            &mut reference_timing,
+            None,
+        );
+        let mut actual_timing = TimingTree::new("shared-root commitment", Level::Debug);
+        let actual = PolynomialBatch::<F, C, D>::from_values(
+            values,
+            1,
+            false,
+            1,
+            &mut actual_timing,
+            None,
+        );
+
+        assert_eq!(actual, reference);
+    }
 
     #[test]
     fn shared_coset_powers_match_per_polynomial_shifts() {
