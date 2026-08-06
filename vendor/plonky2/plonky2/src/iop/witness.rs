@@ -374,17 +374,25 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     }
 
     pub fn full_witness(self) -> MatrixWitness<F> {
-        let mut wire_values = vec![vec![F::ZERO; self.degree]; self.num_wires];
-        for i in 0..self.degree {
-            for j in 0..self.num_wires {
-                let t = Target::Wire(Wire { row: i, column: j });
-                if let Some(x) = self.try_get_target(t) {
-                    wire_values[j][i] = x;
-                }
+        MatrixWitness {
+            wire_values: self.into_wire_values_single_write(),
+        }
+    }
+
+    fn into_wire_values_single_write(self) -> Vec<Vec<F>> {
+        let mut wire_values: Vec<Vec<F>> = (0..self.num_wires)
+            .map(|_| Vec::with_capacity(self.degree))
+            .collect();
+
+        for row in 0..self.degree {
+            let row_start = row * self.num_wires;
+            for (column, wire_column) in wire_values.iter_mut().enumerate() {
+                let representative = self.representative_map[row_start + column];
+                wire_column.push(self.values[representative].unwrap_or(F::ZERO));
             }
         }
 
-        MatrixWitness { wire_values }
+        wire_values
     }
 }
 
@@ -398,5 +406,39 @@ impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
     fn try_get_target(&self, target: Target) -> Option<F> {
         let rep_index = self.representative_map[self.target_index(target)];
         self.values[rep_index]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    #[test]
+    fn single_write_wire_values_preserve_assigned_copied_and_unset_cells() {
+        type F = GoldilocksField;
+
+        let representative_map = [0, 1, 1, 3, 4, 5];
+        let mut witness = PartitionWitness::<F>::new(3, 2, &representative_map);
+        witness
+            .set_target(Target::wire(0, 0), F::from_canonical_u64(7))
+            .unwrap();
+        witness
+            .set_target(Target::wire(0, 1), F::from_canonical_u64(11))
+            .unwrap();
+        witness
+            .set_target(Target::wire(1, 1), F::from_canonical_u64(13))
+            .unwrap();
+
+        let actual = witness.into_wire_values_single_write();
+
+        assert_eq!(
+            actual,
+            vec![
+                vec![F::from_canonical_u64(7), F::ZERO],
+                vec![F::from_canonical_u64(11), F::from_canonical_u64(13),],
+                vec![F::from_canonical_u64(11), F::ZERO],
+            ]
+        );
     }
 }
