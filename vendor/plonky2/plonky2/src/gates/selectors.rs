@@ -2,6 +2,7 @@
 use alloc::{vec, vec::Vec};
 use core::ops::Range;
 
+use hashbrown::HashMap;
 use serde::Serialize;
 
 use crate::field::extension::Extendable;
@@ -119,7 +120,14 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     let num_gates = gates.len();
     let max_gate_degree = gates.last().expect("No gates?").0.degree();
 
-    let index = |id| gates.iter().position(|g| g.0.id() == id).unwrap();
+    let mut gate_indices = HashMap::with_capacity(num_gates);
+    for (i, gate) in gates.iter().enumerate() {
+        gate_indices.entry(gate.0.id()).or_insert(i);
+    }
+    let index = |gate_ref: &GateRef<F, D>| {
+        let id = gate_ref.0.id();
+        *gate_indices.get(&id).unwrap()
+    };
 
     // Special case if we can use only one selector polynomial.
     if max_gate_degree + num_gates - 1 <= max_degree {
@@ -130,7 +138,7 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
             vec![PolynomialValues::new(
                 instances
                     .iter()
-                    .map(|g| F::from_canonical_usize(index(g.gate_ref.0.id())))
+                    .map(|g| F::from_canonical_usize(index(&g.gate_ref)))
                     .collect(),
             )],
             SelectorsInfo {
@@ -162,23 +170,16 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     let group = |i| groups.iter().position(|range| range.contains(&i)).unwrap();
 
     // `selector_indices[i] = j` iff the `i`-th gate uses the `j`-th selector polynomial.
-    let selector_indices = (0..num_gates).map(group).collect();
+    let selector_indices = (0..num_gates).map(group).collect::<Vec<_>>();
 
     // Placeholder value to indicate that a gate doesn't use a selector polynomial.
     let unused = F::from_canonical_usize(UNUSED_SELECTOR);
 
-    let mut polynomials = vec![PolynomialValues::zero(n); groups.len()];
-    for (j, g) in instances.iter().enumerate() {
-        let GateInstance { gate_ref, .. } = g;
-        let i = index(gate_ref.0.id());
-        let gr = group(i);
-        for g in 0..groups.len() {
-            polynomials[g].values[j] = if g == gr {
-                F::from_canonical_usize(i)
-            } else {
-                unused
-            };
-        }
+    let mut polynomials = vec![PolynomialValues::new(vec![unused; n]); groups.len()];
+    for (row, instance) in instances.iter().enumerate() {
+        let i = index(&instance.gate_ref);
+        let selector = selector_indices[i];
+        polynomials[selector].values[row] = F::from_canonical_usize(i);
     }
 
     (
@@ -188,4 +189,80 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
             groups,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{selector_polynomials, GateInstance, GateRef, UNUSED_SELECTOR};
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::Field;
+    use crate::gates::arithmetic_base::ArithmeticGate;
+    use crate::gates::noop::NoopGate;
+    use crate::gates::public_input::PublicInputGate;
+
+    const D: usize = 2;
+    type F = GoldilocksField;
+
+    fn gates_and_instances() -> (Vec<GateRef<F, D>>, Vec<GateInstance<F, D>>, Vec<usize>) {
+        let gates = vec![
+            GateRef::new(NoopGate),
+            GateRef::new(PublicInputGate),
+            GateRef::new(ArithmeticGate { num_ops: 1 }),
+        ];
+        let row_gate_indices = vec![0, 1, 2, 0, 2, 1, 1, 0];
+        let instances = row_gate_indices
+            .iter()
+            .map(|&i| GateInstance {
+                gate_ref: gates[i].clone(),
+                constants: vec![],
+            })
+            .collect();
+        (gates, instances, row_gate_indices)
+    }
+
+    #[test]
+    fn selector_polynomials_single_group_have_exact_values() {
+        let (gates, instances, row_gate_indices) = gates_and_instances();
+        let (polynomials, info) = selector_polynomials(&gates, &instances, 5);
+
+        assert_eq!(info.groups, vec![0..3]);
+        assert_eq!(info.selector_indices, vec![0, 0, 0]);
+        assert_eq!(polynomials.len(), 1);
+        assert_eq!(
+            polynomials[0].values,
+            row_gate_indices
+                .into_iter()
+                .map(F::from_canonical_usize)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn selector_polynomials_multiple_groups_have_exact_values() {
+        let (gates, instances, row_gate_indices) = gates_and_instances();
+        let (polynomials, info) = selector_polynomials(&gates, &instances, 4);
+        let unused = F::from_canonical_usize(UNUSED_SELECTOR);
+
+        assert_eq!(info.groups, vec![0..2, 2..3]);
+        assert_eq!(info.selector_indices, vec![0, 0, 1]);
+        assert_eq!(polynomials.len(), 2);
+        for (row, gate_index) in row_gate_indices.into_iter().enumerate() {
+            assert_eq!(
+                polynomials[0].values[row],
+                if gate_index < 2 {
+                    F::from_canonical_usize(gate_index)
+                } else {
+                    unused
+                }
+            );
+            assert_eq!(
+                polynomials[1].values[row],
+                if gate_index == 2 {
+                    F::from_canonical_usize(gate_index)
+                } else {
+                    unused
+                }
+            );
+        }
+    }
 }
