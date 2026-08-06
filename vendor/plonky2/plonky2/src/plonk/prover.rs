@@ -155,19 +155,29 @@ where
     let public_inputs = partition_witness.get_targets(&prover_data.public_inputs);
     let public_inputs_hash = C::InnerHasher::hash_no_pad(&public_inputs);
 
-    let witness = timed!(
+    let mut witness = timed!(
         timing,
         "compute full witness",
         partition_witness.full_witness()
     );
 
+    // The permutation argument is the only later consumer of the witness matrix, and it reads
+    // only routed columns. Move every non-routed column into its polynomial instead of cloning it.
+    let num_routed_wires = common_data.config.num_routed_wires;
     let wires_values: Vec<PolynomialValues<F>> = timed!(
         timing,
         "compute wire polynomials",
         witness
             .wire_values
-            .par_iter()
-            .map(|column| PolynomialValues::new(column.clone()))
+            .par_iter_mut()
+            .enumerate()
+            .map(|(j, column)| {
+                if j < num_routed_wires {
+                    PolynomialValues::new(column.clone())
+                } else {
+                    PolynomialValues::new(core::mem::take(column))
+                }
+            })
             .collect()
     );
 
