@@ -32,16 +32,56 @@ pub fn fft_root_table<F: Field>(n: usize) -> FftRootTable<F> {
     root_table
 }
 
+/// Process-global Goldilocks FFT root-table cache keyed by `log2(n)`.
+/// Steady-state cost is one atomic load; cold path builds once. Production
+/// proving is Goldilocks-based; callers that pass a prebuilt table never hit
+/// this path.
+#[cfg(feature = "std")]
+fn goldilocks_cached_root_table(
+    n: usize,
+) -> &'static FftRootTable<crate::goldilocks_field::GoldilocksField> {
+    use std::sync::OnceLock;
+
+    use crate::goldilocks_field::GoldilocksField;
+
+    static TABLES: [OnceLock<FftRootTable<GoldilocksField>>; 33] =
+        [const { OnceLock::new() }; 33];
+    let lg_n = log2_strict(n);
+    debug_assert!(lg_n < TABLES.len());
+    TABLES[lg_n].get_or_init(|| fft_root_table::<GoldilocksField>(n))
+}
+
 #[inline]
 fn fft_dispatch<F: Field>(
     input: &mut [F],
     zero_factor: Option<usize>,
     root_table: Option<&FftRootTable<F>>,
 ) {
-    let computed_root_table = root_table.is_none().then(|| fft_root_table(input.len()));
-    let used_root_table = root_table.or(computed_root_table.as_ref()).unwrap();
+    if let Some(t) = root_table {
+        fft_classic(input, zero_factor.unwrap_or(0), t);
+        return;
+    }
 
-    fft_classic(input, zero_factor.unwrap_or(0), used_root_table);
+    #[cfg(feature = "std")]
+    {
+        if core::any::TypeId::of::<F>()
+            == core::any::TypeId::of::<crate::goldilocks_field::GoldilocksField>()
+            && log2_strict(input.len()) < 33
+        {
+            let table = goldilocks_cached_root_table(input.len());
+            // SAFETY: F is GoldilocksField by the TypeId check above.
+            let table = unsafe {
+                &*(table
+                    as *const FftRootTable<crate::goldilocks_field::GoldilocksField>
+                    as *const FftRootTable<F>)
+            };
+            fft_classic(input, zero_factor.unwrap_or(0), table);
+            return;
+        }
+    }
+
+    let computed = fft_root_table(input.len());
+    fft_classic(input, zero_factor.unwrap_or(0), &computed);
 }
 
 #[inline]
