@@ -3,7 +3,6 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
 use core::cmp::min;
-use core::mem::swap;
 
 use anyhow::{ensure, Result};
 use hashbrown::HashMap;
@@ -33,9 +32,13 @@ use crate::plonk::vanishing_poly::{
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
-use crate::util::partial_products::{partial_products_and_z_gx, quotient_chunk_products};
+use crate::util::log2_ceil;
+use crate::util::partial_products::{
+    partial_products_and_zs_from_chunk_rows,
+    quotient_chunk_products_80_by_8_from_numerators_and_inverses,
+    quotient_chunk_products_from_numerators_and_inverses, use_fixed_permutation_chunk_products,
+};
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil, transpose};
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -392,6 +395,41 @@ fn all_wires_permutation_partial_products<
 /// Compute the partial products used in the `Z` polynomial.
 /// Returns the polynomials interpolating `partial_products(f / g)`
 /// where `f, g` are the products in the definition of `Z`: `Z(g^i) = f / g`.
+struct PermutationRow<'a, F: Field> {
+    witness: &'a MatrixWitness<F>,
+    row: usize,
+    x: F,
+    beta: F,
+    gamma: F,
+    k_is: &'a [F],
+    s_sigmas: &'a [F],
+}
+
+impl<F: Field> PermutationRow<'_, F> {
+    fn numerators(&self) -> impl ExactSizeIterator<Item = F> + '_ {
+        (0..self.k_is.len()).map(|j| {
+            let wire_value = self.witness.get_wire(self.row, j);
+            let s_id = self.k_is[j] * self.x;
+            wire_value + self.beta * s_id + self.gamma
+        })
+    }
+
+    fn fill_denominator_inverses(
+        &self,
+        denominators: &mut Vec<F>,
+        denominator_inverses: &mut Vec<F>,
+    ) {
+        debug_assert_eq!(self.s_sigmas.len(), self.k_is.len());
+        denominators.clear();
+        denominators.extend((0..self.k_is.len()).map(|j| {
+            let wire_value = self.witness.get_wire(self.row, j);
+            wire_value + self.beta * self.s_sigmas[j] + self.gamma
+        }));
+        F::batch_multiplicative_inverse_into(denominators, denominator_inverses);
+        debug_assert_eq!(denominator_inverses.len(), self.k_is.len());
+    }
+}
+
 fn wires_permutation_partial_products_and_zs<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -407,46 +445,75 @@ fn wires_permutation_partial_products_and_zs<
     let subgroup = &prover_data.subgroup;
     let k_is = &common_data.k_is;
     let num_prods = common_data.num_partial_products;
+    let num_routed_wires = common_data.config.num_routed_wires;
+    assert!(degree > 1);
+    assert_eq!(k_is.len(), num_routed_wires);
+    assert_eq!(num_prods + 1, num_routed_wires.div_ceil(degree));
+    assert_eq!(prover_data.sigmas.len(), subgroup.len());
+
+    if use_fixed_permutation_chunk_products(num_routed_wires, degree, num_prods + 1) {
+        let all_quotient_chunk_products = subgroup
+            .par_iter()
+            .enumerate()
+            .map_init(
+                || (Vec::new(), Vec::new()),
+                |(denominators, denominator_inverses), (i, &x)| {
+                    let row = PermutationRow {
+                        witness,
+                        row: i,
+                        x,
+                        beta,
+                        gamma,
+                        k_is,
+                        s_sigmas: &prover_data.sigmas[i],
+                    };
+                    row.fill_denominator_inverses(denominators, denominator_inverses);
+                    quotient_chunk_products_80_by_8_from_numerators_and_inverses(
+                        row.numerators(),
+                        denominator_inverses,
+                    )
+                },
+            )
+            .collect::<Vec<[F; 10]>>();
+        assert_eq!(all_quotient_chunk_products.len(), subgroup.len());
+
+        return partial_products_and_zs_from_chunk_rows(&all_quotient_chunk_products, num_prods)
+            .into_iter()
+            .map(PolynomialValues::new)
+            .collect();
+    }
+
     let all_quotient_chunk_products = subgroup
         .par_iter()
         .enumerate()
-        .map(|(i, &x)| {
-            let s_sigmas = &prover_data.sigmas[i];
-            let numerators = (0..common_data.config.num_routed_wires).map(|j| {
-                let wire_value = witness.get_wire(i, j);
-                let k_i = k_is[j];
-                let s_id = k_i * x;
-                wire_value + beta * s_id + gamma
-            });
-            let denominators = (0..common_data.config.num_routed_wires)
-                .map(|j| {
-                    let wire_value = witness.get_wire(i, j);
-                    let s_sigma = s_sigmas[j];
-                    wire_value + beta * s_sigma + gamma
-                })
-                .collect::<Vec<_>>();
-            let denominator_invs = F::batch_multiplicative_inverse(&denominators);
-            let quotient_values = numerators
-                .zip(denominator_invs)
-                .map(|(num, den_inv)| num * den_inv)
-                .collect::<Vec<_>>();
+        .map_init(
+            || (Vec::new(), Vec::new()),
+            |(denominators, denominator_inverses), (i, &x)| {
+                let row = PermutationRow {
+                    witness,
+                    row: i,
+                    x,
+                    beta,
+                    gamma,
+                    k_is,
+                    s_sigmas: &prover_data.sigmas[i],
+                };
+                row.fill_denominator_inverses(denominators, denominator_inverses);
 
-            quotient_chunk_products(&quotient_values, degree)
-        })
+                let chunk_products = quotient_chunk_products_from_numerators_and_inverses(
+                    row.numerators(),
+                    denominator_inverses,
+                    degree,
+                );
+                debug_assert_eq!(chunk_products.len(), num_prods + 1);
+                chunk_products
+            },
+        )
         .collect::<Vec<_>>();
+    assert_eq!(all_quotient_chunk_products.len(), subgroup.len());
 
-    let mut z_x = F::ONE;
-    let mut all_partial_products_and_zs = Vec::with_capacity(all_quotient_chunk_products.len());
-    for quotient_chunk_products in all_quotient_chunk_products {
-        let mut partial_products_and_z_gx =
-            partial_products_and_z_gx(z_x, &quotient_chunk_products);
-        // The last term is Z(gx), but we replace it with Z(x), otherwise Z would end up shifted.
-        swap(&mut z_x, &mut partial_products_and_z_gx[num_prods]);
-        all_partial_products_and_zs.push(partial_products_and_z_gx);
-    }
-
-    transpose(&all_partial_products_and_zs)
-        .into_par_iter()
+    partial_products_and_zs_from_chunk_rows(&all_quotient_chunk_products, num_prods)
+        .into_iter()
         .map(PolynomialValues::new)
         .collect()
 }
@@ -792,7 +859,9 @@ fn compute_quotient_polys<
                     })
                     .collect();
                 let s_sigmas_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires])
+                    .map(|k| {
+                        &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires]
+                    })
                     .collect();
                 let (local_lookup_batch, next_lookup_batch): (Vec<&[F]>, Vec<&[F]>) = if has_lookup
                 {
