@@ -26,6 +26,32 @@ mod vendored_gate_tests {
         assert_base_batch_matches_eval_unfiltered(&gate);
     }
 
+
+    #[test]
+    fn range_check_base_batch_matches_eval_unfiltered_across_batch() {
+        use crate::uint::range_check::RangeCheckGate;
+        use plonky2::plonk::circuit_data::CircuitConfig;
+
+        for bit_size in [15, 16, 32, 48] {
+            let gate = RangeCheckGate::<GoldilocksField, 2>::new_from_config(
+                &CircuitConfig::standard_recursion_config(),
+                bit_size,
+            );
+            assert_base_batch_matches_eval_unfiltered(&gate);
+        }
+    }
+
+
+    #[test]
+    fn comparison_base_batch_matches_eval_unfiltered_across_batch() {
+        use crate::uint::u32::gates::comparison::ComparisonGate;
+
+        for (num_bits, num_chunks) in [(32, 16), (32, 8), (30, 10)] {
+            let gate = ComparisonGate::<GoldilocksField, 2>::new(num_bits, num_chunks);
+            assert_base_batch_matches_eval_unfiltered(&gate);
+        }
+    }
+
     #[test]
     fn random_access_base_batch_matches_eval_unfiltered_across_batch() {
         use plonky2::gates::random_access::RandomAccessGate;
