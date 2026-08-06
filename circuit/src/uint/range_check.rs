@@ -33,6 +33,12 @@ use crate::byte::split::CircuitBuilderByteSplit;
 use crate::utils::ceil_div_usize;
 
 const CUSTOM_GATE_SIZES: &[usize] = &[16, 32, 48];
+const STACK_DIRECT_ACCUMULATION_SCRATCH: usize = 32;
+
+const fn direct_accumulation_scratch_uses_stack(batch_size: usize) -> bool {
+    batch_size <= STACK_DIRECT_ACCUMULATION_SCRATCH
+}
+
 lazy_static! {
     pub static ref CUSTOM_GATE_SIZES_SET: HashSet<usize> = {
         let mut set = HashSet::new();
@@ -354,7 +360,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
         let num_aux = self.aux_limbs_per_input();
         let base = F::from_canonical_usize(Self::BASE);
         let three = F::from_canonical_usize(3);
-        let mut scratch = vec![F::ZERO; n];
+        let mut stack_scratch = [F::ZERO; STACK_DIRECT_ACCUMULATION_SCRATCH];
+        let mut heap_scratch = Vec::new();
+        let scratch: &mut [F] = if direct_accumulation_scratch_uses_stack(n) {
+            &mut stack_scratch[..n]
+        } else {
+            heap_scratch.resize(n, F::ZERO);
+            &mut heap_scratch
+        };
         let mut constraint_index = 0;
 
         for i in 0..self.num_ops {
@@ -373,7 +386,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
             }
             let combined =
                 &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
-            batch_multiply_add_inplace(combined, &scratch, filters);
+            batch_multiply_add_inplace(combined, scratch, filters);
             constraint_index += 1;
 
             for j in 0..num_aux {
@@ -392,7 +405,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
                 }
                 let combined = &mut combined_gate_constraints
                     [constraint_index * n..(constraint_index + 1) * n];
-                batch_multiply_add_inplace(combined, &scratch, filters);
+                batch_multiply_add_inplace(combined, scratch, filters);
                 constraint_index += 1;
             }
         }
@@ -608,35 +621,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direct_filtered_accumulation_matches_materialized_batch() {
+    fn direct_filtered_accumulation_matches_materialized_batch_across_scratch_boundary() {
         const D: usize = 2;
-        const N: usize = 11;
         type F = GoldilocksField;
 
         let gate = RangeCheckGate::<F, D>::new_from_config(
             &CircuitConfig::standard_recursion_config(),
             47,
         );
-        let wires = (0..gate.num_wires() * N)
-            .map(|i| F::from_canonical_usize(3 * i + 5))
-            .collect::<Vec<_>>();
-        let constants = Vec::new();
-        let hash = HashOut::ZERO;
-        let vars = EvaluationVarsBaseBatch::new(N, &constants, &wires, &hash);
-        let filters = (0..N)
-            .map(|i| F::from_canonical_usize(2 * i + 1))
-            .collect::<Vec<_>>();
-        let mut expected = vec![F::ZERO; gate.num_constraints() * N];
-        let materialized = gate.eval_unfiltered_base_batch(vars);
-        for (acc, constraints) in expected
-            .chunks_exact_mut(N)
-            .zip(materialized.chunks_exact(N))
-        {
-            batch_multiply_add_inplace(acc, constraints, &filters);
+
+        for n in [1, 4, 11, 32, 33] {
+            assert_eq!(direct_accumulation_scratch_uses_stack(n), n <= 32);
+
+            let wires = (0..gate.num_wires() * n)
+                .map(|i| F::from_canonical_usize(3 * i + 5))
+                .collect::<Vec<_>>();
+            let constants = Vec::new();
+            let hash = HashOut::ZERO;
+            let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+            let filters = (0..n)
+                .map(|i| F::from_canonical_usize(2 * i + 1))
+                .collect::<Vec<_>>();
+            let seed = (0..gate.num_constraints() * n)
+                .map(|i| F::from_canonical_usize(7 * i + 11))
+                .collect::<Vec<_>>();
+            let mut expected = seed.clone();
+            let materialized = gate.eval_unfiltered_base_batch(vars);
+            for (acc, constraints) in expected
+                .chunks_exact_mut(n)
+                .zip(materialized.chunks_exact(n))
+            {
+                batch_multiply_add_inplace(acc, constraints, &filters);
+            }
+            let mut actual = seed;
+            gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+            assert_eq!(actual, expected, "batch size {n}");
         }
-        let mut actual = vec![F::ZERO; expected.len()];
-        gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
-        assert_eq!(actual, expected);
     }
 
     macro_rules! generate_low_degree_tests {

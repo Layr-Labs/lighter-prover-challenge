@@ -7,8 +7,8 @@ use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::goldilocks_field::GoldilocksField as F;
 use crate::field::types::{Field, PrimeField64};
 use crate::gates::poseidon2::Poseidon2Gate;
-use crate::hash::hash_types::{HashOut, RichField};
-use crate::hash::hashing::{PlonkyPermutation, compress, hash_n_to_hash_no_pad};
+use crate::hash::hash_types::{HashOut, RichField, NUM_HASH_OUT_ELTS};
+use crate::hash::hashing::{compress, PlonkyPermutation};
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::{BoolTarget, Target};
 use crate::plonk::circuit_builder::CircuitBuilder;
@@ -502,7 +502,28 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
     type Permutation = Poseidon2Permutation<F>;
 
     fn hash_no_pad(input: &[F]) -> Self::Hash {
-        hash_n_to_hash_no_pad::<F, Self::Permutation>(input)
+        let mut permutation = Self::Permutation::new(core::iter::repeat(F::ZERO));
+        for input_chunk in input.chunks(Self::Permutation::RATE) {
+            permutation.set_from_slice(input_chunk, 0);
+            permutation.permute();
+        }
+        HashOut {
+            elements: permutation.squeeze()[..NUM_HASH_OUT_ELTS]
+                .try_into()
+                .unwrap(),
+        }
+    }
+
+    fn hash_or_noop(input: &[F]) -> Self::Hash {
+        if input.len() <= NUM_HASH_OUT_ELTS {
+            let mut elements = [F::ZERO; NUM_HASH_OUT_ELTS];
+            for (element, &value) in elements.iter_mut().zip(input) {
+                *element = F::from_canonical_u64(value.to_canonical_u64());
+            }
+            HashOut { elements }
+        } else {
+            Self::hash_no_pad(input)
+        }
     }
 
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash {
@@ -633,15 +654,120 @@ mod test {
     use num::{BigUint, One};
     use p3_field::{AbstractField, PrimeField64 as _};
     use p3_goldilocks::Goldilocks;
-    use rand::{RngCore, thread_rng};
+    use rand::{thread_rng, RngCore};
 
     use super::*;
-    use crate::field::types::PrimeField64;
-    use crate::hash::hashing::hash_n_to_m_no_pad;
+    use crate::field::types::{Field64, PrimeField64};
+    use crate::hash::hashing::{hash_n_to_hash_no_pad, hash_n_to_m_no_pad};
     use crate::hash::poseidon2::p3::p3_poseidon2_hash_n_to_m_no_pad;
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::PoseidonGoldilocksConfig;
+
+    #[cfg(feature = "std")]
+    mod allocation_counter {
+        use core::cell::Cell;
+        use std::alloc::{GlobalAlloc, Layout, System};
+
+        std::thread_local! {
+            static TRACKING: Cell<bool> = const { Cell::new(false) };
+            static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        struct CountingAllocator;
+
+        impl CountingAllocator {
+            fn record_allocation() {
+                let _ = TRACKING.try_with(|tracking| {
+                    if tracking.get() {
+                        let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+                    }
+                });
+            }
+        }
+
+        unsafe impl GlobalAlloc for CountingAllocator {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                Self::record_allocation();
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                Self::record_allocation();
+                unsafe { System.alloc_zeroed(layout) }
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                Self::record_allocation();
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+
+        #[global_allocator]
+        static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+        pub fn count_allocations<T>(f: impl FnOnce() -> T) -> (T, usize) {
+            ALLOCATIONS.with(|count| count.set(0));
+            TRACKING.with(|tracking| assert!(!tracking.replace(true)));
+            let result = f();
+            TRACKING.with(|tracking| tracking.set(false));
+            let allocations = ALLOCATIONS.with(Cell::get);
+            (result, allocations)
+        }
+    }
+
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    struct LegacyPoseidon2Hash;
+
+    impl Hasher<F> for LegacyPoseidon2Hash {
+        const HASH_SIZE: usize = 4 * 8;
+        type Hash = HashOut<F>;
+        type Permutation = Poseidon2Permutation<F>;
+
+        fn hash_no_pad(input: &[F]) -> Self::Hash {
+            hash_n_to_hash_no_pad::<F, Self::Permutation>(input)
+        }
+
+        fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash {
+            compress::<F, Self::Permutation>(left, right)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn direct_hash_paths_match_legacy_without_allocating() {
+        use allocation_counter::count_allocations;
+
+        for width in 0..=2 * Poseidon2Permutation::<F>::RATE {
+            let input = (0..width)
+                .map(|i| F::from_noncanonical_u64(F::ORDER + i as u64 + 1))
+                .collect::<Vec<_>>();
+
+            let expected_hash = LegacyPoseidon2Hash::hash_no_pad(&input);
+            let (actual_hash, hash_allocations) =
+                count_allocations(|| Poseidon2Hash::hash_no_pad(&input));
+            assert_eq!(actual_hash, expected_hash, "hash_no_pad width {width}");
+            assert_eq!(hash_allocations, 0, "hash_no_pad width {width}");
+
+            let expected_or_noop = LegacyPoseidon2Hash::hash_or_noop(&input);
+            let (actual_or_noop, or_noop_allocations) =
+                count_allocations(|| Poseidon2Hash::hash_or_noop(&input));
+            assert_eq!(
+                actual_or_noop, expected_or_noop,
+                "hash_or_noop width {width}"
+            );
+            assert_eq!(
+                actual_or_noop.elements.map(|x| x.to_noncanonical_u64()),
+                expected_or_noop.elements.map(|x| x.to_noncanonical_u64()),
+                "hash_or_noop raw representation width {width}"
+            );
+            assert_eq!(or_noop_allocations, 0, "hash_or_noop width {width}");
+        }
+    }
 
     #[test]
     fn test_poseidon2_with_plonky3() {
