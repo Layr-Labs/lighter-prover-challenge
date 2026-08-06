@@ -250,18 +250,21 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         out.resize(n * w, F::ZERO);
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
-                for (ci, c) in col_range.enumerate() {
-                    let column = columns.col(c);
-                    match layout {
-                        BatchLayout::PolyMajor => {
+                match layout {
+                    BatchLayout::PolyMajor => {
+                        for (ci, c) in col_range.enumerate() {
+                            let column = columns.col(c);
                             let destination = &mut out[ci * n..(ci + 1) * n];
                             for (k, &i) in indices.iter().enumerate() {
                                 destination[k] = column[i * step];
                             }
                         }
-                        BatchLayout::PointMajor => {
-                            for (k, &i) in indices.iter().enumerate() {
-                                out[k * w + ci] = column[i * step];
+                    }
+                    BatchLayout::PointMajor => {
+                        for (k, &i) in indices.iter().enumerate() {
+                            let destination = &mut out[k * w..(k + 1) * w];
+                            for (ci, c) in col_range.clone().enumerate() {
+                                destination[ci] = columns.col(c)[i * step];
                             }
                         }
                     }
