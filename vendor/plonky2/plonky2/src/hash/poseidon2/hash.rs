@@ -40,8 +40,7 @@ pub trait Poseidon2: PrimeField64 {
         let mut a = input_a;
         let mut b = input_b;
 
-        Self::external_linear_layer(&mut a);
-        Self::external_linear_layer(&mut b);
+        Self::external_linear_layer_x2(&mut a, &mut b);
 
         Self::full_rounds_x2(&mut a, &mut b, 0);
         Self::partial_rounds_x2(&mut a, &mut b);
@@ -58,8 +57,7 @@ pub trait Poseidon2: PrimeField64 {
             Self::add_rc(b, r);
             Self::sbox(a);
             Self::sbox(b);
-            Self::external_linear_layer(a);
-            Self::external_linear_layer(b);
+            Self::external_linear_layer_x2(a, b);
         }
     }
 
@@ -89,10 +87,8 @@ pub trait Poseidon2: PrimeField64 {
         let mut c = input_c;
         let mut d = input_d;
 
-        Self::external_linear_layer(&mut a);
-        Self::external_linear_layer(&mut b);
-        Self::external_linear_layer(&mut c);
-        Self::external_linear_layer(&mut d);
+        Self::external_linear_layer_x2(&mut a, &mut b);
+        Self::external_linear_layer_x2(&mut c, &mut d);
 
         Self::full_rounds_x4(&mut a, &mut b, &mut c, &mut d, 0);
         Self::partial_rounds_x4(&mut a, &mut b, &mut c, &mut d);
@@ -119,10 +115,8 @@ pub trait Poseidon2: PrimeField64 {
             Self::sbox(b);
             Self::sbox(c);
             Self::sbox(d);
-            Self::external_linear_layer(a);
-            Self::external_linear_layer(b);
-            Self::external_linear_layer(c);
-            Self::external_linear_layer(d);
+            Self::external_linear_layer_x2(a, b);
+            Self::external_linear_layer_x2(c, d);
         }
     }
 
@@ -180,6 +174,22 @@ pub trait Poseidon2: PrimeField64 {
         external_linear_layer_u128(&mut state_u128);
         for i in 0..WIDTH {
             state[i] = Self::from_noncanonical_u128_with_96_bits(state_u128[i]);
+        }
+    }
+
+    #[inline]
+    #[unroll::unroll_for_loops]
+    fn external_linear_layer_x2(a: &mut [Self; WIDTH], b: &mut [Self; WIDTH]) {
+        let mut a_u128 = [0u128; WIDTH];
+        let mut b_u128 = [0u128; WIDTH];
+        for i in 0..WIDTH {
+            a_u128[i] = a[i].to_noncanonical_u64() as u128;
+            b_u128[i] = b[i].to_noncanonical_u64() as u128;
+        }
+        external_linear_layer_u128_x2(&mut a_u128, &mut b_u128);
+        for i in 0..WIDTH {
+            a[i] = Self::from_noncanonical_u128_with_96_bits(a_u128[i]);
+            b[i] = Self::from_noncanonical_u128_with_96_bits(b_u128[i]);
         }
     }
 
@@ -461,6 +471,43 @@ fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
     // In other words, we can add a single copy of x_i' to the appropriate one of our precomputed sums
     for i in 0..WIDTH {
         state[i] += sums[i % 4];
+    }
+}
+
+#[inline]
+#[unroll::unroll_for_loops]
+fn external_linear_layer_u128_x2(a: &mut [u128; WIDTH], b: &mut [u128; WIDTH]) {
+    for i in (0..WIDTH).step_by(4) {
+        let a01 = a[i] + a[i + 1];
+        let b01 = b[i] + b[i + 1];
+        let a23 = a[i + 2] + a[i + 3];
+        let b23 = b[i + 2] + b[i + 3];
+        let a0123 = a01 + a23;
+        let b0123 = b01 + b23;
+        let a0 = a[i];
+        let b0 = b[i];
+        let a2 = a[i + 2];
+        let b2 = b[i + 2];
+
+        a[i] = a0123 + a01 + a[i + 1];
+        b[i] = b0123 + b01 + b[i + 1];
+        a[i + 1] = a0123 + a[i + 1] + a2 + a2;
+        b[i + 1] = b0123 + b[i + 1] + b2 + b2;
+        a[i + 2] = a0123 + a23 + a[i + 3];
+        b[i + 2] = b0123 + b23 + b[i + 3];
+        a[i + 3] = a0123 + a[i + 3] + a0 + a0;
+        b[i + 3] = b0123 + b[i + 3] + b0 + b0;
+    }
+
+    let mut sums_a = [0u128; 4];
+    let mut sums_b = [0u128; 4];
+    for i in 0..4 {
+        sums_a[i] = a[i] + a[i + 4] + a[i + 8];
+        sums_b[i] = b[i] + b[i + 4] + b[i + 8];
+    }
+    for i in 0..WIDTH {
+        a[i] += sums_a[i % 4];
+        b[i] += sums_b[i % 4];
     }
 }
 
