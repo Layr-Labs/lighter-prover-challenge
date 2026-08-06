@@ -7,6 +7,7 @@ use num::{BigUint, Integer, ToPrimitive};
 use plonky2_util::{assume, branch_hint};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 use crate::ops::Square;
 use crate::types::{Field, Field64, PrimeField, PrimeField64, Sample};
 
@@ -95,55 +96,47 @@ impl Field for GoldilocksField {
         Self::order()
     }
 
-    /// Returns the inverse of the field element, using Fermat's little theorem.
-    /// The inverse of `a` is computed as `a^(p-2)`, where `p` is the prime order of the field.
-    ///
-    /// Mathematically, this is equivalent to:
-    ///                $a^(p-1)     = 1 (mod p)$
-    ///                $a^(p-2) * a = 1 (mod p)$
-    /// Therefore      $a^(p-2)     = a^-1 (mod p)$
-    ///
-    /// The following code has been adapted from winterfell/math/src/field/f64/mod.rs
-    /// located at <https://github.com/facebook/winterfell>.
     fn try_inverse(&self) -> Option<Self> {
-        if self.is_zero() {
+        let value = self.to_canonical_u64();
+        if value == 0 {
             return None;
         }
+        if value == 1 {
+            return Some(Self::ONE);
+        }
 
-        // compute base^(P - 2) using 72 multiplications
-        // The exponent P - 2 is represented in binary as:
-        // 0b1111111111111111111111111111111011111111111111111111111111111111
+        // Extended Euclid with unsigned coefficient magnitudes. Consecutive Bézout coefficients
+        // alternate signs, so their magnitudes satisfy c_next = c_old + quotient * c. They are
+        // denominators of convergents of ORDER / value and remain at most ORDER, avoiding signed
+        // overflow. Every two remainder steps at least halve the older remainder, so 64-bit inputs
+        // terminate within 128 divisions. We return as soon as the next remainder is one, avoiding
+        // the otherwise-useless final division by one.
+        let mut old_remainder = Self::ORDER;
+        let mut remainder = value;
+        let mut old_coefficient = 0u64;
+        let mut coefficient = 1u64;
+        let mut coefficient_is_negative = false;
 
-        // compute base^11
-        let t2 = self.square() * *self;
+        loop {
+            let quotient = old_remainder / remainder;
+            let next_remainder = old_remainder - quotient * remainder;
+            debug_assert!(quotient <= (Self::ORDER - old_coefficient) / coefficient);
+            let next_coefficient = old_coefficient + quotient * coefficient;
 
-        // compute base^111
-        let t3 = t2.square() * *self;
+            if next_remainder == 1 {
+                return Some(Self(if coefficient_is_negative {
+                    next_coefficient
+                } else {
+                    Self::ORDER - next_coefficient
+                }));
+            }
 
-        // compute base^111111 (6 ones)
-        // repeatedly square t3 3 times and multiply by t3
-        let t6 = exp_acc::<3>(t3, t3);
-
-        // compute base^111111111111 (12 ones)
-        // repeatedly square t6 6 times and multiply by t6
-        let t12 = exp_acc::<6>(t6, t6);
-
-        // compute base^111111111111111111111111 (24 ones)
-        // repeatedly square t12 12 times and multiply by t12
-        let t24 = exp_acc::<12>(t12, t12);
-
-        // compute base^1111111111111111111111111111111 (31 ones)
-        // repeatedly square t24 6 times and multiply by t6 first. then square t30 and
-        // multiply by base
-        let t30 = exp_acc::<6>(t24, t6);
-        let t31 = t30.square() * *self;
-
-        // compute base^111111111111111111111111111111101111111111111111111111111111111
-        // repeatedly square t31 32 times and multiply by t31
-        let t63 = exp_acc::<32>(t31, t31);
-
-        // compute base^1111111111111111111111111111111011111111111111111111111111111111
-        Some(t63.square() * *self)
+            old_remainder = remainder;
+            remainder = next_remainder;
+            old_coefficient = coefficient;
+            coefficient = next_coefficient;
+            coefficient_is_negative = !coefficient_is_negative;
+        }
     }
 
     fn from_noncanonical_biguint(n: BigUint) -> Self {
@@ -462,15 +455,134 @@ pub(crate) unsafe fn reduce160(x_lo: u128, x_hi: u32) -> GoldilocksField {
 }
 
 /// Squares the base N number of times and multiplies the result by the tail value.
+#[cfg(test)]
 #[inline(always)]
 fn exp_acc<const N: usize>(base: GoldilocksField, tail: GoldilocksField) -> GoldilocksField {
     base.exp_power_of_2(N) * tail
 }
 
+/// Test oracle retained from the previous implementation.
+#[cfg(test)]
+#[inline(always)]
+fn try_inverse_fermat_chain(value: GoldilocksField) -> Option<GoldilocksField> {
+    if value.is_zero() {
+        return None;
+    }
+
+    // compute base^(P - 2) using 72 multiplications
+    // The exponent P - 2 is represented in binary as:
+    // 0b1111111111111111111111111111111011111111111111111111111111111111
+
+    // compute base^11
+    let t2 = value.square() * value;
+
+    // compute base^111
+    let t3 = t2.square() * value;
+
+    // compute base^111111 (6 ones)
+    // repeatedly square t3 3 times and multiply by t3
+    let t6 = exp_acc::<3>(t3, t3);
+
+    // compute base^111111111111 (12 ones)
+    // repeatedly square t6 6 times and multiply by t6
+    let t12 = exp_acc::<6>(t6, t6);
+
+    // compute base^111111111111111111111111 (24 ones)
+    // repeatedly square t12 12 times and multiply by t12
+    let t24 = exp_acc::<12>(t12, t12);
+
+    // compute base^1111111111111111111111111111111 (31 ones)
+    // repeatedly square t24 6 times and multiply by t6 first. then square t30 and
+    // multiply by base
+    let t30 = exp_acc::<6>(t24, t6);
+    let t31 = t30.square() * value;
+
+    // compute base^111111111111111111111111111111101111111111111111111111111111111
+    // repeatedly square t31 32 times and multiply by t31
+    let t63 = exp_acc::<32>(t31, t31);
+
+    // compute base^1111111111111111111111111111111011111111111111111111111111111111
+    Some(t63.square() * value)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{try_inverse_fermat_chain, GoldilocksField};
+    use crate::types::{Field, Field64, PrimeField64};
     use crate::{test_field_arithmetic, test_prime_field_arithmetic};
 
     test_prime_field_arithmetic!(crate::goldilocks_field::GoldilocksField);
     test_field_arithmetic!(crate::goldilocks_field::GoldilocksField);
+
+    fn check_inverse_against_fermat(raw: u64) {
+        let value = GoldilocksField(raw);
+        let actual = value.try_inverse();
+        let expected = try_inverse_fermat_chain(value);
+
+        assert_eq!(
+            actual.map(|x| x.to_canonical_u64()),
+            expected.map(|x| x.to_canonical_u64()),
+            "raw representation {raw:#018x}"
+        );
+
+        if let Some(inverse) = actual {
+            assert!(
+                inverse.0 < GoldilocksField::ORDER,
+                "inverse is not canonical for raw representation {raw:#018x}"
+            );
+            assert_eq!(
+                value * inverse,
+                GoldilocksField::ONE,
+                "invalid inverse for raw representation {raw:#018x}"
+            );
+        }
+    }
+
+    #[test]
+    fn inverse_matches_fermat_for_small_and_boundary_values() {
+        const WINDOW: u64 = 1 << 16;
+        let order = GoldilocksField::ORDER;
+
+        for delta in 0..WINDOW {
+            check_inverse_against_fermat(delta);
+            check_inverse_against_fermat(order - delta);
+            check_inverse_against_fermat(order + delta);
+            check_inverse_against_fermat(u64::MAX - delta);
+        }
+
+        for bit in 0..64 {
+            let power = 1u64 << bit;
+            for raw in [
+                power.wrapping_sub(1),
+                power,
+                power.wrapping_add(1),
+                order.wrapping_sub(power),
+                order.wrapping_sub(power).wrapping_add(1),
+                order.wrapping_add(power),
+                order.wrapping_add(power).wrapping_sub(1),
+            ] {
+                check_inverse_against_fermat(raw);
+            }
+        }
+    }
+
+    #[test]
+    fn inverse_matches_fermat_for_one_million_deterministic_random_values() {
+        let mut state = 0x476f_6c64_696c_6f63u64;
+
+        for case in 0..1_000_000 {
+            // SplitMix64 gives a reproducible, full-period source stream. Half the cases exercise
+            // the narrow noncanonical interval explicitly; uniform u64 sampling would almost
+            // never hit it.
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut raw = state;
+            raw = (raw ^ (raw >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            raw = (raw ^ (raw >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            raw ^= raw >> 31;
+            if case & 1 == 1 {
+                raw = GoldilocksField::ORDER + raw % (u64::MAX - GoldilocksField::ORDER + 1);
+            }
+            check_inverse_against_fermat(raw);
+        }
+    }
 }
