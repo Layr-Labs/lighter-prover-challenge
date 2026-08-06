@@ -53,7 +53,7 @@ use crate::timed;
 use crate::util::context_tree::ContextTree;
 use crate::util::partial_products::num_partial_products;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil, log2_strict, transpose, transpose_poly_values};
+use crate::util::{log2_ceil, log2_strict, transpose_poly_values};
 
 /// Number of random coins needed for lookups (for each challenge).
 /// A coin is a randomly sampled extension field element from the verifier,
@@ -979,20 +979,21 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .map(|g| g.0.num_constants())
             .max()
             .unwrap();
-        transpose(
-            &self
-                .gate_instances
-                .iter()
-                .map(|g| {
-                    let mut consts = g.constants.clone();
-                    consts.resize(max_constants, F::ZERO);
-                    consts
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_iter()
-        .map(PolynomialValues::new)
-        .collect()
+        let num_rows = self.gate_instances.len();
+        let mut columns = (0..max_constants)
+            .map(|_| vec![F::ZERO; num_rows])
+            .collect::<Vec<_>>();
+
+        // The prover consumes constants column-major. Populate that final
+        // layout directly instead of allocating, cloning, and padding one
+        // small Vec per gate row before transposing the entire matrix.
+        for (row, gate) in self.gate_instances.iter().enumerate() {
+            for (column, &constant) in columns.iter_mut().zip(&gate.constants) {
+                column[row] = constant;
+            }
+        }
+
+        columns.into_iter().map(PolynomialValues::new).collect()
     }
 
     fn sigma_vecs(&self, k_is: &[F], subgroup: &[F]) -> (Vec<PolynomialValues<F>>, Forest) {

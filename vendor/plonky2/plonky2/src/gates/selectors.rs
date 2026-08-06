@@ -119,7 +119,25 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     let num_gates = gates.len();
     let max_gate_degree = gates.last().expect("No gates?").0.degree();
 
-    let index = |id| gates.iter().position(|g| g.0.id() == id).unwrap();
+    // Gate instances hold clones of the GateRefs in `gates`. Resolve the
+    // common case by Arc data-pointer identity, avoiding repeated allocation
+    // of gate ID Strings for every circuit row. Retain the ID-based lookup as
+    // a defensive fallback for callers that constructed equivalent GateRefs
+    // independently.
+    let gate_ptrs = gates
+        .iter()
+        .map(|g| core::ptr::from_ref(g.0.as_ref()).cast::<()>())
+        .collect::<Vec<_>>();
+    let index = |gate_ref: &GateRef<F, D>| {
+        let ptr = core::ptr::from_ref(gate_ref.0.as_ref()).cast::<()>();
+        gate_ptrs
+            .iter()
+            .position(|&gate_ptr| gate_ptr == ptr)
+            .unwrap_or_else(|| {
+                let id = gate_ref.0.id();
+                gates.iter().position(|g| g.0.id() == id).unwrap()
+            })
+    };
 
     // Special case if we can use only one selector polynomial.
     if max_gate_degree + num_gates - 1 <= max_degree {
@@ -130,7 +148,7 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
             vec![PolynomialValues::new(
                 instances
                     .iter()
-                    .map(|g| F::from_canonical_usize(index(g.gate_ref.0.id())))
+                    .map(|g| F::from_canonical_usize(index(&g.gate_ref)))
                     .collect(),
             )],
             SelectorsInfo {
@@ -159,26 +177,29 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
         start += size;
     }
 
-    let group = |i| groups.iter().position(|range| range.contains(&i)).unwrap();
-
     // `selector_indices[i] = j` iff the `i`-th gate uses the `j`-th selector polynomial.
-    let selector_indices = (0..num_gates).map(group).collect();
+    let mut selector_indices = vec![0; num_gates];
+    for (group_index, range) in groups.iter().enumerate() {
+        for gate_index in range.clone() {
+            selector_indices[gate_index] = group_index;
+        }
+    }
 
     // Placeholder value to indicate that a gate doesn't use a selector polynomial.
     let unused = F::from_canonical_usize(UNUSED_SELECTOR);
 
-    let mut polynomials = vec![PolynomialValues::zero(n); groups.len()];
+    // Initialize each selector column to the inactive value, then overwrite
+    // only the one active column for each row. The old row-major loop first
+    // zeroed every column and then rewrote every cell, including all inactive
+    // groups.
+    let mut polynomials = (0..groups.len())
+        .map(|_| PolynomialValues::new(vec![unused; n]))
+        .collect::<Vec<_>>();
     for (j, g) in instances.iter().enumerate() {
         let GateInstance { gate_ref, .. } = g;
-        let i = index(gate_ref.0.id());
-        let gr = group(i);
-        for g in 0..groups.len() {
-            polynomials[g].values[j] = if g == gr {
-                F::from_canonical_usize(i)
-            } else {
-                unused
-            };
-        }
+        let i = index(gate_ref);
+        let group_index = selector_indices[i];
+        polynomials[group_index].values[j] = F::from_canonical_usize(i);
     }
 
     (
