@@ -4,6 +4,7 @@ use core::marker::PhantomData;
 
 use anyhow::Result;
 
+use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::Extendable;
 use crate::field::types::Field;
 use crate::gates::gate::Gate;
@@ -310,6 +311,139 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
         }
 
         res
+    }
+
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: crate::plonk::vars::EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= self.num_constraints() * n);
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+
+        let mut scratch = vec![F::ZERO; n];
+        let mut constraint_index = 0;
+        // Mirrors `eval_unfiltered_base_batch` constraint-for-constraint; each
+        // row lands in `scratch` and is folded straight into the shared
+        // accumulator instead of a materialized matrix.
+        macro_rules! emit {
+            () => {{
+                let combined = &mut combined_gate_constraints
+                    [constraint_index * n..(constraint_index + 1) * n];
+                batch_multiply_add_inplace(combined, &scratch, filters);
+                constraint_index += 1;
+            }};
+        }
+
+        let mut states = vec![[F::ZERO; WIDTH]; n];
+
+        // Assert that `swap` is binary.
+        let swap = col(Self::WIRE_SWAP);
+        for p in 0..n {
+            scratch[p] = swap[p] * swap[p].sub_one();
+        }
+        emit!();
+
+        // Assert that each delta wire is set properly: `delta_i = swap * (rhs - lhs)`.
+        for i in 0..4 {
+            let input_lhs = col(Self::wire_input(i));
+            let input_rhs = col(Self::wire_input(i + 4));
+            let delta_i = col(Self::wire_delta(i));
+            for p in 0..n {
+                scratch[p] = swap[p] * (input_rhs[p] - input_lhs[p]) - delta_i[p];
+            }
+            emit!();
+        }
+
+        // Compute the possibly-swapped input layer.
+        for i in 0..4 {
+            let delta_i = col(Self::wire_delta(i));
+            let input_lhs = col(Self::wire_input(i));
+            let input_rhs = col(Self::wire_input(i + 4));
+            for p in 0..n {
+                states[p][i] = input_lhs[p] + delta_i[p];
+                states[p][i + 4] = input_rhs[p] - delta_i[p];
+            }
+        }
+        for i in 8..WIDTH {
+            let input = col(Self::wire_input(i));
+            for p in 0..n {
+                states[p][i] = input[p];
+            }
+        }
+
+        // The initial linear layer.
+        for state in states.iter_mut() {
+            <F as Poseidon2>::external_linear_layer(state);
+        }
+
+        // The first half of the external rounds.
+        for r in 0..ROUNDS_F_HALF {
+            for state in states.iter_mut() {
+                <F as Poseidon2>::add_rc(state, r);
+            }
+            if r != 0 {
+                for i in 0..WIDTH {
+                    let sbox_in = col(Self::wire_full_sbox_0(r, i));
+                    for p in 0..n {
+                        scratch[p] = states[p][i] - sbox_in[p];
+                        states[p][i] = sbox_in[p];
+                    }
+                    emit!();
+                }
+            }
+            for state in states.iter_mut() {
+                <F as Poseidon2>::sbox(state);
+                <F as Poseidon2>::external_linear_layer(state);
+            }
+        }
+
+        // The internal rounds.
+        for r in 0..ROUNDS_P {
+            let rc = F::from_canonical_u64(INTERNAL_CONSTANTS[r]);
+            let sbox_in = col(Self::wire_partial_sbox(r));
+            for p in 0..n {
+                scratch[p] = states[p][0] + rc - sbox_in[p];
+                states[p][0] = <F as Poseidon2>::sbox_p(&sbox_in[p]);
+            }
+            emit!();
+            for state in states.iter_mut() {
+                <F as Poseidon2>::internal_linear_layer(state);
+            }
+        }
+
+        // The second half of the external rounds.
+        for r in ROUNDS_F_HALF..ROUNDS_F {
+            for state in states.iter_mut() {
+                <F as Poseidon2>::add_rc(state, r);
+            }
+            for i in 0..WIDTH {
+                let sbox_in = col(Self::wire_full_sbox_1(r - ROUNDS_F_HALF, i));
+                for p in 0..n {
+                    scratch[p] = states[p][i] - sbox_in[p];
+                    states[p][i] = sbox_in[p];
+                }
+                emit!();
+            }
+            for state in states.iter_mut() {
+                <F as Poseidon2>::sbox(state);
+                <F as Poseidon2>::external_linear_layer(state);
+            }
+        }
+
+        for i in 0..WIDTH {
+            let output = col(Self::wire_output(i));
+            for p in 0..n {
+                scratch[p] = states[p][i] - output[p];
+            }
+            emit!();
+        }
+
+        debug_assert_eq!(constraint_index, self.num_constraints());
     }
 
     fn eval_unfiltered_base_one(
@@ -716,5 +850,34 @@ mod tests {
 
         let gate = PoseidonGate::<F, D>::new();
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    #[test]
+    fn direct_filtered_accumulation_matches_materialized_batch() {
+        const D: usize = 2;
+        const N: usize = 11;
+        type F = GoldilocksField;
+
+        let gate = Poseidon2Gate::<F, D>::new();
+        let wires = (0..gate.num_wires() * N)
+            .map(|i| F::from_canonical_usize(3 * i + 5))
+            .collect::<Vec<_>>();
+        let constants = Vec::new();
+        let hash = crate::hash::hash_types::HashOut::ZERO;
+        let vars = crate::plonk::vars::EvaluationVarsBaseBatch::new(N, &constants, &wires, &hash);
+        let filters = (0..N)
+            .map(|i| F::from_canonical_usize(2 * i + 1))
+            .collect::<Vec<_>>();
+        let mut expected = vec![F::ZERO; gate.num_constraints() * N];
+        let materialized = gate.eval_unfiltered_base_batch(vars);
+        for (acc, constraints) in expected
+            .chunks_exact_mut(N)
+            .zip(materialized.chunks_exact(N))
+        {
+            crate::field::batch_util::batch_multiply_add_inplace(acc, constraints, &filters);
+        }
+        let mut actual = vec![F::ZERO; expected.len()];
+        gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+        assert_eq!(actual, expected);
     }
 }
