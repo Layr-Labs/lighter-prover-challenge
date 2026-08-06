@@ -39,7 +39,7 @@ pub fn generate_partial_witness<
 
 /// Ready sets at least this large are executed as one data-parallel round; smaller ones run on
 /// the sequential loop, so thin dependency chains keep their single-threaded latency.
-const PARALLEL_WORKLIST_THRESHOLD: usize = 64;
+const PARALLEL_WORKLIST_THRESHOLD: usize = 32;
 
 /// Generators per parallel-round task. Chunking amortizes per-task scheduling and buffer
 /// overhead across cheap generators while leaving enough tasks for load balancing.
