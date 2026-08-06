@@ -6,7 +6,7 @@ use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAss
 
 use itertools::Itertools;
 use num::bigint::BigUint;
-use num::{Integer, One};
+use num::Integer;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{Field, PrimeField, Sample};
@@ -117,12 +117,16 @@ impl Field for Secp256K1Scalar {
     }
 
     fn try_inverse(&self) -> Option<Self> {
-        if self.is_zero() {
-            return None;
-        }
-
-        // Fermat's Little Theorem
-        Some(self.exp_biguint(&(Self::order() - BigUint::one() - BigUint::one())))
+        crate::secp256k1_inverse::mod_inverse(
+            self.0,
+            [
+                0xBFD25E8CD0364141,
+                0xBAAEDCE6AF48A03B,
+                0xFFFFFFFFFFFFFFFE,
+                0xFFFFFFFFFFFFFFFF,
+            ],
+        )
+        .map(Self)
     }
 
     fn from_noncanonical_biguint(val: BigUint) -> Self {

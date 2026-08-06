@@ -22,6 +22,7 @@ pub mod packable;
 pub mod packed;
 pub mod polynomial;
 pub mod secp256k1_base;
+mod secp256k1_inverse;
 pub mod secp256k1_scalar;
 pub mod types;
 pub mod zero_poly_coset;
