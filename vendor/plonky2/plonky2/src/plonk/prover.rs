@@ -62,7 +62,7 @@ pub fn set_lookup_wires<
         let num_lut_entries = LookupTableGate::num_slots(&common_data.config);
 
         // Compute multiplicities.
-        let mut multiplicities = vec![0; lut_len];
+        let mut multiplicities = vec![0u32; lut_len];
 
         let table_value_to_idx: HashMap<u16, usize> = common_data.luts[lut_index]
             .iter()
@@ -103,7 +103,7 @@ pub fn set_lookup_wires<
 
             pw.set_target(
                 mul_target,
-                F::from_canonical_usize(multiplicities[lut_entry]),
+                F::from_canonical_u32(multiplicities[lut_entry]),
             )?;
         }
     }
@@ -443,7 +443,7 @@ fn wires_permutation_partial_products_and_zs<
     debug_assert_eq!(beta_k_is.len(), common_data.config.num_routed_wires);
     let num_routed_wires = common_data.config.num_routed_wires;
     // Group the denominator inversions across many subgroup points: one
-    // Montgomery-trick batch inversion per 64 points instead of one per
+    // Montgomery-trick batch inversion per 128 points instead of one per
     // point. Field inverses are unique, so every quotient value is identical
     // to the per-point version.
     const INV_BATCH: usize = 128;
@@ -498,20 +498,52 @@ fn wires_permutation_partial_products_and_zs<
     let mut z_x = F::ONE;
     for quotient_chunk_products in all_quotient_chunk_products {
         let mut acc = z_x;
-        for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
-            acc *= quotient_chunk_product;
-            if k == num_prods {
-                // The last term is Z(gx), but we store Z(x) in its place,
-                // otherwise Z would end up shifted.
-                columns[k].push(z_x);
-                z_x = acc;
-            } else {
-                columns[k].push(acc);
-            }
+        // Hoist the branch out of the hot loop: all columns except the last
+        // receive the running product; the last receives the old Z(x).
+        for k in 0..num_prods {
+            acc *= quotient_chunk_products[k];
+            columns[k].push(acc);
         }
+        columns[num_prods].push(z_x);
+        z_x = acc * quotient_chunk_products[num_prods];
     }
 
     columns.into_iter().map(PolynomialValues::new).collect()
+}
+
+/// Scratch buffers reused across rows inside `compute_lookup_polys`.
+struct LookupScratch<F: Field> {
+    looked_combos: Vec<F>,
+    minus_looked_combos: Vec<F>,
+    looked_combo_inverses: Vec<F>,
+    lookup_combos: Vec<F>,
+    looking_combos: Vec<F>,
+    minus_looking_combos: Vec<F>,
+    looking_combo_inverses: Vec<F>,
+}
+
+impl<F: Field> LookupScratch<F> {
+    fn new(num_lut_slots: usize, num_lu_slots: usize) -> Self {
+        Self {
+            looked_combos: Vec::with_capacity(num_lut_slots),
+            minus_looked_combos: Vec::with_capacity(num_lut_slots),
+            looked_combo_inverses: Vec::with_capacity(num_lut_slots),
+            lookup_combos: Vec::with_capacity(num_lut_slots),
+            looking_combos: Vec::with_capacity(num_lu_slots),
+            minus_looking_combos: Vec::with_capacity(num_lu_slots),
+            looking_combo_inverses: Vec::with_capacity(num_lu_slots),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.looked_combos.clear();
+        self.minus_looked_combos.clear();
+        self.looked_combo_inverses.clear();
+        self.lookup_combos.clear();
+        self.looking_combos.clear();
+        self.minus_looking_combos.clear();
+        self.looking_combo_inverses.clear();
+    }
 }
 
 /// Computes lookup polynomials for a given challenge.
@@ -530,6 +562,7 @@ fn compute_lookup_polys<
     deltas: &[F; 4],
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
+    scratch: &mut LookupScratch<F>,
 ) -> Vec<PolynomialValues<F>> {
     let degree = common_data.degree();
     let num_lu_slots = LookupGate::num_slots(&common_data.config);
@@ -544,93 +577,92 @@ fn compute_lookup_polys<
         final_poly_vecs.push(PolynomialValues::<F>::new(vec![F::ZERO; degree]));
     }
 
+    let challenge_a = deltas[LookupChallenges::ChallengeA as usize];
+    let challenge_alpha = deltas[LookupChallenges::ChallengeAlpha as usize];
+    let challenge_b = deltas[LookupChallenges::ChallengeB as usize];
+    let challenge_delta = deltas[LookupChallenges::ChallengeDelta as usize];
+
     for LookupWire {
         last_lu_gate: last_lu_row,
         last_lut_gate: last_lut_row,
         first_lut_gate: first_lut_row,
-    } in prover_data.lookup_rows.clone()
+    } in &prover_data.lookup_rows
     {
         // Set values for partial Sums and RE.
         for row in (last_lut_row..(first_lut_row + 1)).rev() {
-            // Get combos for Sum.
-            let looked_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| {
-                    let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
-                    let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
+            scratch.clear();
 
-                    looked_inp + deltas[LookupChallenges::ChallengeA as usize] * looked_out
-                })
-                .collect();
-            // Get (alpha - combo).
-            let minus_looked_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| deltas[LookupChallenges::ChallengeAlpha as usize] - looked_combos[s])
-                .collect();
-            // Get 1/(alpha - combo).
-            let looked_combo_inverses = F::batch_multiplicative_inverse(&minus_looked_combos);
-
-            // Get lookup combos, used to check the well formation of the LUT.
-            let lookup_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| {
-                    let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
-                    let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
-
-                    looked_inp + deltas[LookupChallenges::ChallengeB as usize] * looked_out
-                })
-                .collect();
+            // Build looked combos and lookup combos in one pass.
+            for s in 0..num_lut_slots {
+                let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
+                let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
+                let combo = looked_inp + challenge_a * looked_out;
+                scratch.looked_combos.push(combo);
+                scratch.minus_looked_combos.push(challenge_alpha - combo);
+                scratch.lookup_combos.push(looked_inp + challenge_b * looked_out);
+            }
+            F::batch_multiplicative_inverse_into(
+                &scratch.minus_looked_combos,
+                &mut scratch.looked_combo_inverses,
+            );
 
             // Compute next row's first value of RE.
             // If `row == first_lut_row`, then `final_poly_vecs[0].values[row + 1] == 0`.
             let mut new_re = final_poly_vecs[0].values[row + 1];
-            for elt in &lookup_combos {
-                new_re = new_re * deltas[LookupChallenges::ChallengeDelta as usize] + *elt
+            for elt in &scratch.lookup_combos {
+                new_re = new_re * challenge_delta + *elt;
             }
             final_poly_vecs[0].values[row] = new_re;
 
             for slot in 0..num_partial_lookups {
+                let start = slot * max_lookup_table_degree;
+                let end = min(start + max_lookup_table_degree, num_lut_slots);
+
                 let prev = if slot != 0 {
                     final_poly_vecs[slot].values[row]
                 } else {
                     // If `row == first_lut_row`, then `final_poly_vecs[num_partial_lookups].values[row + 1] == 0`.
                     final_poly_vecs[num_partial_lookups].values[row + 1]
                 };
-                let sum = (slot * max_lookup_table_degree
-                    ..min((slot + 1) * max_lookup_table_degree, num_lut_slots))
-                    .fold(prev, |acc, s| {
-                        acc + witness.get_wire(row, LookupTableGate::wire_ith_multiplicity(s))
-                            * looked_combo_inverses[s]
-                    });
+                let mut sum = prev;
+                for s in start..end {
+                    sum += witness.get_wire(row, LookupTableGate::wire_ith_multiplicity(s))
+                        * scratch.looked_combo_inverses[s];
+                }
                 final_poly_vecs[slot + 1].values[row] = sum;
             }
         }
 
         // Set values for partial LDCs.
         for row in (last_lu_row..last_lut_row).rev() {
-            // Get looking combos.
-            let looking_combos: Vec<F> = (0..num_lu_slots)
-                .map(|s| {
-                    let looking_in = witness.get_wire(row, LookupGate::wire_ith_looking_inp(s));
-                    let looking_out = witness.get_wire(row, LookupGate::wire_ith_looking_out(s));
+            scratch.clear();
 
-                    looking_in + deltas[LookupChallenges::ChallengeA as usize] * looking_out
-                })
-                .collect();
-            // Get (alpha - combo).
-            let minus_looking_combos: Vec<F> = (0..num_lu_slots)
-                .map(|s| deltas[LookupChallenges::ChallengeAlpha as usize] - looking_combos[s])
-                .collect();
-            // Get 1 / (alpha - combo).
-            let looking_combo_inverses = F::batch_multiplicative_inverse(&minus_looking_combos);
+            for s in 0..num_lu_slots {
+                let looking_in = witness.get_wire(row, LookupGate::wire_ith_looking_inp(s));
+                let looking_out = witness.get_wire(row, LookupGate::wire_ith_looking_out(s));
+                let combo = looking_in + challenge_a * looking_out;
+                scratch.looking_combos.push(combo);
+                scratch.minus_looking_combos.push(challenge_alpha - combo);
+            }
+            F::batch_multiplicative_inverse_into(
+                &scratch.minus_looking_combos,
+                &mut scratch.looking_combo_inverses,
+            );
 
             for slot in 0..num_partial_lookups {
+                let start = slot * max_lookup_degree;
+                let end = min(start + max_lookup_degree, num_lu_slots);
+
                 let prev = if slot == 0 {
                     // Valid at _any_ row, even `first_lu_row`.
                     final_poly_vecs[num_partial_lookups].values[row + 1]
                 } else {
                     final_poly_vecs[slot].values[row]
                 };
-                let sum = (slot * max_lookup_degree
-                    ..min((slot + 1) * max_lookup_degree, num_lu_slots))
-                    .fold(F::ZERO, |acc, s| acc + looking_combo_inverses[s]);
+                let mut sum = F::ZERO;
+                for s in start..end {
+                    sum += scratch.looking_combo_inverses[s];
+                }
                 final_poly_vecs[slot + 1].values[row] = prev - sum;
             }
         }
@@ -651,23 +683,28 @@ fn compute_all_lookup_polys<
     common_data: &CommonCircuitData<F, D>,
     lookup: bool,
 ) -> Vec<PolynomialValues<F>> {
-    if lookup {
-        let polys: Vec<Vec<PolynomialValues<F>>> = (0..common_data.config.num_challenges)
-            .map(|c| {
-                compute_lookup_polys(
-                    witness,
-                    &deltas[c * NUM_COINS_LOOKUP..(c + 1) * NUM_COINS_LOOKUP]
-                        .try_into()
-                        .unwrap(),
-                    prover_data,
-                    common_data,
-                )
-            })
-            .collect();
-        polys.into_iter().flatten().collect()
-    } else {
-        vec![]
+    if !lookup {
+        return vec![];
     }
+
+    let num_lut_slots = LookupTableGate::num_slots(&common_data.config);
+    let num_lu_slots = LookupGate::num_slots(&common_data.config);
+
+    (0..common_data.config.num_challenges)
+        .into_par_iter()
+        .flat_map(|c| {
+            let mut scratch = LookupScratch::new(num_lut_slots, num_lu_slots);
+            compute_lookup_polys(
+                witness,
+                &deltas[c * NUM_COINS_LOOKUP..(c + 1) * NUM_COINS_LOOKUP]
+                    .try_into()
+                    .unwrap(),
+                prover_data,
+                common_data,
+                &mut scratch,
+            )
+        })
+        .collect()
 }
 
 const BATCH_SIZE: usize = 32;
@@ -760,6 +797,13 @@ fn compute_quotient_polys<
         s_sigmas_flat: Vec<F>,
         zs_local_flat: Vec<F>,
         zs_next_flat: Vec<F>,
+        // Pre-allocated batch views to avoid per-batch Vec allocations.
+        local_zs_batch: Vec<*const F>,
+        next_zs_batch: Vec<*const F>,
+        partial_products_batch: Vec<*const F>,
+        s_sigmas_batch: Vec<*const F>,
+        local_lookup_batch: Vec<*const F>,
+        next_lookup_batch: Vec<*const F>,
         vanishing: VanishingScratch<F>,
     }
 
@@ -782,16 +826,17 @@ fn compute_quotient_polys<
                 s_sigmas_flat: Vec::new(),
                 zs_local_flat: Vec::new(),
                 zs_next_flat: Vec::new(),
+                local_zs_batch: Vec::with_capacity(BATCH_SIZE),
+                next_zs_batch: Vec::with_capacity(BATCH_SIZE),
+                partial_products_batch: Vec::with_capacity(BATCH_SIZE),
+                s_sigmas_batch: Vec::with_capacity(BATCH_SIZE),
+                local_lookup_batch: Vec::with_capacity(BATCH_SIZE),
+                next_lookup_batch: Vec::with_capacity(BATCH_SIZE),
                 vanishing: VanishingScratch::default(),
             },
             |scratch, (batch_i, (quotient_values_batch, xs_batch))| {
-                // Each batch must be the same size, except the last one, which may be smaller.
-                debug_assert!(
-                    xs_batch.len() == BATCH_SIZE
-                        || (batch_i == num_batches - 1 && xs_batch.len() <= BATCH_SIZE)
-                );
-
                 let n = xs_batch.len();
+
                 scratch.indices.clear();
                 scratch
                     .indices
@@ -842,36 +887,74 @@ fn compute_quotient_polys<
                     &mut scratch.zs_next_flat,
                 );
 
+                // Rebuild the batch views without allocating new Vecs each time.
+                scratch.local_zs_batch.clear();
+                scratch.next_zs_batch.clear();
+                scratch.partial_products_batch.clear();
+                scratch.s_sigmas_batch.clear();
+                scratch.local_lookup_batch.clear();
+                scratch.next_lookup_batch.clear();
+
+                for k in 0..n {
+                    let base_local = k * zs_row_width;
+                    let base_sigma = k * num_routed_wires;
+                    scratch.local_zs_batch.push(
+                        scratch.zs_local_flat[base_local..][common_data.zs_range()].as_ptr(),
+                    );
+                    scratch.next_zs_batch.push(
+                        scratch.zs_next_flat[base_local..][common_data.zs_range()].as_ptr(),
+                    );
+                    scratch.partial_products_batch.push(
+                        scratch.zs_local_flat[base_local..][common_data.partial_products_range()]
+                            .as_ptr(),
+                    );
+                    scratch.s_sigmas_batch.push(
+                        scratch.s_sigmas_flat[base_sigma..base_sigma + num_routed_wires].as_ptr(),
+                    );
+                    if has_lookup {
+                        scratch.local_lookup_batch.push(
+                            scratch.zs_local_flat[base_local..][common_data.lookup_range()].as_ptr(),
+                        );
+                        scratch.next_lookup_batch.push(
+                            scratch.zs_next_flat[base_local..][common_data.lookup_range()].as_ptr(),
+                        );
+                    }
+                }
+
                 let indices_batch = &scratch.indices;
-                let local_zs_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.zs_local_flat[k * zs_row_width..][common_data.zs_range()])
+                let local_zs_batch: Vec<&[F]> = scratch
+                    .local_zs_batch
+                    .iter()
+                    .map(|&p| unsafe { core::slice::from_raw_parts(p, common_data.zs_range().len()) })
                     .collect();
-                let next_zs_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.zs_next_flat[k * zs_row_width..][common_data.zs_range()])
+                let next_zs_batch: Vec<&[F]> = scratch
+                    .next_zs_batch
+                    .iter()
+                    .map(|&p| unsafe { core::slice::from_raw_parts(p, common_data.zs_range().len()) })
                     .collect();
-                let partial_products_batch: Vec<&[F]> = (0..n)
-                    .map(|k| {
-                        &scratch.zs_local_flat[k * zs_row_width..]
-                            [common_data.partial_products_range()]
-                    })
+                let partial_products_batch: Vec<&[F]> = scratch
+                    .partial_products_batch
+                    .iter()
+                    .map(|&p| unsafe { core::slice::from_raw_parts(p, common_data.partial_products_range().len()) })
                     .collect();
-                let s_sigmas_batch: Vec<&[F]> = (0..n)
-                    .map(|k| &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires])
+                let s_sigmas_batch: Vec<&[F]> = scratch
+                    .s_sigmas_batch
+                    .iter()
+                    .map(|&p| unsafe { core::slice::from_raw_parts(p, num_routed_wires) })
                     .collect();
                 let (local_lookup_batch, next_lookup_batch): (Vec<&[F]>, Vec<&[F]>) = if has_lookup
                 {
+                    let lookup_len = common_data.lookup_range().len();
                     (
-                        (0..n)
-                            .map(|k| {
-                                &scratch.zs_local_flat[k * zs_row_width..]
-                                    [common_data.lookup_range()]
-                            })
+                        scratch
+                            .local_lookup_batch
+                            .iter()
+                            .map(|&p| unsafe { core::slice::from_raw_parts(p, lookup_len) })
                             .collect(),
-                        (0..n)
-                            .map(|k| {
-                                &scratch.zs_next_flat[k * zs_row_width..]
-                                    [common_data.lookup_range()]
-                            })
+                        scratch
+                            .next_lookup_batch
+                            .iter()
+                            .map(|&p| unsafe { core::slice::from_raw_parts(p, lookup_len) })
                             .collect(),
                     )
                 } else {

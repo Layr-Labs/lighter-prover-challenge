@@ -2,6 +2,7 @@
 use alloc::vec::Vec;
 
 use plonky2_maybe_rayon::*;
+use core::cmp::Ordering;
 
 use crate::field::polynomial::PolynomialValues;
 use crate::field::types::Field;
@@ -12,6 +13,9 @@ use crate::iop::wire::Wire;
 pub struct Forest {
     /// A map of parent pointers, stored as indices.
     pub(crate) parents: Vec<usize>,
+
+    /// Rank of each set, used for union-by-rank to keep trees flat.
+    ranks: Vec<u8>,
 
     num_wires: usize,
     num_routed_wires: usize,
@@ -28,6 +32,7 @@ impl Forest {
         let capacity = num_wires * degree + num_virtual_targets;
         Self {
             parents: Vec::with_capacity(capacity),
+            ranks: Vec::with_capacity(capacity),
             num_wires,
             num_routed_wires,
             degree,
@@ -43,12 +48,11 @@ impl Forest {
         let index = self.parents.len();
         debug_assert_eq!(self.target_index(t), index);
         self.parents.push(index);
+        self.ranks.push(0);
     }
 
     /// Path compression method, see <https://en.wikipedia.org/wiki/Disjoint-set_data_structure#Finding_set_representatives>.
     pub fn find(&mut self, mut x_index: usize) -> usize {
-        // Note: We avoid recursion here since the chains can be long, causing stack overflows.
-
         // First, find the representative of the set containing `x_index`.
         let mut representative = x_index;
         while self.parents[representative] != representative {
@@ -56,7 +60,8 @@ impl Forest {
         }
 
         // Then, update each node in this chain to point directly to the representative.
-        while self.parents[x_index] != x_index {
+        // Micro-opt: compare against `representative` directly instead of re-reading memory.
+        while x_index != representative {
             let old_parent = self.parents[x_index];
             self.parents[x_index] = representative;
             x_index = old_parent;
@@ -65,7 +70,7 @@ impl Forest {
         representative
     }
 
-    /// Merge two sets.
+    /// Merge two sets using union by rank for near-constant amortized time.
     pub fn merge(&mut self, tx: Target, ty: Target) {
         let x_index = self.find(self.target_index(tx));
         let y_index = self.find(self.target_index(ty));
@@ -74,7 +79,19 @@ impl Forest {
             return;
         }
 
-        self.parents[y_index] = x_index;
+        // Union by rank: attach the shorter tree under the taller one.
+        match self.ranks[x_index].cmp(&self.ranks[y_index]) {
+            Ordering::Less => {
+                self.parents[x_index] = y_index;
+            }
+            Ordering::Greater => {
+                self.parents[y_index] = x_index;
+            }
+            Ordering::Equal => {
+                self.parents[y_index] = x_index;
+                self.ranks[x_index] = self.ranks[x_index].saturating_add(1);
+            }
+        }
     }
 
     /// Compress all paths. After calling this, every `parent` value will point to the node's
@@ -90,14 +107,19 @@ impl Forest {
         let mut sigma = vec![0u32; self.degree * self.num_routed_wires];
         let mut first = vec![u32::MAX; self.parents.len()];
         let mut last = vec![u32::MAX; self.parents.len()];
+        let mut representatives = Vec::new();
 
-        for row in 0..self.degree {
-            for column in 0..self.num_routed_wires {
+        // Loop reordering: iterate column-first so that target_index(column, row) produces
+        // contiguous indices, yielding much better cache locality for `self.parents` and `sigma`.
+        for column in 0..self.num_routed_wires {
+            for row in 0..self.degree {
                 let t = Target::Wire(Wire { row, column });
                 let parent = self.parents[self.target_index(t)];
                 let index = (column * self.degree + row) as u32;
+
                 if first[parent] == u32::MAX {
                     first[parent] = index;
+                    representatives.push(parent);
                 } else {
                     sigma[last[parent] as usize] = index;
                 }
@@ -105,10 +127,9 @@ impl Forest {
             }
         }
 
-        for cell in 0..self.parents.len() {
-            if first[cell] != u32::MAX {
-                sigma[last[cell] as usize] = first[cell];
-            }
+        // Only iterate over representatives that actually appeared, skipping virtual targets.
+        for &rep in &representatives {
+            sigma[last[rep] as usize] = first[rep];
         }
 
         WirePartition { sigma }
@@ -127,13 +148,18 @@ impl WirePartition {
         subgroup: &[F],
     ) -> Vec<PolynomialValues<F>> {
         let degree = 1 << degree_log;
+        let degree_mask = degree - 1;
 
         self.sigma
             .chunks(degree)
             .map(|chunk| {
                 let values = chunk
                     .par_iter()
-                    .map(|&x| k_is[x as usize / degree] * subgroup[x as usize % degree])
+                    .map(|&x| {
+                        let x = x as usize;
+                        // Explicit bit-math: degree is a power of two, so div/mod become shift/mask.
+                        k_is[x >> degree_log] * subgroup[x & degree_mask]
+                    })
                     .collect::<Vec<_>>();
                 PolynomialValues::new(values)
             })
