@@ -186,17 +186,22 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
     ) {
         let batch_size = vars_batch.len();
         debug_assert!(self.num_constraints() * batch_size <= combined_gate_constraints.len());
-        let filters: Vec<_> = vars_batch
-            .iter()
-            .map(|vars| {
-                compute_filter(
-                    row,
-                    group_range.clone(),
-                    vars.local_constants[selector_index],
-                    num_selectors > 1,
-                )
-            })
-            .collect();
+        // Contiguous-column filter computation: read the selector constant
+        // column once and accumulate the same product terms, in the same
+        // order, as the per-point `compute_filter` — identical field values
+        // without the per-point strided views.
+        let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
+        let mut filters = vec![F::ONE; batch_size];
+        for i in group_range
+            .clone()
+            .filter(|&i| i != row)
+            .chain((num_selectors > 1).then_some(UNUSED_SELECTOR))
+        {
+            let k = F::from_canonical_usize(i);
+            for (filter, &s) in filters.iter_mut().zip(selector_col) {
+                *filter *= k - s;
+            }
+        }
         vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
         self.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, combined_gate_constraints);
     }
