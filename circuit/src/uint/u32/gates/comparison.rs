@@ -213,7 +213,135 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ComparisonGate
     }
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        self.eval_unfiltered_base_batch_packed(vars_base)
+        let n = vars_base.len();
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        let chunk_bits = self.chunk_bits();
+        let chunk_base = F::from_canonical_usize(1 << chunk_bits);
+        let chunk_size = 1usize << chunk_bits;
+        let three = F::from_canonical_usize(3);
+        let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
+        let mut chunks_iter = res.chunks_exact_mut(n);
+        let mut most_significant_diff_so_far = vec![F::ZERO; n];
+
+        // combined chunks - input, for both inputs, accumulated per point by
+        // Horner over the chunk columns from most to least significant.
+        for (input_wire, chunk_wire) in [
+            (
+                self.wire_first_input(),
+                &(0..self.num_chunks)
+                    .map(|i| self.wire_first_chunk_val(i))
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                self.wire_second_input(),
+                &(0..self.num_chunks)
+                    .map(|i| self.wire_second_chunk_val(i))
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            let out = chunks_iter.next().unwrap();
+            out.copy_from_slice(col(chunk_wire[self.num_chunks - 1]));
+            for &wire in chunk_wire[..self.num_chunks - 1].iter().rev() {
+                let chunk = col(wire);
+                for p in 0..n {
+                    out[p] = out[p] * chunk_base + chunk[p];
+                }
+            }
+            let input = col(input_wire);
+            for p in 0..n {
+                out[p] -= input[p];
+            }
+        }
+
+        let range_product = |out: &mut [F], value: &[F]| match chunk_size {
+            4 => {
+                for p in 0..n {
+                    let x = value[p];
+                    let y = x * (x - three);
+                    out[p] = y * (y + F::TWO);
+                }
+            }
+            2 => {
+                for p in 0..n {
+                    let x = value[p];
+                    out[p] = x * (x - F::ONE);
+                }
+            }
+            _ => {
+                for p in 0..n {
+                    let x = value[p];
+                    let mut product = x;
+                    for k in 1..chunk_size {
+                        product *= x - F::from_canonical_usize(k);
+                    }
+                    out[p] = product;
+                }
+            }
+        };
+
+        for i in 0..self.num_chunks {
+            let first = col(self.wire_first_chunk_val(i));
+            let second = col(self.wire_second_chunk_val(i));
+            range_product(chunks_iter.next().unwrap(), first);
+            range_product(chunks_iter.next().unwrap(), second);
+
+            let equality_dummy = col(self.wire_equality_dummy(i));
+            let chunks_equal = col(self.wire_chunks_equal(i));
+            let intermediate_value = col(self.wire_intermediate_value(i));
+
+            let out = chunks_iter.next().unwrap();
+            for p in 0..n {
+                let difference = second[p] - first[p];
+                out[p] = difference * equality_dummy[p] - (F::ONE - chunks_equal[p]);
+            }
+            let out = chunks_iter.next().unwrap();
+            for p in 0..n {
+                out[p] = chunks_equal[p] * (second[p] - first[p]);
+            }
+            let out = chunks_iter.next().unwrap();
+            for p in 0..n {
+                out[p] = intermediate_value[p] - chunks_equal[p] * most_significant_diff_so_far[p];
+                most_significant_diff_so_far[p] = intermediate_value[p]
+                    + (F::ONE - chunks_equal[p]) * (second[p] - first[p]);
+            }
+        }
+
+        let most_significant_diff = col(self.wire_most_significant_diff());
+        let out = chunks_iter.next().unwrap();
+        for p in 0..n {
+            out[p] = most_significant_diff[p] - most_significant_diff_so_far[p];
+        }
+
+        for i in 0..chunk_bits + 1 {
+            let bit = col(self.wire_most_significant_diff_bit(i));
+            let out = chunks_iter.next().unwrap();
+            for p in 0..n {
+                out[p] = bit[p] * (F::ONE - bit[p]);
+            }
+        }
+
+        // (2^n + most_significant_diff) - bits_combined, Horner over bits.
+        let two_n = F::from_canonical_u64(1 << chunk_bits);
+        let out = chunks_iter.next().unwrap();
+        out.copy_from_slice(col(self.wire_most_significant_diff_bit(chunk_bits)));
+        for i in (0..chunk_bits).rev() {
+            let bit = col(self.wire_most_significant_diff_bit(i));
+            for p in 0..n {
+                out[p] = out[p].double() + bit[p];
+            }
+        }
+        for p in 0..n {
+            out[p] = (two_n + most_significant_diff[p]) - out[p];
+        }
+
+        let result_bool = col(self.wire_result_bool());
+        let top_bit = col(self.wire_most_significant_diff_bit(chunk_bits));
+        let out = chunks_iter.next().unwrap();
+        for p in 0..n {
+            out[p] = result_bool[p] - top_bit[p];
+        }
+        res
     }
 
     fn eval_unfiltered_circuit(

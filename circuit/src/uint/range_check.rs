@@ -7,7 +7,6 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 use log::warn;
-use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
@@ -337,67 +336,56 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
     }
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        self.eval_unfiltered_base_batch_packed(vars_base)
-    }
-
-    fn eval_unfiltered_base_batch_accumulate(
-        &self,
-        vars_base: EvaluationVarsBaseBatch<F>,
-        filters: &[F],
-        combined_gate_constraints: &mut [F],
-    ) {
         let n = vars_base.len();
-        assert_eq!(filters.len(), n);
-        assert!(combined_gate_constraints.len() >= self.num_constraints() * n);
-
         let wires = vars_base.local_wires;
         let num_aux = self.aux_limbs_per_input();
         let base = F::from_canonical_usize(Self::BASE);
         let three = F::from_canonical_usize(3);
-        let mut scratch = vec![F::ZERO; n];
-        let mut constraint_index = 0;
+        let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
+        let mut chunks = res.chunks_exact_mut(n);
 
         for i in 0..self.num_ops {
             let input = &wires[self.wire_ith_input(i) * n..][..n];
             let top = self.wire_ith_input_jth_aux_limb(i, num_aux - 1);
 
-            scratch.copy_from_slice(&wires[top * n..][..n]);
+            // computed_sum - input, with the sum accumulated per point by
+            // Horner over the limb columns from most to least significant.
+            let out = chunks.next().unwrap();
+            out.copy_from_slice(&wires[top * n..][..n]);
             for j in (0..num_aux - 1).rev() {
                 let limb = &wires[self.wire_ith_input_jth_aux_limb(i, j) * n..][..n];
                 for p in 0..n {
-                    scratch[p] = scratch[p] * base + limb[p];
+                    out[p] = out[p] * base + limb[p];
                 }
             }
             for p in 0..n {
-                scratch[p] -= input[p];
+                out[p] -= input[p];
             }
-            let combined =
-                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
-            batch_multiply_add_inplace(combined, &scratch, filters);
-            constraint_index += 1;
 
+            // Range products. For a full base-4 limb,
+            // x(x-1)(x-2)(x-3) = y(y+2) with y = x(x-3); for a half-range
+            // final limb (odd bit size), x(x-1).
             for j in 0..num_aux {
                 let limb = &wires[self.wire_ith_input_jth_aux_limb(i, j) * n..][..n];
-                if j == num_aux - 1 && self.bit_size % 2 == 1 {
+                let half_range = j == num_aux - 1 && self.bit_size % 2 == 1;
+                let out = chunks.next().unwrap();
+                if half_range {
+                    debug_assert_eq!(Self::BASE / 2, 2);
                     for p in 0..n {
                         let x = limb[p];
-                        scratch[p] = x * (x - F::ONE);
+                        out[p] = x * (x - F::ONE);
                     }
                 } else {
+                    debug_assert_eq!(Self::BASE, 4);
                     for p in 0..n {
                         let x = limb[p];
                         let y = x * (x - three);
-                        scratch[p] = y * (y + F::TWO);
+                        out[p] = y * (y + F::TWO);
                     }
                 }
-                let combined = &mut combined_gate_constraints
-                    [constraint_index * n..(constraint_index + 1) * n];
-                batch_multiply_add_inplace(combined, &scratch, filters);
-                constraint_index += 1;
             }
         }
-
-        debug_assert_eq!(constraint_index, self.num_constraints());
+        res
     }
 
     fn eval_unfiltered_circuit(
@@ -598,7 +586,6 @@ mod tests {
     #[allow(unused_imports)]
     use plonky2::field::types::Field64;
     use plonky2::gates::gate_testing::{test_eval_fns, test_low_degree};
-    use plonky2::hash::hash_types::HashOut;
     use plonky2::iop::target::Target;
     use plonky2::iop::witness::{PartialWitness, WitnessWrite};
     use plonky2::plonk::circuit_data::CircuitConfig;
@@ -606,38 +593,6 @@ mod tests {
     use rand::Rng;
 
     use super::*;
-
-    #[test]
-    fn direct_filtered_accumulation_matches_materialized_batch() {
-        const D: usize = 2;
-        const N: usize = 11;
-        type F = GoldilocksField;
-
-        let gate = RangeCheckGate::<F, D>::new_from_config(
-            &CircuitConfig::standard_recursion_config(),
-            47,
-        );
-        let wires = (0..gate.num_wires() * N)
-            .map(|i| F::from_canonical_usize(3 * i + 5))
-            .collect::<Vec<_>>();
-        let constants = Vec::new();
-        let hash = HashOut::ZERO;
-        let vars = EvaluationVarsBaseBatch::new(N, &constants, &wires, &hash);
-        let filters = (0..N)
-            .map(|i| F::from_canonical_usize(2 * i + 1))
-            .collect::<Vec<_>>();
-        let mut expected = vec![F::ZERO; gate.num_constraints() * N];
-        let materialized = gate.eval_unfiltered_base_batch(vars);
-        for (acc, constraints) in expected
-            .chunks_exact_mut(N)
-            .zip(materialized.chunks_exact(N))
-        {
-            batch_multiply_add_inplace(acc, constraints, &filters);
-        }
-        let mut actual = vec![F::ZERO; expected.len()];
-        gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
-        assert_eq!(actual, expected);
-    }
 
     macro_rules! generate_low_degree_tests {
         ($bit_size:expr) => {
