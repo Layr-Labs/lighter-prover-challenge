@@ -17,11 +17,10 @@ use crate::hash::hash_types::{HashOut, RichField};
 use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
-/// Trees below this size hash on the CPU. The promoted 8.0011 frontier
-/// (6654d43) ranked-validated this raised value inside its composition; my
-/// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
-/// window and is treated as contaminated evidence.
-const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
+/// Trees below this size hash on the CPU. This boundary leaves a 2^16-by-8
+/// tree on the CPU (131,056 permutations), while routing the next size up to
+/// Metal (262,128 permutations), matching the measured CPU/GPU crossover.
+const MIN_GPU_PERMUTATIONS: usize = 1 << 17;
 /// Upper bound on concurrently in-flight GPU tree builds. One set serializes
 /// GPU tree builds exactly like the promoted base's global context mutex: a
 /// 3-set experiment measured 13-18% faster locally but scored -21.6% on the
@@ -1347,6 +1346,12 @@ mod tests {
     use crate::field::types::{Field64, PrimeField64};
     use crate::hash::merkle_tree::{capacity_up_to_mut, fill_digests_buf};
     use crate::hash::poseidon2::hash::Poseidon2Hash;
+
+    #[test]
+    fn gpu_threshold_matches_measured_narrow_tree_crossover() {
+        assert!(!gpu_worthwhile(8, 1 << 16, 4));
+        assert!(gpu_worthwhile(8, 1 << 17, 4));
+    }
 
     fn gpu_duration(command_buffer: &CommandBuffer, wall: Duration) -> Duration {
         let gpu_start: f64 = unsafe {
