@@ -12,8 +12,10 @@ use core::marker::PhantomData;
 
 use anyhow::Result;
 use plonky2::field::extension::Extendable;
+use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
 use plonky2::gates::gate::Gate;
+use plonky2::gates::packed_util::PackedEvaluableBase;
 use plonky2::gates::util::StridedConstraintConsumer;
 use plonky2::hash::hash_types::RichField;
 use plonky2::iop::ext_target::ExtensionTarget;
@@ -23,7 +25,10 @@ use plonky2::iop::wire::Wire;
 use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
-use plonky2::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBase};
+use plonky2::plonk::vars::{
+    EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch,
+    EvaluationVarsBasePacked,
+};
 use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
 
 use crate::utils::ceil_div_usize;
@@ -162,45 +167,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16AddManyGate
 
     fn eval_unfiltered_base_one(
         &self,
-        vars: EvaluationVarsBase<F>,
-        mut yield_constr: StridedConstraintConsumer<F>,
+        _vars: EvaluationVarsBase<F>,
+        _yield_constr: StridedConstraintConsumer<F>,
     ) {
-        for i in 0..self.num_ops {
-            let addends: Vec<F> = (0..self.num_addends)
-                .map(|j| vars.local_wires[self.wire_ith_op_jth_addend(i, j)])
-                .collect();
-            let carry = vars.local_wires[self.wire_ith_carry(i)];
+        panic!("use eval_unfiltered_base_packed instead");
+    }
 
-            let computed_output = addends.iter().fold(F::ZERO, |x, &y| x + y) + carry;
-
-            let output_result = vars.local_wires[self.wire_ith_output_result(i)];
-            let output_carry = vars.local_wires[self.wire_ith_output_carry(i)];
-
-            let base = F::from_canonical_u64(1 << 16u64);
-            let combined_output = output_carry * base + output_result;
-
-            yield_constr.one(combined_output - computed_output);
-
-            let mut combined_result_limbs = F::ZERO;
-            let mut combined_carry_limbs = F::ZERO;
-            let base = F::from_canonical_u64(1u64 << Self::limb_bits());
-            for j in (0..Self::num_limbs()).rev() {
-                let this_limb = vars.local_wires[self.wire_ith_output_jth_limb(i, j)];
-                let max_limb = 1 << Self::limb_bits();
-                let product = (0..max_limb)
-                    .map(|x| this_limb - F::from_canonical_usize(x))
-                    .product();
-                yield_constr.one(product);
-
-                if j < Self::num_result_limbs() {
-                    combined_result_limbs = base * combined_result_limbs + this_limb;
-                } else {
-                    combined_carry_limbs = base * combined_carry_limbs + this_limb;
-                }
-            }
-            yield_constr.one(combined_result_limbs - output_result);
-            yield_constr.one(combined_carry_limbs - output_carry);
-        }
+    fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
+        self.eval_unfiltered_base_batch_packed(vars_base)
     }
 
     fn eval_unfiltered_circuit(
@@ -293,6 +267,57 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16AddManyGate
 
     fn num_constraints(&self) -> usize {
         self.num_ops * (3 + Self::num_limbs())
+    }
+}
+
+impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
+    for U16AddManyGate<F, D>
+{
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+        &self,
+        vars: EvaluationVarsBasePacked<P>,
+        mut yield_constr: StridedConstraintConsumer<P>,
+    ) {
+        // Constraint order must match `eval_unfiltered` exactly: per op, the
+        // combined-output constraint, then one range product per output limb
+        // (most significant first), then the result and carry recompositions.
+        debug_assert_eq!(Self::limb_bits(), 2);
+        let base = F::from_canonical_u64(1 << 16u64);
+        let three = F::from_canonical_u64(3);
+        let two = F::TWO;
+        let num_limbs = Self::num_limbs();
+        let num_result_limbs = Self::num_result_limbs();
+        for i in 0..self.num_ops {
+            let mut computed_output = vars.local_wires[self.wire_ith_carry(i)];
+            for j in 0..self.num_addends {
+                computed_output += vars.local_wires[self.wire_ith_op_jth_addend(i, j)];
+            }
+
+            let output_result = vars.local_wires[self.wire_ith_output_result(i)];
+            let output_carry = vars.local_wires[self.wire_ith_output_carry(i)];
+
+            let combined_output = output_carry * base + output_result;
+            yield_constr.one(combined_output - computed_output);
+
+            // limb_bits = 2, so the limb base is 4 (two doublings per Horner
+            // step) and the range product x(x-1)(x-2)(x-3) factors as y(y+2)
+            // with y = x(x-3): two multiplications per limb instead of three.
+            let mut combined_result_limbs = P::ZEROS;
+            let mut combined_carry_limbs = P::ZEROS;
+            for j in (0..num_limbs).rev() {
+                let this_limb = vars.local_wires[self.wire_ith_output_jth_limb(i, j)];
+                let y = this_limb * (this_limb - three);
+                yield_constr.one(y * (y + two));
+
+                if j < num_result_limbs {
+                    combined_result_limbs = combined_result_limbs.doubles().doubles() + this_limb;
+                } else {
+                    combined_carry_limbs = combined_carry_limbs.doubles().doubles() + this_limb;
+                }
+            }
+            yield_constr.one(combined_result_limbs - output_result);
+            yield_constr.one(combined_carry_limbs - output_carry);
+        }
     }
 }
 
@@ -398,4 +423,56 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
 
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use paste::paste;
+    use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::gates::gate_testing::{test_eval_fns, test_low_degree};
+    use plonky2::plonk::circuit_data::CircuitConfig;
+    use plonky2::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
+
+    use super::*;
+
+    macro_rules! generate_low_degree_tests {
+        ($num_addends:expr) => {
+            paste! {
+                #[test]
+                fn [<low_degree_addends_ $num_addends>]() {
+                    let gate = U16AddManyGate::<GoldilocksField, 4>::new_from_config(
+                        &CircuitConfig::standard_recursion_config(),
+                        $num_addends,
+                    );
+                    test_low_degree::<GoldilocksField, _, 4>(gate);
+                }
+            }
+        };
+    }
+
+    macro_rules! generate_eval_fns_tests {
+        ($num_addends:expr) => {
+            paste! {
+                #[test]
+                fn [<eval_fns_addends_ $num_addends>]() {
+                    const D: usize = 2;
+                    type C = PoseidonGoldilocksConfig;
+                    type F = <C as GenericConfig<D>>::F;
+                    let gate = U16AddManyGate::<F, D>::new_from_config(
+                        &CircuitConfig::standard_recursion_config(),
+                        $num_addends,
+                    );
+                    test_eval_fns::<F, C, _, D>(gate).unwrap();
+                }
+            }
+        };
+    }
+
+    generate_low_degree_tests!(2);
+    generate_low_degree_tests!(11);
+    generate_low_degree_tests!(16);
+
+    generate_eval_fns_tests!(2);
+    generate_eval_fns_tests!(11);
+    generate_eval_fns_tests!(16);
 }

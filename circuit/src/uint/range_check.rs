@@ -8,8 +8,10 @@ use std::collections::HashSet;
 use anyhow::Result;
 use log::warn;
 use plonky2::field::extension::Extendable;
+use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
 use plonky2::gates::gate::Gate;
+use plonky2::gates::packed_util::PackedEvaluableBase;
 use plonky2::gates::util::StridedConstraintConsumer;
 use plonky2::hash::hash_types::RichField;
 use plonky2::iop::ext_target::ExtensionTarget;
@@ -19,7 +21,10 @@ use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
 use plonky2::plonk::plonk_common::{reduce_with_powers, reduce_with_powers_ext_circuit};
-use plonky2::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBase};
+use plonky2::plonk::vars::{
+    EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch,
+    EvaluationVarsBasePacked,
+};
 use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
 
 use crate::builder::Builder;
@@ -298,36 +303,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
 
     fn eval_unfiltered_base_one(
         &self,
-        vars: EvaluationVarsBase<F>,
-        mut yield_constr: StridedConstraintConsumer<F>,
+        _vars: EvaluationVarsBase<F>,
+        _yield_constr: StridedConstraintConsumer<F>,
     ) {
-        let base = F::from_canonical_usize(Self::BASE);
-        for i in 0..self.num_ops {
-            let input_limb = vars.local_wires[self.wire_ith_input(i)];
-            let aux_limbs: Vec<_> = (0..self.aux_limbs_per_input())
-                .map(|j| vars.local_wires[self.wire_ith_input_jth_aux_limb(i, j)])
-                .collect();
-            let computed_sum = reduce_with_powers(&aux_limbs, base);
+        panic!("use eval_unfiltered_base_packed instead");
+    }
 
-            yield_constr.one(computed_sum - input_limb);
-            for aux_limb in aux_limbs.iter().take(aux_limbs.len() - 1) {
-                yield_constr.one(
-                    (0..Self::BASE)
-                        .map(|i| *aux_limb - F::from_canonical_usize(i))
-                        .product(),
-                );
-            }
-            let iter = if self.bit_size % 2 == 1 {
-                Self::BASE / 2
-            } else {
-                Self::BASE
-            };
-            yield_constr.one(
-                (0..iter)
-                    .map(|i| *aux_limbs.last().unwrap() - F::from_canonical_usize(i))
-                    .product(),
-            );
-        }
+    fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
+        self.eval_unfiltered_base_batch_packed(vars_base)
     }
 
     fn eval_unfiltered_circuit(
@@ -411,6 +394,53 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
     // 1 for checking the each sum of aux limbs, plus a range check for each aux limb.
     fn num_constraints(&self) -> usize {
         self.num_ops * (1 + self.aux_limbs_per_input())
+    }
+}
+
+impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
+    for RangeCheckGate<F, D>
+{
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+        &self,
+        vars: EvaluationVarsBasePacked<P>,
+        mut yield_constr: StridedConstraintConsumer<P>,
+    ) {
+        // Constraint order must match `eval_unfiltered` exactly: per op, the
+        // limb-sum constraint, then one range product per aux limb (last limb
+        // last, with a halved range when bit_size is odd).
+        let aux_limbs_per_input = self.aux_limbs_per_input();
+        let three = F::from_canonical_u64(3);
+        let two = F::TWO;
+        let last_is_half_range = self.bit_size % 2 == 1;
+        for i in 0..self.num_ops {
+            let input_limb = vars.local_wires[self.wire_ith_input(i)];
+
+            // Horner over the limbs, most significant first; BASE = 4, so the
+            // scale step is two doublings instead of a multiplication.
+            let mut computed_sum = P::ZEROS;
+            for j in (0..aux_limbs_per_input).rev() {
+                let limb = vars.local_wires[self.wire_ith_input_jth_aux_limb(i, j)];
+                computed_sum = computed_sum.doubles().doubles() + limb;
+            }
+            yield_constr.one(computed_sum - input_limb);
+
+            // x(x-1)(x-2)(x-3) = y(y+2) with y = x(x-3): two multiplications
+            // per limb instead of three, and no per-point constant conversion.
+            for j in 0..aux_limbs_per_input - 1 {
+                let x = vars.local_wires[self.wire_ith_input_jth_aux_limb(i, j)];
+                let y = x * (x - three);
+                yield_constr.one(y * (y + two));
+            }
+            let x = vars.local_wires
+                [self.wire_ith_input_jth_aux_limb(i, aux_limbs_per_input - 1)];
+            if last_is_half_range {
+                // x(x-1)
+                yield_constr.one(x * (x - F::ONE));
+            } else {
+                let y = x * (x - three);
+                yield_constr.one(y * (y + two));
+            }
+        }
     }
 }
 
