@@ -195,6 +195,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     s_sigmas_batch: &[&[F]],
     betas: &[F],
     gammas: &[F],
+    beta_k_is: &[F],
     deltas: &[F],
     alphas: &[F],
     z_h_on_coset: &ZeroPolyOnCoset<F>,
@@ -234,6 +235,9 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     let num_challenges = common_data.config.num_challenges;
     let num_routed_wires = common_data.config.num_routed_wires;
+    debug_assert_eq!(betas.len(), num_challenges);
+    debug_assert_eq!(gammas.len(), num_challenges);
+    debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
 
     let numerator_values = &mut scratch.numerator_values;
     let denominator_values = &mut scratch.denominator_values;
@@ -311,9 +315,8 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
             numerator_values.extend((0..num_routed_wires).map(|j| {
                 let wire_value = vars.local_wires[j];
-                let k_i = common_data.k_is[j];
-                let s_id = k_i * x;
-                wire_value + betas[i] * s_id + gammas[i]
+                let beta_k_i = beta_k_is[i * num_routed_wires + j];
+                wire_value + beta_k_i * x + gammas[i]
             }));
             denominator_values.extend((0..num_routed_wires).map(|j| {
                 let wire_value = vars.local_wires[j];

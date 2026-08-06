@@ -202,6 +202,14 @@ where
 
     let betas = challenger.get_n_challenges(num_challenges);
     let gammas = challenger.get_n_challenges(num_challenges);
+    // The quotient numerator uses `beta_i * (k_j * x)` for every routed wire
+    // and quotient point. Reassociate this finite-field product once per
+    // challenge and wire; the resulting coefficient is reused across all
+    // quotient batches.
+    let beta_k_is: Vec<F> = betas
+        .iter()
+        .flat_map(|&beta| common_data.k_is.iter().map(move |&k_i| beta * k_i))
+        .collect();
 
     let deltas = if has_lookup {
         let mut delts = Vec::with_capacity(2 * num_challenges);
@@ -222,7 +230,14 @@ where
     let mut partial_products_and_zs = timed!(
         timing,
         "compute partial products",
-        all_wires_permutation_partial_products(&witness, &betas, &gammas, prover_data, common_data)
+        all_wires_permutation_partial_products(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            prover_data,
+            common_data,
+        )
     );
 
     // Z is expected at the front of our batch; see `zs_range` and `partial_products_range`.
@@ -271,6 +286,7 @@ where
             &partial_products_zs_and_lookup_commitment,
             &betas,
             &gammas,
+            &beta_k_is,
             &deltas,
             &alphas,
         )
@@ -372,15 +388,21 @@ fn all_wires_permutation_partial_products<
 >(
     witness: &MatrixWitness<F>,
     betas: &[F],
+    beta_k_is: &[F],
     gammas: &[F],
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
 ) -> Vec<Vec<PolynomialValues<F>>> {
+    let num_challenges = common_data.config.num_challenges;
+    let num_routed_wires = common_data.config.num_routed_wires;
+    debug_assert_eq!(betas.len(), num_challenges);
+    debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
     (0..common_data.config.num_challenges)
         .map(|i| {
             wires_permutation_partial_products_and_zs(
                 witness,
                 betas[i],
+                &beta_k_is[i * num_routed_wires..(i + 1) * num_routed_wires],
                 gammas[i],
                 prover_data,
                 common_data,
@@ -399,14 +421,15 @@ fn wires_permutation_partial_products_and_zs<
 >(
     witness: &MatrixWitness<F>,
     beta: F,
+    beta_k_is: &[F],
     gamma: F,
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
 ) -> Vec<PolynomialValues<F>> {
     let degree = common_data.quotient_degree_factor;
     let subgroup = &prover_data.subgroup;
-    let k_is = &common_data.k_is;
     let num_prods = common_data.num_partial_products;
+    debug_assert_eq!(beta_k_is.len(), common_data.config.num_routed_wires);
     let all_quotient_chunk_products = subgroup
         .par_iter()
         .enumerate()
@@ -414,9 +437,7 @@ fn wires_permutation_partial_products_and_zs<
             let s_sigmas = &prover_data.sigmas[i];
             let numerators = (0..common_data.config.num_routed_wires).map(|j| {
                 let wire_value = witness.get_wire(i, j);
-                let k_i = k_is[j];
-                let s_id = k_i * x;
-                wire_value + beta * s_id + gamma
+                wire_value + beta_k_is[j] * x + gamma
             });
             let denominators = (0..common_data.config.num_routed_wires)
                 .map(|j| {
@@ -622,6 +643,7 @@ fn compute_quotient_polys<
     zs_partial_products_and_lookup_commitment: &'a PolynomialBatch<F, C, D>,
     betas: &[F],
     gammas: &[F],
+    beta_k_is: &[F],
     deltas: &[F],
     alphas: &[F],
 ) -> Vec<PolynomialCoeffs<F>> {
@@ -835,6 +857,7 @@ fn compute_quotient_polys<
                     &s_sigmas_batch,
                     betas,
                     gammas,
+                    beta_k_is,
                     deltas,
                     alphas,
                     &z_h_on_coset,
