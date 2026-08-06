@@ -8,8 +8,10 @@ use std::collections::HashSet;
 use anyhow::Result;
 use log::warn;
 use plonky2::field::extension::Extendable;
+use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
 use plonky2::gates::gate::Gate;
+use plonky2::gates::packed_util::PackedEvaluableBase;
 use plonky2::gates::util::StridedConstraintConsumer;
 use plonky2::hash::hash_types::RichField;
 use plonky2::iop::ext_target::ExtensionTarget;
@@ -19,7 +21,10 @@ use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
 use plonky2::plonk::plonk_common::{reduce_with_powers, reduce_with_powers_ext_circuit};
-use plonky2::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBase};
+use plonky2::plonk::vars::{
+    EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch,
+    EvaluationVarsBasePacked,
+};
 use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
 
 use crate::builder::Builder;
@@ -330,6 +335,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
         }
     }
 
+    fn eval_unfiltered_base_batch(&self, vars: EvaluationVarsBaseBatch<F>) -> Vec<F> {
+        self.eval_unfiltered_base_batch_packed(vars)
+    }
+
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,
@@ -411,6 +420,47 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
     // 1 for checking the each sum of aux limbs, plus a range check for each aux limb.
     fn num_constraints(&self) -> usize {
         self.num_ops * (1 + self.aux_limbs_per_input())
+    }
+}
+
+impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
+    for RangeCheckGate<F, D>
+{
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+        &self,
+        vars: EvaluationVarsBasePacked<P>,
+        mut yield_constr: StridedConstraintConsumer<P>,
+    ) {
+        let aux_limbs_per_input = self.aux_limbs_per_input();
+        let base = F::from_canonical_usize(Self::BASE);
+        let last_limb_range = if self.bit_size % 2 == 1 {
+            Self::BASE / 2
+        } else {
+            Self::BASE
+        };
+
+        for i in 0..self.num_ops {
+            let input_limb = vars.local_wires[self.wire_ith_input(i)];
+            let aux_start = self.wire_ith_input_jth_aux_limb(i, 0);
+            let aux_limbs = vars
+                .local_wires
+                .view(aux_start..aux_start + aux_limbs_per_input);
+
+            yield_constr.one(reduce_with_powers(aux_limbs, base) - input_limb);
+            for &aux_limb in aux_limbs.iter().take(aux_limbs_per_input - 1) {
+                yield_constr.one(
+                    (0..Self::BASE)
+                        .map(|value| aux_limb - F::from_canonical_usize(value))
+                        .product(),
+                );
+            }
+            let last_limb = aux_limbs[aux_limbs_per_input - 1];
+            yield_constr.one(
+                (0..last_limb_range)
+                    .map(|value| last_limb - F::from_canonical_usize(value))
+                    .product(),
+            );
+        }
     }
 }
 
