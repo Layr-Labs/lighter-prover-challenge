@@ -52,7 +52,7 @@ pub fn generate_partial_witness<
     // state and does not add anything to serialized prover data.
     let mut unresolved_watches = vec![0usize; generators.len()];
     for (&watch, watchers) in generator_indices_by_watches {
-        if witness.values[watch].is_none() {
+        if !witness.is_representative_set(watch) {
             for &generator_idx in watchers {
                 unresolved_watches[generator_idx] += 1;
             }
