@@ -40,7 +40,7 @@ pub struct RangeCheckQuotientGate {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum U32QuotientGate {
     Arithmetic { num_ops: usize },
-    Subtraction { num_ops: usize },
+    Subtraction { num_ops: usize, num_limbs: usize },
     AddMany { num_ops: usize, num_addends: usize },
 }
 

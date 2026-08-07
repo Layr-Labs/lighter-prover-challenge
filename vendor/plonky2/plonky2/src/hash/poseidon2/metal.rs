@@ -153,7 +153,7 @@ pub(crate) struct RangeCheckQuotientSpec {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum U32QuotientKind {
     Arithmetic,
-    Subtraction,
+    Subtraction { num_limbs: usize },
     AddMany { num_addends: usize },
 }
 
@@ -561,12 +561,17 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                 spec.num_ops.checked_mul(38)?,
                 spec.num_ops.checked_mul(36)?,
             ),
-            U32QuotientKind::Subtraction => (
-                1usize,
-                0usize,
-                spec.num_ops.checked_mul(21)?,
-                spec.num_ops.checked_mul(19)?,
-            ),
+            U32QuotientKind::Subtraction { num_limbs } => {
+                if num_limbs == 0 || num_limbs > 32 {
+                    return None;
+                }
+                (
+                    1usize,
+                    num_limbs,
+                    spec.num_ops.checked_mul(5 + num_limbs)?,
+                    spec.num_ops.checked_mul(3 + num_limbs)?,
+                )
+            }
             U32QuotientKind::AddMany { num_addends } => {
                 if num_addends == 0 || num_addends > 16 {
                     return None;
@@ -2352,7 +2357,7 @@ mod tests {
                 group: 4..7,
                 include_unused_selector: true,
                 num_ops: 6,
-                kind: U32QuotientKind::Subtraction,
+                kind: U32QuotientKind::Subtraction { num_limbs: 16 },
             },
         ];
         // Exercise every production AddMany shape, including both places
@@ -2457,7 +2462,7 @@ mod tests {
                             }
                             assert_eq!(constraints.len(), spec.num_ops * 36);
                         }
-                        U32QuotientKind::Subtraction => {
+                        U32QuotientKind::Subtraction { num_limbs } => {
                             for op in 0..spec.num_ops {
                                 let routed = 5 * op;
                                 let input_x = wires.col(routed)[source_row];
@@ -2470,9 +2475,9 @@ mod tests {
                                         - (input_x - input_y - input_borrow
                                             + base32 * output_borrow),
                                 );
-                                let limb_base = 5 * spec.num_ops + 16 * op;
+                                let limb_base = 5 * spec.num_ops + num_limbs * op;
                                 let mut recomposed = F::ZERO;
-                                for j in (0..16).rev() {
+                                for j in (0..num_limbs).rev() {
                                     let x = wires.col(limb_base + j)[source_row];
                                     let y = x * (x - three);
                                     constraints.push(y * (y + F::TWO));
@@ -2481,7 +2486,7 @@ mod tests {
                                 constraints.push(recomposed - output_result);
                                 constraints.push(output_borrow * (F::ONE - output_borrow));
                             }
-                            assert_eq!(constraints.len(), spec.num_ops * 19);
+                            assert_eq!(constraints.len(), spec.num_ops * (3 + num_limbs));
                         }
                         U32QuotientKind::AddMany { num_addends } => {
                             let routed_per_op = num_addends + 3;

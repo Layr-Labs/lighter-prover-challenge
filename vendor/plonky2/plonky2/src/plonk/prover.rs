@@ -1066,11 +1066,14 @@ fn start_gpu_range_check_gate_quotient<
                     num_ops.checked_mul(38)?,
                     num_ops.checked_mul(36)?,
                 ),
-                U32QuotientGate::Subtraction { num_ops } => (
-                    U32QuotientKind::Subtraction,
+                U32QuotientGate::Subtraction {
                     num_ops,
-                    num_ops.checked_mul(21)?,
-                    num_ops.checked_mul(19)?,
+                    num_limbs,
+                } => (
+                    U32QuotientKind::Subtraction { num_limbs },
+                    num_ops,
+                    num_ops.checked_mul(5 + num_limbs)?,
+                    num_ops.checked_mul(3 + num_limbs)?,
                 ),
                 U32QuotientGate::AddMany {
                     num_ops,

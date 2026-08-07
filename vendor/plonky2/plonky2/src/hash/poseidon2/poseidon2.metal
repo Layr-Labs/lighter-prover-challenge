@@ -562,8 +562,12 @@ kernel void range_check_gate_quotient(
                     constraint_index++);
             }
         } else if (kind == 1u) {
-            // U32SubtractionGate: five routed words followed by 16 base-4
-            // result limbs per operation.
+            // U32SubtractionGate family (U16/U32/U48): five routed words
+            // followed by `num_limbs` base-4 result limbs per operation. The
+            // limb count and the 2^width borrow modulus ride in the spec's
+            // eighth metadata word (the add-many addend slot, unused here).
+            uint num_limbs = spec[7u];
+            ulong limb_modulus = 1UL << (2u * num_limbs);
             for (uint op = 0; op < num_ops; ++op) {
                 ulong routed_base = (ulong)op * 5u;
                 ulong input_x = wires[(routed_base + 0u) * lde_rows + source_row];
@@ -574,7 +578,7 @@ kernel void range_check_gate_quotient(
                 ulong result_initial = gl_sub(gl_sub(input_x, input_y), input_borrow);
                 ulong borrowed = gl_add(
                     result_initial,
-                    gl_mul(4294967296UL, output_borrow));
+                    gl_mul(limb_modulus, output_borrow));
                 range_check_gate_emit(
                     gl_sub(output_result, borrowed),
                     alpha_powers,
@@ -582,9 +586,9 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
 
-                ulong limb_base = (ulong)num_ops * 5u + (ulong)op * 16u;
+                ulong limb_base = (ulong)num_ops * 5u + (ulong)op * (ulong)num_limbs;
                 ulong recomposed = 0;
-                for (uint remaining = 16u; remaining > 0u; --remaining) {
+                for (uint remaining = num_limbs; remaining > 0u; --remaining) {
                     uint j = remaining - 1u;
                     ulong x = wires[(limb_base + j) * lde_rows + source_row];
                     ulong y = gl_mul(x, gl_sub(x, 3));
