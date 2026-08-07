@@ -182,6 +182,12 @@ pub(crate) enum U32QuotientKind {
         num_extra_constants: usize,
         constant_base: usize,
     },
+    /// Base-`base` decomposition: `num_ops` is the limb count, one
+    /// recomposition row plus one range product per limb.
+    BaseSum { base: usize },
+    /// Square-and-multiply exponentiation: `num_ops` is the power-bit count,
+    /// `2 * num_ops + 2` routed and running wires, `num_ops + 1` rows.
+    Exponentiation,
 }
 
 #[derive(Clone, Debug)]
@@ -746,6 +752,27 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                     }
                     (6usize, bits, num_extra_constants, constant_base, wire_count, num_constraints)
                 }
+                U32QuotientKind::BaseSum { base } => {
+                    if !(2..=8).contains(&base) {
+                        return None;
+                    }
+                    (
+                        7usize,
+                        base,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_add(1)?,
+                        spec.num_ops.checked_add(1)?,
+                    )
+                }
+                U32QuotientKind::Exponentiation => (
+                    8usize,
+                    0usize,
+                    0usize,
+                    0usize,
+                    spec.num_ops.checked_mul(2)?.checked_add(2)?,
+                    spec.num_ops.checked_add(1)?,
+                ),
             };
         if wire_count > wires.cols
             || spec.selector_column >= constants.cols
@@ -3013,6 +3040,13 @@ mod tests {
                 }),
             ),
             (3, UnionShape::U32(U32QuotientKind::Arithmetic)),
+            // BaseSumGate at both live bases and their production limb counts,
+            // and ExponentiationGate at the production power-bit count plus a
+            // short shape whose first and last rows are adjacent.
+            (63, UnionShape::U32(U32QuotientKind::BaseSum { base: 2 })),
+            (31, UnionShape::U32(U32QuotientKind::BaseSum { base: 4 })),
+            (66, UnionShape::U32(U32QuotientKind::Exponentiation)),
+            (2, UnionShape::U32(U32QuotientKind::Exponentiation)),
         ];
         let raw_constant_base = shapes.len() + 3;
         for (bits, num_ops, num_extra_constants) in
@@ -3339,6 +3373,39 @@ mod tests {
                                 constraints.push((two * a[1] * a[3] + extra[9]) - c[4]);
                             }
                             assert_eq!(constraints.len(), spec.num_ops * 15);
+                        }
+                        U32QuotientKind::BaseSum { base } => {
+                            let base = F::from_canonical_usize(base);
+                            let limbs =
+                                (0..spec.num_ops).map(|i| wire(1 + i)).collect::<Vec<_>>();
+                            let computed = limbs
+                                .iter()
+                                .rev()
+                                .fold(F::ZERO, |acc, &limb| acc * base + limb);
+                            constraints.push(computed - wire(0));
+                            for &limb in &limbs {
+                                constraints.push(
+                                    (0..base.to_canonical_u64())
+                                        .map(|i| limb - F::from_canonical_u64(i))
+                                        .product(),
+                                );
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops + 1);
+                        }
+                        U32QuotientKind::Exponentiation => {
+                            let base_value = wire(0);
+                            let mut previous = F::ONE;
+                            for i in 0..spec.num_ops {
+                                let bit = wire(spec.num_ops - i);
+                                let running = wire(spec.num_ops + 2 + i);
+                                constraints.push(
+                                    previous * (bit * base_value + (F::ONE - bit)) - running,
+                                );
+                                previous = running * running;
+                            }
+                            constraints
+                                .push(wire(spec.num_ops + 1) - wire(2 * spec.num_ops + 1));
+                            assert_eq!(constraints.len(), spec.num_ops + 1);
                         }
                         U32QuotientKind::Arithmetic => {
                             for op in 0..spec.num_ops {

@@ -974,6 +974,55 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
+        } else if (kind == 7u) {
+            // BaseSumGate: one routed sum then `num_ops` routed limbs. The
+            // recomposition row comes first, then one range product per limb
+            // in wire order. `num_addends` carries the base.
+            uint base = num_addends;
+            ulong acc = wires[(ulong)num_ops * lde_rows + source_row];
+            for (uint i = num_ops; i > 1u; --i) {
+                ulong limb = wires[(ulong)(i - 1u) * lde_rows + source_row];
+                acc = gl_add(gl_mul(acc, (ulong)base), limb);
+            }
+            range_check_gate_emit(
+                gl_sub(acc, wires[source_row]),
+                alpha_powers, alpha_stride, gate_accumulators,
+                constraint_index++);
+            for (uint i = 0; i < num_ops; ++i) {
+                ulong limb = wires[(ulong)(i + 1u) * lde_rows + source_row];
+                ulong product = limb;
+                for (uint k = 1; k < base; ++k) {
+                    product = gl_mul(product, gl_sub(limb, (ulong)k));
+                }
+                range_check_gate_emit(
+                    product,
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 8u) {
+            // ExponentiationGate: the base, `num_ops` power bits in
+            // little-endian order and the output are routed, then the running
+            // values. Each row checks one square-and-multiply step, consuming
+            // the bits from the most significant end, and the last row ties
+            // the final running value to the output.
+            ulong base_value = wires[source_row];
+            ulong previous = 1;
+            for (uint i = 0; i < num_ops; ++i) {
+                ulong bit = wires[(ulong)(num_ops - i) * lde_rows + source_row];
+                ulong running =
+                    wires[((ulong)num_ops + 2u + i) * lde_rows + source_row];
+                ulong selected = gl_add(gl_mul(bit, base_value), gl_sub(1, bit));
+                range_check_gate_emit(
+                    gl_sub(gl_mul(previous, selected), running),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                previous = gl_mul(running, running);
+            }
+            range_check_gate_emit(
+                gl_sub(wires[((ulong)num_ops + 1u) * lde_rows + source_row],
+                       wires[((ulong)num_ops * 2u + 1u) * lde_rows + source_row]),
+                alpha_powers, alpha_stride, gate_accumulators,
+                constraint_index++);
         } else {
             // The Rust encoder rejects unknown discriminants; if a malformed
             // record reaches the shader, make its selected row unsatisfiable.

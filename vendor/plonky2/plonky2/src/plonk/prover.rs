@@ -1238,6 +1238,35 @@ fn start_gpu_range_check_gate_quotient<
                         expected_constraints,
                     )
                 }
+                U32QuotientGate::BaseSum { num_limbs, base } => {
+                    // The shader unrolls the range product, so the base is
+                    // capped; both live bases (2 and 4) are well inside it.
+                    if num_limbs == 0 || !(2..=8).contains(&base) {
+                        if gpu_poseidon_quotient_diagnostics_enabled() {
+                            eprintln!(
+                                "[gpu-range-quotient] invalid base-sum metadata: {u32_gate:?}"
+                            );
+                        }
+                        return None;
+                    }
+                    (
+                        U32QuotientKind::BaseSum { base },
+                        num_limbs,
+                        num_limbs.checked_add(1)?,
+                        num_limbs.checked_add(1)?,
+                    )
+                }
+                U32QuotientGate::Exponentiation { num_power_bits } => {
+                    if num_power_bits == 0 {
+                        return None;
+                    }
+                    (
+                        U32QuotientKind::Exponentiation,
+                        num_power_bits,
+                        num_power_bits.checked_mul(2)?.checked_add(2)?,
+                        num_power_bits.checked_add(1)?,
+                    )
+                }
             };
             if num_ops == 0
                 || gate.0.num_wires() != expected_wires

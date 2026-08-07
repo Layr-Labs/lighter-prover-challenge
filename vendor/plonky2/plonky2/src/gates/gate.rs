@@ -76,6 +76,13 @@ pub enum U32QuotientGate {
         num_ops: usize,
         num_extra_constants: usize,
     },
+    /// Base-`base` decomposition of one routed sum into `num_limbs` routed
+    /// limbs: the recomposition row followed by one range product per limb.
+    BaseSum { num_limbs: usize, base: usize },
+    /// Square-and-multiply exponentiation: the base, `num_power_bits` bits and
+    /// the output are routed, the running values follow, and each row checks
+    /// one accumulation step against its running value.
+    Exponentiation { num_power_bits: usize },
 }
 
 /// A custom gate.
