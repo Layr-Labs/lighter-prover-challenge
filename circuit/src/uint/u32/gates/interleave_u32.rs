@@ -200,11 +200,58 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32InterleaveG
         filters: &[F],
         combined_gate_constraints: &mut [F],
     ) {
-        self.eval_unfiltered_base_batch_accumulate_packed(
-            vars_base,
-            filters,
-            combined_gate_constraints,
-        );
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        let base = F::from_canonical_usize(Self::B);
+        let base_sq = F::from_canonical_usize(Self::B * Self::B);
+        let mut chunks = combined_gate_constraints.chunks_exact_mut(n);
+        let mut scratch = vec![F::ZERO; n];
+
+        for i in 0..self.num_ops {
+            let bit_range = self.wires_ith_bit_decomposition(i);
+
+            // Check 1: recomposition (Horner over bit columns in wire order,
+            // matching `reduce_with_powers(bits.iter().rev(), B)`).
+            let out = chunks.next().unwrap();
+            scratch.fill(F::ZERO);
+            for w in bit_range.clone() {
+                let bit = col(w);
+                for p in 0..n {
+                    scratch[p] = scratch[p] * base + bit[p];
+                }
+            }
+            let x = col(self.wire_ith_x(i));
+            for p in 0..n {
+                out[p] += filters[p] * (scratch[p] - x[p]);
+            }
+
+            // Check 2: interleaved recomposition with base B^2.
+            let out = chunks.next().unwrap();
+            scratch.fill(F::ZERO);
+            for w in bit_range.clone() {
+                let bit = col(w);
+                for p in 0..n {
+                    scratch[p] = scratch[p] * base_sq + bit[p];
+                }
+            }
+            let x_interleaved = col(self.wire_ith_x_interleaved(i));
+            for p in 0..n {
+                out[p] += filters[p] * (scratch[p] - x_interleaved[p]);
+            }
+
+            // Check 3: per-bit range products in wire order.
+            for w in bit_range {
+                let bit = col(w);
+                let out = chunks.next().unwrap();
+                debug_assert_eq!(Self::B, 2);
+                for p in 0..n {
+                    out[p] += filters[p] * (bit[p] * (bit[p] - F::ONE));
+                }
+            }
+        }
     }
 
     fn generators(&self, row: usize, _local_constants: &[F]) -> Vec<WitnessGeneratorRef<F, D>> {

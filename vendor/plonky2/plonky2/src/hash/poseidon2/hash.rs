@@ -1,8 +1,6 @@
 use core::fmt::Debug;
 
 use plonky2_field::ops::Square;
-use plonky2_field::packable::Packable;
-use plonky2_field::packed::PackedField;
 
 use super::config::*;
 use crate::field::extension::{Extendable, FieldExtension};
@@ -468,23 +466,6 @@ fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
 
 impl Poseidon2 for F {
     #[inline]
-    fn internal_linear_layer(state: &mut [Self; WIDTH]) {
-        type Packing = <F as Packable>::Packing;
-
-        // The 12-lane state is three contiguous four-lane AArch64 vectors.
-        // Multiplying before adding preserves the scalar fused result exactly.
-        debug_assert_eq!(<Packing as PackedField>::WIDTH, 4);
-        let sum = Packing::from(sum_12(state));
-        let diagonal: [F; WIDTH] =
-            core::array::from_fn(|i| F::from_canonical_u64(MATRIX_DIAG_12_U64[i]));
-        let packed_state = Packing::pack_slice_mut(state);
-        let packed_diagonal = Packing::pack_slice(&diagonal);
-        for (state, &diagonal) in packed_state.iter_mut().zip(packed_diagonal) {
-            *state = sum + *state * diagonal;
-        }
-    }
-
-    #[inline]
     fn sbox_p(a: &Self) -> Self {
         let a2 = a.square();
         let a4 = a2.square();
@@ -816,10 +797,7 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
         leaf_width: usize,
         num_leaves: usize,
         cap_height: usize,
-    ) -> Option<(
-        crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
-        Vec<Self::Hash>,
-    )> {
+    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
         super::metal::build_merkle_tree(leaves, leaf_width, num_leaves, cap_height)
     }
 
@@ -827,39 +805,8 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
     fn try_build_merkle_tree_columns(
         columns: &[Vec<F>],
         cap_height: usize,
-    ) -> Option<(
-        crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
-        Vec<Self::Hash>,
-    )> {
+    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
         super::metal::build_merkle_tree_columns(columns, cap_height)
-    }
-
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    fn try_allocate_merkle_tree_columns(
-        num_columns: usize,
-        num_rows: usize,
-        cap_height: usize,
-    ) -> Option<crate::hash::merkle_tree::ColumnStore<F>> {
-        super::metal::allocate_columns(num_columns, num_rows, cap_height)
-            .map(crate::hash::merkle_tree::ColumnStore::Shared)
-    }
-
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    fn try_build_merkle_tree_column_store(
-        columns: &crate::hash::merkle_tree::ColumnStore<F>,
-        cap_height: usize,
-    ) -> Option<(
-        crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
-        Vec<Self::Hash>,
-    )> {
-        match columns {
-            crate::hash::merkle_tree::ColumnStore::Owned(columns) => {
-                super::metal::build_merkle_tree_columns(columns, cap_height)
-            }
-            crate::hash::merkle_tree::ColumnStore::Shared(columns) => {
-                super::metal::build_merkle_tree_shared(columns, cap_height)
-            }
-        }
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -869,7 +816,7 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
         cap_height: usize,
     ) -> Option<(
         crate::hash::merkle_tree::ColumnStore<F>,
-        crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
+        Vec<Self::Hash>,
         Vec<Self::Hash>,
     )> {
         super::metal::build_commitment_from_coeffs(coeff_columns, rate_bits, cap_height).map(
@@ -890,7 +837,7 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
         cap_height: usize,
     ) -> Option<(
         crate::hash::merkle_tree::ColumnStore<F>,
-        crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
+        Vec<Self::Hash>,
         Vec<Self::Hash>,
         Vec<Vec<F>>,
     )> {

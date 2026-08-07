@@ -82,46 +82,6 @@ pub fn final_poly_coeff_len(mut degree_bits: usize, reduction_arity_bits: &Vec<u
     1 << degree_bits
 }
 
-/// Bit-reversal + flatten in one gather pass: output leaf `i` is the base-field
-/// limb array of `values[reverse_bits(i, log2(values.len()))]`, so the returned
-/// flat buffer is the bit-reversed codeword laid out row-major, ready for
-/// [`MerkleTree::new_flat`].
-///
-/// The gather is bandwidth- and latency-bound rather than arithmetic-bound:
-/// `reverse_bits` scatters consecutive outputs across the whole codeword, so
-/// essentially every read is a cache miss and a single thread can only keep a
-/// handful of them in flight. Splitting the *output* range into blocks lets one
-/// worker per core drive its own independent miss stream. Block `b` owns
-/// outputs `b * FLATTEN_BLOCK .. (b + 1) * FLATTEN_BLOCK`, a partition of
-/// `0..n`, so every slot is written exactly once and the source is only read —
-/// the result is index-for-index identical to the serial fill.
-fn bitrev_flatten<F: RichField + Extendable<D>, const D: usize>(values: &[F::Extension]) -> Vec<F> {
-    const FLATTEN_BLOCK: usize = 1 << 10;
-
-    let n = values.len();
-    let log_n = log2_strict(n);
-    let mut flat: Vec<F> = Vec::with_capacity(n * D);
-    {
-        let spare = &mut flat.spare_capacity_mut()[..n * D];
-        spare
-            .par_chunks_mut(FLATTEN_BLOCK * D)
-            .enumerate()
-            .for_each(|(block, out)| {
-                let base = block * FLATTEN_BLOCK;
-                for (j, slot) in out.chunks_exact_mut(D).enumerate() {
-                    let limbs = values[reverse_bits(base + j, log_n)].to_basefield_array();
-                    for k in 0..D {
-                        slot[k].write(limbs[k]);
-                    }
-                }
-            });
-    }
-    // SAFETY: the loop above wrote every one of the `n * D` slots of spare
-    // capacity exactly once, so the whole prefix is initialized.
-    unsafe { flat.set_len(n * D) };
-    flat
-}
-
 fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     mut coeffs: PolynomialCoeffs<F::Extension>,
     mut values: PolynomialValues<F::Extension>,
@@ -133,8 +93,7 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     let mut trees = Vec::with_capacity(fri_params.reduction_arity_bits.len());
 
     let mut shift = F::MULTIPLICATIVE_GROUP_GENERATOR;
-    let num_rounds = fri_params.reduction_arity_bits.len();
-    for (round, arity_bits) in fri_params.reduction_arity_bits.iter().enumerate() {
+    for arity_bits in &fri_params.reduction_arity_bits {
         let arity = 1 << arity_bits;
 
         // Fused bit-reversal + flatten: one gather pass writes the flat leaf
@@ -142,7 +101,13 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // codeword starting at `i * arity`), instead of a random-access
         // in-place permutation followed by a separate flattening pass with a
         // heap allocation per element.
-        let flat_values = bitrev_flatten::<F, D>(&values.values);
+        let n = values.values.len();
+        let log_n = log2_strict(n);
+        let mut flat_values: Vec<F> = Vec::with_capacity(n * D);
+        for i in 0..n {
+            let x = values.values[reverse_bits(i, log_n)];
+            flat_values.extend_from_slice(&x.to_basefield_array());
+        }
         let tree = MerkleTree::<F, C::Hasher>::new_flat(
             flat_values,
             arity * D,
@@ -174,20 +139,13 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // The coefficients from `live_chunks` on are the zeros the `resize`
         // above just wrote, and `shift^i * 0 == 0`, so the coset scaling is
         // dead work over that tail: scale only the folded prefix.
-        //
-        // `values` is read by exactly one thing: the *next* round's leaf
-        // gather at the top of this loop. After the final round it is dropped
-        // unread — everything below this loop uses only `coeffs` — so the
-        // last round's transform is entirely dead work. Skip it.
-        if round + 1 < num_rounds {
-            values = coset_fft_zero_tail(
-                &coeffs,
-                shift.into(),
-                live_chunks,
-                Some(fri_params.config.rate_bits),
-                None,
-            );
-        }
+        values = coset_fft_zero_tail(
+            &coeffs,
+            shift.into(),
+            live_chunks,
+            Some(fri_params.config.rate_bits),
+            None,
+        )
     }
 
     // When verifying this proof in a circuit with a different number of query steps,
@@ -325,42 +283,5 @@ fn fri_prover_query_round<
             evals_proofs: initial_proof,
         },
         steps: query_steps,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use plonky2_field::types::Sample;
-
-    use super::*;
-    use crate::field::goldilocks_field::GoldilocksField;
-
-    /// `bitrev_flatten` must be raw-`u64`-identical to the serial
-    /// gather-and-extend loop it replaced, for every leaf and every limb.
-    #[test]
-    fn bitrev_flatten_matches_serial_gather() {
-        const D: usize = 2;
-        type F = GoldilocksField;
-        type FE = <F as Extendable<D>>::Extension;
-
-        // Sizes on both sides of the `FLATTEN_BLOCK = 1 << 10` grain: below it
-        // (a single partial chunk), exactly on it, and several blocks past it.
-        for log_n in [0usize, 1, 5, 10, 11, 13] {
-            let n = 1usize << log_n;
-            let values: Vec<FE> = (0..n).map(|_| FE::rand()).collect();
-
-            // Reference: the original serial fill.
-            let mut expected: Vec<F> = Vec::with_capacity(n * D);
-            for i in 0..n {
-                let x: [F; D] = values[reverse_bits(i, log_n)].to_basefield_array();
-                expected.extend_from_slice(&x);
-            }
-
-            let actual = bitrev_flatten::<F, D>(&values);
-            assert_eq!(actual.len(), expected.len(), "length for n = {n}");
-            for (k, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
-                assert_eq!(a.0, e.0, "limb {k} of {n}");
-            }
-        }
     }
 }

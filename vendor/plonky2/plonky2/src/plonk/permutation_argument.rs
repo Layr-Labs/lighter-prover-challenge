@@ -18,14 +18,7 @@ const OUTER_PARALLEL_SIGMA_COLUMNS: bool = false;
 /// Disjoint Set Forest data-structure following <https://en.wikipedia.org/wiki/Disjoint-set_data_structure>.
 pub struct Forest {
     /// A map of parent pointers, stored as indices.
-    ///
-    /// Entries are `u32` rather than `usize`: a forest index is bounded by
-    /// `num_wires * degree + num_virtual_targets`, which [`Forest::new`] asserts fits in a `u32`.
-    /// Halving the entry width halves the resident size of this map and the memory traffic of
-    /// every read of it — most importantly `PartitionWitness`'s per-write lookup and its
-    /// `full_witness` drain, which are DRAM-bandwidth bound on large circuits. Every value is
-    /// zero-extended at the indexing site, so all derived quantities are unchanged.
-    pub(crate) parents: Vec<u32>,
+    pub(crate) parents: Vec<usize>,
 
     num_wires: usize,
     num_routed_wires: usize,
@@ -40,10 +33,6 @@ impl Forest {
         num_virtual_targets: usize,
     ) -> Self {
         let capacity = num_wires * degree + num_virtual_targets;
-        assert!(
-            capacity <= u32::MAX as usize,
-            "forest of {capacity} targets exceeds the u32 index range of the representative map"
-        );
         Self {
             parents: Vec::with_capacity(capacity),
             num_wires,
@@ -57,40 +46,30 @@ impl Forest {
     }
 
     /// Add a new partition with a single member.
-    ///
-    /// The `u32` narrowing is guarded by [`Forest::new`], which asserts that the announced
-    /// capacity `num_wires * degree + num_virtual_targets` fits in a `u32`; `sigma_vecs` calls
-    /// this exactly that many times. The per-call check is therefore a `debug_assert!`, keeping
-    /// the tens-of-millions-of-iterations insertion loop free of a redundant branch.
     pub fn add(&mut self, t: Target) {
         let index = self.parents.len();
         debug_assert_eq!(self.target_index(t), index);
-        debug_assert!(
-            index <= u32::MAX as usize,
-            "forest index {index} exceeds the u32 index range of the representative map"
-        );
-        self.parents.push(index as u32);
+        self.parents.push(index);
     }
 
     /// Path compression method, see <https://en.wikipedia.org/wiki/Disjoint-set_data_structure#Finding_set_representatives>.
-    pub fn find(&mut self, x_index: usize) -> usize {
+    pub fn find(&mut self, mut x_index: usize) -> usize {
         // Note: We avoid recursion here since the chains can be long, causing stack overflows.
-        let mut x_index = x_index as u32;
 
         // First, find the representative of the set containing `x_index`.
         let mut representative = x_index;
-        while self.parents[representative as usize] != representative {
-            representative = self.parents[representative as usize];
+        while self.parents[representative] != representative {
+            representative = self.parents[representative];
         }
 
         // Then, update each node in this chain to point directly to the representative.
-        while self.parents[x_index as usize] != x_index {
-            let old_parent = self.parents[x_index as usize];
-            self.parents[x_index as usize] = representative;
+        while self.parents[x_index] != x_index {
+            let old_parent = self.parents[x_index];
+            self.parents[x_index] = representative;
             x_index = old_parent;
         }
 
-        representative as usize
+        representative
     }
 
     /// Merge two sets.
@@ -102,40 +81,28 @@ impl Forest {
             return;
         }
 
-        self.parents[y_index] = x_index as u32;
+        self.parents[y_index] = x_index;
     }
 
     /// Compress all paths. After calling this, every `parent` value will point to the node's
     /// representative.
     ///
-    /// The final `parents` vector is identical to calling `find(i)` for every `i`: a node is only
-    /// ever written when it is a non-root (the `continue` guard), and the value written is always
-    /// a root, so roots are stable for the whole pass and every index ends at `root(i)`.
-    ///
-    /// The writeback loop is load-bearing for performance, not just for `i`. A copy-constraint
-    /// class built by repeated `connect` is a *chain*, and the outer loop visits it in the
-    /// direction that walks it from the far end: writing the root into `parents[i]` alone leaves
-    /// every intermediate node still pointing along the chain, so the next index re-walks almost
-    /// the whole thing — quadratic in the class length, over a `parents` array of tens of
-    /// millions of entries. Writing the root into every node on the path as we go makes each
-    /// later node terminate in one hop.
+    /// This dedicated full pass visits every index once and gives it its own direct-root write,
+    /// so the general `find`'s second chain walk (which rewrites intermediate nodes) is
+    /// unnecessary: each intermediate node receives its direct-root assignment when the outer
+    /// loop reaches it. Roots are stable during this pass, so the final `parents` vector is
+    /// identical to calling `find(i)` for every `i`.
     pub(crate) fn compress_paths(&mut self) {
         for i in 0..self.parents.len() {
             let parent = self.parents[i];
-            if parent as usize == i {
+            if parent == i {
                 continue;
             }
             let mut root = parent;
-            while self.parents[root as usize] != root {
-                root = self.parents[root as usize];
+            while self.parents[root] != root {
+                root = self.parents[root];
             }
-            // Point every node on `i`'s path directly at the root, not just `i`.
-            let mut x = i;
-            while self.parents[x] != root {
-                let next = self.parents[x] as usize;
-                self.parents[x] = root;
-                x = next;
-            }
+            self.parents[i] = root;
         }
     }
 
@@ -154,7 +121,7 @@ impl Forest {
         for row in 0..self.degree {
             for column in 0..self.num_routed_wires {
                 let t = Target::Wire(Wire { row, column });
-                let parent = self.parents[self.target_index(t)] as usize;
+                let parent = self.parents[self.target_index(t)];
                 let index = (column * self.degree + row) as u32;
                 let old_tail = last[parent];
                 if old_tail == u32::MAX {
@@ -245,129 +212,6 @@ mod tests {
         merges: &[(Target, Target)],
     ) -> Forest {
         let mut forest = Forest::new(num_wires, num_routed_wires, degree, num_virtual_targets);
-        for row in 0..degree {
-            for column in 0..num_wires {
-                forest.add(Target::Wire(Wire { row, column }));
-            }
-        }
-        for index in 0..num_virtual_targets {
-            forest.add(Target::VirtualTarget { index });
-        }
-        for &(a, b) in merges {
-            forest.merge(a, b);
-        }
-        forest
-    }
-
-    /// Zero-extends the `u32` forest map so it can be compared against `usize` references.
-    fn parents_as_usize(forest: &Forest) -> Vec<usize> {
-        forest.parents.iter().map(|&p| p as usize).collect()
-    }
-
-    /// Verbatim copy of the pre-`u32` `Forest`: `usize` parent pointers throughout. Kept as an
-    /// in-test oracle so the narrowed map can be differentially compared entry-for-entry against
-    /// the exact code it replaced.
-    struct UsizeForest {
-        parents: Vec<usize>,
-        num_wires: usize,
-        num_routed_wires: usize,
-        degree: usize,
-    }
-
-    impl UsizeForest {
-        fn new(
-            num_wires: usize,
-            num_routed_wires: usize,
-            degree: usize,
-            num_virtual_targets: usize,
-        ) -> Self {
-            let capacity = num_wires * degree + num_virtual_targets;
-            Self {
-                parents: Vec::with_capacity(capacity),
-                num_wires,
-                num_routed_wires,
-                degree,
-            }
-        }
-
-        fn target_index(&self, target: Target) -> usize {
-            target.index(self.num_wires, self.degree)
-        }
-
-        fn add(&mut self, t: Target) {
-            let index = self.parents.len();
-            debug_assert_eq!(self.target_index(t), index);
-            self.parents.push(index);
-        }
-
-        fn find(&mut self, mut x_index: usize) -> usize {
-            let mut representative = x_index;
-            while self.parents[representative] != representative {
-                representative = self.parents[representative];
-            }
-            while self.parents[x_index] != x_index {
-                let old_parent = self.parents[x_index];
-                self.parents[x_index] = representative;
-                x_index = old_parent;
-            }
-            representative
-        }
-
-        fn merge(&mut self, tx: Target, ty: Target) {
-            let x_index = self.find(self.target_index(tx));
-            let y_index = self.find(self.target_index(ty));
-            if x_index == y_index {
-                return;
-            }
-            self.parents[y_index] = x_index;
-        }
-
-        fn compress_paths(&mut self) {
-            for i in 0..self.parents.len() {
-                let parent = self.parents[i];
-                if parent == i {
-                    continue;
-                }
-                let mut root = parent;
-                while self.parents[root] != root {
-                    root = self.parents[root];
-                }
-                self.parents[i] = root;
-            }
-        }
-
-        fn wire_partition(&mut self) -> Vec<u32> {
-            let mut sigma = vec![0u32; self.degree * self.num_routed_wires];
-            let mut last = vec![u32::MAX; self.parents.len()];
-
-            for row in 0..self.degree {
-                for column in 0..self.num_routed_wires {
-                    let t = Target::Wire(Wire { row, column });
-                    let parent = self.parents[self.target_index(t)];
-                    let index = (column * self.degree + row) as u32;
-                    let old_tail = last[parent];
-                    if old_tail == u32::MAX {
-                        sigma[index as usize] = index;
-                    } else {
-                        sigma[index as usize] = sigma[old_tail as usize];
-                        sigma[old_tail as usize] = index;
-                    }
-                    last[parent] = index;
-                }
-            }
-
-            sigma
-        }
-    }
-
-    fn build_usize_forest(
-        num_wires: usize,
-        num_routed_wires: usize,
-        degree: usize,
-        num_virtual_targets: usize,
-        merges: &[(Target, Target)],
-    ) -> UsizeForest {
-        let mut forest = UsizeForest::new(num_wires, num_routed_wires, degree, num_virtual_targets);
         for row in 0..degree {
             for column in 0..num_wires {
                 forest.add(Target::Wire(Wire { row, column }));
@@ -562,7 +406,7 @@ mod tests {
                 num_virtual_targets,
                 &merges,
             );
-            let original_parents = parents_as_usize(&forest);
+            let original_parents = forest.parents.clone();
 
             forest.compress_paths();
 
@@ -574,13 +418,12 @@ mod tests {
                     root = original_parents[root];
                 }
                 assert_eq!(
-                    forest.parents[i] as usize, root,
+                    forest.parents[i], root,
                     "compressed parent mismatch at index {i} (degree {degree})"
                 );
             }
 
-            let compressed = parents_as_usize(&forest);
-            let expected = class_cycle_sigma(&compressed, num_wires, num_routed_wires, degree);
+            let expected = class_cycle_sigma(&forest.parents, num_wires, num_routed_wires, degree);
             let sigma = forest.wire_partition().sigma;
             assert_eq!(sigma, expected, "sigma mismatch at degree {degree}");
         }
@@ -609,7 +452,7 @@ mod tests {
                 num_virtual_targets,
                 &merges,
             );
-            let mut reference_parents = parents_as_usize(&forest);
+            let mut reference_parents = forest.parents.clone();
 
             reference_compress_paths(&mut reference_parents);
             let expected_sigma =
@@ -617,111 +460,13 @@ mod tests {
 
             forest.compress_paths();
             assert_eq!(
-                parents_as_usize(&forest),
-                reference_parents,
+                forest.parents, reference_parents,
                 "compressed parents diverge for degree {degree}"
             );
 
             let sigma = forest.wire_partition().sigma;
             assert_eq!(sigma, expected_sigma, "sigma diverges for degree {degree}");
         }
-    }
-
-    /// M1 differential: the `u32` forest against a verbatim `usize` copy of the code it replaced,
-    /// over the whole lifecycle (`add` -> `merge` -> `compress_paths` -> `wire_partition`). Every
-    /// parent entry is compared after each mutating stage, so a narrowing bug anywhere in the
-    /// forest shows up as a full-vector mismatch rather than only in the derived sigma.
-    #[test]
-    fn u32_forest_matches_usize_reference() {
-        // (num_wires, num_routed_wires, degree, num_virtual_targets, merges)
-        let configs = [
-            (135usize, 80usize, 1usize << 12, 1500usize, 4 * (1 << 12)),
-            (135, 80, 1 << 10, 900, 135 * (1 << 10)),
-            (7, 5, 999, 41, 5000),
-            (3, 2, 1, 0, 0),
-        ];
-
-        for (num_wires, num_routed_wires, degree, num_virtual_targets, num_merges) in configs {
-            let mut rng = Lcg(0x0f63_a240 ^ ((degree as u64) << 24) ^ num_wires as u64);
-            let merges =
-                random_merges(&mut rng, num_wires, degree, num_virtual_targets, num_merges);
-
-            let mut forest = Forest::new(num_wires, num_routed_wires, degree, num_virtual_targets);
-            let mut reference =
-                UsizeForest::new(num_wires, num_routed_wires, degree, num_virtual_targets);
-            for row in 0..degree {
-                for column in 0..num_wires {
-                    forest.add(Target::Wire(Wire { row, column }));
-                    reference.add(Target::Wire(Wire { row, column }));
-                }
-            }
-            for index in 0..num_virtual_targets {
-                forest.add(Target::VirtualTarget { index });
-                reference.add(Target::VirtualTarget { index });
-            }
-            assert_eq!(
-                parents_as_usize(&forest),
-                reference.parents,
-                "parents diverge after insertion for degree {degree}"
-            );
-
-            for &(a, b) in &merges {
-                forest.merge(a, b);
-                reference.merge(a, b);
-            }
-            assert_eq!(
-                parents_as_usize(&forest),
-                reference.parents,
-                "parents diverge after merges for degree {degree}"
-            );
-
-            forest.compress_paths();
-            reference.compress_paths();
-            assert_eq!(
-                parents_as_usize(&forest),
-                reference.parents,
-                "parents diverge after compression for degree {degree}"
-            );
-
-            let sigma = forest.wire_partition().sigma;
-            assert_eq!(
-                sigma,
-                reference.wire_partition(),
-                "sigma diverges for degree {degree}"
-            );
-        }
-
-        // A separate check that `find`'s return value and in-place compression agree with the
-        // `usize` oracle when driven directly rather than through `compress_paths`.
-        let (num_wires, num_routed_wires, degree, num_virtual_targets) = (11usize, 8usize, 64, 20);
-        let mut rng = Lcg(0x1e57_a700);
-        let merges = random_merges(&mut rng, num_wires, degree, num_virtual_targets, 400);
-        let mut forest = build_forest(
-            num_wires,
-            num_routed_wires,
-            degree,
-            num_virtual_targets,
-            &merges,
-        );
-        let mut reference = build_usize_forest(
-            num_wires,
-            num_routed_wires,
-            degree,
-            num_virtual_targets,
-            &merges,
-        );
-        for i in 0..reference.parents.len() {
-            assert_eq!(forest.find(i), reference.find(i), "find diverges at {i}");
-            assert_eq!(parents_as_usize(&forest), reference.parents);
-        }
-    }
-
-    /// `Forest::new` rejects a target count that would not fit the narrowed map rather than
-    /// silently truncating indices.
-    #[test]
-    #[should_panic(expected = "exceeds the u32 index range")]
-    fn forest_rejects_capacity_above_u32_max() {
-        let _ = Forest::new(135, 80, 1 << 26, 0);
     }
 
     /// `get_sigma_polys` (shift/mask decode, outer-parallel columns) against the promoted

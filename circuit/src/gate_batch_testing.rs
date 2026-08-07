@@ -420,6 +420,28 @@ mod added_gate_tests {
 
 
 
+
+
+    #[test]
+    fn uninterleave_accumulate_matches_default() {
+        use crate::uint::u32::gates::uninterleave_to_b32::UninterleaveToB32Gate;
+        use crate::uint::u32::gates::uninterleave_to_u32::UninterleaveToU32Gate;
+
+        let config = plonky2::plonk::circuit_data::CircuitConfig::standard_recursion_config();
+        super::assert_accumulate_matches_default(&UninterleaveToB32Gate::new_from_config(&config));
+        super::assert_accumulate_matches_default(&UninterleaveToU32Gate::new_from_config(&config));
+    }
+
+    #[test]
+    fn interleave_accumulate_matches_default() {
+        use crate::uint::u32::gates::interleave_u32::U32InterleaveGate;
+
+        let gate = U32InterleaveGate::new_from_config(
+            &plonky2::plonk::circuit_data::CircuitConfig::standard_recursion_config(),
+        );
+        super::assert_accumulate_matches_default(&gate);
+    }
+
     #[test]
     fn quintic_square_accumulate_matches_default() {
         use crate::eddsa::gates::square_quintic_ext_base::QuinticSquaringGate;

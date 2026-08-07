@@ -283,11 +283,77 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for UninterleaveTo
         filters: &[F],
         combined_gate_constraints: &mut [F],
     ) {
-        self.eval_unfiltered_base_batch_accumulate_packed(
-            vars_base,
-            filters,
-            combined_gate_constraints,
-        );
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        let alpha = F::from_canonical_usize(Self::B);
+        let base32 = F::from_canonical_u64(1 << 32u64);
+        let u32_max = F::from_canonical_u32(u32::MAX);
+        let mut chunks = combined_gate_constraints.chunks_exact_mut(n);
+        let mut output_low = vec![F::ZERO; n];
+        let mut output_high = vec![F::ZERO; n];
+
+        for i in 0..self.num_ops {
+            let bit_range = self.wires_ith_bit_decomposition(i);
+            let bit_wires: Vec<usize> = bit_range.clone().collect();
+
+            output_low.fill(F::ZERO);
+            for &w in &bit_wires[32..] {
+                let bit = col(w);
+                for p in 0..n {
+                    output_low[p] = output_low[p] * alpha + bit[p];
+                }
+            }
+            output_high.fill(F::ZERO);
+            for &w in &bit_wires[..32] {
+                let bit = col(w);
+                for p in 0..n {
+                    output_high[p] = output_high[p] * alpha + bit[p];
+                }
+            }
+
+            let inverse = col(self.wire_ith_inverse(i));
+            let x_interleaved = col(self.wire_ith_x_interleaved(i));
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                let diff = u32_max - output_high[p];
+                let hi_not_max = inverse[p] * diff - F::ONE;
+                out[p] += filters[p] * (hi_not_max * output_low[p]);
+            }
+            let out = chunks.next().unwrap();
+            for p in 0..n {
+                out[p] += filters[p]
+                    * ((output_high[p] * base32 + output_low[p]) - x_interleaved[p]);
+            }
+
+            let x_evens = col(self.wire_ith_x_evens(i));
+            let x_odds = col(self.wire_ith_x_odds(i));
+            let out_evens = chunks.next().unwrap();
+            let out_odds = chunks.next().unwrap();
+            for p in 0..n {
+                let mut computed_evens = F::ZERO;
+                let mut computed_odds = F::ZERO;
+                for j in 0..Self::NUM_BITS / 2 {
+                    let coeff =
+                        F::from_canonical_u64(1 << (2 * (Self::NUM_BITS / 2 - j - 1)));
+                    computed_evens += wires[bit_wires[2 * j] * n + p] * coeff;
+                    computed_odds += wires[bit_wires[2 * j + 1] * n + p] * coeff;
+                }
+                out_evens[p] += filters[p] * (computed_evens - x_evens[p]);
+                out_odds[p] += filters[p] * (computed_odds - x_odds[p]);
+            }
+
+            for &w in &bit_wires {
+                let bit = col(w);
+                let out = chunks.next().unwrap();
+                debug_assert_eq!(Self::B, 2);
+                for p in 0..n {
+                    out[p] += filters[p] * (bit[p] * (bit[p] - F::ONE));
+                }
+            }
+        }
     }
 
     fn generators(&self, row: usize, _local_constants: &[F]) -> Vec<WitnessGeneratorRef<F, D>> {

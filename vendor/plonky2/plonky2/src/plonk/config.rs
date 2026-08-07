@@ -129,17 +129,14 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
     /// Build the native Merkle digests and cap with a specialized backend, when available.
     ///
     /// `leaves` is one flat row-major buffer holding `num_leaves` leaves of `leaf_width`
-    /// field elements each. The first result uses the level-order
-    /// [`crate::hash::merkle_tree::LevelOrderDigests`] layout.
+    /// field elements each. The first result uses
+    /// [`crate::hash::merkle_tree::MerkleTree::digests`] layout.
     fn try_build_merkle_tree(
         _leaves: &[F],
         _leaf_width: usize,
         _num_leaves: usize,
         _cap_height: usize,
-    ) -> Option<(
-        crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
-        Vec<Self::Hash>,
-    )> {
+    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
         None
     }
 
@@ -149,55 +146,22 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
     fn try_build_merkle_tree_columns(
         _columns: &[Vec<F>],
         _cap_height: usize,
-    ) -> Option<(
-        crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
-        Vec<Self::Hash>,
-    )> {
+    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
         None
-    }
-
-    /// Allocates retained column-major leaf storage suitable for a specialized
-    /// Merkle backend. The caller may compute the columns directly in this
-    /// storage before passing it to [`Hasher::try_build_merkle_tree_column_store`].
-    fn try_allocate_merkle_tree_columns(
-        _num_columns: usize,
-        _num_rows: usize,
-        _cap_height: usize,
-    ) -> Option<crate::hash::merkle_tree::ColumnStore<F>> {
-        None
-    }
-
-    /// Like [`Hasher::try_build_merkle_tree_columns`], but accepts retained
-    /// column storage allocated by
-    /// [`Hasher::try_allocate_merkle_tree_columns`].
-    fn try_build_merkle_tree_column_store(
-        columns: &crate::hash::merkle_tree::ColumnStore<F>,
-        cap_height: usize,
-    ) -> Option<(
-        crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
-        Vec<Self::Hash>,
-    )> {
-        match columns {
-            crate::hash::merkle_tree::ColumnStore::Owned(columns) => {
-                Self::try_build_merkle_tree_columns(columns, cap_height)
-            }
-            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-            crate::hash::merkle_tree::ColumnStore::Shared(_) => None,
-        }
     }
 
     /// Computes the coset LDE of the given coefficient columns and the Merkle
     /// tree over the resulting leaves in one fused backend pass, when a
     /// specialized backend is available. Returns the retained LDE column
-    /// storage plus digests in the level-order
-    /// [`crate::hash::merkle_tree::LevelOrderDigests`] layout and the cap.
+    /// storage plus digests and cap in
+    /// [`crate::hash::merkle_tree::MerkleTree::digests`] layout.
     fn try_build_commitment_from_coeffs(
         _coeff_columns: &[&[F]],
         _rate_bits: usize,
         _cap_height: usize,
     ) -> Option<(
         crate::hash::merkle_tree::ColumnStore<F>,
-        crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
+        Vec<Self::Hash>,
         Vec<Self::Hash>,
     )> {
         None
@@ -213,7 +177,7 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
         _cap_height: usize,
     ) -> Option<(
         crate::hash::merkle_tree::ColumnStore<F>,
-        crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
+        Vec<Self::Hash>,
         Vec<Self::Hash>,
         Vec<Vec<F>>,
     )> {

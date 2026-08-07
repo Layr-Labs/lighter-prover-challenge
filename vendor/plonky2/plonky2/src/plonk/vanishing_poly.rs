@@ -213,39 +213,12 @@ fn reduce_gate_constraints_base_batch<F: Field>(
     batch_size: usize,
     alphas: &[F],
     res_out: &mut [F],
-    res_out_is_zero_seed: bool,
 ) {
     debug_assert!(batch_size > 0);
     debug_assert_eq!(constraint_terms_batch.len() % batch_size, 0);
     debug_assert_eq!(res_out.len(), batch_size * alphas.len());
 
-    // When `res_out` is known to be an all-zero (or uninitialized) seed, the
-    // first reversed row can be *assigned* rather than accumulated: with
-    // `*value == F::ZERO`, `term.multiply_accumulate(ZERO, alpha)` is
-    // `reduce128(term as u128)`, whose high half is zero, so `reduce128`
-    // returns `term` unchanged — a raw-limb-identical copy, not merely a
-    // field-value-identical one. Assigning it makes every slot of `res_out`
-    // stored before it is read, which lets the quotient caller skip
-    // zero-filling the accumulator entirely, and drops one multiply per
-    // (point, challenge) on that row.
-    //
-    // This is NOT valid for a caller that passes a nonzero running
-    // accumulator, which the general contract permits, so it is opt-in.
-    let mut rows = constraint_terms_batch.chunks_exact(batch_size).rev();
-    if res_out_is_zero_seed {
-        match rows.next() {
-            Some(first_row) => {
-                for (point, &term) in first_row.iter().enumerate() {
-                    let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
-                    result.fill(term);
-                }
-            }
-            // No constraint rows: preserve the "every slot written" contract.
-            None => res_out.fill(F::ZERO),
-        }
-    }
-
-    for constraint_row in rows {
+    for constraint_row in constraint_terms_batch.chunks_exact(batch_size).rev() {
         for (point, &term) in constraint_row.iter().enumerate() {
             let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
             for (value, &alpha) in result.iter_mut().zip(alphas) {
@@ -310,7 +283,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(betas.len(), num_challenges);
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
-    reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out, true);
+    reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out);
 
     let numerator_values = &mut scratch.numerator_values;
     let denominator_values = &mut scratch.denominator_values;
@@ -1219,7 +1192,7 @@ mod tests {
             F::from_canonical_u64(6),
             F::from_canonical_u64(6),
         ];
-        reduce_gate_constraints_base_batch(&terms, 2, &alphas, &mut actual, false);
+        reduce_gate_constraints_base_batch(&terms, 2, &alphas, &mut actual);
         assert_eq!(actual[0], F::from_canonical_u64(91));
         assert_eq!(actual[2], F::from_canonical_u64(116));
 
@@ -1243,7 +1216,7 @@ mod tests {
             }
 
             let mut actual = initial;
-            reduce_gate_constraints_base_batch(&terms, batch_size, &alphas, &mut actual, false);
+            reduce_gate_constraints_base_batch(&terms, batch_size, &alphas, &mut actual);
             assert_eq!(actual, expected, "batch size {batch_size}");
         }
     }
