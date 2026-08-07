@@ -15,7 +15,7 @@ use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
-use plonky2::gates::gate::Gate;
+use plonky2::gates::gate::{Gate, U32QuotientGate};
 use plonky2::gates::packed_util::PackedEvaluableBase;
 use plonky2::gates::util::StridedConstraintConsumer;
 use plonky2::hash::hash_types::RichField;
@@ -96,6 +96,12 @@ impl U32InterleaveGate {
 impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32InterleaveGate {
     fn id(&self) -> String {
         format!("{self:?}")
+    }
+
+    fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+        Some(U32QuotientGate::Interleave {
+            num_ops: self.num_ops,
+        })
     }
 
     fn eval_unfiltered(&self, vars: EvaluationVars<F, D>) -> Vec<F::Extension> {
@@ -466,5 +472,24 @@ mod tests {
         for num_ops in [1, 2, 3] {
             assert_accumulate_matches_eval_unfiltered(&U32InterleaveGate { num_ops });
         }
+    }
+
+    #[test]
+    fn advertises_quotient_layout() {
+        let gate = U32InterleaveGate { num_ops: 4 };
+        assert_eq!(
+            <U32InterleaveGate as Gate<GoldilocksField, 2>>::u32_quotient_gate(&gate),
+            Some(U32QuotientGate::Interleave { num_ops: 4 })
+        );
+        // The advertised layout must match the real gate shape: two routed
+        // words and 32 bit wires per operation, all 34 rows constrained.
+        assert_eq!(
+            <U32InterleaveGate as Gate<GoldilocksField, 2>>::num_wires(&gate),
+            4 * 34
+        );
+        assert_eq!(
+            <U32InterleaveGate as Gate<GoldilocksField, 2>>::num_constraints(&gate),
+            4 * 34
+        );
     }
 }
