@@ -13,10 +13,10 @@ use core::ops::Range;
 #[cfg(feature = "std")]
 use std::{collections::BTreeMap, sync::Arc};
 
-pub use gate_serialization::default::DefaultGateSerializer;
 pub use gate_serialization::GateSerializer;
-pub use generator_serialization::default::DefaultGeneratorSerializer;
+pub use gate_serialization::default::DefaultGateSerializer;
 pub use generator_serialization::WitnessGeneratorSerializer;
+pub use generator_serialization::default::DefaultGeneratorSerializer;
 use hashbrown::HashMap;
 
 use crate::field::extension::{Extendable, FieldExtension};
@@ -146,6 +146,23 @@ pub trait Read {
         let mut res = Vec::with_capacity(len);
         for _ in 0..len {
             res.push(self.read_usize()?);
+        }
+
+        Ok(res)
+    }
+
+    /// Reads a vector of `u32` values stored with the legacy `usize` wire
+    /// encoding (8 bytes per element). Used for the compact representative
+    /// map: the in-memory type is `u32` but the serialized byte format is
+    /// unchanged. A legacy value above `u32::MAX` is an error, not a
+    /// truncation.
+    #[inline]
+    fn read_u32_vec_from_legacy_usizes(&mut self) -> IoResult<Vec<u32>> {
+        let len = self.read_usize()?;
+        let mut res = Vec::with_capacity(len);
+        for _ in 0..len {
+            let value = self.read_usize()?;
+            res.push(u32::try_from(value).map_err(|_| IoError)?);
         }
 
         Ok(res)
@@ -856,6 +873,14 @@ pub trait Read {
             let k = self.read_usize()?;
             generator_indices_by_watches.insert(k, self.read_usize_vec()?);
         }
+        // Not serialized: each watcher list holds a generator at most once, so its distinct
+        // watched-representative count is its number of appearances across the map.
+        let mut generator_watch_counts = vec![0usize; gen_len];
+        for indices in generator_indices_by_watches.values() {
+            for &generator_idx in indices {
+                generator_watch_counts[generator_idx] += 1;
+            }
+        }
 
         let constants_sigmas_commitment = self.read_polynomial_batch()?;
         let sigmas_len = self.read_usize()?;
@@ -870,7 +895,7 @@ pub trait Read {
 
         let public_inputs = self.read_target_vec()?;
 
-        let representative_map = self.read_usize_vec()?;
+        let representative_map = self.read_u32_vec_from_legacy_usizes()?;
 
         let is_some = self.read_bool()?;
         let fft_root_table = match is_some {
@@ -907,6 +932,7 @@ pub trait Read {
         Ok(ProverOnlyCircuitData {
             generators,
             generator_indices_by_watches,
+            generator_watch_counts,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
@@ -1257,6 +1283,19 @@ pub trait Write {
         self.write_usize(v.len())?;
         for &elem in v.iter() {
             self.write_usize(elem)?;
+        }
+
+        Ok(())
+    }
+
+    /// Writes a vector of `u32` values using the legacy `usize` wire encoding
+    /// (8 bytes per element), byte-identical to `write_usize_vec` on the same
+    /// logical values. Counterpart of `read_u32_vec_from_legacy_usizes`.
+    #[inline]
+    fn write_u32_vec_as_legacy_usizes(&mut self, v: &[u32]) -> IoResult<()> {
+        self.write_usize(v.len())?;
+        for &elem in v.iter() {
+            self.write_usize(elem as usize)?;
         }
 
         Ok(())
@@ -1860,6 +1899,8 @@ pub trait Write {
         let ProverOnlyCircuitData {
             generators,
             generator_indices_by_watches,
+            // Runtime-only; reconstructed from the watcher map when reading.
+            generator_watch_counts: _,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
@@ -1891,7 +1932,7 @@ pub trait Write {
         self.write_usize(subgroup.len())?;
         self.write_field_vec(subgroup)?;
         self.write_target_vec(public_inputs)?;
-        self.write_usize_vec(representative_map)?;
+        self.write_u32_vec_as_legacy_usizes(representative_map)?;
 
         match fft_root_table {
             Some(table) => {
@@ -2245,5 +2286,127 @@ impl Read for Buffer<'_> {
         common_data: &CommonCircuitData<F, D>,
     ) -> IoResult<WitnessGeneratorRef<F, D>> {
         generator_serializer.read_generator(self, common_data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::marker::PhantomData;
+
+    use super::*;
+    use crate::field::types::Field;
+    use crate::gates::arithmetic_base::ArithmeticBaseGenerator;
+    use crate::gates::poseidon2::Poseidon2Generator;
+    use crate::hash::poseidon2::hash::Poseidon2;
+    use crate::iop::generator::{ConstantGenerator, CopyGenerator, RandomValueGenerator};
+    use crate::iop::witness::{PartialWitness, WitnessWrite};
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::config::{AlgebraicHasher, Poseidon2GoldilocksConfig};
+
+    const D: usize = 2;
+    type C = Poseidon2GoldilocksConfig;
+    type F = <C as GenericConfig<D>>::F;
+
+    /// Test-local generator serializer: the crate's default registry predates
+    /// the Poseidon2 gate used by this fork's circuits, so register exactly
+    /// the generators of the test circuit (plus `CopyGenerator` for safety).
+    #[derive(Debug, Default)]
+    struct TestGeneratorSerializer<C: GenericConfig<D>, const D: usize> {
+        pub _phantom: PhantomData<C>,
+    }
+
+    impl<F, C, const D: usize> WitnessGeneratorSerializer<F, D> for TestGeneratorSerializer<C, D>
+    where
+        F: RichField + Extendable<D> + Poseidon2,
+        C: GenericConfig<D, F = F> + 'static,
+        C::Hasher: AlgebraicHasher<F>,
+    {
+        impl_generator_serializer! {
+            TestGeneratorSerializer,
+            ArithmeticBaseGenerator<F, D>,
+            ConstantGenerator<F>,
+            CopyGenerator,
+            Poseidon2Generator<F, D>,
+            RandomValueGenerator
+        }
+    }
+
+    /// The compact `u32` representative map must keep the serialized circuit
+    /// byte format exactly: the legacy 8-byte-per-element `usize` encoding on
+    /// the wire, `u32` only in memory. Encode/decode/re-encode must be a
+    /// byte-identical round trip on a real circuit, and the decoded circuit
+    /// must still prove and verify.
+    #[test]
+    fn test_circuit_data_u32_rep_map_round_trip() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let x = builder.add_virtual_target();
+        let x_sq = builder.square(x);
+        let three = builder.constant(F::from_canonical_u64(3));
+        let y = builder.mul(x_sq, three);
+        // Exercise copy constraints so the forest has non-trivial partitions.
+        let x_alias = builder.add_virtual_target();
+        builder.connect(x, x_alias);
+        builder.register_public_input(y);
+        let data = builder.build::<C>();
+
+        let gate_serializer = DefaultGateSerializer;
+        let generator_serializer = TestGeneratorSerializer::<C, D>::default();
+
+        let bytes = data
+            .to_bytes(&gate_serializer, &generator_serializer)
+            .unwrap();
+        let decoded =
+            CircuitData::<F, C, D>::from_bytes(&bytes, &gate_serializer, &generator_serializer)
+                .unwrap();
+        // The compact map must round-trip exactly (note: whole-struct equality
+        // does not hold in this fork independently of this change — the
+        // commitment's Merkle leaf storage mode is re-materialized on read).
+        assert_eq!(
+            decoded.prover_only.representative_map,
+            data.prover_only.representative_map
+        );
+        let reencoded = decoded
+            .to_bytes(&gate_serializer, &generator_serializer)
+            .unwrap();
+        assert_eq!(reencoded, bytes);
+
+        // The decoded circuit proves; the original circuit's verifier accepts.
+        let mut pw = PartialWitness::new();
+        pw.set_target(x, F::from_canonical_u64(5)).unwrap();
+        let proof = decoded.prove(pw).unwrap();
+        assert_eq!(proof.public_inputs[0], F::from_canonical_u64(75));
+        data.verify(proof).unwrap();
+    }
+
+    /// The `u32`-in-memory helpers must be byte-identical to the legacy
+    /// `usize` helpers on the same logical values, and decoding must reject
+    /// (not truncate) a legacy value above `u32::MAX`.
+    #[test]
+    fn test_u32_vec_legacy_usize_encoding() {
+        let values_u32 = [0u32, 1, 2, 12_345_678, u32::MAX - 1, u32::MAX];
+        let values_usize: Vec<usize> = values_u32.iter().map(|&v| v as usize).collect();
+
+        let mut new_bytes = Vec::new();
+        new_bytes
+            .write_u32_vec_as_legacy_usizes(&values_u32)
+            .unwrap();
+        let mut legacy_bytes = Vec::new();
+        legacy_bytes.write_usize_vec(&values_usize).unwrap();
+        assert_eq!(new_bytes, legacy_bytes);
+        // 8 bytes for the length plus 8 bytes per element, as before.
+        assert_eq!(new_bytes.len(), 8 * (values_u32.len() + 1));
+
+        let mut buffer = Buffer::new(&new_bytes);
+        let decoded = buffer.read_u32_vec_from_legacy_usizes().unwrap();
+        assert_eq!(decoded, values_u32);
+
+        // A legacy value just above `u32::MAX` must produce an error.
+        let mut oversized = Vec::new();
+        oversized
+            .write_usize_vec(&[1usize, (u32::MAX as usize) + 1])
+            .unwrap();
+        let mut buffer = Buffer::new(&oversized);
+        assert!(buffer.read_u32_vec_from_legacy_usizes().is_err());
     }
 }

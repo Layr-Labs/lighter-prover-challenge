@@ -11,7 +11,6 @@
 use core::marker::PhantomData;
 
 use anyhow::Result;
-use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
@@ -205,94 +204,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U48Subtraction
             }
         }
         res
-    }
-
-    fn eval_unfiltered_base_batch_accumulate(
-        &self,
-        vars_base: EvaluationVarsBaseBatch<F>,
-        filters: &[F],
-        combined_gate_constraints: &mut [F],
-    ) {
-        let n = vars_base.len();
-        assert_eq!(filters.len(), n);
-        let num_constraints = self.num_constraints();
-        assert!(combined_gate_constraints.len() >= num_constraints * n);
-
-        let wires = vars_base.local_wires;
-        let three = F::from_canonical_usize(3);
-        let limb_base = F::from_canonical_u64(1u64 << Self::limb_bits());
-        let base = F::from_canonical_u64(1 << 48u64);
-        // Batches are 32 points in this prover; keep the scratch row on the
-        // stack and fall back to the heap only for oversized batches.
-        let mut scratch_stack = [F::ZERO; 64];
-        let mut scratch_heap;
-        let scratch: &mut [F] = if n <= 64 {
-            &mut scratch_stack[..n]
-        } else {
-            scratch_heap = vec![F::ZERO; n];
-            &mut scratch_heap
-        };
-        let mut constraint_index = 0;
-
-        for i in 0..self.num_ops {
-            let input_x = &wires[self.wire_ith_input_x(i) * n..][..n];
-            let input_y = &wires[self.wire_ith_input_y(i) * n..][..n];
-            let input_borrow = &wires[self.wire_ith_input_borrow(i) * n..][..n];
-            let output_result = &wires[self.wire_ith_output_result(i) * n..][..n];
-            let output_borrow = &wires[self.wire_ith_output_borrow(i) * n..][..n];
-
-            for p in 0..n {
-                let result_initial = input_x[p] - input_y[p] - input_borrow[p];
-                scratch[p] = output_result[p] - (result_initial + base * output_borrow[p]);
-            }
-            let combined =
-                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
-            batch_multiply_add_inplace(combined, &scratch, filters);
-            constraint_index += 1;
-
-            // Limb range products (base-4: x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3))
-            // in the same descending order as `eval_unfiltered`.
-            debug_assert_eq!(1 << Self::limb_bits(), 4);
-            for j in (0..Self::num_limbs()).rev() {
-                let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
-                for p in 0..n {
-                    let x = limb[p];
-                    let y = x * (x - three);
-                    scratch[p] = y * (y + F::TWO);
-                }
-                let combined = &mut combined_gate_constraints
-                    [constraint_index * n..(constraint_index + 1) * n];
-                batch_multiply_add_inplace(combined, &scratch, filters);
-                constraint_index += 1;
-            }
-
-            // Recomposition, folded high-to-low exactly as the batch path.
-            scratch.fill(F::ZERO);
-            for j in (0..Self::num_limbs()).rev() {
-                let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
-                for p in 0..n {
-                    scratch[p] = scratch[p] * limb_base + limb[p];
-                }
-            }
-            for p in 0..n {
-                scratch[p] -= output_result[p];
-            }
-            let combined =
-                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
-            batch_multiply_add_inplace(combined, &scratch, filters);
-            constraint_index += 1;
-
-            // Range-check output_borrow to be one bit.
-            for p in 0..n {
-                scratch[p] = output_borrow[p] * (F::ONE - output_borrow[p]);
-            }
-            let combined =
-                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
-            batch_multiply_add_inplace(combined, &scratch, filters);
-            constraint_index += 1;
-        }
-
-        debug_assert_eq!(constraint_index, num_constraints);
     }
 
     fn eval_unfiltered_circuit(
@@ -623,17 +534,5 @@ mod batch_tests {
             &CircuitConfig::standard_recursion_config(),
         );
         assert_base_batch_matches_eval_unfiltered(&gate);
-    }
-
-    // The direct filtered accumulation override must produce bit-identical
-    // values to materializing the batch then multiply-adding row by row.
-    #[test]
-    fn direct_filtered_accumulation_matches_materialized_batch() {
-        use crate::gate_batch_testing::assert_direct_accumulation_matches_materialized_batch;
-
-        let gate = U48SubtractionGate::<GoldilocksField, 2>::new_from_config(
-            &CircuitConfig::standard_recursion_config(),
-        );
-        assert_direct_accumulation_matches_materialized_batch(&gate);
     }
 }
