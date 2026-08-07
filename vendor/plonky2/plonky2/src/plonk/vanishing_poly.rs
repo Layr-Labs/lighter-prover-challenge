@@ -275,6 +275,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     deltas: &[F],
     alphas: &[F],
     excluded_gate_indices: &[usize],
+    cpu_num_gate_constraints: usize,
     z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
     scratch: &mut VanishingScratch<F>,
@@ -303,9 +304,11 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         vars_batch,
         &mut scratch.constraint_terms_batch,
         excluded_gate_indices,
+        cpu_num_gate_constraints,
     );
     let constraint_terms_batch = &scratch.constraint_terms_batch;
-    debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
+    debug_assert!(constraint_terms_batch.len() <= n * num_gate_constraints);
+    debug_assert_eq!(constraint_terms_batch.len() % n, 0);
 
     let num_challenges = common_data.config.num_challenges;
     let num_routed_wires = common_data.config.num_routed_wires;
@@ -979,6 +982,22 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
     );
 }
 
+/// Number of shared constraint rows the CPU can still write. Every gate writes
+/// rows `[0, num_constraints())`, so excluding gates leaves only a live prefix.
+pub(crate) fn cpu_gate_constraint_rows<F: RichField + Extendable<D>, const D: usize>(
+    common_data: &CommonCircuitData<F, D>,
+    excluded_gate_indices: &[usize],
+) -> usize {
+    common_data
+        .gates
+        .iter()
+        .enumerate()
+        .filter(|(gate_index, _)| !excluded_gate_indices.contains(gate_index))
+        .map(|(_, gate)| gate.0.num_constraints())
+        .max()
+        .unwrap_or(0)
+}
+
 /// Internal quotient variant that leaves one gate type's filtered
 /// contribution at zero so a specialized backend can add it separately.
 pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding<
@@ -991,17 +1010,22 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding<
     excluded_gate_index: Option<usize>,
 ) {
     match excluded_gate_index {
-        Some(index) => evaluate_gate_constraints_base_batch_into_excluding_many(
-            common_data,
-            vars_batch,
-            constraints_batch,
-            core::slice::from_ref(&index),
-        ),
+        Some(index) => {
+            let excluded = core::slice::from_ref(&index);
+            evaluate_gate_constraints_base_batch_into_excluding_many(
+                common_data,
+                vars_batch,
+                constraints_batch,
+                excluded,
+                cpu_gate_constraint_rows(common_data, excluded),
+            )
+        }
         None => evaluate_gate_constraints_base_batch_into_excluding_many(
             common_data,
             vars_batch,
             constraints_batch,
             &[],
+            cpu_gate_constraint_rows(common_data, &[]),
         ),
     }
 }
@@ -1016,9 +1040,15 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
     vars_batch: EvaluationVarsBaseBatch<F>,
     constraints_batch: &mut Vec<F>,
     excluded_gate_indices: &[usize],
+    num_constraint_rows: usize,
 ) {
+    debug_assert!(num_constraint_rows <= common_data.num_gate_constraints);
+    debug_assert_eq!(
+        num_constraint_rows,
+        cpu_gate_constraint_rows(common_data, excluded_gate_indices)
+    );
     constraints_batch.clear();
-    constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
+    constraints_batch.resize(num_constraint_rows * vars_batch.len(), F::ZERO);
     let mut filters = Vec::with_capacity(vars_batch.len());
     for (i, gate) in common_data.gates.iter().enumerate() {
         if excluded_gate_indices.contains(&i) {
@@ -1296,6 +1326,59 @@ mod tests {
             let mut actual = initial;
             reduce_gate_constraints_base_batch(&terms, batch_size, &alphas, &mut actual, false);
             assert_eq!(actual, expected, "batch size {batch_size}");
+        }
+    }
+
+    #[test]
+    fn narrowed_row_space_matches_full_width_reduction_in_raw_limbs() {
+        type F = GoldilocksField;
+
+        let alphas = [F::from_canonical_u64(7), F::from_canonical_u64(11)];
+
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            F::from_canonical_u64(state >> 1)
+        };
+
+        for batch_size in [1usize, 7, 32] {
+            for full_rows in [1usize, 88, 136] {
+                for live_rows in [0usize, 1, full_rows / 2, full_rows] {
+                    let mut full = vec![F::ZERO; full_rows * batch_size];
+                    for row in 0..live_rows {
+                        for point in 0..batch_size {
+                            full[row * batch_size + point] = next();
+                        }
+                    }
+
+                    let mut expected = vec![F::ZERO; batch_size * alphas.len()];
+                    reduce_gate_constraints_base_batch(
+                        &full,
+                        batch_size,
+                        &alphas,
+                        &mut expected,
+                        true,
+                    );
+
+                    let mut actual = vec![F::ZERO; batch_size * alphas.len()];
+                    reduce_gate_constraints_base_batch(
+                        &full[..live_rows * batch_size],
+                        batch_size,
+                        &alphas,
+                        &mut actual,
+                        true,
+                    );
+
+                    for (i, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                        assert_eq!(
+                            actual.0, expected.0,
+                            "raw limb mismatch at {i} (full_rows={full_rows}, live_rows={live_rows}, batch={batch_size})"
+                        );
+                    }
+                }
+            }
         }
     }
 }

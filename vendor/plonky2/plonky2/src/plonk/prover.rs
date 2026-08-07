@@ -1516,11 +1516,19 @@ fn compute_quotient_polys<
         .unwrap_or(0)
         .max(num_routed_wires);
     debug_assert!(cpu_num_wires <= common_data.config.num_wires);
+    // The same prefix argument applies to gate constraint rows: every gate
+    // writes rows `[0, num_constraints())`, so rows above the widest gate still
+    // on the CPU remain zero after excluding specialized gates. Hoist this out
+    // of the per-batch loop like `cpu_num_wires`.
+    let cpu_num_gate_constraints =
+        crate::plonk::vanishing_poly::cpu_gate_constraint_rows(common_data, &excluded_gate_indices);
+    debug_assert!(cpu_num_gate_constraints <= common_data.num_gate_constraints);
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if gpu_poseidon_quotient_diagnostics_enabled() && !excluded_gate_indices.is_empty() {
         eprintln!(
-            "[gpu-gate-quotient] CPU wire gather width {cpu_num_wires}/{}; excluded={excluded_gate_indices:?}",
+            "[gpu-gate-quotient] CPU wire gather width {cpu_num_wires}/{}; constraint rows {cpu_num_gate_constraints}/{}; excluded={excluded_gate_indices:?}",
             common_data.config.num_wires,
+            common_data.num_gate_constraints,
         );
     }
 
@@ -1770,6 +1778,7 @@ fn compute_quotient_polys<
                     deltas,
                     alphas,
                     &excluded_gate_indices,
+                    cpu_num_gate_constraints,
                     &z_h_on_coset,
                     &lut_re_poly_evals_refs,
                     &mut scratch.vanishing,
