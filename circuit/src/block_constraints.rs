@@ -168,7 +168,25 @@ impl BlockCircuit {
         pre_exec_proof: &ProofWithPublicInputs<F, C, D>,
     ) -> Result<PartialWitness<F>> {
         let mut pw = PartialWitness::new();
+        Self::witness_inputs_early_into(target, block, pre_exec_proof, &mut pw)?;
+        Ok(pw)
+    }
 
+    /// Writes the early block witness inputs into any writable witness — in
+    /// particular directly into a `PartitionWitness`-backed seeder, whose
+    /// representative slots are array-indexed, bypassing the `PartialWitness`
+    /// hash map (and its per-target hashing) entirely. The set of
+    /// (target, value) pairs written is identical to
+    /// [`Self::witness_inputs_early`]'s.
+    pub fn witness_inputs_early_into<W>(
+        target: &BlockTarget,
+        block: &Block<F>,
+        pre_exec_proof: &ProofWithPublicInputs<F, C, D>,
+        pw: &mut W,
+    ) -> Result<()>
+    where
+        W: plonky2::iop::witness::Witness<F>,
+    {
         pw.set_proof_with_pis_target(&target.pre_exec_proof, pre_exec_proof)?;
 
         let block_witness = BlockWitness::from_block(block, 1);
@@ -238,7 +256,7 @@ impl BlockCircuit {
             .zip_eq(block.new_public_market_details.iter())
             .try_for_each(|(t, mi)| pw.set_partial_market_risk_details_target(t, mi))?;
 
-        Ok(pw)
+        Ok(())
     }
 
     /// The light-chain witness inputs, fed once the light transaction chain proof is available.

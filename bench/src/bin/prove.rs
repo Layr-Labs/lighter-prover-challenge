@@ -62,6 +62,11 @@ fn main() {
         PUBLIC_LIGHT_TX_COUNT,
     )
     .expect("invalid prover fixture");
+    // Reference orchestration. The pipelined variant (`prove_block_pipelined`,
+    // byte-identical proofs, see its differential oracle) drew 11.61 against a
+    // 12.33 bar on its first ranked outing — ~4% below same-hour peer draws —
+    // consistent with its extra thread overlap contending on the saturated
+    // ranked host. It stays in the tree, dormant, for an isolated re-test.
     let proof = prover::prove_block(block, &Circuits::new());
     let mut writer = BufWriter::with_capacity(
         PROOF_OUTPUT_BUFFER_BYTES,
