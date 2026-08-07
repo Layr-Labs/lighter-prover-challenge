@@ -212,6 +212,35 @@ impl Drop for GpuJobGuard {
     }
 }
 
+/// Routing policy for the *storage* decision, i.e. whether the LDE columns are
+/// written directly into a shared Metal buffer. Unlike the hashing decision,
+/// this runs before the CPU LDE is computed and its answer must not depend on
+/// momentary stream occupancy: falling back here reinstates the per-column
+/// `Vec` allocations plus the staging copy that retained columns deleted, and
+/// during the pipelined phase the in-flight counter is essentially never zero,
+/// so a shared predicate would systematically strip the serial circuits' 2^17
+/// trees of retained storage. The two decisions are allowed to disagree —
+/// `MerkleTree::new_column_store` transposes out of a shared buffer when the
+/// hashing side later declines.
+fn gpu_storage_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bool {
+    let leaf_permutations = if leaf_width <= 4 {
+        0
+    } else {
+        leaf_width.div_ceil(8) * leaf_count
+    };
+    let parent_permutations = leaf_count - (1usize << cap_height);
+    let exclusive = EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed);
+    let min_permutations = if exclusive {
+        EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS
+    } else {
+        MIN_GPU_PERMUTATIONS
+    };
+    if leaf_count == 1 << 17 && leaf_width > 4 {
+        return true;
+    }
+    leaf_permutations + parent_permutations >= min_permutations
+}
+
 fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bool {
     let leaf_permutations = if leaf_width <= 4 {
         0
@@ -334,7 +363,7 @@ pub(crate) fn allocate_columns<F: RichField>(
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
         || cap_height > rows.ilog2() as usize
-        || !gpu_worthwhile(cols, rows, cap_height)
+        || !gpu_storage_worthwhile(cols, rows, cap_height)
     {
         return None;
     }
