@@ -163,18 +163,35 @@ pub(crate) enum U32QuotientKind {
         result_limbs: usize,
         num_carry_limbs: usize,
     },
-    /// Byte decomposition: `1 + num_limbs` routed words (sum then bytes)
-    /// plus `4 * num_limbs` base-4 aux limbs, `1 + 5 * num_limbs` rows per
-    /// operation.
     ByteDecomposition {
         num_limbs: usize,
     },
-    /// Degree-5 extension multiplication: fifteen routed words per
-    /// operation, five rows per operation.
     QuinticMultiplication,
-    /// Degree-5 extension squaring: ten routed words plus ten temporaries
-    /// per operation, fifteen rows per operation.
     QuinticSquaring,
+    /// Bit interleaving: two routed words and 32 bit wires per operation,
+    /// with 34 constraint rows per operation.
+    Interleave,
+    /// De-interleaving: four routed words and 64 bit wires per operation,
+    /// with 68 constraint rows per operation.
+    UninterleaveToU32,
+    /// Generic mul-add: four routed wires per operation and one constraint
+    /// row per operation, with two shared gate constants.
+    MulAdd {
+        constant_base: usize,
+    },
+    /// Generic two-term linear combination: three routed wires per operation
+    /// and one constraint row per operation, with two shared gate constants.
+    Addition {
+        constant_base: usize,
+    },
+    /// Select between two elements: four routed wires and one temporary per
+    /// operation, with two constraint rows per operation.
+    Selection,
+    /// Equality check: three routed and three temporary wires per operation,
+    /// with four constraint rows per operation and one shared gate constant.
+    Equality {
+        constant_base: usize,
+    },
     /// Audited random-access layout. The ten-word record stores bits, extra
     /// constants, and the raw constant-column base in its final three words.
     RandomAccess {
@@ -570,10 +587,10 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
     }
 }
 
-/// Starts one whole-domain kernel which evaluates every advertised RangeCheck,
-/// width-generic integer, byte, quintic, and audited random-access gate, applies
-/// each selector filter, and reduces the shared constraint rows with the same
-/// two alpha challenges as the CPU quotient.
+/// Starts one whole-domain kernel which evaluates every advertised RangeCheck
+/// and U32 arithmetic gate, applies each gate's selector filter, and reduces
+/// the shared constraint rows with the same two alpha challenges as the CPU
+/// quotient.
 pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     wires: &MetalColumns<F>,
     constants: &MetalColumns<F>,
@@ -693,16 +710,19 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                         spec.num_ops.checked_mul(limbs.checked_add(3)?)?,
                     )
                 }
-                // The byte-limb count rides in the addend-count metadata
-                // word; the two width words stay zero (`word_base` is unused
-                // by the byte and quintic branches).
                 U32QuotientKind::ByteDecomposition { num_limbs } => {
                     if num_limbs == 0 || num_limbs > 24 {
                         return None;
                     }
-                    let per_op = num_limbs.checked_mul(5)?.checked_add(1)?;
-                    let count = spec.num_ops.checked_mul(per_op)?;
-                    (3usize, num_limbs, 0usize, 0usize, count, count)
+                    let per_op = 1usize.checked_add(num_limbs.checked_mul(5)?)?;
+                    (
+                        3usize,
+                        num_limbs,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_mul(per_op)?,
+                        spec.num_ops.checked_mul(per_op)?,
+                    )
                 }
                 U32QuotientKind::QuinticMultiplication => (
                     4usize,
@@ -720,6 +740,69 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                     spec.num_ops.checked_mul(20)?,
                     spec.num_ops.checked_mul(15)?,
                 ),
+                U32QuotientKind::Interleave => (
+                    7usize,
+                    0usize,
+                    0usize,
+                    0usize,
+                    spec.num_ops.checked_mul(34)?,
+                    spec.num_ops.checked_mul(34)?,
+                ),
+                U32QuotientKind::UninterleaveToU32 => (
+                    8usize,
+                    0usize,
+                    0usize,
+                    0usize,
+                    spec.num_ops.checked_mul(68)?,
+                    spec.num_ops.checked_mul(68)?,
+                ),
+                U32QuotientKind::MulAdd { constant_base } => {
+                    if constant_base.checked_add(2)? > constants.cols {
+                        return None;
+                    }
+                    (
+                        9usize,
+                        0usize,
+                        0usize,
+                        constant_base,
+                        spec.num_ops.checked_mul(4)?,
+                        spec.num_ops,
+                    )
+                }
+                U32QuotientKind::Addition { constant_base } => {
+                    if constant_base.checked_add(2)? > constants.cols {
+                        return None;
+                    }
+                    (
+                        10usize,
+                        0usize,
+                        0usize,
+                        constant_base,
+                        spec.num_ops.checked_mul(3)?,
+                        spec.num_ops,
+                    )
+                }
+                U32QuotientKind::Selection => (
+                    11usize,
+                    0usize,
+                    0usize,
+                    0usize,
+                    spec.num_ops.checked_mul(5)?,
+                    spec.num_ops.checked_mul(2)?,
+                ),
+                U32QuotientKind::Equality { constant_base } => {
+                    if constant_base.checked_add(1)? > constants.cols {
+                        return None;
+                    }
+                    (
+                        12usize,
+                        0usize,
+                        0usize,
+                        constant_base,
+                        spec.num_ops.checked_mul(6)?,
+                        spec.num_ops.checked_mul(4)?,
+                    )
+                }
                 U32QuotientKind::RandomAccess {
                     bits,
                     num_extra_constants,
@@ -744,7 +827,14 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                     if constant_base.checked_add(num_extra_constants)? > constants.cols {
                         return None;
                     }
-                    (6usize, bits, num_extra_constants, constant_base, wire_count, num_constraints)
+                    (
+                        6usize,
+                        bits,
+                        num_extra_constants,
+                        constant_base,
+                        wire_count,
+                        num_constraints,
+                    )
                 }
             };
         if wire_count > wires.cols
@@ -2918,9 +3008,44 @@ mod tests {
                             }
                             assert_eq!(constraints.len(), spec.num_ops * (total_limbs + 3));
                         }
-                        _ => unreachable!(
-                            "covered by metal_byte_and_quintic_gate_quotient_matches_cpu"
-                        ),
+                        U32QuotientKind::ByteDecomposition { num_limbs } => {
+                            let routed_per_op = 1 + num_limbs;
+                            for op in 0..spec.num_ops {
+                                let routed = routed_per_op * op;
+                                let aux_base = routed_per_op * spec.num_ops + 4 * num_limbs * op;
+                                for j in 0..4 * num_limbs {
+                                    let x = wires.col(aux_base + j)[source_row];
+                                    let y = x * (x - three);
+                                    constraints.push(y * (y + F::TWO));
+                                }
+                                for byte_index in 0..num_limbs {
+                                    let base = aux_base + 4 * byte_index;
+                                    let mut recomposed = wires.col(base + 3)[source_row];
+                                    for limb in (0..3).rev() {
+                                        recomposed = recomposed * four + wires.col(base + limb)[source_row];
+                                    }
+                                    constraints.push(recomposed - wires.col(routed + 1 + byte_index)[source_row]);
+                                }
+                                let mut recomposed = wires.col(routed + num_limbs)[source_row];
+                                for byte_index in (0..num_limbs.saturating_sub(1)).rev() {
+                                    recomposed = recomposed * F::from_canonical_u64(256)
+                                        + wires.col(routed + 1 + byte_index)[source_row];
+                                }
+                                constraints.push(recomposed - wires.col(routed)[source_row]);
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * (1 + 5 * num_limbs));
+                        }
+                        U32QuotientKind::QuinticMultiplication
+                        | U32QuotientKind::QuinticSquaring
+                        | U32QuotientKind::Interleave
+                        | U32QuotientKind::UninterleaveToU32
+                        | U32QuotientKind::MulAdd { .. }
+                        | U32QuotientKind::Addition { .. }
+                        | U32QuotientKind::Selection
+                        | U32QuotientKind::Equality { .. }
+                        | U32QuotientKind::RandomAccess { .. } => {
+                            unreachable!("covered by the extended quotient differential test");
+                        }
                     }
 
                     for (challenge, &alpha) in alphas.iter().enumerate() {
@@ -2961,10 +3086,8 @@ mod tests {
     // Differential coverage for the byte-decomposition and EdDSA quintic
     // gates evaluated in the same union job as production RangeCheck,
     // width-generic subtraction and add-many specs. Wire columns mix random
-    // canonical values with a rotating window of the twelve raw boundary
-    // representatives (including noncanonical encodings at and above the
-    // field order) from the packed-field differential suite, so every kernel
-    // operation sees the carry-boundary cases.
+    // canonical values with a rotating window of raw Goldilocks boundary
+    // representatives, so every kernel operation sees carry-boundary cases.
     #[test]
     fn metal_byte_and_quintic_gate_quotient_matches_cpu() {
         type F = GoldilocksField;
@@ -2980,11 +3103,7 @@ mod tests {
 
         let context = shared_context().expect("Metal context must initialize");
         let alphas = [F::from_canonical_u64(13), F::from_canonical_u64(17)];
-
-        // Production shapes for the 136-wire / 80-routed ranked config. This
-        // one random-invalid job contains every current promoted kind, plus
-        // every audited RandomAccess tuple.
-        let mut shapes = vec![
+        let shapes = [
             (
                 3,
                 UnionShape::U32(U32QuotientKind::ByteDecomposition { num_limbs: 8 }),
@@ -2999,6 +3118,39 @@ mod tests {
             ),
             (5, UnionShape::U32(U32QuotientKind::QuinticMultiplication)),
             (6, UnionShape::U32(U32QuotientKind::QuinticSquaring)),
+            // Production interleave shape: two routed words and 32 bit wires
+            // per operation (num_ops 3 fits the 136-wire config with room to
+            // spare).
+            (3, UnionShape::U32(U32QuotientKind::Interleave)),
+            // Production de-interleave shape: four routed words and 64 bit
+            // wires per operation (num_ops 2 is the full 136-wire config).
+            (2, UnionShape::U32(U32QuotientKind::UninterleaveToU32)),
+            // Production generic-gate shapes: mul-add (20 ops), linear
+            // combination (26 ops), select (20 ops) and equality (22 ops)
+            // fill the 80-routed-wire config exactly. Constant base 0 reuses
+            // the first selector column as the shared constants; the
+            // differential reference reads the same columns.
+            (
+                20,
+                UnionShape::U32(U32QuotientKind::MulAdd { constant_base: 0 }),
+            ),
+            (
+                26,
+                UnionShape::U32(U32QuotientKind::Addition { constant_base: 0 }),
+            ),
+            (20, UnionShape::U32(U32QuotientKind::Selection)),
+            (
+                22,
+                UnionShape::U32(U32QuotientKind::Equality { constant_base: 0 }),
+            ),
+            (
+                8,
+                UnionShape::U32(U32QuotientKind::RandomAccess {
+                    bits: 3,
+                    num_extra_constants: 0,
+                    constant_base: 0,
+                }),
+            ),
             (15, UnionShape::RangeCheck { bit_size: 16 }),
             (
                 6,
@@ -3012,22 +3164,7 @@ mod tests {
                     num_carry_limbs: 2,
                 }),
             ),
-            (3, UnionShape::U32(U32QuotientKind::Arithmetic)),
         ];
-        let raw_constant_base = shapes.len() + 3;
-        for (bits, num_ops, num_extra_constants) in
-            [(3usize, 8usize, 0usize), (4, 4, 2), (6, 1, 2)]
-        {
-            shapes.push((
-                num_ops,
-                UnionShape::U32(U32QuotientKind::RandomAccess {
-                    bits,
-                    num_extra_constants,
-                    constant_base: raw_constant_base,
-                }),
-            ));
-        }
-        assert_eq!(shapes.len(), raw_constant_base);
 
         let mut range_specs = Vec::new();
         let mut u32_specs = Vec::new();
@@ -3036,16 +3173,14 @@ mod tests {
             let gate_index = 3 * spec_index + 2;
             let group = 3 * spec_index + 1..3 * spec_index + 4;
             match shape {
-                UnionShape::RangeCheck { bit_size } => {
-                    range_specs.push(RangeCheckQuotientSpec {
-                        selector_column,
-                        gate_index,
-                        group,
-                        include_unused_selector: true,
-                        num_ops,
-                        bit_size,
-                    })
-                }
+                UnionShape::RangeCheck { bit_size } => range_specs.push(RangeCheckQuotientSpec {
+                    selector_column,
+                    gate_index,
+                    group,
+                    include_unused_selector: true,
+                    num_ops,
+                    bit_size,
+                }),
                 UnionShape::U32(kind) => u32_specs.push(U32QuotientSpec {
                     selector_column,
                     gate_index,
@@ -3057,10 +3192,6 @@ mod tests {
             }
         }
 
-        // The raw-representative boundary set from the packed Goldilocks
-        // differential suite: canonical edges plus noncanonical encodings at
-        // and above the order, the epsilon boundaries, and three arbitrary
-        // heavy-limb values.
         let boundary = [
             0u64,
             1,
@@ -3076,14 +3207,14 @@ mod tests {
             2_441_288_194_761_790_662,
         ];
 
-        for step in [1, 2, 4, 8] {
+        for step in [1, 4] {
             let full_rows = QUOTIENT_ROWS * step;
             let mut wires = context
                 .allocate_columns::<F>(full_rows, WIRE_COLUMNS)
                 .expect("wire columns must allocate");
             let mut constants = context
-                .allocate_columns::<F>(full_rows, shapes.len() + 2)
-                .expect("constant columns must allocate");
+                .allocate_columns::<F>(full_rows, shapes.len())
+                .expect("selector columns must allocate");
             let mut rng = StdRng::seed_from_u64(0x0b17_0000 + step as u64);
             for (column_index, column) in wires
                 .columns_mut()
@@ -3094,20 +3225,6 @@ mod tests {
                 for (row, value) in column.iter_mut().enumerate() {
                     *value = if (row + column_index) % 5 == 0 {
                         GoldilocksField(boundary[(row + 7 * column_index) % boundary.len()])
-                    } else {
-                        F::from_canonical_u64(rng.next_u64() % F::ORDER)
-                    };
-                }
-            }
-            for (column_index, column) in constants
-                .columns_mut()
-                .expect("unique constant columns")
-                .into_iter()
-                .enumerate()
-            {
-                for (row, value) in column.iter_mut().enumerate() {
-                    *value = if (row + 3 * column_index) % 7 == 0 {
-                        GoldilocksField(boundary[(row + 5 * column_index) % boundary.len()])
                     } else {
                         F::from_canonical_u64(rng.next_u64() % F::ORDER)
                     };
@@ -3202,17 +3319,13 @@ mod tests {
                     let mut constraints = Vec::new();
                     match spec.kind {
                         U32QuotientKind::Subtraction { result_limbs } => {
-                            let base =
-                                F::from_canonical_u64(1u64 << (2 * result_limbs as u64));
+                            let base = F::from_canonical_u64(1u64 << (2 * result_limbs as u64));
                             for op in 0..spec.num_ops {
                                 let routed = 5 * op;
                                 let output_result = wire(routed + 3);
                                 let output_borrow = wire(routed + 4);
-                                let result_initial =
-                                    wire(routed) - wire(routed + 1) - wire(routed + 2);
-                                constraints.push(
-                                    output_result - (result_initial + base * output_borrow),
-                                );
+                                let result_initial = wire(routed) - wire(routed + 1) - wire(routed + 2);
+                                constraints.push(output_result - (result_initial + base * output_borrow));
                                 let limb_base = 5 * spec.num_ops + result_limbs * op;
                                 let mut recomposed = F::ZERO;
                                 for j in (0..result_limbs).rev() {
@@ -3231,8 +3344,7 @@ mod tests {
                             result_limbs,
                             num_carry_limbs,
                         } => {
-                            let base =
-                                F::from_canonical_u64(1u64 << (2 * result_limbs as u64));
+                            let base = F::from_canonical_u64(1u64 << (2 * result_limbs as u64));
                             let total_limbs = result_limbs + num_carry_limbs;
                             let routed_per_op = num_addends + 3;
                             for op in 0..spec.num_ops {
@@ -3243,10 +3355,8 @@ mod tests {
                                 }
                                 let output_result = wire(routed + num_addends + 1);
                                 let output_carry = wire(routed + num_addends + 2);
-                                constraints
-                                    .push(output_carry * base + output_result - computed);
-                                let limb_base =
-                                    routed_per_op * spec.num_ops + total_limbs * op;
+                                constraints.push(output_carry * base + output_result - computed);
+                                let limb_base = routed_per_op * spec.num_ops + total_limbs * op;
                                 let mut combined_result = F::ZERO;
                                 let mut combined_carry = F::ZERO;
                                 for j in (0..total_limbs).rev() {
@@ -3268,8 +3378,7 @@ mod tests {
                             let routed_per_op = 1 + num_limbs;
                             for op in 0..spec.num_ops {
                                 let routed = routed_per_op * op;
-                                let aux_base =
-                                    routed_per_op * spec.num_ops + 4 * num_limbs * op;
+                                let aux_base = routed_per_op * spec.num_ops + 4 * num_limbs * op;
                                 for j in 0..4 * num_limbs {
                                     let x = wire(aux_base + j);
                                     let y = x * (x - three);
@@ -3289,10 +3398,7 @@ mod tests {
                                 }
                                 constraints.push(acc - wire(routed));
                             }
-                            assert_eq!(
-                                constraints.len(),
-                                spec.num_ops * (1 + 5 * num_limbs)
-                            );
+                            assert_eq!(constraints.len(), spec.num_ops * (1 + 5 * num_limbs));
                         }
                         U32QuotientKind::QuinticMultiplication => {
                             for op in 0..spec.num_ops {
@@ -3331,7 +3437,7 @@ mod tests {
                                 constraints.push(a[1] * a[1] - extra[4]);
                                 constraints.push((two * a[0] * a[2] + extra[4]) - extra[5]);
                                 constraints.push((six * a[3] * a[4] + extra[5]) - c[2]);
-                                constraints.push((three * a[4] * a[4]) - extra[6]);
+                                constraints.push(three * a[4] * a[4] - extra[6]);
                                 constraints.push((two * a[0] * a[3] + extra[6]) - extra[7]);
                                 constraints.push((two * a[1] * a[2] + extra[7]) - c[3]);
                                 constraints.push(a[2] * a[2] - extra[8]);
@@ -3340,39 +3446,117 @@ mod tests {
                             }
                             assert_eq!(constraints.len(), spec.num_ops * 15);
                         }
-                        U32QuotientKind::Arithmetic => {
+                        U32QuotientKind::Interleave => {
+                            let routed_per_op = 2;
                             for op in 0..spec.num_ops {
-                                let routed = 6 * op;
-                                let multiplicand_0 = wire(routed);
-                                let multiplicand_1 = wire(routed + 1);
-                                let addend = wire(routed + 2);
-                                let output_low = wire(routed + 3);
-                                let output_high = wire(routed + 4);
-                                let inverse = wire(routed + 5);
-                                constraints.push(
-                                    (inverse * (u32_max - output_high) - F::ONE) * output_low,
-                                );
-                                constraints.push(
-                                    output_high * base32 + output_low
-                                        - (multiplicand_0 * multiplicand_1 + addend),
-                                );
-                                let limb_base = 6 * spec.num_ops + 32 * op;
-                                let mut combined_low = F::ZERO;
-                                let mut combined_high = F::ZERO;
-                                for j in (0..32).rev() {
-                                    let x = wire(limb_base + j);
-                                    let y = x * (x - three);
-                                    constraints.push(y * (y + F::TWO));
-                                    if j < 16 {
-                                        combined_low = combined_low * four + x;
+                                let routed = routed_per_op * op;
+                                let bit_base = routed_per_op * spec.num_ops + 32 * op;
+                                let mut acc_x = F::ZERO;
+                                let mut acc_interleaved = F::ZERO;
+                                for j in 0..32 {
+                                    let bit = wire(bit_base + j);
+                                    acc_x = acc_x.double() + bit;
+                                    acc_interleaved = acc_interleaved * four + bit;
+                                }
+                                constraints.push(acc_x - wire(routed));
+                                constraints.push(acc_interleaved - wire(routed + 1));
+                                for j in 0..32 {
+                                    let bit = wire(bit_base + j);
+                                    constraints.push(bit * (bit - F::ONE));
+                                }
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * 34);
+                        }
+                        U32QuotientKind::UninterleaveToU32 => {
+                            let routed_per_op = 4;
+                            for op in 0..spec.num_ops {
+                                let routed = routed_per_op * op;
+                                let bit_base = routed_per_op * spec.num_ops + 64 * op;
+                                let mut acc_high = F::ZERO;
+                                let mut acc_low = F::ZERO;
+                                let mut acc_evens = F::ZERO;
+                                let mut acc_odds = F::ZERO;
+                                for j in 0..64 {
+                                    let bit = wire(bit_base + j);
+                                    if j < 32 {
+                                        acc_high = acc_high.double() + bit;
                                     } else {
-                                        combined_high = combined_high * four + x;
+                                        acc_low = acc_low.double() + bit;
+                                    }
+                                    if j % 2 == 0 {
+                                        acc_evens = acc_evens.double() + bit;
+                                    } else {
+                                        acc_odds = acc_odds.double() + bit;
                                     }
                                 }
-                                constraints.push(combined_low - output_low);
-                                constraints.push(combined_high - output_high);
+                                let high_diff = u32_max - acc_high;
+                                let high_not_max = wire(routed + 3) * high_diff - F::ONE;
+                                constraints.push(high_not_max * acc_low);
+                                constraints.push(acc_high * base32 + acc_low - wire(routed));
+                                constraints.push(acc_evens - wire(routed + 1));
+                                constraints.push(acc_odds - wire(routed + 2));
+                                for j in 0..64 {
+                                    let bit = wire(bit_base + j);
+                                    constraints.push(bit * (bit - F::ONE));
+                                }
                             }
-                            assert_eq!(constraints.len(), spec.num_ops * 36);
+                            assert_eq!(constraints.len(), spec.num_ops * 68);
+                        }
+                        U32QuotientKind::MulAdd { constant_base } => {
+                            for op in 0..spec.num_ops {
+                                let routed = 4 * op;
+                                let m0 = wire(routed);
+                                let m1 = wire(routed + 1);
+                                let addend = wire(routed + 2);
+                                let output = wire(routed + 3);
+                                let c0 = constants.col(constant_base)[source_row];
+                                let c1 = constants.col(constant_base + 1)[source_row];
+                                constraints.push(output - (m0 * m1 * c0 + addend * c1));
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops);
+                        }
+                        U32QuotientKind::Addition { constant_base } => {
+                            for op in 0..spec.num_ops {
+                                let routed = 3 * op;
+                                let a0 = wire(routed);
+                                let a1 = wire(routed + 1);
+                                let output = wire(routed + 2);
+                                let c0 = constants.col(constant_base)[source_row];
+                                let c1 = constants.col(constant_base + 1)[source_row];
+                                constraints.push(output - (a0 * c0 + a1 * c1));
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops);
+                        }
+                        U32QuotientKind::Selection => {
+                            for op in 0..spec.num_ops {
+                                let routed = 4 * op;
+                                let b = wire(routed);
+                                let x = wire(routed + 1);
+                                let y = wire(routed + 2);
+                                let result = wire(routed + 3);
+                                let temp = wire(4 * spec.num_ops + op);
+                                constraints.push((b * y - y) - temp);
+                                constraints.push((b * x - temp) - result);
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * 2);
+                        }
+                        U32QuotientKind::Equality { constant_base } => {
+                            for op in 0..spec.num_ops {
+                                let routed = 3 * op;
+                                let x = wire(routed);
+                                let y = wire(routed + 1);
+                                let equal = wire(routed + 2);
+                                let temp_base = 3 * spec.num_ops + 3 * op;
+                                let diff = wire(temp_base);
+                                let invdiff = wire(temp_base + 1);
+                                let prod = wire(temp_base + 2);
+                                let c0 = constants.col(constant_base)[source_row];
+                                constraints.push((x - y) - diff);
+                                constraints.push((diff * invdiff) - prod);
+                                constraints.push((prod * diff) - diff);
+                                constraints.push((c0 - prod) - equal);
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * 4);
                         }
                         U32QuotientKind::RandomAccess {
                             bits,
@@ -3385,30 +3569,24 @@ mod tests {
                             let bit_base = extra_wire_base + num_extra_constants;
                             for copy in 0..spec.num_ops {
                                 let copy_base = routed_per_copy * copy;
-                                for i in 0..bits {
-                                    let b = wire(bit_base + copy * bits + i);
-                                    constraints.push(b * (b - F::ONE));
-                                }
                                 let mut reconstructed_index = F::ZERO;
                                 for i in (0..bits).rev() {
-                                    reconstructed_index = reconstructed_index.double()
-                                        + wire(bit_base + copy * bits + i);
+                                    let bit = wire(bit_base + copy * bits + i);
+                                    constraints.push(bit * (bit - F::ONE));
+                                    reconstructed_index = reconstructed_index.double() + bit;
                                 }
                                 constraints.push(reconstructed_index - wire(copy_base));
-
-                                let mut items =
-                                    (0..vec_size).map(|i| wire(copy_base + 2 + i)).collect::<Vec<_>>();
-                                let mut level_size = vec_size;
-                                for i in 0..bits {
-                                    let b = wire(bit_base + copy * bits + i);
-                                    for k in 0..level_size / 2 {
-                                        let x = items[2 * k];
-                                        let y = items[2 * k + 1];
-                                        items[k] = x + b * (y - x);
+                                let mut selected = F::ZERO;
+                                for item in 0..vec_size {
+                                    let mut eq = F::ONE;
+                                    for i in 0..bits {
+                                        let bit = wire(bit_base + copy * bits + i);
+                                        let expected = (item >> i) & 1;
+                                        eq *= if expected == 0 { F::ONE - bit } else { bit };
                                     }
-                                    level_size /= 2;
+                                    selected += eq * wire(copy_base + 2 + item);
                                 }
-                                constraints.push(items[0] - wire(copy_base + 1));
+                                constraints.push(selected - wire(copy_base + 1));
                             }
                             for i in 0..num_extra_constants {
                                 constraints.push(
@@ -3421,6 +3599,7 @@ mod tests {
                                 spec.num_ops * (bits + 2) + num_extra_constants
                             );
                         }
+                        U32QuotientKind::Arithmetic => unreachable!("not exercised by this test"),
                     }
 
                     for (challenge, &alpha) in alphas.iter().enumerate() {

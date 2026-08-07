@@ -34,9 +34,9 @@ pub struct RangeCheckQuotientGate {
     pub bit_size: usize,
 }
 
-/// Static wire-layout metadata for gates supported by the optional combined
-/// quotient backend. Keeping only layout values here avoids a dependency from
-/// `plonky2` back to downstream circuit crates.
+/// Static wire-layout metadata for the downstream 32-bit arithmetic gates
+/// supported by the optional quotient backend. Keeping only layout values
+/// here avoids a dependency from `plonky2` back to the circuit crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum U32QuotientGate {
     Arithmetic {
@@ -58,19 +58,44 @@ pub enum U32QuotientGate {
         num_carry_limbs: usize,
     },
     /// Byte decomposition: `1 + num_limbs` routed words (sum then bytes)
-    /// plus `4 * num_limbs` base-4 aux limbs per operation,
+    /// plus `4 * num_limbs` base-4 auxiliary limbs per operation, with
     /// `1 + 5 * num_limbs` constraint rows per operation.
-    ByteDecomposition { num_ops: usize, num_limbs: usize },
+    ByteDecomposition {
+        num_ops: usize,
+        num_limbs: usize,
+    },
     /// Degree-5 extension-field multiplication over the base field: fifteen
-    /// routed words per operation (five limbs each for the two inputs and
-    /// the output), five constraint rows per operation.
+    /// routed words per operation and five constraint rows per operation.
     QuinticMultiplication { num_ops: usize },
-    /// Degree-5 extension-field squaring over the base field: ten routed
-    /// words (input and output limbs) plus ten temporary wires per
-    /// operation, fifteen constraint rows per operation.
+    /// Degree-5 extension-field squaring: twenty wires and fifteen rows per
+    /// operation (ten routed words plus ten temporary wires).
     QuinticSquaring { num_ops: usize },
-    /// Random access with a little-endian binary index, `2^bits` list items
-    /// per copy, and optional routed local constants.
+    /// Bit-interleaving a U32 with zeroes: two routed words and 32 bit wires
+    /// per operation, with 34 constraint rows per operation (recomposition of
+    /// the routed value, recomposition of the base-4 interleaved value, then
+    /// 32 bit range checks).
+    Interleave { num_ops: usize },
+    /// De-interleaving a 64-bit interleaved word into its even and odd U32
+    /// halves: four routed words and 64 bit wires per operation, with 68
+    /// constraint rows per operation (a 2^32 canonicity check, the combined
+    /// recomposition, the even/odd half recompositions, then 64 bit range
+    /// checks).
+    UninterleaveToU32 { num_ops: usize },
+    /// Generic mul-add: four routed wires per operation (multiplicand_0,
+    /// multiplicand_1, addend, output) with one constraint row per operation
+    /// and two shared gate constants.
+    MulAdd { num_ops: usize },
+    /// Generic two-term linear combination: three routed wires per operation
+    /// with one constraint row per operation and two shared gate constants.
+    Addition { num_ops: usize },
+    /// Select between two elements: four routed wires and one temporary wire
+    /// per operation, with two constraint rows per operation.
+    Selection { num_ops: usize },
+    /// Equality check: three routed and three temporary wires per operation,
+    /// with four constraint rows per operation and one shared gate constant.
+    Equality { num_ops: usize },
+    /// Random-access lookup with a binary index. The constant base is the
+    /// starting column in the local constants table.
     RandomAccess {
         bits: usize,
         num_ops: usize,
@@ -330,8 +355,8 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         None
     }
 
-    /// Advertises one of the exact promoted gate layouts to optional quotient
-    /// backends. The default leaves unrelated gates on the CPU.
+    /// Advertises one of the exact downstream U32 gate layouts to optional
+    /// quotient backends. The default leaves unrelated gates on the CPU.
     fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
         None
     }

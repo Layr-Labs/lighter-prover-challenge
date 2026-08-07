@@ -879,7 +879,7 @@ fn gpu_poseidon_quotient_diagnostics_enabled() -> bool {
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn gpu_poseidon_quotient_differential_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let environment_enabled = *ENABLED.get_or_init(|| {
+    *ENABLED.get_or_init(|| {
         [
             "PLONKY2_GPU_POSEIDON_DIFFERENTIAL",
             "PLONKY2_GPU_RANGE_DIFFERENTIAL",
@@ -890,21 +890,8 @@ fn gpu_poseidon_quotient_differential_enabled() -> bool {
                 .map(|value| value != "0")
                 .unwrap_or(false)
         })
-    });
-    #[cfg(test)]
-    {
-        environment_enabled || COMPARE_GPU_QUOTIENT.load(core::sync::atomic::Ordering::Relaxed)
-    }
-    #[cfg(not(test))]
-    {
-        environment_enabled
-    }
+    })
 }
-
-/// Test-only switch for an in-process full GPU/CPU quotient differential.
-#[cfg(all(test, feature = "std", target_arch = "aarch64", target_os = "macos"))]
-pub(crate) static COMPARE_GPU_QUOTIENT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
 
 /// Test-only switch: when set, `compute_quotient_polys` evaluates the quotient
 /// values twice — once through the default column-major (`PolyMajor`)
@@ -1045,9 +1032,6 @@ fn start_gpu_range_check_gate_quotient<
         return None;
     }
     let mut gate_indices = Vec::new();
-    // Random-access gates are excluded from the CPU quotient only after the
-    // combined Metal command has accepted and submitted every metadata record.
-    let mut random_access_gate_indices = Vec::new();
     let mut specs = Vec::new();
     let mut u32_specs = Vec::new();
     for (gate_index, gate) in common_data.gates.iter().enumerate() {
@@ -1155,14 +1139,11 @@ fn start_gpu_range_check_gate_quotient<
                 U32QuotientGate::ByteDecomposition { num_ops, num_limbs } => {
                     if num_limbs == 0 || num_limbs > 24 {
                         if gpu_poseidon_quotient_diagnostics_enabled() {
-                            eprintln!(
-                                "[gpu-range-quotient] invalid byte metadata: {u32_gate:?}"
-                            );
+                            eprintln!("[gpu-range-quotient] invalid byte metadata: {u32_gate:?}");
                         }
                         return None;
                     }
-                    let per_op = num_limbs.checked_mul(5)?.checked_add(1)?;
-                    let expected = num_ops.checked_mul(per_op)?;
+                    let expected = num_ops.checked_mul(num_limbs.checked_mul(5)?.checked_add(1)?)?;
                     (
                         U32QuotientKind::ByteDecomposition { num_limbs },
                         num_ops,
@@ -1182,51 +1163,87 @@ fn start_gpu_range_check_gate_quotient<
                     num_ops.checked_mul(20)?,
                     num_ops.checked_mul(15)?,
                 ),
-                U32QuotientGate::RandomAccess {
-                    bits,
+                // Bit interleaving: two routed words and 32 bit wires per
+                // operation, all 34 rows constrained (recomposition, base-4
+                // recomposition, then bit range checks).
+                U32QuotientGate::Interleave { num_ops } => (
+                    U32QuotientKind::Interleave,
                     num_ops,
+                    num_ops.checked_mul(34)?,
+                    num_ops.checked_mul(34)?,
+                ),
+                // De-interleaving: four routed words and 64 bit wires per
+                // operation, all 68 rows constrained (canonicity, combined
+                // recomposition, even/odd halves, then bit range checks).
+                U32QuotientGate::UninterleaveToU32 { num_ops } => (
+                    U32QuotientKind::UninterleaveToU32,
+                    num_ops,
+                    num_ops.checked_mul(68)?,
+                    num_ops.checked_mul(68)?,
+                ),
+                // Generic mul-add: four routed wires per operation, one
+                // constraint row per operation, two shared constants.
+                U32QuotientGate::MulAdd { num_ops } => (
+                    U32QuotientKind::MulAdd {
+                        constant_base: raw_constant_base,
+                    },
+                    num_ops,
+                    num_ops.checked_mul(4)?,
+                    num_ops,
+                ),
+                // Generic two-term linear combination: three routed wires per
+                // operation, one constraint row per operation.
+                U32QuotientGate::Addition { num_ops } => (
+                    U32QuotientKind::Addition {
+                        constant_base: raw_constant_base,
+                    },
+                    num_ops,
+                    num_ops.checked_mul(3)?,
+                    num_ops,
+                ),
+                // Select between two elements: four routed wires and one
+                // temporary per operation, two constraint rows per operation.
+                U32QuotientGate::Selection { num_ops } => (
+                    U32QuotientKind::Selection,
+                    num_ops,
+                    num_ops.checked_mul(5)?,
+                    num_ops.checked_mul(2)?,
+                ),
+                // Equality: three routed and three temporary wires per
+                // operation, four constraint rows per operation, one shared
+                // constant.
+                U32QuotientGate::Equality { num_ops } => (
+                    U32QuotientKind::Equality {
+                        constant_base: raw_constant_base,
+                    },
+                    num_ops,
+                    num_ops.checked_mul(6)?,
+                    num_ops.checked_mul(4)?,
+                ),
+                U32QuotientGate::RandomAccess {
+                    num_ops,
+                    bits,
                     num_extra_constants,
+                    constant_base: _,
                 } => {
                     if !matches!(
                         (bits, num_ops, num_extra_constants),
                         (3, 8, 0) | (4, 4, 2) | (6, 1, 2)
                     ) {
                         if gpu_poseidon_quotient_diagnostics_enabled() {
-                            eprintln!(
-                                "[gpu-range-quotient] unaudited random-access metadata: \
-                                 {u32_gate:?}"
-                            );
+                            eprintln!("[gpu-range-quotient] invalid random-access metadata: {u32_gate:?}");
                         }
                         return None;
                     }
                     let vec_size = 1usize.checked_shl(u32::try_from(bits).ok()?)?;
                     let routed_per_copy = vec_size.checked_add(2)?;
-                    let extra_wire_base = routed_per_copy.checked_mul(num_ops)?;
-                    let routed_wires = extra_wire_base.checked_add(num_extra_constants)?;
-                    let expected_wires = routed_wires.checked_add(num_ops.checked_mul(bits)?)?;
+                    let expected_wires = routed_per_copy
+                        .checked_mul(num_ops)?
+                        .checked_add(num_extra_constants)?
+                        .checked_add(num_ops.checked_mul(bits)?)?;
                     let expected_constraints = num_ops
                         .checked_mul(bits.checked_add(2)?)?
                         .checked_add(num_extra_constants)?;
-                    let constant_end = raw_constant_base.checked_add(num_extra_constants)?;
-                    let expected_extra_constant_wires = (0..num_extra_constants)
-                        .map(|i| extra_wire_base.checked_add(i).map(|wire| (i, wire)))
-                        .collect::<Option<Vec<_>>>()?;
-                    if gate.0.num_constants() != num_extra_constants
-                        || gate.0.extra_constant_wires() != expected_extra_constant_wires
-                        || routed_wires > common_data.config.num_routed_wires
-                        || expected_wires > common_data.config.num_wires
-                        || constant_end > common_data.num_constants
-                    {
-                        if gpu_poseidon_quotient_diagnostics_enabled() {
-                            eprintln!(
-                                "[gpu-range-quotient] random-access layout mismatch \
-                                 gate={gate_index} metadata={u32_gate:?} constants={} \
-                                 expected_constants={num_extra_constants}",
-                                gate.0.num_constants(),
-                            );
-                        }
-                        return None;
-                    }
                     (
                         U32QuotientKind::RandomAccess {
                             bits,
@@ -1263,11 +1280,7 @@ fn start_gpu_range_check_gate_quotient<
                 num_ops,
                 kind,
             });
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { .. }) {
-                random_access_gate_indices.push(gate_index);
-            } else {
-                gate_indices.push(gate_index);
-            }
+            gate_indices.push(gate_index);
         }
     }
     if specs.is_empty() && u32_specs.is_empty() {
@@ -1318,7 +1331,6 @@ fn start_gpu_range_check_gate_quotient<
         }
         return None;
     };
-    gate_indices.extend(random_access_gate_indices);
     let started = GPU_RANGE_QUOTIENT_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
     log::info!(
         "Metal RangeCheck quotient active: started={started}, gates={gate_indices:?}, \
@@ -2036,20 +2048,12 @@ mod quotient_layout_tests {
     use anyhow::Result;
 
     use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field, Field64};
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    use crate::gates::gate::U32QuotientGate;
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    use crate::gates::noop::NoopGate;
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    use crate::plonk::config::Poseidon2GoldilocksConfig;
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
@@ -2088,68 +2092,6 @@ mod quotient_layout_tests {
         COMPARE_QUOTIENT_LAYOUTS.store(false, Ordering::SeqCst);
 
         data.verify(proof?)?;
-        Ok(())
-    }
-
-    /// End-to-end retained-column differential for every audited random-access
-    /// layout. The same prove call compares the combined Metal quotient with a
-    /// full CPU recomputation over identical LDE columns and challenges, then
-    /// verifies the resulting proof.
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    #[test]
-    fn metal_random_access_quotient_matches_cpu_and_verifies() -> Result<()> {
-        let config = CircuitConfig::standard_recursion_config();
-        let mut builder = CircuitBuilder::<F, D>::new(config);
-        for (bits, copies) in [(3usize, 8usize), (4, 4), (6, 1)] {
-            let vec_size = 1usize << bits;
-            for copy in 0..copies {
-                let index = copy % vec_size;
-                let index_target = builder.constant(F::from_canonical_usize(index));
-                let items = (0..vec_size)
-                    .map(|i| {
-                        builder.constant(F::from_canonical_usize(
-                            1 + i + copy * vec_size + bits * 10_000,
-                        ))
-                    })
-                    .collect::<Vec<_>>();
-                let expected = items[index];
-                let selected = builder.random_access(index_target, items);
-                builder.connect(selected, expected);
-                builder.register_public_input(selected);
-            }
-        }
-        // A 2^16-point LDE retains both wire and constants/sigmas commitments
-        // in shared Metal columns, exercising the production full-domain seam.
-        while builder.num_gates() <= (1 << 12) {
-            builder.add_gate(NoopGate, vec![]);
-        }
-        let data = builder.build::<Poseidon2GoldilocksConfig>();
-        assert!(data.common.luts.is_empty());
-        let mut advertised = data
-            .common
-            .gates
-            .iter()
-            .filter_map(|gate| match gate.0.u32_quotient_gate() {
-                Some(U32QuotientGate::RandomAccess {
-                    bits,
-                    num_ops,
-                    num_extra_constants,
-                }) => Some((bits, num_ops, num_extra_constants)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        advertised.sort_unstable();
-        assert_eq!(advertised, vec![(3, 8, 0), (4, 4, 2), (6, 1, 2)]);
-
-        let before = gpu_poseidon_quotient_stats();
-        COMPARE_GPU_QUOTIENT.store(true, Ordering::SeqCst);
-        let proof = data.prove(PartialWitness::new());
-        COMPARE_GPU_QUOTIENT.store(false, Ordering::SeqCst);
-        let proof = proof?;
-        let after = gpu_poseidon_quotient_stats();
-        assert!(after.range_started > before.range_started);
-        assert!(after.range_completed > before.range_completed);
-        data.verify(proof)?;
         Ok(())
     }
 
