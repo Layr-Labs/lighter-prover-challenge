@@ -1365,12 +1365,17 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // gathers read the same values. Extract them once (bounded by 1 GiB so
         // the final block circuit — which is proven once — stays uncached) and
         // let the quotient batch loop copy instead of re-walking the LDE.
+        // At step == 1 the cache would duplicate the retained LDE verbatim;
+        // the `None` fallback reads the identical bytes (mirrored in
+        // `circuit/src/embed.rs` to keep both paths value-identical).
         let quotient_degree_bits = log2_ceil(common.quotient_degree_factor);
         let (constants_sigmas_quotient_cache, constants_sigmas_quotient_step, constants_sigmas_quotient_domain) = {
             let step = 1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
             let domain = 1 << (common.degree_bits() + quotient_degree_bits);
             let cols = common.constants_range().len() + common.sigmas_range().len();
-            if cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
+            if step == 1 {
+                (None, step, domain)
+            } else if cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
                 match (
                     constants_sigmas_commitment.extract_lde_batch_columns(
                         step,
