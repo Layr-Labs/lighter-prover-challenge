@@ -45,39 +45,6 @@ fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
     (light, heavy)
 }
 
-/// Marks the calling thread as latency-critical to the macOS scheduler.
-///
-/// The 49 sequential chain folds are the whole critical path of a block
-/// bundle: every serial section of a fold (witness feed, opening
-/// evaluation, FRI reduce, transcript work) runs on a chain-step thread
-/// while the global worker pool is saturated by transaction proving that
-/// hides behind the spine anyway. At default QoS those serial sections
-/// compete for cores on equal terms with hideable bulk work and are
-/// eligible for efficiency-core placement; per-statement profiling of the
-/// fold pipeline shows episodic multi-hundred-millisecond stalls between
-/// instrumented spans under exactly this contention. `USER_INTERACTIVE`
-/// asks the scheduler to keep the fold thread on a performance core and
-/// schedule it ahead of default-QoS pool workers. This changes thread
-/// scheduling only: no work is added, moved, or reordered, and proof
-/// bytes are untouched. On non-macOS targets this is a no-op.
-#[cfg(target_os = "macos")]
-fn mark_spine_thread_latency_critical() {
-    // `QOS_CLASS_USER_INTERACTIVE` is 0x21 in <sys/qos.h>.
-    #[allow(non_camel_case_types)]
-    type qos_class_t = u32;
-    unsafe extern "C" {
-        fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
-    }
-    // Best-effort: a nonzero return leaves the thread at its previous QoS,
-    // which is exactly the pre-change behavior.
-    unsafe {
-        let _ = pthread_set_qos_class_self_np(0x21, 0);
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn mark_spine_thread_latency_critical() {}
-
 enum ChainState<'scope> {
     Ready(Proof),
     InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
@@ -102,17 +69,17 @@ fn chain_step_proof(
     chain_step: u64,
     previous: Option<ChainState<'_>>,
     base_proof: &Proof,
-    constant_inputs: &plonky2::iop::witness::PartialWitness<F>,
+    dummy_proof: &Proof,
     tx_proof: &Proof,
 ) -> Proof {
-    mark_spine_thread_latency_critical();
     let result = (|| {
         // Phase 1: run every generator that does not depend on the previous chain proof while
         // that proof may still be in flight.
-        let early_inputs = BlockTxChainCircuit::witness_inputs_early_from_template(
-            constant_inputs,
+        let early_inputs = BlockTxChainCircuit::witness_inputs_early(
             chain_target,
+            chain_data,
             chain_step,
+            dummy_proof,
             tx_proof,
         )?;
         let mut pending = PendingPartitionWitness::start(
@@ -219,6 +186,10 @@ fn prove_path(
     pre_output: &BlockPreExecWitness<F>,
     state_metadata_hash: HashOut<F>,
 ) -> Proof {
+    // Register this path as a live pipeline: the heavy and light paths run
+    // concurrently, so neither may lower the GPU routing cutoff while the other
+    // is still dispatching chunk work.
+    plonky2::hash::poseidon2::enter_concurrent_pipeline();
     assert!(
         !chunks.is_empty(),
         "{path:?} transaction path must contain at least one chunk"
@@ -264,16 +235,8 @@ fn prove_path(
     );
     jump = next_jump;
 
-    let chain_constant_inputs = BlockTxChainCircuit::witness_inputs_constant(
-        chain_target,
-        chain_data,
-        dummy_proof,
-    )
-    .expect("chain constant witness inputs failed");
-
     std::thread::scope(|scope| {
         let base = &base_proof;
-        let chain_constant = &chain_constant_inputs;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
@@ -295,7 +258,7 @@ fn prove_path(
                             chain_step,
                             previous,
                             base,
-                            chain_constant,
+                            dummy_proof,
                             &tx_proof,
                         )
                     })
@@ -367,7 +330,7 @@ fn prove_path(
                         chain_step,
                         previous,
                         base,
-                        chain_constant,
+                        dummy_proof,
                         &tx_proof,
                     )
                 })
@@ -378,6 +341,10 @@ fn prove_path(
         // below is the strictly sequential chain tail, so its mid-size
         // commitment trees can use the mostly idle GPU exactly like the
         // pre-execution and final block phases.
+        // This path dispatches no further concurrent work; drop its
+        // registration before claiming the exclusive-phase hint. The hint only
+        // takes effect once every other pipeline has done the same.
+        plonky2::hash::poseidon2::exit_concurrent_pipeline();
         plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
         while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
             let tx_proof = proof_handle
@@ -391,7 +358,7 @@ fn prove_path(
                 chain_step,
                 previous,
                 base,
-                chain_constant,
+                dummy_proof,
                 &tx_proof,
             )));
         }
@@ -439,7 +406,12 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
             let block_circuit_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, || circuits.build_block_circuit())
+                .spawn_scoped(scope, || {
+                    plonky2::hash::poseidon2::enter_concurrent_pipeline();
+                    let built = circuits.build_block_circuit();
+                    plonky2::hash::poseidon2::exit_concurrent_pipeline();
+                    built
+                })
                 .expect("block circuit build thread must start");
             let heavy_handle = std::thread::Builder::new()
                 .name("heavy-tx-chain".into())

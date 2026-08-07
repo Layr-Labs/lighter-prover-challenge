@@ -1,12 +1,15 @@
 #[cfg(not(feature = "std"))]
 use alloc::{
     boxed::Box,
+    collections::BTreeMap,
     string::{String, ToString},
     vec,
     vec::Vec,
 };
 use core::fmt::Debug;
 use core::marker::PhantomData;
+#[cfg(feature = "std")]
+use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow};
 use plonky2_maybe_rayon::*;
@@ -175,8 +178,9 @@ fn run_generator_worklist<
                         );
                         entries.push((generator_idx, finished, round_buffer.target_values.len()));
                         for (t, v) in round_buffer.target_values.drain(..) {
-                            let rep_index =
-                                round_witness.representative_map[round_witness.target_index(t)];
+                            let rep_index = round_witness.representative_map
+                                [round_witness.target_index(t)]
+                                as usize;
                             let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
                                 generator_indices_by_watches.get(&rep_index)
                             } else {
@@ -265,6 +269,41 @@ fn run_generator_worklist<
     Ok(())
 }
 
+/// Seeds `inputs` into `witness` and returns, per generator, the number of distinct
+/// representatives it watches that are still unpopulated.
+///
+/// A generator can run once every distinct representative it watches has a value. The count is
+/// therefore `(total distinct representatives watched) - (those already populated)`. The first
+/// term is `generator_watch_counts`, derived once at circuit-build time; the second is accumulated
+/// here by decrementing each watcher of a representative at the moment that representative is
+/// *first* populated. `set_target_returning_rep` returns the representative only on first
+/// population, so aliased or duplicated inputs decrement at most once and no counter can
+/// underflow. This is the exact complement of the previous initialization, which instead walked
+/// the entire representative-keyed watcher map on every proof and counted the unpopulated
+/// entries — an O(total watch edges) traversal of prover data that is identical for every proof of
+/// a given circuit, repeated once per proof.
+fn seed_inputs_and_unresolved_watches<F: Field>(
+    witness: &mut PartitionWitness<F>,
+    inputs: PartialWitness<F>,
+    generator_watch_counts: &[usize],
+    generator_indices_by_watches: &BTreeMap<usize, Vec<usize>>,
+) -> Result<Vec<usize>> {
+    let mut unresolved_watches = generator_watch_counts.to_vec();
+
+    for (t, v) in inputs.target_values.into_iter() {
+        if let Some(watch) = witness.set_target_returning_rep(t, v)? {
+            if let Some(watchers) = generator_indices_by_watches.get(&watch) {
+                for &generator_idx in watchers {
+                    debug_assert_ne!(unresolved_watches[generator_idx], 0);
+                    unresolved_watches[generator_idx] -= 1;
+                }
+            }
+        }
+    }
+
+    Ok(unresolved_watches)
+}
+
 /// Resumable witness generation: [`Self::start`] seeds an initial set of inputs and runs every
 /// generator that can already make progress, each [`Self::feed`] sets newly available inputs and
 /// resumes only the generators watching them, and [`Self::finish`] performs the same completeness
@@ -322,7 +361,6 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         parallel_threshold: usize,
     ) -> Result<Self> {
         let generators = &prover_data.generators;
-        let generator_indices_by_watches = &prover_data.generator_indices_by_watches;
 
         let mut witness = PartitionWitness::new(
             common_data.config.num_wires,
@@ -330,21 +368,12 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &prover_data.representative_map,
         );
 
-        for (t, v) in inputs.target_values.into_iter() {
-            witness.set_target(t, v)?;
-        }
-
-        // A simple generator can run once all of the distinct representatives it watches have
-        // values. Derive those unresolved counts from the existing watcher index so this remains
-        // local witness state and does not add anything to serialized prover data.
-        let mut unresolved_watches = vec![0usize; generators.len()];
-        for (&watch, watchers) in generator_indices_by_watches {
-            if !witness.is_set_by_rep_index(watch) {
-                for &generator_idx in watchers {
-                    unresolved_watches[generator_idx] += 1;
-                }
-            }
-        }
+        let mut unresolved_watches = seed_inputs_and_unresolved_watches(
+            &mut witness,
+            inputs,
+            &prover_data.generator_watch_counts,
+            &prover_data.generator_indices_by_watches,
+        )?;
 
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
@@ -979,6 +1008,190 @@ mod tests {
             inputs.set_target(t, v)?;
         }
         Ok(inputs)
+    }
+
+    /// The initialization that `seed_inputs_and_unresolved_watches` replaced: seed every input,
+    /// then walk the entire representative-keyed watcher map counting, per generator, the
+    /// still-unpopulated representatives it watches. Kept as an in-test oracle.
+    fn legacy_seed_inputs_and_unresolved_watches<
+        C: GenericConfig<D, F = F>,
+        const D: usize,
+    >(
+        witness: &mut PartitionWitness<F>,
+        inputs: PartialWitness<F>,
+        prover_data: &ProverOnlyCircuitData<F, C, D>,
+    ) -> Result<Vec<usize>>
+    where
+        F: RichField + Extendable<D>,
+    {
+        for (t, v) in inputs.target_values.into_iter() {
+            witness.set_target(t, v)?;
+        }
+
+        let mut unresolved_watches = vec![0usize; prover_data.generators.len()];
+        for (&watch, watchers) in &prover_data.generator_indices_by_watches {
+            if !witness.is_set_by_rep_index(watch) {
+                for &generator_idx in watchers {
+                    unresolved_watches[generator_idx] += 1;
+                }
+            }
+        }
+        Ok(unresolved_watches)
+    }
+
+    /// M2 differential: the precomputed-count initialization must produce exactly the vector the
+    /// removed whole-map scan produced, for every seeding of the inputs. `unresolved_watches` is
+    /// the only state M2 touches, so equality here implies an identical generator schedule.
+    #[test]
+    fn precomputed_watch_counts_match_legacy_map_scan() -> Result<()> {
+        let (outer, early_inputs, late_inputs) = two_inner_proof_fixture()?;
+        let prover_data = &outer.prover_only;
+
+        // The builder-derived counts must equal the number of watcher-list occurrences of each
+        // generator across the whole map (the "no representative is populated yet" case).
+        let mut occurrences = vec![0usize; prover_data.generators.len()];
+        for watchers in prover_data.generator_indices_by_watches.values() {
+            for &generator_idx in watchers {
+                occurrences[generator_idx] += 1;
+            }
+        }
+        assert_eq!(
+            prover_data.generator_watch_counts, occurrences,
+            "builder-derived watch counts disagree with the watcher index"
+        );
+
+        // Watcher lists are deduplicated, so a count is the number of *distinct* representatives.
+        for watchers in prover_data.generator_indices_by_watches.values() {
+            let mut sorted = watchers.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(&sorted, watchers, "watcher list is not deduplicated/sorted");
+        }
+
+        for inputs in [
+            PartialWitness::new(),
+            early_inputs.clone(),
+            late_inputs.clone(),
+            merged_inputs(&early_inputs, &late_inputs)?,
+        ] {
+            let mut new_witness = PartitionWitness::new(
+                outer.common.config.num_wires,
+                outer.common.degree(),
+                &prover_data.representative_map,
+            );
+            let new_counts = seed_inputs_and_unresolved_watches(
+                &mut new_witness,
+                inputs.clone(),
+                &prover_data.generator_watch_counts,
+                &prover_data.generator_indices_by_watches,
+            )?;
+
+            let mut legacy_witness = PartitionWitness::new(
+                outer.common.config.num_wires,
+                outer.common.degree(),
+                &prover_data.representative_map,
+            );
+            let legacy_counts = legacy_seed_inputs_and_unresolved_watches(
+                &mut legacy_witness,
+                inputs,
+                prover_data,
+            )?;
+
+            assert_eq!(
+                new_counts, legacy_counts,
+                "unresolved-watch counts diverge from the legacy map scan"
+            );
+            assert_eq!(new_witness.values, legacy_witness.values);
+            assert_eq!(new_witness.set_bitmap, legacy_witness.set_bitmap);
+        }
+
+        Ok(())
+    }
+
+    /// The precomputed count is the number of *distinct* representatives, so duplicated
+    /// dependencies and copy-constraint aliases of the same value collapse to one.
+    #[test]
+    fn watch_counts_collapse_duplicates_and_aliases() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let initial = builder.add_virtual_target();
+        let first = builder.constant(F::from_canonical_u64(3));
+        let first_alias = builder.add_virtual_target();
+        builder.connect(first, first_alias);
+        let second = builder.add_virtual_target();
+        let output = builder.add_virtual_target();
+        let dependency_calls = Arc::new(AtomicUsize::new(0));
+        let run_calls = Arc::new(AtomicUsize::new(0));
+
+        builder.add_simple_generator(CountingSimpleGenerator {
+            // Six dependencies over three distinct representatives: `initial` twice, `first` and
+            // `first_alias` (copy-constrained), and `second` twice (connected to `first`).
+            dependencies: vec![initial, initial, first, first_alias, second, second],
+            output,
+            dependency_calls: Arc::clone(&dependency_calls),
+            run_calls: Arc::clone(&run_calls),
+        });
+        builder.generate_copy(first, second);
+        builder.register_public_input(output);
+
+        let circuit = builder.build::<C>();
+        let generator_idx = circuit
+            .prover_only
+            .generators
+            .iter()
+            .position(|g| g.0.id() == "CountingSimpleGenerator")
+            .expect("test generator missing");
+        // `first` and `first_alias` are copy-constrained into one representative; `second` is
+        // populated by a `CopyGenerator` and keeps its own. Three distinct watches, not six.
+        assert_eq!(
+            circuit.prover_only.generator_watch_counts[generator_idx], 3,
+            "duplicated and aliased dependencies were not collapsed"
+        );
+
+        let mut inputs = PartialWitness::new();
+        inputs
+            .set_target(initial, F::from_canonical_u64(5))
+            .unwrap();
+        let witness =
+            generate_partial_witness(inputs, &circuit.prover_only, &circuit.common).unwrap();
+        assert_eq!(witness.get_target(output), F::from_canonical_u64(22));
+        assert_eq!(run_calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// M1 differential: the fused `full_witness` drain over the narrowed `u32` map must produce
+    /// the same matrix, cell for cell as raw canonical `u64`s, as resolving every wire through
+    /// the per-target read path.
+    #[test]
+    fn full_witness_matches_per_target_reads() -> Result<()> {
+        use crate::field::types::PrimeField64;
+
+        let (outer, early_inputs, late_inputs) = two_inner_proof_fixture()?;
+        let inputs = merged_inputs(&early_inputs, &late_inputs)?;
+        let witness = generate_partial_witness(inputs, &outer.prover_only, &outer.common)?;
+
+        let num_wires = outer.common.config.num_wires;
+        let degree = outer.common.degree();
+        let expected: Vec<Vec<u64>> = (0..num_wires)
+            .map(|column| {
+                (0..degree)
+                    .map(|row| {
+                        witness
+                            .try_get_target(Target::Wire(Wire { row, column }))
+                            .unwrap_or(F::ZERO)
+                            .to_canonical_u64()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let matrix = witness.full_witness();
+        let actual: Vec<Vec<u64>> = matrix
+            .wire_values
+            .iter()
+            .map(|column| column.iter().map(|v| v.to_canonical_u64()).collect())
+            .collect();
+
+        assert_eq!(actual, expected);
+        Ok(())
     }
 
     fn count_random_generators(

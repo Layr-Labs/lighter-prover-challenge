@@ -163,14 +163,38 @@ static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShare
 /// serialized GPU stream. Process-global on purpose: the phases it brackets
 /// are the only proving work alive, and tree builds may run on rayon workers,
 /// which a thread-local would not reach.
-static EXCLUSIVE_GPU_PHASE: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static EXCLUSIVE_CLAIMS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Number of proving pipelines currently dispatching concurrent work. The
+/// exclusive-phase hint is honoured only while this is zero, because the low
+/// routing cutoff is safe exactly when nothing else can contend for the
+/// serialized GPU stream.
+static ACTIVE_PIPELINES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 /// Marks the start/end of an exclusive serial proving phase during which the
 /// GPU routing cutoff drops to [`EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS`].
 /// Callers must guarantee no other proof runs concurrently while enabled.
 pub fn set_exclusive_gpu_phase(enabled: bool) {
-    EXCLUSIVE_GPU_PHASE.store(enabled, core::sync::atomic::Ordering::Relaxed);
+    if enabled {
+        EXCLUSIVE_CLAIMS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    } else {
+        EXCLUSIVE_CLAIMS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Marks a proving pipeline as actively dispatching concurrent work. While any
+/// pipeline is registered the exclusive-phase hint is suppressed, so one path
+/// entering its serial tail cannot lower the routing cutoff underneath another
+/// path that is still at full tilt.
+pub fn enter_concurrent_pipeline() {
+    ACTIVE_PIPELINES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Releases a registration taken by [`enter_concurrent_pipeline`].
+pub fn exit_concurrent_pipeline() {
+    ACTIVE_PIPELINES.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bool {
@@ -180,7 +204,9 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
         leaf_width.div_ceil(8) * leaf_count
     };
     let parent_permutations = leaf_count - (1usize << cap_height);
-    let min_permutations = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
+    let exclusive = EXCLUSIVE_CLAIMS.load(core::sync::atomic::Ordering::Relaxed) > 0
+        && ACTIVE_PIPELINES.load(core::sync::atomic::Ordering::Relaxed) == 0;
+    let min_permutations = if exclusive {
         EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS
     } else {
         MIN_GPU_PERMUTATIONS
