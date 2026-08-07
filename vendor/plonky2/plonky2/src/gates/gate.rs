@@ -76,6 +76,28 @@ pub enum U32QuotientGate {
         num_ops: usize,
         num_extra_constants: usize,
     },
+    /// Base-`base` decomposition of one routed sum into `num_limbs` routed
+    /// limbs: the recomposition row followed by one range product per limb.
+    BaseSum { num_limbs: usize, base: usize },
+    /// Square-and-multiply exponentiation: the base, `num_power_bits` bits and
+    /// the output are routed, the running values follow, and each row checks
+    /// one accumulation step against its running value.
+    Exponentiation { num_power_bits: usize },
+    /// `output = addend_0 * c0 + addend_1 * c1` over three routed wires per
+    /// operation, with the two coefficients taken from the gate's constants.
+    BaseAddition { num_ops: usize },
+    /// `output = m0 * m1 * c0 + addend * c1` over four routed wires per
+    /// operation, with the two coefficients taken from the gate's constants.
+    BaseArithmetic { num_ops: usize },
+    /// Conditional select over four routed wires and one temporary per
+    /// operation, emitted as two rows sharing the temporary.
+    Selection { num_ops: usize },
+    /// Equality test over three routed wires and three temporaries per
+    /// operation, emitted as four rows; the "one" value is a gate constant.
+    Equality { num_ops: usize },
+    /// Degree-`d` extension multiplication scaled by a gate constant, over
+    /// `3 * d` routed wires per operation and `d` rows.
+    MulExtension { num_ops: usize, d: usize },
 }
 
 /// A custom gate.
@@ -405,6 +427,19 @@ impl<F: RichField + Extendable<D>, const D: usize> Serialize for GateRef<F, D> {
 #[derive(Clone, Debug, Default)]
 pub struct CurrentSlot<F: RichField + Extendable<D>, const D: usize> {
     pub current_slot: HashMap<Vec<F>, (usize, usize)>,
+    /// Memoized [`Gate::num_ops`] for the gate this entry is keyed by.
+    ///
+    /// The default `Gate::num_ops` *materializes* the gate's generator list and returns its
+    /// length, so every call allocates one `WitnessGeneratorRef` (an `Arc`) per operation plus
+    /// the `Vec` holding them, and drops all of it immediately. `find_slot` calls it once per
+    /// packed operation, which is where the overwhelming majority of the circuit's operations
+    /// are placed. Caching it here evaluates it once per distinct gate value instead.
+    ///
+    /// Keying on the entry is exact: `CurrentSlot` entries are keyed by `GateRef`, whose `Eq`
+    /// is `Gate::id()` equality, and every gate's `id()` is a `Debug` rendering of its complete
+    /// configuration. Gates that compare equal therefore have identical fields, and `num_ops`
+    /// is a pure function of those fields.
+    pub num_ops: Option<usize>,
 }
 
 /// A gate along with any constants used to configure it.

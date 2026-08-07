@@ -145,6 +145,13 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> Gate<F, D> fo
         1 + self.num_limbs
     }
 
+    fn u32_quotient_gate(&self) -> Option<crate::gates::gate::U32QuotientGate> {
+        Some(crate::gates::gate::U32QuotientGate::BaseSum {
+            num_limbs: self.num_limbs,
+            base: B,
+        })
+    }
+
     fn num_constants(&self) -> usize {
         0
     }

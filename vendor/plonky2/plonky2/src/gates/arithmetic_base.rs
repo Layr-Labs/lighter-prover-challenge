@@ -164,6 +164,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticGate
         self.num_ops * 4
     }
 
+    fn u32_quotient_gate(&self) -> Option<crate::gates::gate::U32QuotientGate> {
+        Some(crate::gates::gate::U32QuotientGate::BaseArithmetic {
+            num_ops: self.num_ops,
+        })
+    }
+
     fn num_constants(&self) -> usize {
         2
     }
