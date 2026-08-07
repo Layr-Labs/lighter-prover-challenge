@@ -4,7 +4,9 @@
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
-use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
+use circuit::block_pre_execution_constraints::{
+    BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
+};
 use circuit::block_tx::{BlockTx, JumpState, JumpStateTarget};
 use circuit::block_tx_chain_constraints::{
     BlockTxChainCircuit, BlockTxChainTarget, cyclic_base_witness,
