@@ -28,6 +28,9 @@ pub mod secp256k1_scalar;
 pub mod types;
 pub mod zero_poly_coset;
 
+#[cfg(target_arch = "aarch64")]
+mod neon_fft;
+
 #[cfg(test)]
 mod field_testing;
 
