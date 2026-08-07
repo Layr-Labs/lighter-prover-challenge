@@ -57,18 +57,6 @@ pub enum U32QuotientGate {
         base_bits: usize,
         num_carry_limbs: usize,
     },
-    /// Byte decomposition: `1 + num_limbs` routed words (sum then bytes)
-    /// plus `4 * num_limbs` base-4 aux limbs per operation,
-    /// `1 + 5 * num_limbs` constraint rows per operation.
-    ByteDecomposition { num_ops: usize, num_limbs: usize },
-    /// Degree-5 extension-field multiplication over the base field: fifteen
-    /// routed words per operation (five limbs each for the two inputs and
-    /// the output), five constraint rows per operation.
-    QuinticMultiplication { num_ops: usize },
-    /// Degree-5 extension-field squaring over the base field: ten routed
-    /// words (input and output limbs) plus ten temporary wires per
-    /// operation, fifteen constraint rows per operation.
-    QuinticSquaring { num_ops: usize },
 }
 
 /// A custom gate.

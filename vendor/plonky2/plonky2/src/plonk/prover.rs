@@ -1129,36 +1129,6 @@ fn start_gpu_range_check_gate_quotient<
                         num_ops.checked_mul(limbs.checked_add(3)?)?,
                     )
                 }
-                U32QuotientGate::ByteDecomposition { num_ops, num_limbs } => {
-                    if num_limbs == 0 || num_limbs > 24 {
-                        if gpu_poseidon_quotient_diagnostics_enabled() {
-                            eprintln!(
-                                "[gpu-range-quotient] invalid byte metadata: {u32_gate:?}"
-                            );
-                        }
-                        return None;
-                    }
-                    let per_op = num_limbs.checked_mul(5)?.checked_add(1)?;
-                    let expected = num_ops.checked_mul(per_op)?;
-                    (
-                        U32QuotientKind::ByteDecomposition { num_limbs },
-                        num_ops,
-                        expected,
-                        expected,
-                    )
-                }
-                U32QuotientGate::QuinticMultiplication { num_ops } => (
-                    U32QuotientKind::QuinticMultiplication,
-                    num_ops,
-                    num_ops.checked_mul(15)?,
-                    num_ops.checked_mul(5)?,
-                ),
-                U32QuotientGate::QuinticSquaring { num_ops } => (
-                    U32QuotientKind::QuinticSquaring,
-                    num_ops,
-                    num_ops.checked_mul(20)?,
-                    num_ops.checked_mul(15)?,
-                ),
             };
             if num_ops == 0
                 || gate.0.num_wires() != expected_wires
