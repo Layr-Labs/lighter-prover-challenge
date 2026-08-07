@@ -501,8 +501,19 @@ fn wires_permutation_partial_products_and_zs<
     // chunk. Form those products before Montgomery inversion, shrinking each inversion batch by
     // `degree` and reading every witness wire only once.
     const INV_BATCH: usize = 128;
-    let mut all_quotient_chunk_products = vec![F::ZERO; subgroup.len() * num_chunks];
-    all_quotient_chunk_products
+    // Every slot of this buffer is assigned below before anything reads it —
+    // the inner loop writes `quotient_products[t * num_chunks + chunk]` for
+    // every `t` in the batch and every `chunk`, which covers each sub-slice
+    // exactly, and `divide_chunk_products` only multiplies those cells in
+    // place afterwards. So zero-filling it first is dead work: at
+    // `num_chunks = 10` and a 2^16 subgroup that is 5.2 MiB of serial stores
+    // per challenge, ~10.5 MiB per proof, on the per-proof spine between
+    // witness generation and the Zs/partial-products commitment.
+    let product_count = subgroup.len() * num_chunks;
+    let mut all_quotient_chunk_products: Vec<F> = Vec::with_capacity(product_count);
+    let product_slots =
+        crate::hash::merkle_tree::capacity_up_to_mut(&mut all_quotient_chunk_products, product_count);
+    product_slots
         .par_chunks_mut(INV_BATCH * num_chunks)
         .zip(subgroup.par_chunks(INV_BATCH))
         .enumerate()
@@ -530,10 +541,18 @@ fn wires_permutation_partial_products_and_zs<
                             numerator_product *= wire_value + beta_k_is[j] * x + gamma;
                             denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
                         }
-                        quotient_products[t * num_chunks + chunk] = numerator_product;
+                        quotient_products[t * num_chunks + chunk].write(numerator_product);
                         denominator_products.push(denominator_product);
                     }
                 }
+                // SAFETY: the loop above wrote every slot of this sub-slice —
+                // `t` covers `0..xs.len()` and `chunk` covers `0..num_chunks`,
+                // and the sub-slice length is exactly `xs.len() * num_chunks`
+                // (the `zip` pairs each chunk with its own `xs`, so a short
+                // final chunk is still covered exactly).
+                let quotient_products = unsafe {
+                    &mut *(quotient_products as *mut [core::mem::MaybeUninit<F>] as *mut [F])
+                };
                 divide_chunk_products(
                     quotient_products,
                     denominator_products,
@@ -541,6 +560,11 @@ fn wires_permutation_partial_products_and_zs<
                 );
             },
         );
+
+    // SAFETY: the parallel pass above wrote and then divided every one of the
+    // `product_count` slots; `par_chunks_mut` partitions the buffer exactly, so
+    // none is left uninitialized.
+    unsafe { all_quotient_chunk_products.set_len(product_count) };
 
     // Accumulate the sequential Z chain directly into the column-major output
     // polynomials, deleting the per-point row Vec, the row-major intermediate,
