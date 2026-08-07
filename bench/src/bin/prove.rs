@@ -38,7 +38,8 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // /etc/malloc.conf can still override it.
 #[cfg(not(target_env = "msvc"))]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
+static MALLOC_CONF: &[u8; 46] =
+    b"dirty_decay_ms:-1,muzzy_decay_ms:-1,narenas:1\0";
 
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
