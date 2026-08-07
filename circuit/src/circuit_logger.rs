@@ -358,7 +358,7 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
                         .map(|target| U32Target(*target))
                         .collect(),
                 };
-                let biguint = witness.get_biguint_target(big_uint_target);
+                let biguint = witness.get_biguint_target(&big_uint_target);
                 log!(Level::Info, "[InCircuit] {}: {:?}", self.log, biguint);
             }
             TargetTypes::BigUintU16Target => {
@@ -395,7 +395,7 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
                 let big_uint_target = BigUintTarget {
                     limbs: variables.iter().map(|target| U32Target(*target)).collect(),
                 };
-                let biguint = witness.get_biguint_target(big_uint_target);
+                let biguint = witness.get_biguint_target(&big_uint_target);
                 let sign = {
                     let t = witness.get_target(sign);
                     if t == F::ONE {

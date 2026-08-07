@@ -72,6 +72,24 @@ impl<F: Field> PolynomialValues<F> {
         shifted_coeffs
     }
 
+    /// `coset_ifft` with a caller-provided inverse-shift power table
+    /// (`inv_powers[i] == shift^{-i}`, at least `self.len()` long). The scaling
+    /// multiplies the identical operands in the identical order as
+    /// `coset_ifft`; providing the table lets callers whose shift is static
+    /// amortize the serial dependent `powers()` chain across proofs.
+    pub fn coset_ifft_with_inv_powers(self, inv_powers: &[F]) -> PolynomialCoeffs<F> {
+        let mut shifted_coeffs = self.ifft();
+        debug_assert!(inv_powers.len() >= shifted_coeffs.coeffs.len());
+        shifted_coeffs
+            .coeffs
+            .iter_mut()
+            .zip(inv_powers)
+            .for_each(|(c, &r)| {
+                *c *= r;
+            });
+        shifted_coeffs
+    }
+
     pub fn lde_multiple(polys: Vec<Self>, rate_bits: usize) -> Vec<Self> {
         polys.into_iter().map(|p| p.lde(rate_bits)).collect()
     }

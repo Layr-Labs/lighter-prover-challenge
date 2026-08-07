@@ -922,27 +922,36 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderBiguint<F, D> f
 }
 
 pub trait WitnessBigUint<F: PrimeField64>: Witness<F> {
-    fn get_biguint_target(&self, target: BigUintTarget) -> BigUint;
+    fn get_biguint_target(&self, target: &BigUintTarget) -> BigUint;
     fn set_biguint_target(&mut self, target: &BigUintTarget, value: &BigUint) -> Result<()>;
 }
 
 impl<T: Witness<F>, F: PrimeField64> WitnessBigUint<F> for T {
-    fn get_biguint_target(&self, target: BigUintTarget) -> BigUint {
-        target
-            .limbs
-            .into_iter()
-            .rev()
-            .fold(BigUint::zero(), |acc, limb| {
-                (acc << 32) + self.get_target(limb.0).to_canonical_biguint()
-            })
+    fn get_biguint_target(&self, target: &BigUintTarget) -> BigUint {
+        // Single-pass, single-allocation construction. The previous fold
+        // allocated a fresh `BigUint` per limb (`to_canonical_biguint`) plus a
+        // shifted and an added accumulator per step — roughly three heap
+        // allocations per limb, on every witness read of every nonnative and
+        // biguint generator. `BigUint::new` takes the little-endian u32 digit
+        // vector directly and normalizes trailing zeros, which is exactly the
+        // value the fold produced: every limb is a `U32Target`, so its
+        // canonical value fits in 32 bits (asserted below in debug builds).
+        let mut digits = Vec::with_capacity(target.limbs.len());
+        for limb in &target.limbs {
+            let v = self.get_target(limb.0).to_canonical_u64();
+            debug_assert!(v < (1 << 32), "BigUintTarget limb out of u32 range");
+            digits.push(v as u32);
+        }
+        BigUint::new(digits)
     }
 
     fn set_biguint_target(&mut self, target: &BigUintTarget, value: &BigUint) -> Result<()> {
-        let mut limbs = value.to_u32_digits();
-        assert!(target.num_limbs() >= limbs.len());
-        limbs.resize(target.num_limbs(), 0);
+        // Allocation-free limb write: iterate the digit view instead of
+        // collecting and zero-resizing a `Vec` per call.
+        let mut digits = value.iter_u32_digits();
+        assert!(target.num_limbs() >= digits.len());
         for i in 0..target.num_limbs() {
-            self.set_u32_target(target.limbs[i], limbs[i])?;
+            self.set_u32_target(target.limbs[i], digits.next().unwrap_or(0))?;
         }
 
         Ok(())
@@ -955,11 +964,11 @@ pub trait GeneratedValuesBigUint<F: PrimeField> {
 
 impl<F: PrimeField> GeneratedValuesBigUint<F> for GeneratedValues<F> {
     fn set_biguint_target(&mut self, target: &BigUintTarget, value: &BigUint) -> Result<()> {
-        let mut limbs = value.to_u32_digits();
-        assert!(target.num_limbs() >= limbs.len());
-        limbs.resize(target.num_limbs(), 0);
+        // Allocation-free limb write; see `WitnessBigUint::set_biguint_target`.
+        let mut digits = value.iter_u32_digits();
+        assert!(target.num_limbs() >= digits.len());
         for i in 0..target.num_limbs() {
-            self.set_u32_target(target.get_limb(i), limbs[i])?;
+            self.set_u32_target(target.get_limb(i), digits.next().unwrap_or(0))?;
         }
 
         Ok(())
@@ -1200,6 +1209,59 @@ mod tests {
     }
 
     #[test]
+    /// Differential: the single-allocation `get_biguint_target` and the
+    /// allocation-free `set_biguint_target` must match the legacy per-limb
+    /// fold / collect-and-resize semantics, across limb counts, leading
+    /// zeros, and boundary values.
+    #[test]
+    fn get_set_biguint_target_match_legacy_fold() {
+        use num::Zero;
+
+        let mut builder: Builder<F, D> = Builder::new(CIRCUIT_CONFIG);
+
+        fn splitmix64(state: &mut u64) -> u64 {
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        let mut seed = 0x0BAD_5EED_0BAD_5EEDu64;
+
+        for num_limbs in [1usize, 2, 3, 4, 5, 8, 16] {
+            for case in 0..8u32 {
+                let digits: Vec<u32> = (0..num_limbs)
+                    .map(|i| match case {
+                        0 => 0,
+                        1 => u32::MAX,
+                        2 if i + 1 == num_limbs => 0, // leading-zero top limb
+                        _ => splitmix64(&mut seed) as u32,
+                    })
+                    .collect();
+                let value = BigUint::new(digits.clone());
+
+                let target = builder.add_virtual_biguint_target_unsafe(num_limbs);
+                let mut pw = PartialWitness::<F>::new();
+                pw.set_biguint_target(&target, &value).unwrap();
+
+                // New read path.
+                let got = pw.get_biguint_target(&target);
+
+                // Legacy fold reference over the same witness values.
+                let legacy = target
+                    .limbs
+                    .iter()
+                    .rev()
+                    .fold(BigUint::zero(), |acc, limb| {
+                        (acc << 32) + pw.get_target(limb.0).to_canonical_biguint()
+                    });
+
+                assert_eq!(got, legacy, "read mismatch limbs={num_limbs} case={case}");
+                assert_eq!(got, value, "roundtrip mismatch limbs={num_limbs} case={case}");
+            }
+        }
+    }
+
     fn test_biguint_from_bytes_be() {
         let byte_count = rand::thread_rng().gen_range(54..124);
         let bytes = (0..byte_count)

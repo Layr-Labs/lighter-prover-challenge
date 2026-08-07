@@ -127,11 +127,13 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     // `format!`). `entry().or_insert()` keeps first-position semantics for
     // duplicate IDs, matching the previous `.position()` behavior. The map is
     // used only for lookup, so its iteration order never influences any output.
+    // Keys and lookups borrow the `GateRef`-cached ID, so neither building the
+    // map nor the per-row lookups below allocate a fresh ID `String`.
     let mut gate_index = HashMap::with_capacity(num_gates);
     for (i, g) in gates.iter().enumerate() {
-        gate_index.entry(g.0.id()).or_insert(i);
+        gate_index.entry(g.id()).or_insert(i);
     }
-    let index = |id| *gate_index.get(&id).unwrap();
+    let index = |id: &str| *gate_index.get(id).unwrap();
 
     // Special case if we can use only one selector polynomial.
     if max_gate_degree + num_gates - 1 <= max_degree {
@@ -142,7 +144,7 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
             vec![PolynomialValues::new(
                 instances
                     .iter()
-                    .map(|g| F::from_canonical_usize(index(g.gate_ref.0.id())))
+                    .map(|g| F::from_canonical_usize(index(g.gate_ref.id())))
                     .collect(),
             )],
             SelectorsInfo {
@@ -189,7 +191,7 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     let mut polynomials = vec![PolynomialValues::constant(unused, n); groups.len()];
     for (j, g) in instances.iter().enumerate() {
         let GateInstance { gate_ref, .. } = g;
-        let i = index(gate_ref.0.id());
+        let i = index(gate_ref.id());
         polynomials[selector_indices[i]].values[j] = F::from_canonical_usize(i);
     }
 

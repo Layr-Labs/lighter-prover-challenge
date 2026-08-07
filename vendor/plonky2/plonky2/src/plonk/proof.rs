@@ -354,8 +354,45 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         // `zs_partial_products_lookup_eval` contains the permutation argument polynomials as well as lookup polynomials.
         let zs_partial_products_lookup_eval =
             eval_commitment(&zeta_pows, zs_partial_products_lookup_commitment);
-        let zs_partial_products_lookup_next_eval =
-            eval_commitment(&g_zeta_pows, zs_partial_products_lookup_commitment);
+        // At g*zeta only the Z (and, when present, lookup) polynomials are
+        // ever consumed: `plonk_zs_next` reads `zs_range` and `lookup_zs_next`
+        // reads `lookup_range`, and no consumer (including the FRI opening
+        // batches built from `CommonCircuitData::get_fri_instance`) reads the
+        // partial-products entries at the shifted point. Evaluating the full
+        // batch therefore computed and discarded `num_partial_products *
+        // num_challenges` degree-length extension dot products per proof (18
+        // of 20 columns on the production no-lookup shape). Restrict the
+        // shifted evaluation to the consumed index ranges; each retained
+        // per-polynomial dot product is the identical instruction stream, so
+        // every opening value and the transcript are unchanged. The results
+        // are placed in a full-width vector at their original indices so the
+        // consuming ranges below stay untouched.
+        let zs_partial_products_lookup_next_eval = {
+            let polynomials = &zs_partial_products_lookup_commitment.polynomials;
+            let mut evals = vec![F::Extension::ZERO; polynomials.len()];
+            let zs_range = common_data.zs_range();
+            // `lookup_range()` is an unbounded `RangeFrom` meant for slice
+            // indexing; bound it by the batch width (on no-lookup circuits the
+            // start equals the batch width, so the tail is empty).
+            let lookup_start = common_data.lookup_range().start;
+            let consumed: Vec<usize> =
+                zs_range.chain(lookup_start..polynomials.len()).collect();
+            let computed: Vec<F::Extension> = consumed
+                .par_iter()
+                .map(|&i| {
+                    polynomials[i]
+                        .coeffs
+                        .iter()
+                        .zip(&g_zeta_pows)
+                        .map(|(&coeff, zp)| zp.scalar_mul(coeff))
+                        .sum::<F::Extension>()
+                })
+                .collect();
+            for (&i, value) in consumed.iter().zip(computed) {
+                evals[i] = value;
+            }
+            evals
+        };
         let quotient_polys = eval_commitment(&zeta_pows, quotient_polys_commitment);
 
         Self {
