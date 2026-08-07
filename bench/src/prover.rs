@@ -17,7 +17,6 @@ use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
 use plonky2::iop::generator::{ParallelWitnessGuard, PendingPartitionWitness};
-#[cfg(test)]
 use plonky2::iop::generator::generate_partial_witness;
 use plonky2::iop::witness::{PartitionWitness, Witness};
 use plonky2::plonk::circuit_data::CircuitData;
@@ -408,18 +407,35 @@ fn prove_path(
 }
 
 pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
-    // The pre-execution proof runs strictly before any other proving work, so
-    // the serialized GPU stream is otherwise idle: route its mid-size column
-    // trees to the GPU for just this phase.
-    plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-    let pre_proof = BlockPreExecutionCircuit::prove(
-        &circuits.pre_data,
+    // Split the pre-execution proof into witness generation and proving. The
+    // transaction/chain pipelines only need the pre-execution *outputs*
+    // (state roots, metadata), and those are exactly the public-input values
+    // the witness already contains — the proof itself is not consumed until
+    // the final block proof at the very end. Generating the witness up front
+    // (milliseconds) and proving it concurrently with the pipelines removes
+    // the whole pre-execution proving latch from the serial spine. The
+    // public-input values read from the partition witness are identical to
+    // `proof.public_inputs` by construction: the prover copies them from the
+    // same targets.
+    let pre_partial = BlockPreExecutionCircuit::generate_witness(
         &BlockPreExec::from_block(&block),
         &circuits.pre_target,
     )
-    .expect("block pre-execution proof failed");
-    plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
-    let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
+    .expect("block pre-execution witness failed");
+    let pre_partition = generate_partial_witness::<F, C, D>(
+        pre_partial,
+        &circuits.pre_data.prover_only,
+        &circuits.pre_data.common,
+    )
+    .expect("block pre-execution generators failed");
+    let pre_public_inputs: Vec<F> = circuits
+        .pre_data
+        .prover_only
+        .public_inputs
+        .iter()
+        .map(|&target| pre_partition.get_target(target))
+        .collect();
+    let pre_output = BlockPreExecWitness::from_public_inputs(&pre_public_inputs);
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
     let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
@@ -435,8 +451,25 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     block.tx_chunks = tx_chunks;
     block.tx_chunks.push(Vec::new());
 
-    let (light_chain_proof, heavy_chain_proof, block_target, block_data) =
+    let (light_chain_proof, heavy_chain_proof, block_target, block_data, pre_proof) =
         std::thread::scope(|scope| {
+            // The pre-execution proof is only consumed by the final block
+            // proof, so it proves concurrently with the entire pipeline. No
+            // exclusive-GPU marking here: its trees take the normal routing
+            // thresholds alongside the pipelined chunk trees.
+            let pre_proof_handle = std::thread::Builder::new()
+                .name("pre-execution-proof".into())
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, || {
+                    prove_with_partition_witness::<F, C, D>(
+                        &circuits.pre_data.prover_only,
+                        &circuits.pre_data.common,
+                        pre_partition,
+                        &mut TimingTree::default(),
+                    )
+                    .expect("block pre-execution proof failed")
+                })
+                .expect("pre-execution proof thread must start");
             // The final block circuit depends only on already-built circuit data
             // and is not needed until the final proof, so it builds concurrently
             // with the entire transaction/chain proving pipeline.
@@ -477,13 +510,22 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
             let (block_target, block_data) = block_circuit_handle
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let pre_proof = pre_proof_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             (
                 light_chain_proof,
                 heavy_chain_proof,
                 block_target,
                 block_data,
+                pre_proof,
             )
         });
+    #[cfg(debug_assertions)]
+    circuits
+        .pre_data
+        .verify(pre_proof.clone())
+        .expect("pre-execution proof self-check failed");
 
     let (light_chain_input, heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
