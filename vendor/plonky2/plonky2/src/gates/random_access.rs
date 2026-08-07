@@ -525,18 +525,18 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
         self.num_copies * constraints_per_copy + self.num_extra_constants
     }
 
+    fn extra_constant_wires(&self) -> Vec<(usize, usize)> {
+        (0..self.num_extra_constants)
+            .map(|i| (i, self.wire_extra_constant(i)))
+            .collect()
+    }
+
     fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
         Some(U32QuotientGate::RandomAccess {
             bits: self.bits,
             num_ops: self.num_copies,
             num_extra_constants: self.num_extra_constants,
         })
-    }
-
-    fn extra_constant_wires(&self) -> Vec<(usize, usize)> {
-        (0..self.num_extra_constants)
-            .map(|i| (i, self.wire_extra_constant(i)))
-            .collect()
     }
 }
 
