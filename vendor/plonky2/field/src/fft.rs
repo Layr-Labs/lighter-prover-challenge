@@ -32,87 +32,16 @@ pub fn fft_root_table<F: Field>(n: usize) -> FftRootTable<F> {
     root_table
 }
 
-/// Process-wide cache of FFT root tables for the prover's hot field types,
-/// contention-free on the steady-state path: one static fixed-size array of
-/// `OnceLock` slots per cached field type, indexed by log2(size). A hit is a
-/// `TypeId` compare (const-folded per monomorphization) plus one atomic
-/// acquire load — no mutex, no hashing, no shared cache-line writes after a
-/// slot initializes. `fft_root_table` is deterministic per (field, size), so
-/// a cache hit returns exactly the values a fresh computation would; the
-/// cache only avoids recomputing the table on every table-less FFT (FRI fold
-/// rounds, the final-polynomial coset FFT, IFFT/LDE calls without a
-/// precomputed table). Field types without a dedicated table (and sizes past
-/// `MAX_LG_N`) fall back to a fresh, value-identical computation.
-#[cfg(feature = "std")]
-mod root_table_cache {
-    use core::any::{Any, TypeId};
-    use std::sync::{Arc, OnceLock};
-
-    use super::{FftRootTable, fft_root_table};
-    use crate::extension::quadratic::QuadraticExtension;
-    use crate::goldilocks_field::GoldilocksField;
-    use crate::types::Field;
-
-    /// Slots for sizes up to `1 << 32` elements, far past any FFT here.
-    const MAX_LG_N: usize = 33;
-
-    /// A slot holds the type-erased `Arc<FftRootTable<F>>` for its static's
-    /// fixed field type; erasure keeps the generic accessor safe (no
-    /// transmute) while each static's writer only ever stores its own type.
-    type Slot = OnceLock<Arc<dyn Any + Send + Sync>>;
-
-    #[allow(clippy::declare_interior_mutable_const)]
-    const EMPTY_SLOT: Slot = OnceLock::new();
-
-    static GOLDILOCKS_TABLES: [Slot; MAX_LG_N] = [EMPTY_SLOT; MAX_LG_N];
-    static GOLDILOCKS_EXT2_TABLES: [Slot; MAX_LG_N] = [EMPTY_SLOT; MAX_LG_N];
-
-    /// The dedicated slot array for `F`, if `F` is one of the cached types.
-    fn per_type_tables<F: Field>() -> Option<&'static [Slot; MAX_LG_N]> {
-        let f = TypeId::of::<F>();
-        if f == TypeId::of::<GoldilocksField>() {
-            Some(&GOLDILOCKS_TABLES)
-        } else if f == TypeId::of::<QuadraticExtension<GoldilocksField>>() {
-            Some(&GOLDILOCKS_EXT2_TABLES)
-        } else {
-            None
-        }
-    }
-
-    pub(super) fn get<F: Field>(lg_n: usize) -> Arc<FftRootTable<F>> {
-        if let Some(tables) = per_type_tables::<F>() {
-            if let Some(slot) = tables.get(lg_n) {
-                // First caller for this (type, size) computes the table; racers
-                // block only during that one-time construction. Afterwards this
-                // is a single atomic load of the initialized slot.
-                let erased = slot.get_or_init(|| Arc::new(fft_root_table::<F>(1 << lg_n)));
-                if let Ok(table) = Arc::clone(erased).downcast::<FftRootTable<F>>() {
-                    return table;
-                }
-                // Unreachable in practice: each static stores only its own
-                // type. Fall through to a fresh (value-identical) computation.
-            }
-        }
-        Arc::new(fft_root_table::<F>(1 << lg_n))
-    }
-}
-
 #[inline]
 fn fft_dispatch<F: Field>(
     input: &mut [F],
     zero_factor: Option<usize>,
     root_table: Option<&FftRootTable<F>>,
 ) {
-    if let Some(table) = root_table {
-        fft_classic(input, zero_factor.unwrap_or(0), table);
-        return;
-    }
-    #[cfg(feature = "std")]
-    let computed_root_table = root_table_cache::get::<F>(log2_strict(input.len()));
-    #[cfg(not(feature = "std"))]
-    let computed_root_table = fft_root_table::<F>(input.len());
+    let computed_root_table = root_table.is_none().then(|| fft_root_table(input.len()));
+    let used_root_table = root_table.or(computed_root_table.as_ref()).unwrap();
 
-    fft_classic(input, zero_factor.unwrap_or(0), &computed_root_table);
+    fft_classic(input, zero_factor.unwrap_or(0), used_root_table);
 }
 
 #[inline]
@@ -481,40 +410,6 @@ mod tests {
     use crate::packed::PackedField;
     use crate::polynomial::{PolynomialCoeffs, PolynomialValues};
     use crate::types::Field;
-
-    /// The cached-table dispatch path (no caller-supplied table) must return
-    /// bit-identical results to an explicitly computed fresh table, on both
-    /// cold and warm cache, for the cached field types (base and quadratic
-    /// extension, each with a dedicated `OnceLock` slot array) and for an
-    /// uncached field type (quartic extension), which takes the fresh-compute
-    /// fallback on every call.
-    #[cfg(feature = "std")]
-    #[test]
-    fn cached_root_table_matches_fresh_table() {
-        use crate::extension::quartic::QuarticExtension;
-        use crate::types::Sample;
-
-        fn check<F: Field + Sample>() {
-            for lg_n in [1usize, 3, 7] {
-                let n = 1 << lg_n;
-                let table = fft_root_table::<F>(n);
-                let poly = PolynomialCoeffs::new(F::rand_vec(n));
-                let expected = fft_with_options(poly.clone(), None, Some(&table));
-                // First call may populate the cache, second one must hit it.
-                // (For an uncached type both calls take the fallback.)
-                let cold = fft_with_options(poly.clone(), None, None);
-                let warm = fft_with_options(poly, None, None);
-                assert_eq!(expected.values, cold.values);
-                assert_eq!(expected.values, warm.values);
-            }
-        }
-
-        // Cached types: dedicated per-type slot arrays.
-        check::<GoldilocksField>();
-        check::<QuadraticExtension<GoldilocksField>>();
-        // Uncached type: exercises the value-identical fallback path.
-        check::<QuarticExtension<GoldilocksField>>();
-    }
 
     #[test]
     fn fft_and_ifft() {

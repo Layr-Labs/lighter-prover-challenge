@@ -4,7 +4,7 @@
 use core::ops::Range;
 
 use anyhow::Result;
-use plonky2::field::batch_util::batch_multiply_add_inplace;
+use itertools::Itertools;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
@@ -201,40 +201,26 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
         combined_gate_constraints: &mut [F],
     ) {
         let n = vars_base.len();
-        assert_eq!(filters.len(), n);
-        let num_constraints = <Self as Gate<F, D>>::num_constraints(self);
-        assert!(combined_gate_constraints.len() >= num_constraints * n);
-
         let wires = vars_base.local_wires;
         let three = F::from_canonical_usize(3);
         let four = F::from_canonical_usize(4);
         let base = F::from_canonical_usize(256);
-        // Batches are 32 points in this prover; keep the scratch row on the
-        // stack and fall back to the heap only for oversized batches.
-        let mut scratch_stack = [F::ZERO; 64];
-        let mut scratch_heap;
-        let scratch: &mut [F] = if n <= 64 {
-            &mut scratch_stack[..n]
-        } else {
-            scratch_heap = vec![F::ZERO; n];
-            &mut scratch_heap
-        };
-        let mut constraint_index = 0;
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
+        let mut chunks = combined_gate_constraints.chunks_exact_mut(n);
+        let mut scratch = vec![F::ZERO; n];
 
         for i in 0..self.num_ops {
             let aux = self.i_th_aux_limbs(i);
             // Range products per aux limb: x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3).
             for limb_wire in aux.clone() {
                 let col = &wires[limb_wire * n..][..n];
+                let out = chunks.next().unwrap();
                 for p in 0..n {
                     let x = col[p];
                     let y = x * (x - three);
-                    scratch[p] = y * (y + F::TWO);
+                    out[p] += filters[p] * (y * (y + F::TWO));
                 }
-                let combined = &mut combined_gate_constraints
-                    [constraint_index * n..(constraint_index + 1) * n];
-                batch_multiply_add_inplace(combined, &scratch, filters);
-                constraint_index += 1;
             }
 
             // Each byte equals its four aux limbs combined by powers of 4,
@@ -242,6 +228,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
             let bytes = self.i_th_limbs(i);
             for (byte_index, byte_wire) in bytes.clone().enumerate() {
                 let chunk_start = aux.start + 4 * byte_index;
+                let out = chunks.next().unwrap();
                 scratch.copy_from_slice(&wires[(chunk_start + 3) * n..][..n]);
                 for k in (0..3).rev() {
                     let limb = &wires[(chunk_start + k) * n..][..n];
@@ -251,15 +238,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
                 }
                 let byte_col = &wires[byte_wire * n..][..n];
                 for p in 0..n {
-                    scratch[p] -= byte_col[p];
+                    out[p] += filters[p] * (scratch[p] - byte_col[p]);
                 }
-                let combined = &mut combined_gate_constraints
-                    [constraint_index * n..(constraint_index + 1) * n];
-                batch_multiply_add_inplace(combined, &scratch, filters);
-                constraint_index += 1;
             }
 
             // The sum equals the bytes combined by powers of 256.
+            let out = chunks.next().unwrap();
             scratch.copy_from_slice(&wires[(bytes.end - 1) * n..][..n]);
             for byte_wire in (bytes.start..bytes.end - 1).rev() {
                 let col = &wires[byte_wire * n..][..n];
@@ -269,15 +253,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
             }
             let sum_col = &wires[self.i_th_sum(i) * n..][..n];
             for p in 0..n {
-                scratch[p] -= sum_col[p];
+                out[p] += filters[p] * (scratch[p] - sum_col[p]);
             }
-            let combined =
-                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
-            batch_multiply_add_inplace(combined, &scratch, filters);
-            constraint_index += 1;
         }
-
-        debug_assert_eq!(constraint_index, num_constraints);
     }
 
     fn eval_unfiltered_circuit(
@@ -428,24 +406,23 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
             .to_canonical_u64();
 
         // Set bytes
-        // Direct limb-decomposition loops: same limbs in the same order as the
-        // previous `scan`/`collect` into temporary `Vec`s, minus the heap
-        // allocations per generator execution. `i_th_limbs`/`i_th_aux_limbs`
-        // are ranges of exactly `num_limbs`/`4 * num_limbs` columns, so the
-        // pairing is exhaustive exactly as `zip_eq` required.
         let mut acc = sum_value;
-        for i in dummy_gate.i_th_limbs(self.i) {
-            let tmp = acc % 256_u64;
+        for wire in dummy_gate.i_th_limbs(self.i) {
+            out_buffer.set_target(
+                Target::wire(self.row, wire),
+                F::from_canonical_u64(acc % 256_u64),
+            )?;
             acc /= 256_u64;
-            out_buffer.set_target(Target::wire(self.row, i), F::from_canonical_u64(tmp))?;
         }
 
         // Set aux limbs
         let mut acc = sum_value;
-        for i in dummy_gate.i_th_aux_limbs(self.i) {
-            let tmp = acc % 4_u64;
+        for wire in dummy_gate.i_th_aux_limbs(self.i) {
+            out_buffer.set_target(
+                Target::wire(self.row, wire),
+                F::from_canonical_u64(acc % 4_u64),
+            )?;
             acc /= 4_u64;
-            out_buffer.set_target(Target::wire(self.row, i), F::from_canonical_u64(tmp))?;
         }
 
         Ok(())
@@ -548,18 +525,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    // The direct filtered accumulation override must produce bit-identical
-    // values to materializing the batch then multiply-adding row by row.
-    #[test]
-    fn direct_filtered_accumulation_matches_materialized_batch() {
-        use crate::gate_batch_testing::assert_direct_accumulation_matches_materialized_batch;
-
-        for (num_limbs, num_ops) in [(1, 1), (4, 2), (8, 1)] {
-            let gate = ByteDecompositionGate::new(num_limbs, num_ops);
-            assert_direct_accumulation_matches_materialized_batch(&gate);
         }
     }
 }

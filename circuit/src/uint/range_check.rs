@@ -559,17 +559,11 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
             .to_canonical_u64();
 
         let base = RangeCheckGate::<F, D>::BASE as u64;
-        // Direct limb-decomposition loop: same limbs in the same order as the
-        // previous `scan`/`collect` into a temporary `Vec`, minus the heap
-        // allocation per generator execution.
         let mut acc = sum_value;
         for j in 0..self.gate.aux_limbs_per_input() {
-            let tmp = acc % base;
+            let target = Target::wire(self.row, self.gate.wire_ith_input_jth_aux_limb(self.i, j));
+            out_buffer.set_target(target, F::from_canonical_u64(acc % base))?;
             acc /= base;
-            out_buffer.set_target(
-                Target::wire(self.row, self.gate.wire_ith_input_jth_aux_limb(self.i, j)),
-                F::from_canonical_u64(tmp),
-            )?;
         }
         Ok(())
     }

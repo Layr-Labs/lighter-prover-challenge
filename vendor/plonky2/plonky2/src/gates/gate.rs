@@ -182,7 +182,6 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         group_range: Range<usize>,
         num_selectors: usize,
         num_lookup_selectors: usize,
-        filters: &mut Vec<F>,
         combined_gate_constraints: &mut [F],
     ) {
         let batch_size = vars_batch.len();
@@ -192,24 +191,19 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         // order, as the per-point `compute_filter` — identical field values
         // without the per-point strided views.
         let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
-        let mut factors = group_range
+        let mut filters = vec![F::ONE; batch_size];
+        for i in group_range
+            .clone()
             .filter(|&i| i != row)
-            .chain((num_selectors > 1).then_some(UNUSED_SELECTOR));
-        filters.clear();
-        if let Some(i) = factors.next() {
-            let k = F::from_canonical_usize(i);
-            filters.extend(selector_col.iter().map(|&s| k - s));
-        } else {
-            filters.resize(batch_size, F::ONE);
-        }
-        for i in factors {
+            .chain((num_selectors > 1).then_some(UNUSED_SELECTOR))
+        {
             let k = F::from_canonical_usize(i);
             for (filter, &s) in filters.iter_mut().zip(selector_col) {
                 *filter *= k - s;
             }
         }
         vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
-        self.eval_unfiltered_base_batch_accumulate(vars_batch, filters, combined_gate_constraints);
+        self.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, combined_gate_constraints);
     }
 
     /// Adds this gate's filtered constraints into the `combined_gate_constraints` buffer.

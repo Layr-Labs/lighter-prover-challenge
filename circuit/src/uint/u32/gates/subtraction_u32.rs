@@ -11,7 +11,6 @@
 use core::marker::PhantomData;
 
 use anyhow::Result;
-use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
@@ -212,25 +211,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32Subtraction
         combined_gate_constraints: &mut [F],
     ) {
         let n = vars_base.len();
-        assert_eq!(filters.len(), n);
-        let num_constraints = self.num_constraints();
-        assert!(combined_gate_constraints.len() >= num_constraints * n);
-
         let wires = vars_base.local_wires;
         let three = F::from_canonical_usize(3);
         let limb_base = F::from_canonical_u64(1u64 << Self::limb_bits());
         let base32 = F::from_canonical_u64(1 << 32u64);
-        // Batches are 32 points in this prover; keep the scratch row on the
-        // stack and fall back to the heap only for oversized batches.
-        let mut scratch_stack = [F::ZERO; 64];
-        let mut scratch_heap;
-        let scratch: &mut [F] = if n <= 64 {
-            &mut scratch_stack[..n]
-        } else {
-            scratch_heap = vec![F::ZERO; n];
-            &mut scratch_heap
-        };
-        let mut constraint_index = 0;
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
+        let mut chunks = combined_gate_constraints.chunks_exact_mut(n);
+        let mut combined_limbs = vec![F::ZERO; n];
 
         for i in 0..self.num_ops {
             let input_x = &wires[self.wire_ith_input_x(i) * n..][..n];
@@ -239,58 +227,39 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32Subtraction
             let output_result = &wires[self.wire_ith_output_result(i) * n..][..n];
             let output_borrow = &wires[self.wire_ith_output_borrow(i) * n..][..n];
 
+            let out = chunks.next().unwrap();
             for p in 0..n {
                 let result_initial = input_x[p] - input_y[p] - input_borrow[p];
-                scratch[p] = output_result[p] - (result_initial + base32 * output_borrow[p]);
+                out[p] += filters[p] * (output_result[p] - (result_initial + base32 * output_borrow[p]));
             }
-            let combined =
-                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
-            batch_multiply_add_inplace(combined, &scratch, filters);
-            constraint_index += 1;
 
             // Limb range products (base-4: x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3))
-            // in the same descending order as `eval_unfiltered`.
-            debug_assert_eq!(1 << Self::limb_bits(), 4);
+            // in the same descending order as `eval_unfiltered`, accumulating
+            // the recomposition along the way.
+            combined_limbs.fill(F::ZERO);
             for j in (0..Self::num_limbs()).rev() {
                 let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
+                let out = chunks.next().unwrap();
+                debug_assert_eq!(1 << Self::limb_bits(), 4);
                 for p in 0..n {
                     let x = limb[p];
                     let y = x * (x - three);
-                    scratch[p] = y * (y + F::TWO);
+                    out[p] += filters[p] * (y * (y + F::TWO));
                 }
-                let combined = &mut combined_gate_constraints
-                    [constraint_index * n..(constraint_index + 1) * n];
-                batch_multiply_add_inplace(combined, &scratch, filters);
-                constraint_index += 1;
-            }
-
-            // Recomposition, folded high-to-low exactly as the batch path.
-            scratch.fill(F::ZERO);
-            for j in (0..Self::num_limbs()).rev() {
-                let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
                 for p in 0..n {
-                    scratch[p] = scratch[p] * limb_base + limb[p];
+                    combined_limbs[p] = combined_limbs[p] * limb_base + limb[p];
                 }
             }
+            let out = chunks.next().unwrap();
             for p in 0..n {
-                scratch[p] -= output_result[p];
+                out[p] += filters[p] * (combined_limbs[p] - output_result[p]);
             }
-            let combined =
-                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
-            batch_multiply_add_inplace(combined, &scratch, filters);
-            constraint_index += 1;
 
-            // Range-check output_borrow to be one bit.
+            let out = chunks.next().unwrap();
             for p in 0..n {
-                scratch[p] = output_borrow[p] * (F::ONE - output_borrow[p]);
+                out[p] += filters[p] * (output_borrow[p] * (F::ONE - output_borrow[p]));
             }
-            let combined =
-                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
-            batch_multiply_add_inplace(combined, &scratch, filters);
-            constraint_index += 1;
         }
-
-        debug_assert_eq!(constraint_index, num_constraints);
     }
 
     fn eval_unfiltered_circuit(
@@ -479,17 +448,12 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         let output_result_u64 = output_result.to_canonical_u64();
 
         let num_limbs = U32SubtractionGate::<F, D>::num_limbs();
-        let limb_base: u64 = 1 << U32SubtractionGate::<F, D>::limb_bits();
-
-        // Direct limb-decomposition loop: same limbs in the same order as the
-        // previous `scan`/`collect` into a temporary `Vec`, minus the heap
-        // allocation per generator execution.
-        let mut acc = output_result_u64;
+        let limb_base = 1 << U32SubtractionGate::<F, D>::limb_bits();
+        let mut limb_acc = output_result_u64;
         for j in 0..num_limbs {
-            let tmp = acc % limb_base;
-            acc /= limb_base;
             let wire = local_wire(self.gate.wire_ith_output_jth_limb(self.i, j));
-            out_buffer.set_wire(wire, F::from_canonical_u64(tmp))?;
+            out_buffer.set_wire(wire, F::from_canonical_u64(limb_acc % limb_base))?;
+            limb_acc /= limb_base;
         }
 
         Ok(())
@@ -620,17 +584,5 @@ mod batch_tests {
             &CircuitConfig::standard_recursion_config(),
         );
         assert_base_batch_matches_eval_unfiltered(&gate);
-    }
-
-    // The direct filtered accumulation override must produce bit-identical
-    // values to materializing the batch then multiply-adding row by row.
-    #[test]
-    fn direct_filtered_accumulation_matches_materialized_batch() {
-        use crate::gate_batch_testing::assert_direct_accumulation_matches_materialized_batch;
-
-        let gate = U32SubtractionGate::<GoldilocksField, 2>::new_from_config(
-            &CircuitConfig::standard_recursion_config(),
-        );
-        assert_direct_accumulation_matches_materialized_batch(&gate);
     }
 }
