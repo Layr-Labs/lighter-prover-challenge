@@ -138,19 +138,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for Exponentiation
         self.eval_unfiltered_base_batch_packed(vars_base)
     }
 
-    fn eval_unfiltered_base_batch_accumulate(
-        &self,
-        vars_base: EvaluationVarsBaseBatch<F>,
-        filters: &[F],
-        combined_gate_constraints: &mut [F],
-    ) {
-        self.eval_unfiltered_base_batch_accumulate_packed(
-            vars_base,
-            filters,
-            combined_gate_constraints,
-        );
-    }
-
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,
@@ -445,58 +432,4 @@ mod tests {
             "Gate constraints are not satisfied."
         );
     }
-
-    /// Manual timing harness comparing the packed-fused accumulate against the
-    /// materialize-then-add default it replaced. Run with:
-    /// `cargo test --release -p plonky2 exp_accumulate_micro -- --ignored --nocapture`
-    #[test]
-    #[ignore = "manual timing harness"]
-    fn exp_accumulate_microbenchmark() {
-        use core::hint::black_box;
-        use std::time::Instant;
-
-        use plonky2_field::types::Sample;
-
-        use crate::field::batch_util::batch_multiply_add_inplace;
-        use crate::gates::gate::Gate;
-        use crate::plonk::vars::EvaluationVarsBaseBatch;
-
-        const D: usize = 2;
-        type F = GoldilocksField;
-        let gate = ExponentiationGate::<F, D>::new_from_config(&CircuitConfig::standard_recursion_config());
-        let n = 32;
-        let wires = F::rand_vec(gate.num_wires() * n);
-        let constants: Vec<F> = Vec::new();
-        let hash = crate::hash::hash_types::HashOut::ZERO;
-        let filters = F::rand_vec(n);
-        let nc = gate.num_constraints();
-        let mut combined = vec![F::ZERO; nc * n];
-        let iters = 50_000u32;
-        let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
-
-        let mut t_fused = 0.0f64;
-        let mut t_mat = 0.0f64;
-        for _ in 0..4 {
-            let s = Instant::now();
-            for _ in 0..iters {
-                gate.eval_unfiltered_base_batch_accumulate(vars, &filters, black_box(&mut combined));
-            }
-            t_fused += s.elapsed().as_secs_f64();
-
-            let s = Instant::now();
-            for _ in 0..iters {
-                let res = gate.eval_unfiltered_base_batch(vars);
-                for (acc, row) in combined.chunks_exact_mut(n).zip(res.chunks_exact(n)) {
-                    batch_multiply_add_inplace(acc, row, &filters);
-                }
-            }
-            t_mat += s.elapsed().as_secs_f64();
-        }
-        let per = |t: f64| t / (4.0 * iters as f64) * 1e6;
-        println!(
-            "exponentiation accumulate per batch (n=32): packed-fused {:.2} us, materialized-default {:.2} us",
-            per(t_fused), per(t_mat)
-        );
-    }
-
 }

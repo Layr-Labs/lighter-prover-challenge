@@ -11,6 +11,7 @@
 use core::ops::Range;
 
 use anyhow::Result;
+use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
@@ -272,17 +273,123 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for UninterleaveTo
         self.eval_unfiltered_base_batch_packed(vars_base)
     }
 
+    /// Fused accumulate: folds the filtered constraints straight into the
+    /// caller's buffer instead of materializing the whole constraint matrix
+    /// first. The 64 bit columns are read exactly once per op; that single
+    /// pass folds each bit into the high/low halves, into the even/odd
+    /// recompositions, and emits the per-bit range product.
     fn eval_unfiltered_base_batch_accumulate(
         &self,
         vars_base: EvaluationVarsBaseBatch<F>,
         filters: &[F],
         combined_gate_constraints: &mut [F],
     ) {
-        self.eval_unfiltered_base_batch_accumulate_packed(
-            vars_base,
-            filters,
-            combined_gate_constraints,
-        );
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        let num_constraints = <Self as Gate<F, D>>::num_constraints(self);
+        assert!(combined_gate_constraints.len() >= num_constraints * n);
+
+        let wires = vars_base.local_wires;
+        // Base for both folds: the halves reduce with `Self::B`, and
+        // `computed_x_evens`/`computed_x_odds` weight their j-th bit by
+        // `2^(NUM_BITS / 2 - j - 1)`, which is the same base-2 Horner fold.
+        let base = F::from_canonical_usize(Self::B);
+        let split = F::from_canonical_u64(1 << 32u64);
+        let u32_max = F::from_canonical_u32(u32::MAX);
+
+        // Five scratch rows: the high/low halves of the bit decomposition, the
+        // even/odd recompositions, and one row reused for the per-bit range
+        // product and the two combined checks. Batches are 32 points in this
+        // prover; keep them on the stack and fall back to the heap only for
+        // oversized batches.
+        let mut scratch_stack = [F::ZERO; 5 * 64];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if n <= 64 {
+            &mut scratch_stack[..5 * n]
+        } else {
+            scratch_heap = vec![F::ZERO; 5 * n];
+            &mut scratch_heap
+        };
+        let (acc_high, rest) = scratch.split_at_mut(n);
+        let (acc_low, rest) = rest.split_at_mut(n);
+        let (acc_evens, rest) = rest.split_at_mut(n);
+        let (acc_odds, tmp) = rest.split_at_mut(n);
+
+        let mut constraint_index = 0;
+        for i in 0..self.num_ops {
+            // `eval_unfiltered` pushes the canonicity check, the combined
+            // output check, the even and odd checks, then one range check per
+            // bit.
+            let canonicity_row = constraint_index;
+            let combined_row = constraint_index + 1;
+            let evens_row = constraint_index + 2;
+            let odds_row = constraint_index + 3;
+            constraint_index += 4;
+
+            acc_high.fill(F::ZERO);
+            acc_low.fill(F::ZERO);
+            acc_evens.fill(F::ZERO);
+            acc_odds.fill(F::ZERO);
+            for (j, bit_wire) in self.wires_ith_bit_decomposition(i).enumerate() {
+                let col = &wires[bit_wire * n..][..n];
+                // The bits are big-endian, so the first 32 are the high half
+                // and Horner from the front matches `reduce_with_powers` over
+                // the reversed (little-endian) view.
+                let half = if j < Self::NUM_BITS / 2 {
+                    &mut *acc_high
+                } else {
+                    &mut *acc_low
+                };
+                let parity = if j % 2 == 0 {
+                    &mut *acc_evens
+                } else {
+                    &mut *acc_odds
+                };
+                for p in 0..n {
+                    let bit = col[p];
+                    half[p] = half[p] * base + bit;
+                    parity[p] = parity[p] * base + bit;
+                    tmp[p] = bit * (bit - F::ONE);
+                }
+                let combined = &mut combined_gate_constraints
+                    [constraint_index * n..(constraint_index + 1) * n];
+                batch_multiply_add_inplace(combined, tmp, filters);
+                constraint_index += 1;
+            }
+
+            // Canonicity: `(inverse * (u32::MAX - high) - 1) * low`.
+            let inverse_col = &wires[self.wire_ith_inverse(i) * n..][..n];
+            for p in 0..n {
+                tmp[p] = (inverse_col[p] * (u32_max - acc_high[p]) - F::ONE) * acc_low[p];
+            }
+            let combined =
+                &mut combined_gate_constraints[canonicity_row * n..(canonicity_row + 1) * n];
+            batch_multiply_add_inplace(combined, tmp, filters);
+
+            // `high * 2^32 + low - x_interleaved`.
+            let x_interleaved_col = &wires[self.wire_ith_x_interleaved(i) * n..][..n];
+            for p in 0..n {
+                tmp[p] = acc_high[p] * split + acc_low[p] - x_interleaved_col[p];
+            }
+            let combined = &mut combined_gate_constraints[combined_row * n..(combined_row + 1) * n];
+            batch_multiply_add_inplace(combined, tmp, filters);
+
+            let x_evens_col = &wires[self.wire_ith_x_evens(i) * n..][..n];
+            for p in 0..n {
+                acc_evens[p] -= x_evens_col[p];
+            }
+            let combined = &mut combined_gate_constraints[evens_row * n..(evens_row + 1) * n];
+            batch_multiply_add_inplace(combined, acc_evens, filters);
+
+            let x_odds_col = &wires[self.wire_ith_x_odds(i) * n..][..n];
+            for p in 0..n {
+                acc_odds[p] -= x_odds_col[p];
+            }
+            let combined = &mut combined_gate_constraints[odds_row * n..(odds_row + 1) * n];
+            batch_multiply_add_inplace(combined, acc_odds, filters);
+        }
+
+        debug_assert_eq!(constraint_index, num_constraints);
     }
 
     fn generators(&self, row: usize, _local_constants: &[F]) -> Vec<WitnessGeneratorRef<F, D>> {

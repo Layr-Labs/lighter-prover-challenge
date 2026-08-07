@@ -570,10 +570,6 @@ mod tests {
     fn chain_step_two_phase_timing_impl() {
         use std::time::Instant;
 
-        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-            .is_test(false)
-            .try_init();
-
         use circuit::block_tx_chain_constraints::Circuit as _;
         use circuit::types::constants::TX_TYPE_EMPTY;
         use plonky2::field::types::{Field, PrimeField64};
@@ -634,17 +630,7 @@ mod tests {
             state_metadata_hash,
             jump,
         );
-        let tx_prove_start = Instant::now();
-        let mut tx_timing = TimingTree::new("tx-chunk-prove", log::Level::Debug);
-        let tx_proof = plonky2::plonk::prover::prove_with_partition_witness::<F, C, D>(
-            &circuits.tx_data.prover_only,
-            &circuits.tx_data.common,
-            witness,
-            &mut tx_timing,
-        )
-        .expect("tx proof failed");
-        println!("tx chunk prove total {:?}", tx_prove_start.elapsed());
-        tx_timing.print();
+        let tx_proof = prove_tx_witness(TxPath::Light, 0, &circuits.tx_data, witness);
 
         let base_proof = cyclic_base_witness(
             &circuits.dummy_proof,
@@ -711,16 +697,14 @@ mod tests {
             let phase2_elapsed = phase2_start.elapsed();
 
             let prove_start = Instant::now();
-            let mut timing = TimingTree::new("chain-step-prove", log::Level::Debug);
             let proof = prove_with_partition_witness::<F, C, D>(
                 &circuits.chain_data.prover_only,
                 &circuits.chain_data.common,
                 witness,
-                &mut timing,
+                &mut TimingTree::default(),
             )
             .expect("chain step proof failed");
             let prove_elapsed = prove_start.elapsed();
-            timing.print();
 
             println!(
                 "chain step {chain_step}: single-shot witness {single_shot_elapsed:?}, \
