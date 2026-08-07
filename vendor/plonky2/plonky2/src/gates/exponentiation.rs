@@ -200,6 +200,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for Exponentiation
         vec![WitnessGeneratorRef::new(gen.adapter())]
     }
 
+    fn exponentiation_quotient_gate(
+        &self,
+    ) -> Option<crate::gates::gate::ExponentiationQuotientGate> {
+        Some(crate::gates::gate::ExponentiationQuotientGate {
+            num_power_bits: self.num_power_bits,
+        })
+    }
+
     fn num_wires(&self) -> usize {
         self.wire_intermediate_value(self.num_power_bits - 1) + 1
     }

@@ -1009,7 +1009,7 @@ fn start_gpu_range_check_gate_quotient<
     use core::sync::atomic::Ordering;
     use crate::gates::gate::U32QuotientGate;
     use crate::hash::poseidon2::metal::{
-        RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec,
+        BaseSumQuotientSpec, ExponentiationQuotientSpec, RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec,
     };
 
     GPU_RANGE_QUOTIENT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
@@ -1027,9 +1027,58 @@ fn start_gpu_range_check_gate_quotient<
     let mut gate_indices = Vec::new();
     let mut specs = Vec::new();
     let mut u32_specs = Vec::new();
+    let mut base_sum_specs: Vec<BaseSumQuotientSpec> = Vec::new();
+    let mut exp_specs: Vec<ExponentiationQuotientSpec> = Vec::new();
     for (gate_index, gate) in common_data.gates.iter().enumerate() {
         let range = gate.0.range_check_quotient_gate();
         let u32_gate = gate.0.u32_quotient_gate();
+        if range.is_none() && u32_gate.is_none() {
+            if let Some(exp) = gate.0.exponentiation_quotient_gate() {
+                let wire_count = exp.num_power_bits.checked_mul(2)?.checked_add(2)?;
+                if exp.num_power_bits == 0
+                    || gate.0.num_wires() != wire_count
+                    || gate.0.num_constraints() != exp.num_power_bits + 1
+                {
+                    if gpu_poseidon_quotient_diagnostics_enabled() {
+                        eprintln!("[gpu-range-quotient] exp layout mismatch gate={gate_index}");
+                    }
+                    return None;
+                }
+                let selector_column = common_data.selectors_info.selector_indices[gate_index];
+                exp_specs.push(ExponentiationQuotientSpec {
+                    selector_column,
+                    gate_index,
+                    group: common_data.selectors_info.groups[selector_column].clone(),
+                    include_unused_selector,
+                    num_power_bits: exp.num_power_bits,
+                });
+                gate_indices.push(gate_index);
+            }
+            if let Some(base_sum) = gate.0.base_sum_quotient_gate() {
+                let expected = base_sum.num_limbs.checked_add(1)?;
+                if base_sum.num_limbs == 0
+                    || base_sum.base < 2
+                    || base_sum.base > 8
+                    || gate.0.num_wires() != expected
+                    || gate.0.num_constraints() != expected
+                {
+                    if gpu_poseidon_quotient_diagnostics_enabled() {
+                        eprintln!("[gpu-range-quotient] base-sum layout mismatch gate={gate_index}");
+                    }
+                    return None;
+                }
+                let selector_column = common_data.selectors_info.selector_indices[gate_index];
+                base_sum_specs.push(BaseSumQuotientSpec {
+                    selector_column,
+                    gate_index,
+                    group: common_data.selectors_info.groups[selector_column].clone(),
+                    include_unused_selector,
+                    num_limbs: base_sum.num_limbs,
+                    base: base_sum.base,
+                });
+                gate_indices.push(gate_index);
+            }
+        }
         if range.is_some() && u32_gate.is_some() {
             if gpu_poseidon_quotient_diagnostics_enabled() {
                 eprintln!(
@@ -1220,6 +1269,8 @@ fn start_gpu_range_check_gate_quotient<
         step,
         &specs,
         &u32_specs,
+        &base_sum_specs,
+        &exp_specs,
         alphas,
         alpha_offset,
     ) else {
