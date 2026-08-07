@@ -119,6 +119,53 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         res
     }
 
+    /// Writes this gate's unfiltered constraints into `out`, exactly
+    /// `vars_base.len() * self.num_constraints()` long. Gates whose batch
+    /// evaluation already writes contiguous constraint rows override this so
+    /// nothing is allocated per batch; the default preserves behaviour.
+    fn eval_unfiltered_base_batch_into(&self, vars_base: EvaluationVarsBaseBatch<F>, out: &mut [F]) {
+        out.copy_from_slice(&self.eval_unfiltered_base_batch(vars_base));
+    }
+
+    /// The default delegates to [`Gate::eval_unfiltered_base_batch_accumulate`]
+    /// so gates that accumulate directly into the combined buffer (skipping
+    /// materialization) keep that faster path. Gates that must materialize
+    /// override this to use the caller's reused buffer.
+    fn eval_unfiltered_base_batch_accumulate_scratch(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        _scratch: &mut Vec<F>,
+        combined_gate_constraints: &mut [F],
+    ) {
+        self.eval_unfiltered_base_batch_accumulate(vars_base, filters, combined_gate_constraints);
+    }
+
+    /// Helper for gates overriding the scratch accumulate: materialize into
+    /// `scratch`, then fold with the filters.
+    fn accumulate_via_scratch(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        scratch: &mut Vec<F>,
+        combined_gate_constraints: &mut [F],
+    ) {
+        let batch_size = vars_base.len();
+        assert_eq!(filters.len(), batch_size);
+        let len = batch_size * self.num_constraints();
+        if scratch.len() < len {
+            scratch.resize(len, F::ZERO);
+        }
+        let res_batch = &mut scratch[..len];
+        self.eval_unfiltered_base_batch_into(vars_base, res_batch);
+        for (combined, res) in combined_gate_constraints
+            .chunks_exact_mut(batch_size)
+            .zip(res_batch.chunks_exact(batch_size))
+        {
+            batch_multiply_add_inplace(combined, res, filters);
+        }
+    }
+
     fn eval_unfiltered_base_batch_accumulate(
         &self,
         vars_base: EvaluationVarsBaseBatch<F>,
@@ -183,6 +230,7 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         num_selectors: usize,
         num_lookup_selectors: usize,
         filters: &mut Vec<F>,
+        constraint_scratch: &mut Vec<F>,
         combined_gate_constraints: &mut [F],
     ) {
         let batch_size = vars_batch.len();
@@ -209,7 +257,12 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
             }
         }
         vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
-        self.eval_unfiltered_base_batch_accumulate(vars_batch, filters, combined_gate_constraints);
+        self.eval_unfiltered_base_batch_accumulate_scratch(
+            vars_batch,
+            filters,
+            constraint_scratch,
+            combined_gate_constraints,
+        );
     }
 
     /// Adds this gate's filtered constraints into the `combined_gate_constraints` buffer.
