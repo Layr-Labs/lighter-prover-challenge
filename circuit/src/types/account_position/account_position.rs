@@ -65,7 +65,7 @@ pub struct AccountPosition {
     pub allocated_margin: BigInt,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AccountPositionTarget {
     pub last_funding_rate_prefix_sum: BigIntU16Target, // 63 bits
     pub position: BigIntU16Target,                     // 56 bits

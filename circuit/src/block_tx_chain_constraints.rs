@@ -90,7 +90,7 @@ pub struct BlockTxChainCircuit {
     pub block_tx_witness_size: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct BlockTxChainTarget {
     pub cyclic_proof: ProofWithPublicInputsTarget<D>, // proof of previous iteration
     pub self_verifier_data: VerifierCircuitTarget,    // Verifier Circuit Data for this circuit

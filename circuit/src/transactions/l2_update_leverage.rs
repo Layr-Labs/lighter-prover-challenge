@@ -38,7 +38,7 @@ pub struct L2UpdateLeverageTx {
     pub margin_mode: u8,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct L2UpdateLeverageTxTarget {
     pub account_index: Target,
     pub api_key_index: Target,

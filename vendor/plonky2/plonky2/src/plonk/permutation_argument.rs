@@ -16,6 +16,7 @@ use crate::iop::wire::Wire;
 const OUTER_PARALLEL_SIGMA_COLUMNS: bool = false;
 
 /// Disjoint Set Forest data-structure following <https://en.wikipedia.org/wiki/Disjoint-set_data_structure>.
+#[derive(Debug)]
 pub struct Forest {
     /// A map of parent pointers, stored as indices.
     ///
@@ -50,6 +51,33 @@ impl Forest {
             num_routed_wires,
             degree,
         }
+    }
+
+    /// Reconstructs a forest from a stored representative map (the `parents`
+    /// vector of a forest whose paths have already been compressed, i.e.
+    /// `ProverOnlyCircuitData::representative_map`). Intended for loaders that
+    /// re-derive the sigma polynomials without re-running circuit
+    /// construction; the returned forest is exactly the state `sigma_vecs`
+    /// leaves behind after `compress_paths`, so `wire_partition` and
+    /// `get_sigma_polys` produce identical output to the original build.
+    pub fn from_parents(
+        parents: Vec<u32>,
+        num_wires: usize,
+        num_routed_wires: usize,
+        degree: usize,
+    ) -> Self {
+        Self {
+            parents,
+            num_wires,
+            num_routed_wires,
+            degree,
+        }
+    }
+
+    /// Consumes the forest and returns its parent map, undoing
+    /// [`Self::from_parents`] without copying.
+    pub fn into_parents(self) -> Vec<u32> {
+        self.parents
     }
 
     pub(crate) fn target_index(&self, target: Target) -> usize {
@@ -171,12 +199,13 @@ impl Forest {
     }
 }
 
+#[derive(Debug)]
 pub struct WirePartition {
     sigma: Vec<u32>,
 }
 
 impl WirePartition {
-    pub(crate) fn get_sigma_polys<F: Field>(
+    pub fn get_sigma_polys<F: Field>(
         &self,
         degree_log: usize,
         k_is: &[F],

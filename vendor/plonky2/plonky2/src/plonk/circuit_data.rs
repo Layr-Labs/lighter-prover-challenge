@@ -415,6 +415,44 @@ impl GeneratorWatchIndex {
         }
     }
 
+    /// The raw CSR offset table (`representative -> [start, end)` into
+    /// [`Self::watchers`]). Exposed for compact serialization of the index.
+    pub fn offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+
+    /// The flat, concatenated watcher lists indexed by [`Self::offsets`].
+    pub fn watchers(&self) -> &[usize] {
+        &self.watchers
+    }
+
+    /// Rebuilds the index from its raw CSR parts (as exposed by
+    /// [`Self::offsets`] and [`Self::watchers`]); the `entries` count is a pure
+    /// function of the offsets and is re-derived. The offsets must be
+    /// monotonically nondecreasing, start at 0 and end at `watchers.len()`,
+    /// exactly as [`Self::from_map`] produces them.
+    pub fn from_parts(offsets: Vec<u32>, watchers: Vec<usize>) -> Self {
+        assert!(!offsets.is_empty(), "watch index offsets must be non-empty");
+        assert_eq!(offsets[0], 0, "watch index offsets must start at zero");
+        assert_eq!(
+            *offsets.last().unwrap() as usize,
+            watchers.len(),
+            "watch index offsets must cover the watcher list"
+        );
+        let mut entries = 0usize;
+        for bounds in offsets.windows(2) {
+            assert!(bounds[0] <= bounds[1], "watch index offsets must be sorted");
+            if bounds[0] != bounds[1] {
+                entries += 1;
+            }
+        }
+        Self {
+            offsets,
+            watchers,
+            entries,
+        }
+    }
+
     #[inline]
     pub fn get(&self, representative: &usize) -> Option<&[usize]> {
         let end_index = representative.checked_add(1)?;
@@ -804,7 +842,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
 /// is intentionally missing certain fields, such as `CircuitConfig`, because we support only a
 /// limited form of dynamic inner circuits. We can't practically make things like the wire count
 /// dynamic, at least not without setting a maximum wire count and paying for the worst case.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VerifierCircuitTarget {
     /// A commitment to each constant polynomial and each permutation polynomial.
     pub constants_sigmas_cap: MerkleCapTarget,
