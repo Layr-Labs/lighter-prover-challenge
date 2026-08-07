@@ -287,6 +287,70 @@ struct BufferSet {
 struct BufferPool {
     free: Vec<BufferSet>,
     created: usize,
+    waiters: usize,
+    spare_output: Option<Buffer>,
+    detached_readback: bool,
+}
+
+struct DetachedOutput<'a> {
+    owner: &'a MetalShared,
+    buffer: Option<Buffer>,
+}
+
+impl DetachedOutput<'_> {
+    fn buffer(&self) -> &Buffer {
+        self.buffer.as_ref().expect("detached output present")
+    }
+}
+
+impl Drop for DetachedOutput<'_> {
+    fn drop(&mut self) {
+        let Some(buffer) = self.buffer.take() else {
+            return;
+        };
+        let mut pool = self
+            .owner
+            .pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(pool.detached_readback);
+        debug_assert!(pool.spare_output.is_none());
+        pool.spare_output = Some(buffer);
+        pool.detached_readback = false;
+    }
+}
+
+enum TreeReadback<'a, F: RichField> {
+    Ready((LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)),
+    Detached {
+        output: DetachedOutput<'a>,
+        output_len: usize,
+        level_offsets: Vec<usize>,
+        leaf_count: usize,
+        cap_height: usize,
+        marker: PhantomData<F>,
+    },
+}
+
+impl<F: RichField> TreeReadback<'_, F> {
+    fn finish(self) -> (LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>) {
+        match self {
+            Self::Ready(tree) => tree,
+            Self::Detached {
+                output,
+                output_len,
+                level_offsets,
+                leaf_count,
+                cap_height,
+                marker: _,
+            } => {
+                let nodes = unsafe {
+                    slice::from_raw_parts(output.buffer().contents().cast::<u64>(), output_len)
+                };
+                tree_from_levels(nodes, &level_offsets, leaf_count, cap_height)
+            }
+        }
+    }
 }
 
 static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShared::new);
@@ -1001,6 +1065,9 @@ impl MetalShared {
                 pool: Mutex::new(BufferPool {
                     free: Vec::new(),
                     created: 0,
+                    waiters: 0,
+                    spare_output: None,
+                    detached_readback: false,
                 }),
                 available: Condvar::new(),
                 ntt_roots: Mutex::new(HashMap::new()),
@@ -1180,18 +1247,90 @@ impl MetalShared {
                     output: None,
                 });
             }
-            pool = self
-                .available
-                .wait(pool)
-                .map_err(|_| "buffer pool poisoned")?;
+            pool.waiters += 1;
+            match self.available.wait(pool) {
+                Ok(mut next) => {
+                    next.waiters -= 1;
+                    pool = next;
+                }
+                Err(poisoned) => {
+                    let mut next = poisoned.into_inner();
+                    next.waiters -= 1;
+                    return Err("buffer pool poisoned".to_string());
+                }
+            }
         }
     }
 
     fn release_set(&self, set: BufferSet) {
-        if let Ok(mut pool) = self.pool.lock() {
-            pool.free.push(set);
-            self.available.notify_one();
+        let mut pool = self
+            .pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pool.free.push(set);
+        self.available.notify_one();
+    }
+
+    fn try_detach_completed_output(
+        &self,
+        set: &mut BufferSet,
+        output_bytes: usize,
+    ) -> Result<Option<DetachedOutput<'_>>, String> {
+        let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
+        if pool.waiters == 0 || pool.detached_readback {
+            return Ok(None);
         }
+        let replacement = match pool.spare_output.take() {
+            Some(buffer) if buffer.length() >= output_bytes as u64 => buffer,
+            _ => autoreleasepool(|| {
+                self.device
+                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
+            }),
+        };
+        let completed = set
+            .output
+            .replace(replacement)
+            .ok_or_else(|| "completed output buffer missing".to_string())?;
+        pool.detached_readback = true;
+        drop(pool);
+        Ok(Some(DetachedOutput {
+            owner: self,
+            buffer: Some(completed),
+        }))
+    }
+
+    fn completed_tree_readback<F: RichField>(
+        &self,
+        set: &mut BufferSet,
+        output_len: usize,
+        level_offsets: Vec<usize>,
+        leaf_count: usize,
+        cap_height: usize,
+    ) -> Result<TreeReadback<'_, F>, String> {
+        let output_bytes = output_len
+            .checked_mul(size_of::<u64>())
+            .ok_or("Metal Merkle output size overflow")?;
+        if let Some(output) = self.try_detach_completed_output(set, output_bytes)? {
+            return Ok(TreeReadback::Detached {
+                output,
+                output_len,
+                level_offsets,
+                leaf_count,
+                cap_height,
+                marker: PhantomData,
+            });
+        }
+        let output = set
+            .output
+            .as_ref()
+            .ok_or_else(|| "completed output buffer missing".to_string())?;
+        let nodes = unsafe { slice::from_raw_parts(output.contents().cast::<u64>(), output_len) };
+        Ok(TreeReadback::Ready(tree_from_levels(
+            nodes,
+            &level_offsets,
+            leaf_count,
+            cap_height,
+        )))
     }
 
     fn roots_for(&self, log_lde: u32) -> Result<(Buffer, Vec<usize>), String> {
@@ -1306,7 +1445,7 @@ impl MetalShared {
         let cap_count = 1usize << cap_height;
         let total_node_count = 2 * lde_size - cap_count;
 
-        let _job = GpuJobGuard::begin();
+        let job = GpuJobGuard::begin();
         let value_len = degree
             .checked_mul(cols)
             .ok_or("NTT value length overflow")?;
@@ -1346,7 +1485,7 @@ impl MetalShared {
         });
 
         let mut set = self.acquire_set()?;
-        let result = (|| -> Result<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>), String> {
+        let result = (|| -> Result<TreeReadback<'_, F>, String> {
             if set
                 .input
                 .as_ref()
@@ -1522,13 +1661,17 @@ impl MetalShared {
                 ));
             }
 
-            let nodes = unsafe {
-                slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
-            };
-            Ok(tree_from_levels(nodes, &level_offsets, lde_size, cap_height))
+            self.completed_tree_readback(
+                &mut set,
+                output_len,
+                level_offsets,
+                lde_size,
+                cap_height,
+            )
         })();
         self.release_set(set);
-        let (digests, cap) = result?;
+        drop(job);
+        let (digests, cap) = result?.finish();
 
         // Copy the coefficients out for the oracle's `polynomials` field.
         let coeff_source = unsafe {
@@ -1574,7 +1717,7 @@ impl MetalShared {
         let cap_count = 1usize << cap_height;
         let total_node_count = 2 * lde_size - cap_count;
 
-        let _job = GpuJobGuard::begin();
+        let job = GpuJobGuard::begin();
         let coeff_len = degree
             .checked_mul(cols)
             .ok_or("NTT coefficient length overflow")?;
@@ -1621,7 +1764,8 @@ impl MetalShared {
             output_bytes,
         );
         self.release_set(set);
-        let (digests, cap) = result?;
+        drop(job);
+        let (digests, cap) = result?.finish();
         Ok((
             MetalColumns {
                 buffer: column_buffer,
@@ -1651,7 +1795,7 @@ impl MetalShared {
         coeff_bytes: usize,
         output_len: usize,
         output_bytes: usize,
-    ) -> Result<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>), String> {
+    ) -> Result<TreeReadback<'_, F>, String> {
         let cols = coeff_columns.len();
         let lde_size = degree << rate_bits;
         let log_lde = lde_size.ilog2();
@@ -1789,10 +1933,13 @@ impl MetalShared {
             ));
         }
 
-        let nodes = unsafe {
-            slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
-        };
-        Ok(tree_from_levels(nodes, &level_offsets, lde_size, cap_height))
+        self.completed_tree_readback(
+            set,
+            output_len,
+            level_offsets,
+            lde_size,
+            cap_height,
+        )
     }
 
     fn build<F: RichField>(
@@ -1818,7 +1965,7 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("Metal Merkle output size overflow")?;
 
-        let _job = GpuJobGuard::begin();
+        let job = GpuJobGuard::begin();
         let mut set = self.acquire_set()?;
         let result = self.build_with_set(
             &mut set,
@@ -1832,7 +1979,8 @@ impl MetalShared {
             output_bytes,
         );
         self.release_set(set);
-        result
+        drop(job);
+        Ok(result?.finish())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1847,7 +1995,7 @@ impl MetalShared {
         input_bytes: usize,
         output_len: usize,
         output_bytes: usize,
-    ) -> Result<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>), String> {
+    ) -> Result<TreeReadback<'_, F>, String> {
         let cap_count = 1usize << cap_height;
 
         let needs_staging = !matches!(&source, LeafSource::Shared(_));
@@ -1998,14 +2146,13 @@ impl MetalShared {
             ));
         }
 
-        let nodes =
-            unsafe { slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len) };
-        Ok(tree_from_levels(
-            nodes,
-            &level_offsets,
+        self.completed_tree_readback(
+            set,
+            output_len,
+            level_offsets,
             leaf_count,
             cap_height,
-        ))
+        )
     }
 }
 
@@ -2161,6 +2308,102 @@ mod tests {
     use crate::hash::merkle_tree::{capacity_up_to_mut, fill_digests_buf, merkle_tree_prove};
     use crate::hash::poseidon2::hash::Poseidon2Hash;
     use crate::plonk::vars::EvaluationVarsBaseBatch;
+
+    #[test]
+    fn does_not_detach_output_without_a_waiting_build() {
+        let context = MetalShared::new().expect("Metal context");
+        let mut set = context.acquire_set().expect("buffer set");
+        set.output = Some(autoreleasepool(|| {
+            context
+                .device
+                .new_buffer(64, MTLResourceOptions::StorageModeShared)
+        }));
+
+        let detached = context
+            .try_detach_completed_output(&mut set, 64)
+            .expect("pool state");
+        assert!(detached.is_none());
+        let pool = context.pool.lock().unwrap();
+        assert_eq!(pool.waiters, 0);
+        assert!(pool.spare_output.is_none());
+        assert!(!pool.detached_readback);
+    }
+
+    #[test]
+    fn detached_output_releases_waiting_set_without_reusing_storage() {
+        use std::sync::mpsc;
+
+        let context = MetalShared::new().expect("Metal context");
+        let mut set = context.acquire_set().expect("first set");
+        set.output = Some(autoreleasepool(|| {
+            context
+                .device
+                .new_buffer(64, MTLResourceOptions::StorageModeShared)
+        }));
+        let original = set.output.as_ref().unwrap().contents();
+
+        std::thread::scope(|scope| {
+            let (tx, rx) = mpsc::sync_channel(0);
+            let context_ref = &context;
+            scope.spawn(move || {
+                let next = context_ref.acquire_set().expect("waiting set");
+                tx.send(next).expect("return acquired set");
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while context.pool.lock().unwrap().waiters != 1 {
+                assert!(Instant::now() < deadline, "waiter did not block on the set");
+                std::thread::yield_now();
+            }
+
+            let detached = context
+                .try_detach_completed_output(&mut set, 64)
+                .expect("pool state")
+                .expect("waiting build enables detach");
+            let replacement = set.output.as_ref().unwrap().contents();
+            assert_eq!(detached.buffer().contents(), original);
+            assert_ne!(replacement, original);
+
+            context.release_set(set);
+            let next = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("next build acquires before readback release");
+            assert_eq!(next.output.as_ref().unwrap().contents(), replacement);
+            context.release_set(next);
+
+            drop(detached);
+            let pool = context.pool.lock().unwrap();
+            assert!(!pool.detached_readback);
+            assert!(pool.spare_output.is_some());
+        });
+    }
+
+    #[test]
+    fn detached_tree_readback_matches_direct_level_conversion() {
+        type F = GoldilocksField;
+
+        let context = MetalShared::new().expect("Metal context");
+        let mut set = context.acquire_set().expect("buffer set");
+        let limbs: Vec<u64> = (0..28).collect();
+        set.output = Some(autoreleasepool(|| {
+            context.device.new_buffer_with_data(
+                limbs.as_ptr().cast::<c_void>(),
+                size_of_val(limbs.as_slice()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }));
+        let offsets = vec![0, 16, 24];
+        let expected = tree_from_levels::<F>(&limbs, &offsets, 4, 0);
+
+        context.pool.lock().unwrap().waiters = 1;
+        let pending = context
+            .completed_tree_readback::<F>(&mut set, limbs.len(), offsets, 4, 0)
+            .expect("completed tree readback");
+        context.pool.lock().unwrap().waiters = 0;
+        context.release_set(set);
+
+        assert_eq!(pending.finish(), expected);
+    }
 
     fn gpu_duration(command_buffer: &CommandBuffer, wall: Duration) -> Duration {
         let gpu_start: f64 = unsafe {
