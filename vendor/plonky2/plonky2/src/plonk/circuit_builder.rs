@@ -1282,19 +1282,22 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // representative exactly when the list's last entry is already this generator. Deriving
         // the counts here costs one comparison per watched target and avoids the separate global
         // traversal of the finished map that the naive variant would need.
-        let mut generator_watch_counts = vec![0usize; self.generators.len()];
+        let mut generator_watch_counts = vec![0u32; self.generators.len()];
         let mut generator_indices_by_watches = BTreeMap::new();
         for (i, generator) in self.generators.iter().enumerate() {
+            let generator_idx = u32::try_from(i).expect("number of generators exceeds u32::MAX");
             for watch in generator.0.watch_list() {
                 let watch_index = forest.target_index(watch);
                 let watch_rep_index = forest.parents[watch_index] as usize;
                 let watchers = generator_indices_by_watches
                     .entry(watch_rep_index)
                     .or_insert_with(Vec::new);
-                if watchers.last() != Some(&i) {
-                    generator_watch_counts[i] += 1;
+                if watchers.last() != Some(&generator_idx) {
+                    generator_watch_counts[i] = generator_watch_counts[i]
+                        .checked_add(1)
+                        .expect("generator watch count exceeds u32::MAX");
                 }
-                watchers.push(i);
+                watchers.push(generator_idx);
             }
         }
         for indices in generator_indices_by_watches.values_mut() {

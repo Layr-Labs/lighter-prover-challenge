@@ -874,20 +874,23 @@ pub trait Read {
         let mut generator_indices_by_watches = BTreeMap::new();
         for _ in 0..map_len {
             let k = self.read_usize()?;
-            generator_indices_by_watches.insert(k, self.read_usize_vec()?);
+            generator_indices_by_watches.insert(k, self.read_usize_encoded_u32_vec()?);
         }
 
         // `generator_watch_counts` is runtime-only and carries no bytes: it is a pure function of
         // the watcher map just read. Each map entry's watcher list is deduplicated at build time,
         // so a generator appears once per distinct representative it watches and counting its
         // occurrences reproduces the builder-derived counts exactly.
-        let mut generator_watch_counts = vec![0usize; generators.len()];
+        let mut generator_watch_counts = vec![0u32; generators.len()];
         for watchers in generator_indices_by_watches.values() {
             for &generator_idx in watchers {
+                let generator_idx = generator_idx as usize;
                 if generator_idx >= generators.len() {
                     return Err(IoError);
                 }
-                generator_watch_counts[generator_idx] += 1;
+                generator_watch_counts[generator_idx] = generator_watch_counts[generator_idx]
+                    .checked_add(1)
+                    .ok_or(IoError)?;
             }
         }
 
@@ -1934,7 +1937,7 @@ pub trait Write {
         self.write_usize(generator_indices_by_watches.len())?;
         for (k, v) in generator_indices_by_watches {
             self.write_usize(*k)?;
-            self.write_usize_vec(v)?;
+            self.write_usize_encoded_u32_vec(v)?;
         }
 
         self.write_polynomial_batch(constants_sigmas_commitment)?;

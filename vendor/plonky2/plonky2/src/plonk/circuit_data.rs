@@ -370,7 +370,7 @@ pub struct ProverOnlyCircuitData<
     pub generators: Vec<WitnessGeneratorRef<F, D>>,
     /// Generator indices (within the `Vec` above), indexed by the representative of each target
     /// they watch.
-    pub generator_indices_by_watches: BTreeMap<usize, Vec<usize>>,
+    pub generator_indices_by_watches: BTreeMap<usize, Vec<u32>>,
     /// For each generator (indexed as in `generators`), the number of *distinct* representatives
     /// it watches — equivalently, the number of entries of `generator_indices_by_watches` whose
     /// watcher list contains that generator.
@@ -380,7 +380,7 @@ pub struct ProverOnlyCircuitData<
     /// decrementing on first population, instead of traversing the entire watcher map at the
     /// start of every proof. Runtime-only: it is a pure function of `generator_indices_by_watches`
     /// and is reconstructed on deserialization, so the serialized format is unchanged.
-    pub generator_watch_counts: Vec<usize>,
+    pub generator_watch_counts: Vec<u32>,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.
