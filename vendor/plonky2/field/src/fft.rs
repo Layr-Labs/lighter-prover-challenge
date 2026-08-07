@@ -439,6 +439,75 @@ fn fft_classic_simd_single_layer_neon(
     }
 }
 
+/// One FRI butterfly layer over quadratic-extension elements, with the
+/// modular reduction in vector registers.
+///
+/// `QuadraticExtension<GoldilocksField>` is `X^2 - 7`, so
+/// `(a0 + a1*u) * (b0 + b1*u) = (a0*b0 + 7*a1*b1) + (a0*b1 + a1*b0)*u`.
+/// The four scalar products run through the same paired
+/// `NeonGoldilocksField` assembly the base-field path uses (hiding the
+/// scalar `mul`/`umulh` latency), the two component reductions are scalar,
+/// and the butterfly `u + t` / `u - t` reductions run as two-lane vector
+/// adds/subs reproducing `impl Add/Sub for GoldilocksField` word for word.
+/// Same blocks, same pairing, same twiddles, same order as the generic body.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_single_layer_neon_ext(
+    values: &mut [crate::extension::quadratic::QuadraticExtension<
+        crate::goldilocks_field::GoldilocksField,
+    >],
+    lg_half_m: usize,
+    omega_row: &[crate::extension::quadratic::QuadraticExtension<
+        crate::goldilocks_field::GoldilocksField,
+    >],
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+    use crate::extension::quadratic::QuadraticExtension;
+    use crate::goldilocks_field::GoldilocksField;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    const W: u64 = 7;
+    let half = 1usize << lg_half_m;
+    let m = half << 1;
+    debug_assert!(omega_row.len() >= half);
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        let mut k = 0;
+        while k + m <= values.len() {
+            let mut j = 0;
+            while j + 1 <= half {
+                let v = *values.get_unchecked(k + half + j);
+                let w = *omega_row.get_unchecked(j);
+                // Extension product: two paired scalar muls, then two scalar
+                // component reductions with the W = 7 conjugation.
+                let p = NeonGoldilocksField([w.0[0], w.0[1]])
+                    * NeonGoldilocksField([v.0[0], v.0[1]]);
+                let q = NeonGoldilocksField([w.0[0], w.0[1]])
+                    * NeonGoldilocksField([v.0[1], v.0[0]]);
+                let c0 = (p.0[0] + GoldilocksField(W) * p.0[1]).0;
+                let c1 = (q.0[0] + q.0[1]).0;
+                let tv = vcombine_u64(vcreate_u64(c0), vcreate_u64(c1));
+
+                let u = *values.get_unchecked(k + j);
+                let uv = vcombine_u64(vcreate_u64(u.0[0].0), vcreate_u64(u.0[1].0));
+                let sum = gl_add_neon(uv, tv, eps);
+                let diff = gl_sub_neon(uv, tv, eps);
+                *values.get_unchecked_mut(k + j) = QuadraticExtension([
+                    GoldilocksField(vgetq_lane_u64(sum, 0)),
+                    GoldilocksField(vgetq_lane_u64(sum, 1)),
+                ]);
+                *values.get_unchecked_mut(k + half + j) = QuadraticExtension([
+                    GoldilocksField(vgetq_lane_u64(diff, 0)),
+                    GoldilocksField(vgetq_lane_u64(diff, 1)),
+                ]);
+                j += 1;
+            }
+            k += m;
+        }
+    }
+}
+
 #[inline(always)]
 fn fft_classic_simd_single_layer<P: PackedField>(
     packed_values: &mut [P],
@@ -481,6 +550,47 @@ fn fft_classic_simd_single_layer<P: PackedField>(
             )
         };
         fft_classic_simd_single_layer_neon(scalars, lg_half_m, omega_row);
+        return;
+    }
+    // Quadratic-extension (FRI) fast path: the butterfly add/sub reductions
+    // run as two-lane vectors over each element's Goldilocks components.
+    #[cfg(target_arch = "aarch64")]
+    if lg_half_m >= lg_packed_width
+        && core::any::TypeId::of::<P>()
+            == core::any::TypeId::of::<
+                crate::extension::quadratic::QuadraticExtension<
+                    crate::goldilocks_field::GoldilocksField,
+                >,
+            >()
+    {
+        // SAFETY: the `TypeId` compare proves `P` is exactly
+        // `QuadraticExtension<GoldilocksField>`, whose `PackedField` `WIDTH`
+        // is 1, so `packed_values` is exactly `len` contiguous extension
+        // elements with the same alignment (a single `[GoldilocksField; 2]`
+        // field, no padding). The omega row is already the correct type.
+        fft_classic_simd_single_layer_neon_ext(
+            unsafe {
+                core::slice::from_raw_parts_mut(
+                    packed_values
+                        .as_mut_ptr()
+                        .cast::<crate::extension::quadratic::QuadraticExtension<
+                            crate::goldilocks_field::GoldilocksField,
+                        >>(),
+                    packed_values.len() * P::WIDTH,
+                )
+            },
+            lg_half_m,
+            unsafe {
+                let row = &root_table[lg_half_m];
+                core::slice::from_raw_parts(
+                    row.as_ptr()
+                        .cast::<crate::extension::quadratic::QuadraticExtension<
+                            crate::goldilocks_field::GoldilocksField,
+                        >>(),
+                    row.len(),
+                )
+            },
+        );
         return;
     }
 
@@ -1792,6 +1902,42 @@ mod tests {
 
     use crate::extension::quadratic::QuadraticExtension;
     use crate::fft::{FftRootTable, fft, fft_classic, fft_root_table, fft_with_options, ifft};
+
+    /// Portable copy of the extension-butterfly product used by the NEON
+    /// path: `(a0 + a1*u) * (b0 + b1*u)` with `u^2 = 7`, reduced
+    /// component-wise exactly like the generic `QuadraticExtension` mul.
+    fn ext_product_portable(
+        w: &QuadraticExtension<GoldilocksField>,
+        v: &QuadraticExtension<GoldilocksField>,
+    ) -> [u64; 2] {
+        let w0 = w.0[0].0;
+        let w1 = w.0[1].0;
+        let v0 = v.0[0].0;
+        let v1 = v.0[1].0;
+        let a = GoldilocksField(w0) * GoldilocksField(v0);
+        let b = GoldilocksField(w1) * GoldilocksField(v1);
+        let c = GoldilocksField(w0) * GoldilocksField(v1);
+        let d = GoldilocksField(w1) * GoldilocksField(v0);
+        let c0 = (a + GoldilocksField(7) * b).0;
+        let c1 = (c + d).0;
+        [c0, c1]
+    }
+
+    #[test]
+    fn extension_neon_product_matches_generic_mul() {
+        use crate::types::Sample;
+        for _ in 0..1000 {
+            let w = QuadraticExtension::<GoldilocksField>::rand();
+            let v = QuadraticExtension::<GoldilocksField>::rand();
+            let expected = (w * v).0;
+            let got = ext_product_portable(&w, &v);
+            assert_eq!(
+                [got[0], got[1]],
+                [expected[0].0, expected[1].0],
+                "extension product formula diverges"
+            );
+        }
+    }
     use crate::goldilocks_field::GoldilocksField;
     use crate::packable::Packable;
     use crate::packed::PackedField;
