@@ -304,45 +304,6 @@ fn seed_inputs_and_unresolved_watches<F: Field>(
     Ok(unresolved_watches)
 }
 
-/// Direct-seeding adapter: writes values straight into the partition's
-/// representative slots while maintaining the same per-generator
-/// unresolved-watch counters as [`seed_inputs_and_unresolved_watches`],
-/// without routing the values through a `PartialWitness` map first. The
-/// decrement rule is identical: `set_target_returning_rep` returns the
-/// representative only on first population, so aliased or duplicated
-/// inputs decrement at most once and no counter can underflow.
-pub struct PartitionSeeder<'a, 'b, F: Field> {
-    witness: &'b mut PartitionWitness<'a, F>,
-    unresolved_watches: &'b mut [usize],
-    generator_indices_by_watches: &'b BTreeMap<usize, Vec<usize>>,
-}
-
-impl<F: Field> Debug for PartitionSeeder<'_, '_, F> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("PartitionSeeder").finish_non_exhaustive()
-    }
-}
-
-impl<F: Field> WitnessWrite<F> for PartitionSeeder<'_, '_, F> {
-    fn set_target(&mut self, target: Target, value: F) -> Result<()> {
-        if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
-            if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
-                for &generator_idx in watchers {
-                    debug_assert_ne!(self.unresolved_watches[generator_idx], 0);
-                    self.unresolved_watches[generator_idx] -= 1;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl<F: Field> Witness<F> for PartitionSeeder<'_, '_, F> {
-    fn try_get_target(&self, target: Target) -> Option<F> {
-        self.witness.try_get_target(target)
-    }
-}
-
 /// Resumable witness generation: [`Self::start`] seeds an initial set of inputs and runs every
 /// generator that can already make progress, each [`Self::feed`] sets newly available inputs and
 /// resumes only the generators watching them, and [`Self::finish`] performs the same completeness
@@ -435,55 +396,6 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             remaining_generators,
             prover_data,
             parallel_threshold,
-        })
-    }
-
-    /// Like [`Self::start`], but the initial inputs are written by `seed`
-    /// directly into the partition through a [`PartitionSeeder`] — no
-    /// intermediate `PartialWitness` map is built or replayed. Worklist
-    /// initialization is unchanged: all generators are queued, gated by the
-    /// same unresolved-watch counters the map-seeded path would produce.
-    pub fn start_seeded(
-        prover_data: &'a ProverOnlyCircuitData<F, C, D>,
-        common_data: &CommonCircuitData<F, D>,
-        seed: impl FnOnce(&mut PartitionSeeder<'a, '_, F>) -> Result<()>,
-    ) -> Result<Self> {
-        let generators = &prover_data.generators;
-
-        let mut witness = PartitionWitness::new(
-            common_data.config.num_wires,
-            common_data.degree(),
-            &prover_data.representative_map,
-        );
-
-        let mut unresolved_watches = prover_data.generator_watch_counts.to_vec();
-        seed(&mut PartitionSeeder {
-            witness: &mut witness,
-            unresolved_watches: &mut unresolved_watches,
-            generator_indices_by_watches: &prover_data.generator_indices_by_watches,
-        })?;
-
-        let mut generator_is_expired = vec![false; generators.len()];
-        let mut remaining_generators = generators.len();
-
-        // Initially, all generators are queued.
-        run_generator_worklist(
-            &mut witness,
-            prover_data,
-            &mut unresolved_watches,
-            &mut generator_is_expired,
-            &mut remaining_generators,
-            (0..generators.len()).collect(),
-            PARALLEL_WORKLIST_THRESHOLD,
-        )?;
-
-        Ok(Self {
-            witness,
-            unresolved_watches,
-            generator_is_expired,
-            remaining_generators,
-            prover_data,
-            parallel_threshold: PARALLEL_WORKLIST_THRESHOLD,
         })
     }
 

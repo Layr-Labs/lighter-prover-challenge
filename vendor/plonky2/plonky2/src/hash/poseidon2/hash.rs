@@ -797,7 +797,10 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
         leaf_width: usize,
         num_leaves: usize,
         cap_height: usize,
-    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
+    ) -> Option<(
+        crate::hash::merkle_tree::MerkleDigestStore<Self::Hash>,
+        Vec<Self::Hash>,
+    )> {
         super::metal::build_merkle_tree(leaves, leaf_width, num_leaves, cap_height)
     }
 
@@ -805,7 +808,10 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
     fn try_build_merkle_tree_columns(
         columns: &[Vec<F>],
         cap_height: usize,
-    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
+    ) -> Option<(
+        crate::hash::merkle_tree::MerkleDigestStore<Self::Hash>,
+        Vec<Self::Hash>,
+    )> {
         super::metal::build_merkle_tree_columns(columns, cap_height)
     }
 
@@ -823,7 +829,10 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
     fn try_build_merkle_tree_column_store(
         columns: &crate::hash::merkle_tree::ColumnStore<F>,
         cap_height: usize,
-    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
+    ) -> Option<(
+        crate::hash::merkle_tree::MerkleDigestStore<Self::Hash>,
+        Vec<Self::Hash>,
+    )> {
         match columns {
             crate::hash::merkle_tree::ColumnStore::Owned(columns) => {
                 super::metal::build_merkle_tree_columns(columns, cap_height)
@@ -841,7 +850,7 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
         cap_height: usize,
     ) -> Option<(
         crate::hash::merkle_tree::ColumnStore<F>,
-        Vec<Self::Hash>,
+        crate::hash::merkle_tree::MerkleDigestStore<Self::Hash>,
         Vec<Self::Hash>,
     )> {
         super::metal::build_commitment_from_coeffs(coeff_columns, rate_bits, cap_height).map(
@@ -862,7 +871,7 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
         cap_height: usize,
     ) -> Option<(
         crate::hash::merkle_tree::ColumnStore<F>,
-        Vec<Self::Hash>,
+        crate::hash::merkle_tree::MerkleDigestStore<Self::Hash>,
         Vec<Self::Hash>,
         Vec<Vec<F>>,
     )> {

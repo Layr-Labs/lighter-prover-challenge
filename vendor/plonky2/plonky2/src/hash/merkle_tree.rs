@@ -102,7 +102,104 @@ pub enum MerkleLeaves<F> {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Backing storage for Merkle digests.
+///
+/// CPU builders use the historical recursive subtree layout. GPU builders
+/// naturally produce complete levels, so retaining that layout avoids an
+/// additional full-tree recursive reorder after every commitment.
+#[derive(Clone, Debug)]
+pub enum MerkleDigestStore<H> {
+    Recursive(Vec<H>),
+    Levels {
+        /// All levels from leaf hashes through the cap, concatenated bottom-up.
+        nodes: Vec<H>,
+        /// Start index of every level in `nodes`, measured in hashes.
+        level_offsets: Vec<usize>,
+    },
+}
+
+impl<H: Copy> MerkleDigestStore<H> {
+    fn is_valid(&self, num_leaves: usize, cap_height: usize) -> bool {
+        let cap_count = 1 << cap_height;
+        match self {
+            Self::Recursive(digests) => digests.len() == 2 * (num_leaves - cap_count),
+            Self::Levels {
+                nodes,
+                level_offsets,
+            } => {
+                level_offsets.len() == log2_strict(num_leaves) - cap_height + 1
+                    && level_offsets.first() == Some(&0)
+                    && nodes.len() == 2 * num_leaves - cap_count
+            }
+        }
+    }
+
+    pub(crate) fn recursive_digests(
+        &self,
+        num_leaves: usize,
+        cap_height: usize,
+    ) -> Vec<H> {
+        match self {
+            Self::Recursive(digests) => digests.clone(),
+            Self::Levels {
+                nodes,
+                level_offsets,
+            } => {
+                let cap_count = 1 << cap_height;
+                let subtree_leaf_count = num_leaves / cap_count;
+                let subtree_digest_count = 2 * (subtree_leaf_count - 1);
+                let mut digests = Vec::with_capacity(2 * (num_leaves - cap_count));
+                for cap_index in 0..cap_count {
+                    let start = digests.len();
+                    digests.resize(start + subtree_digest_count, nodes[0]);
+                    fill_recursive_from_levels(
+                        &mut digests[start..],
+                        nodes,
+                        level_offsets,
+                        cap_index * subtree_leaf_count,
+                        subtree_leaf_count,
+                    );
+                }
+                digests
+            }
+        }
+    }
+}
+
+fn fill_recursive_from_levels<H: Copy>(
+    digests: &mut [H],
+    nodes: &[H],
+    level_offsets: &[usize],
+    start_leaf: usize,
+    leaf_count: usize,
+) -> H {
+    if leaf_count == 1 {
+        return nodes[level_offsets[0] + start_leaf];
+    }
+
+    let (left_half, right_half) = digests.split_at_mut(digests.len() / 2);
+    let (left_root, left_digests) = left_half.split_last_mut().unwrap();
+    let (right_root, right_digests) = right_half.split_first_mut().unwrap();
+    let half = leaf_count / 2;
+    *left_root = fill_recursive_from_levels(
+        left_digests,
+        nodes,
+        level_offsets,
+        start_leaf,
+        half,
+    );
+    *right_root = fill_recursive_from_levels(
+        right_digests,
+        nodes,
+        level_offsets,
+        start_leaf + half,
+        half,
+    );
+
+    nodes[level_offsets[leaf_count.ilog2() as usize] + start_leaf / leaf_count]
+}
+
+#[derive(Clone, Debug)]
 pub struct MerkleTree<F: RichField, H: Hasher<F>> {
     /// The data in the leaves of the Merkle tree.
     pub leaves: MerkleLeaves<F>,
@@ -110,19 +207,36 @@ pub struct MerkleTree<F: RichField, H: Hasher<F>> {
     /// The number of leaves.
     pub num_leaves: usize,
 
-    /// The digests in the tree. Consists of `cap.len()` sub-trees, each corresponding to one
-    /// element in `cap`. Each subtree is contiguous and located at
-    /// `digests[digests.len() / cap.len() * i..digests.len() / cap.len() * (i + 1)]`.
-    /// Within each subtree, siblings are stored next to each other. The layout is,
-    /// left_child_subtree || left_child_digest || right_child_digest || right_child_subtree, where
-    /// left_child_digest and right_child_digest are H::Hash and left_child_subtree and
-    /// right_child_subtree recurse. Observe that the digest of a node is stored by its _parent_.
-    /// Consequently, the digests of the roots are not stored here (they can be found in `cap`).
-    pub digests: Vec<H::Hash>,
+    /// The digests in the tree, retained in the native layout of the selected
+    /// CPU or GPU builder. Both layouts produce identical authentication paths.
+    pub digests: MerkleDigestStore<H::Hash>,
 
     /// The Merkle cap.
     pub cap: MerkleCap<F, H>,
 }
+
+impl<F: RichField, H: Hasher<F>> PartialEq for MerkleTree<F, H> {
+    fn eq(&self, other: &Self) -> bool {
+        let digests_equal = if self.cap.is_empty() || other.cap.is_empty() {
+            match (&self.digests, &other.digests) {
+                (MerkleDigestStore::Recursive(a), MerkleDigestStore::Recursive(b)) => a == b,
+                _ => false,
+            }
+        } else {
+            self.digests
+                .recursive_digests(self.num_leaves, self.cap.height())
+                == other
+                    .digests
+                    .recursive_digests(other.num_leaves, other.cap.height())
+        };
+        self.leaves == other.leaves
+            && self.num_leaves == other.num_leaves
+            && self.cap == other.cap
+            && digests_equal
+    }
+}
+
+impl<F: RichField, H: Hasher<F>> Eq for MerkleTree<F, H> {}
 
 impl<F: RichField, H: Hasher<F>> Default for MerkleTree<F, H> {
     fn default() -> Self {
@@ -132,7 +246,7 @@ impl<F: RichField, H: Hasher<F>> Default for MerkleTree<F, H> {
                 width: 0,
             },
             num_leaves: 0,
-            digests: Vec::new(),
+            digests: MerkleDigestStore::Recursive(Vec::new()),
             cap: MerkleCap::default(),
         }
     }
@@ -496,7 +610,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         );
 
         if let Some((digests, cap)) = H::try_build_merkle_tree_column_store(&columns, cap_height) {
-            debug_assert_eq!(digests.len(), 2 * (num_leaves - (1 << cap_height)));
+            debug_assert!(digests.is_valid(num_leaves, cap_height));
             debug_assert_eq!(cap.len(), 1 << cap_height);
             return Self {
                 leaves: MerkleLeaves::Columns { columns, log_rows },
@@ -528,7 +642,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         Self {
             leaves: MerkleLeaves::Columns { columns, log_rows },
             num_leaves,
-            digests,
+            digests: MerkleDigestStore::Recursive(digests),
             cap: MerkleCap(cap),
         }
     }
@@ -537,12 +651,12 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     /// Merkle pipeline) into a tree.
     pub fn from_prebuilt_columns(
         columns: ColumnStore<F>,
-        digests: Vec<H::Hash>,
+        digests: MerkleDigestStore<H::Hash>,
         cap: Vec<H::Hash>,
     ) -> Self {
         let num_leaves = columns.num_rows();
         let log_rows = log2_strict(num_leaves);
-        debug_assert_eq!(digests.len(), 2 * (num_leaves - cap.len()));
+        debug_assert!(digests.is_valid(num_leaves, log2_strict(cap.len())));
         Self {
             leaves: MerkleLeaves::Columns { columns, log_rows },
             num_leaves,
@@ -600,7 +714,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         if let Some((digests, cap)) =
             H::try_build_merkle_tree(&leaves, leaf_width, num_leaves, cap_height)
         {
-            debug_assert_eq!(digests.len(), 2 * (num_leaves - (1 << cap_height)));
+            debug_assert!(digests.is_valid(num_leaves, cap_height));
             debug_assert_eq!(cap.len(), 1 << cap_height);
             return Self {
                 leaves: MerkleLeaves::Rows {
@@ -620,7 +734,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
                 width: leaf_width,
             },
             num_leaves,
-            digests,
+            digests: MerkleDigestStore::Recursive(digests),
             cap: MerkleCap(cap),
         }
     }
@@ -659,8 +773,25 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     /// Create a Merkle proof from a leaf index.
     pub fn prove(&self, leaf_index: usize) -> MerkleProof<F, H> {
         let cap_height = log2_strict(self.cap.len());
-        let siblings =
-            merkle_tree_prove::<F, H>(leaf_index, self.num_leaves, cap_height, &self.digests);
+        let siblings = match &self.digests {
+            MerkleDigestStore::Recursive(digests) => {
+                merkle_tree_prove::<F, H>(leaf_index, self.num_leaves, cap_height, digests)
+            }
+            MerkleDigestStore::Levels {
+                nodes,
+                level_offsets,
+            } => {
+                let num_layers = log2_strict(self.num_leaves) - cap_height;
+                let mut node_index = leaf_index;
+                (0..num_layers)
+                    .map(|level| {
+                        let sibling = nodes[level_offsets[level] + (node_index ^ 1)];
+                        node_index >>= 1;
+                        sibling
+                    })
+                    .collect()
+            }
+        };
 
         MerkleProof { siblings }
     }
@@ -693,6 +824,61 @@ pub(crate) mod tests {
             verify_merkle_proof_to_cap(leaf, i, &tree.cap, &proof)?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn level_major_proofs_match_recursive_layout() {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        let leaves = random_data::<F>(64, 9);
+        for cap_height in [0, 2, 6] {
+            let recursive = MerkleTree::<F, H>::new(leaves.clone(), cap_height);
+
+            let mut current = leaves
+                .iter()
+                .map(|leaf| H::hash_or_noop(leaf))
+                .collect::<Vec<_>>();
+            let mut nodes = current.clone();
+            let mut level_offsets = vec![0];
+            while current.len() > 1 << cap_height {
+                current = current
+                    .chunks_exact(2)
+                    .map(|pair| H::two_to_one(pair[0], pair[1]))
+                    .collect();
+                level_offsets.push(nodes.len());
+                nodes.extend_from_slice(&current);
+            }
+
+            let level_major = MerkleTree::<F, H> {
+                leaves: MerkleLeaves::Rows {
+                    data: leaves.iter().flatten().copied().collect(),
+                    width: leaves[0].len(),
+                },
+                num_leaves: leaves.len(),
+                digests: MerkleDigestStore::Levels {
+                    nodes,
+                    level_offsets,
+                },
+                cap: recursive.cap.clone(),
+            };
+
+            assert_eq!(
+                level_major
+                    .digests
+                    .recursive_digests(level_major.num_leaves, cap_height),
+                recursive
+                    .digests
+                    .recursive_digests(recursive.num_leaves, cap_height)
+            );
+            assert_eq!(level_major, recursive);
+
+            for leaf_index in 0..leaves.len() {
+                assert_eq!(level_major.prove(leaf_index), recursive.prove(leaf_index));
+            }
+        }
     }
 
     #[test]
