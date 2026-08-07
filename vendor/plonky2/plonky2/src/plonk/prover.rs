@@ -1022,7 +1022,7 @@ fn start_gpu_range_check_gate_quotient<
     use core::sync::atomic::Ordering;
     use crate::gates::gate::U32QuotientGate;
     use crate::hash::poseidon2::metal::{
-        RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec,
+        RandomAccessQuotientSpec, RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec,
     };
 
     GPU_RANGE_QUOTIENT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
@@ -1050,9 +1050,41 @@ fn start_gpu_range_check_gate_quotient<
     let mut random_access_gate_indices = Vec::new();
     let mut specs = Vec::new();
     let mut u32_specs = Vec::new();
+    let mut ra_specs: Vec<RandomAccessQuotientSpec> = Vec::new();
     for (gate_index, gate) in common_data.gates.iter().enumerate() {
         let range = gate.0.range_check_quotient_gate();
         let u32_gate = gate.0.u32_quotient_gate();
+        if range.is_none() && u32_gate.is_none() {
+            if let Some(ra) = gate.0.random_access_quotient_gate() {
+                let vec_size = 1usize << ra.bits;
+                let routed = (vec_size + 2) * ra.num_copies + ra.num_extra_constants;
+                let expected_wires = routed + ra.num_copies * ra.bits;
+                let expected_constraints =
+                    ra.num_copies * (ra.bits + 2) + ra.num_extra_constants;
+                if ra.num_copies == 0
+                    || ra.bits == 0
+                    || ra.bits > 4
+                    || gate.0.num_wires() != expected_wires
+                    || gate.0.num_constraints() != expected_constraints
+                    || gate.0.num_constants() != ra.num_extra_constants
+                {
+                    return None;
+                }
+                let selector_column = common_data.selectors_info.selector_indices[gate_index];
+                ra_specs.push(RandomAccessQuotientSpec {
+                    selector_column,
+                    gate_index,
+                    group: common_data.selectors_info.groups[selector_column].clone(),
+                    include_unused_selector,
+                    num_copies: ra.num_copies,
+                    bits: ra.bits,
+                    num_extra_constants: ra.num_extra_constants,
+                    constants_offset: common_data.selectors_info.num_selectors()
+                        + common_data.num_lookup_selectors,
+                });
+                gate_indices.push(gate_index);
+            }
+        }
         if range.is_some() && u32_gate.is_some() {
             if gpu_poseidon_quotient_diagnostics_enabled() {
                 eprintln!(
@@ -1303,6 +1335,7 @@ fn start_gpu_range_check_gate_quotient<
         step,
         &specs,
         &u32_specs,
+        &ra_specs,
         alphas,
         alpha_offset,
     ) else {

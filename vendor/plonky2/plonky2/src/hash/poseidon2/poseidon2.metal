@@ -439,6 +439,7 @@ kernel void range_check_gate_quotient(
     constant uint& alpha_stride [[buffer(8)]],
     constant uint& range_count [[buffer(9)]],
     constant uint& u32_count [[buffer(10)]],
+    constant uint& ra_count [[buffer(11)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= quotient_rows) {
         return;
@@ -980,6 +981,101 @@ kernel void range_check_gate_quotient(
             range_check_gate_emit(
                 1, alpha_powers, alpha_stride, gate_accumulators,
                 constraint_index++);
+        }
+
+        total[0] = gl_add(total[0], gl_mul(filter, gate_accumulators[0]));
+        total[1] = gl_add(total[1], gl_mul(filter, gate_accumulators[1]));
+    }
+
+    // RandomAccessGate. Routed wires per copy: access index, claimed element,
+    // then `1 << bits` list items. The index bits follow all routed wires at
+    // `routed + copy * bits + i`. Per copy the CPU emits `bits` booleanity
+    // checks, then the binary-decomposition check (Horner over the bits from
+    // the most significant down), then the folded selection against the
+    // claimed element. The fold selects pairwise with bit `i` at level `i`,
+    // starting from the list items. Afterwards the gate emits one
+    // `local_constant[i] - wire` check per extra constant.
+    constant uint* ra_metadata = metadata + (range_count + u32_count) * 10u;
+    for (uint ra_index = 0; ra_index < ra_count; ++ra_index) {
+        constant uint* spec = ra_metadata + ra_index * 10u;
+        uint selector_column = spec[0];
+        uint gate_index = spec[1];
+        uint group_start = spec[2];
+        uint group_end = spec[3];
+        uint include_unused_selector = spec[4];
+        uint num_copies = spec[5];
+        uint bits = spec[6];
+        uint num_extra_constants = spec[7];
+        uint routed = spec[8];
+        uint constants_offset = spec[9];
+
+        ulong selector = constants[(ulong)selector_column * lde_rows + source_row];
+        ulong filter = 1;
+        for (uint i = group_start; i < group_end; ++i) {
+            if (i != gate_index) {
+                filter = gl_mul(filter, gl_sub((ulong)i, selector));
+            }
+        }
+        if (include_unused_selector != 0u) {
+            filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
+        }
+
+        ulong gate_accumulators[2] = { 0, 0 };
+        uint constraint_index = 0;
+        uint vec_size = 1u << bits;
+
+        for (uint copy = 0; copy < num_copies; ++copy) {
+            ulong copy_base = (ulong)(vec_size + 2u) * (ulong)copy;
+            ulong bit_base = (ulong)routed + (ulong)copy * (ulong)bits;
+
+            for (uint i = 0; i < bits; ++i) {
+                ulong b = wires[(bit_base + i) * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_mul(b, gl_sub(b, 1)),
+                    alpha_powers, alpha_stride, gate_accumulators, constraint_index++);
+            }
+
+            ulong reconstructed = 0;
+            for (uint i = bits; i > 0u; --i) {
+                ulong b = wires[(bit_base + i - 1u) * lde_rows + source_row];
+                reconstructed = gl_add(gl_add(reconstructed, reconstructed), b);
+            }
+            ulong access_index = wires[copy_base * lde_rows + source_row];
+            range_check_gate_emit(
+                gl_sub(reconstructed, access_index),
+                alpha_powers, alpha_stride, gate_accumulators, constraint_index++);
+
+            // bits <= 4 is enforced host-side, so the fold fits in registers.
+            ulong items[8];
+            uint level_size = vec_size / 2u;
+            ulong b0 = wires[bit_base * lde_rows + source_row];
+            for (uint k = 0; k < level_size; ++k) {
+                ulong x = wires[(copy_base + 2u + 2u * k) * lde_rows + source_row];
+                ulong y = wires[(copy_base + 2u + 2u * k + 1u) * lde_rows + source_row];
+                items[k] = gl_add(x, gl_mul(b0, gl_sub(y, x)));
+            }
+            for (uint i = 1; i < bits; ++i) {
+                ulong b = wires[(bit_base + i) * lde_rows + source_row];
+                level_size /= 2u;
+                for (uint k = 0; k < level_size; ++k) {
+                    ulong x = items[2u * k];
+                    ulong y = items[2u * k + 1u];
+                    items[k] = gl_add(x, gl_mul(b, gl_sub(y, x)));
+                }
+            }
+            ulong claimed = wires[(copy_base + 1u) * lde_rows + source_row];
+            range_check_gate_emit(
+                gl_sub(items[0], claimed),
+                alpha_powers, alpha_stride, gate_accumulators, constraint_index++);
+        }
+
+        for (uint i = 0; i < num_extra_constants; ++i) {
+            ulong constant_value =
+                constants[(ulong)(constants_offset + i) * lde_rows + source_row];
+            ulong wire_value = wires[(ulong)(routed - num_extra_constants + i) * lde_rows + source_row];
+            range_check_gate_emit(
+                gl_sub(constant_value, wire_value),
+                alpha_powers, alpha_stride, gate_accumulators, constraint_index++);
         }
 
         total[0] = gl_add(total[0], gl_mul(filter, gate_accumulators[0]));
