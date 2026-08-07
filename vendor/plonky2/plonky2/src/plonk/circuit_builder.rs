@@ -9,6 +9,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use hashbrown::{HashMap, HashSet};
 use itertools::Itertools;
 use log::{debug, info, warn, Level};
+use plonky2_maybe_rayon::*;
 #[cfg(feature = "timing")]
 use web_time::Instant;
 
@@ -53,7 +54,7 @@ use crate::timed;
 use crate::util::context_tree::ContextTree;
 use crate::util::partial_products::num_partial_products;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil, log2_strict, transpose, transpose_poly_values};
+use crate::util::{log2_ceil, log2_strict, transpose_poly_values};
 
 /// Number of random coins needed for lookups (for each challenge).
 /// A coin is a randomly sampled extension field element from the verifier,
@@ -979,20 +980,29 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .map(|g| g.0.num_constants())
             .max()
             .unwrap();
-        transpose(
-            &self
-                .gate_instances
-                .iter()
-                .map(|g| {
-                    let mut consts = g.constants.clone();
-                    consts.resize(max_constants, F::ZERO);
-                    consts
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_iter()
-        .map(PolynomialValues::new)
-        .collect()
+        // Write each constant column directly out of `gate_instances` instead
+        // of materializing the padded row-major matrix first. The old form
+        // allocated one `Vec<F>` per gate instance (a `degree`-sized burst of
+        // small mallocs, each cloned from the gate's constants and then
+        // zero-padded) purely to feed `transpose`, which then read every row
+        // once more to produce exactly these columns and freed the whole matrix.
+        //
+        // Value-exact: `resize(max_constants, ZERO)` pads short constant lists
+        // with `ZERO` and truncates any longer than `max_constants`, which is
+        // precisely what `get(c)` does for `c < max_constants` — missing index
+        // maps to `ZERO`, indices past `max_constants` are never read. The
+        // parallel-over-columns shape matches `transpose`'s own.
+        (0..max_constants)
+            .into_par_iter()
+            .map(|c| {
+                PolynomialValues::new(
+                    self.gate_instances
+                        .iter()
+                        .map(|g| g.constants.get(c).copied().unwrap_or(F::ZERO))
+                        .collect(),
+                )
+            })
+            .collect()
     }
 
     fn sigma_vecs(&self, k_is: &[F], subgroup: &[F]) -> (Vec<PolynomialValues<F>>, Forest) {
@@ -1264,15 +1274,27 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         );
 
         // Index generator indices by their watched targets.
+        //
+        // The same pass also records, per generator, how many *distinct* representatives it
+        // watches. Generators are visited in ascending index order, so every list receives its
+        // pushes in nondecreasing generator order and all pushes of a given generator into a
+        // given list are contiguous at that list's tail: a push is a repeat of an already-counted
+        // representative exactly when the list's last entry is already this generator. Deriving
+        // the counts here costs one comparison per watched target and avoids the separate global
+        // traversal of the finished map that the naive variant would need.
+        let mut generator_watch_counts = vec![0usize; self.generators.len()];
         let mut generator_indices_by_watches = BTreeMap::new();
         for (i, generator) in self.generators.iter().enumerate() {
             for watch in generator.0.watch_list() {
                 let watch_index = forest.target_index(watch);
-                let watch_rep_index = forest.parents[watch_index];
-                generator_indices_by_watches
+                let watch_rep_index = forest.parents[watch_index] as usize;
+                let watchers = generator_indices_by_watches
                     .entry(watch_rep_index)
-                    .or_insert_with(Vec::new)
-                    .push(i);
+                    .or_insert_with(Vec::new);
+                if watchers.last() != Some(&i) {
+                    generator_watch_counts[i] += 1;
+                }
+                watchers.push(i);
             }
         }
         for indices in generator_indices_by_watches.values_mut() {
@@ -1338,6 +1360,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,
             generator_indices_by_watches,
+            generator_watch_counts,
             constants_sigmas_commitment,
             sigmas: transpose_poly_values(sigma_vecs),
             subgroup,
@@ -1391,5 +1414,89 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // TODO: Can skip parts of this.
         let circuit_data = self.build::<C>();
         circuit_data.verifier_data()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::Sample;
+    use crate::util::transpose;
+
+    /// The direct-column `constant_polys` must be raw-`u64` identical to the
+    /// legacy "clone each gate's constants, pad to `max_constants`, transpose"
+    /// construction, on a real mixed gate set.
+    #[test]
+    fn constant_polys_match_legacy_transpose() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+
+        // Reference: the pre-change body, verbatim.
+        fn legacy(builder: &CircuitBuilder<GoldilocksField, 2>) -> Vec<Vec<GoldilocksField>> {
+            type F = GoldilocksField;
+            let max_constants = builder
+                .gates
+                .iter()
+                .map(|g| g.0.num_constants())
+                .max()
+                .unwrap();
+            transpose(
+                &builder
+                    .gate_instances
+                    .iter()
+                    .map(|g| {
+                        let mut consts = g.constants.clone();
+                        consts.resize(max_constants, F::ZERO);
+                        consts
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+
+        fn check(builder: &CircuitBuilder<GoldilocksField, 2>, label: &str) {
+            let expected = legacy(builder);
+            let actual = builder.constant_polys();
+            assert_eq!(actual.len(), expected.len(), "{label}: column count");
+            for (c, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(a.values.len(), e.len(), "{label}: column {c} length");
+                for (r, (x, y)) in a.values.iter().zip(e.iter()).enumerate() {
+                    assert_eq!(x.0, y.0, "{label}: column {c} row {r}");
+                }
+            }
+        }
+
+        // A production-shaped mix: `ConstantGate` carries the widest constant
+        // vector, `ArithmeticGate` a narrower one, `PublicInputGate`/`NoopGate`
+        // none at all, so every gate instance needs a different amount of
+        // zero padding.
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let one = builder.one();
+        let mut acc = builder.constant(F::from_canonical_u64(0x1234_5678_9abc_def0));
+        for i in 0..64u64 {
+            let c = builder.constant(F::from_canonical_u64(i.wrapping_mul(0x9e37_79b9) | 1));
+            acc = builder.mul_add(acc, c, one);
+            acc = builder.add(acc, c);
+        }
+        builder.register_public_input(acc);
+        builder.add_gate(NoopGate, vec![]);
+        check(&builder, "mixed gate set");
+
+        // `resize(max_constants, ..)` also *truncates* constant vectors longer
+        // than `max_constants`, which `get(c)` reproduces by never reading past
+        // `max_constants`. `add_gate` asserts this can't happen in production,
+        // so synthesize it directly to pin the equivalence anyway.
+        let max_constants = builder
+            .gates
+            .iter()
+            .map(|g| g.0.num_constants())
+            .max()
+            .unwrap();
+        let gate_ref = builder.gate_instances[0].gate_ref.clone();
+        builder.gate_instances.push(GateInstance {
+            gate_ref,
+            constants: F::rand_vec(max_constants + 3),
+        });
+        check(&builder, "over-long constants");
     }
 }
