@@ -175,6 +175,9 @@ pub(crate) struct VanishingScratch<F> {
     pub vanishing_all_lookup_terms: Vec<F>,
     pub lookup_selectors: Vec<F>,
     pub constraint_terms_batch: Vec<F>,
+    /// Per-point gate-filter vector reused across every 32-point batch (and
+    /// across every gate within a batch) instead of one allocation per batch.
+    pub filters: Vec<F>,
 }
 
 /// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
@@ -274,7 +277,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     beta_k_is: &[F],
     deltas: &[F],
     alphas: &[F],
-    excluded_gate_indices: &[usize],
+    cpu_gate_indices: &[usize],
     z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
     scratch: &mut VanishingScratch<F>,
@@ -302,7 +305,8 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         common_data,
         vars_batch,
         &mut scratch.constraint_terms_batch,
-        excluded_gate_indices,
+        &mut scratch.filters,
+        cpu_gate_indices,
     );
     let constraint_terms_batch = &scratch.constraint_terms_batch;
     debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
@@ -991,18 +995,30 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding<
     excluded_gate_index: Option<usize>,
 ) {
     match excluded_gate_index {
-        Some(index) => evaluate_gate_constraints_base_batch_into_excluding_many(
-            common_data,
-            vars_batch,
-            constraints_batch,
-            core::slice::from_ref(&index),
-        ),
-        None => evaluate_gate_constraints_base_batch_into_excluding_many(
-            common_data,
-            vars_batch,
-            constraints_batch,
-            &[],
-        ),
+        Some(index) => {
+            let cpu_gate_indices = (0..common_data.gates.len())
+                .filter(|&i| i != index)
+                .collect::<Vec<_>>();
+            let mut filters = Vec::with_capacity(vars_batch.len());
+            evaluate_gate_constraints_base_batch_into_excluding_many(
+                common_data,
+                vars_batch,
+                constraints_batch,
+                &mut filters,
+                &cpu_gate_indices,
+            );
+        }
+        None => {
+            let cpu_gate_indices = (0..common_data.gates.len()).collect::<Vec<_>>();
+            let mut filters = Vec::with_capacity(vars_batch.len());
+            evaluate_gate_constraints_base_batch_into_excluding_many(
+                common_data,
+                vars_batch,
+                constraints_batch,
+                &mut filters,
+                &cpu_gate_indices,
+            );
+        }
     }
 }
 
@@ -1015,15 +1031,13 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
     common_data: &CommonCircuitData<F, D>,
     vars_batch: EvaluationVarsBaseBatch<F>,
     constraints_batch: &mut Vec<F>,
-    excluded_gate_indices: &[usize],
+    filters: &mut Vec<F>,
+    cpu_gate_indices: &[usize],
 ) {
     constraints_batch.clear();
     constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
-    let mut filters = Vec::with_capacity(vars_batch.len());
-    for (i, gate) in common_data.gates.iter().enumerate() {
-        if excluded_gate_indices.contains(&i) {
-            continue;
-        }
+    for &i in cpu_gate_indices {
+        let gate = &common_data.gates[i];
         let selector_index = common_data.selectors_info.selector_indices[i];
         gate.0.eval_filtered_base_batch(
             vars_batch,
@@ -1032,7 +1046,7 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
             common_data.selectors_info.groups[selector_index].clone(),
             common_data.selectors_info.num_selectors(),
             common_data.num_lookup_selectors,
-            &mut filters,
+            filters,
             constraints_batch,
         );
     }
