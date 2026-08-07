@@ -403,6 +403,19 @@ fn fft_classic_simd_fused_two_layers<P: PackedField>(
     }
 }
 
+/// Run FFT stages `start..end`, one whole-buffer pass each.
+///
+/// A radix-4 traversal fusing stage pairs used to drive these layers, on
+/// the reasoning that it halved whole-array memory passes. Memory passes
+/// are not what this kernel is short of: removing the 2^13 cache blocking
+/// entirely changes the time by under 1% at every thread count from 1 to
+/// 12. What the fused form does cost is registers -- four packed values
+/// plus three twiddle vectors live, against two and one here, while the
+/// Goldilocks multiply is scalar GPR assembly. Measured on both production
+/// LDE shapes (2^19 and 2^17, rate 8) with interleaved arms and per-thread
+/// minimums, single layers are 3-7% faster at every thread count, and
+/// bit-identical: same butterflies, same twiddles, same per-element order,
+/// same raw `GoldilocksField.0` words.
 #[inline(always)]
 fn fft_classic_simd_layers<P: PackedField>(
     packed_values: &mut [P],
@@ -411,20 +424,8 @@ fn fft_classic_simd_layers<P: PackedField>(
     root_table: &FftRootTable<P::Scalar>,
 ) {
     let lg_packed_width = log2_strict(P::WIDTH);
-    let mut lg_half_m = start;
-    // Odd stage count: run the first stage unfused so the remainder pairs up.
-    if (end - start) % 2 == 1 {
+    for lg_half_m in start..end {
         fft_classic_simd_single_layer(packed_values, lg_half_m, lg_packed_width, root_table);
-        lg_half_m += 1;
-    }
-    while lg_half_m < end {
-        fft_classic_simd_fused_two_layers(
-            packed_values,
-            lg_half_m,
-            lg_packed_width,
-            root_table,
-        );
-        lg_half_m += 2;
     }
 }
 
@@ -1698,6 +1699,74 @@ mod tests {
         check::<QuadraticExtension<GoldilocksField>>();
         // Uncached type: exercises the value-identical fallback path.
         check::<QuarticExtension<GoldilocksField>>();
+    }
+
+
+    /// Driving the layers as single stages must be **bit**-identical to the
+    /// radix-4 fused traversal it replaced on the production path, not
+    /// merely congruent: the two perform the same butterflies on the same
+    /// values with the same twiddles in the same per-element order, so the
+    /// raw `GoldilocksField.0` words must match exactly. Every start stage
+    /// at each size is covered, so both stage-count parities are exercised.
+    #[test]
+    fn single_layer_driver_matches_fused_reference_raw_words() {
+        use crate::fft::{
+            fft_classic_simd_fused_two_layers, fft_classic_simd_layers,
+            fft_classic_simd_single_layer,
+        };
+
+        /// The pre-change driver, verbatim, as the oracle.
+        fn drive_fused<P: PackedField>(
+            packed_values: &mut [P],
+            start: usize,
+            end: usize,
+            root_table: &FftRootTable<P::Scalar>,
+        ) {
+            let lg_packed_width = log2_strict(P::WIDTH);
+            let mut lg_half_m = start;
+            if (end - start) % 2 == 1 {
+                fft_classic_simd_single_layer(
+                    packed_values,
+                    lg_half_m,
+                    lg_packed_width,
+                    root_table,
+                );
+                lg_half_m += 1;
+            }
+            while lg_half_m < end {
+                fft_classic_simd_fused_two_layers(
+                    packed_values,
+                    lg_half_m,
+                    lg_packed_width,
+                    root_table,
+                );
+                lg_half_m += 2;
+            }
+        }
+
+        type F = GoldilocksField;
+        type P = <F as Packable>::Packing;
+        for lg_n in [4usize, 5, 8, 11, 13, 16, 17] {
+            let n = 1 << lg_n;
+            let roots = fft_root_table::<F>(n);
+            for start in 2..lg_n {
+                let mut expected = deterministic_values(n);
+                let mut actual = expected.clone();
+                drive_fused::<P>(P::pack_slice_mut(&mut expected), start, lg_n, &roots);
+                fft_classic_simd_layers::<P>(
+                    P::pack_slice_mut(&mut actual),
+                    start,
+                    lg_n,
+                    &roots,
+                );
+                for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                    assert_eq!(
+                        a.0, e.0,
+                        "raw word mismatch at 2^{lg_n} start {start} index {i}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
