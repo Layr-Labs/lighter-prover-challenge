@@ -23,6 +23,12 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
 /// window and is treated as contaminated evidence.
 const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
+/// Floor for routing a tree to an *idle* GPU. A 2^16-leaf width-8 tree is
+/// 131,056 permutations, just under 1 << 17, so that cutoff would miss the
+/// fold trees it is meant to catch. Below roughly 2^15 leaves the
+/// per-dispatch overhead stops being amortized, so small trees stay on the
+/// CPU even when the device is free.
+const OPPORTUNISTIC_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
 /// Lower routing threshold used only while an exclusive serial proving phase
 /// is active (see [`set_exclusive_gpu_phase`]). During the pre-execution and
 /// final block proofs nothing else can contend for the serialized GPU stream,
@@ -248,7 +254,30 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
             || leaf_width > 64
             || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
     }
-    leaf_permutations + parent_permutations >= min_permutations
+    let permutations = leaf_permutations + parent_permutations;
+    if permutations >= min_permutations {
+        return true;
+    }
+
+    // Opportunistic routing. Measured head-to-head with the current CPU
+    // implementation (interleaved base cases, 64-leaf Rayon cutoff), on an
+    // otherwise idle device and with cap equality asserted, the GPU build is
+    // faster at every size at or above 2^16 leaves:
+    //
+    //   2^16 w8  (131k perms)  CPU 11.13 ms  GPU  6.71 ms  0.60
+    //   2^17 w8  (262k perms)  CPU 14.56 ms  GPU  9.14 ms  0.63
+    //   2^18 w8  (524k perms)  CPU 29.11 ms  GPU 17.83 ms  0.61
+    //   2^17 w16 (393k perms)  CPU 22.74 ms  GPU 14.86 ms  0.65
+    //   2^16 w68 (655k perms)  CPU 35.79 ms  GPU 19.59 ms  0.55
+    //
+    // The static cutoffs above are deliberately conservative because under
+    // pipeline load the device is saturated and a small tree submitted then
+    // finishes later than it would on the CPU. That reasoning does not apply
+    // when nothing is in flight — most of the serial chain tail, where these
+    // fold-sized trees actually sit. So when the stream is idle, take the
+    // measured win instead of leaving the device unused.
+    permutations >= OPPORTUNISTIC_MIN_GPU_PERMUTATIONS
+        && GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0
 }
 
 fn shared_context() -> Option<&'static MetalShared> {
