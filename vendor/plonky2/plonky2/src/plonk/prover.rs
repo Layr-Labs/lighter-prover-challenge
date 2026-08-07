@@ -1435,6 +1435,12 @@ fn compute_quotient_polys<
         let _ = allow_gpu_poseidon;
         Vec::new()
     };
+    // The offload decision is fixed for this quotient proof. Materialize the
+    // surviving CPU gates once, in the same ascending order as `gates`, rather
+    // than linearly scanning the exclusions for every gate in every batch.
+    let cpu_gate_indices = (0..common_data.gates.len())
+        .filter(|gate_index| !excluded_gate_indices.contains(gate_index))
+        .collect::<Vec<_>>();
 
     let z_h_on_coset = ZeroPolyOnCoset::new(common_data.degree_bits(), quotient_degree_bits);
     // The `L_0` denominator inverses consumed by `eval_l_0` depend only on
@@ -1506,12 +1512,9 @@ fn compute_quotient_polys<
     // remaining gates, while the permutation argument always needs the routed
     // prefix. Do not gather dead high columns for offloaded Poseidon/Range
     // gates into every 32-point CPU scratch batch.
-    let cpu_num_wires = common_data
-        .gates
+    let cpu_num_wires = cpu_gate_indices
         .iter()
-        .enumerate()
-        .filter(|(gate_index, _)| !excluded_gate_indices.contains(gate_index))
-        .map(|(_, gate)| gate.0.num_wires())
+        .map(|&gate_index| common_data.gates[gate_index].0.num_wires())
         .max()
         .unwrap_or(0)
         .max(num_routed_wires);
@@ -1769,7 +1772,7 @@ fn compute_quotient_polys<
                     beta_k_is,
                     deltas,
                     alphas,
-                    &excluded_gate_indices,
+                    &cpu_gate_indices,
                     &z_h_on_coset,
                     &lut_re_poly_evals_refs,
                     &mut scratch.vanishing,
