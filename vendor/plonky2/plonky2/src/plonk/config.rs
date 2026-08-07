@@ -129,14 +129,17 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
     /// Build the native Merkle digests and cap with a specialized backend, when available.
     ///
     /// `leaves` is one flat row-major buffer holding `num_leaves` leaves of `leaf_width`
-    /// field elements each. The first result uses
-    /// [`crate::hash::merkle_tree::MerkleTree::digests`] layout.
+    /// field elements each. The first result is the digest storage in whatever
+    /// layout the backend produced; see [`crate::hash::merkle_tree::MerkleDigests`].
     fn try_build_merkle_tree(
         _leaves: &[F],
         _leaf_width: usize,
         _num_leaves: usize,
         _cap_height: usize,
-    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
+    ) -> Option<(
+        crate::hash::merkle_tree::MerkleDigests<F, Self>,
+        Vec<Self::Hash>,
+    )> {
         None
     }
 
@@ -146,7 +149,10 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
     fn try_build_merkle_tree_columns(
         _columns: &[Vec<F>],
         _cap_height: usize,
-    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
+    ) -> Option<(
+        crate::hash::merkle_tree::MerkleDigests<F, Self>,
+        Vec<Self::Hash>,
+    )> {
         None
     }
 

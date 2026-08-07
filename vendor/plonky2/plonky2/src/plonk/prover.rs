@@ -170,7 +170,7 @@ where
         "compute wire polynomials",
         witness
             .wire_values
-            .par_iter_mut()
+            .iter_mut()
             .enumerate()
             .map(|(j, column)| {
                 if j < num_routed_wires {
@@ -340,7 +340,7 @@ where
         timing,
         "split up quotient polys",
         quotient_polys
-            .into_par_iter()
+            .into_iter()
             .flat_map(|mut quotient_poly| {
                 quotient_poly.trim_to_len(quotient_degree).expect(
                     "Quotient has failed, the vanishing polynomial is not divisible by Z_H",

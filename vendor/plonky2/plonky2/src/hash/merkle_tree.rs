@@ -92,6 +92,80 @@ pub enum MerkleLeaves<F> {
     },
 }
 
+/// Storage for a tree's interior node digests.
+#[derive(Clone, Debug)]
+pub enum MerkleDigests<F: RichField, H: Hasher<F>> {
+    /// Consists of `cap.len()` sub-trees, each corresponding to one element in
+    /// `cap`. Each subtree is contiguous and located at
+    /// `digests[digests.len() / cap.len() * i..digests.len() / cap.len() * (i + 1)]`.
+    /// Within each subtree, siblings are stored next to each other. The layout is,
+    /// left_child_subtree || left_child_digest || right_child_digest || right_child_subtree, where
+    /// left_child_digest and right_child_digest are H::Hash and left_child_subtree and
+    /// right_child_subtree recurse. Observe that the digest of a node is stored by its _parent_.
+    /// Consequently, the digests of the roots are not stored here (they can be found in `cap`).
+    Interleaved(Vec<H::Hash>),
+    /// The level-major node buffer the Metal backend hashed into, retained as
+    /// the tree's storage instead of being scattered into the interleaved
+    /// layout. Level 0 holds the leaf digests and the last level is the cap.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    LevelMajor(crate::hash::poseidon2::metal::MetalNodes<F>),
+}
+
+impl<F: RichField, H: Hasher<F>> MerkleDigests<F, H> {
+    /// Wraps a node buffer the Metal backend retained.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    pub fn level_major(nodes: crate::hash::poseidon2::metal::MetalNodes<F>) -> Self {
+        // Nodes are read back as four `u64` limbs, so the hash must be exactly
+        // four field elements wide.
+        assert_eq!(H::HASH_SIZE, 4 * core::mem::size_of::<u64>());
+        Self::LevelMajor(nodes)
+    }
+
+    /// The number of digests the interleaved layout holds.
+    pub fn len(&self) -> usize {
+        match self {
+            MerkleDigests::Interleaved(digests) => digests.len(),
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            MerkleDigests::LevelMajor(nodes) => nodes.num_digests(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Materializes the interleaved layout, scattering the level-major buffer
+    /// when that is what backs this tree.
+    pub fn to_interleaved_vec(&self) -> Vec<H::Hash> {
+        match self {
+            MerkleDigests::Interleaved(digests) => digests.clone(),
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            MerkleDigests::LevelMajor(nodes) => nodes
+                .interleaved_digests()
+                .iter()
+                .map(|digest| <H::Hash as GenericHashOut<F>>::from_bytes(&digest.to_bytes()))
+                .collect(),
+        }
+    }
+}
+
+impl<F: RichField, H: Hasher<F>> PartialEq for MerkleDigests<F, H> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (MerkleDigests::Interleaved(left), MerkleDigests::Interleaved(right)) => left == right,
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            (MerkleDigests::LevelMajor(left), MerkleDigests::LevelMajor(right)) => left == right,
+            // Storage layout is the backend's choice; equality is over the
+            // digests themselves, so a level-major tree equals the interleaved
+            // tree it deserializes to.
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            _ => self.to_interleaved_vec() == other.to_interleaved_vec(),
+        }
+    }
+}
+
+impl<F: RichField, H: Hasher<F>> Eq for MerkleDigests<F, H> {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MerkleTree<F: RichField, H: Hasher<F>> {
     /// The data in the leaves of the Merkle tree.
@@ -100,15 +174,9 @@ pub struct MerkleTree<F: RichField, H: Hasher<F>> {
     /// The number of leaves.
     pub num_leaves: usize,
 
-    /// The digests in the tree. Consists of `cap.len()` sub-trees, each corresponding to one
-    /// element in `cap`. Each subtree is contiguous and located at
-    /// `digests[digests.len() / cap.len() * i..digests.len() / cap.len() * (i + 1)]`.
-    /// Within each subtree, siblings are stored next to each other. The layout is,
-    /// left_child_subtree || left_child_digest || right_child_digest || right_child_subtree, where
-    /// left_child_digest and right_child_digest are H::Hash and left_child_subtree and
-    /// right_child_subtree recurse. Observe that the digest of a node is stored by its _parent_.
-    /// Consequently, the digests of the roots are not stored here (they can be found in `cap`).
-    pub digests: Vec<H::Hash>,
+    /// The digests in the tree, in whichever layout the backend that built it
+    /// produced. See [`MerkleDigests`].
+    pub digests: MerkleDigests<F, H>,
 
     /// The Merkle cap.
     pub cap: MerkleCap<F, H>,
@@ -122,7 +190,7 @@ impl<F: RichField, H: Hasher<F>> Default for MerkleTree<F, H> {
                 width: 0,
             },
             num_leaves: 0,
-            digests: Vec::new(),
+            digests: MerkleDigests::Interleaved(Vec::new()),
             cap: MerkleCap::default(),
         }
     }
@@ -444,6 +512,41 @@ pub(crate) fn merkle_tree_prove<F: RichField, H: Hasher<F>>(
         .collect()
 }
 
+/// Level-major node buffers store each digest as four canonical `u64` limbs in
+/// `HashOut::elements` order, which is exactly the little-endian byte encoding
+/// [`GenericHashOut`] uses for a 32-byte hash.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn hash_from_limbs<F: RichField, H: Hasher<F>>(limbs: [u64; 4]) -> H::Hash {
+    let mut bytes = [0u8; 4 * core::mem::size_of::<u64>()];
+    for (chunk, limb) in bytes
+        .chunks_exact_mut(core::mem::size_of::<u64>())
+        .zip(limbs)
+    {
+        chunk.copy_from_slice(&limb.to_le_bytes());
+    }
+    <H::Hash as GenericHashOut<F>>::from_bytes(&bytes)
+}
+
+/// [`merkle_tree_prove`] against the level-major layout. The node on the path
+/// at level `i` has level-major index `leaf_index >> i`, so its sibling is a
+/// direct gather at `(leaf_index >> i) ^ 1` — no per-subtree addressing.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+pub(crate) fn merkle_tree_prove_level_major<F: RichField, H: Hasher<F>>(
+    leaf_index: usize,
+    leaves_len: usize,
+    cap_height: usize,
+    nodes: &crate::hash::poseidon2::metal::MetalNodes<F>,
+) -> Vec<H::Hash> {
+    let num_layers = log2_strict(leaves_len) - cap_height;
+    debug_assert_eq!(leaf_index >> (cap_height + num_layers), 0);
+    debug_assert_eq!(nodes.leaf_count(), leaves_len);
+    debug_assert_eq!(nodes.cap_height(), cap_height);
+
+    (0..num_layers)
+        .map(|level| hash_from_limbs::<F, H>(nodes.node_limbs(level, (leaf_index >> level) ^ 1)))
+        .collect()
+}
+
 impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     /// Build a tree from per-leaf vectors. All leaves must have the same width.
     pub fn new(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
@@ -522,7 +625,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         Self {
             leaves: MerkleLeaves::Columns { columns, log_rows },
             num_leaves,
-            digests,
+            digests: MerkleDigests::Interleaved(digests),
             cap: MerkleCap(cap),
         }
     }
@@ -532,7 +635,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         leaf_width: usize,
         num_leaves: usize,
         cap_height: usize,
-    ) -> (Vec<H::Hash>, Vec<H::Hash>) {
+    ) -> (MerkleDigests<F, H>, Vec<H::Hash>) {
         let num_digests = 2 * (num_leaves - (1 << cap_height));
         let mut digests = Vec::with_capacity(num_digests);
 
@@ -556,7 +659,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             digests.set_len(num_digests);
             cap.set_len(len_cap);
         }
-        (digests, cap)
+        (MerkleDigests::Interleaved(digests), cap)
     }
 
     fn from_flat_parts(
@@ -635,8 +738,15 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     /// Create a Merkle proof from a leaf index.
     pub fn prove(&self, leaf_index: usize) -> MerkleProof<F, H> {
         let cap_height = log2_strict(self.cap.len());
-        let siblings =
-            merkle_tree_prove::<F, H>(leaf_index, self.num_leaves, cap_height, &self.digests);
+        let siblings = match &self.digests {
+            MerkleDigests::Interleaved(digests) => {
+                merkle_tree_prove::<F, H>(leaf_index, self.num_leaves, cap_height, digests)
+            }
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            MerkleDigests::LevelMajor(nodes) => {
+                merkle_tree_prove_level_major::<F, H>(leaf_index, self.num_leaves, cap_height, nodes)
+            }
+        };
 
         MerkleProof { siblings }
     }

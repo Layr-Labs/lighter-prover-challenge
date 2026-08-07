@@ -3,7 +3,7 @@ use core::marker::PhantomData;
 use core::mem::{size_of, size_of_val};
 use core::slice;
 use std::collections::HashMap;
-use std::sync::{Condvar, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use metal::{
     Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
@@ -50,6 +50,11 @@ const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
 const MAX_BUFFER_SETS: usize = 1;
 /// Parallel staging copy granularity in u64 elements (4 MiB chunks).
 const STAGING_CHUNK: usize = 1 << 19;
+/// Free node buffers retained per exact byte size. Node buffers are owned by
+/// the tree they hold the digests for rather than by the pooled buffer set, so
+/// a small free list keeps their allocation off the build path; tree shapes
+/// repeat across proofs, so the exact-size key hits.
+const MAX_RECYCLED_NODE_BUFFERS: usize = 4;
 
 struct MetalShared {
     device: Device,
@@ -146,6 +151,126 @@ impl<F> PartialEq for MetalColumns<F> {
 
 impl<F> Eq for MetalColumns<F> {}
 
+/// A GPU node buffer owned by the tree whose digests it holds. Dropping it
+/// hands the buffer to the size-keyed recycler instead of freeing it.
+struct NodeBuffer {
+    buffer: Buffer,
+    bytes: u64,
+}
+
+impl Drop for NodeBuffer {
+    fn drop(&mut self) {
+        if let Ok(mut recycler) = NODE_BUFFERS.lock() {
+            let free = recycler.entry(self.bytes).or_default();
+            if free.len() < MAX_RECYCLED_NODE_BUFFERS {
+                free.push(self.buffer.clone());
+            }
+        }
+    }
+}
+
+/// Merkle tree nodes retained in the CPU-visible buffer the GPU hashed them
+/// into, in the level-major layout the kernels write: level 0 holds the
+/// `leaf_count` leaf digests, level `l` holds `leaf_count >> l` nodes, and the
+/// last level is the cap. Node `i` of level `l` occupies the four canonical
+/// u64 limbs at `level_offsets[l] + i * 4`, in `HashOut::elements` order.
+pub struct MetalNodes<F> {
+    nodes: Arc<NodeBuffer>,
+    level_offsets: Vec<usize>,
+    leaf_count: usize,
+    cap_height: usize,
+    _phantom: PhantomData<F>,
+}
+
+impl<F> Clone for MetalNodes<F> {
+    fn clone(&self) -> Self {
+        Self {
+            nodes: Arc::clone(&self.nodes),
+            level_offsets: self.level_offsets.clone(),
+            leaf_count: self.leaf_count,
+            cap_height: self.cap_height,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<F> MetalNodes<F> {
+    pub fn leaf_count(&self) -> usize {
+        self.leaf_count
+    }
+
+    pub fn cap_height(&self) -> usize {
+        self.cap_height
+    }
+
+    /// The number of digests plonky2's interleaved layout would hold.
+    pub fn num_digests(&self) -> usize {
+        2 * (self.leaf_count - (1usize << self.cap_height))
+    }
+
+    /// The four limbs of node `index` at `level`, level 0 being the leaves.
+    pub fn node_limbs(&self, level: usize, index: usize) -> [u64; 4] {
+        let nodes = self.raw();
+        let offset = self.level_offsets[level] + index * 4;
+        core::array::from_fn(|limb| nodes[offset + limb])
+    }
+
+    fn raw(&self) -> &[u64] {
+        // SAFETY: the GPU wrote all `(2 * leaf_count - cap_count) * 4` limbs
+        // before its command buffer completed, and the buffer is never mutated
+        // after this handle was returned.
+        unsafe {
+            slice::from_raw_parts(
+                self.nodes.buffer.contents().cast::<u64>(),
+                (2 * self.leaf_count - (1usize << self.cap_height)) * 4,
+            )
+        }
+    }
+}
+
+impl<F: RichField> MetalNodes<F> {
+    /// The Merkle cap: the last stored level, in index order.
+    pub fn cap(&self) -> Vec<HashOut<F>> {
+        let nodes = self.raw();
+        let cap_level = self.level_offsets.len() - 1;
+        (0..1usize << self.cap_height)
+            .map(|index| read_node(nodes, self.level_offsets[cap_level], index))
+            .collect()
+    }
+
+    /// Materializes plonky2's interleaved digest layout. Proving gathers from
+    /// the level-major buffer directly; only serialization and the equality
+    /// harness need the scattered form.
+    pub fn interleaved_digests(&self) -> Vec<HashOut<F>> {
+        tree_from_levels(
+            self.raw(),
+            &self.level_offsets,
+            self.leaf_count,
+            self.cap_height,
+        )
+        .0
+    }
+}
+
+impl<F> core::fmt::Debug for MetalNodes<F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MetalNodes")
+            .field("leaf_count", &self.leaf_count)
+            .field("cap_height", &self.cap_height)
+            .finish()
+    }
+}
+
+impl<F> PartialEq for MetalNodes<F> {
+    fn eq(&self, other: &Self) -> bool {
+        self.leaf_count == other.leaf_count
+            && self.cap_height == other.cap_height
+            && self.raw() == other.raw()
+    }
+}
+
+impl<F> Eq for MetalNodes<F> {}
+
 struct BufferSet {
     input: Option<Buffer>,
     output: Option<Buffer>,
@@ -157,6 +282,11 @@ struct BufferPool {
 }
 
 static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShared::new);
+
+/// Node buffers released by dropped trees, keyed by exact byte size and handed
+/// back to the next tree of that shape.
+static NODE_BUFFERS: LazyLock<Mutex<HashMap<u64, Vec<Buffer>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// True while the prover is inside an exclusive serial phase (pre-execution
 /// or final block proof) where no concurrent proof can contend for the
@@ -211,7 +341,7 @@ pub(crate) fn build_merkle_tree<F: RichField>(
     leaf_width: usize,
     leaf_count: usize,
     cap_height: usize,
-) -> Option<(Vec<HashOut<F>>, Vec<HashOut<F>>)> {
+) -> Option<(MetalNodes<F>, Vec<HashOut<F>>)> {
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || leaves.len() != leaf_count * leaf_width
@@ -235,7 +365,7 @@ pub(crate) fn build_merkle_tree<F: RichField>(
 pub(crate) fn build_merkle_tree_columns<F: RichField>(
     columns: &[Vec<F>],
     cap_height: usize,
-) -> Option<(Vec<HashOut<F>>, Vec<HashOut<F>>)> {
+) -> Option<(MetalNodes<F>, Vec<HashOut<F>>)> {
     let leaf_width = columns.len();
     let leaf_count = columns.first().map_or(0, Vec::len);
     if F::ORDER != 0xffff_ffff_0000_0001
@@ -460,6 +590,26 @@ impl MetalShared {
             pool.free.push(set);
             self.available.notify_one();
         }
+    }
+
+    /// A node buffer of exactly `bytes`, recycled from a dropped tree when one
+    /// of that size is free. Taken outside the exclusive buffer set so a
+    /// recycler miss does not extend the GPU window.
+    fn acquire_node_buffer(&self, bytes: usize) -> Result<Arc<NodeBuffer>, String> {
+        let bytes = bytes.max(size_of::<u64>()) as u64;
+        let recycled = NODE_BUFFERS
+            .lock()
+            .map_err(|_| "node buffer recycler poisoned")?
+            .get_mut(&bytes)
+            .and_then(|free| free.pop());
+        let buffer = match recycled {
+            Some(buffer) => buffer,
+            None => autoreleasepool(|| {
+                self.device
+                    .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+            }),
+        };
+        Ok(Arc::new(NodeBuffer { buffer, bytes }))
     }
 
     fn roots_for(&self, log_lde: u32) -> Result<(Buffer, Vec<usize>), String> {
@@ -1057,7 +1207,7 @@ impl MetalShared {
         leaf_width: usize,
         leaf_count: usize,
         cap_height: usize,
-    ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
+    ) -> Result<(MetalNodes<F>, Vec<HashOut<F>>), String> {
         let cap_count = 1usize << cap_height;
         let total_node_count = 2 * leaf_count - cap_count;
 
@@ -1074,6 +1224,10 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("Metal Merkle output size overflow")?;
 
+        // The nodes outlive this call as the tree's digest storage, so they get
+        // their own recycled buffer rather than the pooled one.
+        let node_buffer = self.acquire_node_buffer(output_bytes)?;
+
         let mut set = self.acquire_set()?;
         let result = self.build_with_set(
             &mut set,
@@ -1083,11 +1237,12 @@ impl MetalShared {
             cap_height,
             input_len,
             input_bytes,
-            output_len,
-            output_bytes,
+            node_buffer,
         );
         self.release_set(set);
-        result
+        let nodes = result?;
+        let cap = nodes.cap();
+        Ok((nodes, cap))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1100,9 +1255,8 @@ impl MetalShared {
         cap_height: usize,
         input_len: usize,
         input_bytes: usize,
-        output_len: usize,
-        output_bytes: usize,
-    ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
+        node_buffer: Arc<NodeBuffer>,
+    ) -> Result<MetalNodes<F>, String> {
         let cap_count = 1usize << cap_height;
 
         if set
@@ -1154,17 +1308,7 @@ impl MetalShared {
             }
         }
 
-        if set
-            .output
-            .as_ref()
-            .map_or(true, |buffer| buffer.length() < output_bytes as u64)
-        {
-            set.output = Some(autoreleasepool(|| {
-                self.device
-                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
-            }));
-        }
-        let output_buffer = set.output.as_ref().unwrap();
+        let output_buffer = &node_buffer.buffer;
 
         let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
@@ -1247,14 +1391,13 @@ impl MetalShared {
             ));
         }
 
-        let nodes =
-            unsafe { slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len) };
-        Ok(tree_from_levels(
-            nodes,
-            &level_offsets,
+        Ok(MetalNodes {
+            nodes: node_buffer,
+            level_offsets,
             leaf_count,
             cap_height,
-        ))
+            _phantom: PhantomData,
+        })
     }
 }
 
@@ -2189,28 +2332,159 @@ kernel void goldilocks_mul_bench_native(
                 let context = CONTEXT
                     .as_ref()
                     .unwrap_or_else(|error| panic!("{error}"));
-                let gpu = context
-                    .build(
-                        LeafSource::Rows(&flat),
-                        width,
-                        leaves.len(),
-                        cap_height,
-                    )
-                    .unwrap();
+                let gpu = interleaved_tree(
+                    context
+                        .build(
+                            LeafSource::Rows(&flat),
+                            width,
+                            leaves.len(),
+                            cap_height,
+                        )
+                        .unwrap(),
+                );
                 let cpu = cpu_tree(&leaves, cap_height);
                 assert_tree_eq(&gpu, &cpu, width, cap_height);
 
-                let gpu_cols = context
-                    .build(
-                        LeafSource::Columns(&columns),
-                        width,
-                        leaves.len(),
-                        cap_height,
-                    )
-                    .unwrap();
+                let gpu_cols = interleaved_tree(
+                    context
+                        .build(
+                            LeafSource::Columns(&columns),
+                            width,
+                            leaves.len(),
+                            cap_height,
+                        )
+                        .unwrap(),
+                );
                 assert_tree_eq(&gpu_cols, &cpu, width, cap_height);
             }
         }
+    }
+
+    /// Every query index must produce the same sibling path from the retained
+    /// level-major buffer as from the CPU tree's interleaved digests, and the
+    /// scattered view of that buffer must match the CPU digests node for node.
+    #[test]
+    fn metal_level_major_matches_cpu_tree_and_proofs() {
+        use crate::hash::merkle_proofs::{verify_merkle_proof_to_cap, MerkleProof};
+        use crate::hash::merkle_tree::{
+            merkle_tree_prove, merkle_tree_prove_level_major, MerkleCap,
+        };
+
+        let mut rng = StdRng::seed_from_u64(0x4c56_4c4d_414a_4f52);
+        for (width, log_leaves) in [
+            (0usize, 3usize),
+            (1, 4),
+            (4, 5),
+            (5, 3),
+            (8, 6),
+            (9, 4),
+            (17, 5),
+            (64, 3),
+        ] {
+            let leaf_count = 1usize << log_leaves;
+            let leaves = (0..leaf_count)
+                .map(|leaf| {
+                    (0..width)
+                        .map(|column| {
+                            let raw = match (leaf * width + column) & 7 {
+                                0 => 0,
+                                1 => 1,
+                                2 => GoldilocksField::ORDER - 1,
+                                3 => GoldilocksField::ORDER,
+                                4 => GoldilocksField::ORDER + 1,
+                                5 => u64::MAX,
+                                _ => rng.next_u64(),
+                            };
+                            GoldilocksField(raw)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let flat: Vec<GoldilocksField> =
+                leaves.iter().flat_map(|leaf| leaf.iter().copied()).collect();
+            let columns: Vec<Vec<GoldilocksField>> = (0..width)
+                .map(|column| {
+                    (0..leaf_count)
+                        .map(|natural| {
+                            let leaf = crate::util::reverse_bits(natural, log_leaves);
+                            leaves[leaf][column]
+                        })
+                        .collect()
+                })
+                .collect();
+
+            for cap_height in 0..=log_leaves {
+                let context = CONTEXT
+                    .as_ref()
+                    .unwrap_or_else(|error| panic!("{error}"));
+                let cpu = cpu_tree(&leaves, cap_height);
+
+                for (source, label) in [
+                    (LeafSource::Rows(&flat), "rows"),
+                    (LeafSource::Columns(&columns), "columns"),
+                ] {
+                    let (nodes, cap) =
+                        context.build(source, width, leaf_count, cap_height).unwrap();
+                    assert_tree_eq(
+                        &(nodes.interleaved_digests(), cap.clone()),
+                        &cpu,
+                        width,
+                        cap_height,
+                    );
+
+                    let merkle_cap = MerkleCap::<GoldilocksField, Poseidon2Hash>(cap);
+                    for leaf_index in 0..leaf_count {
+                        let level_major = merkle_tree_prove_level_major::<
+                            GoldilocksField,
+                            Poseidon2Hash,
+                        >(
+                            leaf_index, leaf_count, cap_height, &nodes
+                        );
+                        let interleaved = merkle_tree_prove::<GoldilocksField, Poseidon2Hash>(
+                            leaf_index, leaf_count, cap_height, &cpu.0,
+                        );
+                        assert_eq!(
+                            level_major.len(),
+                            interleaved.len(),
+                            "{label} width {width}, cap height {cap_height}, leaf {leaf_index}"
+                        );
+                        for (level, (actual, expected)) in
+                            level_major.iter().zip(&interleaved).enumerate()
+                        {
+                            assert_eq!(
+                                actual.elements.map(|value| value.to_canonical_u64()),
+                                expected.elements.map(|value| value.to_canonical_u64()),
+                                "{label} width {width}, cap height {cap_height}, \
+                                 leaf {leaf_index}, level {level}"
+                            );
+                        }
+                        verify_merkle_proof_to_cap(
+                            leaves[leaf_index].clone(),
+                            leaf_index,
+                            &merkle_cap,
+                            &MerkleProof {
+                                siblings: level_major,
+                            },
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{label} width {width}, cap height {cap_height}, \
+                                 leaf {leaf_index}: {error}"
+                            )
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn interleaved_tree(
+        built: (MetalNodes<GoldilocksField>, Vec<HashOut<GoldilocksField>>),
+    ) -> (
+        Vec<HashOut<GoldilocksField>>,
+        Vec<HashOut<GoldilocksField>>,
+    ) {
+        (built.0.interleaved_digests(), built.1)
     }
 
     fn cpu_tree(
