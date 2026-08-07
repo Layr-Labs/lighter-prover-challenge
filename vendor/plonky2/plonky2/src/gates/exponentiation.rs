@@ -227,12 +227,17 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
     ) {
         let base = vars.local_wires[self.wire_base()];
 
-        let power_bits: Vec<_> = (0..self.num_power_bits)
-            .map(|i| vars.local_wires[self.wire_power_bit(i)])
-            .collect();
-        let intermediate_values: Vec<_> = (0..self.num_power_bits)
-            .map(|i| vars.local_wires[self.wire_intermediate_value(i)])
-            .collect();
+        // Contiguous wire blocks (power bits at 1..1+n, intermediates at
+        // 2+n..2+2n). Borrow in place — identical values to the previous
+        // map/collect, without ~4 KiB of heap traffic per packed call.
+        // Ranked-validated pattern (RealAdii Exponentiation wire-view).
+        let power_bits = vars
+            .local_wires
+            .view(self.wire_power_bit(0)..self.wire_power_bit(0) + self.num_power_bits);
+        let intermediate_values = vars.local_wires.view(
+            self.wire_intermediate_value(0)
+                ..self.wire_intermediate_value(0) + self.num_power_bits,
+        );
 
         let output = vars.local_wires[self.wire_output()];
 

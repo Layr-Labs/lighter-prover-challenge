@@ -303,7 +303,17 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     let max_degree = common_data.quotient_degree_factor;
     let num_prods = common_data.num_partial_products;
 
-    let num_gate_constraints = common_data.num_gate_constraints;
+    // `common_data.num_gate_constraints` is the max over *all* gates, including
+    // ones the Metal job already evaluates. Those high rows stay zero on the
+    // CPU path (the GPU merge-back adds the offloaded contributions later), so
+    // sizing the buffer and the Horner reduce to the CPU survivors' max is
+    // value-identical and drops pure zero-row work. mega-dmitriy near-miss.
+    let num_gate_constraints = cpu_gate_indices
+        .iter()
+        .map(|&i| common_data.gates[i].0.num_constraints())
+        .max()
+        .unwrap_or(0)
+        .min(common_data.num_gate_constraints);
 
     evaluate_gate_constraints_base_batch_into_cpu_gates::<F, D>(
         common_data,
@@ -311,6 +321,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         &mut scratch.constraint_terms_batch,
         cpu_gate_indices,
         &mut scratch.gate_filters,
+        num_gate_constraints,
     );
     let constraint_terms_batch = &scratch.constraint_terms_batch;
     debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
@@ -1030,6 +1041,12 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
     let cpu_gate_indices = (0..common_data.gates.len())
         .filter(|i| !excluded_gate_indices.contains(i))
         .collect::<Vec<_>>();
+    let num_gate_constraints = cpu_gate_indices
+        .iter()
+        .map(|&i| common_data.gates[i].0.num_constraints())
+        .max()
+        .unwrap_or(0)
+        .min(common_data.num_gate_constraints);
     let mut filters = Vec::with_capacity(vars_batch.len());
     evaluate_gate_constraints_base_batch_into_cpu_gates(
         common_data,
@@ -1037,6 +1054,7 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
         constraints_batch,
         &cpu_gate_indices,
         &mut filters,
+        num_gate_constraints,
     );
 }
 
@@ -1051,11 +1069,14 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
     constraints_batch: &mut Vec<F>,
     cpu_gate_indices: &[usize],
     filters: &mut Vec<F>,
+    // Max constraints among the CPU survivors (≤ common_data.num_gate_constraints).
+    num_gate_constraints: usize,
 ) {
     constraints_batch.clear();
-    constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
+    constraints_batch.resize(num_gate_constraints * vars_batch.len(), F::ZERO);
     for &i in cpu_gate_indices {
         let gate = &common_data.gates[i];
+        debug_assert!(gate.0.num_constraints() <= num_gate_constraints);
         let selector_index = common_data.selectors_info.selector_indices[i];
         gate.0.eval_filtered_base_batch(
             vars_batch,
