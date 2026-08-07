@@ -362,14 +362,40 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
             let top = self.wire_ith_input_jth_aux_limb(i, num_aux - 1);
 
             scratch.copy_from_slice(&wires[top * n..][..n]);
-            for j in (0..num_aux - 1).rev() {
-                let limb = &wires[self.wire_ith_input_jth_aux_limb(i, j) * n..][..n];
+            // Fold the `- input` sweep into the last Horner step rather than
+            // making a second full read-modify-write pass over the batch
+            // scratch. The same three field operations run on the same
+            // operands in the same order (multiply by base, add limb, subtract
+            // input); only the store and reload of `scratch[p]` between the
+            // Horner step and the subtraction disappears. That makes this
+            // raw-representative-exact, not merely ring-identical — there is
+            // no reassociation. One whole 32-point pass per op per evaluation
+            // batch is deleted, in the gate that is the second-largest compute
+            // symbol in this prover's profile.
+            //
+            // Deliberately NOT taken: replacing `* base` (base = 4) with two
+            // doublings. That variant measured 118.18 s against a 107.08 s
+            // matched control in a rejected submission — LLVM already
+            // strength-reduces the constant multiply inside `reduce_128`.
+            if num_aux == 1 {
+                // The Horner loop body never runs here, so there is no step to
+                // fold the subtraction into.
                 for p in 0..n {
-                    scratch[p] = scratch[p] * base + limb[p];
+                    scratch[p] -= input[p];
                 }
-            }
-            for p in 0..n {
-                scratch[p] -= input[p];
+            } else {
+                for j in (0..num_aux - 1).rev() {
+                    let limb = &wires[self.wire_ith_input_jth_aux_limb(i, j) * n..][..n];
+                    if j == 0 {
+                        for p in 0..n {
+                            scratch[p] = scratch[p] * base + limb[p] - input[p];
+                        }
+                    } else {
+                        for p in 0..n {
+                            scratch[p] = scratch[p] * base + limb[p];
+                        }
+                    }
+                }
             }
             let combined =
                 &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
