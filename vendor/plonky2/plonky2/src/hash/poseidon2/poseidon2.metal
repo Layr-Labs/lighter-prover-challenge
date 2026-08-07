@@ -385,9 +385,9 @@ inline void range_check_gate_emit(
 // Each RangeCheck metadata record is eight uints:
 //   selector column, gate index, group start/end, include UNUSED selector,
 //   operation count, base-4 limbs per operation, final-limb range (2 or 4).
-// It is followed by U32 records with the same five selector words, then:
-//   kind (arithmetic=0, subtraction=1, add-many=2), operation count,
-//   addend count (zero except for add-many).
+// It is followed by promoted-gate records with the same five selector words,
+// then kind (arithmetic=0, subtraction=1, add-many=2, byte-decomposition=3),
+// operation count, and a kind parameter (addend count or byte-limb count).
 // Every gate starts again at constraint row zero. This matches the CPU's
 // shared row accumulator: reducing each filtered gate locally with the same
 // alpha powers and then adding the results is linear in those row values.
@@ -402,7 +402,7 @@ kernel void range_check_gate_quotient(
     constant uint& step [[buffer(7)]],
     constant uint& alpha_stride [[buffer(8)]],
     constant uint& range_count [[buffer(9)]],
-    constant uint& u32_count [[buffer(10)]],
+    constant uint& promoted_count [[buffer(10)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= quotient_rows) {
         return;
@@ -474,9 +474,9 @@ kernel void range_check_gate_quotient(
         total[1] = gl_add(total[1], gl_mul(filter, gate_accumulators[1]));
     }
 
-    constant uint* u32_metadata = metadata + range_count * 8u;
-    for (uint u32_index = 0; u32_index < u32_count; ++u32_index) {
-        constant uint* spec = u32_metadata + u32_index * 8u;
+    constant uint* promoted_metadata = metadata + range_count * 8u;
+    for (uint promoted_index = 0; promoted_index < promoted_count; ++promoted_index) {
+        constant uint* spec = promoted_metadata + promoted_index * 8u;
         uint selector_column = spec[0];
         uint gate_index = spec[1];
         uint group_start = spec[2];
@@ -484,7 +484,7 @@ kernel void range_check_gate_quotient(
         uint include_unused_selector = spec[4];
         uint kind = spec[5];
         uint num_ops = spec[6];
-        uint num_addends = spec[7];
+        uint parameter = spec[7];
 
         ulong selector = constants[(ulong)selector_column * lde_rows + source_row];
         ulong filter = 1;
@@ -609,9 +609,10 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
-        } else {
+        } else if (kind == 2u) {
             // U32AddManyGate: num_addends inputs, carry/result/output-carry,
             // then 16 result and two carry base-4 limbs per operation.
+            uint num_addends = parameter;
             uint routed_per_op = num_addends + 3u;
             for (uint op = 0; op < num_ops; ++op) {
                 ulong routed_base = (ulong)op * routed_per_op;
@@ -661,6 +662,69 @@ kernel void range_check_gate_quotient(
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(combined_carry, output_carry),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 3u) {
+            // ByteDecompositionGate: each operation has one sum followed by
+            // num_limbs byte wires. All routed operations precede four
+            // base-4 auxiliary limbs per byte and operation.
+            uint num_limbs = parameter;
+            uint routed_per_op = num_limbs + 1u;
+            uint aux_per_op = 4u * num_limbs;
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong routed_base = (ulong)op * routed_per_op;
+                ulong aux_base =
+                    (ulong)routed_per_op * num_ops + (ulong)op * aux_per_op;
+
+                // Match the CPU gate exactly: all auxiliary range products
+                // for this operation come before any recomposition rows.
+                for (uint j = 0; j < aux_per_op; ++j) {
+                    ulong x = wires[(aux_base + j) * lde_rows + source_row];
+                    ulong y = gl_mul(x, gl_sub(x, 3));
+                    range_check_gate_emit(
+                        gl_mul(y, gl_add(y, 2)),
+                        alpha_powers,
+                        alpha_stride,
+                        gate_accumulators,
+                        constraint_index++);
+                }
+
+                // Each byte is little-endian in four base-4 limbs.
+                for (uint byte_index = 0; byte_index < num_limbs; ++byte_index) {
+                    ulong limb_base = aux_base + (ulong)byte_index * 4u;
+                    ulong recomposed =
+                        wires[(limb_base + 3u) * lde_rows + source_row];
+                    for (uint remaining = 3u; remaining > 0u; --remaining) {
+                        uint j = remaining - 1u;
+                        recomposed = gl_add(
+                            gl_mul(recomposed, 4),
+                            wires[(limb_base + j) * lde_rows + source_row]);
+                    }
+                    ulong byte_value = wires[
+                        (routed_base + 1u + byte_index) * lde_rows + source_row];
+                    range_check_gate_emit(
+                        gl_sub(recomposed, byte_value),
+                        alpha_powers,
+                        alpha_stride,
+                        gate_accumulators,
+                        constraint_index++);
+                }
+
+                // The sum is little-endian in the byte wires.
+                ulong recomposed_sum = wires[
+                    (routed_base + num_limbs) * lde_rows + source_row];
+                for (uint remaining = num_limbs - 1u; remaining > 0u; --remaining) {
+                    uint byte_index = remaining - 1u;
+                    recomposed_sum = gl_add(
+                        gl_mul(recomposed_sum, 256),
+                        wires[(routed_base + 1u + byte_index) * lde_rows + source_row]);
+                }
+                ulong expected_sum = wires[routed_base * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(recomposed_sum, expected_sum),
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
