@@ -1068,9 +1068,14 @@ fn compute_quotient_polys<
             column.push(value);
         }
     }
+    let inverse_coset_shift_powers =
+        precomputed::inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
-        .map(|column| PolynomialValues::new(column).coset_ifft(F::coset_shift()))
+        .map(|column| {
+            PolynomialValues::new(column)
+                .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
+        })
         .collect()
 }
 
@@ -1095,6 +1100,7 @@ pub(crate) mod precomputed {
 
         static SUBGROUPS: OnceLock<Map> = OnceLock::new();
         static COSET_POWERS: OnceLock<Map> = OnceLock::new();
+        static INVERSE_COSET_POWERS: OnceLock<Map> = OnceLock::new();
 
         fn get_or_compute<F: Field>(
             cache: &'static OnceLock<Map>,
@@ -1133,6 +1139,13 @@ pub(crate) mod precomputed {
                 F::coset_shift().powers().take(degree).collect()
             })
         }
+
+        /// Cached `F::coset_shift().inverse().powers().take(degree)`.
+        pub(crate) fn inverse_coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
+            get_or_compute(&INVERSE_COSET_POWERS, degree, || {
+                F::coset_shift().inverse().powers().take(degree).collect()
+            })
+        }
     }
 
     /// Without `std` there is no process-global synchronization; fall back to
@@ -1151,9 +1164,19 @@ pub(crate) mod precomputed {
         pub(crate) fn coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
             Arc::new(F::coset_shift().powers().take(degree).collect::<Vec<F>>())
         }
+
+        pub(crate) fn inverse_coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
+            Arc::new(
+                F::coset_shift()
+                    .inverse()
+                    .powers()
+                    .take(degree)
+                    .collect::<Vec<F>>(),
+            )
+        }
     }
 
-    pub(crate) use imp::{coset_shift_powers, two_adic_subgroup};
+    pub(crate) use imp::{coset_shift_powers, inverse_coset_shift_powers, two_adic_subgroup};
 }
 
 #[cfg(test)]
@@ -1312,6 +1335,20 @@ mod quotient_layout_tests {
             let direct: Vec<F> = F::coset_shift().powers().take(degree).collect();
             assert_eq!(*precomputed::coset_shift_powers::<F>(degree), direct);
             assert_eq!(*precomputed::coset_shift_powers::<F>(degree), direct);
+
+            let direct_inverse: Vec<F> = F::coset_shift()
+                .inverse()
+                .powers()
+                .take(degree)
+                .collect();
+            assert_eq!(
+                *precomputed::inverse_coset_shift_powers::<F>(degree),
+                direct_inverse
+            );
+            assert_eq!(
+                *precomputed::inverse_coset_shift_powers::<F>(degree),
+                direct_inverse
+            );
         }
     }
 
