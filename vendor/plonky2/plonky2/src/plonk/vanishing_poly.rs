@@ -177,6 +177,37 @@ pub(crate) struct VanishingScratch<F> {
     pub constraint_terms_batch: Vec<F>,
 }
 
+/// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
+/// of two layouts.
+///
+/// `Rows` carries per-point slices (entry `k` is the row for point `k`) cut out
+/// of point-major gather buffers; it is required whenever the circuit has
+/// lookups, whose constraint evaluator consumes per-point rows.
+///
+/// `Cols` carries flat column-major buffers straight from `fill_lde_batch`'s
+/// `PolyMajor` layout — column `c`'s batch values occupy `[c * n..(c + 1) * n]`
+/// — which the no-lookup column evaluator reads directly, with no transpose in
+/// between.
+#[derive(Clone, Copy)]
+pub(crate) enum PermutationBatch<'a, F> {
+    Rows {
+        local_zs_batch: &'a [&'a [F]],
+        next_zs_batch: &'a [&'a [F]],
+        partial_products_batch: &'a [&'a [F]],
+        s_sigmas_batch: &'a [&'a [F]],
+    },
+    Cols {
+        /// Z and partial-product columns `0..(num_partial_products + 1) * num_challenges`
+        /// of the zs/partial-products commitment, i.e. `zs_range` followed by
+        /// `partial_products_range`.
+        zs_partial_products_cols: &'a [F],
+        /// Z columns only (`zs_range`), gathered at the "next" indices.
+        zs_next_cols: &'a [F],
+        /// Sigma columns (`sigmas_range` of the constants-sigmas commitment).
+        s_sigmas_cols: &'a [F],
+    },
+}
+
 fn reduce_gate_constraints_base_batch<F: Field>(
     constraint_terms_batch: &[F],
     batch_size: usize,
@@ -208,12 +239,9 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     indices_batch: &[usize],
     xs_batch: &[F],
     vars_batch: EvaluationVarsBaseBatch<F>,
-    local_zs_batch: &[&[F]],
-    next_zs_batch: &[&[F]],
+    perm: PermutationBatch<'_, F>,
     local_lookup_zs_batch: &[&[F]],
     next_lookup_zs_batch: &[&[F]],
-    partial_products_batch: &[&[F]],
-    s_sigmas_batch: &[&[F]],
     betas: &[F],
     gammas: &[F],
     beta_k_is: &[F],
@@ -229,8 +257,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     let n = indices_batch.len();
     assert_eq!(xs_batch.len(), n);
     assert_eq!(vars_batch.len(), n);
-    assert_eq!(local_zs_batch.len(), n);
-    assert_eq!(next_zs_batch.len(), n);
     if has_lookup {
         assert_eq!(local_lookup_zs_batch.len(), n);
         assert_eq!(next_lookup_zs_batch.len(), n);
@@ -238,8 +264,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         assert_eq!(local_lookup_zs_batch.len(), 0);
         assert_eq!(next_lookup_zs_batch.len(), 0);
     }
-    assert_eq!(partial_products_batch.len(), n);
-    assert_eq!(s_sigmas_batch.len(), n);
 
     let max_degree = common_data.quotient_degree_factor;
     let num_prods = common_data.num_partial_products;
@@ -273,7 +297,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     // The terms checking the lookup constraints.
     let vanishing_all_lookup_terms = &mut scratch.vanishing_all_lookup_terms;
     vanishing_z_1_terms.clear();
-    vanishing_partial_products_terms.clear();
     vanishing_all_lookup_terms.clear();
 
     debug_assert_eq!(res_out.len(), n * num_challenges);
@@ -281,12 +304,29 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     // Column-major evaluation of the permutation-argument terms when the
     // circuit has no lookups. Per point this performs exactly the same field
     // operations, in the same order, as the per-point loop below; it only
-    // reads each wire and sigma column contiguously across the batch instead
-    // of through per-point strided views. Term rows are laid out in the same
+    // reads each wire, sigma, Z and partial-product column contiguously across
+    // the batch — straight out of the `PolyMajor` gather buffers — instead of
+    // through per-point strided views. Term rows are laid out in the same
     // order the per-point loop pushes terms, and the final alpha reduction
     // consumes them in the same reversed order, so `res_out` is
     // value-identical.
-    if !has_lookup {
+    if let PermutationBatch::Cols {
+        zs_partial_products_cols,
+        zs_next_cols,
+        s_sigmas_cols,
+    } = perm
+    {
+        assert!(
+            !has_lookup,
+            "lookup circuits need per-point permutation rows"
+        );
+        assert_eq!(
+            zs_partial_products_cols.len(),
+            (num_prods + 1) * num_challenges * n
+        );
+        assert_eq!(zs_next_cols.len(), num_challenges * n);
+        assert_eq!(s_sigmas_cols.len(), num_routed_wires * n);
+
         let wires = vars_batch.local_wires;
         let chunk_size = max_degree;
         let num_chunks = num_routed_wires.div_ceil(chunk_size);
@@ -297,8 +337,9 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         let num_rows = num_challenges * (1 + num_chunks);
 
         let term_rows = &mut scratch.vanishing_partial_products_terms;
-        term_rows.clear();
-        term_rows.resize(num_rows * n, F::ZERO);
+        if term_rows.len() != num_rows * n {
+            term_rows.resize(num_rows * n, F::ZERO);
+        }
 
         let l_0_xs = &mut scratch.vanishing_z_1_terms;
         l_0_xs.clear();
@@ -312,62 +353,56 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         let num_prod = &mut scratch.numerator_values;
         let den_prod = &mut scratch.denominator_values;
 
-        // Hoist the per-point sigma rows into contiguous columns so the
-        // chunk-product loops read them with unit stride. Values unchanged;
-        // each sigma is read once per challenge, so the transpose pays for
-        // itself with the standard two challenges.
-        let sigma_cols = &mut scratch.lookup_selectors;
-        sigma_cols.clear();
-        sigma_cols.resize(num_routed_wires * n, F::ZERO);
-        for (k, s_sigmas) in s_sigmas_batch.iter().enumerate() {
-            for (j, &s) in s_sigmas.iter().take(num_routed_wires).enumerate() {
-                sigma_cols[j * n + k] = s;
+        // The accumulator chain for challenge `i` is the column sequence
+        // [Z_i(x) | partials i*num_prods..(i+1)*num_prods | Z_i(gx)], read
+        // directly out of the PolyMajor buffers: `zs_range` starts at column
+        // 0 and `partial_products_range` at column `num_challenges`, and the
+        // next-Z buffer was gathered over `zs_range` alone. Column `c` here
+        // holds exactly the values the old per-point transpose scattered into
+        // `acc_cols[i * acc_stride + c * n..][..n]`.
+        let acc_col = |i: usize, c: usize| -> &[F] {
+            if c == 0 {
+                &zs_partial_products_cols[i * n..][..n]
+            } else if c <= num_prods {
+                &zs_partial_products_cols[(num_challenges + i * num_prods + (c - 1)) * n..][..n]
+            } else {
+                &zs_next_cols[i * n..][..n]
             }
-        }
-
-        // Same treatment for the per-point Z and partial-product slices: one
-        // transpose into contiguous columns kills the per-point double
-        // dereferences in the accumulator-selection loop below.
-        let acc_cols_len = num_challenges * (num_prods + 2) * n;
-        let mut acc_cols = vec![F::ZERO; acc_cols_len];
-        let acc_stride = (num_prods + 2) * n;
-        for k in 0..n {
-            let local_zs = local_zs_batch[k];
-            let next_zs = next_zs_batch[k];
-            let partial_products = partial_products_batch[k];
-            for i in 0..num_challenges {
-                let base = i * acc_stride;
-                acc_cols[base + k] = local_zs[i];
-                for (c, &p) in partial_products[i * num_prods..(i + 1) * num_prods]
-                    .iter()
-                    .enumerate()
-                {
-                    acc_cols[base + (c + 1) * n + k] = p;
-                }
-                acc_cols[base + (num_prods + 1) * n + k] = next_zs[i];
-            }
-        }
+        };
 
         for i in 0..num_challenges {
-            let z_col = &acc_cols[i * acc_stride..][..n];
+            let z_col = acc_col(i, 0);
             let z1_row = &mut term_rows[i * n..][..n];
             for k in 0..n {
                 z1_row[k] = l_0_xs[k] * z_col[k].sub_one();
             }
 
             for c in 0..num_chunks {
-                let j_range = c * chunk_size..((c + 1) * chunk_size).min(num_routed_wires);
+                let j_start = c * chunk_size;
+                let j_end = ((c + 1) * chunk_size).min(num_routed_wires);
+                let beta = betas[i];
+                let gamma = gammas[i];
 
+                // The first factor of each chunk lands by direct assignment:
+                // the reference path multiplies it into `ONE`, and
+                // `ONE * a == a` bitwise for Goldilocks (`reduce128` is the
+                // identity on inputs `< 2^64`), so skipping that multiply —
+                // and the resize-to-ONE memset — changes no value.
                 num_prod.clear();
-                num_prod.resize(n, F::ONE);
                 den_prod.clear();
-                den_prod.resize(n, F::ONE);
-                for j in j_range {
+                {
+                    let wire_col = &wires[j_start * n..][..n];
+                    let sigma_col = &s_sigmas_cols[j_start * n..][..n];
+                    let beta_k_i = beta_k_is[i * num_routed_wires + j_start];
+                    for k in 0..n {
+                        num_prod.push(wire_col[k] + beta_k_i * xs_batch[k] + gamma);
+                        den_prod.push(wire_col[k] + beta * sigma_col[k] + gamma);
+                    }
+                }
+                for j in j_start + 1..j_end {
                     let wire_col = &wires[j * n..][..n];
-                    let sigma_col = &sigma_cols[j * n..][..n];
+                    let sigma_col = &s_sigmas_cols[j * n..][..n];
                     let beta_k_i = beta_k_is[i * num_routed_wires + j];
-                    let beta = betas[i];
-                    let gamma = gammas[i];
                     for k in 0..n {
                         num_prod[k] *= wire_col[k] + beta_k_i * xs_batch[k] + gamma;
                         den_prod[k] *= wire_col[k] + beta * sigma_col[k] + gamma;
@@ -376,11 +411,10 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
                 let row =
                     &mut term_rows[(num_challenges + i * num_chunks + c) * n..][..n];
-                // The accumulator chain per challenge is laid out as columns
-                // [Z(x) | partials 0..num_prods | Z(gx)], so chunk c reads
-                // column c as prev and column c+1 as next — contiguously.
-                let prev_col = &acc_cols[i * acc_stride + c * n..][..n];
-                let next_col = &acc_cols[i * acc_stride + (c + 1) * n..][..n];
+                // Chunk c reads accumulator column c as prev and column c+1
+                // as next.
+                let prev_col = acc_col(i, c);
+                let next_col = acc_col(i, c + 1);
                 for k in 0..n {
                     row[k] = prev_col[k] * num_prod[k] - next_col[k] * den_prod[k];
                 }
@@ -398,13 +432,26 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             }
         }
 
-        term_rows.clear();
         l_0_xs.clear();
         num_prod.clear();
         den_prod.clear();
-        scratch.lookup_selectors.clear();
         return;
     }
+
+    let PermutationBatch::Rows {
+        local_zs_batch,
+        next_zs_batch,
+        partial_products_batch,
+        s_sigmas_batch,
+    } = perm
+    else {
+        unreachable!("Cols variant returns above")
+    };
+    vanishing_partial_products_terms.clear();
+    assert_eq!(local_zs_batch.len(), n);
+    assert_eq!(next_zs_batch.len(), n);
+    assert_eq!(partial_products_batch.len(), n);
+    assert_eq!(s_sigmas_batch.len(), n);
 
     for k in 0..n {
         let index = indices_batch[k];
@@ -897,6 +944,7 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
 ) {
     constraints_batch.clear();
     constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
+    let mut filters = Vec::with_capacity(vars_batch.len());
     for (i, gate) in common_data.gates.iter().enumerate() {
         let selector_index = common_data.selectors_info.selector_indices[i];
         gate.0.eval_filtered_base_batch(
@@ -906,6 +954,7 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
             common_data.selectors_info.groups[selector_index].clone(),
             common_data.selectors_info.num_selectors(),
             common_data.num_lookup_selectors,
+            &mut filters,
             constraints_batch,
         );
     }

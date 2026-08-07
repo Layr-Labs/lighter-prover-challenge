@@ -4,7 +4,6 @@
 use core::ops::Range;
 
 use anyhow::Result;
-use itertools::Itertools;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
@@ -342,35 +341,24 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
             .to_canonical_u64();
 
         // Set bytes
-        let limbs = dummy_gate
-            .i_th_limbs(self.i)
-            .map(|i| Target::wire(self.row, i));
-        let limbs_value = (0..self.num_limbs)
-            .scan(sum_value, |acc, _| {
-                let tmp = *acc % (256_u64);
-                *acc /= 256_u64;
-                Some(F::from_canonical_u64(tmp))
-            })
-            .collect::<Vec<_>>();
-
-        for (b, b_value) in limbs.zip_eq(limbs_value) {
-            out_buffer.set_target(b, b_value)?;
+        // Direct limb-decomposition loops: same limbs in the same order as the
+        // previous `scan`/`collect` into temporary `Vec`s, minus the heap
+        // allocations per generator execution. `i_th_limbs`/`i_th_aux_limbs`
+        // are ranges of exactly `num_limbs`/`4 * num_limbs` columns, so the
+        // pairing is exhaustive exactly as `zip_eq` required.
+        let mut acc = sum_value;
+        for i in dummy_gate.i_th_limbs(self.i) {
+            let tmp = acc % 256_u64;
+            acc /= 256_u64;
+            out_buffer.set_target(Target::wire(self.row, i), F::from_canonical_u64(tmp))?;
         }
 
         // Set aux limbs
-        let limbs = dummy_gate
-            .i_th_aux_limbs(self.i)
-            .map(|i| Target::wire(self.row, i));
-        let limbs_value = (0..4 * self.num_limbs)
-            .scan(sum_value, |acc, _| {
-                let tmp = *acc % (4_u64);
-                *acc /= 4_u64;
-                Some(F::from_canonical_u64(tmp))
-            })
-            .collect::<Vec<_>>();
-
-        for (b, b_value) in limbs.zip_eq(limbs_value) {
-            out_buffer.set_target(b, b_value)?;
+        let mut acc = sum_value;
+        for i in dummy_gate.i_th_aux_limbs(self.i) {
+            let tmp = acc % 4_u64;
+            acc /= 4_u64;
+            out_buffer.set_target(Target::wire(self.row, i), F::from_canonical_u64(tmp))?;
         }
 
         Ok(())

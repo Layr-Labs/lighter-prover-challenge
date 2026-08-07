@@ -276,44 +276,6 @@ impl<F: Field> PolynomialCoeffs<F> {
         self.coset_fft_with_options(shift, None, None)
     }
 
-    /// Returns the evaluation of the polynomial on the coset `shift*H`, for a
-    /// polynomial whose coefficients past `len >> rate_bits` are all zero (the
-    /// zero-padded-LDE invariant this codebase's FFT shortcut relies on).
-    ///
-    /// Value-exact versus `coset_fft_with_options(shift, Some(rate_bits), ..)`:
-    /// that path materializes `shift^i * c_i` for the *full* length — a fresh
-    /// full-length allocation plus a multiply per zero tail element, all of
-    /// which produce zeros the FFT's zero-run expansion never reads (its
-    /// expansion writes every element past the live prefix before any read).
-    /// This variant scales only the live prefix and leaves the tail
-    /// uninitialized; field elements are plain-old-data, so exposing memory
-    /// that is only ever written first is sound.
-    pub fn coset_fft_zero_tail(
-        &self,
-        shift: F,
-        rate_bits: usize,
-        root_table: Option<&FftRootTable<F>>,
-    ) -> PolynomialValues<F> {
-        let n = self.len();
-        let support = n >> rate_bits;
-        debug_assert!(
-            self.coeffs[support..].iter().all(|c| c.is_zero()),
-            "coset_fft_zero_tail requires an all-zero tail past len >> rate_bits"
-        );
-        let mut scaled = Vec::with_capacity(n);
-        scaled.extend(
-            shift
-                .powers()
-                .zip(&self.coeffs[..support])
-                .map(|(r, &c)| r * c),
-        );
-        #[allow(clippy::uninit_vec)]
-        unsafe {
-            scaled.set_len(n);
-        }
-        PolynomialCoeffs::new(scaled).fft_with_options(Some(rate_bits), root_table)
-    }
-
     /// Returns the evaluation of the polynomial on the coset `shift*H`.
     pub fn coset_fft_with_options(
         &self,
@@ -509,30 +471,6 @@ mod tests {
                 coeffs: vec![F::ONE, F::TWO]
             }
         );
-    }
-
-    /// The zero-tail coset FFT must be value-identical to the classic
-    /// full-length scaled path for every (length, rate_bits) shape the prover
-    /// uses, over both the base field and its quadratic extension.
-    #[test]
-    fn test_coset_fft_zero_tail_matches_classic() {
-        fn check<F: Field>() {
-            for lg_n in [1, 2, 4, 6, 9] {
-                for rate_bits in 0..=3.min(lg_n) {
-                    let n = 1 << lg_n;
-                    let support = n >> rate_bits;
-                    let mut coeffs = F::rand_vec(support);
-                    coeffs.resize(n, F::ZERO);
-                    let poly = PolynomialCoeffs::new(coeffs);
-                    let shift = F::MULTIPLICATIVE_GROUP_GENERATOR;
-                    let classic = poly.coset_fft_with_options(shift, Some(rate_bits), None);
-                    let zero_tail = poly.coset_fft_zero_tail(shift, rate_bits, None);
-                    assert_eq!(classic.values, zero_tail.values, "lg_n={lg_n} rate_bits={rate_bits}");
-                }
-            }
-        }
-        check::<GoldilocksField>();
-        check::<crate::extension::quadratic::QuadraticExtension<GoldilocksField>>();
     }
 
     #[test]
