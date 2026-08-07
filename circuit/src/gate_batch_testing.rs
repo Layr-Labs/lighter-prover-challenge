@@ -181,6 +181,21 @@ mod accumulate_microbench {
         );
     }
 
+    /// `ByteDecompositionGate` in its production shape: `new_from_config`
+    /// with `CIRCUIT_CONFIG` yields `num_limbs = 8, num_ops = 3`, i.e. 123
+    /// constraints per row -- the many-constraints case the fused accumulate
+    /// is supposed to amortize.
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn byte_decomposition_accumulate_microbench() {
+        use crate::byte::split_gate::ByteDecompositionGate;
+
+        const ITERS: usize = 20_000;
+        for (num_limbs, num_ops) in [(8, 3), (8, 1), (4, 2)] {
+            bench_gate(&ByteDecompositionGate::new(num_limbs, num_ops), ITERS);
+        }
+    }
+
     #[test]
     #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
     fn accumulate_microbench() {
