@@ -227,32 +227,28 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
     ) {
         let base = vars.local_wires[self.wire_base()];
 
-        let power_bits: Vec<_> = (0..self.num_power_bits)
-            .map(|i| vars.local_wires[self.wire_power_bit(i)])
-            .collect();
-        let intermediate_values: Vec<_> = (0..self.num_power_bits)
-            .map(|i| vars.local_wires[self.wire_intermediate_value(i)])
-            .collect();
-
         let output = vars.local_wires[self.wire_output()];
 
         for i in 0..self.num_power_bits {
             let prev_intermediate_value = if i == 0 {
                 P::ONES
             } else {
-                intermediate_values[i - 1].square()
+                vars.local_wires[self.wire_intermediate_value(i - 1)].square()
             };
 
-            // power_bits is in LE order, but we accumulate in BE order.
-            let cur_bit = power_bits[self.num_power_bits - i - 1];
+            // power bits are in LE order, but we accumulate in BE order.
+            let cur_bit = vars.local_wires[self.wire_power_bit(self.num_power_bits - i - 1)];
 
             let not_cur_bit = P::ONES - cur_bit;
             let computed_intermediate_value =
                 prev_intermediate_value * (cur_bit * base + not_cur_bit);
-            yield_constr.one(computed_intermediate_value - intermediate_values[i]);
+            let intermediate_value = vars.local_wires[self.wire_intermediate_value(i)];
+            yield_constr.one(computed_intermediate_value - intermediate_value);
         }
 
-        yield_constr.one(output - intermediate_values[self.num_power_bits - 1]);
+        let final_intermediate_value =
+            vars.local_wires[self.wire_intermediate_value(self.num_power_bits - 1)];
+        yield_constr.one(output - final_intermediate_value);
     }
 }
 
@@ -337,8 +333,10 @@ mod tests {
     use rand::Rng;
 
     use super::*;
+    use crate::field::extension::FieldExtension;
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::Sample;
+    use crate::field::packable::Packable;
+    use crate::field::types::{Field64, PrimeField64, Sample};
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
     use crate::hash::hash_types::HashOut;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
@@ -380,6 +378,83 @@ mod tests {
         test_eval_fns::<F, C, _, D>(ExponentiationGate::new_from_config(
             &CircuitConfig::standard_recursion_config(),
         ))
+    }
+
+    #[test]
+    fn base_batch_matches_default_eval_on_noncanonical_inputs_raw() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+
+        // Exercise raw aliases of small field elements, including noncanonical zero,
+        // alongside unrelated canonical values. Field equality canonicalizes, so compare
+        // the output words below to catch representation changes as well as value changes.
+        fn value(i: usize) -> F {
+            let raw = (i as u64)
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .rotate_left((i % 61) as u32);
+            match i % 5 {
+                0 => GoldilocksField(F::ORDER),
+                1 => GoldilocksField(F::ORDER + (raw & 0xffff)),
+                2 => GoldilocksField(u64::MAX),
+                _ => GoldilocksField(raw % F::ORDER),
+            }
+        }
+
+        let packing_width = <<F as Packable>::Packing as PackedField>::WIDTH;
+        let mut batch_sizes = vec![
+            1,
+            packing_width.saturating_sub(1).max(1),
+            packing_width,
+            packing_width + 1,
+            2 * packing_width,
+            2 * packing_width + 1,
+            31,
+            32,
+            33,
+        ];
+        batch_sizes.sort_unstable();
+        batch_sizes.dedup();
+
+        for num_power_bits in [1, 2, 17, 67] {
+            let gate = ExponentiationGate::<F, D>::new(num_power_bits);
+            for &n in &batch_sizes {
+                // `EvaluationVarsBaseBatch` stores columns contiguously.
+                let wires = (0..gate.num_wires() * n)
+                    .map(|i| value(i + 1))
+                    .collect::<Vec<_>>();
+                let hash = HashOut::ZERO;
+                let vars = EvaluationVarsBaseBatch::new(n, &[], &wires, &hash);
+                let actual = gate.eval_unfiltered_base_batch(vars);
+
+                for point in 0..n {
+                    let wires_one = (0..gate.num_wires())
+                        .map(|wire| {
+                            <<F as Extendable<D>>::Extension as FieldExtension<D>>::from_basefield(
+                                wires[wire * n + point],
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let vars_one = EvaluationVars {
+                        local_constants: &[],
+                        local_wires: &wires_one,
+                        public_inputs_hash: &hash,
+                    };
+
+                    // Per-point `eval_unfiltered` is the default semantic path and is
+                    // independent of the packed base-batch implementation under test.
+                    let expected = gate.eval_unfiltered(vars_one);
+                    for (constraint, expected) in expected.iter().enumerate() {
+                        let coefficients: [F; D] = expected.to_basefield_array();
+                        assert!(coefficients[1].is_zero());
+                        assert_eq!(
+                            actual[constraint * n + point].to_noncanonical_u64(),
+                            coefficients[0].to_noncanonical_u64(),
+                            "bits={num_power_bits}, n={n}, point={point}, constraint={constraint}",
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
