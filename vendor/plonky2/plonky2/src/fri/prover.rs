@@ -75,6 +75,95 @@ pub(crate) type FriCommitedTrees<F, C, const D: usize> = (
     PolynomialCoeffs<<F as Extendable<D>>::Extension>,
 );
 
+/// Flattens an extension-field codeword into base-field limbs in bit-reversed
+/// order: output row `i` (of `D` limbs) holds `values[reverse_bits(i)]`. The
+/// bytes are identical to the serial
+/// `for i { flat.extend(values[reverse_bits(i)].to_basefield_array()) }` loop;
+/// large codewords are gathered in parallel over destination blocks —
+/// `i -> reverse_bits(i)` is a bijection, so every output row is written by
+/// exactly one worker, exactly once.
+pub(crate) fn flatten_bitrev<F: RichField + Extendable<D>, const D: usize>(
+    values: &[F::Extension],
+) -> Vec<F> {
+    let n = values.len();
+    let log_n = log2_strict(n);
+    let mut flat_values: Vec<F> = Vec::with_capacity(n * D);
+    const GATHER_BLOCK: usize = 1024;
+    if n >= 2 * GATHER_BLOCK {
+        #[derive(Clone, Copy)]
+        struct SendPtr<T>(*mut T);
+        unsafe impl<T> Send for SendPtr<T> {}
+        unsafe impl<T> Sync for SendPtr<T> {}
+        impl<T> SendPtr<T> {
+            fn get(self) -> *mut T {
+                self.0
+            }
+        }
+        let base = SendPtr(flat_values.as_mut_ptr());
+        (0..n / GATHER_BLOCK).into_par_iter().for_each(move |block| {
+            let start = block * GATHER_BLOCK;
+            for i in start..start + GATHER_BLOCK {
+                let x = values[reverse_bits(i, log_n)];
+                let limbs = x.to_basefield_array();
+                // SAFETY: destination rows `i * D..(i + 1) * D` are disjoint
+                // across `i`, each is written exactly once, and
+                // `(n - 1) * D + D <= n * D` is within the allocated capacity.
+                let row = unsafe { base.get().add(i * D) };
+                for (j, &limb) in limbs.iter().enumerate() {
+                    unsafe { row.add(j).write(limb) };
+                }
+            }
+        });
+        // SAFETY: every element in `0..n * D` was initialized above (`n` is a
+        // power of two, so the blocks cover `0..n` exactly).
+        unsafe { flat_values.set_len(n * D) };
+    } else {
+        for i in 0..n {
+            let x = values[reverse_bits(i, log_n)];
+            flat_values.extend_from_slice(&x.to_basefield_array());
+        }
+    }
+    flat_values
+}
+
+#[cfg(test)]
+mod flatten_bitrev_tests {
+    use plonky2_field::types::Sample;
+
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    /// The parallel blocked gather must be byte-identical to the serial
+    /// reference at sizes below, at, and above the parallel threshold.
+    #[test]
+    fn parallel_gather_matches_serial_reference() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type FE = <F as Extendable<D>>::Extension;
+
+        for lg_n in [1, 5, 10, 11, 12, 13] {
+            let n = 1 << lg_n;
+            let values: Vec<FE> = (0..n).map(|_| FE::rand()).collect();
+
+            let log_n = log2_strict(n);
+            let mut reference: Vec<F> = Vec::with_capacity(n * D);
+            for i in 0..n {
+                let x = values[reverse_bits(i, log_n)];
+                reference.extend_from_slice(&FieldExtension::<D>::to_basefield_array(&x));
+            }
+
+            let flat = flatten_bitrev::<F, D>(&values);
+            assert_eq!(flat.len(), reference.len(), "lg_n = {lg_n}");
+            for (i, (a, b)) in flat.iter().zip(&reference).enumerate() {
+                assert_eq!(
+                    a.0, b.0,
+                    "raw limb mismatch at index {i} for lg_n = {lg_n}"
+                );
+            }
+        }
+    }
+}
+
 pub fn final_poly_coeff_len(mut degree_bits: usize, reduction_arity_bits: &Vec<usize>) -> usize {
     for arity_bits in reduction_arity_bits {
         degree_bits -= *arity_bits;
@@ -100,14 +189,9 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // buffer directly (leaf `i` is the `arity`-chunk of the bit-reversed
         // codeword starting at `i * arity`), instead of a random-access
         // in-place permutation followed by a separate flattening pass with a
-        // heap allocation per element.
-        let n = values.values.len();
-        let log_n = log2_strict(n);
-        let mut flat_values: Vec<F> = Vec::with_capacity(n * D);
-        for i in 0..n {
-            let x = values.values[reverse_bits(i, log_n)];
-            flat_values.extend_from_slice(&x.to_basefield_array());
-        }
+        // heap allocation per element. The gather is parallelized over
+        // destination blocks.
+        let flat_values = flatten_bitrev::<F, D>(&values.values);
         let tree = MerkleTree::<F, C::Hasher>::new_flat(
             flat_values,
             arity * D,
