@@ -5,7 +5,7 @@ use plonky2_field::ops::Square;
 use super::config::*;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::goldilocks_field::GoldilocksField as F;
-use crate::field::types::{Field, PrimeField64};
+use crate::field::types::{Field, Field64, PrimeField64};
 use crate::gates::poseidon2::Poseidon2Gate;
 use crate::hash::hash_types::{HashOut, NUM_HASH_OUT_ELTS, RichField};
 use crate::hash::hashing::{PlonkyPermutation, compress, hash_n_to_hash_no_pad};
@@ -183,6 +183,26 @@ pub trait Poseidon2: PrimeField64 {
         }
     }
 
+    /// `external_linear_layer` with the given round's constants folded into
+    /// the layer's u128 accumulators before the final reduction.
+    #[inline]
+    #[unroll::unroll_for_loops]
+    fn external_linear_layer_with_rc(state: &mut [Self; WIDTH], external_round: usize) {
+        debug_assert!(external_round < EXTERNAL_CONSTANTS.len());
+        let mut state_u128: [u128; WIDTH] = [0u128; WIDTH];
+        for i in 0..WIDTH {
+            state_u128[i] = state[i].to_noncanonical_u64() as u128;
+        }
+        external_linear_layer_u128(&mut state_u128);
+        for i in 0..WIDTH {
+            // Layer accumulator < 28 * 2^64 and rc < 2^64, so the fused value
+            // stays below 2^69 < 2^96.
+            state[i] = Self::from_noncanonical_u128_with_96_bits(
+                state_u128[i] + EXTERNAL_CONSTANTS[external_round][i] as u128,
+            );
+        }
+    }
+
     #[inline]
     #[unroll::unroll_for_loops]
     fn external_linear_layer_extension<F: FieldExtension<D, BaseField = Self>, const D: usize>(
@@ -212,10 +232,13 @@ pub trait Poseidon2: PrimeField64 {
     #[inline]
     #[unroll::unroll_for_loops]
     fn internal_linear_layer(state: &mut [Self; WIDTH]) {
-        let sum = sum_12(state); // hard coded for WIDTH = 12
+        let sum = sum_12_u128(state); // hard coded for WIDTH = 12
         for i in 0..WIDTH {
-            state[i] =
-                sum.multiply_accumulate(state[i], Self::from_canonical_u64(MATRIX_DIAG_12_U64[i]));
+            // sum < 12 * 2^64 < 2^68 and diag < ORDER (const-asserted below),
+            // so sum + x * diag <= 2^68 + (2^64 - 1)(2^64 - 2^32) < 2^128.
+            state[i] = Self::from_noncanonical_u128(
+                sum + (state[i].to_noncanonical_u64() as u128) * (MATRIX_DIAG_12_U64[i] as u128),
+            );
         }
     }
 
@@ -440,14 +463,16 @@ fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
         let t01 = state[i] + state[i + 1];
         let t23 = state[i + 2] + state[i + 3];
         let t0123 = t01 + t23;
+        let t01123 = t0123 + state[i + 1];
+        let t01233 = t0123 + state[i + 3];
 
         let x0 = state[i];
         let x2 = state[i + 2];
 
-        state[i] = t0123 + t01 + state[i + 1]; // 2*x[0] + 3*x[1] + x[2] + x[3]
-        state[i + 1] = t0123 + state[i + 1] + x2 + x2; // x[0] + 2*x[1] + 3*x[2] + x[3]
-        state[i + 2] = t0123 + t23 + state[i + 3]; // x[0] + x[1] + 2*x[2] + 3*x[3]
-        state[i + 3] = t0123 + state[i + 3] + x0 + x0; // 3*x[0] + x[1] + x[2] + 2*x[3]
+        state[i] = t01123 + t01; // 2*x[0] + 3*x[1] + x[2] + x[3]
+        state[i + 1] = t01123 + x2 + x2; // x[0] + 2*x[1] + 3*x[2] + x[3]
+        state[i + 2] = t01233 + t23; // x[0] + x[1] + 2*x[2] + 3*x[3]
+        state[i + 3] = t01233 + x0 + x0; // 3*x[0] + x[1] + x[2] + 2*x[3]
     }
     // Now, we apply the outer circulant matrix (to compute the y_i values).
 
@@ -595,11 +620,29 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
     }
 }
 
+// Overflow bound for the u128 internal-layer update: every diagonal constant
+// must be canonical so that x * diag <= (2^64 - 1)(2^64 - 2^32).
+const _: () = {
+    let mut i = 0;
+    while i < WIDTH {
+        assert!(MATRIX_DIAG_12_U64[i] < F::ORDER);
+        i += 1;
+    }
+};
+
 #[inline]
-/// Sum of 12 elements to u128; unrolled for performance.
+/// Reduced sum of 12 elements; the packed sponge path splats this into a
+/// four-lane vector, so it needs a canonical-domain field value rather than
+/// the raw u128 the scalar/gate paths consume.
 fn sum_12<F: PrimeField64>(inputs: &[F]) -> F {
+    F::from_noncanonical_u128_with_96_bits(sum_12_u128(inputs))
+}
+
+#[inline]
+/// Raw u128 sum of 12 elements (< 12 * 2^64 < 2^68); unrolled for performance.
+fn sum_12_u128<F: PrimeField64>(inputs: &[F]) -> u128 {
     debug_assert!(inputs.len() == 12);
-    let tmp = inputs[0].to_noncanonical_u64() as u128
+    inputs[0].to_noncanonical_u64() as u128
         + inputs[1].to_noncanonical_u64() as u128
         + inputs[2].to_noncanonical_u64() as u128
         + inputs[3].to_noncanonical_u64() as u128
@@ -610,9 +653,7 @@ fn sum_12<F: PrimeField64>(inputs: &[F]) -> F {
         + inputs[8].to_noncanonical_u64() as u128
         + inputs[9].to_noncanonical_u64() as u128
         + inputs[10].to_noncanonical_u64() as u128
-        + inputs[11].to_noncanonical_u64() as u128;
-
-    F::from_noncanonical_u128_with_96_bits(tmp)
+        + inputs[11].to_noncanonical_u64() as u128
 }
 
 /// Hash two equal-length inputs with two lockstep overwrite-mode sponges whose
