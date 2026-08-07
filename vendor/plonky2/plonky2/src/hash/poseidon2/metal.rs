@@ -49,8 +49,10 @@ const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
 /// official ranked host (submission 41467098), so concurrent GPU submission is
 /// intentionally disabled.
 const MAX_BUFFER_SETS: usize = 1;
-/// Parallel staging copy granularity in u64 elements (4 MiB chunks).
-const STAGING_CHUNK: usize = 1 << 19;
+/// Parallel staging copy granularity in u64 elements (1 MiB chunks).
+/// Smaller chunks expose enough independent copies to occupy all performance cores
+/// while the single Metal command stream prepares or drains a large tree.
+const STAGING_CHUNK: usize = 1 << 17;
 
 struct MetalShared {
     device: Device,
