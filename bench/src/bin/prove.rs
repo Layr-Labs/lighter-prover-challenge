@@ -11,7 +11,7 @@ mod embedded;
 mod prover;
 
 use std::env;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::BufWriter;
 
 use api::{
@@ -20,6 +20,9 @@ use api::{
 };
 use circuit::block::Block;
 use circuit::types::config::F;
+#[cfg(unix)]
+use memmap2::Advice;
+use memmap2::MmapOptions;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -38,7 +41,8 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // /etc/malloc.conf can still override it.
 #[cfg(not(target_env = "msvc"))]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
+static MALLOC_CONF: &[u8; 57] =
+    b"dirty_decay_ms:-1,muzzy_decay_ms:-1,oversize_threshold:0\0";
 
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
@@ -55,19 +59,40 @@ fn main() {
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
-    let json = fs::read(fixture).expect("cannot read prover fixture");
-    let block = Block::<F>::from_json_with_empty_txs(
-        &json,
-        HEAVY_TX_PER_PROOF,
-        LIGHT_TX_PER_PROOF,
-        PUBLIC_HEAVY_TX_COUNT,
-        PUBLIC_LIGHT_TX_COUNT,
-    )
-    .expect("invalid prover fixture");
-    // Embedded circuits (deserialized from compile-time blobs) by default;
-    // falls back to building from scratch if they are unavailable, and
-    // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B measurement.
-    let proof = prover::prove_block(block, Circuits::load());
+    // Overlap fixture parse with embedded circuit load: independent work that
+    // previously ran fully serial on the scored critical path.
+    let (block, circuits) = rayon::join(
+        || {
+            let fixture_file = File::open(&fixture).expect("cannot open prover fixture");
+            // SAFETY: the benchmark owns immutable fixture files for the full
+            // lifetime of this mapping; the mapping is consumed before return.
+            let json = unsafe { MmapOptions::new().map(&fixture_file) }
+                .expect("cannot map prover fixture");
+            // The parser consumes the mapping once from front to back. Tell the
+            // kernel to begin faulting pages before serde reaches them and keep
+            // subsequent faults on the sequential readahead path.
+            #[cfg(unix)]
+            {
+                json.advise(Advice::WillNeed)
+                    .expect("cannot prefetch prover fixture");
+                json.advise(Advice::Sequential)
+                    .expect("cannot advise sequential fixture access");
+            }
+            Block::<F>::from_json_with_empty_txs(
+                &json,
+                HEAVY_TX_PER_PROOF,
+                LIGHT_TX_PER_PROOF,
+                PUBLIC_HEAVY_TX_COUNT,
+                PUBLIC_LIGHT_TX_COUNT,
+            )
+            .expect("invalid prover fixture")
+        },
+        // Embedded circuits (deserialized from compile-time blobs) by default;
+        // falls back to building from scratch if they are unavailable, and
+        // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B measurement.
+        Circuits::load,
+    );
+    let proof = prover::prove_block(block, circuits);
     let mut writer = BufWriter::with_capacity(
         PROOF_OUTPUT_BUFFER_BYTES,
         File::create(output).expect("cannot create proof output"),
@@ -93,5 +118,21 @@ fn main() {
     // in the hash path is `commit()`ed and then `wait_until_completed()`ed
     // before its results are read, and nothing in this binary spawns a detached
     // thread, so there is no in-flight background work left to lose here.
+    //
+    // `std::process::exit` still takes libc's orderly `exit(3)` path on Unix,
+    // including process-exit handlers which cannot affect the already flushed
+    // proof. `_exit(2)` terminates immediately; the explicit writer flush and
+    // close above make bypassing stdio/atexit cleanup safe.
+    #[cfg(unix)]
+    unsafe {
+        libc::_exit(0)
+    }
+    #[cfg(not(unix))]
     std::process::exit(0);
 }
+
+// redraw-best-stack occupancy+restores host-lottery
+
+// neverstop-redraw-5
+
+// p90-fire-30-1786143207

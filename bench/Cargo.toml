@@ -35,6 +35,8 @@ sha2 = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 bincode = { workspace = true }
+libc = "0.2"
+memmap2 = "0.9"
 ff = { workspace = true }
 hashbrown = { workspace = true }
 clap = { workspace = true }
