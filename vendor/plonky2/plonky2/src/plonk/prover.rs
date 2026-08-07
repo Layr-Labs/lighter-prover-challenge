@@ -1097,6 +1097,18 @@ fn start_gpu_range_check_gate_quotient<
                         num_ops.checked_mul(result_limbs.checked_add(3)?)?,
                     )
                 }
+                U32QuotientGate::QuinticMultiplication { num_ops } => (
+                    U32QuotientKind::QuinticMultiplication,
+                    num_ops,
+                    num_ops.checked_mul(15)?,
+                    num_ops.checked_mul(5)?,
+                ),
+                U32QuotientGate::QuinticSquaring { num_ops } => (
+                    U32QuotientKind::QuinticSquaring,
+                    num_ops,
+                    num_ops.checked_mul(20)?,
+                    num_ops.checked_mul(15)?,
+                ),
                 U32QuotientGate::AddMany {
                     num_ops,
                     num_addends,

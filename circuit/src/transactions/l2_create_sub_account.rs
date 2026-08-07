@@ -29,7 +29,7 @@ pub struct L2CreateSubAccountTx {
     pub api_key_index: u8,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct L2CreateSubAccountTxTarget {
     pub account_index: Target, // 48 bits
     pub api_key_index: Target, // 8 bits

@@ -30,8 +30,7 @@ use crate::uint::u8::U8Target;
 #[derive(Clone, Debug)]
 pub struct ECDSASecretKeyTarget<C: Curve>(pub NonNativeTarget<C::ScalarField>);
 
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-#[serde(bound = "")]
+#[derive(Clone, Debug, Default)]
 pub struct ECDSAPublicKeyTarget<C: Curve>(pub AffinePointTarget<C>);
 
 pub trait CircuitBuilderECDSAPublicKey<F: RichField + Extendable<D>, const D: usize> {
@@ -122,8 +121,7 @@ impl<T: Witness<F>, F: PrimeField64> ECDSAPublicKeyTargetWitness<F> for T {
     }
 }
 
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-#[serde(bound = "")]
+#[derive(Clone, Debug, Default)]
 pub struct ECDSASignatureTarget<C: Curve> {
     pub r: NonNativeTarget<C::ScalarField>,
     pub s: NonNativeTarget<C::ScalarField>,

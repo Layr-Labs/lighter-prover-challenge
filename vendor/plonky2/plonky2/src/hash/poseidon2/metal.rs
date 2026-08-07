@@ -163,6 +163,8 @@ pub(crate) enum U32QuotientKind {
         result_limbs: usize,
         num_carry_limbs: usize,
     },
+    QuinticMultiplication,
+    QuinticSquaring,
 }
 
 #[derive(Clone, Debug)]
@@ -610,6 +612,22 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                         spec.num_ops.checked_mul(limbs.checked_add(3)?)?,
                     )
                 }
+                U32QuotientKind::QuinticMultiplication => (
+                    4usize,
+                    0usize,
+                    0usize,
+                    0usize,
+                    spec.num_ops.checked_mul(15)?,
+                    spec.num_ops.checked_mul(5)?,
+                ),
+                U32QuotientKind::QuinticSquaring => (
+                    5usize,
+                    0usize,
+                    0usize,
+                    0usize,
+                    spec.num_ops.checked_mul(20)?,
+                    spec.num_ops.checked_mul(15)?,
+                ),
             };
         if wire_count > wires.cols
             || spec.selector_column >= constants.cols
@@ -2600,6 +2618,54 @@ mod tests {
                                 constraints.push(combined_carry - output_carry);
                             }
                             assert_eq!(constraints.len(), spec.num_ops * (total_limbs + 3));
+                        }
+                        U32QuotientKind::QuinticMultiplication => {
+                            let const_3 = F::from_canonical_u64(3);
+                            for op in 0..spec.num_ops {
+                                let base = 15 * op;
+                                let a = (0..5).map(|j| wires.col(base + j)[source_row]).collect::<Vec<_>>();
+                                let b = (0..5).map(|j| wires.col(base + 5 + j)[source_row]).collect::<Vec<_>>();
+                                let c = (0..5).map(|j| wires.col(base + 10 + j)[source_row]).collect::<Vec<_>>();
+                                let mut d = [F::ZERO; 9];
+                                for j in 0..5 {
+                                    for k in 0..5 {
+                                        d[j + k] += a[j] * b[k];
+                                    }
+                                }
+                                for k in 0..5 {
+                                    let term = if k + 5 <= 8 { d[k] + const_3 * d[k + 5] } else { d[k] };
+                                    constraints.push(term - c[k]);
+                                }
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * 5);
+                        }
+                        U32QuotientKind::QuinticSquaring => {
+                            let const_2 = F::from_canonical_u64(2);
+                            let const_3 = F::from_canonical_u64(3);
+                            let const_6 = F::from_canonical_u64(6);
+                            for op in 0..spec.num_ops {
+                                let base = 10 * op;
+                                let tmp_base = 10 * spec.num_ops + 10 * op;
+                                let a = (0..5).map(|j| wires.col(base + j)[source_row]).collect::<Vec<_>>();
+                                let c = (0..5).map(|j| wires.col(base + 5 + j)[source_row]).collect::<Vec<_>>();
+                                let extra = (0..10).map(|j| wires.col(tmp_base + j)[source_row]).collect::<Vec<_>>();
+                                constraints.push(a[0] * a[0] - extra[0]);
+                                constraints.push((const_6 * a[1] * a[4] + extra[0]) - extra[1]);
+                                constraints.push((const_6 * a[2] * a[3] + extra[1]) - c[0]);
+                                constraints.push(const_3 * a[3] * a[3] - extra[2]);
+                                constraints.push((const_2 * a[0] * a[1] + extra[2]) - extra[3]);
+                                constraints.push((const_6 * a[2] * a[4] + extra[3]) - c[1]);
+                                constraints.push(a[1] * a[1] - extra[4]);
+                                constraints.push((const_2 * a[0] * a[2] + extra[4]) - extra[5]);
+                                constraints.push((const_6 * a[3] * a[4] + extra[5]) - c[2]);
+                                constraints.push((const_3 * a[4] * a[4]) - extra[6]);
+                                constraints.push((const_2 * a[0] * a[3] + extra[6]) - extra[7]);
+                                constraints.push((const_2 * a[1] * a[2] + extra[7]) - c[3]);
+                                constraints.push(a[2] * a[2] - extra[8]);
+                                constraints.push((const_2 * a[0] * a[4] + extra[8]) - extra[9]);
+                                constraints.push((const_2 * a[1] * a[3] + extra[9]) - c[4]);
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * 15);
                         }
                     }
 

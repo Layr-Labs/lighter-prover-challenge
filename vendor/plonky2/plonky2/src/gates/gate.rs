@@ -57,6 +57,12 @@ pub enum U32QuotientGate {
         base_bits: usize,
         num_carry_limbs: usize,
     },
+    /// Quintic-extension multiplication: 15 routed words per operation
+    /// (five a-limbs, five b-limbs, five c-limbs), five reduction constraints.
+    QuinticMultiplication { num_ops: usize },
+    /// Quintic-extension squaring: 10 routed words (five a-limbs, five
+    /// c-limbs) plus 10 intermediate limbs, fifteen constraints.
+    QuinticSquaring { num_ops: usize },
 }
 
 /// A custom gate.
