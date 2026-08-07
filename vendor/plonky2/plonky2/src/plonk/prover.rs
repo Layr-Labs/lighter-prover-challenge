@@ -1562,3 +1562,67 @@ mod l_0_table_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod chain_step_tests {
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::{Field, PrimeField64};
+    use crate::fri::reduction_strategies::FriReductionStrategy;
+    use crate::fri::FriConfig;
+    use crate::iop::witness::PartialWitness;
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::circuit_data::CircuitConfig;
+    use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    type F = GoldilocksField;
+    type C = Poseidon2GoldilocksConfig;
+    const D: usize = 2;
+
+    /// Full prove -> verify roundtrip at the serial chain-step shape: a
+    /// 136-wire circuit with degree exactly 2^14 (FRI rate 3, cap 4, 28 query
+    /// rounds), mirroring the bench's chain-step config. With the compiled
+    /// `ExclusiveOnly` GPU NTT scope, the wires (2^17 x 136), constants/sigmas
+    /// (2^17 x 20) and Zs (2^17 x 16) commitments keep their NTT on the CPU
+    /// outside an exclusive phase (the frontier behavior); the proof must
+    /// still verify end to end.
+    #[test]
+    fn test_full_proof_roundtrip_chain_step_shape() -> anyhow::Result<()> {
+        let config = CircuitConfig {
+            num_wires: 136,
+            num_routed_wires: 80,
+            num_constants: 2,
+            use_base_arithmetic_gate: true,
+            security_bits: 100,
+            num_challenges: 2,
+            zero_knowledge: false,
+            max_quotient_degree_factor: 8,
+            fri_config: FriConfig {
+                rate_bits: 3,
+                cap_height: 4,
+                proof_of_work_bits: 16,
+                reduction_strategy: FriReductionStrategy::ConstantArityBits(4, 5),
+                num_query_rounds: 28,
+            },
+            optimization_flags: 0,
+        };
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        // A non-trivial arithmetic constraint: z = x * y, the single public
+        // input, so the proof carries a checkable value.
+        let x = builder.constant(F::from_canonical_u64(6));
+        let y = builder.constant(F::from_canonical_u64(7));
+        let z = builder.mul(x, y);
+        builder.register_public_input(z);
+        // Pad with distinct constant gates (the mul gate plus the two value
+        // constants above are the remaining rows) so the circuit's degree is
+        // exactly 2^14, the chain step's degree.
+        for i in 0..(1usize << 14) - 3 {
+            builder.constant(F::from_canonical_u64((i + 1024) as u64));
+        }
+        let data = builder.build::<C>();
+
+        let proof = data.prove(PartialWitness::new())?;
+        data.verify(proof.clone())?;
+        assert_eq!(proof.public_inputs[0].to_canonical_u64(), 42);
+        Ok(())
+    }
+}

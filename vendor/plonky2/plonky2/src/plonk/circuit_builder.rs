@@ -9,6 +9,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use hashbrown::{HashMap, HashSet};
 use itertools::Itertools;
 use log::{debug, info, warn, Level};
+use plonky2_maybe_rayon::*;
 #[cfg(feature = "timing")]
 use web_time::Instant;
 
@@ -53,7 +54,7 @@ use crate::timed;
 use crate::util::context_tree::ContextTree;
 use crate::util::partial_products::num_partial_products;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil, log2_strict, transpose, transpose_poly_values};
+use crate::util::{log2_ceil, log2_strict, transpose_poly_values};
 
 /// Number of random coins needed for lookups (for each challenge).
 /// A coin is a randomly sampled extension field element from the verifier,
@@ -979,20 +980,21 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .map(|g| g.0.num_constants())
             .max()
             .unwrap();
-        transpose(
-            &self
-                .gate_instances
-                .iter()
-                .map(|g| {
-                    let mut consts = g.constants.clone();
-                    consts.resize(max_constants, F::ZERO);
-                    consts
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_iter()
-        .map(PolynomialValues::new)
-        .collect()
+        let instances = &self.gate_instances;
+        // Column `c`, row `j` is instance `j`'s `c`-th constant, zero-padded.
+        // Rows are processed in parallel per column; ordering is preserved by
+        // `IndexedParallelIterator`, so the values are identical to the old
+        // per-row clone + transpose, without allocating a `Vec` per row.
+        (0..max_constants)
+            .map(|c| {
+                PolynomialValues::new(
+                    instances
+                        .par_iter()
+                        .map(|g| g.constants.get(c).copied().unwrap_or(F::ZERO))
+                        .collect(),
+                )
+            })
+            .collect()
     }
 
     fn sigma_vecs(&self, k_is: &[F], subgroup: &[F]) -> (Vec<PolynomialValues<F>>, Forest) {
@@ -1391,5 +1393,71 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // TODO: Can skip parts of this.
         let circuit_data = self.build::<C>();
         circuit_data.verifier_data()
+    }
+}
+
+#[cfg(test)]
+mod constant_polys_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::util::transpose;
+
+    type F = GoldilocksField;
+    const D: usize = 2;
+
+    /// Old serial constant polynomial construction (per-row clone + resize +
+    /// transpose), kept for differential comparison.
+    fn constant_polys_serial(builder: &CircuitBuilder<F, D>) -> Vec<PolynomialValues<F>> {
+        let max_constants = builder
+            .gates
+            .iter()
+            .map(|g| g.0.num_constants())
+            .max()
+            .unwrap();
+        transpose(
+            &builder
+                .gate_instances
+                .iter()
+                .map(|g| {
+                    let mut consts = g.constants.clone();
+                    consts.resize(max_constants, F::ZERO);
+                    consts
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(PolynomialValues::new)
+        .collect()
+    }
+
+    /// The per-column parallel construction must be bit-identical to the old
+    /// serial clone + transpose, on a circuit with several gate types of
+    /// differing constant counts (so zero-padding is exercised).
+    #[test]
+    fn constant_polys_match_serial() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+
+        let mut acc = builder.constant(F::from_canonical_u64(7));
+        for i in 1..220u64 {
+            let x = builder.constant(F::from_canonical_u64(i));
+            acc = builder.mul(acc, x);
+            acc = builder.add(acc, x);
+            builder.range_check(x, 8);
+            builder.range_check(acc, 32);
+            let _split = builder.split_le(x, 8);
+        }
+        builder.blind_and_pad();
+
+        let consts_new = builder.constant_polys();
+        let consts_old = constant_polys_serial(&builder);
+        assert_eq!(
+            consts_old.len(),
+            consts_new.len(),
+            "constant poly count mismatch"
+        );
+        for (o, n) in consts_old.iter().zip(&consts_new) {
+            assert_eq!(o.values, n.values, "constant polynomial mismatch");
+        }
     }
 }

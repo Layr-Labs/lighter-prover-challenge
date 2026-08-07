@@ -852,6 +852,15 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
             },
         )
     }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn try_lde_from_coeffs(
+        coeff_columns: &[&[F]],
+        rate_bits: usize,
+    ) -> Option<crate::hash::merkle_tree::ColumnStore<F>> {
+        super::metal::lde_from_coeffs(coeff_columns, rate_bits)
+            .map(crate::hash::merkle_tree::ColumnStore::Shared)
+    }
 }
 
 impl Poseidon2Hash {

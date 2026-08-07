@@ -196,6 +196,65 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     serial_critical_shape || leaf_permutations + parent_permutations >= min_permutations
 }
 
+/// Which commitment shapes route through the fused GPU NTT + Merkle path.
+/// `ChainPriority` (default-compiled) routes the serial chain-step shape
+/// (2^17-leaf trees, from the degree-2^14 circuits) in every phase, plus any
+/// shape the exclusive-phase threshold grants. `ExclusiveOnly` is the
+/// conservative A/B variant: only the exclusive-phase grants, leaving the
+/// chain-step commitments on the CPU FFT during the pipelined phases.
+// The `ExclusiveOnly` variant is never constructed under the default const
+// below; it exists as the documented orchestrator flip.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum GpuNttScope {
+    ExclusiveOnly,
+    ChainPriority,
+}
+
+/// Routing scope for the fused GPU NTT + Merkle commitment path, consulted by
+/// [`gpu_ntt_commitment_worthwhile`]. The flat global toggle for this path
+/// (oracle.rs `GPU_NTT_COMMITMENTS`, submission 644c4257) lost on the ranked
+/// host: its NTT stages put the pipelined 2^19-leaf chunk commitments — three
+/// trees per chunk, 52 chunks, each a 2^21-point x 136-wide NTT — onto the
+/// serialized GPU stream, the ranked critical path. The scoped predicate
+/// below keeps those on the CPU FFT (hashing stays GPU) while still granting
+/// the shapes that actually sit on the strictly sequential critical path.
+const GPU_NTT_SCOPE: GpuNttScope = GpuNttScope::ExclusiveOnly;
+// Exclusive-phase-only A/B variant:
+// const GPU_NTT_SCOPE: GpuNttScope = GpuNttScope::ExclusiveOnly;
+
+/// Shape/phase-scoped routing for the fused GPU NTT + Merkle commitment path
+/// (`build_commitment_from_coeffs` / `build_commitment_from_values`).
+///
+/// The 2^17-leaf commitment trees are produced only by the degree-2^14 serial
+/// circuits (chain steps and pre-execution; the pipelined chunk circuits
+/// commit at 2^19 leaves and their FRI folds at 2^16 and below). They sit on
+/// the strictly sequential critical path in every phase, so they win the
+/// serialized GPU stream regardless of phase — the same priority the Merkle
+/// chain-priority rule (`gpu_worthwhile`) grants them for hashing. During the
+/// exclusive phases nothing contends for the GPU, so any shape the exclusive
+/// threshold admits also routes through the fused path; the pipelined 2^19
+/// chunk commitments never qualify (their NTT stays on the CPU, exactly as
+/// the frontier ships today).
+fn gpu_ntt_commitment_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bool {
+    let leaf_permutations = if leaf_width <= 4 {
+        0
+    } else {
+        leaf_width.div_ceil(8) * leaf_count
+    };
+    let parent_permutations = leaf_count - (1usize << cap_height);
+    let exclusive = EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed);
+    let exclusive_grant = exclusive
+        && leaf_permutations + parent_permutations >= EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS;
+    match GPU_NTT_SCOPE {
+        GpuNttScope::ChainPriority => {
+            let serial_critical_shape = leaf_count == 1 << 17 && leaf_width > 4;
+            serial_critical_shape || exclusive_grant
+        }
+        GpuNttScope::ExclusiveOnly => exclusive_grant,
+    }
+}
+
 fn shared_context() -> Option<&'static MetalShared> {
     match &*CONTEXT {
         Ok(context) => Some(context),
@@ -289,7 +348,10 @@ pub(crate) fn build_commitment_from_coeffs<F: RichField>(
     let lde_size = degree << rate_bits;
     if lde_size > u32::MAX as usize
         || cols > u32::MAX as usize
-        || !gpu_worthwhile(cols, lde_size, cap_height)
+        // Shape/phase-scoped: the serial chain-step shape (2^17 leaves) and
+        // exclusive-phase grants route the fused NTT+Merkle path to the GPU;
+        // pipelined 2^19 chunk commitments keep their NTT on the CPU.
+        || !gpu_ntt_commitment_worthwhile(cols, lde_size, cap_height)
     {
         return None;
     }
@@ -333,7 +395,10 @@ pub(crate) fn build_commitment_from_values<F: RichField>(
     let lde_size = degree << rate_bits;
     if lde_size > u32::MAX as usize
         || cols > u32::MAX as usize
-        || !gpu_worthwhile(cols, lde_size, cap_height)
+        // Shape/phase-scoped: the serial chain-step shape (2^17 leaves) and
+        // exclusive-phase grants route the fused IFFT+NTT+Merkle path to the
+        // GPU; pipelined 2^19 chunk commitments keep their IFFT/NTT on CPU.
+        || !gpu_ntt_commitment_worthwhile(cols, lde_size, cap_height)
     {
         return None;
     }
@@ -343,6 +408,46 @@ pub(crate) fn build_commitment_from_values<F: RichField>(
         Ok(result) => Some(result),
         Err(error) => {
             log::warn!("Metal NTT values commitment failed; using CPU path: {error}");
+            None
+        }
+    }
+}
+
+/// Computes the coset LDE of every coefficient column on the GPU without
+/// building a Merkle tree, returning the retained CPU-visible natural-order
+/// LDE columns. `None` falls back to the CPU FFT.
+pub(crate) fn lde_from_coeffs<F: RichField>(
+    coeff_columns: &[&[F]],
+    rate_bits: usize,
+) -> Option<MetalColumns<F>> {
+    let cols = coeff_columns.len();
+    let degree = coeff_columns.first().map_or(0, |column| column.len());
+    if F::ORDER != 0xffff_ffff_0000_0001
+        || size_of::<F>() != size_of::<u64>()
+        || cols == 0
+        || degree == 0
+        || !degree.is_power_of_two()
+        || coeff_columns.iter().any(|column| column.len() != degree)
+        || rate_bits == 0
+    {
+        return None;
+    }
+    let lde_size = degree << rate_bits;
+    if lde_size > u32::MAX as usize
+        || cols > u32::MAX as usize
+        // Phase-aware routing identical to the tree builders: only borrow the
+        // serialized GPU stream when the cost is worthwhile, so the NTT never
+        // queues behind pipelined tree builds on the critical path.
+        || !gpu_worthwhile(cols, lde_size, 4)
+    {
+        return None;
+    }
+
+    let context = shared_context()?;
+    match context.lde_from_coeffs(coeff_columns, degree, rate_bits) {
+        Ok(columns) => Some(columns),
+        Err(error) => {
+            log::warn!("Metal NTT LDE failed; using CPU FFT: {error}");
             None
         }
     }
@@ -1049,6 +1154,135 @@ impl MetalShared {
             slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
         };
         Ok(tree_from_levels(nodes, &level_offsets, lde_size, cap_height))
+    }
+
+    /// NTT-only variant of [`Self::build_from_coeffs_with_set`]: runs the
+    /// coset-LDE prepare and butterfly stages but skips leaf and parent
+    /// hashing, returning the natural-order LDE columns. The values are only
+    /// ever fed back into CPU-side consumers (the FRI fold gather), so no
+    /// tree output is produced.
+    fn lde_from_coeffs<F: RichField>(
+        &self,
+        coeff_columns: &[&[F]],
+        degree: usize,
+        rate_bits: usize,
+    ) -> Result<MetalColumns<F>, String> {
+        let cols = coeff_columns.len();
+        let lde_size = degree << rate_bits;
+        let log_lde = lde_size.ilog2();
+
+        let coeff_len = degree
+            .checked_mul(cols)
+            .ok_or("NTT coefficient length overflow")?;
+        let coeff_bytes = coeff_len
+            .checked_mul(size_of::<u64>())
+            .ok_or("NTT coefficient size overflow")?;
+        let column_len = lde_size
+            .checked_mul(cols)
+            .ok_or("NTT column length overflow")?;
+        let column_bytes = column_len
+            .checked_mul(size_of::<u64>())
+            .ok_or("NTT column size overflow")?;
+
+        let (roots_buffer, roots_offsets) = self.roots_for(log_lde)?;
+        let shift_buffer = self.shift_powers_for(degree)?;
+
+        // The LDE columns outlive this call as the FRI fold's leaf source, so
+        // they get their own buffer rather than a pooled one.
+        let column_buffer = autoreleasepool(|| {
+            self.device
+                .new_buffer(column_bytes as u64, MTLResourceOptions::StorageModeShared)
+        });
+
+        let mut set = self.acquire_set()?;
+        let result = (|| -> Result<(), String> {
+            if set
+                .input
+                .as_ref()
+                .map_or(true, |buffer| buffer.length() < coeff_bytes as u64)
+            {
+                set.input = Some(autoreleasepool(|| {
+                    self.device
+                        .new_buffer(coeff_bytes as u64, MTLResourceOptions::StorageModeShared)
+                }));
+            }
+            let input_buffer = set.input.as_ref().unwrap();
+            {
+                let destination = unsafe {
+                    slice::from_raw_parts_mut(input_buffer.contents().cast::<u64>(), coeff_len)
+                };
+                destination
+                    .par_chunks_mut(degree)
+                    .zip(coeff_columns.par_iter())
+                    .for_each(|(destination, column)| {
+                        let source = unsafe {
+                            slice::from_raw_parts(column.as_ptr().cast::<u64>(), degree)
+                        };
+                        destination.copy_from_slice(source);
+                    });
+            }
+
+            let command_buffer = autoreleasepool(|| -> CommandBuffer {
+                let degree_u32 = degree as u32;
+                let lde_size_u32 = lde_size as u32;
+                let log_degree_u32 = degree.ilog2();
+                let rate_bits_u32 = rate_bits as u32;
+                let command_buffer = self.queue.new_command_buffer();
+
+                let prepare = command_buffer.new_compute_command_encoder();
+                prepare.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+                prepare.set_buffer(0, Some(input_buffer), 0);
+                prepare.set_buffer(1, Some(&shift_buffer), 0);
+                prepare.set_buffer(2, Some(&column_buffer), 0);
+                set_u32(prepare, 3, degree_u32);
+                set_u32(prepare, 4, lde_size_u32);
+                set_u32(prepare, 5, log_degree_u32);
+                set_u32(prepare, 6, rate_bits_u32);
+                dispatch2d(prepare, &self.ntt_prepare_pipeline, lde_size, cols);
+                prepare.end_encoding();
+
+                for stage in rate_bits as u32..log_lde {
+                    let stage_encoder = command_buffer.new_compute_command_encoder();
+                    stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
+                    stage_encoder.set_buffer(0, Some(&column_buffer), 0);
+                    stage_encoder.set_buffer(
+                        1,
+                        Some(&roots_buffer),
+                        (roots_offsets[stage as usize] * size_of::<u64>()) as NSUInteger,
+                    );
+                    set_u32(stage_encoder, 2, lde_size_u32);
+                    set_u32(stage_encoder, 3, stage);
+                    set_u32(
+                        stage_encoder,
+                        4,
+                        u32::from(stage == log_lde - 1),
+                    );
+                    dispatch2d(stage_encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
+                    stage_encoder.end_encoding();
+                }
+
+                command_buffer.commit();
+                command_buffer.to_owned()
+            });
+
+            command_buffer.wait_until_completed();
+            if command_buffer.status() != MTLCommandBufferStatus::Completed {
+                return Err(format!(
+                    "command buffer ended with status {:?}",
+                    command_buffer.status()
+                ));
+            }
+            Ok(())
+        })();
+        self.release_set(set);
+        result?;
+
+        Ok(MetalColumns {
+            buffer: column_buffer,
+            rows: lde_size,
+            cols,
+            _phantom: PhantomData,
+        })
     }
 
     fn build<F: RichField>(
@@ -2074,6 +2308,155 @@ kernel void goldilocks_mul_bench_native(
                 assert_tree_eq(&(gpu_digests, gpu_cap), &cpu, cols, cap_height);
             }
         }
+    }
+
+    /// Differential at the exact serial chain-step commitment shape: degree
+    /// 2^14 polynomials at rate 3 (2^17 LDE rows), widths 16/20/136 with
+    /// cap height 4 — the wires/constants/Zs trees the bench's chain-step
+    /// circuits commit every step. The fused GPU NTT + Merkle pipeline must
+    /// produce bit-identical LDE columns to the CPU coset FFT and an
+    /// identical digest buffer + cap to the CPU tree over the bit-reversed
+    /// transpose (the CPU-NTT + GPU-Merkle path's leaf order).
+    #[test]
+    fn metal_ntt_commitment_chain_step_shape_matches_cpu() {
+        use crate::field::polynomial::PolynomialCoeffs;
+        use crate::util::transpose_to_bitrev_flat;
+
+        let mut rng = StdRng::seed_from_u64(0x4348_4149_4e31);
+        let (log_degree, rate_bits, cap_height) = (14usize, 3usize, 4usize);
+        for cols in [16usize, 20, 136] {
+            let degree = 1usize << log_degree;
+            let lde_size = degree << rate_bits;
+            let coeffs: Vec<Vec<GoldilocksField>> = (0..cols)
+                .map(|_| {
+                    (0..degree)
+                        .map(|_| GoldilocksField(rng.next_u64() % GoldilocksField::ORDER))
+                        .collect()
+                })
+                .collect();
+
+            // CPU reference: zero-pad, coset-shift, FFT per column.
+            let cpu_columns: Vec<Vec<GoldilocksField>> = coeffs
+                .iter()
+                .map(|c| {
+                    PolynomialCoeffs::new(c.clone())
+                        .lde(rate_bits)
+                        .coset_fft_with_options(
+                            GoldilocksField::coset_shift(),
+                            Some(rate_bits),
+                            None,
+                        )
+                        .values
+                })
+                .collect();
+
+            let context = CONTEXT
+                .as_ref()
+                .unwrap_or_else(|error| panic!("{error}"));
+            let coeff_refs: Vec<&[GoldilocksField]> =
+                coeffs.iter().map(|c| c.as_slice()).collect();
+            let (gpu_columns, gpu_digests, gpu_cap) = context
+                .build_from_coeffs(&coeff_refs, degree, rate_bits, cap_height)
+                .unwrap();
+
+            for j in 0..cols {
+                let gpu = gpu_columns.col(j);
+                for i in 0..lde_size {
+                    assert_eq!(
+                        gpu[i].to_canonical_u64(),
+                        cpu_columns[j][i].to_canonical_u64(),
+                        "column {j} row {i} (chain-step shape, cols {cols})"
+                    );
+                }
+            }
+
+            // Tree must match the CPU tree over the bit-reversed transpose.
+            let flat = transpose_to_bitrev_flat(&cpu_columns);
+            let rows: Vec<Vec<GoldilocksField>> = flat
+                .chunks(cols)
+                .map(|row| row.to_vec())
+                .collect();
+            let cpu = cpu_tree(&rows, cap_height);
+            assert_tree_eq(&(gpu_digests, gpu_cap), &cpu, cols, cap_height);
+        }
+    }
+
+    /// Routing gate for the fused GPU NTT + Merkle commitment path, asserting
+    /// the semantics of whichever scope is compiled into `GPU_NTT_SCOPE`:
+    /// - `ChainPriority`: the serial chain-step shape (2^17 leaves) qualifies
+    ///   in any phase; the pipelined 2^19-leaf chunk shape does not (its NTT
+    ///   stays on the CPU), and an exclusive phase grants it.
+    /// - `ExclusiveOnly`: nothing qualifies without an exclusive phase; both
+    ///   threshold-eligible shapes qualify inside one.
+    #[test]
+    fn metal_ntt_commitment_routing_matches_compiled_scope() {
+        let mut rng = StdRng::seed_from_u64(0x4348_4149_4e32);
+        let (degree, rate_bits, cap_height) = (1usize << 14, 3usize, 4usize);
+        let coeffs: Vec<Vec<GoldilocksField>> = (0..136usize)
+            .map(|_| {
+                (0..degree)
+                    .map(|_| GoldilocksField(rng.next_u64() % GoldilocksField::ORDER))
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<&[GoldilocksField]> = coeffs.iter().map(|c| c.as_slice()).collect();
+        // Pipelined chunk shape (degree 2^16 -> 2^19 leaves, width 8): its NTT
+        // must never fire outside an exclusive phase under either scope.
+        let chunk_degree = 1usize << 16;
+        let chunk_coeffs: Vec<Vec<GoldilocksField>> = (0..8usize)
+            .map(|_| {
+                (0..chunk_degree)
+                    .map(|_| GoldilocksField(rng.next_u64() % GoldilocksField::ORDER))
+                    .collect()
+            })
+            .collect();
+        let chunk_refs: Vec<&[GoldilocksField]> =
+            chunk_coeffs.iter().map(|c| c.as_slice()).collect();
+
+        crate::hash::poseidon2::set_exclusive_gpu_phase(false);
+        let chain_step_plain = build_commitment_from_coeffs(&refs, rate_bits, cap_height).is_some();
+        let chunk_plain = build_commitment_from_coeffs(&chunk_refs, rate_bits, cap_height).is_some();
+        crate::hash::poseidon2::set_exclusive_gpu_phase(true);
+        let chain_step_exclusive =
+            build_commitment_from_coeffs(&refs, rate_bits, cap_height).is_some();
+        let chunk_exclusive = build_commitment_from_coeffs(&chunk_refs, rate_bits, cap_height).is_some();
+        crate::hash::poseidon2::set_exclusive_gpu_phase(false);
+
+        match GPU_NTT_SCOPE {
+            GpuNttScope::ChainPriority => {
+                assert!(
+                    chain_step_plain,
+                    "ChainPriority: chain-step shape must route without an exclusive phase"
+                );
+                assert!(
+                    !chunk_plain,
+                    "ChainPriority: pipelined 2^19 chunk shape must keep its NTT on the CPU"
+                );
+            }
+            GpuNttScope::ExclusiveOnly => {
+                assert!(
+                    !chain_step_plain,
+                    "ExclusiveOnly: chain-step shape must keep its NTT on the CPU outside \
+                     an exclusive phase"
+                );
+                assert!(
+                    !chunk_plain,
+                    "ExclusiveOnly: pipelined 2^19 chunk shape must keep its NTT on the CPU \
+                     outside an exclusive phase"
+                );
+            }
+        }
+        // Both scopes grant the fused path to threshold-eligible shapes while
+        // the stream is idle (the chain-step and chunk shapes both clear
+        // `EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS`).
+        assert!(
+            chain_step_exclusive,
+            "exclusive phase must grant the fused path to the chain-step shape"
+        );
+        assert!(
+            chunk_exclusive,
+            "exclusive phase must grant the fused path to threshold-eligible shapes"
+        );
     }
 
     #[test]
