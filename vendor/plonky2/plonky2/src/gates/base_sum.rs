@@ -170,16 +170,34 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> PackedEvaluab
     ) {
         let sum = vars.local_wires[Self::WIRE_SUM];
         let limbs = vars.local_wires.view(self.limbs());
-        let computed_sum = reduce_with_powers(limbs, F::from_canonical_usize(B));
 
-        yield_constr.one(computed_sum - sum);
+        if B == 2 {
+            // Production instantiation. Same terms, same order, same values as the
+            // generic path below: `reduce_with_powers` is Horner from the most
+            // significant limb down, and doubling is `x + x` in any field; the
+            // per-limb range product `prod_{i<2}(limb - i)` is `limb * (limb - 1)`.
+            // Written out so the generic base-`B` product loop and its
+            // `from_canonical_usize` per term disappear for the case that runs.
+            let mut computed_sum = P::ZEROS;
+            for &limb in limbs.iter().rev() {
+                computed_sum = computed_sum + computed_sum + limb;
+            }
+            yield_constr.one(computed_sum - sum);
 
-        let constraints_iter = limbs.iter().map(|&limb| {
-            (0..B)
-                .map(|i| limb - F::from_canonical_usize(i))
-                .product::<P>()
-        });
-        yield_constr.many(constraints_iter);
+            let constraints_iter = limbs.iter().map(|&limb| limb * (limb - F::ONE));
+            yield_constr.many(constraints_iter);
+        } else {
+            let computed_sum = reduce_with_powers(limbs, F::from_canonical_usize(B));
+
+            yield_constr.one(computed_sum - sum);
+
+            let constraints_iter = limbs.iter().map(|&limb| {
+                (0..B)
+                    .map(|i| limb - F::from_canonical_usize(i))
+                    .product::<P>()
+            });
+            yield_constr.many(constraints_iter);
+        }
     }
 }
 

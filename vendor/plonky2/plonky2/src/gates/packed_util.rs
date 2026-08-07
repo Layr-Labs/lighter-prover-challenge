@@ -81,17 +81,16 @@ pub trait PackedEvaluableBase<F: RichField + Extendable<D>, const D: usize>: Gat
                 vars_packed,
                 StridedConstraintConsumer::new(scratch, width, 0),
             );
-            let mut filter = <F as Packable>::Packing::ZEROS;
-            filter
-                .as_slice_mut()
-                .copy_from_slice(&filters[offset..offset + width]);
+            // Load packed lanes directly. The previous form zero-initialized each
+            // packed value and then immediately overwrote every lane of it, so the
+            // `ZEROS` store was dead; `from_slice` reinterprets the slice in place.
+            let filter = *<F as Packable>::Packing::from_slice(&filters[offset..offset + width]);
             for j in 0..num_constraints {
                 let combined = &mut combined_gate_constraints[j * n + offset..][..width];
-                let mut acc = <F as Packable>::Packing::ZEROS;
-                acc.as_slice_mut().copy_from_slice(combined);
-                let mut row = <F as Packable>::Packing::ZEROS;
-                row.as_slice_mut()
-                    .copy_from_slice(&scratch[j * width..(j + 1) * width]);
+                let acc = *<F as Packable>::Packing::from_slice(combined);
+                let row = *<F as Packable>::Packing::from_slice(
+                    &scratch[j * width..(j + 1) * width],
+                );
                 combined.copy_from_slice(acc.multiply_accumulate(row, filter).as_slice());
             }
         }
