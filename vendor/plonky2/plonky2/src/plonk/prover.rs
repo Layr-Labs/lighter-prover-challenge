@@ -10,6 +10,7 @@ use plonky2_maybe_rayon::*;
 
 use super::circuit_builder::{LookupChallenges, LookupWire};
 use crate::field::extension::Extendable;
+use crate::field::fft::ifft_borrowed;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
@@ -162,21 +163,23 @@ where
 
     // Only the routed columns are read again after this point (the
     // permutation argument covers wires `j < num_routed_wires`; nothing else
-    // consumes the matrix), so move the non-routed columns out instead of
-    // cloning them.
+    // consumes the matrix). Non-routed columns are moved out and IFFT'd in
+    // place; routed columns are IFFT'd from the borrowed witness column
+    // (`ifft_borrowed` fuses the former clone with the FFT's initial
+    // bit-reversal gather), so no witness column is copied.
     let num_routed_wires = common_data.config.num_routed_wires;
-    let wires_values: Vec<PolynomialValues<F>> = timed!(
+    let wires_coeffs: Vec<PolynomialCoeffs<F>> = timed!(
         timing,
-        "compute wire polynomials",
+        "compute wire polynomials (IFFT)",
         witness
             .wire_values
             .par_iter_mut()
             .enumerate()
             .map(|(j, column)| {
                 if j < num_routed_wires {
-                    PolynomialValues::new(column.clone())
+                    ifft_borrowed(column)
                 } else {
-                    PolynomialValues::new(core::mem::take(column))
+                    PolynomialValues::new(core::mem::take(column)).ifft()
                 }
             })
             .collect()
@@ -185,8 +188,8 @@ where
     let wires_commitment = timed!(
         timing,
         "compute wires commitment",
-        PolynomialBatch::<F, C, D>::from_values(
-            wires_values,
+        PolynomialBatch::<F, C, D>::from_coeffs(
+            wires_coeffs,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::WIRES.blinding,
             config.fri_config.cap_height,
@@ -945,13 +948,64 @@ fn compute_quotient_polys<
                         .all(|(&sx, &x)| sx == F::coset_shift() * x)
                 );
 
-                prover_data.constants_sigmas_commitment.fill_lde_batch(
-                    &scratch.indices,
-                    step,
-                    common_data.constants_range(),
-                    BatchLayout::PolyMajor,
-                    &mut scratch.local_constants,
-                );
+                // The constants and sigma columns are circuit-fixed, so their
+                // quotient-domain values were extracted once at circuit build
+                // time; copy them per batch instead of re-walking the strided
+                // LDE (which amplifies cache-line traffic 8x at step 8).
+                let cache_start = BATCH_SIZE * batch_i;
+                // The cache is column-major (`PolyMajor`); the per-point
+                // (`PointMajor`) path with lookups keeps the original gathers.
+                let constants_cache = if col_major_perm {
+                    prover_data.constants_sigmas_quotient_cache.as_ref()
+                } else {
+                    None
+                };
+                if let Some(cache) = constants_cache {
+                    debug_assert_eq!(
+                        prover_data.constants_sigmas_quotient_step, step,
+                        "quotient gather step must match the cache extraction step"
+                    );
+                    let cc = common_data.constants_range().len();
+                    let q = prover_data.constants_sigmas_quotient_domain;
+                    scratch.local_constants.resize(cc * n, F::ZERO);
+                    for ci in 0..cc {
+                        scratch.local_constants[ci * n..(ci + 1) * n].copy_from_slice(
+                            &cache[ci * q + cache_start..ci * q + cache_start + n],
+                        );
+                    }
+                    let sc = common_data.sigmas_range().len();
+                    scratch.s_sigmas_flat.resize(sc * n, F::ZERO);
+                    for ci in 0..sc {
+                        scratch.s_sigmas_flat[ci * n..(ci + 1) * n].copy_from_slice(
+                            &cache[(cc + ci) * q + cache_start..(cc + ci) * q + cache_start + n],
+                        );
+                    }
+                } else {
+                    prover_data.constants_sigmas_commitment.fill_lde_batch(
+                        &scratch.indices,
+                        step,
+                        common_data.constants_range(),
+                        BatchLayout::PolyMajor,
+                        &mut scratch.local_constants,
+                    );
+                    // Layout seam: the no-lookup column evaluator consumes the
+                    // PolyMajor gathers as-is (and the "next" gather narrows to
+                    // the Z columns, the only ones it reads); the per-point path
+                    // keeps the full-width PointMajor gathers and row views.
+                    let (batch_layout, _zs_local_range, _zs_next_range) = if col_major_perm {
+                        (BatchLayout::PolyMajor, 0..0, 0..0)
+                    } else {
+                        (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
+                    };
+
+                    prover_data.constants_sigmas_commitment.fill_lde_batch(
+                        &scratch.indices,
+                        step,
+                        common_data.sigmas_range(),
+                        batch_layout,
+                        &mut scratch.s_sigmas_flat,
+                    );
+                }
                 // Layout seam: the no-lookup column evaluator consumes the
                 // PolyMajor gathers as-is (and the "next" gather narrows to
                 // the Z columns, the only ones it reads); the per-point path
@@ -965,14 +1019,6 @@ fn compute_quotient_polys<
                 } else {
                     (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
                 };
-
-                prover_data.constants_sigmas_commitment.fill_lde_batch(
-                    &scratch.indices,
-                    step,
-                    common_data.sigmas_range(),
-                    batch_layout,
-                    &mut scratch.s_sigmas_flat,
-                );
                 wires_commitment.fill_lde_batch(
                     &scratch.indices,
                     step,
