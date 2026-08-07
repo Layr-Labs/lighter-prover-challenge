@@ -9,6 +9,7 @@ use anyhow::Result;
 use log::warn;
 use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
+use plonky2::field::packable::Packable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
 use plonky2::gates::gate::Gate;
@@ -376,23 +377,67 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
             batch_multiply_add_inplace(combined, &scratch, filters);
             constraint_index += 1;
 
+            // Fold each limb's range polynomial straight into the filtered
+            // accumulator. The old shape materialized the polynomial into
+            // `scratch` purely so that `batch_multiply_add_inplace` could read
+            // it back on the very next line; this runs the same packed
+            // `multiply_accumulate` over the same operands in the same order,
+            // so it is raw-representative-exact rather than merely
+            // ring-identical. What disappears is one full store-and-reload of
+            // the batch scratch per limb -- and unlike the Horner fold above,
+            // which runs once per op, this loop runs `num_aux` times per op
+            // (16 limbs for a 32-bit check), so it deletes the dominant share
+            // of this gate's scratch traffic.
+            //
+            // Splitting at a WIDTH multiple and casting is exactly what
+            // `batch_multiply_add_inplace` already does to these same
+            // `combined` subslices, so the packing carries no new alignment
+            // assumption.
+            let width = <<F as Packable>::Packing as PackedField>::WIDTH;
+            let split = n - n % width;
             for j in 0..num_aux {
                 let limb = &wires[self.wire_ith_input_jth_aux_limb(i, j) * n..][..n];
-                if j == num_aux - 1 && self.bit_size % 2 == 1 {
-                    for p in 0..n {
-                        let x = limb[p];
-                        scratch[p] = x * (x - F::ONE);
-                    }
-                } else {
-                    for p in 0..n {
-                        let x = limb[p];
-                        let y = x * (x - three);
-                        scratch[p] = y * (y + F::TWO);
-                    }
-                }
                 let combined = &mut combined_gate_constraints
                     [constraint_index * n..(constraint_index + 1) * n];
-                batch_multiply_add_inplace(combined, &scratch, filters);
+
+                let (combined_head, combined_tail) = combined.split_at_mut(split);
+                let (limb_head, limb_tail) = limb.split_at(split);
+                let (filters_head, filters_tail) = filters.split_at(split);
+                let combined_packed = <F as Packable>::Packing::pack_slice_mut(combined_head);
+                let limb_packed = <F as Packable>::Packing::pack_slice(limb_head);
+                let filters_packed = <F as Packable>::Packing::pack_slice(filters_head);
+
+                // A halved top limb is binary, so its polynomial is x(x-1);
+                // every other limb is base-4 and uses y(y+2) with y = x(x-3).
+                if j == num_aux - 1 && self.bit_size % 2 == 1 {
+                    for ((acc, &x), &f) in combined_packed
+                        .iter_mut()
+                        .zip(limb_packed)
+                        .zip(filters_packed)
+                    {
+                        *acc = acc.multiply_accumulate(x * (x - F::ONE), f);
+                    }
+                    for ((acc, &x), &f) in
+                        combined_tail.iter_mut().zip(limb_tail).zip(filters_tail)
+                    {
+                        *acc += x * (x - F::ONE) * f;
+                    }
+                } else {
+                    for ((acc, &x), &f) in combined_packed
+                        .iter_mut()
+                        .zip(limb_packed)
+                        .zip(filters_packed)
+                    {
+                        let y = x * (x - three);
+                        *acc = acc.multiply_accumulate(y * (y + F::TWO), f);
+                    }
+                    for ((acc, &x), &f) in
+                        combined_tail.iter_mut().zip(limb_tail).zip(filters_tail)
+                    {
+                        let y = x * (x - three);
+                        *acc += y * (y + F::TWO) * f;
+                    }
+                }
                 constraint_index += 1;
             }
         }
@@ -612,30 +657,37 @@ mod tests {
         const N: usize = 11;
         type F = GoldilocksField;
 
-        let gate = RangeCheckGate::<F, D>::new_from_config(
-            &CircuitConfig::standard_recursion_config(),
-            47,
-        );
-        let wires = (0..gate.num_wires() * N)
-            .map(|i| F::from_canonical_usize(3 * i + 5))
-            .collect::<Vec<_>>();
-        let constants = Vec::new();
-        let hash = HashOut::ZERO;
-        let vars = EvaluationVarsBaseBatch::new(N, &constants, &wires, &hash);
-        let filters = (0..N)
-            .map(|i| F::from_canonical_usize(2 * i + 1))
-            .collect::<Vec<_>>();
-        let mut expected = vec![F::ZERO; gate.num_constraints() * N];
-        let materialized = gate.eval_unfiltered_base_batch(vars);
-        for (acc, constraints) in expected
-            .chunks_exact_mut(N)
-            .zip(materialized.chunks_exact(N))
-        {
-            batch_multiply_add_inplace(acc, constraints, &filters);
+        // N = 11 is deliberately not a multiple of the packed WIDTH, so every
+        // case below exercises both the packed body and the scalar tail.
+        // Sizes cover the production gates (16/32/48), an odd size whose top
+        // limb is halved and therefore binary (47), and the single-aux-limb
+        // edge cases (1/2/3) that skip the Horner loop entirely.
+        for bit_size in [1, 2, 3, 16, 32, 47, 48] {
+            let gate = RangeCheckGate::<F, D>::new_from_config(
+                &CircuitConfig::standard_recursion_config(),
+                bit_size,
+            );
+            let wires = (0..gate.num_wires() * N)
+                .map(|i| F::from_canonical_usize(3 * i + 5))
+                .collect::<Vec<_>>();
+            let constants = Vec::new();
+            let hash = HashOut::ZERO;
+            let vars = EvaluationVarsBaseBatch::new(N, &constants, &wires, &hash);
+            let filters = (0..N)
+                .map(|i| F::from_canonical_usize(2 * i + 1))
+                .collect::<Vec<_>>();
+            let mut expected = vec![F::ZERO; gate.num_constraints() * N];
+            let materialized = gate.eval_unfiltered_base_batch(vars);
+            for (acc, constraints) in expected
+                .chunks_exact_mut(N)
+                .zip(materialized.chunks_exact(N))
+            {
+                batch_multiply_add_inplace(acc, constraints, &filters);
+            }
+            let mut actual = vec![F::ZERO; expected.len()];
+            gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+            assert_eq!(actual, expected, "bit_size {bit_size}");
         }
-        let mut actual = vec![F::ZERO; expected.len()];
-        gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
-        assert_eq!(actual, expected);
     }
 
     macro_rules! generate_low_degree_tests {
