@@ -644,6 +644,10 @@ mod tests {
     use rand::Rng;
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::eddsa::gates::mul_quintic_ext_base::QuinticMultiplicationGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::eddsa::gates::square_quintic_ext_base::QuinticSquaringGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::uint::u32::gates::add_many_u32::U32AddManyGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::uint::u32::gates::arithmetic_u32::U32ArithmeticGate;
@@ -748,6 +752,34 @@ mod tests {
         builder.connect(carry, Target::wire(row, add_many.wire_ith_carry(op)));
         u32_inputs.push((carry, 7));
 
+        let mut quintic_inputs = Vec::new();
+        let quintic_mul = QuinticMultiplicationGate::new_from_config(&config);
+        let (row, op) = builder.find_slot(quintic_mul.clone(), &[], &[]);
+        for (wire, value) in (0..5)
+            .map(|j| (quintic_mul.wire_ith_multiplicand_jth_limb_0(op, j), 2 + j as u64))
+            .chain((0..5).map(|j| {
+                (
+                    quintic_mul.wire_ith_multiplicand_jth_limb_1(op, j),
+                    11 + j as u64,
+                )
+            }))
+        {
+            let input = builder.add_virtual_target();
+            builder.connect(input, Target::wire(row, wire));
+            quintic_inputs.push((input, value));
+        }
+
+        let quintic_square = QuinticSquaringGate::new_from_config(&config);
+        let (row, op) = builder.find_slot(quintic_square.clone(), &[], &[]);
+        for j in 0..5 {
+            let input = builder.add_virtual_target();
+            builder.connect(
+                input,
+                Target::wire(row, quintic_square.wire_ith_multiplicand_jth_limb(op, j)),
+            );
+            quintic_inputs.push((input, 23 + j as u64));
+        }
+
         // 4097 rows pad to degree 8192. Its rate-8 constants/sigmas and wire
         // commitments both exceed the retained-Metal routing threshold.
         while builder.num_gates() < 4097 {
@@ -766,6 +798,9 @@ mod tests {
             pw.set_target(input, F::from_canonical_u64(value))?;
         }
         for (input, value) in u32_inputs {
+            pw.set_target(input, F::from_canonical_u64(value))?;
+        }
+        for (input, value) in quintic_inputs {
             pw.set_target(input, F::from_canonical_u64(value))?;
         }
 

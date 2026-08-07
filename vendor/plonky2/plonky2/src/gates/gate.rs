@@ -59,6 +59,15 @@ pub enum U32QuotientGate {
     },
 }
 
+/// Static wire-layout metadata for the downstream quintic extension gates.
+/// The backend validates the exact multiplication or squaring layout before
+/// excluding the advertised gate from the CPU quotient path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuinticQuotientGate {
+    Multiplication { num_ops: usize },
+    Squaring { num_ops: usize },
+}
+
 /// A custom gate.
 ///
 /// Vanilla Plonk arithmetization only supports basic fan-in 2 / fan-out 1 arithmetic gates,
@@ -314,6 +323,12 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
     /// Advertises one of the exact downstream U32 gate layouts to optional
     /// quotient backends. The default leaves unrelated gates on the CPU.
     fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+        None
+    }
+
+    /// Advertises one of the exact downstream quintic gate layouts to
+    /// optional quotient backends. The default keeps unrelated gates on CPU.
+    fn quintic_quotient_gate(&self) -> Option<QuinticQuotientGate> {
         None
     }
 
