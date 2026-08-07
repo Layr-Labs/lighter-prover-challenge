@@ -1036,6 +1036,29 @@ fn start_gpu_range_check_gate_quotient<
         return None;
     }
 
+    // Per-circuit gate selection on the recursion spine. Ranked evidence
+    // (3492806b: BaseSum+Equality added to the union, base 16.7715 ->
+    // 15.9466, -4.92%) shows the chain circuit's GPU gate job has crossed
+    // its load-balance point: the spine is a small serial gate loop
+    // (~482 constraints across 14 gates) repeated ~60 times, and its
+    // offloaded range/u32 gates make the GPU side the straggler while the
+    // same gates still pay in the deep-pipelined degree-2^16 tx chunks.
+    // Keep this circuit shape's marginal range/u32 gates on the CPU; the
+    // separate Poseidon2 gate quotient job (launched by the caller) is
+    // unchanged and still uses the GPU.
+    const SPINE_DEGREE_BITS: usize = 14;
+    if common_data.degree_bits() == SPINE_DEGREE_BITS
+        && !crate::hash::poseidon2::metal::exclusive_gpu_phase_active()
+    {
+        if gpu_poseidon_quotient_diagnostics_enabled() {
+            eprintln!(
+                "[gpu-range-quotient] spine shape (degree {SPINE_DEGREE_BITS}): \
+                 range/u32 gates kept on CPU"
+            );
+        }
+        return None;
+    }
+
     let include_unused_selector = common_data.selectors_info.num_selectors() > 1;
     let raw_constant_base = common_data
         .selectors_info
