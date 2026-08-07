@@ -492,7 +492,9 @@ fn all_wires_permutation_partial_products<
     let num_routed_wires = common_data.config.num_routed_wires;
     debug_assert_eq!(betas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
+    // Independent per challenge; ordered collect keeps values bit-identical.
     (0..common_data.config.num_challenges)
+        .into_par_iter()
         .map(|i| {
             wires_permutation_partial_products_and_zs(
                 witness,

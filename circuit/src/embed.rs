@@ -489,7 +489,11 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         let step = 1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
         let domain = 1 << (common.degree_bits() + quotient_degree_bits);
         let cols = common.constants_range().len() + common.sigmas_range().len();
-        if cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
+        // At step == 1 the cache would duplicate the retained LDE verbatim;
+        // the quotient loop's `None` fallback reads the identical bytes.
+        if step == 1 {
+            (None, step, domain)
+        } else if cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
             match (
                 constants_sigmas_commitment.extract_lde_batch_columns(
                     step,

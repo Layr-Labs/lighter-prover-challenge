@@ -9,7 +9,7 @@ use plonky2::field::types::{Field, Field64};
 use plonky2::hash::hash_types::{HashOutTarget, RichField};
 use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::iop::generator::PendingPartitionWitness;
-use plonky2::iop::witness::{PartialWitness, Witness, WitnessWrite};
+use plonky2::iop::witness::{PartialWitness, PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_data::{CircuitConfig, CircuitData};
 use plonky2::plonk::config::GenericConfig;
 use plonky2::plonk::proof::ProofWithPublicInputs;
@@ -196,6 +196,41 @@ impl Circuit<C, F, D> for BlockPreExecutionCircuit {
 }
 
 impl BlockPreExecutionCircuit {
+    /// First half of the two-phase form of [`Circuit::prove`]: witness only,
+    /// so callers can read public-input values before the proof runs.
+    pub fn generate_partition_witness<'a>(
+        circuit: &'a CircuitData<F, C, D>,
+        block: &BlockPreExec<F>,
+        target: &BlockPreExecutionTarget,
+    ) -> Result<PartitionWitness<'a, F>> {
+        let pending =
+            PendingPartitionWitness::start_seeded(&circuit.prover_only, &circuit.common, |seeder| {
+                Self::seed_witness_into(block, target, seeder)
+            })?;
+        pending.finish()
+    }
+
+    /// Second half of the two-phase form of [`Circuit::prove`]: proves from a
+    /// witness produced by [`Self::generate_partition_witness`].
+    pub fn prove_witnessed(
+        circuit: &CircuitData<F, C, D>,
+        witness: PartitionWitness<'_, F>,
+    ) -> Result<ProofWithPublicInputs<F, C, D>> {
+        let mut timing = TimingTree::new("BlockPreExecutionCircuit::prove_witnessed", Level::Debug);
+        let proof = prove_with_partition_witness::<F, C, D>(
+            &circuit.prover_only,
+            &circuit.common,
+            witness,
+            &mut timing,
+        )?;
+        // Recursive parents validate this proof in release builds; keep the eager check for tests.
+        #[cfg(debug_assertions)]
+        timed!(timing, "verify", { circuit.verify(proof.clone())? });
+
+        timing.print();
+        Ok(proof)
+    }
+
     /// Seeded form of [`Circuit::generate_witness`]: writes the same targets directly
     /// through `pw` (any partition seeder or map).
     fn seed_witness_into<W: Witness<F> + WitnessWrite<F>>(

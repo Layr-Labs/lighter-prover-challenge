@@ -383,44 +383,67 @@ fn prove_path(
         // below is the strictly sequential chain tail, so its mid-size
         // commitment trees can use the mostly idle GPU exactly like the
         // pre-execution and final block phases.
-        plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
+        //
+        // Only the light path's drain is a true exclusive window, and only
+        // once its last in-flight tx proof has joined: the heavy tail
+        // overlaps the still-running light pipeline, where the flag would
+        // re-route fold trees behind in-flight 2^19-leaf chunk trees.
+        if path == TxPath::Light && in_flight.is_empty() {
+            plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
+        }
         while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
             let tx_proof = proof_handle
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            if path == TxPath::Light && in_flight.is_empty() {
+                plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
+            }
+            // Spawned like pipelined folds so phase-1 witness generation
+            // keeps overlapping the previous fold's prove through the tail.
             let previous = chain.take();
-            chain = Some(ChainState::Ready(chain_step_proof(
-                path,
-                chain_target,
-                chain_data,
-                chain_step,
-                previous,
-                base,
-                dummy_proof,
-                &tx_proof,
-            )));
+            let handle = std::thread::Builder::new()
+                .name(format!("{path:?}-chain-step-{chain_step}"))
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    chain_step_proof(
+                        path,
+                        chain_target,
+                        chain_data,
+                        chain_step,
+                        previous,
+                        base,
+                        dummy_proof,
+                        &tx_proof,
+                    )
+                })
+                .expect("chain step pipeline thread must start");
+            chain = Some(ChainState::InFlight(handle));
         }
         let chain_proof = chain
             .map(ChainState::wait)
             .expect("transaction path must produce a chain proof");
-        plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+        if path == TxPath::Light {
+            plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+        }
         chain_proof
     })
 }
 
 pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
-    // The pre-execution proof runs strictly before any other proving work, so
-    // the serialized GPU stream is otherwise idle: route its mid-size column
-    // trees to the GPU for just this phase.
+    // Only the final BlockCircuit consumes the pre-execution PROOF; the
+    // paths need just its witness values, so once the witness is complete
+    // the proof moves onto a scoped thread and the paths start earlier.
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-    let pre_proof = BlockPreExecutionCircuit::prove(
+    let pre_witness = BlockPreExecutionCircuit::generate_partition_witness(
         &circuits.pre_data,
         &BlockPreExec::from_block(&block),
         &circuits.pre_target,
     )
-    .expect("block pre-execution proof failed");
+    .expect("block pre-execution witness generation failed");
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
-    let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
+    let pre_output = BlockPreExecWitness::from_public_inputs(
+        &pre_witness.get_targets(&circuits.pre_data.prover_only.public_inputs),
+    );
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
     let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
@@ -441,6 +464,14 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
         // block so the finished extensions can be released below.
         let circuits = &circuits;
         std::thread::scope(|scope| {
+            let pre_proof_handle = std::thread::Builder::new()
+                .name("pre-execution-proof".into())
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    BlockPreExecutionCircuit::prove_witnessed(&circuits.pre_data, pre_witness)
+                        .expect("block pre-execution proof failed")
+                })
+                .expect("pre-execution proof thread must start");
             // The final block circuit depends only on already-built circuit data
             // and is not needed until the final proof, so it builds concurrently
             // with the entire transaction/chain proving pipeline.
@@ -476,7 +507,6 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
                 })
                 .expect("heavy transaction chain thread must start");
             let block_ref = &block;
-            let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -484,10 +514,13 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
                     let (block_target, block_data) = circuits.build_block_circuit();
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
+                    let pre_proof = pre_proof_handle
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                     let early = BlockCircuit::witness_inputs_early(
                         &block_target,
                         block_ref,
-                        pre_proof_ref,
+                        &pre_proof,
                     )
                     .expect("final block early witness inputs failed");
                     let mut pending = PendingPartitionWitness::start(
