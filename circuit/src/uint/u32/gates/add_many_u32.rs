@@ -463,6 +463,8 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32AddManyGate
         Some(U32QuotientGate::AddMany {
             num_ops: self.num_ops,
             num_addends: self.num_addends,
+            base_bits: 32,
+            num_carry_limbs: Self::num_carry_limbs(),
         })
     }
 }

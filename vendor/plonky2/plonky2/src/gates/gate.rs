@@ -39,18 +39,24 @@ pub struct RangeCheckQuotientGate {
 /// here avoids a dependency from `plonky2` back to the circuit crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum U32QuotientGate {
-    Arithmetic { num_ops: usize },
-    Subtraction { num_ops: usize },
-    AddMany { num_ops: usize, num_addends: usize },
-}
-
-/// Static wire-layout metadata for the downstream byte-decomposition gate.
-/// The backend validates the advertised dimensions before excluding the gate
-/// from the CPU quotient path.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ByteDecompositionQuotientGate {
-    pub num_ops: usize,
-    pub num_limbs: usize,
+    Arithmetic {
+        num_ops: usize,
+    },
+    /// Borrowing subtraction of two `base_bits`-wide words. The layout is
+    /// identical at every width: five routed words per operation followed by
+    /// `base_bits / 2` base-4 result limbs.
+    Subtraction {
+        num_ops: usize,
+        base_bits: usize,
+    },
+    /// Addition of `num_addends` `base_bits`-wide words plus a carry, with
+    /// `base_bits / 2` result limbs and `num_carry_limbs` carry limbs.
+    AddMany {
+        num_ops: usize,
+        num_addends: usize,
+        base_bits: usize,
+        num_carry_limbs: usize,
+    },
 }
 
 /// A custom gate.
@@ -308,12 +314,6 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
     /// Advertises one of the exact downstream U32 gate layouts to optional
     /// quotient backends. The default leaves unrelated gates on the CPU.
     fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
-        None
-    }
-
-    /// Advertises the exact downstream byte-decomposition layout to optional
-    /// quotient backends. The default leaves unrelated gates on the CPU.
-    fn byte_decomposition_quotient_gate(&self) -> Option<ByteDecompositionQuotientGate> {
         None
     }
 
