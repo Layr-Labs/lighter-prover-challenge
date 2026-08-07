@@ -45,39 +45,6 @@ fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
     (light, heavy)
 }
 
-/// Marks the calling thread as latency-critical to the macOS scheduler.
-///
-/// The 49 sequential chain folds are the whole critical path of a block
-/// bundle: every serial section of a fold (witness feed, opening
-/// evaluation, FRI reduce, transcript work) runs on a chain-step thread
-/// while the global worker pool is saturated by transaction proving that
-/// hides behind the spine anyway. At default QoS those serial sections
-/// compete for cores on equal terms with hideable bulk work and are
-/// eligible for efficiency-core placement; per-statement profiling of the
-/// fold pipeline shows episodic multi-hundred-millisecond stalls between
-/// instrumented spans under exactly this contention. `USER_INTERACTIVE`
-/// asks the scheduler to keep the fold thread on a performance core and
-/// schedule it ahead of default-QoS pool workers. This changes thread
-/// scheduling only: no work is added, moved, or reordered, and proof
-/// bytes are untouched. On non-macOS targets this is a no-op.
-#[cfg(target_os = "macos")]
-fn mark_spine_thread_latency_critical() {
-    // `QOS_CLASS_USER_INTERACTIVE` is 0x21 in <sys/qos.h>.
-    #[allow(non_camel_case_types)]
-    type qos_class_t = u32;
-    unsafe extern "C" {
-        fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
-    }
-    // Best-effort: a nonzero return leaves the thread at its previous QoS,
-    // which is exactly the pre-change behavior.
-    unsafe {
-        let _ = pthread_set_qos_class_self_np(0x21, 0);
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn mark_spine_thread_latency_critical() {}
-
 enum ChainState<'scope> {
     Ready(Proof),
     InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
@@ -102,17 +69,17 @@ fn chain_step_proof(
     chain_step: u64,
     previous: Option<ChainState<'_>>,
     base_proof: &Proof,
-    constant_inputs: &plonky2::iop::witness::PartialWitness<F>,
+    dummy_proof: &Proof,
     tx_proof: &Proof,
 ) -> Proof {
-    mark_spine_thread_latency_critical();
     let result = (|| {
         // Phase 1: run every generator that does not depend on the previous chain proof while
         // that proof may still be in flight.
-        let early_inputs = BlockTxChainCircuit::witness_inputs_early_from_template(
-            constant_inputs,
+        let early_inputs = BlockTxChainCircuit::witness_inputs_early(
             chain_target,
+            chain_data,
             chain_step,
+            dummy_proof,
             tx_proof,
         )?;
         let mut pending = PendingPartitionWitness::start(
@@ -264,16 +231,8 @@ fn prove_path(
     );
     jump = next_jump;
 
-    let chain_constant_inputs = BlockTxChainCircuit::witness_inputs_constant(
-        chain_target,
-        chain_data,
-        dummy_proof,
-    )
-    .expect("chain constant witness inputs failed");
-
     std::thread::scope(|scope| {
         let base = &base_proof;
-        let chain_constant = &chain_constant_inputs;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
@@ -295,7 +254,7 @@ fn prove_path(
                             chain_step,
                             previous,
                             base,
-                            chain_constant,
+                            dummy_proof,
                             &tx_proof,
                         )
                     })
@@ -367,7 +326,7 @@ fn prove_path(
                         chain_step,
                         previous,
                         base,
-                        chain_constant,
+                        dummy_proof,
                         &tx_proof,
                     )
                 })
@@ -391,7 +350,7 @@ fn prove_path(
                 chain_step,
                 previous,
                 base,
-                chain_constant,
+                dummy_proof,
                 &tx_proof,
             )));
         }
@@ -570,10 +529,6 @@ mod tests {
     fn chain_step_two_phase_timing_impl() {
         use std::time::Instant;
 
-        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-            .is_test(false)
-            .try_init();
-
         use circuit::block_tx_chain_constraints::Circuit as _;
         use circuit::types::constants::TX_TYPE_EMPTY;
         use plonky2::field::types::{Field, PrimeField64};
@@ -634,17 +589,7 @@ mod tests {
             state_metadata_hash,
             jump,
         );
-        let tx_prove_start = Instant::now();
-        let mut tx_timing = TimingTree::new("tx-chunk-prove", log::Level::Debug);
-        let tx_proof = plonky2::plonk::prover::prove_with_partition_witness::<F, C, D>(
-            &circuits.tx_data.prover_only,
-            &circuits.tx_data.common,
-            witness,
-            &mut tx_timing,
-        )
-        .expect("tx proof failed");
-        println!("tx chunk prove total {:?}", tx_prove_start.elapsed());
-        tx_timing.print();
+        let tx_proof = prove_tx_witness(TxPath::Light, 0, &circuits.tx_data, witness);
 
         let base_proof = cyclic_base_witness(
             &circuits.dummy_proof,
@@ -711,16 +656,14 @@ mod tests {
             let phase2_elapsed = phase2_start.elapsed();
 
             let prove_start = Instant::now();
-            let mut timing = TimingTree::new("chain-step-prove", log::Level::Debug);
             let proof = prove_with_partition_witness::<F, C, D>(
                 &circuits.chain_data.prover_only,
                 &circuits.chain_data.common,
                 witness,
-                &mut timing,
+                &mut TimingTree::default(),
             )
             .expect("chain step proof failed");
             let prove_elapsed = prove_start.elapsed();
-            timing.print();
 
             println!(
                 "chain step {chain_step}: single-shot witness {single_shot_elapsed:?}, \

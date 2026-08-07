@@ -338,16 +338,13 @@ pub struct PartitionWitness<'a, F: Field> {
     /// Bitmap with one bit per slot of `values`; bit `i` of word `i / 64` is set iff slot `i` has
     /// been assigned a value.
     pub set_bitmap: Vec<u64>,
-    /// Representative index of every target, as `u32`. Halving the entry width halves the bytes
-    /// this table costs per read; every value is zero-extended at the indexing site, so the slots
-    /// selected in `values`/`set_bitmap` are unchanged.
-    pub representative_map: &'a [u32],
+    pub representative_map: &'a [usize],
     pub num_wires: usize,
     pub degree: usize,
 }
 
 impl<'a, F: Field> PartitionWitness<'a, F> {
-    pub fn new(num_wires: usize, degree: usize, representative_map: &'a [u32]) -> Self {
+    pub fn new(num_wires: usize, degree: usize, representative_map: &'a [usize]) -> Self {
         let len = representative_map.len();
         Self {
             values: vec![F::ZERO; len],
@@ -372,7 +369,7 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     /// Set a `Target`. On success, returns the representative index of the newly-set target. If the
     /// target was already set, returns `None`.
     pub fn set_target_returning_rep(&mut self, target: Target, value: F) -> Result<Option<usize>> {
-        let rep_index = self.representative_map[self.target_index(target)] as usize;
+        let rep_index = self.representative_map[self.target_index(target)];
         if self.is_set_by_rep_index(rep_index) {
             let old_value = self.values[rep_index];
             if value != old_value {
@@ -397,64 +394,14 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     }
 
     pub fn full_witness(self) -> MatrixWitness<F> {
-        // Single fused pass, parallel over row chunks. Cell (column j, row i)
-        // is `values[representative_map[i * num_wires + j]]` (unset slots hold
-        // `F::ZERO` in the dense `values` vector), with `Target::index`'s
-        // `row * num_wires + column` inlined as a running cursor. Each
-        // parallel task owns one row range of every column — disjoint
-        // `MaybeUninit` segments carved off the pre-sized column buffers up
-        // front — reads `representative_map` sequentially within its range,
-        // and initializes every cell exactly once before the final `set_len`.
-        let num_wires = self.num_wires;
-        let degree = self.degree;
-        let mut wire_values: Vec<Vec<F>> = (0..num_wires)
-            .map(|_| Vec::with_capacity(degree))
-            .collect();
-        let num_chunks = 16.min(degree.max(1));
-        let chunk_rows = degree.div_ceil(num_chunks);
-        {
-            let mut segments: Vec<Vec<&mut [core::mem::MaybeUninit<F>]>> = (0..num_chunks)
-                .map(|_| Vec::with_capacity(num_wires))
-                .collect();
-            for column in wire_values.iter_mut() {
-                let mut rest =
-                    crate::hash::merkle_tree::capacity_up_to_mut(column, degree);
-                for segment_columns in segments.iter_mut() {
-                    let take = chunk_rows.min(rest.len());
-                    let (head, tail) = rest.split_at_mut(take);
-                    segment_columns.push(head);
-                    rest = tail;
-                }
-            }
-            use plonky2_maybe_rayon::*;
-            segments
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(chunk, columns)| {
-                    let rows = columns.first().map_or(0, |column| column.len());
-                    let mut wire_index = chunk * chunk_rows * num_wires;
-                    for i in 0..rows {
-                        for column in columns.iter_mut() {
-                            column[i].write(
-                                self.values[self.representative_map[wire_index] as usize],
-                            );
-                            wire_index += 1;
-                        }
-                    }
-                });
-        }
-        for column in wire_values.iter_mut() {
-            // SAFETY: every one of the `degree` slots of every column was
-            // initialized exactly once by the disjoint segment writes above.
-            unsafe {
-                column.set_len(degree);
-            }
-        }
-
-        MatrixWitness { wire_values }
-    }
-    #[allow(dead_code)]
-    fn full_witness_serial_reference(self) -> MatrixWitness<F> {
+        // Redraw ticket 5.
+        // Single fused pass. Cell (column j, row i) is
+        // `values[representative_map[i * num_wires + j]]` or zero — the same
+        // lookup `try_get_target(Target::Wire { row: i, column: j })` resolved
+        // to, with `Target::index`'s `row * num_wires + column` inlined as a
+        // running cursor. This deletes the full zero-prefill pass over the
+        // matrix and the per-cell Target construction and index arithmetic of
+        // the second pass, while reading `representative_map` sequentially.
         let mut wire_values: Vec<Vec<F>> = (0..self.num_wires)
             .map(|_| Vec::with_capacity(self.degree))
             .collect();
@@ -463,7 +410,7 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
             for column in wire_values.iter_mut() {
                 // Unset slots hold `F::ZERO` in the dense `values` vector, so this is exactly
                 // the old `values[rep].unwrap_or(F::ZERO)` without touching the bitmap.
-                column.push(self.values[self.representative_map[wire_index] as usize]);
+                column.push(self.values[self.representative_map[wire_index]]);
                 wire_index += 1;
             }
         }
@@ -480,7 +427,7 @@ impl<F: Field> WitnessWrite<F> for PartitionWitness<'_, F> {
 
 impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
     fn try_get_target(&self, target: Target) -> Option<F> {
-        let rep_index = self.representative_map[self.target_index(target)] as usize;
+        let rep_index = self.representative_map[self.target_index(target)];
         if self.is_set_by_rep_index(rep_index) {
             Some(self.values[rep_index])
         } else {

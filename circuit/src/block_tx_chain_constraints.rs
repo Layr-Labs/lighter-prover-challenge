@@ -199,19 +199,20 @@ impl BlockTxChainCircuit {
 
     /// Chain-step witness inputs that do not depend on the cyclic (previous chain step) proof, so
     /// they can be seeded and their generators run before that proof is available.
-    /// The witness inputs that are constant for every recursion step of one
-    /// chain path: the circuit's own verifier data and the dummy-slot proof.
-    /// Built once per path and cloned per step — a `HashMap` clone copies the
-    /// buckets directly, replacing tens of thousands of re-hashed inserts of
-    /// the same dummy-proof and verifier-data values at every chain step.
-    pub fn witness_inputs_constant(
+    pub fn witness_inputs_early(
         target: &BlockTxChainTarget,
         circuit_data: &CircuitData<F, C, D>,
+        recursion_step: u64,
         dummy_proof_cyclic: &ProofWithPublicInputs<F, C, D>,
+        current_block_tx_proof: &ProofWithPublicInputs<F, C, D>,
     ) -> Result<PartialWitness<F>> {
         let mut pw = PartialWitness::new();
 
         pw.set_verifier_data_target(&target.self_verifier_data, &circuit_data.verifier_only)?;
+
+        pw.set_proof_with_pis_target(&target.tx_proof, current_block_tx_proof)?;
+
+        pw.set_target(target.recursion_step, F::from_canonical_u64(recursion_step))?;
 
         // This will take place of `DummyProofGenerator`
         pw.set_proof_with_pis_target(
@@ -220,42 +221,6 @@ impl BlockTxChainCircuit {
         )?;
 
         Ok(pw)
-    }
-
-    /// The per-step early inputs, layered onto a clone of
-    /// [`Self::witness_inputs_constant`]'s template. The map contents are
-    /// identical to building the witness from scratch — the same targets
-    /// receive the same values; only insertion order differs, which a
-    /// `HashMap` does not observe.
-    pub fn witness_inputs_early_from_template(
-        template: &PartialWitness<F>,
-        target: &BlockTxChainTarget,
-        recursion_step: u64,
-        current_block_tx_proof: &ProofWithPublicInputs<F, C, D>,
-    ) -> Result<PartialWitness<F>> {
-        let mut pw = template.clone();
-
-        pw.set_proof_with_pis_target(&target.tx_proof, current_block_tx_proof)?;
-
-        pw.set_target(target.recursion_step, F::from_canonical_u64(recursion_step))?;
-
-        Ok(pw)
-    }
-
-    pub fn witness_inputs_early(
-        target: &BlockTxChainTarget,
-        circuit_data: &CircuitData<F, C, D>,
-        recursion_step: u64,
-        dummy_proof_cyclic: &ProofWithPublicInputs<F, C, D>,
-        current_block_tx_proof: &ProofWithPublicInputs<F, C, D>,
-    ) -> Result<PartialWitness<F>> {
-        let template = Self::witness_inputs_constant(target, circuit_data, dummy_proof_cyclic)?;
-        Self::witness_inputs_early_from_template(
-            &template,
-            target,
-            recursion_step,
-            current_block_tx_proof,
-        )
     }
 
     /// The cyclic-proof witness inputs, fed once the previous chain step's proof is available.
