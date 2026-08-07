@@ -79,4 +79,97 @@ impl<F: Field> ZeroPolyOnCoset<F> {
         }
         self.eval(i) * (self.n * (x - F::ONE)).inverse()
     }
+
+    /// Evaluates `L_0` at a consecutive batch of coset points using Montgomery's trick.
+    ///
+    /// Quotient evaluation consumes points in contiguous batches. Grouping their denominator
+    /// inversions replaces one exponentiation per point with one inversion for the whole batch;
+    /// both caller-owned buffers retain their allocations across batches.
+    pub fn eval_l_0_batch_contiguous_into(
+        &self,
+        index_start: usize,
+        xs: &[F],
+        denominators: &mut Vec<F>,
+        values: &mut Vec<F>,
+    ) {
+        if let Some(table) = &self.l_0_denominator_inverses {
+            values.clear();
+            values.extend(
+                xs.iter().enumerate().map(|(offset, _)| {
+                    self.eval(index_start + offset) * table[index_start + offset]
+                }),
+            );
+            return;
+        }
+
+        denominators.clear();
+        denominators.extend(xs.iter().map(|&x| self.n * (x - F::ONE)));
+        F::batch_multiplicative_inverse_into(denominators, values);
+        for (offset, value) in values.iter_mut().enumerate() {
+            *value *= self.eval(index_start + offset);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+
+    use super::ZeroPolyOnCoset;
+    use crate::goldilocks_field::GoldilocksField;
+    use crate::types::Field;
+
+    #[test]
+    fn contiguous_l0_batch_and_cached_table_match_scalar() {
+        type F = GoldilocksField;
+
+        for n_log in [2usize, 6] {
+            for rate_bits in [0usize, 1, 3] {
+                let domain_log = n_log + rate_bits;
+                let xs = F::two_adic_subgroup(domain_log)
+                    .into_iter()
+                    .map(|x| F::coset_shift() * x)
+                    .collect::<Vec<_>>();
+                let direct = ZeroPolyOnCoset::<F>::new(n_log, rate_bits);
+                let expected = xs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &x)| direct.eval_l_0(i, x))
+                    .collect::<Vec<_>>();
+
+                for batch_size in [1usize, 2, 3, 7, 32] {
+                    let mut denominators = vec![F::ONE; batch_size + 3];
+                    let mut actual = vec![F::ONE; batch_size + 5];
+                    for (batch, xs_batch) in xs.chunks(batch_size).enumerate() {
+                        let start = batch * batch_size;
+                        direct.eval_l_0_batch_contiguous_into(
+                            start,
+                            xs_batch,
+                            &mut denominators,
+                            &mut actual,
+                        );
+                        assert_eq!(actual, expected[start..start + xs_batch.len()]);
+                    }
+                }
+
+                let n = F::from_canonical_usize(1 << n_log);
+                let table = F::batch_multiplicative_inverse(
+                    &xs.iter().map(|&x| n * (x - F::ONE)).collect::<Vec<_>>(),
+                );
+                let cached = ZeroPolyOnCoset::<F>::new(n_log, rate_bits)
+                    .with_l_0_denominator_inverses(Arc::new(table));
+                let cached_scalar = xs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &x)| cached.eval_l_0(i, x))
+                    .collect::<Vec<_>>();
+                assert_eq!(cached_scalar, expected);
+
+                let mut denominators = Vec::new();
+                let mut actual = Vec::new();
+                cached.eval_l_0_batch_contiguous_into(0, &xs, &mut denominators, &mut actual);
+                assert_eq!(actual, expected);
+            }
+        }
+    }
 }
