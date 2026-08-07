@@ -95,3 +95,5 @@ fn main() {
     // thread, so there is no in-flight background work left to lose here.
     std::process::exit(0);
 }
+
+// redraw-best-stack occupancy+restores host-lottery
