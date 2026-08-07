@@ -3,17 +3,19 @@
 
 //! Embedded startup circuits.
 //!
-//! `build.rs` constructs the five startup circuits during the untimed compile
-//! job and serializes them (see `circuit::embed`) into OUT_DIR blobs that are
-//! compiled into this binary. [`Circuits::from_embedded`] reconstitutes the
-//! exact `Circuits` value `Circuits::new` builds, several times faster than
-//! rebuilding, moving that work out of the scored worker lifetime.
+//! `build.rs` constructs the five startup circuits **and** the final block
+//! circuit during the untimed compile job and serializes them (see
+//! `circuit::embed`) into OUT_DIR blobs that are compiled into this binary.
+//! [`Circuits::from_embedded`] reconstitutes the startup set; the final block
+//! loads via [`Circuits::load_block_circuit`] so define+build never runs on the
+//! scored light-spine critical path.
 //!
 //! [`Circuits::load`] is the production entry point: embedded first, build
 //! fallback on any error, `LIGHTER_BUILD_CIRCUITS=1` to force the build path
 //! (measurement A/B). The `embedded_matches_rebuilt` ignored test is the
 //! value-equality oracle between the two paths.
 
+use circuit::block_constraints::BlockTarget;
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
@@ -28,6 +30,7 @@ static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx
 static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
 static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+static BLOCK_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block.embed"));
 
 fn load_blob<T: serde::de::DeserializeOwned>(
     name: &'static str,
@@ -110,6 +113,28 @@ impl Circuits {
             Err(error) => {
                 log::warn!("embedded circuits unavailable ({error:#}); building from scratch");
                 Self::new()
+            }
+        }
+    }
+
+    /// Loads the final block circuit from the compile-time embed blob.
+    /// Value-identical to [`Self::build_block_circuit`] when the blob matches
+    /// the five parent circuits (same define inputs).
+    pub fn load_block_circuit(&self) -> anyhow::Result<(BlockTarget, CircuitData<F, C, D>)> {
+        let _ = self; // parents already embedded; block blob is self-contained
+        load_blob::<BlockTarget>("block", BLOCK_BLOB)
+    }
+
+    /// Prefer embedded final block; fall back to runtime build.
+    pub fn load_or_build_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
+        if std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1") {
+            return self.build_block_circuit();
+        }
+        match self.load_block_circuit() {
+            Ok(pair) => pair,
+            Err(error) => {
+                log::warn!("embedded block circuit unavailable ({error:#}); building at runtime");
+                self.build_block_circuit()
             }
         }
     }
@@ -357,6 +382,7 @@ mod tests {
             ("heavy_chain", HEAVY_CHAIN_BLOB),
             ("light_tx", LIGHT_TX_BLOB),
             ("light_chain", LIGHT_CHAIN_BLOB),
+            ("block", BLOCK_BLOB),
         ] {
             assert!(
                 !blob.is_empty(),

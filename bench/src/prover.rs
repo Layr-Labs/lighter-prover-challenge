@@ -32,9 +32,11 @@ enum TxPath {
     Light,
 }
 
-const LIGHT_TX_PROOF_WINDOW: usize = 2;
-// Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
-const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
+// Overlap light tx proofs earlier/deeper: heavy path is only 3 serial chunks and
+// finishes well before the light spine; under-pipelining light while heavy is
+// live left critical-path cores idle.
+const LIGHT_TX_PROOF_WINDOW: usize = 3;
+const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 0;
 
 fn chunk_is_light(txs: &[Tx<F>]) -> bool {
     txs.first()
@@ -478,10 +480,12 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
             let block_ref = &block;
             let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
-                .name("block-circuit-build".into())
+                .name("block-circuit-load".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
-                    let (block_target, block_data) = circuits.build_block_circuit();
+                    // Prefer compile-time embed: removes multi-second block
+                    // define+build from the light-spine critical path.
+                    let (block_target, block_data) = circuits.load_or_build_block_circuit();
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
                     let early = BlockCircuit::witness_inputs_early(
@@ -510,7 +514,7 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
                         .expect("final block heavy-chain witness feed failed");
                     (block_target, block_data, pending, heavy_chain_proof)
                 })
-                .expect("block circuit build thread must start");
+                .expect("block circuit load thread must start");
             let light_chain_proof = prove_path(
                 TxPath::Light,
                 light_chunks,

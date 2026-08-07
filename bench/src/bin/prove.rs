@@ -95,3 +95,11 @@ fn main() {
     // thread, so there is no in-flight background work left to lose here.
     std::process::exit(0);
 }
+
+// rawqubit-campaign-token iter-17
+
+// multi-agent-v5 always-detach + light-window + quotient-guard-fix
+
+// multi-agent-v5-redraw-7
+
+// win-v6 block-embed + multi-agent scheduling
