@@ -240,7 +240,17 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
             }};
         }
 
-        let mut states = vec![[F::ZERO; WIDTH]; n];
+        // Like the constraint-row scratch above: batches are 32 points, so the
+        // per-point permutation states live on the stack too, with a heap
+        // fallback only for oversized batches.
+        let mut states_stack = [[F::ZERO; WIDTH]; 64];
+        let mut states_heap;
+        let states: &mut [[F; WIDTH]] = if n <= 64 {
+            &mut states_stack[..n]
+        } else {
+            states_heap = vec![[F::ZERO; WIDTH]; n];
+            &mut states_heap
+        };
 
         // Assert that `swap` is binary.
         let swap = col(Self::WIRE_SWAP);

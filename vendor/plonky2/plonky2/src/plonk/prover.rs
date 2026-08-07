@@ -264,6 +264,12 @@ where
     let lookup_polys =
         compute_all_lookup_polys(&witness, &deltas, prover_data, common_data, has_lookup);
 
+    // The permutation argument and lookup polys were the last readers of the
+    // witness matrix (non-routed columns were already moved out into
+    // `wires_values`). Free the ~80 routed columns now, before the ZS
+    // commitment, quotient evaluation, and FRI phases raise memory pressure.
+    drop(witness);
+
     if has_lookup {
         zs_partial_products.extend(lookup_polys);
     }
@@ -1050,17 +1056,21 @@ fn compute_quotient_polys<
         );
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
-    (0..num_challenges)
+    // One streaming pass splits the interleaved point-major buffer into the
+    // per-challenge columns, instead of `num_challenges` parallel passes each
+    // stride-reading the whole buffer. Same values in the same order; only
+    // which pass writes them changes.
+    let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
+        .map(|_| Vec::with_capacity(points.len()))
+        .collect();
+    for point_values in quotient_values.chunks_exact(num_challenges) {
+        for (column, &value) in challenge_columns.iter_mut().zip(point_values) {
+            column.push(value);
+        }
+    }
+    challenge_columns
         .into_par_iter()
-        .map(|challenge| {
-            PolynomialValues::new(
-                quotient_values
-                    .chunks_exact(num_challenges)
-                    .map(|point_values| point_values[challenge])
-                    .collect(),
-            )
-        })
-        .map(|values| values.coset_ifft(F::coset_shift()))
+        .map(|column| PolynomialValues::new(column).coset_ifft(F::coset_shift()))
         .collect()
 }
 
