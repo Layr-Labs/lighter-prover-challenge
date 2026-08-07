@@ -135,6 +135,17 @@ impl<F: RichField> RangeCheckGateQuotientJob<F> {
     }
 }
 
+/// One advertised `BaseSumGate` in the quotient union.
+#[derive(Clone, Debug)]
+pub(crate) struct BaseSumQuotientSpec {
+    pub selector_column: usize,
+    pub gate_index: usize,
+    pub group: core::ops::Range<usize>,
+    pub include_unused_selector: bool,
+    pub num_limbs: usize,
+    pub base: usize,
+}
+
 /// One custom range-check gate's selector and base-4 wire layout. All fields
 /// are checked before being flattened into the Metal kernel's u32 metadata.
 #[derive(Clone, Debug)]
@@ -523,13 +534,17 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     step: usize,
     specs: &[RangeCheckQuotientSpec],
     u32_specs: &[U32QuotientSpec],
+    base_sum_specs: &[BaseSumQuotientSpec],
     alphas: &[F],
     alpha_offset: usize,
 ) -> Option<RangeCheckGateQuotientJob<F>> {
     const SPEC_WORDS: usize = 10;
     const MAX_INLINE_BYTES: usize = 4096;
 
-    let spec_count = specs.len().checked_add(u32_specs.len())?;
+    let spec_count = specs
+        .len()
+        .checked_add(u32_specs.len())?
+        .checked_add(base_sum_specs.len())?;
 
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
@@ -731,6 +746,35 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             carry_limbs as u32,
         ]);
     }
+    for spec in base_sum_specs {
+        if spec.num_limbs == 0 || spec.base < 2 || spec.base > 8 {
+            return None;
+        }
+        let num_constraints = spec.num_limbs.checked_add(1)?;
+        if spec.selector_column >= constants.cols
+            || spec.group.start > spec.group.end
+            || spec.group.end > u32::MAX as usize
+            || spec.selector_column > u32::MAX as usize
+            || spec.gate_index > u32::MAX as usize
+            || spec.num_limbs > u32::MAX as usize
+            || num_constraints > wires.cols
+        {
+            return None;
+        }
+        alpha_stride = alpha_stride.max(num_constraints);
+        metadata.extend([
+            spec.selector_column as u32,
+            spec.gate_index as u32,
+            spec.group.start as u32,
+            spec.group.end as u32,
+            spec.include_unused_selector as u32,
+            spec.num_limbs as u32,
+            spec.base as u32,
+            0,
+            0,
+            0,
+        ]);
+    }
     if alpha_stride == 0
         || alpha_stride > u32::MAX as usize
         || alpha_stride
@@ -758,6 +802,7 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
         &metadata,
         specs.len(),
         u32_specs.len(),
+        base_sum_specs.len(),
         &alpha_powers,
         alpha_stride,
     ) {
@@ -1127,6 +1172,7 @@ impl MetalShared {
         metadata: &[u32],
         range_count: usize,
         u32_count: usize,
+        base_sum_count: usize,
         alpha_powers: &[u64],
         alpha_stride: usize,
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
@@ -1134,7 +1180,7 @@ impl MetalShared {
             .range_check_gate_quotient_pipeline
             .as_ref()
             .ok_or("RangeCheck gate quotient pipeline unavailable")?;
-        if metadata.len() != (range_count + u32_count) * 10
+        if metadata.len() != (range_count + u32_count + base_sum_count) * 10
             || alpha_powers.len() != alpha_stride * 2
         {
             return Err("invalid RangeCheck quotient metadata".to_string());
@@ -1173,6 +1219,7 @@ impl MetalShared {
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
+            set_u32(encoder, 11, base_sum_count as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             command_buffer.commit();

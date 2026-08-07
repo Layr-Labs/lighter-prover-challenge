@@ -34,6 +34,15 @@ pub struct RangeCheckQuotientGate {
     pub bit_size: usize,
 }
 
+/// Static wire-layout metadata for `BaseSumGate<B>`: the sum on wire 0 and
+/// `num_limbs` base-`base` limbs after it. Constraints are one Horner
+/// recomposition then one range product per limb.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BaseSumQuotientGate {
+    pub num_limbs: usize,
+    pub base: usize,
+}
+
 /// Static wire-layout metadata for the downstream 32-bit arithmetic gates
 /// supported by the optional quotient backend. Keeping only layout values
 /// here avoids a dependency from `plonky2` back to the circuit crate.
@@ -326,6 +335,11 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
     /// Advertises one of the exact downstream U32 gate layouts to optional
     /// quotient backends. The default leaves unrelated gates on the CPU.
     fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+        None
+    }
+
+    /// Advertises the `BaseSumGate` layout to optional quotient backends.
+    fn base_sum_quotient_gate(&self) -> Option<BaseSumQuotientGate> {
         None
     }
 
