@@ -11,7 +11,7 @@ mod embedded;
 mod prover;
 
 use std::env;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::BufWriter;
 
 use api::{
@@ -20,6 +20,7 @@ use api::{
 };
 use circuit::block::Block;
 use circuit::types::config::F;
+use memmap2::MmapOptions;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -59,7 +60,11 @@ fn main() {
     // previously ran fully serial on the scored critical path.
     let (block, circuits) = rayon::join(
         || {
-            let json = fs::read(&fixture).expect("cannot read prover fixture");
+            let fixture_file = File::open(&fixture).expect("cannot open prover fixture");
+            // SAFETY: the benchmark owns immutable fixture files for the full
+            // lifetime of this mapping; the mapping is consumed before return.
+            let json = unsafe { MmapOptions::new().map(&fixture_file) }
+                .expect("cannot map prover fixture");
             Block::<F>::from_json_with_empty_txs(
                 &json,
                 HEAVY_TX_PER_PROOF,
