@@ -175,6 +175,19 @@ pub(crate) enum U32QuotientKind {
     /// Degree-5 extension squaring: ten routed words plus ten temporaries
     /// per operation, fifteen rows per operation.
     QuinticSquaring,
+    /// `ExponentiationGate`: `num_ops` carries the power-bit count.
+    Exponentiation,
+    /// `EqualityGate`: `constant_column` is the index, inside the
+    /// constants/sigmas commitment, of the gate's first constant (its "one").
+    Equality {
+        constant_column: usize,
+    },
+    /// `ReducingGate` / `ReducingExtensionGate` at `D == 2`: `num_ops` carries
+    /// the coefficient count and `extension_coeffs` selects whether each
+    /// coefficient occupies one base wire or a full two-wire extension value.
+    Reducing {
+        extension_coeffs: bool,
+    },
     /// Audited random-access layout. The ten-word record stores bits, extra
     /// constants, and the raw constant-column base in its final three words.
     RandomAccess {
@@ -506,10 +519,10 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
     }
 }
 
-/// Starts one whole-domain kernel which evaluates every advertised RangeCheck,
-/// width-generic integer, byte, quintic, and audited random-access gate, applies
-/// each selector filter, and reduces the shared constraint rows with the same
-/// two alpha challenges as the CPU quotient.
+/// Starts one whole-domain kernel which evaluates every advertised RangeCheck
+/// and promoted arithmetic gate, applies each gate's selector filter, and
+/// reduces the shared constraint rows with the same two alpha challenges as
+/// the CPU quotient.
 pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     wires: &MetalColumns<F>,
     constants: &MetalColumns<F>,
@@ -656,6 +669,48 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                     spec.num_ops.checked_mul(20)?,
                     spec.num_ops.checked_mul(15)?,
                 ),
+                // Wire 0 is the base, wires 1..=n the power bits, wire 1+n the
+                // output and wires 2+n..2+2n the running intermediate values.
+                U32QuotientKind::Exponentiation => (
+                    6usize,
+                    0usize,
+                    0usize,
+                    0usize,
+                    spec.num_ops.checked_mul(2)?.checked_add(2)?,
+                    spec.num_ops.checked_add(1)?,
+                ),
+                // Three routed words per operation (x, y, equal) followed by
+                // three unrouted temporaries (diff, invdiff, prod). The
+                // constants column travels in the addend-count slot.
+                U32QuotientKind::Equality { constant_column } => {
+                    if constant_column >= constants.cols {
+                        return None;
+                    }
+                    (
+                        7usize,
+                        constant_column,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_mul(6)?,
+                        spec.num_ops.checked_mul(4)?,
+                    )
+                }
+                // Output, alpha and old accumulator take two wires each, then
+                // one or two wires per coefficient, then one accumulator per
+                // step except the last (which aliases the output wires).
+                U32QuotientKind::Reducing { extension_coeffs } => {
+                    let coeff_wires = if extension_coeffs { 2usize } else { 1usize };
+                    (
+                        8usize,
+                        extension_coeffs as usize,
+                        0usize,
+                        0usize,
+                        spec.num_ops
+                            .checked_mul(coeff_wires.checked_add(2)?)?
+                            .checked_add(4)?,
+                        spec.num_ops.checked_mul(2)?,
+                    )
+                }
                 U32QuotientKind::RandomAccess {
                     bits,
                     num_extra_constants,
@@ -680,7 +735,14 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                     if constant_base.checked_add(num_extra_constants)? > constants.cols {
                         return None;
                     }
-                    (6usize, bits, num_extra_constants, constant_base, wire_count, num_constraints)
+                    (
+                        9usize,
+                        bits,
+                        num_extra_constants,
+                        constant_base,
+                        wire_count,
+                        num_constraints,
+                    )
                 }
             };
         if wire_count > wires.cols
@@ -2715,15 +2777,12 @@ mod tests {
         }
     }
 
-    // Differential coverage for the byte-decomposition and EdDSA quintic
-    // gates evaluated in the same union job as production RangeCheck,
-    // width-generic subtraction and add-many specs. Wire columns mix random
-    // canonical values with a rotating window of the twelve raw boundary
-    // representatives (including noncanonical encodings at and above the
-    // field order) from the packed-field differential suite, so every kernel
-    // operation sees the carry-boundary cases.
+    // All-kind differential for every promoted gate family in one union job.
+    // Wire and raw local-constant columns mix random canonical values with the
+    // packed-field suite's twelve raw boundary representatives, including
+    // noncanonical encodings at and above the field order.
     #[test]
-    fn metal_byte_and_quintic_gate_quotient_matches_cpu() {
+    fn metal_all_promoted_gate_quotients_match_cpu() {
         type F = GoldilocksField;
         const WIRE_COLUMNS: usize = 136;
         const QUOTIENT_ROWS: usize = 64;
@@ -2737,10 +2796,15 @@ mod tests {
 
         let context = shared_context().expect("Metal context must initialize");
         let alphas = [F::from_canonical_u64(13), F::from_canonical_u64(17)];
+        // Sixteen selector columns are followed by two raw local constants.
+        // Equality reads raw constant zero; the RA4/RA6 layouts use both.
+        const RAW_CONSTANT_BASE: usize = 16;
 
-        // Production shapes for the 136-wire / 80-routed ranked config. This
-        // one random-invalid job contains every current promoted kind, plus
-        // every audited RandomAccess tuple.
+        // Production shapes for the 136-wire / 80-routed ranked config: the
+        // ByteDecompositionGate ships as (num_limbs 8, num_ops 3); the
+        // quintic gates as 5 and 6 operations. The smaller byte shapes,
+        // RangeCheck, subtraction and add-many specs exercise the union
+        // reduction across all live kinds.
         let mut shapes = vec![
             (
                 3,
@@ -2769,9 +2833,33 @@ mod tests {
                     num_carry_limbs: 2,
                 }),
             ),
+            // Production shapes for the gates matched by type in the prover:
+            // 67 power bits, 22 equality operations, and the two reducing
+            // flavours at the coefficient counts that fill 136 wires.
+            (
+                (WIRE_COLUMNS - 2) / 2,
+                UnionShape::U32(U32QuotientKind::Exponentiation),
+            ),
+            (
+                WIRE_COLUMNS / 6,
+                UnionShape::U32(U32QuotientKind::Equality {
+                    constant_column: RAW_CONSTANT_BASE,
+                }),
+            ),
+            (
+                (WIRE_COLUMNS - 4) / 3,
+                UnionShape::U32(U32QuotientKind::Reducing {
+                    extension_coeffs: false,
+                }),
+            ),
+            (
+                (WIRE_COLUMNS - 4) / 4,
+                UnionShape::U32(U32QuotientKind::Reducing {
+                    extension_coeffs: true,
+                }),
+            ),
             (3, UnionShape::U32(U32QuotientKind::Arithmetic)),
         ];
-        let raw_constant_base = shapes.len() + 3;
         for (bits, num_ops, num_extra_constants) in
             [(3usize, 8usize, 0usize), (4, 4, 2), (6, 1, 2)]
         {
@@ -2780,11 +2868,11 @@ mod tests {
                 UnionShape::U32(U32QuotientKind::RandomAccess {
                     bits,
                     num_extra_constants,
-                    constant_base: raw_constant_base,
+                    constant_base: RAW_CONSTANT_BASE,
                 }),
             ));
         }
-        assert_eq!(shapes.len(), raw_constant_base);
+        assert_eq!(shapes.len(), RAW_CONSTANT_BASE);
 
         let mut range_specs = Vec::new();
         let mut u32_specs = Vec::new();
@@ -2839,7 +2927,7 @@ mod tests {
                 .allocate_columns::<F>(full_rows, WIRE_COLUMNS)
                 .expect("wire columns must allocate");
             let mut constants = context
-                .allocate_columns::<F>(full_rows, shapes.len() + 2)
+                .allocate_columns::<F>(full_rows, RAW_CONSTANT_BASE + 2)
                 .expect("constant columns must allocate");
             let mut rng = StdRng::seed_from_u64(0x0b17_0000 + step as u64);
             for (column_index, column) in wires
@@ -3097,6 +3185,83 @@ mod tests {
                             }
                             assert_eq!(constraints.len(), spec.num_ops * 15);
                         }
+                        U32QuotientKind::Exponentiation => {
+                            let num_power_bits = spec.num_ops;
+                            let exponent_base = wire(0);
+                            for i in 0..num_power_bits {
+                                let previous = if i == 0 {
+                                    F::ONE
+                                } else {
+                                    let last = wire(2 + num_power_bits + i - 1);
+                                    last * last
+                                };
+                                let current_bit = wire(1 + (num_power_bits - i - 1));
+                                constraints.push(
+                                    previous
+                                        * (current_bit * exponent_base
+                                            + (F::ONE - current_bit))
+                                        - wire(2 + num_power_bits + i),
+                                );
+                            }
+                            constraints.push(
+                                wire(1 + num_power_bits) - wire(1 + 2 * num_power_bits),
+                            );
+                            assert_eq!(constraints.len(), num_power_bits + 1);
+                        }
+                        U32QuotientKind::Equality { constant_column } => {
+                            let const_0 = constants.col(constant_column)[source_row];
+                            for op in 0..spec.num_ops {
+                                let temporary = 3 * spec.num_ops + 3 * op;
+                                let difference = wire(temporary);
+                                let product = wire(temporary + 2);
+                                constraints.push((wire(3 * op) - wire(3 * op + 1)) - difference);
+                                constraints
+                                    .push(difference * wire(temporary + 1) - product);
+                                constraints.push(product * difference - difference);
+                                constraints.push((const_0 - product) - wire(3 * op + 2));
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * 4);
+                        }
+                        U32QuotientKind::Reducing { extension_coeffs } => {
+                            // Quadratic Goldilocks extension: x^2 = 7.
+                            assert_eq!(
+                                <F as crate::field::extension::Extendable<2>>::W,
+                                F::from_canonical_u64(7),
+                                "the kernel hard-codes the quadratic extension modulus"
+                            );
+                            let w = F::from_canonical_u64(7);
+                            let coeff_wires = if extension_coeffs { 2 } else { 1 };
+                            let coeff_start = 6;
+                            let acc_start = coeff_start + spec.num_ops * coeff_wires;
+                            let alpha_0 = wire(2);
+                            let alpha_1 = wire(3);
+                            let mut acc_0 = wire(4);
+                            let mut acc_1 = wire(5);
+                            for i in 0..spec.num_ops {
+                                let next_start = if i + 1 == spec.num_ops {
+                                    0
+                                } else {
+                                    acc_start + 2 * i
+                                };
+                                let next_0 = wire(next_start);
+                                let next_1 = wire(next_start + 1);
+                                let coeff_wire = coeff_start + i * coeff_wires;
+                                let coeff_0 = wire(coeff_wire);
+                                let coeff_1 = if extension_coeffs {
+                                    wire(coeff_wire + 1)
+                                } else {
+                                    F::ZERO
+                                };
+                                constraints.push(
+                                    acc_0 * alpha_0 + w * acc_1 * alpha_1 + coeff_0 - next_0,
+                                );
+                                constraints
+                                    .push(acc_0 * alpha_1 + acc_1 * alpha_0 + coeff_1 - next_1);
+                                acc_0 = next_0;
+                                acc_1 = next_1;
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * 2);
+                        }
                         U32QuotientKind::Arithmetic => {
                             for op in 0..spec.num_ops {
                                 let routed = 6 * op;
@@ -3153,8 +3318,9 @@ mod tests {
                                 }
                                 constraints.push(reconstructed_index - wire(copy_base));
 
-                                let mut items =
-                                    (0..vec_size).map(|i| wire(copy_base + 2 + i)).collect::<Vec<_>>();
+                                let mut items = (0..vec_size)
+                                    .map(|i| wire(copy_base + 2 + i))
+                                    .collect::<Vec<_>>();
                                 let mut level_size = vec_size;
                                 for i in 0..bits {
                                     let b = wire(bit_base + copy * bits + i);
