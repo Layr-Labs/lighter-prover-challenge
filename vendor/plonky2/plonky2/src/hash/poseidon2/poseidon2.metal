@@ -388,10 +388,13 @@ inline void range_check_gate_emit(
 //   then two unused words that keep both record kinds the same stride.
 // It is followed by U32-family records with the same five selector words, then:
 //   kind (arithmetic=0, subtraction=1, add-many=2, byte-decomposition=3,
-//   quintic-multiplication=4, quintic-squaring=5), operation count,
-//   addend count (byte-limb count for byte decomposition, zero except for
-//   add-many), base-4 result limbs, and carry limbs (zero except for
-//   add-many).
+//   quintic-multiplication=4, quintic-squaring=5, random-access=6,
+//   exponentiation=7, base-sum=8), operation count,
+//   addend count (byte-limb count for byte decomposition, index-bit count
+//   for random access, exponent-bit count for exponentiation, limb count
+//   for base-sum, zero otherwise), base-4 result limbs (extra-constant
+//   count for random access, recomposition base for base-sum), and carry
+//   limbs (the constants-column offset for random access, zero otherwise).
 // The result-limb count is what makes the subtraction and add-many branches
 // width-generic: a `2 * result_limbs`-bit word recomposes from that many
 // base-4 limbs and its overflow weight is `1 << (2 * result_limbs)`, which
@@ -771,7 +774,7 @@ kernel void range_check_gate_quotient(
                         constraint_index++);
                 }
             }
-        } else {
+        } else if (kind == 5u) {
             // QuinticSquaringGate: ten routed words per operation (input
             // limbs a then output limbs c) plus ten temporary wires. Each
             // constraint checks one accumulation step of the squaring
@@ -859,6 +862,170 @@ kernel void range_check_gate_quotient(
                 range_check_gate_emit(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[1]), a[3]), extra[9]), c[4]),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 6u) {
+            // RandomAccessGate: per copy, an access index, the claimed
+            // element and a 2^bits-entry list of routed wires; the shared
+            // extra-constant mirror block follows the copies, then `bits`
+            // index-bit wires per copy. Constraint order matches the CPU
+            // accumulate override exactly: per copy the bit boolean
+            // checks, the index recomposition, then the selected-element
+            // check; after all copies one row per extra constant.
+            uint bits = num_addends;
+            uint num_extra_constants = result_limbs;
+            uint constants_offset = num_carry_limbs;
+            uint vec_size = 1u << bits;
+            uint routed_per_copy = 2u + vec_size;
+            uint extra_base = routed_per_copy * num_ops;
+            uint bit_base = extra_base + num_extra_constants;
+            for (uint copy = 0; copy < num_ops; ++copy) {
+                ulong routed_base = (ulong)copy * routed_per_copy;
+                ulong copy_bits = (ulong)bit_base + (ulong)copy * bits;
+                for (uint i = 0; i < bits; ++i) {
+                    ulong b = wires[(copy_bits + i) * lde_rows + source_row];
+                    range_check_gate_emit(
+                        gl_mul(b, gl_sub(b, 1)),
+                        alpha_powers,
+                        alpha_stride,
+                        gate_accumulators,
+                        constraint_index++);
+                }
+                ulong reconstructed = 0;
+                for (uint remaining = bits; remaining > 0u; --remaining) {
+                    uint i = remaining - 1u;
+                    ulong b = wires[(copy_bits + i) * lde_rows + source_row];
+                    reconstructed =
+                        gl_add(gl_add(reconstructed, reconstructed), b);
+                }
+                ulong access_index = wires[routed_base * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(reconstructed, access_index),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+
+                // The selector-tree fold x + b*(y - x) per level, evaluated
+                // depth-first so the live set stays at `bits + 1` partial
+                // values for any list size (production uses bits 3, 4, 6).
+                // Every field operation is exact mod p, so the depth-first
+                // walk produces the same residue as the CPU's
+                // level-by-level fold; combines at tree level L consume
+                // index bit L, exactly like the CPU pass over that level.
+                ulong stack_value[7];
+                uint stack_level[7];
+                uint stack_len = 0;
+                for (uint leaf = 0; leaf < vec_size; ++leaf) {
+                    ulong value =
+                        wires[(routed_base + 2u + leaf) * lde_rows + source_row];
+                    uint level = 0;
+                    while (stack_len > 0u
+                           && stack_level[stack_len - 1u] == level) {
+                        ulong x = stack_value[--stack_len];
+                        ulong b =
+                            wires[(copy_bits + level) * lde_rows + source_row];
+                        value = gl_add(x, gl_mul(b, gl_sub(value, x)));
+                        ++level;
+                    }
+                    stack_value[stack_len] = value;
+                    stack_level[stack_len] = level;
+                    ++stack_len;
+                }
+                ulong claimed =
+                    wires[(routed_base + 1u) * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(stack_value[0], claimed),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+            }
+            for (uint i = 0; i < num_extra_constants; ++i) {
+                ulong constant_value = constants[
+                    (ulong)(constants_offset + i) * lde_rows + source_row];
+                ulong mirror =
+                    wires[(ulong)(extra_base + i) * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(constant_value, mirror),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 7u) {
+            // ExponentiationGate (one operation per row): wire 0 is the
+            // base, wires 1..=num_power_bits the little-endian exponent
+            // bits, wire num_power_bits + 1 the output, then one
+            // intermediate value per bit. Constraint i checks intermediate
+            // i against the square of its predecessor times the selected
+            // multiplicand, consuming exponent bits in big-endian order;
+            // the final row checks the output against the last
+            // intermediate.
+            uint num_power_bits = num_addends;
+            ulong base_wire = wires[source_row];
+            ulong prev = 1;
+            for (uint i = 0; i < num_power_bits; ++i) {
+                if (i != 0u) {
+                    ulong prev_intermediate = wires[
+                        (ulong)(1u + num_power_bits + i) * lde_rows + source_row];
+                    prev = gl_mul(prev_intermediate, prev_intermediate);
+                }
+                ulong cur_bit =
+                    wires[(ulong)(num_power_bits - i) * lde_rows + source_row];
+                ulong mul_by =
+                    gl_add(gl_mul(cur_bit, base_wire), gl_sub(1, cur_bit));
+                ulong intermediate = wires[
+                    (ulong)(2u + num_power_bits + i) * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(gl_mul(prev, mul_by), intermediate),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+            }
+            ulong output =
+                wires[(ulong)(1u + num_power_bits) * lde_rows + source_row];
+            ulong last = wires[
+                (ulong)(1u + 2u * num_power_bits) * lde_rows + source_row];
+            range_check_gate_emit(
+                gl_sub(output, last),
+                alpha_powers,
+                alpha_stride,
+                gate_accumulators,
+                constraint_index++);
+        } else if (kind == 8u) {
+            // BaseSumGate (one operation per row): wire 0 is the sum,
+            // wires 1..=num_limbs the little-endian limbs. Row 0 checks
+            // the base-`base` recomposition (highest limb first); row
+            // 1 + j range-checks limb j with the ascending product
+            // (limb - 0)(limb - 1)...(limb - base + 1), exactly the CPU
+            // specialization's factor order.
+            uint num_limbs = num_addends;
+            ulong sum_base = result_limbs;
+            ulong computed = 0;
+            for (uint remaining = num_limbs; remaining > 0u; --remaining) {
+                ulong limb = wires[(ulong)remaining * lde_rows + source_row];
+                computed = gl_add(gl_mul(computed, sum_base), limb);
+            }
+            ulong sum = wires[source_row];
+            range_check_gate_emit(
+                gl_sub(computed, sum),
+                alpha_powers,
+                alpha_stride,
+                gate_accumulators,
+                constraint_index++);
+            for (uint j = 0; j < num_limbs; ++j) {
+                ulong limb = wires[(ulong)(1u + j) * lde_rows + source_row];
+                ulong product = limb;
+                for (ulong i = 1; i < sum_base; ++i) {
+                    product = gl_mul(product, gl_sub(limb, i));
+                }
+                range_check_gate_emit(
+                    product,
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
                     constraint_index++);
             }
         }

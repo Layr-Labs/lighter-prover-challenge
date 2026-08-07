@@ -1159,6 +1159,78 @@ fn start_gpu_range_check_gate_quotient<
                     num_ops.checked_mul(20)?,
                     num_ops.checked_mul(15)?,
                 ),
+                U32QuotientGate::RandomAccess {
+                    num_copies,
+                    bits,
+                    num_extra_constants,
+                } => {
+                    // The kernel evaluates the 2^bits-entry selector tree
+                    // with a depth-first stack of `bits + 1` registers;
+                    // bits 1..=6 covers every production shape (3, 4, 6).
+                    if bits == 0 || bits > 6 || num_copies == 0 {
+                        if gpu_poseidon_quotient_diagnostics_enabled() {
+                            eprintln!(
+                                "[gpu-range-quotient] invalid random-access metadata: {u32_gate:?}"
+                            );
+                        }
+                        return None;
+                    }
+                    let vec_size = 1usize << bits;
+                    // The gate-visible constant columns follow the selector
+                    // columns in the shared constants commitment (the union
+                    // guard already rejects lookup circuits).
+                    let constants_offset = common_data.selectors_info.num_selectors()
+                        + common_data.num_lookup_selectors;
+                    (
+                        U32QuotientKind::RandomAccess {
+                            bits,
+                            num_extra_constants,
+                            constants_offset,
+                        },
+                        num_copies,
+                        num_copies
+                            .checked_mul(vec_size.checked_add(2)?.checked_add(bits)?)?
+                            .checked_add(num_extra_constants)?,
+                        num_copies
+                            .checked_mul(bits.checked_add(2)?)?
+                            .checked_add(num_extra_constants)?,
+                    )
+                }
+                U32QuotientGate::Exponentiation { num_power_bits } => {
+                    if num_power_bits == 0 {
+                        if gpu_poseidon_quotient_diagnostics_enabled() {
+                            eprintln!(
+                                "[gpu-range-quotient] invalid exponentiation metadata: {u32_gate:?}"
+                            );
+                        }
+                        return None;
+                    }
+                    // One operation per row: the base wire, `num_power_bits`
+                    // exponent bits, the output, then the intermediates.
+                    (
+                        U32QuotientKind::Exponentiation { num_power_bits },
+                        1,
+                        num_power_bits.checked_mul(2)?.checked_add(2)?,
+                        num_power_bits.checked_add(1)?,
+                    )
+                }
+                U32QuotientGate::BaseSum { num_limbs, base } => {
+                    if num_limbs == 0 || base < 2 || base > 8 {
+                        if gpu_poseidon_quotient_diagnostics_enabled() {
+                            eprintln!(
+                                "[gpu-range-quotient] invalid base-sum metadata: {u32_gate:?}"
+                            );
+                        }
+                        return None;
+                    }
+                    // One operation per row: the sum wire then the limbs.
+                    (
+                        U32QuotientKind::BaseSum { num_limbs, base },
+                        1,
+                        num_limbs.checked_add(1)?,
+                        num_limbs.checked_add(1)?,
+                    )
+                }
             };
             if num_ops == 0
                 || gate.0.num_wires() != expected_wires

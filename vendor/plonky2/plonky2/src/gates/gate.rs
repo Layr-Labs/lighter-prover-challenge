@@ -69,6 +69,24 @@ pub enum U32QuotientGate {
     /// words (input and output limbs) plus ten temporary wires per
     /// operation, fifteen constraint rows per operation.
     QuinticSquaring { num_ops: usize },
+    /// Random-access list checks: `num_copies` copies each open one
+    /// `2^bits`-entry routed list with an index and claimed element, plus
+    /// `num_extra_constants` trailing routed constant mirrors and `bits`
+    /// non-routed index-bit wires per copy;
+    /// `num_copies * (bits + 2) + num_extra_constants` constraint rows.
+    RandomAccess {
+        num_copies: usize,
+        bits: usize,
+        num_extra_constants: usize,
+    },
+    /// Square-and-multiply exponentiation: one operation per row over
+    /// `num_power_bits` exponent bits with as many intermediate wires,
+    /// `num_power_bits + 1` constraint rows.
+    Exponentiation { num_power_bits: usize },
+    /// Little-endian base-`base` decomposition of one sum wire into
+    /// `num_limbs` limb wires; one operation per row, `1 + num_limbs`
+    /// constraint rows.
+    BaseSum { num_limbs: usize, base: usize },
 }
 
 /// A custom gate.

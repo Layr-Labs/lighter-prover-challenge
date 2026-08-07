@@ -530,6 +530,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
             .map(|i| (i, self.wire_extra_constant(i)))
             .collect()
     }
+
+    fn u32_quotient_gate(&self) -> Option<crate::gates::gate::U32QuotientGate> {
+        Some(crate::gates::gate::U32QuotientGate::RandomAccess {
+            num_copies: self.num_copies,
+            bits: self.bits,
+            num_extra_constants: self.num_extra_constants,
+        })
+    }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>

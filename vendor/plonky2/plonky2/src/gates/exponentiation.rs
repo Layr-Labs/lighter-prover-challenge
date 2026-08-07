@@ -215,6 +215,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for Exponentiation
     fn num_constraints(&self) -> usize {
         self.num_power_bits + 1
     }
+
+    fn u32_quotient_gate(&self) -> Option<crate::gates::gate::U32QuotientGate> {
+        Some(crate::gates::gate::U32QuotientGate::Exponentiation {
+            num_power_bits: self.num_power_bits,
+        })
+    }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>

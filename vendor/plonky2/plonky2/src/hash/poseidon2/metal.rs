@@ -175,6 +175,27 @@ pub(crate) enum U32QuotientKind {
     /// Degree-5 extension squaring: ten routed words plus ten temporaries
     /// per operation, fifteen rows per operation.
     QuinticSquaring,
+    /// Random-access list checks: `2 + 2^bits` routed wires per copy, the
+    /// shared extra-constant mirror block, then `bits` index-bit wires per
+    /// copy; `bits + 2` rows per copy plus one row per extra constant.
+    /// `constants_offset` locates the gate-visible constant columns (after
+    /// the selector columns) inside the shared constants commitment.
+    RandomAccess {
+        bits: usize,
+        num_extra_constants: usize,
+        constants_offset: usize,
+    },
+    /// Square-and-multiply exponentiation over `num_power_bits` exponent
+    /// bits; one operation per row, `num_power_bits + 1` rows.
+    Exponentiation {
+        num_power_bits: usize,
+    },
+    /// Little-endian base-`base` recomposition of `num_limbs` limbs; one
+    /// operation per row, `1 + num_limbs` rows.
+    BaseSum {
+        num_limbs: usize,
+        base: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -649,6 +670,67 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                     spec.num_ops.checked_mul(20)?,
                     spec.num_ops.checked_mul(15)?,
                 ),
+                // The index-bit count rides in the addend-count metadata
+                // word, the extra-constant count in the result-limb word
+                // and the constants-column offset in the carry-limb word.
+                U32QuotientKind::RandomAccess {
+                    bits,
+                    num_extra_constants,
+                    constants_offset,
+                } => {
+                    if bits == 0
+                        || bits > 6
+                        || constants_offset
+                            .checked_add(num_extra_constants)
+                            .map_or(true, |end| end > constants.cols)
+                    {
+                        return None;
+                    }
+                    let vec_size = 1usize << bits;
+                    let per_copy = vec_size.checked_add(2)?.checked_add(bits)?;
+                    (
+                        6usize,
+                        bits,
+                        num_extra_constants,
+                        constants_offset,
+                        spec.num_ops
+                            .checked_mul(per_copy)?
+                            .checked_add(num_extra_constants)?,
+                        spec.num_ops
+                            .checked_mul(bits.checked_add(2)?)?
+                            .checked_add(num_extra_constants)?,
+                    )
+                }
+                // One operation per row; the exponent-bit count rides in
+                // the addend-count word.
+                U32QuotientKind::Exponentiation { num_power_bits } => {
+                    if num_power_bits == 0 || spec.num_ops != 1 {
+                        return None;
+                    }
+                    (
+                        7usize,
+                        num_power_bits,
+                        0usize,
+                        0usize,
+                        num_power_bits.checked_mul(2)?.checked_add(2)?,
+                        num_power_bits.checked_add(1)?,
+                    )
+                }
+                // One operation per row; the limb count rides in the
+                // addend-count word and the base in the result-limb word.
+                U32QuotientKind::BaseSum { num_limbs, base } => {
+                    if num_limbs == 0 || base < 2 || base > 8 || spec.num_ops != 1 {
+                        return None;
+                    }
+                    (
+                        8usize,
+                        num_limbs,
+                        base,
+                        0usize,
+                        num_limbs.checked_add(1)?,
+                        num_limbs.checked_add(1)?,
+                    )
+                }
             };
         if wire_count > wires.cols
             || spec.selector_column >= constants.cols
@@ -2693,6 +2775,10 @@ mod tests {
         const WIRE_COLUMNS: usize = 136;
         const QUOTIENT_ROWS: usize = 64;
         const ALPHA_OFFSET: usize = 19;
+        // One selector column per union spec below, then the shared
+        // extra-constant columns the random-access shapes mirror.
+        const SELECTOR_COLUMNS: usize = 14;
+        const EXTRA_CONSTANT_COLUMNS: usize = 2;
 
         #[derive(Clone, Copy)]
         enum UnionShape {
@@ -2736,7 +2822,52 @@ mod tests {
                     num_carry_limbs: 2,
                 }),
             ),
+            (
+                4,
+                UnionShape::U32(U32QuotientKind::RandomAccess {
+                    bits: 4,
+                    num_extra_constants: 2,
+                    constants_offset: SELECTOR_COLUMNS,
+                }),
+            ),
+            (
+                8,
+                UnionShape::U32(U32QuotientKind::RandomAccess {
+                    bits: 3,
+                    num_extra_constants: 0,
+                    constants_offset: SELECTOR_COLUMNS,
+                }),
+            ),
+            (
+                1,
+                UnionShape::U32(U32QuotientKind::RandomAccess {
+                    bits: 6,
+                    num_extra_constants: 2,
+                    constants_offset: SELECTOR_COLUMNS,
+                }),
+            ),
+            (
+                1,
+                UnionShape::U32(U32QuotientKind::Exponentiation {
+                    num_power_bits: 67,
+                }),
+            ),
+            (
+                1,
+                UnionShape::U32(U32QuotientKind::BaseSum {
+                    num_limbs: 63,
+                    base: 2,
+                }),
+            ),
+            (
+                1,
+                UnionShape::U32(U32QuotientKind::BaseSum {
+                    num_limbs: 16,
+                    base: 4,
+                }),
+            ),
         ];
+        assert_eq!(shapes.len(), SELECTOR_COLUMNS);
 
         let mut range_specs = Vec::new();
         let mut u32_specs = Vec::new();
@@ -2791,7 +2922,10 @@ mod tests {
                 .allocate_columns::<F>(full_rows, WIRE_COLUMNS)
                 .expect("wire columns must allocate");
             let mut constants = context
-                .allocate_columns::<F>(full_rows, shapes.len())
+                .allocate_columns::<F>(
+                    full_rows,
+                    SELECTOR_COLUMNS + EXTRA_CONSTANT_COLUMNS,
+                )
                 .expect("selector columns must allocate");
             let mut rng = StdRng::seed_from_u64(0x0b17_0000 + step as u64);
             for (column_index, column) in wires
@@ -2829,6 +2963,19 @@ mod tests {
                             1 => F::from_canonical_usize(other_gate),
                             2 => F::from_canonical_usize(UNUSED_SELECTOR),
                             _ => F::from_canonical_u64(rng.next_u64() % F::ORDER),
+                        };
+                    }
+                }
+                // The shared extra-constant columns read by the
+                // random-access shapes: raw boundary representatives on a
+                // stride, random canonical values elsewhere.
+                for extra in 0..EXTRA_CONSTANT_COLUMNS {
+                    let column = &mut selector_columns[SELECTOR_COLUMNS + extra];
+                    for row in 0..full_rows {
+                        column[row] = if (row + extra) % 3 == 0 {
+                            GoldilocksField(boundary[(row + 5 * extra) % boundary.len()])
+                        } else {
+                            F::from_canonical_u64(rng.next_u64() % F::ORDER)
                         };
                     }
                 }
@@ -3032,6 +3179,90 @@ mod tests {
                                 constraints.push((two * a[1] * a[3] + extra[9]) - c[4]);
                             }
                             assert_eq!(constraints.len(), spec.num_ops * 15);
+                        }
+                        U32QuotientKind::RandomAccess {
+                            bits,
+                            num_extra_constants,
+                            constants_offset,
+                        } => {
+                            let vec_size = 1 << bits;
+                            let routed_per_copy = 2 + vec_size;
+                            let extra_base = routed_per_copy * spec.num_ops;
+                            let bit_base = extra_base + num_extra_constants;
+                            for copy in 0..spec.num_ops {
+                                let routed = routed_per_copy * copy;
+                                let copy_bits = bit_base + bits * copy;
+                                for i in 0..bits {
+                                    let b = wire(copy_bits + i);
+                                    constraints.push(b * (b - F::ONE));
+                                }
+                                let mut reconstructed = F::ZERO;
+                                for i in (0..bits).rev() {
+                                    reconstructed =
+                                        reconstructed.double() + wire(copy_bits + i);
+                                }
+                                constraints.push(reconstructed - wire(routed));
+                                // Reference fold: level by level, exactly the
+                                // CPU accumulate order (the kernel walks the
+                                // same tree depth-first).
+                                let mut items = (0..vec_size)
+                                    .map(|i| wire(routed + 2 + i))
+                                    .collect::<Vec<_>>();
+                                for i in 0..bits {
+                                    let b = wire(copy_bits + i);
+                                    items = items
+                                        .chunks_exact(2)
+                                        .map(|pair| pair[0] + b * (pair[1] - pair[0]))
+                                        .collect();
+                                }
+                                constraints.push(items[0] - wire(routed + 1));
+                            }
+                            for i in 0..num_extra_constants {
+                                let constant =
+                                    constants.col(constants_offset + i)[source_row];
+                                constraints.push(constant - wire(extra_base + i));
+                            }
+                            assert_eq!(
+                                constraints.len(),
+                                spec.num_ops * (bits + 2) + num_extra_constants
+                            );
+                        }
+                        U32QuotientKind::Exponentiation { num_power_bits } => {
+                            let base = wire(0);
+                            for i in 0..num_power_bits {
+                                let prev = if i == 0 {
+                                    F::ONE
+                                } else {
+                                    let value = wire(1 + num_power_bits + i);
+                                    value * value
+                                };
+                                let cur_bit = wire(num_power_bits - i);
+                                let computed =
+                                    prev * (cur_bit * base + (F::ONE - cur_bit));
+                                constraints
+                                    .push(computed - wire(2 + num_power_bits + i));
+                            }
+                            constraints.push(
+                                wire(1 + num_power_bits) - wire(1 + 2 * num_power_bits),
+                            );
+                            assert_eq!(constraints.len(), num_power_bits + 1);
+                        }
+                        U32QuotientKind::BaseSum { num_limbs, base } => {
+                            let base_f = F::from_canonical_usize(base);
+                            let mut computed = F::ZERO;
+                            for j in (0..num_limbs).rev() {
+                                computed = computed * base_f + wire(1 + j);
+                            }
+                            constraints.push(computed - wire(0));
+                            for j in 0..num_limbs {
+                                let limb = wire(1 + j);
+                                constraints.push(
+                                    (0..base)
+                                        .map(|i| limb - F::from_canonical_usize(i))
+                                        .product(),
+                                );
+                            }
+                            assert_eq!(constraints.len(), 1 + num_limbs);
                         }
                         U32QuotientKind::Arithmetic => {
                             unreachable!("not exercised by this test");
