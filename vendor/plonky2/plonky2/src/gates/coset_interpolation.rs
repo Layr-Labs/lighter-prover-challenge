@@ -84,8 +84,9 @@ impl<F: RichField + Extendable<D>, const D: usize> CosetInterpolationGate<F, D> 
         let degree = (n_points - 2) / (n_intermediates + 1) + 2;
 
         let barycentric_weights = barycentric_weights(
-            &F::two_adic_subgroup(subgroup_bits)
-                .into_iter()
+            &crate::field::fft::cached_two_adic_subgroup::<F>(subgroup_bits)
+                .iter()
+                .copied()
                 .map(|x| (x, F::ZERO))
                 .collect::<Vec<_>>(),
         );
@@ -212,7 +213,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
             (evaluation_point - shifted_evaluation_point.scalar_mul(shift)).to_basefield_array(),
         );
 
-        let domain = F::two_adic_subgroup(self.subgroup_bits);
+        let domain = crate::field::fft::cached_two_adic_subgroup::<F>(self.subgroup_bits);
         let values = (0..self.num_points())
             .map(|i| vars.get_local_ext_algebra(self.wires_value(i)))
             .collect::<Vec<_>>();
@@ -412,7 +413,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
                 .to_ext_target_array(),
         );
 
-        let domain = F::two_adic_subgroup(self.subgroup_bits);
+        let domain = crate::field::fft::cached_two_adic_subgroup::<F>(self.subgroup_bits);
         let values = (0..self.num_points())
             .map(|i| vars.get_local_ext_algebra(self.wires_value(i)))
             .collect::<Vec<_>>();

@@ -175,6 +175,8 @@ pub(crate) struct VanishingScratch<F> {
     pub vanishing_all_lookup_terms: Vec<F>,
     pub lookup_selectors: Vec<F>,
     pub constraint_terms_batch: Vec<F>,
+    /// Reused selector-filter buffer across ~1.1M batches (exakoss / our 16.82 tip).
+    pub gate_filters: Vec<F>,
 }
 
 /// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
@@ -274,7 +276,8 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     beta_k_is: &[F],
     deltas: &[F],
     alphas: &[F],
-    excluded_gate_indices: &[usize],
+    // Ascending CPU survivor indices (fixed for the proof after offload).
+    cpu_gate_indices: &[usize],
     cpu_num_gate_constraints: usize,
     z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
@@ -299,11 +302,12 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     let num_gate_constraints = common_data.num_gate_constraints;
 
-    evaluate_gate_constraints_base_batch_into_excluding_many::<F, D>(
+    evaluate_gate_constraints_base_batch_into_cpu_gates::<F, D>(
         common_data,
         vars_batch,
         &mut scratch.constraint_terms_batch,
-        excluded_gate_indices,
+        cpu_gate_indices,
+        &mut scratch.gate_filters,
         cpu_num_gate_constraints,
     );
     let constraint_terms_batch = &scratch.constraint_terms_batch;
@@ -1050,22 +1054,40 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
     excluded_gate_indices: &[usize],
     num_constraint_rows: usize,
 ) {
-    // Rows at or above `num_constraint_rows` are identically zero once the
-    // excluded gates are gone, and `reduce_gate_constraints_base_batch` walks
-    // rows backwards off a raw-zero seed, so omitting them is raw-limb
-    // identical while deleting both this memset and their Horner passes.
-    debug_assert!(num_constraint_rows <= common_data.num_gate_constraints);
-    debug_assert_eq!(
+    let cpu_gate_indices = (0..common_data.gates.len())
+        .filter(|i| !excluded_gate_indices.contains(i))
+        .collect::<Vec<_>>();
+    let mut filters = Vec::with_capacity(vars_batch.len());
+    evaluate_gate_constraints_base_batch_into_cpu_gates(
+        common_data,
+        vars_batch,
+        constraints_batch,
+        &cpu_gate_indices,
+        &mut filters,
         num_constraint_rows,
-        cpu_gate_constraint_rows(common_data, excluded_gate_indices)
     );
+}
+
+/// Hot path: precomputed ascending survivors + reusable filter scratch.
+pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    vars_batch: EvaluationVarsBaseBatch<F>,
+    constraints_batch: &mut Vec<F>,
+    cpu_gate_indices: &[usize],
+    filters: &mut Vec<F>,
+    num_constraint_rows: usize,
+) {
+    // Rows at or above `num_constraint_rows` are identically zero once the
+    // excluded gates are gone; omitting them is raw-limb identical.
+    debug_assert!(num_constraint_rows <= common_data.num_gate_constraints);
     constraints_batch.clear();
     constraints_batch.resize(num_constraint_rows * vars_batch.len(), F::ZERO);
-    let mut filters = Vec::with_capacity(vars_batch.len());
-    for (i, gate) in common_data.gates.iter().enumerate() {
-        if excluded_gate_indices.contains(&i) {
-            continue;
-        }
+    for &i in cpu_gate_indices {
+        let gate = &common_data.gates[i];
+        debug_assert!(gate.0.num_constraints() <= num_constraint_rows);
         let selector_index = common_data.selectors_info.selector_indices[i];
         gate.0.eval_filtered_base_batch(
             vars_batch,
@@ -1074,7 +1096,7 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
             common_data.selectors_info.groups[selector_index].clone(),
             common_data.selectors_info.num_selectors(),
             common_data.num_lookup_selectors,
-            &mut filters,
+            filters,
             constraints_batch,
         );
     }
