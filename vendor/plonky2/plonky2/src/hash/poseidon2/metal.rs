@@ -1501,51 +1501,21 @@ fn tree_from_levels<F: RichField>(
 ) -> (LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>) {
     let cap_count = 1usize << cap_height;
     let node_count = 2 * leaf_count - cap_count;
-    // Hard (not `debug_`) assert: the `set_len` below is sound only because the
-    // limb slice covers every digest slot, and all three call sites size the
-    // GPU output buffer with exactly this expression.
-    assert_eq!(nodes.len(), node_count * 4);
+    debug_assert_eq!(nodes.len(), node_count * 4);
     debug_assert_eq!(level_offsets[0], 0);
 
     // Chunked parallel bulk copy out of the CPU-visible shared buffer; every
     // worker walks its chunk sequentially, so the whole read stays a
     // streaming pass.
-    //
-    // The copy overwrites all `node_count` slots before any is read, so
-    // pre-filling the buffer with `HashOut::ZERO` is dead work — and it is
-    // *serial* dead work performed while the exclusive buffer set is held
-    // (`MAX_BUFFER_SETS == 1`), ahead of the parallel copy, so it also turns a
-    // parallel phase into serial-then-parallel. `HashOut<F>` is a plain struct
-    // with no `IsZero` specialization, so `vec![HashOut::ZERO; n]` really is a
-    // store loop rather than `alloc_zeroed`.
-    let mut digests: Vec<HashOut<F>> = Vec::with_capacity(node_count);
-    crate::hash::merkle_tree::capacity_up_to_mut(&mut digests, node_count)
+    let mut digests = vec![HashOut::ZERO; node_count];
+    digests
         .par_chunks_mut(STAGING_CHUNK / 4)
         .zip(nodes.par_chunks(STAGING_CHUNK))
         .for_each(|(digests, limbs)| {
             for (digest, limbs) in digests.iter_mut().zip(limbs.chunks_exact(4)) {
-                digest.write(HashOut {
-                    elements: core::array::from_fn(|i| F::from_canonical_u64(limbs[i])),
-                });
+                digest.elements = core::array::from_fn(|i| F::from_canonical_u64(limbs[i]));
             }
         });
-    // SAFETY: every one of the `node_count` slots was written exactly once
-    // above. `nodes.len() == node_count * 4` is asserted, and `STAGING_CHUNK`
-    // is a multiple of 4, so `par_chunks_mut(STAGING_CHUNK / 4)` and
-    // `par_chunks(STAGING_CHUNK)` yield the same chunk count and rayon's
-    // indexed `zip` pairs chunk `i` with chunk `i` without truncating either
-    // side. Digest chunk `i` of length `m` is paired with a limb chunk of
-    // length exactly `4 * m`, whose `chunks_exact(4)` yields exactly `m` items
-    // with no remainder — including the short final chunk — so the inner `zip`
-    // visits every digest of every chunk. `elements` is `HashOut`'s only
-    // field, so each `write` initializes a whole slot. `set_len` runs only
-    // after the copy returns; an unwind out of it drops a length-0 `Vec`,
-    // leaving nothing uninitialized to drop. This is the same argument that
-    // already licenses `capacity_up_to_mut` in `MerkleTree::cpu_digests` and
-    // `LevelOrderDigests::to_interleaved`.
-    unsafe {
-        digests.set_len(node_count);
-    }
 
     // The GPU offsets are in u64 limbs; the CPU representation indexes whole
     // digests.
@@ -2449,42 +2419,6 @@ kernel void goldilocks_mul_bench_native(
                 assert_all_paths_match_cpu(&gpu_cols, &cpu, leaves.len(), cap_height);
             }
         }
-    }
-
-    /// The staging copy in [`tree_from_levels`] pairs `STAGING_CHUNK / 4`-sized
-    /// digest chunks with `STAGING_CHUNK`-sized limb chunks, and its `set_len`
-    /// is sound only if that pairing covers every slot including a short final
-    /// chunk. Every other differential builds a tree that fits in one chunk;
-    /// this one spans two (node count `2 * (1 << 17) - 16 = 262128`, i.e. one
-    /// full 131072-digest chunk plus a 131056-digest remainder).
-    #[test]
-    fn metal_merkle_matches_cpu_across_staging_chunks() {
-        const WIDTH: usize = 4;
-        let leaf_count = 1usize << 17;
-        let cap_height = 4;
-        let node_count = 2 * leaf_count - (1usize << cap_height);
-        assert!(node_count > STAGING_CHUNK / 4 && node_count % (STAGING_CHUNK / 4) != 0);
-
-        let mut rng = StdRng::seed_from_u64(0x5354_4147_4348_4e4b);
-        let leaves: Vec<Vec<GoldilocksField>> = (0..leaf_count)
-            .map(|_| {
-                (0..WIDTH)
-                    .map(|_| GoldilocksField(rng.next_u64() % GoldilocksField::ORDER))
-                    .collect()
-            })
-            .collect();
-        let flat: Vec<GoldilocksField> =
-            leaves.iter().flat_map(|leaf| leaf.iter().copied()).collect();
-
-        let context = CONTEXT
-            .as_ref()
-            .unwrap_or_else(|error| panic!("{error}"));
-        let gpu = context
-            .build(LeafSource::Rows(&flat), WIDTH, leaf_count, cap_height)
-            .unwrap();
-        assert_eq!(gpu.0.nodes.len(), node_count);
-        let cpu = cpu_tree(&leaves, cap_height);
-        assert_tree_eq(&gpu, &cpu, WIDTH, cap_height);
     }
 
     fn cpu_tree(

@@ -421,6 +421,24 @@ mod added_gate_tests {
 
 
     #[test]
+    fn evaluate_sequence_accumulate_matches_default() {
+        use crate::delta::evaluate_sequence::EvaluateSequenceGate;
+
+        let gate =
+            EvaluateSequenceGate::new_from_config(&CircuitConfig::standard_recursion_config());
+        assert_accumulate_matches_default(&gate);
+    }
+
+    #[test]
+    fn evaluate_bitstream_accumulate_matches_default() {
+        use crate::blob::evaluate_bitstream::EvaluateBitstreamGate;
+
+        let gate =
+            EvaluateBitstreamGate::new_from_config(&CircuitConfig::standard_recursion_config());
+        assert_accumulate_matches_default(&gate);
+    }
+
+    #[test]
     fn quintic_square_accumulate_matches_default() {
         use crate::eddsa::gates::square_quintic_ext_base::QuinticSquaringGate;
 
