@@ -879,7 +879,7 @@ fn gpu_poseidon_quotient_diagnostics_enabled() -> bool {
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn gpu_poseidon_quotient_differential_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
+    let environment_enabled = *ENABLED.get_or_init(|| {
         [
             "PLONKY2_GPU_POSEIDON_DIFFERENTIAL",
             "PLONKY2_GPU_RANGE_DIFFERENTIAL",
@@ -890,8 +890,21 @@ fn gpu_poseidon_quotient_differential_enabled() -> bool {
                 .map(|value| value != "0")
                 .unwrap_or(false)
         })
-    })
+    });
+    #[cfg(test)]
+    {
+        environment_enabled || COMPARE_GPU_QUOTIENT.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        environment_enabled
+    }
 }
+
+/// Test-only switch for an in-process full GPU/CPU quotient differential.
+#[cfg(all(test, feature = "std", target_arch = "aarch64", target_os = "macos"))]
+pub(crate) static COMPARE_GPU_QUOTIENT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Test-only switch: when set, `compute_quotient_polys` evaluates the quotient
 /// values twice — once through the default column-major (`PolyMajor`)
@@ -903,54 +916,6 @@ fn gpu_poseidon_quotient_differential_enabled() -> bool {
 #[cfg(test)]
 pub(crate) static COMPARE_QUOTIENT_LAYOUTS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-
-/// Diagnostics-only gate census: prints, once per distinct circuit shape, the
-/// full gate list with the wire span / constraint count / degree that decide
-/// both the CPU constraint cost and the `cpu_num_wires` gather floor. Gated on
-/// the same env switch as the rest of the GPU diagnostics, so it is inert in
-/// the ranked sandbox (which clears the environment).
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn gate_census_once<F: RichField + Extendable<D>, const D: usize>(
-    common_data: &CommonCircuitData<F, D>,
-    excluded_gate_indices: &[usize],
-    cpu_num_wires: usize,
-) {
-    use std::collections::HashSet;
-    use std::fmt::Write as _;
-    use std::sync::Mutex;
-
-    static SEEN: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
-
-    let mut report = String::new();
-    let _ = writeln!(
-        report,
-        "[gate-census] degree_bits={} gates={} selectors={} num_gate_constraints={} \
-         gather={cpu_num_wires}/{} excluded={excluded_gate_indices:?}",
-        common_data.degree_bits(),
-        common_data.gates.len(),
-        common_data.selectors_info.num_selectors(),
-        common_data.num_gate_constraints,
-        common_data.config.num_wires,
-    );
-    for (index, gate) in common_data.gates.iter().enumerate() {
-        let _ = writeln!(
-            report,
-            "[gate-census]   {index:>2} wires={:>3} constraints={:>3} degree={} selector={} \
-             off={} id={}",
-            gate.0.num_wires(),
-            gate.0.num_constraints(),
-            gate.0.degree(),
-            common_data.selectors_info.selector_indices[index],
-            excluded_gate_indices.contains(&index) as u8,
-            gate.0.id(),
-        );
-    }
-    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut seen = seen.lock().unwrap();
-    if seen.insert(report.clone()) {
-        eprint!("{report}");
-    }
-}
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn start_gpu_poseidon_gate_quotient<
@@ -1055,23 +1020,13 @@ fn start_gpu_range_check_gate_quotient<
     crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
 )> {
     use core::sync::atomic::Ordering;
-    use crate::gates::equality_base::EqualityGate;
-    use crate::gates::exponentiation::ExponentiationGate;
     use crate::gates::gate::U32QuotientGate;
-    use crate::gates::reducing::ReducingGate;
-    use crate::gates::reducing_extension::ReducingExtensionGate;
     use crate::hash::poseidon2::metal::{
         RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec,
     };
 
     GPU_RANGE_QUOTIENT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-    // `EqualityGate` reads a gate-local constant, whose commitment column is
-    // the selector prefix width; lookup selectors would shift that prefix, so
-    // they are ruled out here alongside the existing lookup guard.
-    if common_data.num_lookup_polys != 0
-        || common_data.num_lookup_selectors != 0
-        || common_data.config.num_challenges != 2
-    {
+    if common_data.num_lookup_polys != 0 || common_data.config.num_challenges != 2 {
         if gpu_poseidon_quotient_diagnostics_enabled() {
             eprintln!(
                 "[gpu-range-quotient] guard rejected: lookups={} challenges={}",
@@ -1082,7 +1037,17 @@ fn start_gpu_range_check_gate_quotient<
     }
 
     let include_unused_selector = common_data.selectors_info.num_selectors() > 1;
+    let raw_constant_base = common_data
+        .selectors_info
+        .num_selectors()
+        .checked_add(common_data.num_lookup_selectors)?;
+    if raw_constant_base > common_data.num_constants {
+        return None;
+    }
     let mut gate_indices = Vec::new();
+    // Random-access gates are excluded from the CPU quotient only after the
+    // combined Metal command has accepted and submitted every metadata record.
+    let mut random_access_gate_indices = Vec::new();
     let mut specs = Vec::new();
     let mut u32_specs = Vec::new();
     for (gate_index, gate) in common_data.gates.iter().enumerate() {
@@ -1217,6 +1182,62 @@ fn start_gpu_range_check_gate_quotient<
                     num_ops.checked_mul(20)?,
                     num_ops.checked_mul(15)?,
                 ),
+                U32QuotientGate::RandomAccess {
+                    bits,
+                    num_ops,
+                    num_extra_constants,
+                } => {
+                    if !matches!(
+                        (bits, num_ops, num_extra_constants),
+                        (3, 8, 0) | (4, 4, 2) | (6, 1, 2)
+                    ) {
+                        if gpu_poseidon_quotient_diagnostics_enabled() {
+                            eprintln!(
+                                "[gpu-range-quotient] unaudited random-access metadata: \
+                                 {u32_gate:?}"
+                            );
+                        }
+                        return None;
+                    }
+                    let vec_size = 1usize.checked_shl(u32::try_from(bits).ok()?)?;
+                    let routed_per_copy = vec_size.checked_add(2)?;
+                    let extra_wire_base = routed_per_copy.checked_mul(num_ops)?;
+                    let routed_wires = extra_wire_base.checked_add(num_extra_constants)?;
+                    let expected_wires = routed_wires.checked_add(num_ops.checked_mul(bits)?)?;
+                    let expected_constraints = num_ops
+                        .checked_mul(bits.checked_add(2)?)?
+                        .checked_add(num_extra_constants)?;
+                    let constant_end = raw_constant_base.checked_add(num_extra_constants)?;
+                    let expected_extra_constant_wires = (0..num_extra_constants)
+                        .map(|i| extra_wire_base.checked_add(i).map(|wire| (i, wire)))
+                        .collect::<Option<Vec<_>>>()?;
+                    if gate.0.num_constants() != num_extra_constants
+                        || gate.0.extra_constant_wires() != expected_extra_constant_wires
+                        || routed_wires > common_data.config.num_routed_wires
+                        || expected_wires > common_data.config.num_wires
+                        || constant_end > common_data.num_constants
+                    {
+                        if gpu_poseidon_quotient_diagnostics_enabled() {
+                            eprintln!(
+                                "[gpu-range-quotient] random-access layout mismatch \
+                                 gate={gate_index} metadata={u32_gate:?} constants={} \
+                                 expected_constants={num_extra_constants}",
+                                gate.0.num_constants(),
+                            );
+                        }
+                        return None;
+                    }
+                    (
+                        U32QuotientKind::RandomAccess {
+                            bits,
+                            num_extra_constants,
+                            constant_base: raw_constant_base,
+                        },
+                        num_ops,
+                        expected_wires,
+                        expected_constraints,
+                    )
+                }
             };
             if num_ops == 0
                 || gate.0.num_wires() != expected_wires
@@ -1242,100 +1263,11 @@ fn start_gpu_range_check_gate_quotient<
                 num_ops,
                 kind,
             });
-            gate_indices.push(gate_index);
-        }
-        // These vendored gates sit at the top of the surviving wire span in
-        // the production circuits and are pure arithmetic, so they are matched
-        // by type here instead of through the downstream-crate trait hooks
-        // (those hooks exist only to avoid a `plonky2` -> circuit-crate dep).
-        let native = if let Some(exponentiation) =
-            gate.0.as_any().downcast_ref::<ExponentiationGate<F, D>>()
-        {
-            let num_power_bits = exponentiation.num_power_bits;
-            Some((
-                U32QuotientKind::Exponentiation,
-                num_power_bits,
-                num_power_bits.checked_mul(2)?.checked_add(2)?,
-                num_power_bits.checked_add(1)?,
-            ))
-        } else if let Some(equality) = gate.0.as_any().downcast_ref::<EqualityGate>() {
-            // The gate reads its single constant (the "one" value) as local
-            // constant 0, i.e. the column immediately after the selector
-            // prefix of the constants/sigmas commitment.
-            let constant_column = common_data.selectors_info.num_selectors();
-            Some((
-                U32QuotientKind::Equality { constant_column },
-                equality.num_ops,
-                equality.num_ops.checked_mul(6)?,
-                equality.num_ops.checked_mul(4)?,
-            ))
-        } else if let Some(reducing) = gate.0.as_any().downcast_ref::<ReducingGate<D>>() {
-            // The kernel's extension arithmetic is specialised to the
-            // quadratic Goldilocks extension.
-            if D != 2 {
-                None
+            if matches!(u32_gate, U32QuotientGate::RandomAccess { .. }) {
+                random_access_gate_indices.push(gate_index);
             } else {
-                Some((
-                    U32QuotientKind::Reducing {
-                        extension_coeffs: false,
-                    },
-                    reducing.num_coeffs,
-                    reducing.num_coeffs.checked_mul(3)?.checked_add(4)?,
-                    reducing.num_coeffs.checked_mul(2)?,
-                ))
+                gate_indices.push(gate_index);
             }
-        } else if let Some(reducing) =
-            gate.0.as_any().downcast_ref::<ReducingExtensionGate<D>>()
-        {
-            if D != 2 {
-                None
-            } else {
-                Some((
-                    U32QuotientKind::Reducing {
-                        extension_coeffs: true,
-                    },
-                    reducing.num_coeffs,
-                    reducing.num_coeffs.checked_mul(4)?.checked_add(4)?,
-                    reducing.num_coeffs.checked_mul(2)?,
-                ))
-            }
-        } else {
-            None
-        };
-        if let Some((kind, num_ops, expected_wires, expected_constraints)) = native {
-            if range.is_some() || u32_gate.is_some() {
-                if gpu_poseidon_quotient_diagnostics_enabled() {
-                    eprintln!(
-                        "[gpu-range-quotient] gate {gate_index} advertised conflicting layouts"
-                    );
-                }
-                return None;
-            }
-            if num_ops == 0
-                || gate.0.num_wires() != expected_wires
-                || gate.0.num_constraints() != expected_constraints
-            {
-                if gpu_poseidon_quotient_diagnostics_enabled() {
-                    eprintln!(
-                        "[gpu-range-quotient] native layout mismatch gate={gate_index} \
-                         kind={kind:?} wires={} constraints={} expected_wires={expected_wires} \
-                         expected_constraints={expected_constraints}",
-                        gate.0.num_wires(),
-                        gate.0.num_constraints(),
-                    );
-                }
-                return None;
-            }
-            let selector_column = common_data.selectors_info.selector_indices[gate_index];
-            u32_specs.push(U32QuotientSpec {
-                selector_column,
-                gate_index,
-                group: common_data.selectors_info.groups[selector_column].clone(),
-                include_unused_selector,
-                num_ops,
-                kind,
-            });
-            gate_indices.push(gate_index);
         }
     }
     if specs.is_empty() && u32_specs.is_empty() {
@@ -1386,6 +1318,7 @@ fn start_gpu_range_check_gate_quotient<
         }
         return None;
     };
+    gate_indices.extend(random_access_gate_indices);
     let started = GPU_RANGE_QUOTIENT_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
     log::info!(
         "Metal RangeCheck quotient active: started={started}, gates={gate_indices:?}, \
@@ -1589,10 +1522,6 @@ fn compute_quotient_polys<
             "[gpu-gate-quotient] CPU wire gather width {cpu_num_wires}/{}; excluded={excluded_gate_indices:?}",
             common_data.config.num_wires,
         );
-    }
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if gpu_poseidon_quotient_diagnostics_enabled() {
-        gate_census_once(common_data, &excluded_gate_indices, cpu_num_wires);
     }
 
     // The zero-fill this used to do existed only to seed the Horner chain in
@@ -2107,12 +2036,20 @@ mod quotient_layout_tests {
     use anyhow::Result;
 
     use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field, Field64};
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::gates::gate::U32QuotientGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::gates::noop::NoopGate;
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::plonk::config::Poseidon2GoldilocksConfig;
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
@@ -2151,6 +2088,68 @@ mod quotient_layout_tests {
         COMPARE_QUOTIENT_LAYOUTS.store(false, Ordering::SeqCst);
 
         data.verify(proof?)?;
+        Ok(())
+    }
+
+    /// End-to-end retained-column differential for every audited random-access
+    /// layout. The same prove call compares the combined Metal quotient with a
+    /// full CPU recomputation over identical LDE columns and challenges, then
+    /// verifies the resulting proof.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn metal_random_access_quotient_matches_cpu_and_verifies() -> Result<()> {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        for (bits, copies) in [(3usize, 8usize), (4, 4), (6, 1)] {
+            let vec_size = 1usize << bits;
+            for copy in 0..copies {
+                let index = copy % vec_size;
+                let index_target = builder.constant(F::from_canonical_usize(index));
+                let items = (0..vec_size)
+                    .map(|i| {
+                        builder.constant(F::from_canonical_usize(
+                            1 + i + copy * vec_size + bits * 10_000,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                let expected = items[index];
+                let selected = builder.random_access(index_target, items);
+                builder.connect(selected, expected);
+                builder.register_public_input(selected);
+            }
+        }
+        // A 2^16-point LDE retains both wire and constants/sigmas commitments
+        // in shared Metal columns, exercising the production full-domain seam.
+        while builder.num_gates() <= (1 << 12) {
+            builder.add_gate(NoopGate, vec![]);
+        }
+        let data = builder.build::<Poseidon2GoldilocksConfig>();
+        assert!(data.common.luts.is_empty());
+        let mut advertised = data
+            .common
+            .gates
+            .iter()
+            .filter_map(|gate| match gate.0.u32_quotient_gate() {
+                Some(U32QuotientGate::RandomAccess {
+                    bits,
+                    num_ops,
+                    num_extra_constants,
+                }) => Some((bits, num_ops, num_extra_constants)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        advertised.sort_unstable();
+        assert_eq!(advertised, vec![(3, 8, 0), (4, 4, 2), (6, 1, 2)]);
+
+        let before = gpu_poseidon_quotient_stats();
+        COMPARE_GPU_QUOTIENT.store(true, Ordering::SeqCst);
+        let proof = data.prove(PartialWitness::new());
+        COMPARE_GPU_QUOTIENT.store(false, Ordering::SeqCst);
+        let proof = proof?;
+        let after = gpu_poseidon_quotient_stats();
+        assert!(after.range_started > before.range_started);
+        assert!(after.range_completed > before.range_completed);
+        data.verify(proof)?;
         Ok(())
     }
 
