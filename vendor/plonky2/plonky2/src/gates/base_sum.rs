@@ -262,4 +262,52 @@ mod tests {
         type F = <C as GenericConfig<D>>::F;
         test_eval_fns::<F, C, _, D>(BaseSumGate::<6>::new(11))
     }
+
+    /// Manual timing harness for the packed accumulate path of the production
+    /// `B = 2` gate, modeled on `exp_accumulate_micro` in `gates/exponentiation.rs`.
+    /// `BaseSumGate` is the largest gate symbol in a proving profile after
+    /// Poseidon2, and had no harness of its own. Run with:
+    /// `cargo test --release -p plonky2 base_sum_accumulate_micro -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual timing harness"]
+    fn base_sum_accumulate_microbenchmark() {
+        use core::hint::black_box;
+        use std::time::Instant;
+
+        use plonky2_field::types::{Field, Sample};
+
+        use crate::gates::gate::Gate;
+        use crate::plonk::vars::EvaluationVarsBaseBatch;
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+        let gate = BaseSumGate::<2>::new(32);
+        let n = 32;
+        let wires = F::rand_vec(<BaseSumGate<2> as Gate<F, D>>::num_wires(&gate) * n);
+        let constants: Vec<F> = Vec::new();
+        let hash = crate::hash::hash_types::HashOut::ZERO;
+        let filters = F::rand_vec(n);
+        let nc = <BaseSumGate<2> as Gate<F, D>>::num_constraints(&gate);
+        let mut combined = vec![F::ZERO; nc * n];
+        let iters = 50_000u32;
+        let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+
+        let mut t = 0.0f64;
+        for _ in 0..4 {
+            let s = Instant::now();
+            for _ in 0..iters {
+                <BaseSumGate<2> as Gate<F, D>>::eval_unfiltered_base_batch_accumulate(
+                    &gate,
+                    vars,
+                    &filters,
+                    black_box(&mut combined),
+                );
+            }
+            t += s.elapsed().as_secs_f64();
+        }
+        println!(
+            "base_sum B=2 accumulate per batch (n=32): {:.3} us",
+            t / (4.0 * iters as f64) * 1e6
+        );
+    }
 }
