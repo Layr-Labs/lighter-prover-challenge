@@ -77,6 +77,10 @@ impl PathCircuits {
 }
 
 impl Circuits {
+    /// Builds every circuit before any proving starts. The scored binary uses
+    /// the pipelined startup in `prover::prove_block_pipelined` instead; this
+    /// stays for the reference orchestration and the differential oracle.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         let ((pre_target, pre_data), (heavy, light)) = rayon::join(
             || {

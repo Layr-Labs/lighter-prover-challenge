@@ -529,9 +529,30 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // the clone-then-resize that `lde(&self)` performs.
         let mut lde_final_poly = final_poly;
         let live_coeffs = lde_final_poly.len();
-        lde_final_poly
-            .coeffs
-            .resize(live_coeffs << fri_params.config.rate_bits, F::Extension::ZERO);
+        let lde_len = live_coeffs << fri_params.config.rate_bits;
+        // Only a prefix of the padded tail is ever read. `coset_fft_zero_tail`
+        // consumes `[..live_coeffs]`; the first commit round then folds
+        // `[..live_chunks * arity]`, i.e. `live_coeffs` rounded up to the first
+        // round's arity, after which `coeffs` is replaced wholesale by the
+        // folded vector and this buffer is dropped. Zero-fill exactly that read
+        // window instead of the whole `8x` buffer — for a d18 block proof the
+        // deleted memset is 28 MiB per proof (~7 MiB at d16), all of it either
+        // immediately overwritten or never touched.
+        let first_arity = 1usize
+            << fri_params
+                .reduction_arity_bits
+                .first()
+                .copied()
+                .unwrap_or(0);
+        let read_bound = live_coeffs.next_multiple_of(first_arity).min(lde_len);
+        lde_final_poly.coeffs.reserve_exact(lde_len - live_coeffs);
+        lde_final_poly.coeffs.resize(read_bound, F::Extension::ZERO);
+        // SAFETY: `reserve_exact` guarantees capacity `lde_len`, and every
+        // element in `[0, read_bound)` is initialized above. Elements beyond
+        // `read_bound` are never read: the zero-tail FFT consumes only the live
+        // prefix, and the fold consumes only `[..live_chunks * arity]`, which is
+        // `<= read_bound`. Same pattern as the promoted `lde_values` fast path.
+        unsafe { lde_final_poly.coeffs.set_len(lde_len) };
         let lde_final_values = timed!(
             timing,
             &format!("perform final FFT {}", lde_final_poly.len()),
