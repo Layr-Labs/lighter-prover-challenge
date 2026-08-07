@@ -414,16 +414,12 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
 
         let get_local_wire = |column| witness.get_wire(local_wire(column));
 
-        // Direct left fold over ascending addend index: the same association as
-        // the previous `collect` + `fold(F::ZERO, ..)`, minus the temporary
-        // `Vec` per generator execution.
-        let mut addends_sum = F::ZERO;
-        for j in 0..self.gate.num_addends {
-            addends_sum += get_local_wire(self.gate.wire_ith_op_jth_addend(self.i, j));
-        }
+        let addends: Vec<_> = (0..self.gate.num_addends)
+            .map(|j| get_local_wire(self.gate.wire_ith_op_jth_addend(self.i, j)))
+            .collect();
         let carry = get_local_wire(self.gate.wire_ith_carry(self.i));
 
-        let output = addends_sum + carry;
+        let output = addends.iter().fold(F::ZERO, |x, &y| x + y) + carry;
         let output_u64 = output.to_canonical_u64();
 
         let output_carry_u64 = output_u64 >> 32;
@@ -440,23 +436,28 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
 
         let num_result_limbs = U32AddManyGate::<F, D>::num_result_limbs();
         let num_carry_limbs = U32AddManyGate::<F, D>::num_carry_limbs();
-        let limb_base: u64 = 1 << U32AddManyGate::<F, D>::limb_bits();
+        let limb_base = 1 << U32AddManyGate::<F, D>::limb_bits();
 
-        // In-place limb decomposition in the identical chained order the two
-        // `split_to_limbs` `collect`s produced: result limbs at j in
-        // 0..num_result_limbs, then carry limbs at the following indices.
-        let mut result_val = output_result_u64;
-        for j in 0..num_result_limbs {
+        let split_to_limbs = |mut val, num| {
+            std::iter::from_fn(move || {
+                if num == 0 {
+                    None
+                } else {
+                    let ret = val % limb_base;
+                    val /= limb_base;
+                    Some(F::from_canonical_u64(ret))
+                }
+            })
+            .take(num)
+            .collect::<Vec<_>>()
+        };
+
+        let result_limbs = split_to_limbs(output_result_u64, num_result_limbs);
+        let carry_limbs = split_to_limbs(output_carry_u64, num_carry_limbs);
+
+        for (j, limb) in result_limbs.into_iter().chain(carry_limbs).enumerate() {
             let wire = local_wire(self.gate.wire_ith_output_jth_limb(self.i, j));
-            out_buffer.set_wire(wire, F::from_canonical_u64(result_val % limb_base))?;
-            result_val /= limb_base;
-        }
-        let mut carry_val = output_carry_u64;
-        for j in 0..num_carry_limbs {
-            let wire =
-                local_wire(self.gate.wire_ith_output_jth_limb(self.i, num_result_limbs + j));
-            out_buffer.set_wire(wire, F::from_canonical_u64(carry_val % limb_base))?;
-            carry_val /= limb_base;
+            out_buffer.set_wire(wire, limb)?;
         }
 
         Ok(())
