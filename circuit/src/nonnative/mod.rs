@@ -665,8 +665,8 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let a = FF::from_noncanonical_biguint(witness.get_biguint_target(self.a.value.clone()));
-        let b = FF::from_noncanonical_biguint(witness.get_biguint_target(self.b.value.clone()));
+        let a = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.a.value));
+        let b = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.b.value));
         let a_biguint = a.to_canonical_biguint();
         let b_biguint = b.to_canonical_biguint();
         let sum_biguint = a_biguint + b_biguint;
@@ -778,7 +778,7 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
             .summands
             .iter()
             .map(|summand| {
-                FF::from_noncanonical_biguint(witness.get_biguint_target(summand.value.clone()))
+                FF::from_noncanonical_biguint(witness.get_biguint_target(&summand.value))
             })
             .collect();
         let summand_biguints: Vec<_> = summands
@@ -898,8 +898,8 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let a = FF::from_noncanonical_biguint(witness.get_biguint_target(self.a.value.clone()));
-        let b = FF::from_noncanonical_biguint(witness.get_biguint_target(self.b.value.clone()));
+        let a = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.a.value));
+        let b = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.b.value));
         let a_biguint = a.to_canonical_biguint();
         let b_biguint = b.to_canonical_biguint();
 
@@ -1016,8 +1016,69 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let a = FF::from_noncanonical_biguint(witness.get_biguint_target(self.a.value.clone()));
-        let b = FF::from_noncanonical_biguint(witness.get_biguint_target(self.b.value.clone()));
+        // All-stack limb pipeline. Value-identical to the historical path
+        // (`FF` round-trip to canonicalize each input mod the field order,
+        // multiply, then divide by the order): for the prime fields nonnative
+        // arithmetic targets, `from_noncanonical_biguint(x).to_canonical_biguint()`
+        // is exactly `x % FF::order()`, computed here by the same Knuth-D
+        // division that then reduces the product. Only the order's digit
+        // extraction still allocates.
+        use crate::bigint::limb_math;
+        let la = self.a.value.num_limbs();
+        let lb = self.b.value.num_limbs();
+        if la <= limb_math::MAX_LIMBS / 2 && lb <= limb_math::MAX_LIMBS / 2 {
+            use plonky2::iop::witness::Witness;
+
+            use crate::uint::u32::witness::GeneratedValuesU32;
+            let m_digits = FF::order().to_u32_digits();
+            if !m_digits.is_empty() && m_digits.len() <= limb_math::MAX_LIMBS {
+                let mut a = [0u32; limb_math::MAX_LIMBS];
+                let mut b = [0u32; limb_math::MAX_LIMBS];
+                for (i, limb) in self.a.value.limbs.iter().enumerate() {
+                    let x = witness.get_target(limb.0).to_canonical_u64();
+                    debug_assert!(x < (1u64 << 32), "BigUintTarget limb out of u32 range");
+                    a[i] = x as u32;
+                }
+                for (i, limb) in self.b.value.limbs.iter().enumerate() {
+                    let x = witness.get_target(limb.0).to_canonical_u64();
+                    debug_assert!(x < (1u64 << 32), "BigUintTarget limb out of u32 range");
+                    b[i] = x as u32;
+                }
+                // Canonicalize the inputs mod the order.
+                let mut scratch_q = [0u32; limb_math::MAX_LIMBS];
+                let mut a_c = [0u32; limb_math::MAX_LIMBS];
+                let mut b_c = [0u32; limb_math::MAX_LIMBS];
+                limb_math::div_rem_limbs(&a[..la], &m_digits, &mut scratch_q, &mut a_c);
+                limb_math::div_rem_limbs(&b[..lb], &m_digits, &mut scratch_q, &mut b_c);
+                // prod = a_c * b_c; (overflow, prod_reduced) = prod div/mod order.
+                let mut prod = [0u32; 2 * limb_math::MAX_LIMBS];
+                let lp = limb_math::mul_limbs(&a_c, &b_c, &mut prod);
+                let mut overflow = [0u32; 2 * limb_math::MAX_LIMBS];
+                let mut reduced = [0u32; limb_math::MAX_LIMBS];
+                limb_math::div_rem_limbs(&prod[..lp.max(1)], &m_digits, &mut overflow, &mut reduced);
+
+                let write = |out_buffer: &mut GeneratedValues<F>,
+                             t: &BigUintTarget,
+                             digits: &[u32]|
+                 -> Result<()> {
+                    let sig = limb_math::significant_len(digits);
+                    assert!(
+                        sig <= t.num_limbs(),
+                        "nonnative mul output exceeds target limb budget"
+                    );
+                    for i in 0..t.num_limbs() {
+                        out_buffer
+                            .set_u32_target(t.get_limb(i), digits.get(i).copied().unwrap_or(0))?;
+                    }
+                    Ok(())
+                };
+                write(out_buffer, &self.prod.value, &reduced)?;
+                return write(out_buffer, &self.overflow, &overflow);
+            }
+        }
+
+        let a = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.a.value));
+        let b = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.b.value));
         let a_biguint = a.to_canonical_biguint();
         let b_biguint = b.to_canonical_biguint();
 
@@ -1146,9 +1207,9 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let a = FF::from_noncanonical_biguint(witness.get_biguint_target(self.a.value.clone()));
-        let b = FF::from_noncanonical_biguint(witness.get_biguint_target(self.b.value.clone()));
-        let d = FF::from_noncanonical_biguint(witness.get_biguint_target(self.d.value.clone()));
+        let a = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.a.value));
+        let b = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.b.value));
+        let d = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.d.value));
         let a_biguint = a.to_canonical_biguint();
         let b_biguint = b.to_canonical_biguint();
         let d_biguint = d.to_canonical_biguint();
@@ -1306,7 +1367,7 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let x = FF::from_noncanonical_biguint(witness.get_biguint_target(self.x.value.clone()));
+        let x = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.x.value));
         let inv = x.try_inverse();
         if inv.is_none() {
             out_buffer.set_biguint_target(&self.div, &BigUint::ZERO)?;
@@ -1412,7 +1473,7 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let b = witness.get_biguint_target(self.b.value.clone());
+        let b = witness.get_biguint_target(&self.b.value);
         let b_inv = FF::from_noncanonical_biguint(b.clone()).try_inverse();
         if b_inv.is_none() {
             out_buffer.set_biguint_target(&self.div.value, &BigUint::ZERO)?;
@@ -1421,7 +1482,7 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         }
         let b_inv = b_inv.unwrap();
 
-        let a = witness.get_biguint_target(self.a.value.clone());
+        let a = witness.get_biguint_target(&self.a.value);
 
         let order = FF::order();
         let (_, div) = (&a * b_inv.to_canonical_biguint()).div_rem(&order);

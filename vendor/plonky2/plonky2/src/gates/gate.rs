@@ -299,24 +299,40 @@ impl<T: Gate<F, D>, F: RichField + Extendable<D>, const D: usize> AnyGate<F, D> 
 }
 
 /// A wrapper around an `Arc<AnyGate>` which implements `PartialEq`, `Eq` and `Hash` based on gate IDs.
+///
+/// The gate ID is computed once at construction and cached: `Gate::id` formats a fresh
+/// `String` on every call, and `GateRef` equality, hashing, and `Debug` are on hot
+/// circuit-construction paths (`find_slot`, the builder's gate set, selector
+/// construction), where recomputing the ID per comparison dominates. The cache field is
+/// private and only `GateRef::new` constructs the pair, so every `GateRef` carries a
+/// cache consistent with its gate.
 #[derive(Clone)]
-pub struct GateRef<F: RichField + Extendable<D>, const D: usize>(pub Arc<dyn AnyGate<F, D>>);
+pub struct GateRef<F: RichField + Extendable<D>, const D: usize>(
+    pub Arc<dyn AnyGate<F, D>>,
+    Arc<str>,
+);
 
 impl<F: RichField + Extendable<D>, const D: usize> GateRef<F, D> {
     pub fn new<G: Gate<F, D>>(gate: G) -> GateRef<F, D> {
-        GateRef(Arc::new(gate))
+        let id: Arc<str> = gate.id().into();
+        GateRef(Arc::new(gate), id)
+    }
+
+    /// The cached gate ID. Identical to `self.0.id()`, without allocating.
+    pub fn id(&self) -> &str {
+        &self.1
     }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> PartialEq for GateRef<F, D> {
     fn eq(&self, other: &Self) -> bool {
-        self.0.id() == other.0.id()
+        self.1 == other.1
     }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> Hash for GateRef<F, D> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.id().hash(state)
+        self.1.hash(state)
     }
 }
 
@@ -324,13 +340,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Eq for GateRef<F, D> {}
 
 impl<F: RichField + Extendable<D>, const D: usize> Debug for GateRef<F, D> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
-        write!(f, "{}", self.0.id())
+        write!(f, "{}", self.1)
     }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> Serialize for GateRef<F, D> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0.id())
+        serializer.serialize_str(&self.1)
     }
 }
 

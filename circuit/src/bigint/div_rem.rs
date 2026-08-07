@@ -20,6 +20,7 @@ use plonky2::iop::witness::PartitionWitness;
 use plonky2::plonk::circuit_data::CommonCircuitData;
 use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
 
+use super::limb_math;
 use super::biguint::{
     BigUintTarget, CircuitBuilderBiguint, GeneratedValuesBigUint, WitnessBigUint,
 };
@@ -194,8 +195,90 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let a = witness.get_biguint_target(self.a.clone());
-        let b = witness.get_biguint_target(self.b.clone());
+        // Fast path: inputs of at most four u32 limbs fit in `u128`, so the
+        // whole division runs on machine integers with zero heap allocations.
+        // The matching-engine fee divisions are exactly this shape. Values and
+        // edge behavior are identical to the `BigUint` path: a zero divisor
+        // yields zero quotient and remainder, and an output that exceeds its
+        // target's limb budget panics (the `BigUint` path's length assert).
+        if self.a.num_limbs() <= 4 && self.b.num_limbs() <= 4 {
+            use plonky2::iop::witness::Witness;
+
+            use crate::uint::u32::witness::GeneratedValuesU32;
+            let read_u128 = |t: &BigUintTarget| -> u128 {
+                let mut v = 0u128;
+                for (i, limb) in t.limbs.iter().enumerate() {
+                    let x = witness.get_target(limb.0).to_canonical_u64();
+                    debug_assert!(x < (1u64 << 32), "BigUintTarget limb out of u32 range");
+                    v |= (x as u128) << (32 * i);
+                }
+                v
+            };
+            let write_u128 = |out_buffer: &mut GeneratedValues<F>,
+                              t: &BigUintTarget,
+                              mut v: u128|
+             -> Result<()> {
+                for i in 0..t.num_limbs() {
+                    out_buffer.set_u32_target(t.get_limb(i), (v & 0xFFFF_FFFF) as u32)?;
+                    v >>= 32;
+                }
+                assert!(v == 0, "div_rem output exceeds target limb budget");
+                Ok(())
+            };
+            let a = read_u128(&self.a);
+            let b = read_u128(&self.b);
+            let (div, rem) = if b == 0 { (0, 0) } else { (a / b, a % b) };
+            write_u128(out_buffer, &self.div, div)?;
+            return write_u128(out_buffer, &self.rem, rem);
+        }
+
+        // Stack-array long division for every shape up to MAX_LIMBS (the
+        // production shapes are far below it); values and edge behavior are
+        // identical to the historical BigUint path, including the zero-divisor
+        // convention and the output-budget length panics.
+        if self.a.num_limbs() <= limb_math::MAX_LIMBS && self.b.num_limbs() <= limb_math::MAX_LIMBS
+        {
+            use plonky2::iop::witness::Witness;
+
+            use crate::uint::u32::witness::GeneratedValuesU32;
+            let mut a = [0u32; limb_math::MAX_LIMBS];
+            let mut b = [0u32; limb_math::MAX_LIMBS];
+            for (i, limb) in self.a.limbs.iter().enumerate() {
+                let x = witness.get_target(limb.0).to_canonical_u64();
+                debug_assert!(x < (1u64 << 32), "BigUintTarget limb out of u32 range");
+                a[i] = x as u32;
+            }
+            for (i, limb) in self.b.limbs.iter().enumerate() {
+                let x = witness.get_target(limb.0).to_canonical_u64();
+                debug_assert!(x < (1u64 << 32), "BigUintTarget limb out of u32 range");
+                b[i] = x as u32;
+            }
+            let mut q = [0u32; limb_math::MAX_LIMBS];
+            let mut r = [0u32; limb_math::MAX_LIMBS];
+            if limb_math::significant_len(&b) != 0 {
+                limb_math::div_rem_limbs(&a, &b, &mut q, &mut r);
+            }
+            let write = |out_buffer: &mut GeneratedValues<F>,
+                         t: &BigUintTarget,
+                         digits: &[u32]|
+             -> Result<()> {
+                let sig = limb_math::significant_len(digits);
+                assert!(
+                    sig <= t.num_limbs(),
+                    "div_rem output exceeds target limb budget"
+                );
+                for i in 0..t.num_limbs() {
+                    out_buffer
+                        .set_u32_target(t.get_limb(i), digits.get(i).copied().unwrap_or(0))?;
+                }
+                Ok(())
+            };
+            write(out_buffer, &self.div, &q)?;
+            return write(out_buffer, &self.rem, &r);
+        }
+
+        let a = witness.get_biguint_target(&self.a);
+        let b = witness.get_biguint_target(&self.b);
 
         if b.is_zero() {
             out_buffer.set_biguint_target(&self.div, &BigUint::ZERO)?;

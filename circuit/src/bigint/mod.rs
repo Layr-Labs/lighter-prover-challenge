@@ -4,6 +4,7 @@
 pub mod big_u16;
 pub mod bigint;
 pub mod biguint;
+pub mod limb_math;
 pub mod comparison;
 pub mod div_rem;
 pub mod unsafe_big;
