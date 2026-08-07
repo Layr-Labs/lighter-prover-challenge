@@ -428,6 +428,32 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         }
     }
 
+    /// Extracts the stride-`step` LDE values for a whole quotient domain of
+    /// `q_domain` indices, column-major (`PolyMajor`): `out[c * q_domain + i]`
+    /// = `columns[c][i * step]`. The constants/sigma columns are
+    /// circuit-fixed, so the caller caches the result once per circuit and
+    /// every subsequent proof's quotient gathers copy from it instead of
+    /// re-walking the strided LDE.
+    pub(crate) fn extract_lde_batch_columns(
+        &self,
+        step: usize,
+        col_range: core::ops::Range<usize>,
+        q_domain: usize,
+    ) -> Option<Vec<F>> {
+        let w = col_range.len();
+        let mut out = Vec::with_capacity(w * q_domain);
+        match &self.merkle_tree.leaves {
+            MerkleLeaves::Columns { columns, .. } => {
+                for c in col_range {
+                    let column = columns.col(c);
+                    out.extend((0..q_domain).map(|i| column[i * step]));
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
     /// Like `get_lde_values`, but fetches LDE values from a batch of `P::WIDTH` points, and returns
     /// packed values.
     pub fn get_lde_values_packed<P>(&self, index_start: usize, step: usize) -> Vec<P>
