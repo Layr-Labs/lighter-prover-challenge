@@ -349,14 +349,13 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
             let x_interleaved = vars.local_wires[self.wire_ith_x_interleaved(i)];
             let bits = vars.local_wires.view(self.wires_ith_bit_decomposition(i));
 
-            let mut output_low = P::ZEROS;
-            let mut output_high = P::ZEROS;
-            let alpha = F::from_canonical_usize(Self::B);
-            for &term in bits.into_iter().skip(32) {
-                output_low = output_low * alpha + term;
+            let mut output_low = bits[32];
+            for &term in bits.into_iter().skip(33) {
+                output_low = output_low + output_low + term;
             }
-            for &term in bits.into_iter().take(32) {
-                output_high = output_high * alpha + term;
+            let mut output_high = bits[0];
+            for &term in bits.into_iter().take(32).skip(1) {
+                output_high = output_high + output_high + term;
             }
             let inverse = vars.local_wires[self.wire_ith_inverse(i)];
             let combined_output = {
@@ -384,16 +383,12 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
             let x_evens = vars.local_wires[self.wire_ith_x_evens(i)];
             let x_odds = vars.local_wires[self.wire_ith_x_odds(i)];
 
-            let mut computed_x_evens = P::ZEROS;
-            let mut computed_x_odds = P::ZEROS;
+            let mut computed_x_evens = bits[0];
+            let mut computed_x_odds = bits[1];
 
-            for i in 0..Self::NUM_BITS / 2 {
-                let ith_even_bit = bits[2 * i];
-                let ith_odd_bit = bits[2 * i + 1];
-
-                let coeff = P::Scalar::from_canonical_u32(1 << (Self::NUM_BITS / 2 - i - 1));
-                computed_x_evens += ith_even_bit * coeff;
-                computed_x_odds += ith_odd_bit * coeff;
+            for i in 1..Self::NUM_BITS / 2 {
+                computed_x_evens = computed_x_evens + computed_x_evens + bits[2 * i];
+                computed_x_odds = computed_x_odds + computed_x_odds + bits[2 * i + 1];
             }
 
             yield_constr.one(computed_x_evens - x_evens);

@@ -43,38 +43,6 @@ pub fn batch_multiply_inplace<F: Field>(out: &mut [F], a: &[F]) {
         *x_out *= *x_a;
     }
 }
-/// Elementwise `out[i] = a[i] * b[i]`, writing a destination that is not also an
-/// input.
-///
-/// The LDE fill previously reached its coset-scaled state in two passes over
-/// `degree` words: `copy_from_slice` (read `a`, write `out`) followed by
-/// `batch_multiply_inplace` (read `out`, read `b`, write `out`). The
-/// intermediate unscaled copy is never observed — the FFT only ever sees the
-/// scaled values — so the copy is a materialization that can be deleted by
-/// folding the multiply into the same pass.
-///
-/// The packed/scalar split is identical to `batch_multiply_inplace`'s: the
-/// maximal `P::WIDTH` prefix uses packed multiplication and the ragged tail uses
-/// the same scalar operation, so every produced word is bit-identical to the
-/// two-pass form.
-pub fn batch_multiply_into<F: Field>(out: &mut [F], a: &[F], b: &[F]) {
-    let n = out.len();
-    assert_eq!(n, a.len(), "output and first input must have the same length");
-    assert_eq!(n, b.len(), "output and second input must have the same length");
-
-    let (out_packed, out_leftovers) =
-        pack_slice_with_leftovers_mut::<<F as Packable>::Packing>(out);
-    let (a_packed, a_leftovers) = pack_slice_with_leftovers::<<F as Packable>::Packing>(a);
-    let (b_packed, b_leftovers) = pack_slice_with_leftovers::<<F as Packable>::Packing>(b);
-
-    for ((x_out, x_a), x_b) in out_packed.iter_mut().zip(a_packed).zip(b_packed) {
-        *x_out = *x_a * *x_b;
-    }
-    for ((x_out, x_a), x_b) in out_leftovers.iter_mut().zip(a_leftovers).zip(b_leftovers) {
-        *x_out = *x_a * *x_b;
-    }
-}
-
 /// Elementwise multiply two slices and add the products to an output slice.
 pub fn batch_multiply_add_inplace<F: Field>(out: &mut [F], a: &[F], b: &[F]) {
     let n = out.len();
@@ -150,4 +118,3 @@ mod tests {
         assert_eq!(out, expected);
     }
 }
-

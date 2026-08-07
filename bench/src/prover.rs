@@ -408,7 +408,7 @@ fn prove_path(
     })
 }
 
-pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
+pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     // The pre-execution proof runs strictly before any other proving work, so
     // the serialized GPU stream is otherwise idle: route its mid-size column
     // trees to the GPU for just this phase.
@@ -436,10 +436,7 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
     block.tx_chunks = tx_chunks;
     block.tx_chunks.push(Vec::new());
 
-    let (light_chain_proof, heavy_chain_proof, block_target, block_data) = {
-        // The pipeline only ever reads the circuits; the borrow ends with this
-        // block so the finished extensions can be released below.
-        let circuits = &circuits;
+    let (light_chain_proof, heavy_chain_proof, block_target, block_data) =
         std::thread::scope(|scope| {
             // The final block circuit depends only on already-built circuit data
             // and is not needed until the final proof, so it builds concurrently
@@ -487,14 +484,7 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
                 block_target,
                 block_data,
             )
-        })
-    };
-
-    // Every circuit but the block circuit has now produced its last proof, so
-    // their preprocessed low-degree extensions are unreachable. Release them
-    // before the final block proof — the process's peak-RSS moment — stacks its
-    // own extensions on top of them.
-    circuits.release_finished_circuit_extensions();
+        });
 
     let (light_chain_input, heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
@@ -529,7 +519,7 @@ mod tests {
 
     #[test]
     fn prove_block_returns_one_final_block_proof() {
-        let prove: fn(Block<F>, Circuits) -> Proof = prove_block;
+        let prove: fn(Block<F>, &Circuits) -> Proof = prove_block;
         let _ = prove;
     }
 
