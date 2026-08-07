@@ -446,7 +446,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     /// circuit-fixed, so the caller caches the result once per circuit and
     /// every subsequent proof's quotient gathers copy from it instead of
     /// re-walking the strided LDE.
-    pub fn extract_lde_batch_columns(
+    pub(crate) fn extract_lde_batch_columns(
         &self,
         step: usize,
         col_range: core::ops::Range<usize>,

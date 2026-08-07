@@ -48,7 +48,6 @@ pub mod delta;
 pub mod deserializers;
 pub mod ecdsa;
 pub mod eddsa;
-pub mod embed;
 pub mod hash_utils;
 pub mod hints;
 pub mod keccak;

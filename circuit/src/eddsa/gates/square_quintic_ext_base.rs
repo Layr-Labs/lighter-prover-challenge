@@ -10,6 +10,7 @@ use alloc::{
 
 use anyhow::Result;
 use plonky2::field::extension::{Extendable, FieldExtension};
+use plonky2::field::packable::Packable;
 use plonky2::field::packed::PackedField;
 use plonky2::gates::gate::Gate;
 use plonky2::gates::packed_util::PackedEvaluableBase;
@@ -155,44 +156,15 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for QuinticSquarin
         let n = vars_base.len();
         assert_eq!(filters.len(), n);
         assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
-        let wires = vars_base.local_wires;
-        let col = |w: usize| &wires[w * n..][..n];
-        let const_2 = F::from_canonical_u64(2);
-        let const_3 = F::from_canonical_u64(3);
-        let const_6 = F::from_canonical_u64(6);
-        let mut chunks = combined_gate_constraints.chunks_exact_mut(n);
-
-        for i in 0..self.num_ops {
-            let a: [&[F]; 5] =
-                core::array::from_fn(|j| col(self.wire_ith_multiplicand_jth_limb(i, j)));
-            let c: [&[F]; 5] = core::array::from_fn(|j| col(self.wire_ith_output_jth_limb(i, j)));
-            let extra: [&[F]; 10] = core::array::from_fn(|j| col(self.temporary_wire(i, j)));
-            let mut outs: [&mut [F]; 15] = core::array::from_fn(|_| chunks.next().unwrap());
-
-            for p in 0..n {
-                let ap: [F; 5] = core::array::from_fn(|j| a[j][p]);
-                let f = filters[p];
-                // Identical expressions and order to `eval_unfiltered_base_packed`.
-                outs[0][p] += f * (ap[0] * ap[0] - extra[0][p]);
-                outs[1][p] += f * ((const_6 * ap[1] * ap[4] + extra[0][p]) - extra[1][p]);
-                outs[2][p] += f * ((const_6 * ap[2] * ap[3] + extra[1][p]) - c[0][p]);
-
-                outs[3][p] += f * (const_3 * ap[3] * ap[3] - extra[2][p]);
-                outs[4][p] += f * ((const_2 * ap[0] * ap[1] + extra[2][p]) - extra[3][p]);
-                outs[5][p] += f * ((const_6 * ap[2] * ap[4] + extra[3][p]) - c[1][p]);
-
-                outs[6][p] += f * (ap[1] * ap[1] - extra[4][p]);
-                outs[7][p] += f * ((const_2 * ap[0] * ap[2] + extra[4][p]) - extra[5][p]);
-                outs[8][p] += f * ((const_6 * ap[3] * ap[4] + extra[5][p]) - c[2][p]);
-
-                outs[9][p] += f * ((const_3 * ap[4] * ap[4]) - extra[6][p]);
-                outs[10][p] += f * ((const_2 * ap[0] * ap[3] + extra[6][p]) - extra[7][p]);
-                outs[11][p] += f * ((const_2 * ap[1] * ap[2] + extra[7][p]) - c[3][p]);
-
-                outs[12][p] += f * (ap[2] * ap[2] - extra[8][p]);
-                outs[13][p] += f * ((const_2 * ap[0] * ap[4] + extra[8][p]) - extra[9][p]);
-                outs[14][p] += f * ((const_2 * ap[1] * ap[3] + extra[9][p]) - c[4][p]);
-            }
+        let (packed_iter, leftovers_iter) = vars_base.pack::<<F as Packable>::Packing>();
+        let leftovers_start = n - leftovers_iter.len();
+        for (i, vars) in packed_iter.enumerate() {
+            let base = <F as Packable>::Packing::WIDTH * i;
+            accumulate_packed_squaring(self, vars, filters, combined_gate_constraints, n, base);
+        }
+        for (i, vars) in leftovers_iter.enumerate() {
+            let base = leftovers_start + i;
+            accumulate_packed_squaring(self, vars, filters, combined_gate_constraints, n, base);
         }
     }
 
@@ -348,6 +320,61 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
             yield_constr.one((const_2 * a[0] * a[4] + extra[8]) - extra[9]);
             yield_constr.one((const_2 * a[1] * a[3] + extra[9]) - c[4]);
         }
+    }
+}
+
+/// One point-group's worth of filtered constraint accumulation, generic over the
+/// packing width. The constraint expressions and their order are identical to
+/// `eval_unfiltered_base_packed`, and the filter application matches
+/// `batch_multiply_add_inplace` (`out += constraint * filter`, packed lanes for the
+/// full-width groups and scalar for the ragged tail), so the accumulated values are
+/// bit-identical to materializing the batch and multiply-adding row by row.
+fn accumulate_packed_squaring<F: RichField, P: PackedField<Scalar = F>>(
+    gate: &QuinticSquaringGate,
+    vars: EvaluationVarsBasePacked<P>,
+    filters: &[F],
+    combined: &mut [F],
+    n: usize,
+    base: usize,
+) {
+    let f = *P::from_slice(&filters[base..base + P::WIDTH]);
+    let const_2 = P::from(F::from_canonical_u64(2));
+    let const_3 = P::from(F::from_canonical_u64(3));
+    let const_6 = P::from(F::from_canonical_u64(6));
+
+    let mut k = 0usize;
+    let mut push = |val: P| {
+        let out = P::from_slice_mut(&mut combined[k * n + base..k * n + base + P::WIDTH]);
+        *out += val * f;
+        k += 1;
+    };
+
+    for i in 0..gate.num_ops {
+        let a: [P; 5] =
+            core::array::from_fn(|j| vars.local_wires[gate.wire_ith_multiplicand_jth_limb(i, j)]);
+        let c: [P; 5] =
+            core::array::from_fn(|j| vars.local_wires[gate.wire_ith_output_jth_limb(i, j)]);
+        let extra: [P; 10] = core::array::from_fn(|j| vars.local_wires[gate.temporary_wire(i, j)]);
+
+        push(a[0] * a[0] - extra[0]);
+        push((const_6 * a[1] * a[4] + extra[0]) - extra[1]);
+        push((const_6 * a[2] * a[3] + extra[1]) - c[0]);
+
+        push(const_3 * a[3] * a[3] - extra[2]);
+        push((const_2 * a[0] * a[1] + extra[2]) - extra[3]);
+        push((const_6 * a[2] * a[4] + extra[3]) - c[1]);
+
+        push(a[1] * a[1] - extra[4]);
+        push((const_2 * a[0] * a[2] + extra[4]) - extra[5]);
+        push((const_6 * a[3] * a[4] + extra[5]) - c[2]);
+
+        push((const_3 * a[4] * a[4]) - extra[6]);
+        push((const_2 * a[0] * a[3] + extra[6]) - extra[7]);
+        push((const_2 * a[1] * a[2] + extra[7]) - c[3]);
+
+        push(a[2] * a[2] - extra[8]);
+        push((const_2 * a[0] * a[4] + extra[8]) - extra[9]);
+        push((const_2 * a[1] * a[3] + extra[9]) - c[4]);
     }
 }
 

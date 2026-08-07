@@ -54,7 +54,7 @@ impl AccountAsset {
     }
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct AccountAssetTarget {
     pub index_0: Target,
     pub balance: BigUintTarget,

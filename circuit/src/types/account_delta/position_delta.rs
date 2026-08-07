@@ -30,7 +30,7 @@ pub struct PositionDelta {
     pub position_delta: BigInt, // value is in range [-2^56 + 1, 2^56 - 1], thus the diff is in range [-2^57 + 2, 2^57 - 2]
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct PositionDeltaTarget {
     pub funding_rate_prefix_sum_delta: BigIntU16Target,
     pub position_delta: BigIntU16Target,

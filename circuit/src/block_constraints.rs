@@ -97,8 +97,7 @@ pub struct BlockCircuit {
     pub target: BlockTarget,
 }
 
-#[serde_with::serde_as]
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug)]
 pub struct BlockTarget {
     pub pre_exec_proof: ProofWithPublicInputsTarget<D>, // proof of pre execution beginning of the block
     pub light_tx_chain_proof: ProofWithPublicInputsTarget<D>, // proof of light tx chain execution
@@ -107,7 +106,6 @@ pub struct BlockTarget {
     pub block: BlockWitnessTarget, // Public block witness
 
     // Private witness: raw public market details after the block.
-    #[serde_as(as = "[_; POSITION_LIST_SIZE]")]
     pub new_market_risk_details_partial: [MarketRiskDetailsTarget; POSITION_LIST_SIZE],
 }
 

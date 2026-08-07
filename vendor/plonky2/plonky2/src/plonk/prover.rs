@@ -979,17 +979,6 @@ fn start_gpu_poseidon_gate_quotient<
     Some((gate_index, job))
 }
 
-/// Base-4 result limbs for a `base_bits`-wide U32-family gate. Widths are
-/// restricted to the shapes the shader is differentially tested against; any
-/// other width leaves the gate on the CPU.
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn supported_quotient_result_limbs(base_bits: usize) -> Option<usize> {
-    match base_bits {
-        16 | 32 | 48 => Some(base_bits / 2),
-        _ => None,
-    }
-}
-
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn start_gpu_range_check_gate_quotient<
     F: RichField + Extendable<D>,
@@ -1077,39 +1066,17 @@ fn start_gpu_range_check_gate_quotient<
                     num_ops.checked_mul(38)?,
                     num_ops.checked_mul(36)?,
                 ),
-                // Every width shares one layout: five routed words per
-                // operation followed by `base_bits / 2` base-4 result limbs,
-                // so the wire and constraint counts are linear in the width.
-                U32QuotientGate::Subtraction {
+                U32QuotientGate::Subtraction { num_ops } => (
+                    U32QuotientKind::Subtraction,
                     num_ops,
-                    base_bits,
-                } => {
-                    let Some(result_limbs) = supported_quotient_result_limbs(base_bits) else {
-                        if gpu_poseidon_quotient_diagnostics_enabled() {
-                            eprintln!("[gpu-range-quotient] invalid U32 metadata: {u32_gate:?}");
-                        }
-                        return None;
-                    };
-                    (
-                        U32QuotientKind::Subtraction { result_limbs },
-                        num_ops,
-                        num_ops.checked_mul(result_limbs.checked_add(5)?)?,
-                        num_ops.checked_mul(result_limbs.checked_add(3)?)?,
-                    )
-                }
+                    num_ops.checked_mul(21)?,
+                    num_ops.checked_mul(19)?,
+                ),
                 U32QuotientGate::AddMany {
                     num_ops,
                     num_addends,
-                    base_bits,
-                    num_carry_limbs,
                 } => {
-                    let Some(result_limbs) = supported_quotient_result_limbs(base_bits) else {
-                        if gpu_poseidon_quotient_diagnostics_enabled() {
-                            eprintln!("[gpu-range-quotient] invalid U32 metadata: {u32_gate:?}");
-                        }
-                        return None;
-                    };
-                    if num_addends == 0 || num_addends > 16 || num_carry_limbs == 0 {
+                    if num_addends == 0 || num_addends > 16 {
                         if gpu_poseidon_quotient_diagnostics_enabled() {
                             eprintln!(
                                 "[gpu-range-quotient] invalid U32 metadata: {u32_gate:?}"
@@ -1117,16 +1084,11 @@ fn start_gpu_range_check_gate_quotient<
                         }
                         return None;
                     }
-                    let limbs = result_limbs.checked_add(num_carry_limbs)?;
                     (
-                        U32QuotientKind::AddMany {
-                            num_addends,
-                            result_limbs,
-                            num_carry_limbs,
-                        },
+                        U32QuotientKind::AddMany { num_addends },
                         num_ops,
-                        num_ops.checked_mul(num_addends.checked_add(3)?.checked_add(limbs)?)?,
-                        num_ops.checked_mul(limbs.checked_add(3)?)?,
+                        num_ops.checked_mul(num_addends.checked_add(21)?)?,
+                        num_ops.checked_mul(21)?,
                     )
                 }
             };

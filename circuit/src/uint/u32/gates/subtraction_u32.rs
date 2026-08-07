@@ -378,7 +378,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32Subtraction
     fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
         Some(U32QuotientGate::Subtraction {
             num_ops: self.num_ops,
-            base_bits: 32,
         })
     }
 }
