@@ -287,16 +287,14 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
             }
         }
 
-        // The initial linear layer.
+        // The initial linear layer, fused with round 0's constants.
         for state in states.iter_mut() {
-            <F as Poseidon2>::external_linear_layer(state);
+            <F as Poseidon2>::external_linear_layer_with_rc(state, 0);
         }
 
-        // The first half of the external rounds.
+        // The first half of the external rounds; each round's trailing linear
+        // layer fuses the next round's constants.
         for r in 0..ROUNDS_F_HALF {
-            for state in states.iter_mut() {
-                <F as Poseidon2>::add_rc(state, r);
-            }
             if r != 0 {
                 for i in 0..WIDTH {
                     let sbox_in = col(Self::wire_full_sbox_0(r, i));
@@ -309,7 +307,11 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
             }
             for state in states.iter_mut() {
                 <F as Poseidon2>::sbox(state);
-                <F as Poseidon2>::external_linear_layer(state);
+                if r + 1 < ROUNDS_F_HALF {
+                    <F as Poseidon2>::external_linear_layer_with_rc(state, r + 1);
+                } else {
+                    <F as Poseidon2>::external_linear_layer(state);
+                }
             }
         }
 
@@ -327,10 +329,14 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
             }
         }
 
-        // The second half of the external rounds.
+        // The second half of the external rounds; round 4's constants follow
+        // an internal layer, so they stay scalar, while rounds 5..7's fuse
+        // into the preceding round's trailing linear layer.
         for r in ROUNDS_F_HALF..ROUNDS_F {
-            for state in states.iter_mut() {
-                <F as Poseidon2>::add_rc(state, r);
+            if r == ROUNDS_F_HALF {
+                for state in states.iter_mut() {
+                    <F as Poseidon2>::add_rc(state, r);
+                }
             }
             for i in 0..WIDTH {
                 let sbox_in = col(Self::wire_full_sbox_1(r - ROUNDS_F_HALF, i));
@@ -342,7 +348,11 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
             }
             for state in states.iter_mut() {
                 <F as Poseidon2>::sbox(state);
-                <F as Poseidon2>::external_linear_layer(state);
+                if r + 1 < ROUNDS_F {
+                    <F as Poseidon2>::external_linear_layer_with_rc(state, r + 1);
+                } else {
+                    <F as Poseidon2>::external_linear_layer(state);
+                }
             }
         }
 
