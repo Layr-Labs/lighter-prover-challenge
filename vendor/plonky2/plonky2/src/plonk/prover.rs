@@ -1009,7 +1009,7 @@ fn start_gpu_range_check_gate_quotient<
     use core::sync::atomic::Ordering;
     use crate::gates::gate::U32QuotientGate;
     use crate::hash::poseidon2::metal::{
-        RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec,
+        ByteDecompositionQuotientSpec, RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec,
     };
 
     GPU_RANGE_QUOTIENT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
@@ -1027,9 +1027,41 @@ fn start_gpu_range_check_gate_quotient<
     let mut gate_indices = Vec::new();
     let mut specs = Vec::new();
     let mut u32_specs = Vec::new();
+    let mut byte_specs: Vec<ByteDecompositionQuotientSpec> = Vec::new();
     for (gate_index, gate) in common_data.gates.iter().enumerate() {
         let range = gate.0.range_check_quotient_gate();
         let u32_gate = gate.0.u32_quotient_gate();
+        if let Some(byte_gate) = gate.0.byte_decomposition_quotient_gate() {
+            // Both counts are `(1 + 5 * num_limbs) * num_ops`; reject any gate
+            // whose real layout disagrees with what it advertises.
+            let per_op = byte_gate.num_limbs.checked_mul(5)?.checked_add(1)?;
+            let expected = per_op.checked_mul(byte_gate.num_ops)?;
+            if byte_gate.num_ops == 0
+                || byte_gate.num_limbs == 0
+                || gate.0.num_wires() != expected
+                || gate.0.num_constraints() != expected
+            {
+                if gpu_poseidon_quotient_diagnostics_enabled() {
+                    eprintln!(
+                        "[gpu-range-quotient] byte layout mismatch gate={gate_index} \
+                         metadata={byte_gate:?} wires={} constraints={} expected={expected}",
+                        gate.0.num_wires(),
+                        gate.0.num_constraints(),
+                    );
+                }
+                return None;
+            }
+            let selector_column = common_data.selectors_info.selector_indices[gate_index];
+            byte_specs.push(ByteDecompositionQuotientSpec {
+                selector_column,
+                gate_index,
+                group: common_data.selectors_info.groups[selector_column].clone(),
+                include_unused_selector,
+                num_ops: byte_gate.num_ops,
+                num_limbs: byte_gate.num_limbs,
+            });
+            gate_indices.push(gate_index);
+        }
         if range.is_some() && u32_gate.is_some() {
             if gpu_poseidon_quotient_diagnostics_enabled() {
                 eprintln!(
@@ -1190,6 +1222,7 @@ fn start_gpu_range_check_gate_quotient<
         step,
         &specs,
         &u32_specs,
+        &byte_specs,
         alphas,
         alpha_offset,
     ) else {

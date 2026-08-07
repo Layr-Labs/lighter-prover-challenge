@@ -13,8 +13,7 @@ use crate::nonnative::{CircuitBuilderNonNative, NonNativeTarget};
 
 /// A Target representing an affine point on the curve `C`. We use incomplete arithmetic for efficiency,
 /// so we assume these points are not zero.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-#[serde(bound = "")]
+#[derive(Clone, Debug, Default)]
 pub struct AffinePointTarget<C: Curve> {
     pub x: NonNativeTarget<C::BaseField>,
     pub y: NonNativeTarget<C::BaseField>,

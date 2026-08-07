@@ -44,7 +44,7 @@ where
     pub pub_key: QuinticExtension<F>,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug)]
 pub struct L1ChangePubKeyTxTarget {
     pub account_index: Target,
     pub master_account_index: Target,

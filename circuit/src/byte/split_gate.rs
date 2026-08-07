@@ -341,6 +341,15 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
     }
 
     // 1 for the sum then `num_limbs` for the limbs.
+    fn byte_decomposition_quotient_gate(
+        &self,
+    ) -> Option<plonky2::gates::gate::ByteDecompositionQuotientGate> {
+        Some(plonky2::gates::gate::ByteDecompositionQuotientGate {
+            num_ops: self.num_ops,
+            num_limbs: self.num_limbs,
+        })
+    }
+
     fn num_wires(&self) -> usize {
         (1 + self.num_limbs * 5) * self.num_ops
     }

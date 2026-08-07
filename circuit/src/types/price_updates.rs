@@ -42,13 +42,10 @@ impl Default for PriceUpdates {
     }
 }
 
-#[serde_with::serde_as]
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug)]
 pub struct PriceUpdatesTarget {
     // 32 bits each
-    #[serde_as(as = "[_; POSITION_LIST_SIZE]")]
     pub index_price: [Target; POSITION_LIST_SIZE],
-    #[serde_as(as = "[_; POSITION_LIST_SIZE]")]
     pub mark_price: [Target; POSITION_LIST_SIZE],
     pub asset_index_price: [Target; MARGINED_ASSET_LIST_SIZE],
 }
