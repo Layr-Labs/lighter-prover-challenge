@@ -9,7 +9,7 @@ use plonky2::field::types::Field;
 use plonky2::hash::hash_types::{HashOutTarget, RichField};
 use plonky2::iop::generator::PendingPartitionWitness;
 use plonky2::iop::target::{BoolTarget, Target};
-use plonky2::iop::witness::{PartialWitness, Witness, WitnessWrite};
+use plonky2::iop::witness::{PartialWitness, WitnessWrite};
 use plonky2::plonk::circuit_data::{CircuitConfig, CircuitData, CommonCircuitData};
 use plonky2::plonk::config::GenericConfig;
 use plonky2::plonk::proof::{
@@ -97,8 +97,7 @@ pub struct BlockCircuit {
     pub target: BlockTarget,
 }
 
-#[serde_with::serde_as]
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug)]
 pub struct BlockTarget {
     pub pre_exec_proof: ProofWithPublicInputsTarget<D>, // proof of pre execution beginning of the block
     pub light_tx_chain_proof: ProofWithPublicInputsTarget<D>, // proof of light tx chain execution
@@ -107,7 +106,6 @@ pub struct BlockTarget {
     pub block: BlockWitnessTarget, // Public block witness
 
     // Private witness: raw public market details after the block.
-    #[serde_as(as = "[_; POSITION_LIST_SIZE]")]
     pub new_market_risk_details_partial: [MarketRiskDetailsTarget; POSITION_LIST_SIZE],
 }
 
@@ -162,14 +160,14 @@ impl BlockCircuit {
         }
     }
 
-    /// Seeded form of [`Self::witness_inputs_early`]: writes the same targets directly through
-    /// `pw` (any partition seeder or map), with no dedicated `PartialWitness` transport.
-    pub fn seed_witness_early_into<W: Witness<F> + WitnessWrite<F>>(
+    /// Block witness inputs that do not depend on the chain proofs, so they can be seeded and
+    /// their generators run while the transaction chains are still proving.
+    pub fn witness_inputs_early(
         target: &BlockTarget,
         block: &Block<F>,
         pre_exec_proof: &ProofWithPublicInputs<F, C, D>,
-        pw: &mut W,
-    ) -> Result<()> {
+    ) -> Result<PartialWitness<F>> {
+        let mut pw = PartialWitness::new();
 
         pw.set_proof_with_pis_target(&target.pre_exec_proof, pre_exec_proof)?;
 
@@ -240,19 +238,6 @@ impl BlockCircuit {
             .zip_eq(block.new_public_market_details.iter())
             .try_for_each(|(t, mi)| pw.set_partial_market_risk_details_target(t, mi))?;
 
-        Ok(())
-    }
-
-
-    /// Block witness inputs that do not depend on the chain proofs, so they can be seeded and
-    /// their generators run while the transaction chains are still proving.
-    pub fn witness_inputs_early(
-        target: &BlockTarget,
-        block: &Block<F>,
-        pre_exec_proof: &ProofWithPublicInputs<F, C, D>,
-    ) -> Result<PartialWitness<F>> {
-        let mut pw = PartialWitness::new();
-        Self::seed_witness_early_into(target, block, pre_exec_proof, &mut pw)?;
         Ok(pw)
     }
 
@@ -793,34 +778,16 @@ impl Circuit<C, F, D> for BlockCircuit {
     ) -> Result<ProofWithPublicInputs<F, C, D>> {
         let mut timing = TimingTree::new("BlockCircuit", Level::Debug);
 
-        // Seed the partition directly: the same targets `generate_witness` would
-        // accumulate in a `PartialWitness` map — the early block inputs plus all three
-        // recursive proofs — are written straight into the partition's representative
-        // slots, deleting the map build and its full replay pass.
-        let pending = timed!(timing, "witness", {
-            PendingPartitionWitness::start_seeded(
-                &circuit_data.prover_only,
-                &circuit_data.common,
-                |seeder| {
-                    Self::seed_witness_early_into(target, block, pre_exec_proof, seeder)?;
-                    seeder.set_proof_with_pis_target(
-                        &target.light_tx_chain_proof,
-                        light_tx_chain_proof,
-                    )?;
-                    seeder.set_proof_with_pis_target(
-                        &target.heavy_tx_chain_proof,
-                        heavy_tx_chain_proof,
-                    )
-                },
+        let pw = timed!(timing, "witness", {
+            Self::generate_witness(
+                target,
+                block,
+                pre_exec_proof,
+                light_tx_chain_proof,
+                heavy_tx_chain_proof,
             )?
         });
-        let partition_witness = pending.finish()?;
-        let proof = prove_with_partition_witness(
-            &circuit_data.prover_only,
-            &circuit_data.common,
-            partition_witness,
-            &mut timing,
-        )?;
+        let proof = circuit_data.prove(pw)?;
         // The trusted benchmark verifies the final proof; keep the eager check for tests.
         #[cfg(debug_assertions)]
         timed!(timing, "verify", { circuit_data.verify(proof.clone())? });

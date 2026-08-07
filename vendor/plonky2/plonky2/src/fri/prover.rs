@@ -15,7 +15,7 @@ use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
@@ -97,26 +97,38 @@ pub fn final_poly_coeff_len(mut degree_bits: usize, reduction_arity_bits: &Vec<u
 /// the result is index-for-index identical to the serial fill.
 fn bitrev_flatten<F: RichField + Extendable<D>, const D: usize>(values: &[F::Extension]) -> Vec<F> {
     const FLATTEN_BLOCK: usize = 1 << 10;
+    // Late FRI rounds are too small to amortize Rayon dispatch. Keep those
+    // gathers on the caller thread; larger rounds retain block parallelism.
+    const FLATTEN_PAR_THRESHOLD: usize = FLATTEN_BLOCK * 4;
 
     let n = values.len();
     let log_n = log2_strict(n);
     let mut flat: Vec<F> = Vec::with_capacity(n * D);
     {
         let spare = &mut flat.spare_capacity_mut()[..n * D];
-        spare
-            .par_chunks_mut(FLATTEN_BLOCK * D)
-            .enumerate()
-            .for_each(|(block, out)| {
-                let base = block * FLATTEN_BLOCK;
-                for (j, slot) in out.chunks_exact_mut(D).enumerate() {
-                    let limbs = values[reverse_bits(base + j, log_n)].to_basefield_array();
-                    for k in 0..D {
-                        slot[k].write(limbs[k]);
-                    }
+        if n <= FLATTEN_PAR_THRESHOLD {
+            for (i, slot) in spare.chunks_exact_mut(D).enumerate() {
+                let limbs = values[reverse_bits(i, log_n)].to_basefield_array();
+                for k in 0..D {
+                    slot[k].write(limbs[k]);
                 }
-            });
+            }
+        } else {
+            spare
+                .par_chunks_mut(FLATTEN_BLOCK * D)
+                .enumerate()
+                .for_each(|(block, out)| {
+                    let base = block * FLATTEN_BLOCK;
+                    for (j, slot) in out.chunks_exact_mut(D).enumerate() {
+                        let limbs = values[reverse_bits(base + j, log_n)].to_basefield_array();
+                        for k in 0..D {
+                            slot[k].write(limbs[k]);
+                        }
+                    }
+                });
+        }
     }
-    // SAFETY: the loop above wrote every one of the `n * D` slots of spare
+    // SAFETY: the branch above wrote every one of the `n * D` slots of spare
     // capacity exactly once, so the whole prefix is initialized.
     unsafe { flat.set_len(n * D) };
     flat
@@ -247,21 +259,80 @@ pub(crate) fn fri_proof_of_work<
     // state with any inputs (excluding the PoW witness candidate). The second step is to overwrite
     // one more element of our sponge state with the candidate, then apply the permutation,
     // obtaining our duplex's post-state which contains the PoW response.
+    //
+    // We evaluate sixteen candidates per Rayon task, batching each quarter through
+    // `Permutation::permute_x4`. Amortizing Rayon scheduling and iterator work
+    // across four fused permutations preserves the scalar candidate semantics.
     let mut duplex_intermediate_state = challenger.sponge_state;
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
+    const CANDIDATES_PER_TASK: u64 = 16;
+    let max_candidate = F::NEG_ONE.to_canonical_u64();
+    let block_count = max_candidate / CANDIDATES_PER_TASK + 1;
+    let pow_witness = (0..block_count)
         .into_par_iter()
-        .find_any(|&candidate| {
-            let mut duplex_state = duplex_intermediate_state;
-            duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-            duplex_state.permute();
-            let pow_response = duplex_state.squeeze().iter().last().unwrap();
-            let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-            leading_zeros >= min_leading_zeros
+        .find_map_any(|block| {
+            let base = block * CANDIDATES_PER_TASK;
+            let mut states = [duplex_intermediate_state; CANDIDATES_PER_TASK as usize];
+            let mut n = 0;
+            for (i, state) in states.iter_mut().enumerate() {
+                let candidate = base + i as u64;
+                if candidate > max_candidate {
+                    break;
+                }
+                state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+                n = i + 1;
+            }
+            if n == CANDIDATES_PER_TASK as usize {
+                let [
+                    mut s0,
+                    mut s1,
+                    mut s2,
+                    mut s3,
+                    mut s4,
+                    mut s5,
+                    mut s6,
+                    mut s7,
+                    mut s8,
+                    mut s9,
+                    mut s10,
+                    mut s11,
+                    mut s12,
+                    mut s13,
+                    mut s14,
+                    mut s15,
+                ] = states;
+                <<C as GenericConfig<D>>::Hasher as Hasher<F>>::Permutation::permute_x4(
+                    &mut s0, &mut s1, &mut s2, &mut s3,
+                );
+                <<C as GenericConfig<D>>::Hasher as Hasher<F>>::Permutation::permute_x4(
+                    &mut s4, &mut s5, &mut s6, &mut s7,
+                );
+                <<C as GenericConfig<D>>::Hasher as Hasher<F>>::Permutation::permute_x4(
+                    &mut s8, &mut s9, &mut s10, &mut s11,
+                );
+                <<C as GenericConfig<D>>::Hasher as Hasher<F>>::Permutation::permute_x4(
+                    &mut s12, &mut s13, &mut s14, &mut s15,
+                );
+                states = [
+                    s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14,
+                    s15,
+                ];
+            } else {
+                for state in states.iter_mut().take(n) {
+                    state.permute();
+                }
+            }
+            for (i, state) in states.iter().take(n).enumerate() {
+                let pow_response = state.squeeze().iter().last().unwrap();
+                let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
+                if leading_zeros >= min_leading_zeros {
+                    return Some(F::from_canonical_u64(base + i as u64));
+                }
+            }
+            None
         })
-        .map(F::from_canonical_u64)
         .expect("Proof of work failed. This is highly unlikely!");
 
     // Recompute pow_response using our normal Challenger code, and make sure it matches.
@@ -334,6 +405,29 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::fri::reduction_strategies::FriReductionStrategy;
+    use crate::hash::poseidon2::hash::Poseidon2Hash;
+    use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    #[test]
+    fn batched_proof_of_work_finds_a_valid_witness() {
+        type F = GoldilocksField;
+
+        let config = FriConfig {
+            rate_bits: 2,
+            cap_height: 4,
+            proof_of_work_bits: 16,
+            reduction_strategy: FriReductionStrategy::Fixed(Vec::new()),
+            num_query_rounds: 28,
+        };
+        let mut challenger = Challenger::<F, Poseidon2Hash>::new();
+        challenger.observe_elements(&[F::ONE, F::TWO, F::NEG_ONE]);
+
+        let _witness = fri_proof_of_work::<F, Poseidon2GoldilocksConfig, 2>(
+            &mut challenger,
+            &config,
+        );
+    }
 
     /// `bitrev_flatten` must be raw-`u64`-identical to the serial
     /// gather-and-extend loop it replaced, for every leaf and every limb.

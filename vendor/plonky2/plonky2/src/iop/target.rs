@@ -68,7 +68,7 @@ impl Target {
 }
 
 /// A `Target` which has already been constrained such that it can only be 0 or 1.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 #[allow(clippy::manual_non_exhaustive)]
 pub struct BoolTarget {
     pub target: Target,

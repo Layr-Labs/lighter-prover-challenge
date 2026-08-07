@@ -46,7 +46,7 @@ pub struct L1CreateOrderTx {
     pub order_type: u8,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct L1CreateOrderTxTarget {
     pub master_account_index: Target,
     pub account_index: Target, // 48 bits

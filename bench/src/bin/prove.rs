@@ -5,8 +5,6 @@
 
 #[path = "../api.rs"]
 mod api;
-#[path = "../embedded.rs"]
-mod embedded;
 #[path = "../prover.rs"]
 mod prover;
 
@@ -64,10 +62,7 @@ fn main() {
         PUBLIC_LIGHT_TX_COUNT,
     )
     .expect("invalid prover fixture");
-    // Embedded circuits (deserialized from compile-time blobs) by default;
-    // falls back to building from scratch if they are unavailable, and
-    // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B measurement.
-    let proof = prover::prove_block(block, Circuits::load());
+    let proof = prover::prove_block(block, Circuits::new());
     let mut writer = BufWriter::with_capacity(
         PROOF_OUTPUT_BUFFER_BYTES,
         File::create(output).expect("cannot create proof output"),

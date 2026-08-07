@@ -15,8 +15,7 @@ use crate::types::market_details::{PublicMarketDetailsTarget, connect_public_mar
 use crate::uint::u8::{CircuitBuilderU8, U8Target};
 use crate::uint::u32::gadgets::arithmetic_u32::U32Target;
 
-#[serde_with::serde_as]
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug)]
 /// In circuit represantion of [`crate::block::BlockWitness`]
 pub struct BlockWitnessTarget {
     pub block_number: Target,
@@ -36,7 +35,6 @@ pub struct BlockWitnessTarget {
     pub old_prefix_priority_operation_hash: KeccakOutputTarget,
     pub new_prefix_priority_operation_hash: KeccakOutputTarget,
 
-    #[serde_as(as = "[_; POSITION_LIST_SIZE]")]
     pub new_public_market_details: [PublicMarketDetailsTarget; POSITION_LIST_SIZE],
 }
 

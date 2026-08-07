@@ -53,13 +53,3 @@ incremental = false
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-
-# bench/build.rs constructs and serializes the five startup circuits at
-# compile time. Build scripts default to opt-level 0, which would turn that
-# few-second construction into minutes of untimed-but-annoying work; compile
-# the build-dependency graph optimized instead.
-[profile.release.build-override]
-opt-level = 3
-
-[profile.dev.build-override]
-opt-level = 3
