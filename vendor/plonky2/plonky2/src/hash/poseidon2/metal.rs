@@ -14,6 +14,7 @@ use plonky2_maybe_rayon::*;
 
 use crate::field::types::{Field, PrimeField64};
 use crate::hash::hash_types::{HashOut, RichField};
+use crate::hash::merkle_tree::LevelOrderDigests;
 use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
@@ -265,7 +266,7 @@ pub(crate) fn build_merkle_tree<F: RichField>(
     leaf_width: usize,
     leaf_count: usize,
     cap_height: usize,
-) -> Option<(Vec<HashOut<F>>, Vec<HashOut<F>>)> {
+) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || leaves.len() != leaf_count * leaf_width
@@ -289,7 +290,7 @@ pub(crate) fn build_merkle_tree<F: RichField>(
 pub(crate) fn build_merkle_tree_columns<F: RichField>(
     columns: &[Vec<F>],
     cap_height: usize,
-) -> Option<(Vec<HashOut<F>>, Vec<HashOut<F>>)> {
+) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.len();
     let leaf_count = columns.first().map_or(0, Vec::len);
     if F::ORDER != 0xffff_ffff_0000_0001
@@ -354,7 +355,7 @@ pub(crate) fn allocate_columns<F: RichField>(
 pub(crate) fn build_merkle_tree_shared<F: RichField>(
     columns: &MetalColumns<F>,
     cap_height: usize,
-) -> Option<(Vec<HashOut<F>>, Vec<HashOut<F>>)> {
+) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
     if F::ORDER != 0xffff_ffff_0000_0001
@@ -393,7 +394,11 @@ pub(crate) fn build_commitment_from_coeffs<F: RichField>(
     coeff_columns: &[&[F]],
     rate_bits: usize,
     cap_height: usize,
-) -> Option<(MetalColumns<F>, Vec<HashOut<F>>, Vec<HashOut<F>>)> {
+) -> Option<(
+    MetalColumns<F>,
+    LevelOrderDigests<HashOut<F>>,
+    Vec<HashOut<F>>,
+)> {
     let cols = coeff_columns.len();
     let degree = coeff_columns.first().map_or(0, |column| column.len());
     if F::ORDER != 0xffff_ffff_0000_0001
@@ -434,7 +439,7 @@ pub(crate) fn build_commitment_from_values<F: RichField>(
     cap_height: usize,
 ) -> Option<(
     MetalColumns<F>,
-    Vec<HashOut<F>>,
+    LevelOrderDigests<HashOut<F>>,
     Vec<HashOut<F>>,
     Vec<Vec<F>>,
 )> {
@@ -709,7 +714,7 @@ impl MetalShared {
     ) -> Result<
         (
             MetalColumns<F>,
-            Vec<HashOut<F>>,
+            LevelOrderDigests<HashOut<F>>,
             Vec<HashOut<F>>,
             Vec<Vec<F>>,
         ),
@@ -761,7 +766,7 @@ impl MetalShared {
         });
 
         let mut set = self.acquire_set()?;
-        let result = (|| -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
+        let result = (|| -> Result<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>), String> {
             if set
                 .input
                 .as_ref()
@@ -968,13 +973,21 @@ impl MetalShared {
         ))
     }
 
+    #[allow(clippy::type_complexity)]
     fn build_from_coeffs<F: RichField>(
         &self,
         coeff_columns: &[&[F]],
         degree: usize,
         rate_bits: usize,
         cap_height: usize,
-    ) -> Result<(MetalColumns<F>, Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
+    ) -> Result<
+        (
+            MetalColumns<F>,
+            LevelOrderDigests<HashOut<F>>,
+            Vec<HashOut<F>>,
+        ),
+        String,
+    > {
         let cols = coeff_columns.len();
         let lde_size = degree << rate_bits;
         let log_lde = lde_size.ilog2();
@@ -1058,7 +1071,7 @@ impl MetalShared {
         coeff_bytes: usize,
         output_len: usize,
         output_bytes: usize,
-    ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
+    ) -> Result<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>), String> {
         let cols = coeff_columns.len();
         let lde_size = degree << rate_bits;
         let log_lde = lde_size.ilog2();
@@ -1208,7 +1221,7 @@ impl MetalShared {
         leaf_width: usize,
         leaf_count: usize,
         cap_height: usize,
-    ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
+    ) -> Result<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>), String> {
         let cap_count = 1usize << cap_height;
         let total_node_count = 2 * leaf_count - cap_count;
 
@@ -1254,7 +1267,7 @@ impl MetalShared {
         input_bytes: usize,
         output_len: usize,
         output_bytes: usize,
-    ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
+    ) -> Result<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>), String> {
         let cap_count = 1usize << cap_height;
 
         let needs_staging = !matches!(&source, LeafSource::Shared(_));
@@ -1473,111 +1486,49 @@ fn dispatch(
     );
 }
 
+/// Copies the GPU's level-order node array (leaf digests first, cap level
+/// last; 4 u64 limbs per digest) into CPU-owned [`LevelOrderDigests`] storage
+/// with one bulk streaming pass, and reads the cap off the top level. The
+/// interleaved [`crate::hash::merkle_tree::MerkleTree::digests`] layout is
+/// deliberately not rebuilt here: `prove` indexes the levels directly, and
+/// the rare consumers that need the interleaved array (serialization)
+/// materialize it on demand via [`LevelOrderDigests::to_interleaved`].
 fn tree_from_levels<F: RichField>(
     nodes: &[u64],
     level_offsets: &[usize],
     leaf_count: usize,
     cap_height: usize,
-) -> (Vec<HashOut<F>>, Vec<HashOut<F>>) {
+) -> (LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>) {
     let cap_count = 1usize << cap_height;
-    let subtree_leaf_count = leaf_count / cap_count;
-    let subtree_digest_count = 2 * (subtree_leaf_count - 1);
-    let digest_count = 2 * (leaf_count - cap_count);
+    let node_count = 2 * leaf_count - cap_count;
+    debug_assert_eq!(nodes.len(), node_count * 4);
+    debug_assert_eq!(level_offsets[0], 0);
 
-    // The scatter below writes every one of these slots before any is read, so
-    // pre-filling them with `HashOut::ZERO` is dead work — and it is *serial*
-    // dead work inside the exclusive buffer-set hold (`MAX_BUFFER_SETS == 1`),
-    // ahead of a 16-way parallel write, so it also converts a parallel phase
-    // into serial-then-parallel. For a 2^19-leaf tree that is 32 MiB of stores
-    // per commitment, ~318 commitments per worker process.
-    //
-    // `HashOut<F>` is a plain struct with no `IsZero` specialization, so
-    // `vec![HashOut::ZERO; n]` really is a store loop rather than `alloc_zeroed`.
-    let mut digests: Vec<HashOut<F>> = Vec::with_capacity(digest_count);
-    let mut cap: Vec<HashOut<F>> = Vec::with_capacity(cap_count);
-    let digests_uninit = crate::hash::merkle_tree::capacity_up_to_mut(&mut digests, digest_count);
-    let cap_uninit = crate::hash::merkle_tree::capacity_up_to_mut(&mut cap, cap_count);
+    // Chunked parallel bulk copy out of the CPU-visible shared buffer; every
+    // worker walks its chunk sequentially, so the whole read stays a
+    // streaming pass.
+    let mut digests = vec![HashOut::ZERO; node_count];
+    digests
+        .par_chunks_mut(STAGING_CHUNK / 4)
+        .zip(nodes.par_chunks(STAGING_CHUNK))
+        .for_each(|(digests, limbs)| {
+            for (digest, limbs) in digests.iter_mut().zip(limbs.chunks_exact(4)) {
+                digest.elements = core::array::from_fn(|i| F::from_canonical_u64(limbs[i]));
+            }
+        });
 
-    if subtree_digest_count == 0 {
-        cap_uninit
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(cap_index, root)| {
-                root.write(read_node(nodes, level_offsets[0], cap_index));
-            });
-    } else {
-        digests_uninit
-            .par_chunks_exact_mut(subtree_digest_count)
-            .zip(cap_uninit.par_iter_mut())
-            .enumerate()
-            .for_each(|(cap_index, (subtree_digests, root))| {
-                root.write(fill_subtree_layout(
-                    subtree_digests,
-                    nodes,
-                    level_offsets,
-                    cap_index * subtree_leaf_count,
-                    subtree_leaf_count,
-                ));
-            });
-    }
-    // SAFETY: every slot of both buffers was written exactly once above.
-    // `cap`: one write per index, either by the degenerate branch or as each
-    // subtree's root. `digests`: `par_chunks_exact_mut(subtree_digest_count)`
-    // partitions it exactly (`cap_count * 2 * (subtree_leaf_count - 1)
-    // == 2 * (leaf_count - cap_count)`, no remainder), and `fill_subtree_layout`
-    // writes exactly `2 * (n - 1)` slots for an `n`-leaf subtree — by induction
-    // it splits into left_digests, left_root, right_root, right_digests, a
-    // disjoint partition of the whole slice, with the `n == 1` base case
-    // receiving an empty slice. This is the same argument that already licenses
-    // `capacity_up_to_mut` in `MerkleTree::cpu_digests`.
-    unsafe {
-        digests.set_len(digest_count);
-        cap.set_len(cap_count);
-    }
-    (digests, cap)
-}
-
-fn fill_subtree_layout<F: RichField>(
-    digests: &mut [core::mem::MaybeUninit<HashOut<F>>],
-    nodes: &[u64],
-    level_offsets: &[usize],
-    start_leaf: usize,
-    leaf_count: usize,
-) -> HashOut<F> {
-    if leaf_count == 1 {
-        return read_node(nodes, level_offsets[0], start_leaf);
-    }
-
-    let (left_half, right_half) = digests.split_at_mut(digests.len() / 2);
-    let (left_root, left_digests) = left_half.split_last_mut().unwrap();
-    let (right_root, right_digests) = right_half.split_first_mut().unwrap();
-    let half = leaf_count / 2;
-    // The two halves and the two root slots are a disjoint partition of
-    // `digests`, so every slot is initialized exactly once.
-    left_root.write(fill_subtree_layout(
-        left_digests,
-        nodes,
-        level_offsets,
-        start_leaf,
-        half,
-    ));
-    right_root.write(fill_subtree_layout(
-        right_digests,
-        nodes,
-        level_offsets,
-        start_leaf + half,
-        half,
-    ));
-
-    let level = leaf_count.ilog2() as usize;
-    read_node(nodes, level_offsets[level], start_leaf / leaf_count)
-}
-
-fn read_node<F: RichField>(nodes: &[u64], level_offset: usize, index: usize) -> HashOut<F> {
-    let offset = level_offset + index * 4;
-    HashOut {
-        elements: core::array::from_fn(|i| F::from_canonical_u64(nodes[offset + i])),
-    }
+    // The GPU offsets are in u64 limbs; the CPU representation indexes whole
+    // digests.
+    let level_offsets: Vec<usize> = level_offsets.iter().map(|offset| offset / 4).collect();
+    let cap_offset = *level_offsets.last().unwrap();
+    let cap = digests[cap_offset..cap_offset + cap_count].to_vec();
+    (
+        LevelOrderDigests {
+            nodes: digests,
+            level_offsets,
+        },
+        cap,
+    )
 }
 
 #[cfg(test)]
@@ -2271,7 +2222,9 @@ kernel void goldilocks_mul_bench_native(
                     .map(|row| row.to_vec())
                     .collect();
                 let cpu = cpu_tree(&rows, cap_height);
-                assert_tree_eq(&(gpu_digests, gpu_cap), &cpu, cols, cap_height);
+                let gpu = (gpu_digests, gpu_cap);
+                assert_tree_eq(&gpu, &cpu, cols, cap_height);
+                assert_all_paths_match_cpu(&gpu, &cpu, lde_size, cap_height);
             }
         }
     }
@@ -2343,7 +2296,9 @@ kernel void goldilocks_mul_bench_native(
             let rows: Vec<Vec<GoldilocksField>> =
                 flat.chunks(cols).map(|row| row.to_vec()).collect();
             let cpu = cpu_tree(&rows, cap_height);
-            assert_tree_eq(&(gpu_digests, gpu_cap), &cpu, cols, cap_height);
+            let gpu = (gpu_digests, gpu_cap);
+            assert_tree_eq(&gpu, &cpu, cols, cap_height);
+            assert_all_paths_match_cpu(&gpu, &cpu, lde_size, cap_height);
         }
     }
 
@@ -2450,6 +2405,7 @@ kernel void goldilocks_mul_bench_native(
                     .unwrap();
                 let cpu = cpu_tree(&leaves, cap_height);
                 assert_tree_eq(&gpu, &cpu, width, cap_height);
+                assert_all_paths_match_cpu(&gpu, &cpu, leaves.len(), cap_height);
 
                 let gpu_cols = context
                     .build(
@@ -2460,6 +2416,7 @@ kernel void goldilocks_mul_bench_native(
                     )
                     .unwrap();
                 assert_tree_eq(&gpu_cols, &cpu, width, cap_height);
+                assert_all_paths_match_cpu(&gpu_cols, &cpu, leaves.len(), cap_height);
             }
         }
     }
@@ -2489,16 +2446,21 @@ kernel void goldilocks_mul_bench_native(
         (digests, cap)
     }
 
+    type GpuTree = (
+        LevelOrderDigests<HashOut<GoldilocksField>>,
+        Vec<HashOut<GoldilocksField>>,
+    );
+
     fn assert_tree_eq(
-        actual: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
+        actual: &GpuTree,
         expected: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
         width: usize,
         cap_height: usize,
     ) {
-        assert_eq!(actual.0.len(), expected.0.len());
+        let actual_digests = actual.0.to_interleaved();
+        assert_eq!(actual_digests.len(), expected.0.len());
         assert_eq!(actual.1.len(), expected.1.len());
-        for (index, (actual, expected)) in actual
-            .0
+        for (index, (actual, expected)) in actual_digests
             .iter()
             .chain(&actual.1)
             .zip(expected.0.iter().chain(&expected.1))
@@ -2513,19 +2475,16 @@ kernel void goldilocks_mul_bench_native(
         }
     }
 
-    fn assert_tree_raw_eq(
-        actual: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
-        expected: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
-        width: usize,
-        cap_height: usize,
-    ) {
-        assert_eq!(actual.0.len(), expected.0.len());
+    fn assert_tree_raw_eq(actual: &GpuTree, expected: &GpuTree, width: usize, cap_height: usize) {
+        assert_eq!(actual.0.level_offsets, expected.0.level_offsets);
+        assert_eq!(actual.0.nodes.len(), expected.0.nodes.len());
         assert_eq!(actual.1.len(), expected.1.len());
         for (index, (actual, expected)) in actual
             .0
+            .nodes
             .iter()
             .chain(&actual.1)
-            .zip(expected.0.iter().chain(&expected.1))
+            .zip(expected.0.nodes.iter().chain(&expected.1))
             .enumerate()
         {
             let actual = actual.elements.map(|value| value.to_noncanonical_u64());
@@ -2538,28 +2497,48 @@ kernel void goldilocks_mul_bench_native(
     }
 
     fn assert_all_paths_raw_eq(
-        actual: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
-        expected: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
+        actual: &GpuTree,
+        expected: &GpuTree,
         rows: usize,
         cap_height: usize,
     ) {
+        let num_layers = rows.ilog2() as usize - cap_height;
         for leaf in 0..rows {
-            let actual_path = merkle_tree_prove::<GoldilocksField, Poseidon2Hash>(
-                leaf, rows, cap_height, &actual.0,
-            );
-            let expected_path = merkle_tree_prove::<GoldilocksField, Poseidon2Hash>(
-                leaf,
-                rows,
-                cap_height,
-                &expected.0,
-            );
-            assert_eq!(actual_path.len(), expected_path.len());
+            let actual_path = actual.0.prove_siblings(leaf);
+            let expected_path = expected.0.prove_siblings(leaf);
+            assert_eq!(actual_path.len(), num_layers);
+            assert_eq!(expected_path.len(), num_layers);
             for (level, (actual, expected)) in actual_path.iter().zip(&expected_path).enumerate() {
                 let actual = actual.elements.map(|value| value.to_noncanonical_u64());
                 let expected = expected.elements.map(|value| value.to_noncanonical_u64());
                 assert_eq!(
                     actual, expected,
                     "raw Merkle path mismatch at leaf {leaf}, level {level}"
+                );
+            }
+        }
+    }
+
+    /// Differential check of the level-order proving path: for every leaf the
+    /// siblings read out of the GPU level-order storage must equal the ones
+    /// `merkle_tree_prove` extracts from the CPU interleaved layout.
+    fn assert_all_paths_match_cpu(
+        gpu: &GpuTree,
+        cpu: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
+        rows: usize,
+        cap_height: usize,
+    ) {
+        for leaf in 0..rows {
+            let gpu_path = gpu.0.prove_siblings(leaf);
+            let cpu_path =
+                merkle_tree_prove::<GoldilocksField, Poseidon2Hash>(leaf, rows, cap_height, &cpu.0);
+            assert_eq!(gpu_path.len(), cpu_path.len());
+            for (level, (gpu, cpu)) in gpu_path.iter().zip(&cpu_path).enumerate() {
+                let gpu = gpu.elements.map(|value| value.to_canonical_u64());
+                let cpu = cpu.elements.map(|value| value.to_canonical_u64());
+                assert_eq!(
+                    gpu, cpu,
+                    "Merkle path mismatch vs CPU at leaf {leaf}, level {level}"
                 );
             }
         }

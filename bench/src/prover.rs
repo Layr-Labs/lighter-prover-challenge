@@ -104,31 +104,39 @@ fn chain_step_proof(
     chain_step: u64,
     previous: Option<ChainState<'_>>,
     base_proof: &Proof,
-    constant_inputs: &plonky2::iop::witness::PartialWitness<F>,
+    dummy_proof: &Proof,
     tx_proof: &Proof,
 ) -> Proof {
     mark_spine_thread_latency_critical();
     let result = (|| {
         // Phase 1: run every generator that does not depend on the previous chain proof while
-        // that proof may still be in flight.
-        let early_inputs = BlockTxChainCircuit::witness_inputs_early_from_template(
-            constant_inputs,
-            chain_target,
-            chain_step,
-            tx_proof,
-        )?;
-        let mut pending = PendingPartitionWitness::start(
-            early_inputs,
+        // that proof may still be in flight. Inputs are written directly into
+        // the partition's representative slots — no PartialWitness map, no
+        // per-path template clone, no replay pass.
+        let mut pending = PendingPartitionWitness::start_seeded(
             &chain_data.prover_only,
             &chain_data.common,
+            |seeder| {
+                BlockTxChainCircuit::witness_inputs_early_into(
+                    chain_target,
+                    chain_data,
+                    chain_step,
+                    dummy_proof,
+                    tx_proof,
+                    seeder,
+                )
+            },
         )?;
 
-        // Phase 2: wait for the previous chain proof, feed it, and prove.
+        // Phase 2: wait for the previous chain proof, feed it directly, and prove.
         let previous_proof = previous.map(ChainState::wait);
-        pending.feed(BlockTxChainCircuit::witness_inputs_cyclic(
-            chain_target,
-            previous_proof.as_ref().unwrap_or(base_proof),
-        )?)?;
+        pending.feed_seeded(|feeder| {
+            BlockTxChainCircuit::witness_inputs_cyclic_into(
+                chain_target,
+                previous_proof.as_ref().unwrap_or(base_proof),
+                feeder,
+            )
+        })?;
         BlockTxChainCircuit::prove_prepared(pending, chain_data)
     })();
     result.unwrap_or_else(|error| {
@@ -268,16 +276,9 @@ fn prove_path(
     );
     jump = next_jump;
 
-    let chain_constant_inputs = BlockTxChainCircuit::witness_inputs_constant(
-        chain_target,
-        chain_data,
-        dummy_proof,
-    )
-    .expect("chain constant witness inputs failed");
 
     std::thread::scope(|scope| {
         let base = &base_proof;
-        let chain_constant = &chain_constant_inputs;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
@@ -299,7 +300,7 @@ fn prove_path(
                             chain_step,
                             previous,
                             base,
-                            chain_constant,
+                            dummy_proof,
                             &tx_proof,
                         )
                     })
@@ -371,7 +372,7 @@ fn prove_path(
                         chain_step,
                         previous,
                         base,
-                        chain_constant,
+                        dummy_proof,
                         &tx_proof,
                     )
                 })
@@ -395,7 +396,7 @@ fn prove_path(
                 chain_step,
                 previous,
                 base,
-                chain_constant,
+                dummy_proof,
                 &tx_proof,
             )));
         }
@@ -574,6 +575,8 @@ mod tests {
     fn chain_step_two_phase_timing_impl() {
         use std::time::Instant;
 
+        const CHAIN_STEPS: u64 = 10;
+
         let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .is_test(false)
             .try_init();
@@ -660,7 +663,7 @@ mod tests {
         );
 
         let mut previous: Option<Proof> = None;
-        for chain_step in 0..3u64 {
+        for chain_step in 0..CHAIN_STEPS {
             let cyclic_proof = previous.as_ref().unwrap_or(&base_proof);
 
             let single_shot_start = Instant::now();
@@ -726,11 +729,29 @@ mod tests {
             let prove_elapsed = prove_start.elapsed();
             timing.print();
 
+            // Differential integration check for the production direct-seeding
+            // path. The reference above keeps the old PartialWitness map
+            // path solely for this manual timing harness.
+            let direct_start = Instant::now();
+            let direct_proof = chain_step_proof(
+                TxPath::Light,
+                &circuits.chain_target,
+                &circuits.chain_data,
+                chain_step,
+                previous.clone().map(ChainState::Ready),
+                &base_proof,
+                &circuits.dummy_proof,
+                &tx_proof,
+            );
+            let direct_elapsed = direct_start.elapsed();
+            assert_eq!(proof.public_inputs, direct_proof.public_inputs);
+
             println!(
                 "chain step {chain_step}: single-shot witness {single_shot_elapsed:?}, \
-                 phase1 {phase1_elapsed:?}, phase2 {phase2_elapsed:?}, prove {prove_elapsed:?}",
+                 map phase1 {phase1_elapsed:?}, map phase2 {phase2_elapsed:?}, \
+                 map prove {prove_elapsed:?}, direct total {direct_elapsed:?}",
             );
-            previous = Some(proof);
+            previous = Some(direct_proof);
         }
 
         circuits
