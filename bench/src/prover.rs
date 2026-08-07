@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use circuit::block::Block;
-use circuit::block_constraints::{BlockCircuit, Circuit as _};
+use circuit::block_constraints::BlockCircuit;
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
 use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
 use circuit::block_tx::{BlockTx, JumpState, JumpStateTarget};
@@ -13,7 +13,7 @@ use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget};
 #[cfg(test)]
 use circuit::block_tx_constraints::Circuit as _;
 use circuit::tx::Tx;
-use circuit::types::config::{C, D, F};
+use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
 use circuit::types::constants::TX_LIGHT;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
 use plonky2::iop::generator::{ParallelWitnessGuard, PendingPartitionWitness};
@@ -24,7 +24,10 @@ use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::util::timing::TimingTree;
 
-use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
+use crate::api::{
+    Circuits, HEAVY_TX_MODE, HEAVY_TX_PER_PROOF, LIGHT_TX_MODE, LIGHT_TX_PER_PROOF, PathCircuits,
+    PROVER_THREAD_STACK_BYTES, Proof,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxPath {
@@ -408,18 +411,64 @@ fn prove_path(
     })
 }
 
-pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
-    // The pre-execution proof runs strictly before any other proving work, so
-    // the serialized GPU stream is otherwise idle: route its mid-size column
-    // trees to the GPU for just this phase.
-    plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-    let pre_proof = BlockPreExecutionCircuit::prove(
-        &circuits.pre_data,
-        &BlockPreExec::from_block(&block),
-        &circuits.pre_target,
-    )
-    .expect("block pre-execution proof failed");
-    plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+pub fn prove_block(block: Block<F>) -> Proof {
+    // Build the two transaction paths while the pre-execution lane builds its
+    // circuit and immediately proves it. The transaction-path builds are the
+    // startup critical path, so the pre proof fits behind work already required.
+    let ((pre_data, pre_proof), heavy, light) = std::thread::scope(|scope| {
+        let block_ref = &block;
+        let pre_handle = std::thread::Builder::new()
+            .name("pre-lane".into())
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, move || {
+                let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
+                let pre_target = pre.target;
+                let pre_data = pre.builder.build::<C>();
+                let pre_proof = BlockPreExecutionCircuit::prove(
+                    &pre_data,
+                    &BlockPreExec::from_block(block_ref),
+                    &pre_target,
+                )
+                .expect("block pre-execution proof failed");
+                (pre_data, pre_proof)
+            })
+            .expect("pre lane thread must start");
+        let heavy_handle = std::thread::Builder::new()
+            .name("heavy-circuits-build".into())
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, || {
+                PathCircuits::new(HEAVY_TX_PER_PROOF, HEAVY_TX_MODE)
+            })
+            .expect("heavy circuits build thread must start");
+        let light = PathCircuits::new(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE);
+        (
+            pre_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            heavy_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            light,
+        )
+    });
+    let circuits = Circuits {
+        heavy_tx_target: heavy.tx_target,
+        heavy_tx_data: heavy.tx_data,
+        light_tx_target: light.tx_target,
+        light_tx_data: light.tx_data,
+        pre_data,
+        heavy_chain_target: heavy.chain_target,
+        heavy_chain_data: heavy.chain_data,
+        light_chain_target: light.chain_target,
+        light_chain_data: light.chain_data,
+        dummy_heavy_proof: heavy.dummy_proof,
+        dummy_light_proof: light.dummy_proof,
+    };
+
+    prove_block_after_pre(block, circuits, pre_proof)
+}
+
+fn prove_block_after_pre(mut block: Block<F>, mut circuits: Circuits, pre_proof: Proof) -> Proof {
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
@@ -436,19 +485,13 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
     block.tx_chunks = tx_chunks;
     block.tx_chunks.push(Vec::new());
 
-    let (light_chain_proof, heavy_chain_proof, block_target, block_data) = {
+    let (light_chain_proof, heavy_chain_proof, block_target, block_data, block_pending) = {
         // The pipeline only ever reads the circuits; the borrow ends with this
         // block so the finished extensions can be released below.
         let circuits = &circuits;
         std::thread::scope(|scope| {
-            // The final block circuit depends only on already-built circuit data
-            // and is not needed until the final proof, so it builds concurrently
-            // with the entire transaction/chain proving pipeline.
-            let block_circuit_handle = std::thread::Builder::new()
-                .name("block-circuit-build".into())
-                .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, || circuits.build_block_circuit())
-                .expect("block circuit build thread must start");
+            let block_ref = &block;
+            let pre_proof_ref = &pre_proof;
             let heavy_handle = std::thread::Builder::new()
                 .name("heavy-tx-chain".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -465,6 +508,39 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
                     )
                 })
                 .expect("heavy transaction chain thread must start");
+            // Build the final circuit, seed every witness input that is already
+            // available, and feed the heavy proof as soon as its short path
+            // completes. Only the light-chain feed remains on the serial tail.
+            let block_circuit_handle = std::thread::Builder::new()
+                .name("block-circuit-build".into())
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    let (block_target, block_data) = circuits.build_block_circuit();
+                    let block_data: &'static CircuitData<F, C, D> = Box::leak(Box::new(block_data));
+                    let early_inputs =
+                        BlockCircuit::witness_inputs_early(&block_target, block_ref, pre_proof_ref)
+                            .expect("final block early witness inputs failed");
+                    let mut pending = PendingPartitionWitness::start(
+                        early_inputs,
+                        &block_data.prover_only,
+                        &block_data.common,
+                    )
+                    .expect("final block early witness phase failed");
+                    let heavy_chain_proof = heavy_handle
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    pending
+                        .feed(
+                            BlockCircuit::witness_inputs_heavy_chain(
+                                &block_target,
+                                &heavy_chain_proof,
+                            )
+                            .expect("final block heavy-chain witness inputs failed"),
+                        )
+                        .expect("final block heavy-chain witness feed failed");
+                    (block_target, block_data, pending, heavy_chain_proof)
+                })
+                .expect("block circuit build thread must start");
             let light_chain_proof = prove_path(
                 TxPath::Light,
                 light_chunks,
@@ -475,10 +551,7 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
                 &pre_output,
                 state_metadata_hash,
             );
-            let heavy_chain_proof = heavy_handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            let (block_target, block_data) = block_circuit_handle
+            let (block_target, block_data, block_pending, heavy_chain_proof) = block_circuit_handle
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             (
@@ -486,6 +559,7 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
                 heavy_chain_proof,
                 block_target,
                 block_data,
+                block_pending,
             )
         })
     };
@@ -496,7 +570,7 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
     // own extensions on top of them.
     circuits.release_finished_circuit_extensions();
 
-    let (light_chain_input, heavy_chain_input) =
+    let (light_chain_input, _heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
     // The final block witness runs on the serial tail with nothing else proving, so it alone
     // opts into parallel worklist rounds; tx-proof and chain witness generation run concurrently
@@ -506,15 +580,15 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
     // route the final block proof's mid-size column trees to the GPU for just
     // this phase.
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-    let final_proof = BlockCircuit::prove(
-        &block_target,
-        &block_data,
-        &block,
-        &pre_proof,
-        light_chain_input,
-        heavy_chain_input,
-    )
-    .expect("final block proof failed");
+    let mut block_pending = block_pending;
+    block_pending
+        .feed(
+            BlockCircuit::witness_inputs_light_chain(&block_target, light_chain_input)
+                .expect("final block light-chain witness inputs failed"),
+        )
+        .expect("final block light-chain witness feed failed");
+    let final_proof =
+        BlockCircuit::prove_prepared(block_pending, block_data).expect("final block proof failed");
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
     final_proof
 }
@@ -529,7 +603,7 @@ mod tests {
 
     #[test]
     fn prove_block_returns_one_final_block_proof() {
-        let prove: fn(Block<F>, Circuits) -> Proof = prove_block;
+        let prove: fn(Block<F>) -> Proof = prove_block;
         let _ = prove;
     }
 

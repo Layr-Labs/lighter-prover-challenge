@@ -3,9 +3,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use circuit::block_constraints::{BlockCircuit, BlockTarget, Circuit as _};
-use circuit::block_pre_execution_constraints::{
-    BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
-};
 use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, BlockTxChainTarget, Circuit as _};
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _};
 use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
@@ -31,7 +28,6 @@ pub struct Circuits {
     pub heavy_tx_data: CircuitData<F, C, D>,
     pub light_tx_target: BlockTxTarget,
     pub light_tx_data: CircuitData<F, C, D>,
-    pub pre_target: BlockPreExecutionTarget,
     pub pre_data: CircuitData<F, C, D>,
     pub heavy_chain_target: BlockTxChainTarget,
     pub heavy_chain_data: CircuitData<F, C, D>,
@@ -79,35 +75,6 @@ impl PathCircuits {
 }
 
 impl Circuits {
-    pub fn new() -> Self {
-        let ((pre_target, pre_data), (heavy, light)) = rayon::join(
-            || {
-                let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
-                (pre.target, pre.builder.build::<C>())
-            },
-            || {
-                rayon::join(
-                    || PathCircuits::new(HEAVY_TX_PER_PROOF, HEAVY_TX_MODE),
-                    || PathCircuits::new(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE),
-                )
-            },
-        );
-        Self {
-            heavy_tx_target: heavy.tx_target,
-            heavy_tx_data: heavy.tx_data,
-            light_tx_target: light.tx_target,
-            light_tx_data: light.tx_data,
-            pre_target,
-            pre_data,
-            heavy_chain_target: heavy.chain_target,
-            heavy_chain_data: heavy.chain_data,
-            light_chain_target: light.chain_target,
-            light_chain_data: light.chain_data,
-            dummy_heavy_proof: heavy.dummy_proof,
-            dummy_light_proof: light.dummy_proof,
-        }
-    }
-
     /// Releases the extended (LDE) constants/sigmas commitment of every circuit
     /// whose proving has already finished when the final block proof starts.
     ///
