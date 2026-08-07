@@ -5,7 +5,7 @@ use core::fmt::Debug;
 
 use crate::field::extension::Extendable;
 use crate::field::types::Field;
-use crate::hash::hash_types::{HashOut, HashOutTarget, RichField, NUM_HASH_OUT_ELTS};
+use crate::hash::hash_types::{HashOut, HashOutTarget, NUM_HASH_OUT_ELTS, RichField};
 use crate::iop::target::Target;
 use crate::plonk::circuit_builder::CircuitBuilder;
 use crate::plonk::config::AlgebraicHasher;
@@ -88,6 +88,16 @@ pub trait PlonkyPermutation<T: Copy + Default>:
 
     /// Apply permutation to internal state
     fn permute(&mut self);
+
+    /// Apply the permutation to four independent states. Implementations may
+    /// override this to interleave or vectorize the independent dependency
+    /// chains; the default preserves the scalar behavior.
+    #[inline]
+    fn permute_x4(states: &mut [Self; 4]) {
+        for state in states {
+            state.permute();
+        }
+    }
 
     /// Return a slice of `RATE` elements
     fn squeeze(&self) -> &[T];
