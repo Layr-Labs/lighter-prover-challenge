@@ -122,6 +122,19 @@ impl<F: RichField> MetalColumns<F> {
         }
     }
 
+    /// Gather one logical row from the column-major shared buffer. Resolving
+    /// the Metal buffer's CPU pointer once avoids an Objective-C `contents`
+    /// message for every column during FRI query extraction.
+    pub fn row_vec(&self, row: usize) -> Vec<F> {
+        assert!(row < self.rows);
+        let base = self.buffer.contents().cast::<F>();
+        // SAFETY: the buffer contains `rows * cols` initialized field
+        // elements. For every j < cols, j * rows + row is in bounds.
+        (0..self.cols)
+            .map(|j| unsafe { *base.add(j * self.rows + row) })
+            .collect()
+    }
+
     pub(crate) fn columns_mut(&mut self) -> Option<Vec<&mut [F]>> {
         if Arc::strong_count(&self.uniqueness) != 1 {
             return None;

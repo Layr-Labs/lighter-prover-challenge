@@ -76,6 +76,16 @@ impl<F: RichField> ColumnStore<F> {
         }
     }
 
+    /// Copy a logical row out of the column-major store while matching on the
+    /// backing representation only once.
+    pub fn row_vec(&self, row: usize) -> Vec<F> {
+        match self {
+            ColumnStore::Owned(columns) => columns.iter().map(|column| column[row]).collect(),
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            ColumnStore::Shared(columns) => columns.row_vec(row),
+        }
+    }
+
     pub(crate) fn columns_mut(&mut self) -> Option<Vec<&mut [F]>> {
         match self {
             ColumnStore::Owned(columns) => {
@@ -745,9 +755,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             MerkleLeaves::Rows { data, width } => data[i * width..(i + 1) * width].to_vec(),
             MerkleLeaves::Columns { columns, log_rows } => {
                 let natural = crate::util::reverse_bits(i, *log_rows);
-                (0..columns.num_cols())
-                    .map(|j| columns.col(j)[natural])
-                    .collect()
+                columns.row_vec(natural)
             }
         }
     }
