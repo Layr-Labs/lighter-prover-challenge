@@ -121,8 +121,13 @@ impl Field for Secp256K1Scalar {
             return None;
         }
 
-        // Fermat's Little Theorem
-        Some(self.exp_biguint(&(Self::order() - BigUint::one() - BigUint::one())))
+        // Extended Euclid instead of Fermat exponentiation (~380 nonnative
+        // 256-bit modmuls -> one gcd chain); the unique inverse in canonical
+        // form, identical to the previous value.
+        let inv =
+            crate::secp256k1_base::modinv_biguint(&self.to_canonical_biguint(), &Self::order())
+                .expect("nonzero element of a prime field is invertible");
+        Some(Self::from_noncanonical_biguint(inv))
     }
 
     fn from_noncanonical_biguint(val: BigUint) -> Self {
