@@ -1506,16 +1506,30 @@ fn tree_from_levels<F: RichField>(
 
     // Chunked parallel bulk copy out of the CPU-visible shared buffer; every
     // worker walks its chunk sequentially, so the whole read stays a
-    // streaming pass.
-    let mut digests = vec![HashOut::ZERO; node_count];
-    digests
+    // streaming pass. The copy writes every slot before any is read, so the
+    // buffer starts uninitialized rather than zero-filled (`HashOut<F>` has
+    // no `IsZero` specialization, so `vec![HashOut::ZERO; n]` would be a
+    // full serial store pass inside the exclusive buffer-set hold).
+    let mut digests: Vec<HashOut<F>> = Vec::with_capacity(node_count);
+    let digests_uninit =
+        crate::hash::merkle_tree::capacity_up_to_mut(&mut digests, node_count);
+    digests_uninit
         .par_chunks_mut(STAGING_CHUNK / 4)
         .zip(nodes.par_chunks(STAGING_CHUNK))
         .for_each(|(digests, limbs)| {
             for (digest, limbs) in digests.iter_mut().zip(limbs.chunks_exact(4)) {
-                digest.elements = core::array::from_fn(|i| F::from_canonical_u64(limbs[i]));
+                digest.write(HashOut {
+                    elements: core::array::from_fn(|i| F::from_canonical_u64(limbs[i])),
+                });
             }
         });
+    // SAFETY: `par_chunks_mut(STAGING_CHUNK / 4)` partitions all `node_count`
+    // slots, and each chunk is zipped against exactly `4×` as many limbs
+    // (`nodes.len() == node_count * 4`, asserted above), so the inner zip
+    // writes every slot of every chunk exactly once.
+    unsafe {
+        digests.set_len(node_count);
+    }
 
     // The GPU offsets are in u64 limbs; the CPU representation indexes whole
     // digests.
