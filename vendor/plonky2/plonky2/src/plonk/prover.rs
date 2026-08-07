@@ -32,8 +32,8 @@ use crate::plonk::vanishing_poly::{
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
+use crate::util::log2_ceil;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil};
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -782,17 +782,14 @@ fn compute_quotient_polys<
     let lde_size = points.len();
 
     let z_h_on_coset = ZeroPolyOnCoset::new(common_data.degree_bits(), quotient_degree_bits);
-    // The `L_0` denominator inverses consumed by `eval_l_0` depend only on
-    // `(degree_bits, quotient_degree_bits, coset shift)` — not on any challenge — so they are
-    // computed once per circuit shape for the process and shared across proofs. Each cached
-    // entry is bit-identical to the per-point inversion it replaces.
+    // Build the process-shared L_0 table with one full-domain Montgomery inversion instead of one
+    // exponentiation per point. Subsequent proofs of the same circuit shape reuse the table.
     #[cfg(feature = "std")]
-    let z_h_on_coset = z_h_on_coset.with_l_0_denominator_inverses(
-        l_0_table_cache::l_0_denominator_inverses::<F>(
+    let z_h_on_coset =
+        z_h_on_coset.with_l_0_values(l_0_table_cache::l_0_values::<F>(
             common_data.degree_bits(),
             quotient_degree_bits,
-        ),
-    );
+        ));
 
     // Precompute the lookup table evals on the challenges in delta
     // These values are used to produce the final RE constraints for each lut,
@@ -1318,12 +1315,12 @@ mod quotient_layout_tests {
     }
 }
 
-/// Process-global cache of the `L_0(x)` denominator inverses `(n * (x - 1))^-1` consumed by
-/// `ZeroPolyOnCoset::eval_l_0` in the quotient pass: one entry per LDE point `x = g * w^i`,
-/// `2^(degree_bits + quotient_degree_bits)` per circuit shape. The values depend only on
-/// `(degree_bits, quotient_degree_bits)` and the field's coset shift, so they are built once
-/// per process and shared across proofs, mirroring the precomputed-table style of
-/// `field::fft::fft_root_table`.
+/// Process-global cache of full `L_0(x) = Z_H(x)/(n * (x - 1))` values consumed by the
+/// quotient pass: one entry per LDE point `x = g * w^i`, or
+/// `2^(degree_bits + quotient_degree_bits)` entries per circuit shape. The values depend only on
+/// `(degree_bits, quotient_degree_bits)` and the field's coset shift, so they are built once per
+/// process and shared across proofs. Caching the final product lets hot quotient batches copy the
+/// table directly instead of repeating a field multiplication on every proof.
 #[cfg(feature = "std")]
 mod l_0_table_cache {
     use core::any::{Any, TypeId};
@@ -1333,26 +1330,33 @@ mod l_0_table_cache {
     use plonky2_maybe_rayon::*;
 
     use crate::field::types::Field;
+    use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 
     /// Keyed by field type and `(degree_bits, quotient_degree_bits)`; the coset shift is a
     /// constant of the field type.
     static CACHE: OnceLock<Mutex<HashMap<(TypeId, usize, usize), Arc<dyn Any + Send + Sync>>>> =
         OnceLock::new();
 
-    /// Builds the table with, per entry, exactly the operations of the uncached
-    /// `eval_l_0(i, g * w^i)` path: `x = g * w^i` from the same `two_adic_subgroup` points the
-    /// prover feeds it, then `(n * (x - ONE)).inverse()` — the same inverse of the same
-    /// product, so every entry is bit-identical to the value it replaces. Entries are
-    /// independent, so the parallel map changes nothing.
+    /// Builds all denominator inverses with Montgomery's trick, then folds the periodic
+    /// `Z_H(x)` numerator into the cached table once. Every result is raw-identical to the former
+    /// hot-path product, but every later proof can copy it without arithmetic.
     fn build<F: Field>(degree_bits: usize, quotient_degree_bits: usize) -> Vec<F> {
         let n = F::from_canonical_usize(1 << degree_bits);
-        F::two_adic_subgroup(degree_bits + quotient_degree_bits)
+        let points = super::precomputed::two_adic_subgroup::<F>(degree_bits + quotient_degree_bits);
+        let denominators = points
+            .par_iter()
+            .map(|&x| n * (F::coset_shift() * x - F::ONE))
+            .collect::<Vec<_>>();
+        let denominator_inverses = F::batch_multiplicative_inverse(&denominators);
+        let zero_poly = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits);
+        denominator_inverses
             .into_par_iter()
-            .map(|x| (n * (F::coset_shift() * x - F::ONE)).inverse())
+            .enumerate()
+            .map(|(i, inverse)| zero_poly.eval(i) * inverse)
             .collect()
     }
 
-    pub(super) fn l_0_denominator_inverses<F: Field>(
+    pub(super) fn l_0_values<F: Field>(
         degree_bits: usize,
         quotient_degree_bits: usize,
     ) -> Arc<Vec<F>> {
@@ -1377,9 +1381,8 @@ mod flat_chunk_products_tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
     use plonky2_field::types::{Field, PrimeField64};
 
-    use crate::util::partial_products::quotient_chunk_products_into;
-
     use super::divide_chunk_products;
+    use crate::util::partial_products::quotient_chunk_products_into;
 
     type F = GoldilocksField;
 
@@ -1532,27 +1535,26 @@ mod l_0_table_tests {
     use plonky2_field::types::Field;
     use plonky2_field::zero_poly_coset::ZeroPolyOnCoset;
 
-    use super::l_0_table_cache::l_0_denominator_inverses;
+    use super::l_0_table_cache::l_0_values;
 
     type F = GoldilocksField;
 
     const COMBOS: [(usize, usize); 5] = [(1, 1), (3, 2), (4, 3), (6, 2), (8, 3)];
 
-    /// Every cached entry must equal the legacy per-point computation
-    /// `(n * (g * w^i - 1)).inverse()` bit-for-bit (raw u64 representation, not just field
-    /// value), for several (degree_bits, quotient_degree_bits) combos.
+    /// Every cached entry must equal the legacy full `L_0(x)` computation bit-for-bit (raw u64
+    /// representation, not just field value), for several circuit shapes.
     #[test]
-    fn table_entries_match_legacy_per_point_inversion() {
+    fn table_entries_match_legacy_l_0_values() {
         for (degree_bits, quotient_degree_bits) in COMBOS {
-            let table = l_0_denominator_inverses::<F>(degree_bits, quotient_degree_bits);
+            let table = l_0_values::<F>(degree_bits, quotient_degree_bits);
             let points = F::two_adic_subgroup(degree_bits + quotient_degree_bits);
+            let plain = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits);
             assert_eq!(table.len(), points.len());
-            let n = F::from_canonical_usize(1 << degree_bits);
             for (i, &point) in points.iter().enumerate() {
                 // The prover's shifted point, computed exactly as `compute_quotient_polys`
                 // computes `shifted_xs`.
                 let x = F::coset_shift() * point;
-                let legacy = (n * (x - F::ONE)).inverse();
+                let legacy = plain.eval_l_0(i, x);
                 assert_eq!(
                     table[i].0, legacy.0,
                     "entry {i} of table ({degree_bits}, {quotient_degree_bits})"
@@ -1568,7 +1570,7 @@ mod l_0_table_tests {
         for (degree_bits, quotient_degree_bits) in COMBOS {
             let plain = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits);
             let cached = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits)
-                .with_l_0_denominator_inverses(l_0_denominator_inverses::<F>(
+                .with_l_0_values(l_0_values::<F>(
                     degree_bits,
                     quotient_degree_bits,
                 ));
