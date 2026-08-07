@@ -486,6 +486,21 @@ pub struct ProverOnlyCircuitData<
     pub lookup_rows: Vec<LookupWire>,
     /// A vector of (looking_in, looking_out) pairs for each lookup table index.
     pub lut_to_lookups: Vec<Lookup>,
+    /// Quotient-domain values of the constants and sigma columns (PolyMajor:
+    /// all `constants_range().len() + sigmas_range().len()` columns, each a
+    /// `constants_sigmas_quotient_domain`-length slice, constants first), plus
+    /// the gather parameters they were extracted with. The constants and sigma
+    /// polynomials are circuit-fixed, so these strided LDE values are
+    /// identical for every proof of this circuit; the quotient batch loop
+    /// copies from here instead of re-walking the LDE. `None` when the
+    /// commitment is not column-backed or the cache would be too large.
+    /// Runtime-only: not serialized (the quotient path falls back to the
+    /// strided gather on a deserialized circuit).
+    pub constants_sigmas_quotient_cache: Option<Vec<F>>,
+    /// Stride used to extract [`Self::constants_sigmas_quotient_cache`].
+    pub constants_sigmas_quotient_step: usize,
+    /// Quotient domain size used to extract [`Self::constants_sigmas_quotient_cache`].
+    pub constants_sigmas_quotient_domain: usize,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
