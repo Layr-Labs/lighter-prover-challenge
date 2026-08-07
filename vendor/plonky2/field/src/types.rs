@@ -122,6 +122,16 @@ pub trait Field:
         *self * (Self::ONE + Self::TWO)
     }
 
+    /// Internal FFT hook for multiplying a value by a twiddle known to lie in
+    /// a base subfield. Ordinary fields keep the full multiplication; extension
+    /// implementations may override it with a type-safe scalar multiplication.
+    /// Callers must use ordinary `Mul` for an extension-only root row.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn mul_fft_base_twiddle(twiddle: Self, value: Self) -> Self {
+        twiddle * value
+    }
+
     /// Compute the multiplicative inverse of this field element.
     fn try_inverse(&self) -> Option<Self>;
 
