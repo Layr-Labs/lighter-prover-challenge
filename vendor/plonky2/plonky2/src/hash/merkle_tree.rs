@@ -446,7 +446,9 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
 
         // Rayon task creation dominates the tiny subtrees near the leaves. Keep
         // enough parallelism at the upper levels, then recurse synchronously.
-        let (left_digest, right_digest) = if num_leaves > 16 {
+        // A 64-leaf cutoff was previously promoted after a 16/64/128/256
+        // public-fixture sweep, but the current frontier accidentally restored 16.
+        let (left_digest, right_digest) = if num_leaves > 64 {
             plonky2_maybe_rayon::join(
                 || fill_subtree_flat::<F, H>(left_digests_buf, left_leaves, leaf_width, half),
                 || fill_subtree_flat::<F, H>(right_digests_buf, right_leaves, leaf_width, half),
