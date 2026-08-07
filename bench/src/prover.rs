@@ -7,22 +7,21 @@ use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
 use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
 use circuit::block_tx::{BlockTx, JumpState, JumpStateTarget};
 use circuit::block_tx_chain_constraints::{
-    BlockTxChainCircuit, BlockTxChainTarget, cyclic_base_witness,
+    BlockTxChainCircuit, BlockTxChainTarget, Circuit as _, cyclic_base_witness,
 };
-use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget};
-#[cfg(test)]
-use circuit::block_tx_constraints::Circuit as _;
+use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _};
 use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
-use plonky2::iop::generator::{ParallelWitnessGuard, PendingPartitionWitness};
-#[cfg(test)]
 use plonky2::iop::generator::generate_partial_witness;
 use plonky2::iop::witness::{PartitionWitness, Witness};
 use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::util::timing::TimingTree;
+use std::collections::BTreeMap;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::sync::mpsc;
 
 use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
 
@@ -35,6 +34,8 @@ enum TxPath {
 const LIGHT_TX_PROOF_WINDOW: usize = 2;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
+const HEAVY_TX_PROOF_WORKERS: usize = 1;
+const LIGHT_TX_PROOF_WORKERS: usize = 2;
 
 fn chunk_is_light(txs: &[Tx<F>]) -> bool {
     txs.first()
@@ -47,51 +48,37 @@ fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
     (light, heavy)
 }
 
-/// Marks the calling thread as latency-critical to the macOS scheduler.
-///
-/// The 49 sequential chain folds are the whole critical path of a block
-/// bundle: every serial section of a fold (witness feed, opening
-/// evaluation, FRI reduce, transcript work) runs on a chain-step thread
-/// while the global worker pool is saturated by transaction proving that
-/// hides behind the spine anyway. At default QoS those serial sections
-/// compete for cores on equal terms with hideable bulk work and are
-/// eligible for efficiency-core placement; per-statement profiling of the
-/// fold pipeline shows episodic multi-hundred-millisecond stalls between
-/// instrumented spans under exactly this contention. `USER_INTERACTIVE`
-/// asks the scheduler to keep the fold thread on a performance core and
-/// schedule it ahead of default-QoS pool workers. This changes thread
-/// scheduling only: no work is added, moved, or reordered, and proof
-/// bytes are untouched. On non-macOS targets this is a no-op.
-#[cfg(target_os = "macos")]
-fn mark_spine_thread_latency_critical() {
-    // `QOS_CLASS_USER_INTERACTIVE` is 0x21 in <sys/qos.h>.
-    #[allow(non_camel_case_types)]
-    type qos_class_t = u32;
-    unsafe extern "C" {
-        fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
-    }
-    // Best-effort: a nonzero return leaves the thread at its previous QoS,
-    // which is exactly the pre-change behavior.
-    unsafe {
-        let _ = pthread_set_qos_class_self_np(0x21, 0);
+fn max_tx_proof_window(path: TxPath, step: u64) -> usize {
+    match path {
+        TxPath::Heavy => 1,
+        TxPath::Light if step >= LIGHT_TX_PROOF_OVERLAP_START_STEP => LIGHT_TX_PROOF_WINDOW,
+        TxPath::Light => 1,
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn mark_spine_thread_latency_critical() {}
-
-enum ChainState<'scope> {
-    Ready(Proof),
-    InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
+struct TxJob<'a> {
+    step: u64,
+    chunk_index: usize,
+    tx_data: &'a CircuitData<F, C, D>,
+    witness: PartitionWitness<'a, F>,
 }
 
-impl ChainState<'_> {
-    fn wait(self) -> Proof {
-        match self {
-            ChainState::Ready(proof) => proof,
-            ChainState::InFlight(handle) => handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+enum TxWorkerResult {
+    Proof(u64, Proof),
+    Panic(Box<dyn std::any::Any + Send + 'static>),
+}
+
+enum ChainWorkerResult {
+    Proof(Proof),
+    Panic(Box<dyn std::any::Any + Send + 'static>),
+}
+
+fn tx_worker_for_step(path: TxPath, step: u64) -> usize {
+    match path {
+        TxPath::Heavy => 0,
+        TxPath::Light if step < LIGHT_TX_PROOF_OVERLAP_START_STEP => 0,
+        TxPath::Light => {
+            ((step - LIGHT_TX_PROOF_OVERLAP_START_STEP) as usize) % LIGHT_TX_PROOF_WORKERS
         }
     }
 }
@@ -102,44 +89,20 @@ fn chain_step_proof(
     chain_target: &BlockTxChainTarget,
     chain_data: &CircuitData<F, C, D>,
     chain_step: u64,
-    previous: Option<ChainState<'_>>,
+    previous_proof: Option<&Proof>,
     base_proof: &Proof,
     dummy_proof: &Proof,
     tx_proof: &Proof,
 ) -> Proof {
-    mark_spine_thread_latency_critical();
-    let result = (|| {
-        // Phase 1: run every generator that does not depend on the previous chain proof while
-        // that proof may still be in flight. Inputs are written directly into
-        // the partition's representative slots — no PartialWitness map, no
-        // per-path template clone, no replay pass.
-        let mut pending = PendingPartitionWitness::start_seeded(
-            &chain_data.prover_only,
-            &chain_data.common,
-            |seeder| {
-                BlockTxChainCircuit::witness_inputs_early_into(
-                    chain_target,
-                    chain_data,
-                    chain_step,
-                    dummy_proof,
-                    tx_proof,
-                    seeder,
-                )
-            },
-        )?;
-
-        // Phase 2: wait for the previous chain proof, feed it directly, and prove.
-        let previous_proof = previous.map(ChainState::wait);
-        pending.feed_seeded(|feeder| {
-            BlockTxChainCircuit::witness_inputs_cyclic_into(
-                chain_target,
-                previous_proof.as_ref().unwrap_or(base_proof),
-                feeder,
-            )
-        })?;
-        BlockTxChainCircuit::prove_prepared(pending, chain_data)
-    })();
-    result.unwrap_or_else(|error| {
+    BlockTxChainCircuit::prove(
+        chain_target,
+        chain_data,
+        chain_step,
+        previous_proof.unwrap_or(base_proof),
+        dummy_proof,
+        tx_proof,
+    )
+    .unwrap_or_else(|error| {
         panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")
     })
 }
@@ -181,19 +144,17 @@ fn generate_tx_witness<'a>(
         old_jump,
         txs,
     };
-    // Write witness values directly into the partition's representative
-    // slots (array-indexed), bypassing the PartialWitness hash map and its
-    // per-target hashing for the ~10^5 inputs of every transaction chunk,
-    // while maintaining the same unresolved-watch counters.
-    let partition_witness = PendingPartitionWitness::start_seeded(
-        &tx_data.prover_only,
-        &tx_data.common,
-        |seeder| BlockTxCircuit::generate_witness_into(&block_tx, tx_target, seeder),
-    )
-    .and_then(PendingPartitionWitness::finish)
-    .unwrap_or_else(|error| {
-        panic!("{path:?} block transaction chunk #{chunk_index} witness generation failed: {error:?}")
-    });
+    let partial_witness =
+        BlockTxCircuit::generate_witness(&block_tx, tx_target).unwrap_or_else(|error| {
+            panic!("{path:?} block transaction chunk #{chunk_index} witness failed: {error:?}")
+        });
+    let partition_witness =
+        generate_partial_witness::<F, C, D>(partial_witness, &tx_data.prover_only, &tx_data.common)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{path:?} block transaction chunk #{chunk_index} generators failed: {error:?}"
+                )
+            });
     let new_jump = jump_from_witness(&partition_witness, &tx_target.new_jump);
     (partition_witness, new_jump)
 }
@@ -276,80 +237,116 @@ fn prove_path(
     );
     jump = next_jump;
 
-
     std::thread::scope(|scope| {
-        let base = &base_proof;
-        let mut chain: Option<ChainState<'_>> = None;
-        let mut pending_tx: Option<(u64, Proof)> = None;
-        let mut in_flight = std::collections::VecDeque::new();
-        let mut current_step = 0u64;
-
-        loop {
-            if let Some((chain_step, tx_proof)) = pending_tx.take() {
-                // The predecessor handle moves into the chain thread, which waits for it only
-                // after its tx-proof-side witness generation: the path thread never blocks here.
-                let previous = chain.take();
-                let handle = std::thread::Builder::new()
-                    .name(format!("{path:?}-chain-step-{chain_step}"))
+        let worker_count = match path {
+            TxPath::Heavy => HEAVY_TX_PROOF_WORKERS,
+            TxPath::Light => LIGHT_TX_PROOF_WORKERS,
+        };
+        let (result_tx, result_rx) = mpsc::sync_channel::<TxWorkerResult>(worker_count);
+        let mut job_txs = Vec::with_capacity(worker_count);
+        let mut workers = Vec::with_capacity(worker_count);
+        for worker in 0..worker_count {
+            let (job_tx, job_rx) = mpsc::sync_channel::<TxJob<'_>>(1);
+            let result_tx = result_tx.clone();
+            job_txs.push(job_tx);
+            workers.push(
+                std::thread::Builder::new()
+                    .name(format!("{path:?}-tx-worker-{worker}"))
                     .stack_size(PROVER_THREAD_STACK_BYTES)
                     .spawn_scoped(scope, move || {
-                        chain_step_proof(
+                        while let Ok(job) = job_rx.recv() {
+                            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                                prove_tx_witness(path, job.chunk_index, job.tx_data, job.witness)
+                            }));
+                            let panicked = outcome.is_err();
+                            let result = match outcome {
+                                Ok(proof) => TxWorkerResult::Proof(job.step, proof),
+                                Err(panic) => TxWorkerResult::Panic(panic),
+                            };
+                            if result_tx.send(result).is_err() {
+                                break;
+                            }
+                            if panicked {
+                                break;
+                            }
+                        }
+                    })
+                    .expect("transaction worker thread must start"),
+            );
+        }
+        drop(result_tx);
+
+        let base = &base_proof;
+        let (chain_tx, chain_rx) = mpsc::sync_channel::<(u64, Proof)>(1);
+        let (chain_result_tx, chain_result_rx) = mpsc::sync_channel::<ChainWorkerResult>(1);
+        let chain_handle = std::thread::Builder::new()
+            .name(format!("{path:?}-chain-worker"))
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, move || {
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    let mut previous: Option<Proof> = None;
+                    let mut expected_step = 0;
+                    while let Ok((step, tx_proof)) = chain_rx.recv() {
+                        assert_eq!(step, expected_step, "chain proofs must be consumed in order");
+                        let proof = chain_step_proof(
                             path,
                             chain_target,
                             chain_data,
-                            chain_step,
-                            previous,
+                            step,
+                            previous.as_ref(),
                             base,
                             dummy_proof,
                             &tx_proof,
-                        )
-                    })
-                    .expect("chain step pipeline thread must start");
-                chain = Some(ChainState::InFlight(handle));
-            }
+                        );
+                        previous = Some(proof);
+                        expected_step += 1;
+                    }
+                    previous.expect("transaction path must produce a chain proof")
+                }));
+                let result = match outcome {
+                    Ok(proof) => ChainWorkerResult::Proof(proof),
+                    Err(panic) => ChainWorkerResult::Panic(panic),
+                };
+                let _ = chain_result_tx.send(result);
+            })
+            .expect("chain worker thread must start");
 
-            let witness = current_witness;
-            let proof_handle = std::thread::Builder::new()
-                .name(format!("{path:?}-tx-proof-{current_step}"))
-                .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, move || {
-                    prove_tx_witness(path, current_chunk_index, tx_data, witness)
+        let mut next_step = 0u64;
+        let mut outstanding = 0usize;
+        let mut ready = BTreeMap::new();
+        let mut next_chain_step = 0u64;
+        loop {
+            job_txs[tx_worker_for_step(path, next_step)]
+                .send(TxJob {
+                    step: next_step,
+                    chunk_index: current_chunk_index,
+                    tx_data,
+                    witness: current_witness,
                 })
-                .expect("transaction proof pipeline thread must start");
+                .expect("transaction workers must remain available");
+            outstanding += 1;
 
             let next_witness = chunks.next().map(|(chunk_index, txs)| {
                 let (witness, next_jump) = generate_tx_witness(
-                    path,
-                    chunk_index,
-                    txs,
-                    tx_data,
-                    tx_target,
-                    created_at,
-                    state_metadata_hash,
-                    jump,
+                    path, chunk_index, txs, tx_data, tx_target, created_at, state_metadata_hash, jump,
                 );
                 jump = next_jump;
                 (chunk_index, witness)
             });
 
-            in_flight.push_back((current_step, proof_handle));
-            let max_in_flight =
-                if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
-                    LIGHT_TX_PROOF_WINDOW
-                } else {
-                    1
+            if outstanding >= max_tx_proof_window(path, next_step) {
+                let (step, proof) = match result_rx.recv().expect("transaction worker result must arrive") {
+                    TxWorkerResult::Proof(step, proof) => (step, proof),
+                    TxWorkerResult::Panic(panic) => resume_unwind(panic),
                 };
-            if in_flight.len() >= max_in_flight {
-                let (proof_step, proof_handle) = in_flight
-                    .pop_front()
-                    .expect("transaction proof window must not be empty");
-                let tx_proof = proof_handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                pending_tx = Some((proof_step, tx_proof));
+                ready.insert(step, proof);
+                outstanding -= 1;
+                while let Some(proof) = ready.remove(&next_chain_step) {
+                    chain_tx.send((next_chain_step, proof)).expect("chain worker must remain available");
+                    next_chain_step += 1;
+                }
             }
-            current_step += 1;
-
+            next_step += 1;
             match next_witness {
                 Some((chunk_index, witness)) => {
                     current_chunk_index = chunk_index;
@@ -358,68 +355,38 @@ fn prove_path(
                 None => break,
             }
         }
-
-        if let Some((chain_step, tx_proof)) = pending_tx.take() {
-            let previous = chain.take();
-            let handle = std::thread::Builder::new()
-                .name(format!("{path:?}-chain-step-{chain_step}"))
-                .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, move || {
-                    chain_step_proof(
-                        path,
-                        chain_target,
-                        chain_data,
-                        chain_step,
-                        previous,
-                        base,
-                        dummy_proof,
-                        &tx_proof,
-                    )
-                })
-                .expect("chain step pipeline thread must start");
-            chain = Some(ChainState::InFlight(handle));
+        drop(job_txs);
+        while outstanding > 0 {
+            let (step, proof) = match result_rx.recv().expect("transaction worker result must arrive") {
+                TxWorkerResult::Proof(step, proof) => (step, proof),
+                TxWorkerResult::Panic(panic) => resume_unwind(panic),
+            };
+            ready.insert(step, proof);
+            outstanding -= 1;
+            while let Some(proof) = ready.remove(&next_chain_step) {
+                chain_tx.send((next_chain_step, proof)).expect("chain worker must remain available");
+                next_chain_step += 1;
+            }
         }
-        // Past this point the pipeline spawns no new chunk work: the drain
-        // below is the strictly sequential chain tail, so its mid-size
-        // commitment trees can use the mostly idle GPU exactly like the
-        // pre-execution and final block phases.
-        plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-        while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
-            let tx_proof = proof_handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            let previous = chain.take();
-            chain = Some(ChainState::Ready(chain_step_proof(
-                path,
-                chain_target,
-                chain_data,
-                chain_step,
-                previous,
-                base,
-                dummy_proof,
-                &tx_proof,
-            )));
+        drop(chain_tx);
+        for worker in workers {
+            worker.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         }
-        let chain_proof = chain
-            .map(ChainState::wait)
-            .expect("transaction path must produce a chain proof");
-        plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
-        chain_proof
+        chain_handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        match chain_result_rx.recv().expect("chain worker must return a proof") {
+            ChainWorkerResult::Proof(proof) => proof,
+            ChainWorkerResult::Panic(panic) => resume_unwind(panic),
+        }
     })
 }
 
 pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
-    // The pre-execution proof runs strictly before any other proving work, so
-    // the serialized GPU stream is otherwise idle: route its mid-size column
-    // trees to the GPU for just this phase.
-    plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
     let pre_proof = BlockPreExecutionCircuit::prove(
         &circuits.pre_data,
         &BlockPreExec::from_block(&block),
         &circuits.pre_target,
     )
     .expect("block pre-execution proof failed");
-    plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
@@ -488,15 +455,7 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
 
     let (light_chain_input, heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
-    // The final block witness runs on the serial tail with nothing else proving, so it alone
-    // opts into parallel worklist rounds; tx-proof and chain witness generation run concurrently
-    // with proving and stay sequential.
-    let _parallel_block_witness = ParallelWitnessGuard::new();
-    // For the same reason the serialized GPU stream is otherwise idle here:
-    // route the final block proof's mid-size column trees to the GPU for just
-    // this phase.
-    plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-    let final_proof = BlockCircuit::prove(
+    BlockCircuit::prove(
         &block_target,
         &block_data,
         &block,
@@ -504,9 +463,7 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
         light_chain_input,
         heavy_chain_input,
     )
-    .expect("final block proof failed");
-    plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
-    final_proof
+    .expect("final block proof failed")
 }
 
 #[cfg(test)]
@@ -559,204 +516,29 @@ mod tests {
         assert_eq!(final_chain_inputs(&light, &heavy), (&light, &heavy));
     }
 
-    /// Manual timing harness for the two-phase chain-step witness split. Run with:
-    /// `RAYON_NUM_THREADS=8 cargo test --release -p bench --bin prove -- --ignored chain_step`
     #[test]
-    #[ignore = "manual timing harness; run explicitly with --release"]
-    fn chain_step_two_phase_timing() {
-        std::thread::Builder::new()
-            .stack_size(PROVER_THREAD_STACK_BYTES)
-            .spawn(chain_step_two_phase_timing_impl)
-            .expect("timing harness thread must start")
-            .join()
-            .expect("timing harness thread must finish");
+    fn transaction_window_policy_is_bounded_and_delayed_for_light_path() {
+        assert_eq!(max_tx_proof_window(TxPath::Heavy, 0), 1);
+        assert_eq!(max_tx_proof_window(TxPath::Heavy, 99), 1);
+        assert_eq!(max_tx_proof_window(TxPath::Light, 0), 1);
+        assert_eq!(max_tx_proof_window(TxPath::Light, 2), 1);
+        assert_eq!(max_tx_proof_window(TxPath::Light, 3), 2);
+        assert_eq!(max_tx_proof_window(TxPath::Light, 48), 2);
     }
 
-    fn chain_step_two_phase_timing_impl() {
-        use std::time::Instant;
-
-        const CHAIN_STEPS: u64 = 10;
-
-        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-            .is_test(false)
-            .try_init();
-
-        use circuit::block_tx_chain_constraints::Circuit as _;
-        use circuit::types::constants::TX_TYPE_EMPTY;
-        use plonky2::field::types::{Field, PrimeField64};
-
-        use crate::api::{LIGHT_TX_MODE, PathCircuits};
-
-        let build_start = Instant::now();
-        let circuits = PathCircuits::new(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE);
-        println!("light path circuits built in {:?}", build_start.elapsed());
-
-        let block = Block::<F>::from_json_with_empty_txs(
-            include_bytes!("../bench_test.json"),
-            HEAVY_TX_PER_PROOF,
-            LIGHT_TX_PER_PROOF,
-            PUBLIC_HEAVY_TX_COUNT,
-            PUBLIC_LIGHT_TX_COUNT,
-        )
-        .expect("public fixture must parse");
-
-        // An all-empty (padding) chunk carries no state transition, so its embedded roots and
-        // metadata hash are the only values the tx and chain constraints must agree on.
-        // Chain-step cost is independent of tx contents: the chain circuit is fixed-size.
-        let mut empty_tx = block
-            .tx_chunks
-            .iter()
-            .flatten()
-            .find(|tx| tx.tx_type == TX_TYPE_EMPTY)
-            .expect("fixture must contain an empty padding tx")
-            .clone();
-        empty_tx.tx_circuit_type = TX_LIGHT;
-        empty_tx.tx_index = F::NEG_ONE.to_canonical_u64();
-
-        let new_state_root = empty_tx.old_state_root;
-        let old_delta_root = empty_tx.old_account_delta_tree_root;
-        // The post-pre-execution metadata replayed natively: pre-execution only refreshes the
-        // timestamps of the enabled recalculations.
-        let mut new_state_metadata = block.state_metadata.clone();
-        if block.calculate_funding {
-            new_state_metadata.last_funding_round_timestamp = block.created_at;
+    #[test]
+    fn ordered_ready_steps_are_consumed_fifo() {
+        let mut ready = std::collections::BTreeMap::new();
+        ready.insert(2, "two");
+        ready.insert(0, "zero");
+        ready.insert(1, "one");
+        let mut next = 0;
+        let mut consumed = Vec::new();
+        while let Some(value) = ready.remove(&next) {
+            consumed.push(value);
+            next += 1;
         }
-        if block.calculate_oracle_prices {
-            new_state_metadata.last_oracle_price_timestamp = block.created_at;
-        }
-        if block.calculate_premium {
-            new_state_metadata.last_premium_timestamp = block.created_at;
-        }
-        let state_metadata_hash = new_state_metadata.hash();
-        let jump = JumpState::initial(new_state_root, old_delta_root);
-
-        let light_chunk = vec![empty_tx; LIGHT_TX_PER_PROOF];
-        let (witness, _) = generate_tx_witness(
-            TxPath::Light,
-            0,
-            light_chunk,
-            &circuits.tx_data,
-            &circuits.tx_target,
-            block.created_at,
-            state_metadata_hash,
-            jump,
-        );
-        let tx_prove_start = Instant::now();
-        let mut tx_timing = TimingTree::new("tx-chunk-prove", log::Level::Debug);
-        let tx_proof = plonky2::plonk::prover::prove_with_partition_witness::<F, C, D>(
-            &circuits.tx_data.prover_only,
-            &circuits.tx_data.common,
-            witness,
-            &mut tx_timing,
-        )
-        .expect("tx proof failed");
-        println!("tx chunk prove total {:?}", tx_prove_start.elapsed());
-        tx_timing.print();
-
-        let base_proof = cyclic_base_witness(
-            &circuits.dummy_proof,
-            block.block_number,
-            block.created_at,
-            new_state_root,
-            new_state_root,
-            old_delta_root,
-        );
-
-        let mut previous: Option<Proof> = None;
-        for chain_step in 0..CHAIN_STEPS {
-            let cyclic_proof = previous.as_ref().unwrap_or(&base_proof);
-
-            let single_shot_start = Instant::now();
-            let inputs = BlockTxChainCircuit::generate_witness(
-                &circuits.chain_target,
-                &circuits.chain_data,
-                chain_step,
-                cyclic_proof,
-                &circuits.dummy_proof,
-                &tx_proof,
-            )
-            .expect("single-shot witness inputs failed");
-            let single_shot = generate_partial_witness::<F, C, D>(
-                inputs,
-                &circuits.chain_data.prover_only,
-                &circuits.chain_data.common,
-            )
-            .expect("single-shot witness generation failed");
-            let single_shot_elapsed = single_shot_start.elapsed();
-            drop(single_shot);
-
-            let phase1_start = Instant::now();
-            let early_inputs = BlockTxChainCircuit::witness_inputs_early(
-                &circuits.chain_target,
-                &circuits.chain_data,
-                chain_step,
-                &circuits.dummy_proof,
-                &tx_proof,
-            )
-            .expect("early witness inputs failed");
-            let mut pending = PendingPartitionWitness::start(
-                early_inputs,
-                &circuits.chain_data.prover_only,
-                &circuits.chain_data.common,
-            )
-            .expect("early witness generation failed");
-            let phase1_elapsed = phase1_start.elapsed();
-
-            let phase2_start = Instant::now();
-            pending
-                .feed(
-                    BlockTxChainCircuit::witness_inputs_cyclic(
-                        &circuits.chain_target,
-                        cyclic_proof,
-                    )
-                    .expect("cyclic witness inputs failed"),
-                )
-                .expect("cyclic witness generation failed");
-            let witness = pending
-                .finish()
-                .expect("chain step witness must be complete");
-            let phase2_elapsed = phase2_start.elapsed();
-
-            let prove_start = Instant::now();
-            let mut timing = TimingTree::new("chain-step-prove", log::Level::Debug);
-            let proof = prove_with_partition_witness::<F, C, D>(
-                &circuits.chain_data.prover_only,
-                &circuits.chain_data.common,
-                witness,
-                &mut timing,
-            )
-            .expect("chain step proof failed");
-            let prove_elapsed = prove_start.elapsed();
-            timing.print();
-
-            // Differential integration check for the production direct-seeding
-            // path. The reference above keeps the old PartialWitness map
-            // path solely for this manual timing harness.
-            let direct_start = Instant::now();
-            let direct_proof = chain_step_proof(
-                TxPath::Light,
-                &circuits.chain_target,
-                &circuits.chain_data,
-                chain_step,
-                previous.clone().map(ChainState::Ready),
-                &base_proof,
-                &circuits.dummy_proof,
-                &tx_proof,
-            );
-            let direct_elapsed = direct_start.elapsed();
-            assert_eq!(proof.public_inputs, direct_proof.public_inputs);
-
-            println!(
-                "chain step {chain_step}: single-shot witness {single_shot_elapsed:?}, \
-                 map phase1 {phase1_elapsed:?}, map phase2 {phase2_elapsed:?}, \
-                 map prove {prove_elapsed:?}, direct total {direct_elapsed:?}",
-            );
-            previous = Some(direct_proof);
-        }
-
-        circuits
-            .chain_data
-            .verify(previous.expect("chain must produce proofs"))
-            .expect("final chain step proof must verify");
+        assert_eq!(consumed, vec!["zero", "one", "two"]);
+        assert!(ready.is_empty());
     }
 }

@@ -39,16 +39,16 @@ pub struct Circuits {
     pub dummy_light_proof: Proof,
 }
 
-pub(crate) struct PathCircuits {
-    pub(crate) tx_target: BlockTxTarget,
-    pub(crate) tx_data: CircuitData<F, C, D>,
-    pub(crate) chain_target: BlockTxChainTarget,
-    pub(crate) chain_data: CircuitData<F, C, D>,
-    pub(crate) dummy_proof: Proof,
+struct PathCircuits {
+    tx_target: BlockTxTarget,
+    tx_data: CircuitData<F, C, D>,
+    chain_target: BlockTxChainTarget,
+    chain_data: CircuitData<F, C, D>,
+    dummy_proof: Proof,
 }
 
 impl PathCircuits {
-    pub(crate) fn new(tx_per_proof: usize, tx_mode: u8) -> Self {
+    fn new(tx_per_proof: usize, tx_mode: u8) -> Self {
         let tx = BlockTxCircuit::define(CIRCUIT_CONFIG, tx_per_proof, CHAIN_ID, tx_mode);
         let tx_target = tx.target;
         let tx_data = tx.builder.build::<C>();
@@ -143,53 +143,5 @@ mod tests {
             .expect("embedded heavy dummy proof is invalid");
         let _: Proof = bincode::deserialize(include_bytes!("../dummy-light-chain-proof.bin"))
             .expect("embedded light dummy proof is invalid");
-    }
-}
-
-#[cfg(test)]
-mod build_timing {
-    use std::time::Instant;
-
-    use super::*;
-
-    /// Manual timing harness for the startup circuit builds, which run once per
-    /// worker spawn inside the ranked timed window (five spawns per run). Run:
-    /// `cargo test --release -p bench --bin prove -- --ignored build_phase_timing --nocapture`
-    #[test]
-    #[ignore = "manual timing harness"]
-    fn build_phase_timing() {
-        std::thread::Builder::new()
-            .stack_size(PROVER_THREAD_STACK_BYTES)
-            .spawn(|| {
-                let t = Instant::now();
-                let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
-                let t_pre_define = t.elapsed();
-                let t = Instant::now();
-                let pre_data = pre.builder.build::<C>();
-                let t_pre_build = t.elapsed();
-                drop(pre_data);
-
-                let t = Instant::now();
-                let tx = BlockTxCircuit::define(CIRCUIT_CONFIG, LIGHT_TX_PER_PROOF, CHAIN_ID, LIGHT_TX_MODE);
-                let t_tx_define = t.elapsed();
-                let t = Instant::now();
-                let tx_data = tx.builder.build::<C>();
-                let t_tx_build = t.elapsed();
-
-                let t = Instant::now();
-                let chain = BlockTxChainCircuit::define(CIRCUIT_CONFIG, &tx_data, ON_CHAIN_OPERATIONS_LIMIT);
-                let t_chain_define = t.elapsed();
-                let t = Instant::now();
-                let chain_data = chain.builder.build::<C>();
-                let t_chain_build = t.elapsed();
-                drop(chain_data);
-
-                println!("pre:   define {t_pre_define:?} build {t_pre_build:?}");
-                println!("tx:    define {t_tx_define:?} build {t_tx_build:?}");
-                println!("chain: define {t_chain_define:?} build {t_chain_build:?}");
-            })
-            .expect("spawn")
-            .join()
-            .expect("join");
     }
 }
