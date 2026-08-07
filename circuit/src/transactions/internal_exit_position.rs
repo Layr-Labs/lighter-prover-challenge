@@ -35,7 +35,7 @@ pub struct InternalExitPositionTx {
     pub market_index: u16,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InternalExitPositionTxTarget {
     pub account_index: Target,
     pub market_index: Target,

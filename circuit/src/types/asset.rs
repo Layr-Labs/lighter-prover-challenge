@@ -74,7 +74,7 @@ impl Asset {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AssetTarget {
     pub extension_multiplier: BigUintTarget,
     pub min_transfer_amount: BigUintTarget,

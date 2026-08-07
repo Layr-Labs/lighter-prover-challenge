@@ -49,7 +49,7 @@ pub struct L1RegisterAssetTx {
     pub index_price: i64, // Given by sequencer
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct L1RegisterAssetTxTarget {
     pub asset_index: Target,
     pub extension_multiplier: BigUintTarget,
