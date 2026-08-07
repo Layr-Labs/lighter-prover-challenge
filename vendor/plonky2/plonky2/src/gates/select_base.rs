@@ -8,6 +8,7 @@ use anyhow::Result;
 
 use crate::field::extension::Extendable;
 use crate::field::packed::PackedField;
+use crate::field::types::PrimeField64;
 use crate::gates::gate::Gate;
 use crate::gates::packed_util::PackedEvaluableBase;
 use crate::gates::util::StridedConstraintConsumer;
@@ -237,8 +238,19 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         let result = Target::wire(self.row, self.gate.wire_ith_output(self.i));
         let temp = Target::wire(self.row, self.gate.wire_ith_temporary(self.i, 0));
 
-        let temp_value = b * y - y;
-        let result_value = b * x - temp_value;
+        let (temp_value, result_value) = match PrimeField64::to_noncanonical_u64(&b) {
+            0 => {
+                let temp_value = -y;
+                let result_value = -temp_value;
+                (temp_value, result_value)
+            }
+            1 => (F::ZERO, x),
+            _ => {
+                let temp_value = b * y - y;
+                let result_value = b * x - temp_value;
+                (temp_value, result_value)
+            }
+        };
 
         out_buffer.set_target(temp, temp_value)?;
         out_buffer.set_target(result, result_value)?;
