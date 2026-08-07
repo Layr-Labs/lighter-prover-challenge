@@ -5,6 +5,7 @@ use alloc::{format, string::String, vec::Vec};
 
 use anyhow::Result;
 
+use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::Extendable;
 use crate::field::packed::PackedField;
 use crate::gates::gate::Gate;
@@ -95,6 +96,40 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for AdditionGate {
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
         self.eval_unfiltered_base_batch_packed(vars_base)
+    }
+
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= self.num_ops * n);
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        let const_0 = &vars_base.local_constants[..n];
+        let const_1 = &vars_base.local_constants[n..][..n];
+
+        let mut scratch_stack = [F::ZERO; 64];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if n <= 64 {
+            &mut scratch_stack[..n]
+        } else {
+            scratch_heap = vec![F::ZERO; n];
+            &mut scratch_heap
+        };
+        for i in 0..self.num_ops {
+            let addend_0 = col(Self::wire_ith_addend_0(i));
+            let addend_1 = col(Self::wire_ith_addend_1(i));
+            let output = col(Self::wire_ith_output(i));
+            for p in 0..n {
+                scratch[p] = output[p] - (addend_0[p] * const_0[p] + addend_1[p] * const_1[p]);
+            }
+            let combined = &mut combined_gate_constraints[i * n..(i + 1) * n];
+            batch_multiply_add_inplace(combined, scratch, filters);
+        }
     }
 
     fn eval_unfiltered_circuit(
@@ -244,6 +279,7 @@ mod tests {
     use anyhow::Result;
 
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::Field;
     use crate::gates::addition_base::AdditionGate;
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
     use crate::plonk::circuit_data::CircuitConfig;
@@ -262,5 +298,45 @@ mod tests {
         type F = <C as GenericConfig<D>>::F;
         let gate = AdditionGate::new_from_config(&CircuitConfig::standard_recursion_config());
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    #[test]
+    fn direct_filtered_accumulation_matches_materialized_batch() {
+        const D: usize = 2;
+        const N: usize = 11;
+        type F = GoldilocksField;
+        use crate::gates::gate::Gate;
+
+        let gate = AdditionGate::new_from_config(&CircuitConfig::standard_recursion_config());
+        let num_wires = <AdditionGate as Gate<F, D>>::num_wires(&gate);
+        let num_constants = <AdditionGate as Gate<F, D>>::num_constants(&gate);
+        let num_constraints = <AdditionGate as Gate<F, D>>::num_constraints(&gate);
+        let wires = (0..num_wires * N)
+            .map(|i| F::from_canonical_usize(3 * i + 5))
+            .collect::<Vec<_>>();
+        let constants = (0..num_constants * N)
+            .map(|i| F::from_canonical_usize(7 * i + 2))
+            .collect::<Vec<_>>();
+        let hash = crate::hash::hash_types::HashOut::ZERO;
+        let vars = crate::plonk::vars::EvaluationVarsBaseBatch::new(N, &constants, &wires, &hash);
+        let filters = (0..N)
+            .map(|i| F::from_canonical_usize(2 * i + 1))
+            .collect::<Vec<_>>();
+        let materialized = <AdditionGate as Gate<F, D>>::eval_unfiltered_base_batch(&gate, vars);
+        let mut expected = vec![F::ZERO; num_constraints * N];
+        for (acc, constraints) in expected
+            .chunks_exact_mut(N)
+            .zip(materialized.chunks_exact(N))
+        {
+            crate::field::batch_util::batch_multiply_add_inplace(acc, constraints, &filters);
+        }
+        let mut actual = vec![F::ZERO; expected.len()];
+        <AdditionGate as Gate<F, D>>::eval_unfiltered_base_batch_accumulate(
+            &gate,
+            vars,
+            &filters,
+            &mut actual,
+        );
+        assert_eq!(actual, expected);
     }
 }
