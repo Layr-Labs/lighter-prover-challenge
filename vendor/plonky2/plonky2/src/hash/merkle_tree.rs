@@ -544,6 +544,21 @@ pub(crate) fn merkle_tree_prove<F: RichField, H: Hasher<F>>(
 }
 
 impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
+    /// Returns the natural-order, column-major Metal leaf storage when this
+    /// commitment retained its LDE in a shared GPU-visible buffer.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    pub(crate) fn shared_columns(
+        &self,
+    ) -> Option<&crate::hash::poseidon2::metal::MetalColumns<F>> {
+        match &self.leaves {
+            MerkleLeaves::Columns {
+                columns: ColumnStore::Shared(columns),
+                ..
+            } => Some(columns),
+            _ => None,
+        }
+    }
+
     /// Build a tree from per-leaf vectors. All leaves must have the same width.
     pub fn new(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
         let num_leaves = leaves.len();

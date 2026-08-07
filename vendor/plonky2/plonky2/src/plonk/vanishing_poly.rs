@@ -274,6 +274,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     beta_k_is: &[F],
     deltas: &[F],
     alphas: &[F],
+    excluded_gate_indices: &[usize],
     z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
     scratch: &mut VanishingScratch<F>,
@@ -297,10 +298,11 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     let num_gate_constraints = common_data.num_gate_constraints;
 
-    evaluate_gate_constraints_base_batch_into::<F, D>(
+    evaluate_gate_constraints_base_batch_into_excluding_many::<F, D>(
         common_data,
         vars_batch,
         &mut scratch.constraint_terms_batch,
+        excluded_gate_indices,
     );
     let constraint_terms_batch = &scratch.constraint_terms_batch;
     debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
@@ -969,10 +971,59 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
     vars_batch: EvaluationVarsBaseBatch<F>,
     constraints_batch: &mut Vec<F>,
 ) {
+    evaluate_gate_constraints_base_batch_into_excluding(
+        common_data,
+        vars_batch,
+        constraints_batch,
+        None,
+    );
+}
+
+/// Internal quotient variant that leaves one gate type's filtered
+/// contribution at zero so a specialized backend can add it separately.
+pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    vars_batch: EvaluationVarsBaseBatch<F>,
+    constraints_batch: &mut Vec<F>,
+    excluded_gate_index: Option<usize>,
+) {
+    match excluded_gate_index {
+        Some(index) => evaluate_gate_constraints_base_batch_into_excluding_many(
+            common_data,
+            vars_batch,
+            constraints_batch,
+            core::slice::from_ref(&index),
+        ),
+        None => evaluate_gate_constraints_base_batch_into_excluding_many(
+            common_data,
+            vars_batch,
+            constraints_batch,
+            &[],
+        ),
+    }
+}
+
+/// Multi-gate version used when one GPU quotient pass replaces several gate
+/// types while the CPU evaluates the remaining shared constraint rows.
+pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    vars_batch: EvaluationVarsBaseBatch<F>,
+    constraints_batch: &mut Vec<F>,
+    excluded_gate_indices: &[usize],
+) {
     constraints_batch.clear();
     constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
     let mut filters = Vec::with_capacity(vars_batch.len());
     for (i, gate) in common_data.gates.iter().enumerate() {
+        if excluded_gate_indices.contains(&i) {
+            continue;
+        }
         let selector_index = common_data.selectors_info.selector_indices[i];
         gate.0.eval_filtered_base_batch(
             vars_batch,

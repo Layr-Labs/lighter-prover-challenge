@@ -11,7 +11,7 @@ use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
-use plonky2::gates::gate::Gate;
+use plonky2::gates::gate::{Gate, RangeCheckQuotientGate};
 use plonky2::gates::packed_util::PackedEvaluableBase;
 use plonky2::gates::util::StridedConstraintConsumer;
 use plonky2::hash::hash_types::RichField;
@@ -354,7 +354,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
         let num_aux = self.aux_limbs_per_input();
         let base = F::from_canonical_usize(Self::BASE);
         let three = F::from_canonical_usize(3);
-        let mut scratch = vec![F::ZERO; n];
+        // Quotient evaluation uses batches of at most 32 points.
+        let mut stack_scratch = [F::ZERO; 32];
+        let scratch = &mut stack_scratch[..n];
         let mut constraint_index = 0;
 
         for i in 0..self.num_ops {
@@ -508,6 +510,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
     fn num_constraints(&self) -> usize {
         self.num_ops * (1 + self.aux_limbs_per_input())
     }
+
+    fn range_check_quotient_gate(&self) -> Option<RangeCheckQuotientGate> {
+        Some(RangeCheckQuotientGate {
+            num_ops: self.num_ops,
+            bit_size: self.bit_size,
+        })
+    }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
@@ -623,12 +632,23 @@ mod tests {
     #[allow(unused_imports)]
     use plonky2::field::types::Field64;
     use plonky2::gates::gate_testing::{test_eval_fns, test_low_degree};
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use plonky2::gates::noop::NoopGate;
     use plonky2::hash::hash_types::HashOut;
     use plonky2::iop::target::Target;
     use plonky2::iop::witness::{PartialWitness, WitnessWrite};
     use plonky2::plonk::circuit_data::CircuitConfig;
-    use plonky2::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
+    use plonky2::plonk::config::{
+        GenericConfig, Poseidon2GoldilocksConfig, PoseidonGoldilocksConfig,
+    };
     use rand::Rng;
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::uint::u32::gates::add_many_u32::U32AddManyGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::uint::u32::gates::arithmetic_u32::U32ArithmeticGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::uint::u32::gates::subtraction_u32::U32SubtractionGate;
 
     use super::*;
 
@@ -662,6 +682,101 @@ mod tests {
         let mut actual = vec![F::ZERO; expected.len()];
         gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
         assert_eq!(actual, expected);
+    }
+
+    /// End-to-end seam check for the retained-column guards, multi-gate CPU
+    /// exclusion, Z_H division, and fallback-capable full quotient assembly.
+    /// Run alone with `PLONKY2_GPU_RANGE_DIFFERENTIAL=1`; it is ignored by
+    /// default because padding high enough to route both shared commitments
+    /// through Metal is intentionally much larger than the ordinary gate
+    /// tests below.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[ignore = "explicit Metal full-quotient differential"]
+    fn metal_range_quotient_matches_full_cpu() -> Result<()> {
+        const D: usize = 2;
+        type C = Poseidon2GoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+
+        assert!(std::env::var_os("PLONKY2_GPU_RANGE_DIFFERENTIAL").is_some());
+        let mut config = CircuitConfig::standard_ecc_config();
+        config.security_bits = 0;
+        config.fri_config.proof_of_work_bits = 0;
+        config.fri_config.num_query_rounds = 1;
+        let mut builder = CircuitBuilder::<F, D>::new(config.clone());
+        let mut inputs = Vec::new();
+        for bit_size in [16usize, 32, 48] {
+            let input = builder.add_virtual_target();
+            let gate = RangeCheckGate::new_from_config(&config, bit_size);
+            let (row, op) = builder.find_slot(gate, &[], &[]);
+            builder.connect(input, Target::wire(row, gate.wire_ith_input(op)));
+            inputs.push((input, bit_size));
+        }
+        let mut u32_inputs = Vec::new();
+        let arithmetic = U32ArithmeticGate::<F, D>::new_from_config(&config);
+        let (row, op) = builder.find_slot(arithmetic, &[], &[]);
+        for (wire, value) in [
+            (arithmetic.wire_ith_multiplicand_0(op), 0x1234_5678),
+            (arithmetic.wire_ith_multiplicand_1(op), 0x9abc_def0),
+            (arithmetic.wire_ith_addend(op), 0x1020_3040),
+        ] {
+            let input = builder.add_virtual_target();
+            builder.connect(input, Target::wire(row, wire));
+            u32_inputs.push((input, value));
+        }
+
+        let subtraction = U32SubtractionGate::<F, D>::new_from_config(&config);
+        let (row, op) = builder.find_slot(subtraction, &[], &[]);
+        for (wire, value) in [
+            (subtraction.wire_ith_input_x(op), 0x1020_3040),
+            (subtraction.wire_ith_input_y(op), 0x5060_7080),
+            (subtraction.wire_ith_input_borrow(op), 1),
+        ] {
+            let input = builder.add_virtual_target();
+            builder.connect(input, Target::wire(row, wire));
+            u32_inputs.push((input, value));
+        }
+
+        let add_many = U32AddManyGate::<F, D>::new_from_config(&config, 16);
+        let (row, op) = builder.find_slot(add_many, &[F::from_canonical_usize(16)], &[]);
+        for j in 0..16 {
+            let input = builder.add_virtual_target();
+            builder.connect(input, Target::wire(row, add_many.wire_ith_op_jth_addend(op, j)));
+            u32_inputs.push((input, 0x0102_0304 + j as u64));
+        }
+        let carry = builder.add_virtual_target();
+        builder.connect(carry, Target::wire(row, add_many.wire_ith_carry(op)));
+        u32_inputs.push((carry, 7));
+
+        // 4097 rows pad to degree 8192. Its rate-8 constants/sigmas and wire
+        // commitments both exceed the retained-Metal routing threshold.
+        while builder.num_gates() < 4097 {
+            builder.add_gate(NoopGate, vec![]);
+        }
+
+        let data = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+        for (input, bit_size) in inputs {
+            let value = match bit_size {
+                16 => 0xabcd,
+                32 => 0x89ab_cdef,
+                48 => 0x1234_5678_9abc,
+                _ => unreachable!(),
+            };
+            pw.set_target(input, F::from_canonical_u64(value))?;
+        }
+        for (input, value) in u32_inputs {
+            pw.set_target(input, F::from_canonical_u64(value))?;
+        }
+
+        let before = plonky2::plonk::prover::gpu_poseidon_quotient_stats();
+        let proof = data.prove(pw)?;
+        let after = plonky2::plonk::prover::gpu_poseidon_quotient_stats();
+        assert!(after.range_started > before.range_started);
+        assert!(after.range_completed > before.range_completed);
+        assert_eq!(after.range_fallbacks, before.range_fallbacks);
+        data.verify(proof)?;
+        Ok(())
     }
 
     macro_rules! generate_low_degree_tests {
