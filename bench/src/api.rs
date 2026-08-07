@@ -9,7 +9,6 @@ use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, BlockTxChainTarge
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _};
 use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
-use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::proof::ProofWithPublicInputs;
 
@@ -40,16 +39,16 @@ pub struct Circuits {
     pub dummy_light_proof: Proof,
 }
 
-pub(crate) struct PathCircuits {
-    pub(crate) tx_target: BlockTxTarget,
-    pub(crate) tx_data: CircuitData<F, C, D>,
-    pub(crate) chain_target: BlockTxChainTarget,
-    pub(crate) chain_data: CircuitData<F, C, D>,
-    pub(crate) dummy_proof: Proof,
+struct PathCircuits {
+    tx_target: BlockTxTarget,
+    tx_data: CircuitData<F, C, D>,
+    chain_target: BlockTxChainTarget,
+    chain_data: CircuitData<F, C, D>,
+    dummy_proof: Proof,
 }
 
 impl PathCircuits {
-    pub(crate) fn new(tx_per_proof: usize, tx_mode: u8) -> Self {
+    fn new(tx_per_proof: usize, tx_mode: u8) -> Self {
         let tx = BlockTxCircuit::define(CIRCUIT_CONFIG, tx_per_proof, CHAIN_ID, tx_mode);
         let tx_target = tx.target;
         let tx_data = tx.builder.build::<C>();
@@ -107,46 +106,6 @@ impl Circuits {
         }
     }
 
-    /// Releases the extended (LDE) constants/sigmas commitment of every circuit
-    /// whose proving has already finished when the final block proof starts.
-    ///
-    /// `ProverOnlyCircuitData::constants_sigmas_commitment` holds a rate-`2^3`
-    /// low-degree extension of that circuit's preprocessed columns, built once
-    /// at circuit-build time and otherwise kept alive for the whole process. It
-    /// is read only by proofs *of that circuit* — the quotient evaluation's
-    /// `fill_lde_batch` and the FRI query openings — so once the pre-execution
-    /// proof and both transaction chains have produced their proofs, the
-    /// pre-execution, transaction and chain extensions are unreachable: the
-    /// final block proof reads only `block_data`, those three finished proofs
-    /// and the block itself.
-    ///
-    /// Those five extensions are `2 * 2^19 * 88 + 3 * 2^17 * 86` field elements
-    /// = 1.01 GB, and on this host they are resident in CPU-visible Metal
-    /// shared buffers whose release returns the pages to the OS immediately.
-    /// The final block proof is the process's peak-RSS moment — it stacks its
-    /// own `2^21`-row wires, Z and quotient extensions (2.89 GB) on top of
-    /// every retained extension — so releasing these first takes 1.01 GB
-    /// straight off the high-water mark.
-    ///
-    /// Nothing else is released here. Generators, representative maps and
-    /// witness buffers are CPU-heap objects, and this binary runs jemalloc with
-    /// `dirty_decay_ms:-1,muzzy_decay_ms:-1`: freeing them cannot lower RSS,
-    /// while their recursive drop is not free.
-    ///
-    /// Value-exact: no quantity is computed differently, only storage that no
-    /// subsequent read can reach is returned early.
-    pub fn release_finished_circuit_extensions(&mut self) {
-        for data in [
-            &mut self.pre_data,
-            &mut self.light_tx_data,
-            &mut self.heavy_tx_data,
-            &mut self.light_chain_data,
-            &mut self.heavy_chain_data,
-        ] {
-            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
-        }
-    }
-
     /// Builds the final block circuit, which depends on the pre-execution and
     /// both chain circuits but is only needed for the final proof. Callers run
     /// this concurrently with transaction/chain proving.
@@ -184,53 +143,5 @@ mod tests {
             .expect("embedded heavy dummy proof is invalid");
         let _: Proof = bincode::deserialize(include_bytes!("../dummy-light-chain-proof.bin"))
             .expect("embedded light dummy proof is invalid");
-    }
-}
-
-#[cfg(test)]
-mod build_timing {
-    use std::time::Instant;
-
-    use super::*;
-
-    /// Manual timing harness for the startup circuit builds, which run once per
-    /// worker spawn inside the ranked timed window (five spawns per run). Run:
-    /// `cargo test --release -p bench --bin prove -- --ignored build_phase_timing --nocapture`
-    #[test]
-    #[ignore = "manual timing harness"]
-    fn build_phase_timing() {
-        std::thread::Builder::new()
-            .stack_size(PROVER_THREAD_STACK_BYTES)
-            .spawn(|| {
-                let t = Instant::now();
-                let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
-                let t_pre_define = t.elapsed();
-                let t = Instant::now();
-                let pre_data = pre.builder.build::<C>();
-                let t_pre_build = t.elapsed();
-                drop(pre_data);
-
-                let t = Instant::now();
-                let tx = BlockTxCircuit::define(CIRCUIT_CONFIG, LIGHT_TX_PER_PROOF, CHAIN_ID, LIGHT_TX_MODE);
-                let t_tx_define = t.elapsed();
-                let t = Instant::now();
-                let tx_data = tx.builder.build::<C>();
-                let t_tx_build = t.elapsed();
-
-                let t = Instant::now();
-                let chain = BlockTxChainCircuit::define(CIRCUIT_CONFIG, &tx_data, ON_CHAIN_OPERATIONS_LIMIT);
-                let t_chain_define = t.elapsed();
-                let t = Instant::now();
-                let chain_data = chain.builder.build::<C>();
-                let t_chain_build = t.elapsed();
-                drop(chain_data);
-
-                println!("pre:   define {t_pre_define:?} build {t_pre_build:?}");
-                println!("tx:    define {t_tx_define:?} build {t_tx_build:?}");
-                println!("chain: define {t_chain_define:?} build {t_chain_build:?}");
-            })
-            .expect("spawn")
-            .join()
-            .expect("join");
     }
 }

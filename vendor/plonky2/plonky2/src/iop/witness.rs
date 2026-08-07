@@ -331,50 +331,28 @@ impl<F: Field> Witness<F> for PartialWitness<F> {
 /// The value of a target is defined to be the value of its root in the forest.
 #[derive(Clone, Debug)]
 pub struct PartitionWitness<'a, F: Field> {
-    /// Value of each representative slot. Unset slots hold `F::ZERO`; whether a slot has actually
-    /// been set is tracked by the 1-bit-per-slot `set_bitmap`. Storing the values densely (8 bytes
-    /// per slot instead of 16 for `Option<F>`) halves memory traffic during witness generation.
-    pub values: Vec<F>,
-    /// Bitmap with one bit per slot of `values`; bit `i` of word `i / 64` is set iff slot `i` has
-    /// been assigned a value.
-    pub set_bitmap: Vec<u64>,
-    /// Representative index of every target, as `u32`. Halving the entry width halves the bytes
-    /// this table costs per read; every value is zero-extended at the indexing site, so the slots
-    /// selected in `values`/`set_bitmap` are unchanged.
-    pub representative_map: &'a [u32],
+    pub values: Vec<Option<F>>,
+    pub representative_map: &'a [usize],
     pub num_wires: usize,
     pub degree: usize,
 }
 
 impl<'a, F: Field> PartitionWitness<'a, F> {
-    pub fn new(num_wires: usize, degree: usize, representative_map: &'a [u32]) -> Self {
-        let len = representative_map.len();
+    pub fn new(num_wires: usize, degree: usize, representative_map: &'a [usize]) -> Self {
         Self {
-            values: vec![F::ZERO; len],
-            set_bitmap: vec![0u64; len.div_ceil(64)],
+            values: vec![None; representative_map.len()],
             representative_map,
             num_wires,
             degree,
         }
     }
 
-    /// Returns whether the slot at the given representative index has been set.
-    #[inline]
-    pub fn is_set_by_rep_index(&self, rep_index: usize) -> bool {
-        (self.set_bitmap[rep_index >> 6] >> (rep_index & 63)) & 1 != 0
-    }
-
-    #[inline]
-    fn mark_set(&mut self, rep_index: usize) {
-        self.set_bitmap[rep_index >> 6] |= 1u64 << (rep_index & 63);
-    }
-
     /// Set a `Target`. On success, returns the representative index of the newly-set target. If the
     /// target was already set, returns `None`.
     pub fn set_target_returning_rep(&mut self, target: Target, value: F) -> Result<Option<usize>> {
-        let rep_index = self.representative_map[self.target_index(target)] as usize;
-        if self.is_set_by_rep_index(rep_index) {
-            let old_value = self.values[rep_index];
+        let rep_index = self.representative_map[self.target_index(target)];
+        let rep_value = &mut self.values[rep_index];
+        if let Some(old_value) = *rep_value {
             if value != old_value {
                 return Err(anyhow!(
                     "Partition containing {:?} was set twice with different values: {} != {}",
@@ -386,8 +364,7 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
 
             Ok(None)
         } else {
-            self.values[rep_index] = value;
-            self.mark_set(rep_index);
+            *rep_value = Some(value);
             Ok(Some(rep_index))
         }
     }
@@ -397,74 +374,13 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     }
 
     pub fn full_witness(self) -> MatrixWitness<F> {
-        // Single fused pass, parallel over row chunks. Cell (column j, row i)
-        // is `values[representative_map[i * num_wires + j]]` (unset slots hold
-        // `F::ZERO` in the dense `values` vector), with `Target::index`'s
-        // `row * num_wires + column` inlined as a running cursor. Each
-        // parallel task owns one row range of every column — disjoint
-        // `MaybeUninit` segments carved off the pre-sized column buffers up
-        // front — reads `representative_map` sequentially within its range,
-        // and initializes every cell exactly once before the final `set_len`.
-        let num_wires = self.num_wires;
-        let degree = self.degree;
-        let mut wire_values: Vec<Vec<F>> = (0..num_wires)
-            .map(|_| Vec::with_capacity(degree))
-            .collect();
-        let num_chunks = 16.min(degree.max(1));
-        let chunk_rows = degree.div_ceil(num_chunks);
-        {
-            let mut segments: Vec<Vec<&mut [core::mem::MaybeUninit<F>]>> = (0..num_chunks)
-                .map(|_| Vec::with_capacity(num_wires))
-                .collect();
-            for column in wire_values.iter_mut() {
-                let mut rest =
-                    crate::hash::merkle_tree::capacity_up_to_mut(column, degree);
-                for segment_columns in segments.iter_mut() {
-                    let take = chunk_rows.min(rest.len());
-                    let (head, tail) = rest.split_at_mut(take);
-                    segment_columns.push(head);
-                    rest = tail;
+        let mut wire_values = vec![vec![F::ZERO; self.degree]; self.num_wires];
+        for i in 0..self.degree {
+            for j in 0..self.num_wires {
+                let t = Target::Wire(Wire { row: i, column: j });
+                if let Some(x) = self.try_get_target(t) {
+                    wire_values[j][i] = x;
                 }
-            }
-            use plonky2_maybe_rayon::*;
-            segments
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(chunk, columns)| {
-                    let rows = columns.first().map_or(0, |column| column.len());
-                    let mut wire_index = chunk * chunk_rows * num_wires;
-                    for i in 0..rows {
-                        for column in columns.iter_mut() {
-                            column[i].write(
-                                self.values[self.representative_map[wire_index] as usize],
-                            );
-                            wire_index += 1;
-                        }
-                    }
-                });
-        }
-        for column in wire_values.iter_mut() {
-            // SAFETY: every one of the `degree` slots of every column was
-            // initialized exactly once by the disjoint segment writes above.
-            unsafe {
-                column.set_len(degree);
-            }
-        }
-
-        MatrixWitness { wire_values }
-    }
-    #[allow(dead_code)]
-    fn full_witness_serial_reference(self) -> MatrixWitness<F> {
-        let mut wire_values: Vec<Vec<F>> = (0..self.num_wires)
-            .map(|_| Vec::with_capacity(self.degree))
-            .collect();
-        let mut wire_index = 0;
-        for _ in 0..self.degree {
-            for column in wire_values.iter_mut() {
-                // Unset slots hold `F::ZERO` in the dense `values` vector, so this is exactly
-                // the old `values[rep].unwrap_or(F::ZERO)` without touching the bitmap.
-                column.push(self.values[self.representative_map[wire_index] as usize]);
-                wire_index += 1;
             }
         }
 
@@ -480,11 +396,7 @@ impl<F: Field> WitnessWrite<F> for PartitionWitness<'_, F> {
 
 impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
     fn try_get_target(&self, target: Target) -> Option<F> {
-        let rep_index = self.representative_map[self.target_index(target)] as usize;
-        if self.is_set_by_rep_index(rep_index) {
-            Some(self.values[rep_index])
-        } else {
-            None
-        }
+        let rep_index = self.representative_map[self.target_index(target)];
+        self.values[rep_index]
     }
 }

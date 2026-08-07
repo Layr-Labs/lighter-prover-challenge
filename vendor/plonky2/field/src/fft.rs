@@ -4,11 +4,6 @@ use core::cmp::{max, min};
 use plonky2_util::{log2_strict, reverse_index_bits_in_place};
 use unroll::unroll_for_loops;
 
-#[cfg(target_arch = "aarch64")]
-use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
-#[cfg(target_arch = "aarch64")]
-use crate::goldilocks_field::mul_16th_root_powers;
-
 use crate::packable::Packable;
 use crate::packed::PackedField;
 use crate::polynomial::{PolynomialCoeffs, PolynomialValues};
@@ -37,138 +32,16 @@ pub fn fft_root_table<F: Field>(n: usize) -> FftRootTable<F> {
     root_table
 }
 
-/// Process-wide cache of FFT root tables for the prover's hot field types,
-/// contention-free on the steady-state path: one static fixed-size array of
-/// `OnceLock` slots per cached field type, indexed by log2(size). A hit is a
-/// `TypeId` compare (const-folded per monomorphization) plus one atomic
-/// acquire load — no mutex, no hashing, no shared cache-line writes after a
-/// slot initializes. `fft_root_table` is deterministic per (field, size), so
-/// a cache hit returns exactly the values a fresh computation would; the
-/// cache only avoids recomputing the table on every table-less FFT (FRI fold
-/// rounds, the final-polynomial coset FFT, IFFT/LDE calls without a
-/// precomputed table). Field types without a dedicated table (and sizes past
-/// `MAX_LG_N`) fall back to a fresh, value-identical computation.
-#[cfg(feature = "std")]
-mod root_table_cache {
-    use alloc::vec::Vec;
-    use core::any::{Any, TypeId};
-    use std::sync::{Arc, OnceLock};
-
-    use super::{FftRootTable, fft_root_table};
-    use crate::extension::quadratic::QuadraticExtension;
-    use crate::goldilocks_field::GoldilocksField;
-    use crate::types::Field;
-
-    /// Slots for sizes up to `1 << 32` elements, far past any FFT here.
-    const MAX_LG_N: usize = 33;
-
-    /// A slot holds the type-erased `Arc<FftRootTable<F>>` for its static's
-    /// fixed field type; erasure keeps the generic accessor safe (no
-    /// transmute) while each static's writer only ever stores its own type.
-    type Slot = OnceLock<Arc<dyn Any + Send + Sync>>;
-
-    #[allow(clippy::declare_interior_mutable_const)]
-    const EMPTY_SLOT: Slot = OnceLock::new();
-
-    static GOLDILOCKS_TABLES: [Slot; MAX_LG_N] = [EMPTY_SLOT; MAX_LG_N];
-    static GOLDILOCKS_EXT2_TABLES: [Slot; MAX_LG_N] = [EMPTY_SLOT; MAX_LG_N];
-
-    /// The dedicated slot array for `F`, if `F` is one of the cached types.
-    fn per_type_tables<F: Field>() -> Option<&'static [Slot; MAX_LG_N]> {
-        let f = TypeId::of::<F>();
-        if f == TypeId::of::<GoldilocksField>() {
-            Some(&GOLDILOCKS_TABLES)
-        } else if f == TypeId::of::<QuadraticExtension<GoldilocksField>>() {
-            Some(&GOLDILOCKS_EXT2_TABLES)
-        } else {
-            None
-        }
-    }
-
-    pub(super) fn get<F: Field>(lg_n: usize) -> Arc<FftRootTable<F>> {
-        if let Some(tables) = per_type_tables::<F>() {
-            if let Some(slot) = tables.get(lg_n) {
-                // First caller for this (type, size) computes the table; racers
-                // block only during that one-time construction. Afterwards this
-                // is a single atomic load of the initialized slot.
-                let erased = slot.get_or_init(|| Arc::new(fft_root_table::<F>(1 << lg_n)));
-                if let Ok(table) = Arc::clone(erased).downcast::<FftRootTable<F>>() {
-                    return table;
-                }
-                // Unreachable in practice: each static stores only its own
-                // type. Fall through to a fresh (value-identical) computation.
-            }
-        }
-        Arc::new(fft_root_table::<F>(1 << lg_n))
-    }
-
-    static GOLDILOCKS_SUBGROUPS: [Slot; MAX_LG_N] = [EMPTY_SLOT; MAX_LG_N];
-
-    /// The dedicated subgroup slot array for `F`, if `F` is a cached type.
-    /// Only the base field is cached: subgroup elements of an extension's
-    /// two-adic subgroup are not needed on any hot path.
-    fn per_type_subgroups<F: Field>() -> Option<&'static [Slot; MAX_LG_N]> {
-        (TypeId::of::<F>() == TypeId::of::<GoldilocksField>()).then_some(&GOLDILOCKS_SUBGROUPS)
-    }
-
-    /// `F::two_adic_subgroup(lg_n)` through the same process-wide cache
-    /// discipline as the root tables: deterministic per (field, size), so a
-    /// hit returns exactly the values a fresh computation would.
-    pub(super) fn get_subgroup<F: Field>(lg_n: usize) -> Arc<Vec<F>> {
-        if let Some(tables) = per_type_subgroups::<F>() {
-            if let Some(slot) = tables.get(lg_n) {
-                let erased = slot.get_or_init(|| Arc::new(F::two_adic_subgroup(lg_n)));
-                if let Ok(subgroup) = Arc::clone(erased).downcast::<Vec<F>>() {
-                    return subgroup;
-                }
-            }
-        }
-        Arc::new(F::two_adic_subgroup(lg_n))
-    }
-}
-
-/// Process-wide cached `F::two_adic_subgroup(lg_n)`, value-identical to a
-/// fresh computation. Avoids the per-call primitive-root exponentiation and
-/// power chain on hot paths that need a small fixed subgroup repeatedly.
-#[cfg(feature = "std")]
-pub fn cached_two_adic_subgroup<F: Field>(lg_n: usize) -> alloc::sync::Arc<Vec<F>> {
-    root_table_cache::get_subgroup::<F>(lg_n)
-}
-
-#[cfg(not(feature = "std"))]
-pub fn cached_two_adic_subgroup<F: Field>(lg_n: usize) -> alloc::sync::Arc<Vec<F>> {
-    alloc::sync::Arc::new(F::two_adic_subgroup(lg_n))
-}
-
 #[inline]
 fn fft_dispatch<F: Field>(
     input: &mut [F],
     zero_factor: Option<usize>,
     root_table: Option<&FftRootTable<F>>,
 ) {
-    if let Some(table) = root_table {
-        fft_classic(input, zero_factor.unwrap_or(0), table);
-        return;
-    }
-    #[cfg(feature = "std")]
-    let computed_root_table = root_table_cache::get::<F>(log2_strict(input.len()));
-    #[cfg(not(feature = "std"))]
-    let computed_root_table = fft_root_table::<F>(input.len());
+    let computed_root_table = root_table.is_none().then(|| fft_root_table(input.len()));
+    let used_root_table = root_table.or(computed_root_table.as_ref()).unwrap();
 
-    fft_classic(input, zero_factor.unwrap_or(0), &computed_root_table);
-}
-
-/// Computes an FFT in the caller-provided buffer.
-///
-/// This is equivalent to [`fft_with_options`], but permits buffers backed by
-/// shared CPU/GPU memory to remain in place.
-#[inline]
-pub fn fft_in_place_with_options<F: Field>(
-    buffer: &mut [F],
-    zero_factor: Option<usize>,
-    root_table: Option<&FftRootTable<F>>,
-) {
-    fft_dispatch(buffer, zero_factor, root_table);
+    fft_classic(input, zero_factor.unwrap_or(0), used_root_table);
 }
 
 #[inline]
@@ -197,85 +70,14 @@ pub fn ifft_with_options<F: Field>(
     zero_factor: Option<usize>,
     root_table: Option<&FftRootTable<F>>,
 ) -> PolynomialCoeffs<F> {
-    ifft_with_options_and_postscale(poly, zero_factor, root_table, None)
-}
-
-pub(crate) fn ifft_with_options_and_postscale<F: Field>(
-    poly: PolynomialValues<F>,
-    zero_factor: Option<usize>,
-    root_table: Option<&FftRootTable<F>>,
-    postscale: Option<&[F]>,
-) -> PolynomialCoeffs<F> {
     let n = poly.len();
     let lg_n = log2_strict(n);
     let n_inv = F::inverse_2exp(lg_n);
+
     let PolynomialValues { values: mut buffer } = poly;
     fft_dispatch(&mut buffer, zero_factor, root_table);
 
-    match postscale {
-        None => {
-            // We reverse all values except the first, and divide each by n.
-            buffer[0] *= n_inv;
-            buffer[n / 2] *= n_inv;
-            for i in 1..(n / 2) {
-                let j = n - i;
-                let coeffs_i = buffer[j] * n_inv;
-                let coeffs_j = buffer[i] * n_inv;
-                buffer[i] = coeffs_i;
-                buffer[j] = coeffs_j;
-            }
-        }
-        Some(scales) => {
-            assert_eq!(scales.len(), n);
-            // Fuse the caller's coefficient scaling into the same writes as
-            // IFFT reversal and normalization, preserving multiplication order.
-            buffer[0] *= n_inv;
-            buffer[n / 2] *= n_inv;
-            buffer[0] *= scales[0];
-            if n > 1 {
-                buffer[n / 2] *= scales[n / 2];
-            }
-            for i in 1..(n / 2) {
-                let j = n - i;
-                let mut coeffs_i = buffer[j] * n_inv;
-                let mut coeffs_j = buffer[i] * n_inv;
-                coeffs_i *= scales[i];
-                coeffs_j *= scales[j];
-                buffer[i] = coeffs_i;
-                buffer[j] = coeffs_j;
-            }
-        }
-    }
-    PolynomialCoeffs { coeffs: buffer }
-}
-
-/// `ifft` of a borrowed column without the caller-side copy: the initial
-/// bit-reversal permutation is applied as an out-of-place gather from
-/// `values` into the fresh buffer (the same permutation `fft_classic`'s
-/// in-place pass would apply to a clone), after which the identical
-/// butterfly layers and coefficient reversal/scaling run. Value-identical
-/// to `ifft(PolynomialValues::new(values.to_vec()))`.
-pub fn ifft_borrowed<F: Field>(values: &[F]) -> PolynomialCoeffs<F> {
-    let n = values.len();
-    let lg_n = log2_strict(n);
-    let n_inv = F::inverse_2exp(lg_n);
-
-    let mut buffer = plonky2_util::reverse_index_bits(values);
-
-    #[cfg(feature = "std")]
-    let root_table = root_table_cache::get::<F>(lg_n);
-    #[cfg(not(feature = "std"))]
-    let root_table = fft_root_table::<F>(n);
-
-    let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
-    if lg_n <= lg_packed_width {
-        fft_classic_simd::<F>(&mut buffer, 0, lg_n, &root_table);
-    } else {
-        fft_classic_simd::<<F as Packable>::Packing>(&mut buffer, 0, lg_n, &root_table);
-    }
-
-    // Identical post-pass to `ifft_with_options`: reverse all values except
-    // the first, dividing each by n.
+    // We reverse all values except the first, and divide each by n.
     buffer[0] *= n_inv;
     buffer[n / 2] *= n_inv;
     for i in 1..(n / 2) {
@@ -336,74 +138,6 @@ fn fft_classic_simd<P: PackedField>(
 }
 
 #[inline(always)]
-fn fft_classic_simd_single_layer<P: PackedField>(
-    packed_values: &mut [P],
-    lg_half_m: usize,
-    lg_packed_width: usize,
-    root_table: &FftRootTable<P::Scalar>,
-) {
-    let lg_m = lg_half_m + 1;
-    let m = 1 << lg_m; // Subarray size (in field elements).
-    let packed_m = m >> lg_packed_width; // Subarray size (in vectors).
-    let half_packed_m = packed_m / 2;
-    debug_assert!(half_packed_m != 0);
-
-    // Omega values for this iteration, as a slice of vectors.
-    let omega_table = P::pack_slice(&root_table[lg_half_m]);
-    for k in (0..packed_values.len()).step_by(packed_m) {
-        for j in 0..half_packed_m {
-            let omega = omega_table[j];
-            let t = omega * packed_values[k + half_packed_m + j];
-            let u = packed_values[k + j];
-            packed_values[k + j] = u + t;
-            packed_values[k + half_packed_m + j] = u - t;
-        }
-    }
-}
-
-/// Two consecutive stages fused into one radix-4-style traversal: the exact
-/// same butterflies with the exact same `root_table` twiddles, but each
-/// quarter-block element is loaded and stored once per stage *pair* instead
-/// of once per stage, halving whole-array memory passes for these layers.
-#[inline(always)]
-fn fft_classic_simd_fused_two_layers<P: PackedField>(
-    packed_values: &mut [P],
-    lg_half_m: usize,
-    lg_packed_width: usize,
-    root_table: &FftRootTable<P::Scalar>,
-) {
-    // Quarter size in vectors for the size-2^(lg_half_m + 2) fused block.
-    let q = (1usize << lg_half_m) >> lg_packed_width;
-    debug_assert!(q != 0);
-    let stage1_omegas = P::pack_slice(&root_table[lg_half_m]);
-    let stage2_omegas = P::pack_slice(&root_table[lg_half_m + 1]);
-
-    for k in (0..packed_values.len()).step_by(4 * q) {
-        for j in 0..q {
-            let w1 = stage1_omegas[j];
-            let a = packed_values[k + j];
-            let b = packed_values[k + q + j];
-            let c = packed_values[k + 2 * q + j];
-            let d = packed_values[k + 3 * q + j];
-
-            // First stage: butterflies within [a,b] and within [c,d].
-            let t = w1 * b;
-            let (ab0, ab1) = (a + t, a - t);
-            let t = w1 * d;
-            let (cd0, cd1) = (c + t, c - t);
-
-            // Second stage: butterflies pairing positions j and j + 2q.
-            let t = stage2_omegas[j] * cd0;
-            packed_values[k + j] = ab0 + t;
-            packed_values[k + 2 * q + j] = ab0 - t;
-            let t = stage2_omegas[q + j] * cd1;
-            packed_values[k + q + j] = ab1 + t;
-            packed_values[k + 3 * q + j] = ab1 - t;
-        }
-    }
-}
-
-#[inline(always)]
 fn fft_classic_simd_layers<P: PackedField>(
     packed_values: &mut [P],
     start: usize,
@@ -411,20 +145,24 @@ fn fft_classic_simd_layers<P: PackedField>(
     root_table: &FftRootTable<P::Scalar>,
 ) {
     let lg_packed_width = log2_strict(P::WIDTH);
-    let mut lg_half_m = start;
-    // Odd stage count: run the first stage unfused so the remainder pairs up.
-    if (end - start) % 2 == 1 {
-        fft_classic_simd_single_layer(packed_values, lg_half_m, lg_packed_width, root_table);
-        lg_half_m += 1;
-    }
-    while lg_half_m < end {
-        fft_classic_simd_fused_two_layers(
-            packed_values,
-            lg_half_m,
-            lg_packed_width,
-            root_table,
-        );
-        lg_half_m += 2;
+    for lg_half_m in start..end {
+        let lg_m = lg_half_m + 1;
+        let m = 1 << lg_m; // Subarray size (in field elements).
+        let packed_m = m >> lg_packed_width; // Subarray size (in vectors).
+        let half_packed_m = packed_m / 2;
+        debug_assert!(half_packed_m != 0);
+
+        // Omega values for this iteration, as a slice of vectors.
+        let omega_table = P::pack_slice(&root_table[lg_half_m]);
+        for k in (0..packed_values.len()).step_by(packed_m) {
+            for j in 0..half_packed_m {
+                let omega = omega_table[j];
+                let t = omega * packed_values[k + half_packed_m + j];
+                let u = packed_values[k + j];
+                packed_values[k + j] = u + t;
+                packed_values[k + half_packed_m + j] = u - t;
+            }
+        }
     }
 }
 
@@ -454,33 +192,6 @@ fn fft_zero_padded_first_layer_block<P: PackedField>(
             packed_values[pair_destination + j] = u + t;
             packed_values[pair_destination + packed_repeat + j] = u - t;
         }
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn fft_zero_padded_rate_8_first_layer_block(
-    packed_values: &mut [WideGoldilocksField],
-    source_start: usize,
-    nonzero_len: usize,
-    destination: usize,
-) {
-    debug_assert!(nonzero_len >= 2);
-
-    for pair in (0..nonzero_len / 2).rev() {
-        let source = source_start + pair * 2;
-        let u = packed_values[source / 4].as_slice()[source % 4];
-        let v = packed_values[(source + 1) / 4].as_slice()[(source + 1) % 4];
-        let products = mul_16th_root_powers(v);
-        let low = *WideGoldilocksField::from_slice(&products[..4]);
-        let high = *WideGoldilocksField::from_slice(&products[4..]);
-        let u = WideGoldilocksField::from(u);
-        let pair_destination = destination + pair * 4;
-
-        packed_values[pair_destination] = u + low;
-        packed_values[pair_destination + 1] = u + high;
-        packed_values[pair_destination + 2] = u - low;
-        packed_values[pair_destination + 3] = u - high;
     }
 }
 
@@ -522,34 +233,6 @@ fn fft_zero_padded_cache_blocks<P: PackedField>(
     for block in (0..num_blocks).rev() {
         let source_start = block * nonzero_per_block;
         let destination = block * packed_block_len;
-        #[cfg(target_arch = "aarch64")]
-        if r == 3 && core::any::TypeId::of::<P>() == core::any::TypeId::of::<WideGoldilocksField>()
-        {
-            let wide_values = unsafe {
-                // SAFETY: The TypeId check proves this is the exact concrete packed type;
-                // only the generic spelling of the slice differs at this point.
-                core::slice::from_raw_parts_mut(
-                    packed_values.as_mut_ptr().cast::<WideGoldilocksField>(),
-                    packed_values.len(),
-                )
-            };
-            fft_zero_padded_rate_8_first_layer_block(
-                wide_values,
-                source_start,
-                nonzero_per_block,
-                destination,
-            );
-        } else {
-            fft_zero_padded_first_layer_block(
-                packed_values,
-                source_start,
-                nonzero_per_block,
-                destination,
-                packed_repeat,
-                omega_table,
-            );
-        }
-        #[cfg(not(target_arch = "aarch64"))]
         fft_zero_padded_first_layer_block(
             packed_values,
             source_start,
@@ -663,64 +346,6 @@ mod tests {
     use crate::packed::PackedField;
     use crate::polynomial::{PolynomialCoeffs, PolynomialValues};
     use crate::types::Field;
-
-    /// `ifft_borrowed` must be bit-identical to `ifft` of a copy across
-    /// sizes straddling the packed width and the small/large bit-reversal
-    /// strategies, for both a cached-table field type and an uncached one.
-    #[test]
-    fn ifft_borrowed_matches_ifft() {
-        use crate::extension::quartic::QuarticExtension;
-        use crate::fft::ifft_borrowed;
-        use crate::types::Sample;
-
-        fn check<F: Field + Sample>() {
-            for lg_n in [1usize, 2, 4, 6, 7, 10, 13] {
-                let n = 1 << lg_n;
-                let values = F::rand_vec(n);
-                let expected = ifft(PolynomialValues::new(values.clone()));
-                let actual = ifft_borrowed(&values);
-                assert_eq!(expected.coeffs, actual.coeffs);
-            }
-        }
-
-        check::<GoldilocksField>();
-        check::<QuadraticExtension<GoldilocksField>>();
-        check::<QuarticExtension<GoldilocksField>>();
-    }
-
-    /// The cached-table dispatch path (no caller-supplied table) must return
-    /// bit-identical results to an explicitly computed fresh table, on both
-    /// cold and warm cache, for the cached field types (base and quadratic
-    /// extension, each with a dedicated `OnceLock` slot array) and for an
-    /// uncached field type (quartic extension), which takes the fresh-compute
-    /// fallback on every call.
-    #[cfg(feature = "std")]
-    #[test]
-    fn cached_root_table_matches_fresh_table() {
-        use crate::extension::quartic::QuarticExtension;
-        use crate::types::Sample;
-
-        fn check<F: Field + Sample>() {
-            for lg_n in [1usize, 3, 7] {
-                let n = 1 << lg_n;
-                let table = fft_root_table::<F>(n);
-                let poly = PolynomialCoeffs::new(F::rand_vec(n));
-                let expected = fft_with_options(poly.clone(), None, Some(&table));
-                // First call may populate the cache, second one must hit it.
-                // (For an uncached type both calls take the fallback.)
-                let cold = fft_with_options(poly.clone(), None, None);
-                let warm = fft_with_options(poly, None, None);
-                assert_eq!(expected.values, cold.values);
-                assert_eq!(expected.values, warm.values);
-            }
-        }
-
-        // Cached types: dedicated per-type slot arrays.
-        check::<GoldilocksField>();
-        check::<QuadraticExtension<GoldilocksField>>();
-        // Uncached type: exercises the value-identical fallback path.
-        check::<QuarticExtension<GoldilocksField>>();
-    }
 
     #[test]
     fn fft_and_ifft() {

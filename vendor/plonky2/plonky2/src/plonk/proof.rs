@@ -11,8 +11,7 @@ use anyhow::ensure;
 use plonky2_maybe_rayon::*;
 use serde::{Deserialize, Serialize};
 
-use crate::field::extension::{Extendable, FieldExtension};
-use crate::field::types::Field;
+use crate::field::extension::Extendable;
 use crate::fri::oracle::PolynomialBatch;
 use crate::fri::proof::{
     CompressedFriProof, FriChallenges, FriChallengesTarget, FriProof, FriProofTarget,
@@ -321,47 +320,25 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         quotient_polys_commitment: &PolynomialBatch<F, C, D>,
         common_data: &CommonCircuitData<F, D>,
     ) -> Self {
-        // Every committed polynomial in these batches has at most `degree`
-        // coefficients, so one powers table per opening point covers all of
-        // them. Evaluating as `sum_i c_i * z^i` against the table replaces the
-        // previous `p.to_extension().eval(z)`, which cloned each polynomial
-        // into a degree-sized extension vector (one allocation plus a full
-        // conversion pass per polynomial) before running extension-by-
-        // extension Horner. The dot product reads the base coefficients in
-        // place, and multiplies each by a table entry via `scalar_mul`.
-        // Value-exactness: the field is exact, `powers()` produces exactly
-        // `z^i`, and `sum c_i z^i` under any association equals Horner's
-        // `(..(c_{n-1} z + c_{n-2}) z + ..)`, so every opening is the
-        // identical field element and the transcript is unchanged.
-        let degree = common_data.degree();
-        let table = |z: F::Extension| -> Vec<F::Extension> { z.powers().take(degree).collect() };
-        let zeta_pows = table(zeta);
-        let g_zeta_pows = table(g * zeta);
-        let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
+        let eval_commitment = |z: F::Extension, c: &PolynomialBatch<F, C, D>| {
             c.polynomials
                 .par_iter()
-                .map(|p| {
-                    p.coeffs
-                        .iter()
-                        .zip(pows)
-                        .map(|(&coeff, zp)| zp.scalar_mul(coeff))
-                        .sum::<F::Extension>()
-                })
+                .map(|p| p.to_extension().eval(z))
                 .collect::<Vec<_>>()
         };
-        let constants_sigmas_eval = eval_commitment(&zeta_pows, constants_sigmas_commitment);
+        let constants_sigmas_eval = eval_commitment(zeta, constants_sigmas_commitment);
 
         // `zs_partial_products_lookup_eval` contains the permutation argument polynomials as well as lookup polynomials.
         let zs_partial_products_lookup_eval =
-            eval_commitment(&zeta_pows, zs_partial_products_lookup_commitment);
+            eval_commitment(zeta, zs_partial_products_lookup_commitment);
         let zs_partial_products_lookup_next_eval =
-            eval_commitment(&g_zeta_pows, zs_partial_products_lookup_commitment);
-        let quotient_polys = eval_commitment(&zeta_pows, quotient_polys_commitment);
+            eval_commitment(g * zeta, zs_partial_products_lookup_commitment);
+        let quotient_polys = eval_commitment(zeta, quotient_polys_commitment);
 
         Self {
             constants: constants_sigmas_eval[common_data.constants_range()].to_vec(),
             plonk_sigmas: constants_sigmas_eval[common_data.sigmas_range()].to_vec(),
-            wires: eval_commitment(&zeta_pows, wires_commitment),
+            wires: eval_commitment(zeta, wires_commitment),
             plonk_zs: zs_partial_products_lookup_eval[common_data.zs_range()].to_vec(),
             plonk_zs_next: zs_partial_products_lookup_next_eval[common_data.zs_range()].to_vec(),
             partial_products: zs_partial_products_lookup_eval[common_data.partial_products_range()]

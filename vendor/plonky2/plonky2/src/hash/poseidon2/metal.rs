@@ -3,7 +3,7 @@ use core::marker::PhantomData;
 use core::mem::{size_of, size_of_val};
 use core::slice;
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::{Condvar, LazyLock, Mutex};
 
 use metal::{
     Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
@@ -14,7 +14,6 @@ use plonky2_maybe_rayon::*;
 
 use crate::field::types::{Field, PrimeField64};
 use crate::hash::hash_types::{HashOut, RichField};
-use crate::hash::merkle_tree::LevelOrderDigests;
 use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
@@ -23,26 +22,6 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
 /// window and is treated as contaminated evidence.
 const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
-/// Lower routing threshold used only while an exclusive serial proving phase
-/// is active (see [`set_exclusive_gpu_phase`]). During the pre-execution and
-/// final block proofs nothing else can contend for the serialized GPU stream,
-/// so the mid-size column trees those proofs commit (their Zs/partial-products
-/// tree at 524,272 estimated permutations and quotient tree at 393,200 miss
-/// the default 1<<19 cutoff) hash on an otherwise idle GPU. The global cutoff
-/// stays untouched for the pipelined phases, where lowering it is the
-/// documented priority-inversion regression.
-// Measured head-to-head (equal-output asserted, warm runs, cap height 4):
-// the GPU wins ~2x already at 262,128 permutations (2^17-leaf width-8 trees:
-// CPU 14.9 ms vs GPU 7.8 ms) — the chain-step quotient/FRI commitment shape,
-// which sits 16 permutations BELOW the 1 << 18 gate and was still hashing on
-// the CPU during the exclusive phases. 1 << 17 captures it; the measured
-// GPU/CPU break-even is ~131k permutations.
-// Within an exclusive phase nothing contends for the GPU, so even the
-// measured-parity shapes win: 2^16-leaf width-8 trees (131,056 permutations)
-// measured GPU/CPU 0.88 warm with zero contention. 1 << 16 admits them while
-// still keeping the genuinely CPU-favored tiny shapes (2^15 width-8 measured
-// 1.37) on the CPU.
-const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
 /// Upper bound on concurrently in-flight GPU tree builds. One set serializes
 /// GPU tree builds exactly like the promoted base's global context mutex: a
 /// 3-set experiment measured 13-18% faster locally but scored -21.6% on the
@@ -61,13 +40,6 @@ struct MetalShared {
     ntt_prepare_pipeline: ComputePipelineState,
     ntt_stage_pipeline: ComputePipelineState,
     ifft_finalize_pipeline: ComputePipelineState,
-    /// Optional so a quotient-kernel setup failure cannot disable the
-    /// already-proven Metal commitment backend.
-    poseidon_gate_quotient_pipeline: Option<ComputePipelineState>,
-    /// Kept independent from the Poseidon gate pipeline so either optional
-    /// specialization can fail closed without disabling commitments or the
-    /// other quotient kernel.
-    range_check_gate_quotient_pipeline: Option<ComputePipelineState>,
     parameters: Buffer,
     pool: Mutex<BufferPool>,
     available: Condvar,
@@ -85,95 +57,12 @@ struct NttRoots {
     offsets: Vec<usize>,
 }
 
-/// An asynchronously submitted Poseidon2 gate-constraint evaluation. Its
-/// point-major output stays in shared storage for zero-copy CPU combination.
-pub(crate) struct PoseidonGateQuotientJob<F> {
-    command_buffer: CommandBuffer,
-    output: Buffer,
-    len: usize,
-    _job: GpuJobGuard,
-    _phantom: PhantomData<F>,
-}
-
-/// An asynchronously submitted sum of all advertised RangeCheckGate
-/// contributions. Its layout matches [`PoseidonGateQuotientJob`]: two
-/// challenge values per quotient-domain point.
-pub(crate) struct RangeCheckGateQuotientJob<F> {
-    command_buffer: CommandBuffer,
-    output: Buffer,
-    len: usize,
-    _job: GpuJobGuard,
-    _phantom: PhantomData<F>,
-}
-impl<F: RichField> PoseidonGateQuotientJob<F> {
-    pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
-        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(format!(
-                "Poseidon2 gate quotient command buffer ended with status {:?}",
-                self.command_buffer.status()
-            ));
-        }
-        // SAFETY: construction is restricted to an 8-byte Goldilocks field,
-        // and the completed kernel canonicalized every output word.
-        Ok(unsafe { slice::from_raw_parts(self.output.contents().cast::<F>(), self.len) })
-    }
-}
-
-impl<F: RichField> RangeCheckGateQuotientJob<F> {
-    pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
-        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(format!(
-                "RangeCheck gate quotient command buffer ended with status {:?}",
-                self.command_buffer.status()
-            ));
-        }
-        // SAFETY: construction is restricted to an 8-byte Goldilocks field,
-        // and the completed kernel canonicalized every output word.
-        Ok(unsafe { slice::from_raw_parts(self.output.contents().cast::<F>(), self.len) })
-    }
-}
-
-/// One custom range-check gate's selector and base-4 wire layout. All fields
-/// are checked before being flattened into the Metal kernel's u32 metadata.
-#[derive(Clone, Debug)]
-pub(crate) struct RangeCheckQuotientSpec {
-    pub selector_column: usize,
-    pub gate_index: usize,
-    pub group: core::ops::Range<usize>,
-    pub include_unused_selector: bool,
-    pub num_ops: usize,
-    pub bit_size: usize,
-}
-
-/// Exact wire layout of a downstream U32 gate. These variants are evaluated
-/// in the same command buffer and accumulated into the same two-word output
-/// as the RangeCheck specializations.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum U32QuotientKind {
-    Arithmetic,
-    Subtraction,
-    AddMany { num_addends: usize },
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct U32QuotientSpec {
-    pub selector_column: usize,
-    pub gate_index: usize,
-    pub group: core::ops::Range<usize>,
-    pub include_unused_selector: bool,
-    pub num_ops: usize,
-    pub kind: U32QuotientKind,
-}
-
 /// LDE columns computed and retained in a CPU-visible Metal shared buffer.
 /// Written once during the fused NTT + Merkle build, immutable afterwards.
 pub struct MetalColumns<F> {
     buffer: Buffer,
     rows: usize,
     cols: usize,
-    uniqueness: Arc<()>,
     _phantom: PhantomData<F>,
 }
 
@@ -183,7 +72,6 @@ impl<F> Clone for MetalColumns<F> {
             buffer: self.buffer.clone(),
             rows: self.rows,
             cols: self.cols,
-            uniqueness: self.uniqueness.clone(),
             _phantom: PhantomData,
         }
     }
@@ -209,20 +97,6 @@ impl<F: RichField> MetalColumns<F> {
                 self.rows,
             )
         }
-    }
-
-    pub(crate) fn columns_mut(&mut self) -> Option<Vec<&mut [F]>> {
-        if Arc::strong_count(&self.uniqueness) != 1 {
-            return None;
-        }
-        // SAFETY: allocation is restricted to the 8-byte Goldilocks field, for
-        // which every u64 bit pattern is valid. The uniqueness token and
-        // exclusive access to the handle guarantee that no cloned handle, CPU
-        // reader, or GPU reader can observe the buffer during initialization.
-        let values = unsafe {
-            slice::from_raw_parts_mut(self.buffer.contents().cast::<F>(), self.rows * self.cols)
-        };
-        Some(values.chunks_exact_mut(self.rows).collect())
     }
 }
 
@@ -264,44 +138,6 @@ struct BufferPool {
 
 static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShared::new);
 
-/// True while the prover is inside an exclusive serial phase (pre-execution
-/// or final block proof) where no concurrent proof can contend for the
-/// serialized GPU stream. Process-global on purpose: the phases it brackets
-/// are the only proving work alive, and tree builds may run on rayon workers,
-/// which a thread-local would not reach.
-static EXCLUSIVE_GPU_PHASE: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Marks the start/end of an exclusive serial proving phase during which the
-/// GPU routing cutoff drops to [`EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS`].
-/// Callers must guarantee no other proof runs concurrently while enabled.
-pub fn set_exclusive_gpu_phase(enabled: bool) {
-    EXCLUSIVE_GPU_PHASE.store(enabled, core::sync::atomic::Ordering::Relaxed);
-}
-
-/// Number of Merkle builds currently occupying the serialized GPU stream
-/// (from buffer acquisition through `wait_until_completed`). Routing reads
-/// this to decide whether a small serial-path tree would enqueue behind
-/// in-flight work; the count is a heuristic only — either routing outcome
-/// hashes the identical tree, so races are benign.
-static GPU_JOBS_IN_FLIGHT: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-
-struct GpuJobGuard;
-
-impl GpuJobGuard {
-    fn begin() -> Self {
-        GPU_JOBS_IN_FLIGHT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        GpuJobGuard
-    }
-}
-
-impl Drop for GpuJobGuard {
-    fn drop(&mut self) {
-        GPU_JOBS_IN_FLIGHT.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bool {
     let leaf_permutations = if leaf_width <= 4 {
         0
@@ -309,35 +145,7 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
         leaf_width.div_ceil(8) * leaf_count
     };
     let parent_permutations = leaf_count - (1usize << cap_height);
-    let exclusive = EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed);
-    let min_permutations = if exclusive {
-        EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS
-    } else {
-        MIN_GPU_PERMUTATIONS
-    };
-    // The 2^17-leaf commitment trees are produced only by the degree-2^14
-    // serial circuits (chain steps and pre-execution; the pipelined chunk
-    // circuits commit at 2^19 leaves and their FRI folds at 2^16 and below).
-    // Those trees sit on the strictly sequential critical path in every
-    // phase and measured ~2x faster on the GPU when the stream is idle
-    // (2^17 width-8: CPU 14.9 ms vs GPU 7.8 ms). But command buffers execute
-    // FIFO per queue, so when a pipelined 2^19-leaf chunk tree is already in
-    // flight the fold tree waits behind it: phase-level spans on an M-series
-    // host measured the fold's commit phases at 200-320 ms under pipeline
-    // load versus 10-50 ms alone, while its pure-CPU phases inflated <1.3x.
-    // The ~15 ms CPU build beats that queue wait by an order of magnitude
-    // for the narrow shapes (width <= 64: the Z/partial-product and quotient
-    // trees), so route those to the GPU only while its stream is unoccupied.
-    // The width-135 wires tree stays on the GPU unconditionally: its CPU
-    // build (~17 permutations per leaf) costs about as much as the queue
-    // wait and measurably starves the fold's pure-CPU phases.
-    let serial_critical_shape = leaf_count == 1 << 17 && leaf_width > 4;
-    if serial_critical_shape {
-        return exclusive
-            || leaf_width > 64
-            || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
-    }
-    leaf_permutations + parent_permutations >= min_permutations
+    leaf_permutations + parent_permutations >= MIN_GPU_PERMUTATIONS
 }
 
 fn shared_context() -> Option<&'static MetalShared> {
@@ -355,7 +163,7 @@ pub(crate) fn build_merkle_tree<F: RichField>(
     leaf_width: usize,
     leaf_count: usize,
     cap_height: usize,
-) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
+) -> Option<(Vec<HashOut<F>>, Vec<HashOut<F>>)> {
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || leaves.len() != leaf_count * leaf_width
@@ -379,7 +187,7 @@ pub(crate) fn build_merkle_tree<F: RichField>(
 pub(crate) fn build_merkle_tree_columns<F: RichField>(
     columns: &[Vec<F>],
     cap_height: usize,
-) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
+) -> Option<(Vec<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.len();
     let leaf_count = columns.first().map_or(0, Vec::len);
     if F::ORDER != 0xffff_ffff_0000_0001
@@ -409,304 +217,6 @@ pub(crate) fn build_merkle_tree_columns<F: RichField>(
     }
 }
 
-/// Starts a whole-domain Poseidon2Gate evaluation over retained natural-order
-/// LDE columns. `alpha_offset` is the number of non-gate vanishing terms that
-/// precede the gate constraints in the global alpha reduction.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
-    wires: &MetalColumns<F>,
-    constants: &MetalColumns<F>,
-    quotient_rows: usize,
-    step: usize,
-    selector_column: usize,
-    gate_index: usize,
-    group: core::ops::Range<usize>,
-    include_unused_selector: bool,
-    alphas: &[F],
-    alpha_offset: usize,
-) -> Option<PoseidonGateQuotientJob<F>> {
-    const POSEIDON_GATE_WIRES: usize = 135;
-    const POSEIDON_GATE_CONSTRAINTS: usize = 123;
-
-    if F::ORDER != 0xffff_ffff_0000_0001
-        || size_of::<F>() != size_of::<u64>()
-        || alphas.len() != 2
-        || wires.cols < POSEIDON_GATE_WIRES
-        || wires.rows == 0
-        || wires.rows != constants.rows
-        || selector_column >= constants.cols
-        || quotient_rows == 0
-        || step == 0
-        || quotient_rows.checked_mul(step) != Some(wires.rows)
-        || group.start > gate_index
-        || gate_index >= group.end
-        || wires.rows > u32::MAX as usize
-        || quotient_rows > u32::MAX as usize
-        || step > u32::MAX as usize
-        || selector_column > u32::MAX as usize
-        || gate_index > u32::MAX as usize
-        || group.end > u32::MAX as usize
-    {
-        return None;
-    }
-
-    let mut alpha_powers = Vec::with_capacity(2 * POSEIDON_GATE_CONSTRAINTS);
-    for &alpha in alphas {
-        let mut power = alpha.exp_u64(alpha_offset as u64);
-        for _ in 0..POSEIDON_GATE_CONSTRAINTS {
-            alpha_powers.push(power.to_canonical_u64());
-            power *= alpha;
-        }
-    }
-
-    let context = shared_context()?;
-    match context.start_poseidon2_gate_quotient(
-        wires,
-        constants,
-        quotient_rows,
-        step,
-        selector_column,
-        gate_index,
-        group,
-        include_unused_selector,
-        &alpha_powers,
-    ) {
-        Ok(job) => Some(job),
-        Err(error) => {
-            log::warn!("Metal Poseidon2 gate quotient unavailable; using CPU path: {error}");
-            None
-        }
-    }
-}
-
-/// Starts one whole-domain kernel which evaluates every advertised RangeCheck
-/// and U32 arithmetic gate, applies each gate's selector filter, and reduces
-/// the shared constraint rows with the same two alpha challenges as the CPU
-/// quotient.
-pub(crate) fn start_range_check_gate_quotient<F: RichField>(
-    wires: &MetalColumns<F>,
-    constants: &MetalColumns<F>,
-    quotient_rows: usize,
-    step: usize,
-    specs: &[RangeCheckQuotientSpec],
-    u32_specs: &[U32QuotientSpec],
-    alphas: &[F],
-    alpha_offset: usize,
-) -> Option<RangeCheckGateQuotientJob<F>> {
-    const SPEC_WORDS: usize = 8;
-    const MAX_INLINE_BYTES: usize = 4096;
-
-    let spec_count = specs.len().checked_add(u32_specs.len())?;
-
-    if F::ORDER != 0xffff_ffff_0000_0001
-        || size_of::<F>() != size_of::<u64>()
-        || alphas.len() != 2
-        || spec_count == 0
-        || spec_count
-            .checked_mul(SPEC_WORDS * size_of::<u32>())
-            .map_or(true, |bytes| bytes > MAX_INLINE_BYTES)
-        || wires.rows == 0
-        || wires.rows != constants.rows
-        || quotient_rows == 0
-        || step == 0
-        || quotient_rows.checked_mul(step) != Some(wires.rows)
-        || wires.rows > u32::MAX as usize
-        || quotient_rows > u32::MAX as usize
-        || step > u32::MAX as usize
-    {
-        return None;
-    }
-
-    let mut alpha_stride = 0usize;
-    let mut metadata = Vec::with_capacity(spec_count * SPEC_WORDS);
-    for spec in specs {
-        if spec.bit_size == 0 || spec.bit_size > 64 || spec.num_ops == 0 {
-            return None;
-        }
-        let num_aux = spec.bit_size.div_ceil(2);
-        let wire_count = spec.num_ops.checked_mul(1 + num_aux)?;
-        let num_constraints = wire_count;
-        if wire_count > wires.cols
-            || spec.selector_column >= constants.cols
-            || spec.group.start > spec.gate_index
-            || spec.gate_index >= spec.group.end
-            || spec.selector_column > u32::MAX as usize
-            || spec.gate_index > u32::MAX as usize
-            || spec.group.end > u32::MAX as usize
-            || spec.num_ops > u32::MAX as usize
-            || num_aux > u32::MAX as usize
-        {
-            return None;
-        }
-        alpha_stride = alpha_stride.max(num_constraints);
-        metadata.extend([
-            spec.selector_column as u32,
-            spec.gate_index as u32,
-            spec.group.start as u32,
-            spec.group.end as u32,
-            spec.include_unused_selector as u32,
-            spec.num_ops as u32,
-            num_aux as u32,
-            if spec.bit_size & 1 == 1 { 2 } else { 4 },
-        ]);
-    }
-    for spec in u32_specs {
-        if spec.num_ops == 0 {
-            return None;
-        }
-        let (kind, num_addends, wire_count, num_constraints) = match spec.kind {
-            U32QuotientKind::Arithmetic => (
-                0usize,
-                0usize,
-                spec.num_ops.checked_mul(38)?,
-                spec.num_ops.checked_mul(36)?,
-            ),
-            U32QuotientKind::Subtraction => (
-                1usize,
-                0usize,
-                spec.num_ops.checked_mul(21)?,
-                spec.num_ops.checked_mul(19)?,
-            ),
-            U32QuotientKind::AddMany { num_addends } => {
-                if num_addends == 0 || num_addends > 16 {
-                    return None;
-                }
-                (
-                    2usize,
-                    num_addends,
-                    spec.num_ops.checked_mul(num_addends.checked_add(21)?)?,
-                    spec.num_ops.checked_mul(21)?,
-                )
-            }
-        };
-        if wire_count > wires.cols
-            || spec.selector_column >= constants.cols
-            || spec.group.start > spec.gate_index
-            || spec.gate_index >= spec.group.end
-            || spec.selector_column > u32::MAX as usize
-            || spec.gate_index > u32::MAX as usize
-            || spec.group.end > u32::MAX as usize
-            || spec.num_ops > u32::MAX as usize
-            || num_addends > u32::MAX as usize
-        {
-            return None;
-        }
-        alpha_stride = alpha_stride.max(num_constraints);
-        metadata.extend([
-            spec.selector_column as u32,
-            spec.gate_index as u32,
-            spec.group.start as u32,
-            spec.group.end as u32,
-            spec.include_unused_selector as u32,
-            kind as u32,
-            spec.num_ops as u32,
-            num_addends as u32,
-        ]);
-    }
-    if alpha_stride == 0
-        || alpha_stride > u32::MAX as usize
-        || alpha_stride
-            .checked_mul(2 * size_of::<u64>())
-            .map_or(true, |bytes| bytes > MAX_INLINE_BYTES)
-    {
-        return None;
-    }
-
-    let mut alpha_powers = Vec::with_capacity(2 * alpha_stride);
-    for &alpha in alphas {
-        let mut power = alpha.exp_u64(alpha_offset as u64);
-        for _ in 0..alpha_stride {
-            alpha_powers.push(power.to_canonical_u64());
-            power *= alpha;
-        }
-    }
-
-    let context = shared_context()?;
-    match context.start_range_check_gate_quotient(
-        wires,
-        constants,
-        quotient_rows,
-        step,
-        &metadata,
-        specs.len(),
-        u32_specs.len(),
-        &alpha_powers,
-        alpha_stride,
-    ) {
-        Ok(job) => Some(job),
-        Err(error) => {
-            log::warn!("Metal RangeCheck gate quotient unavailable; using CPU path: {error}");
-            None
-        }
-    }
-}
-
-/// Allocates the final retained column store before the CPU LDE is computed,
-/// so the same shared buffer can be bound directly as the Metal leaf input.
-pub(crate) fn allocate_columns<F: RichField>(
-    cols: usize,
-    rows: usize,
-    cap_height: usize,
-) -> Option<MetalColumns<F>> {
-    if F::ORDER != 0xffff_ffff_0000_0001
-        || size_of::<F>() != size_of::<u64>()
-        || cols == 0
-        || rows == 0
-        || !rows.is_power_of_two()
-        || rows > u32::MAX as usize
-        || cols > u32::MAX as usize
-        || cap_height > rows.ilog2() as usize
-        || !gpu_worthwhile(cols, rows, cap_height)
-    {
-        return None;
-    }
-
-    let context = shared_context()?;
-    match context.allocate_columns(rows, cols) {
-        Ok(columns) => Some(columns),
-        Err(error) => {
-            log::warn!("Metal column allocation failed; using CPU storage: {error}");
-            None
-        }
-    }
-}
-
-/// Hashes retained shared columns without copying them through the pooled
-/// staging buffer.
-pub(crate) fn build_merkle_tree_shared<F: RichField>(
-    columns: &MetalColumns<F>,
-    cap_height: usize,
-) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
-    let leaf_width = columns.cols;
-    let leaf_count = columns.rows;
-    if F::ORDER != 0xffff_ffff_0000_0001
-        || size_of::<F>() != size_of::<u64>()
-        || leaf_width == 0
-        || leaf_count == 0
-        || !leaf_count.is_power_of_two()
-        || leaf_count > u32::MAX as usize
-        || leaf_width > u32::MAX as usize
-        || cap_height > leaf_count.ilog2() as usize
-        || !gpu_worthwhile(leaf_width, leaf_count, cap_height)
-    {
-        return None;
-    }
-
-    let context = shared_context()?;
-    match context.build(
-        LeafSource::Shared(columns),
-        leaf_width,
-        leaf_count,
-        cap_height,
-    ) {
-        Ok(tree) => Some(tree),
-        Err(error) => {
-            log::warn!("Metal shared-column hashing failed; using CPU Merkle hashing: {error}");
-            None
-        }
-    }
-}
-
 /// Computes the coset LDE of every coefficient column on the GPU and hashes the
 /// resulting Merkle tree in the same command buffer. Returns the retained
 /// CPU-visible LDE columns plus the digests and cap. `None` falls back to the
@@ -715,11 +225,7 @@ pub(crate) fn build_commitment_from_coeffs<F: RichField>(
     coeff_columns: &[&[F]],
     rate_bits: usize,
     cap_height: usize,
-) -> Option<(
-    MetalColumns<F>,
-    LevelOrderDigests<HashOut<F>>,
-    Vec<HashOut<F>>,
-)> {
+) -> Option<(MetalColumns<F>, Vec<HashOut<F>>, Vec<HashOut<F>>)> {
     let cols = coeff_columns.len();
     let degree = coeff_columns.first().map_or(0, |column| column.len());
     if F::ORDER != 0xffff_ffff_0000_0001
@@ -760,7 +266,7 @@ pub(crate) fn build_commitment_from_values<F: RichField>(
     cap_height: usize,
 ) -> Option<(
     MetalColumns<F>,
-    LevelOrderDigests<HashOut<F>>,
+    Vec<HashOut<F>>,
     Vec<HashOut<F>>,
     Vec<Vec<F>>,
 )> {
@@ -801,9 +307,6 @@ enum LeafSource<'a, F> {
     /// Natural-order poly-major columns; tree leaf `i` is
     /// `columns[j][reverse_bits(i)]`, handled by the col-major kernel.
     Columns(&'a [Vec<F>]),
-    /// Natural-order poly-major columns already resident in shared Metal
-    /// storage. Hash directly without a staging copy.
-    Shared(&'a MetalColumns<F>),
 }
 
 impl MetalShared {
@@ -850,22 +353,6 @@ impl MetalShared {
             let ifft_finalize_pipeline = device
                 .new_compute_pipeline_state_with_function(&ifft_finalize_function)
                 .map_err(|error| format!("ifft finalize pipeline creation failed: {error}"))?;
-            let poseidon_gate_quotient_pipeline = library
-                .get_function("poseidon2_gate_quotient", None)
-                .ok()
-                .and_then(|function| {
-                    device
-                        .new_compute_pipeline_state_with_function(&function)
-                        .ok()
-                });
-            let range_check_gate_quotient_pipeline = library
-                .get_function("range_check_gate_quotient", None)
-                .ok()
-                .and_then(|function| {
-                    device
-                        .new_compute_pipeline_state_with_function(&function)
-                        .ok()
-                });
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -887,8 +374,6 @@ impl MetalShared {
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
-                poseidon_gate_quotient_pipeline,
-                range_check_gate_quotient_pipeline,
                 parameters,
                 pool: Mutex::new(BufferPool {
                     free: Vec::new(),
@@ -899,163 +384,6 @@ impl MetalShared {
                 ntt_shifts: Mutex::new(HashMap::new()),
                 ntt_ones: Mutex::new(HashMap::new()),
             })
-        })
-    }
-
-    fn allocate_columns<F: RichField>(
-        &self,
-        rows: usize,
-        cols: usize,
-    ) -> Result<MetalColumns<F>, String> {
-        let len = rows
-            .checked_mul(cols)
-            .ok_or("Metal column length overflow")?;
-        let bytes = len
-            .checked_mul(size_of::<u64>())
-            .ok_or("Metal column size overflow")?;
-        let buffer = autoreleasepool(|| {
-            self.device
-                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
-        });
-        Ok(MetalColumns {
-            buffer,
-            rows,
-            cols,
-            uniqueness: Arc::new(()),
-            _phantom: PhantomData,
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn start_poseidon2_gate_quotient<F: RichField>(
-        &self,
-        wires: &MetalColumns<F>,
-        constants: &MetalColumns<F>,
-        quotient_rows: usize,
-        step: usize,
-        selector_column: usize,
-        gate_index: usize,
-        group: core::ops::Range<usize>,
-        include_unused_selector: bool,
-        alpha_powers: &[u64],
-    ) -> Result<PoseidonGateQuotientJob<F>, String> {
-        let pipeline = self
-            .poseidon_gate_quotient_pipeline
-            .as_ref()
-            .ok_or("Poseidon2 gate quotient pipeline unavailable")?;
-        let len = quotient_rows
-            .checked_mul(2)
-            .ok_or("Poseidon2 gate quotient output length overflow")?;
-        let bytes = len
-            .checked_mul(size_of::<u64>())
-            .ok_or("Poseidon2 gate quotient output size overflow")?;
-        let output = autoreleasepool(|| {
-            self.device
-                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
-        });
-        let job_guard = GpuJobGuard::begin();
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&wires.buffer), 0);
-            encoder.set_buffer(1, Some(&constants.buffer), 0);
-            encoder.set_buffer(2, Some(&output), 0);
-            encoder.set_buffer(3, Some(&self.parameters), 0);
-            encoder.set_bytes(
-                4,
-                size_of_val(alpha_powers) as NSUInteger,
-                alpha_powers.as_ptr().cast::<c_void>(),
-            );
-            set_u32(encoder, 5, wires.rows as u32);
-            set_u32(encoder, 6, quotient_rows as u32);
-            set_u32(encoder, 7, step as u32);
-            set_u32(encoder, 8, selector_column as u32);
-            set_u32(encoder, 9, gate_index as u32);
-            set_u32(encoder, 10, group.start as u32);
-            set_u32(encoder, 11, group.end as u32);
-            set_u32(encoder, 12, include_unused_selector as u32);
-            dispatch(encoder, pipeline, quotient_rows);
-            encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.to_owned()
-        });
-        Ok(PoseidonGateQuotientJob {
-            command_buffer,
-            output,
-            len,
-            _job: job_guard,
-            _phantom: PhantomData,
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn start_range_check_gate_quotient<F: RichField>(
-        &self,
-        wires: &MetalColumns<F>,
-        constants: &MetalColumns<F>,
-        quotient_rows: usize,
-        step: usize,
-        metadata: &[u32],
-        range_count: usize,
-        u32_count: usize,
-        alpha_powers: &[u64],
-        alpha_stride: usize,
-    ) -> Result<RangeCheckGateQuotientJob<F>, String> {
-        let pipeline = self
-            .range_check_gate_quotient_pipeline
-            .as_ref()
-            .ok_or("RangeCheck gate quotient pipeline unavailable")?;
-        if metadata.len() != (range_count + u32_count) * 8
-            || alpha_powers.len() != alpha_stride * 2
-        {
-            return Err("invalid RangeCheck quotient metadata".to_string());
-        }
-        let len = quotient_rows
-            .checked_mul(2)
-            .ok_or("RangeCheck gate quotient output length overflow")?;
-        let bytes = len
-            .checked_mul(size_of::<u64>())
-            .ok_or("RangeCheck gate quotient output size overflow")?;
-        let output = autoreleasepool(|| {
-            self.device
-                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
-        });
-        let job_guard = GpuJobGuard::begin();
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&wires.buffer), 0);
-            encoder.set_buffer(1, Some(&constants.buffer), 0);
-            encoder.set_buffer(2, Some(&output), 0);
-            encoder.set_bytes(
-                3,
-                size_of_val(alpha_powers) as NSUInteger,
-                alpha_powers.as_ptr().cast::<c_void>(),
-            );
-            encoder.set_bytes(
-                4,
-                size_of_val(metadata) as NSUInteger,
-                metadata.as_ptr().cast::<c_void>(),
-            );
-            set_u32(encoder, 5, wires.rows as u32);
-            set_u32(encoder, 6, quotient_rows as u32);
-            set_u32(encoder, 7, step as u32);
-            set_u32(encoder, 8, alpha_stride as u32);
-            set_u32(encoder, 9, range_count as u32);
-            set_u32(encoder, 10, u32_count as u32);
-            dispatch(encoder, pipeline, quotient_rows);
-            encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.to_owned()
-        });
-        Ok(RangeCheckGateQuotientJob {
-            command_buffer,
-            output,
-            len,
-            _job: job_guard,
-            _phantom: PhantomData,
         })
     }
 
@@ -1186,7 +514,7 @@ impl MetalShared {
     ) -> Result<
         (
             MetalColumns<F>,
-            LevelOrderDigests<HashOut<F>>,
+            Vec<HashOut<F>>,
             Vec<HashOut<F>>,
             Vec<Vec<F>>,
         ),
@@ -1198,7 +526,6 @@ impl MetalShared {
         let cap_count = 1usize << cap_height;
         let total_node_count = 2 * lde_size - cap_count;
 
-        let _job = GpuJobGuard::begin();
         let value_len = degree
             .checked_mul(cols)
             .ok_or("NTT value length overflow")?;
@@ -1238,7 +565,7 @@ impl MetalShared {
         });
 
         let mut set = self.acquire_set()?;
-        let result = (|| -> Result<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>), String> {
+        let result = (|| -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
             if set
                 .input
                 .as_ref()
@@ -1436,7 +763,6 @@ impl MetalShared {
                 buffer: column_buffer,
                 rows: lde_size,
                 cols,
-                uniqueness: Arc::new(()),
                 _phantom: PhantomData,
             },
             digests,
@@ -1445,28 +771,19 @@ impl MetalShared {
         ))
     }
 
-    #[allow(clippy::type_complexity)]
     fn build_from_coeffs<F: RichField>(
         &self,
         coeff_columns: &[&[F]],
         degree: usize,
         rate_bits: usize,
         cap_height: usize,
-    ) -> Result<
-        (
-            MetalColumns<F>,
-            LevelOrderDigests<HashOut<F>>,
-            Vec<HashOut<F>>,
-        ),
-        String,
-    > {
+    ) -> Result<(MetalColumns<F>, Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
         let cols = coeff_columns.len();
         let lde_size = degree << rate_bits;
         let log_lde = lde_size.ilog2();
         let cap_count = 1usize << cap_height;
         let total_node_count = 2 * lde_size - cap_count;
 
-        let _job = GpuJobGuard::begin();
         let coeff_len = degree
             .checked_mul(cols)
             .ok_or("NTT coefficient length overflow")?;
@@ -1519,7 +836,6 @@ impl MetalShared {
                 buffer: column_buffer,
                 rows: lde_size,
                 cols,
-                uniqueness: Arc::new(()),
                 _phantom: PhantomData,
             },
             digests,
@@ -1543,7 +859,7 @@ impl MetalShared {
         coeff_bytes: usize,
         output_len: usize,
         output_bytes: usize,
-    ) -> Result<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>), String> {
+    ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
         let cols = coeff_columns.len();
         let lde_size = degree << rate_bits;
         let log_lde = lde_size.ilog2();
@@ -1693,7 +1009,7 @@ impl MetalShared {
         leaf_width: usize,
         leaf_count: usize,
         cap_height: usize,
-    ) -> Result<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>), String> {
+    ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
         let cap_count = 1usize << cap_height;
         let total_node_count = 2 * leaf_count - cap_count;
 
@@ -1710,7 +1026,6 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("Metal Merkle output size overflow")?;
 
-        let _job = GpuJobGuard::begin();
         let mut set = self.acquire_set()?;
         let result = self.build_with_set(
             &mut set,
@@ -1739,14 +1054,13 @@ impl MetalShared {
         input_bytes: usize,
         output_len: usize,
         output_bytes: usize,
-    ) -> Result<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>), String> {
+    ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
         let cap_count = 1usize << cap_height;
 
-        let needs_staging = !matches!(&source, LeafSource::Shared(_));
-        if needs_staging
-            && set.input.as_ref().map_or(true, |buffer| {
-                buffer.length() < input_bytes.max(size_of::<u64>()) as u64
-            })
+        if set
+            .input
+            .as_ref()
+            .map_or(true, |buffer| buffer.length() < input_bytes.max(size_of::<u64>()) as u64)
         {
             set.input = Some(autoreleasepool(|| {
                 self.device.new_buffer(
@@ -1755,11 +1069,11 @@ impl MetalShared {
                 )
             }));
         }
-        if needs_staging && leaf_width != 0 {
+        let input_buffer = set.input.as_ref().unwrap();
+        if leaf_width != 0 {
             // `F` is guaranteed by the caller to be the 8-byte Goldilocks field, whose
             // in-memory representation is its (possibly noncanonical) u64 value, so the
             // staging copy is a plain parallel memcpy in either layout.
-            let input_buffer = set.input.as_ref().unwrap();
             let destination = unsafe {
                 slice::from_raw_parts_mut(input_buffer.contents().cast::<u64>(), input_len)
             };
@@ -1789,13 +1103,8 @@ impl MetalShared {
                             destination.copy_from_slice(source);
                         });
                 }
-                LeafSource::Shared(_) => unreachable!("shared columns do not use staging"),
             }
         }
-        let input_buffer = match &source {
-            LeafSource::Rows(_) | LeafSource::Columns(_) => set.input.as_ref().unwrap(),
-            LeafSource::Shared(columns) => &columns.buffer,
-        };
 
         if set
             .output
@@ -1816,7 +1125,7 @@ impl MetalShared {
             let log_leaf_count_u32 = leaf_count.ilog2();
             let leaf_pipeline = match &source {
                 LeafSource::Rows(_) => &self.leaf_pipeline,
-                LeafSource::Columns(_) | LeafSource::Shared(_) => &self.leaf_colmajor_pipeline,
+                LeafSource::Columns(_) => &self.leaf_colmajor_pipeline,
             };
             let command_buffer = self.queue.new_command_buffer();
             let leaf_encoder = command_buffer.new_compute_command_encoder();
@@ -1834,7 +1143,7 @@ impl MetalShared {
                 size_of::<u32>() as NSUInteger,
                 (&leaf_count_u32 as *const u32).cast::<c_void>(),
             );
-            if matches!(&source, LeafSource::Columns(_) | LeafSource::Shared(_)) {
+            if matches!(&source, LeafSource::Columns(_)) {
                 leaf_encoder.set_bytes(
                     5,
                     size_of::<u32>() as NSUInteger,
@@ -1958,79 +1267,69 @@ fn dispatch(
     );
 }
 
-/// Copies the GPU's level-order node array (leaf digests first, cap level
-/// last; 4 u64 limbs per digest) into CPU-owned [`LevelOrderDigests`] storage
-/// with one bulk streaming pass, and reads the cap off the top level. The
-/// interleaved [`crate::hash::merkle_tree::MerkleTree::digests`] layout is
-/// deliberately not rebuilt here: `prove` indexes the levels directly, and
-/// the rare consumers that need the interleaved array (serialization)
-/// materialize it on demand via [`LevelOrderDigests::to_interleaved`].
 fn tree_from_levels<F: RichField>(
     nodes: &[u64],
     level_offsets: &[usize],
     leaf_count: usize,
     cap_height: usize,
-) -> (LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>) {
+) -> (Vec<HashOut<F>>, Vec<HashOut<F>>) {
     let cap_count = 1usize << cap_height;
-    let node_count = 2 * leaf_count - cap_count;
-    // Hard (not `debug_`) assert: the `set_len` below is sound only because the
-    // limb slice covers every digest slot, and all three call sites size the
-    // GPU output buffer with exactly this expression.
-    assert_eq!(nodes.len(), node_count * 4);
-    debug_assert_eq!(level_offsets[0], 0);
+    let subtree_leaf_count = leaf_count / cap_count;
+    let subtree_digest_count = 2 * (subtree_leaf_count - 1);
+    let mut digests = vec![HashOut::ZERO; 2 * (leaf_count - cap_count)];
+    let mut cap = vec![HashOut::ZERO; cap_count];
 
-    // Chunked parallel bulk copy out of the CPU-visible shared buffer; every
-    // worker walks its chunk sequentially, so the whole read stays a
-    // streaming pass.
-    //
-    // The copy overwrites all `node_count` slots before any is read, so
-    // pre-filling the buffer with `HashOut::ZERO` is dead work — and it is
-    // *serial* dead work performed while the exclusive buffer set is held
-    // (`MAX_BUFFER_SETS == 1`), ahead of the parallel copy, so it also turns a
-    // parallel phase into serial-then-parallel. `HashOut<F>` is a plain struct
-    // with no `IsZero` specialization, so `vec![HashOut::ZERO; n]` really is a
-    // store loop rather than `alloc_zeroed`.
-    let mut digests: Vec<HashOut<F>> = Vec::with_capacity(node_count);
-    crate::hash::merkle_tree::capacity_up_to_mut(&mut digests, node_count)
-        .par_chunks_mut(STAGING_CHUNK / 4)
-        .zip(nodes.par_chunks(STAGING_CHUNK))
-        .for_each(|(digests, limbs)| {
-            for (digest, limbs) in digests.iter_mut().zip(limbs.chunks_exact(4)) {
-                digest.write(HashOut {
-                    elements: core::array::from_fn(|i| F::from_canonical_u64(limbs[i])),
-                });
-            }
-        });
-    // SAFETY: every one of the `node_count` slots was written exactly once
-    // above. `nodes.len() == node_count * 4` is asserted, and `STAGING_CHUNK`
-    // is a multiple of 4, so `par_chunks_mut(STAGING_CHUNK / 4)` and
-    // `par_chunks(STAGING_CHUNK)` yield the same chunk count and rayon's
-    // indexed `zip` pairs chunk `i` with chunk `i` without truncating either
-    // side. Digest chunk `i` of length `m` is paired with a limb chunk of
-    // length exactly `4 * m`, whose `chunks_exact(4)` yields exactly `m` items
-    // with no remainder — including the short final chunk — so the inner `zip`
-    // visits every digest of every chunk. `elements` is `HashOut`'s only
-    // field, so each `write` initializes a whole slot. `set_len` runs only
-    // after the copy returns; an unwind out of it drops a length-0 `Vec`,
-    // leaving nothing uninitialized to drop. This is the same argument that
-    // already licenses `capacity_up_to_mut` in `MerkleTree::cpu_digests` and
-    // `LevelOrderDigests::to_interleaved`.
-    unsafe {
-        digests.set_len(node_count);
+    if subtree_digest_count == 0 {
+        cap.par_iter_mut()
+            .enumerate()
+            .for_each(|(cap_index, root)| {
+                *root = read_node(nodes, level_offsets[0], cap_index);
+            });
+    } else {
+        digests
+            .par_chunks_exact_mut(subtree_digest_count)
+            .zip(cap.par_iter_mut())
+            .enumerate()
+            .for_each(|(cap_index, (subtree_digests, root))| {
+                *root = fill_subtree_layout(
+                    subtree_digests,
+                    nodes,
+                    level_offsets,
+                    cap_index * subtree_leaf_count,
+                    subtree_leaf_count,
+                );
+            });
+    }
+    (digests, cap)
+}
+
+fn fill_subtree_layout<F: RichField>(
+    digests: &mut [HashOut<F>],
+    nodes: &[u64],
+    level_offsets: &[usize],
+    start_leaf: usize,
+    leaf_count: usize,
+) -> HashOut<F> {
+    if leaf_count == 1 {
+        return read_node(nodes, level_offsets[0], start_leaf);
     }
 
-    // The GPU offsets are in u64 limbs; the CPU representation indexes whole
-    // digests.
-    let level_offsets: Vec<usize> = level_offsets.iter().map(|offset| offset / 4).collect();
-    let cap_offset = *level_offsets.last().unwrap();
-    let cap = digests[cap_offset..cap_offset + cap_count].to_vec();
-    (
-        LevelOrderDigests {
-            nodes: digests,
-            level_offsets,
-        },
-        cap,
-    )
+    let (left_half, right_half) = digests.split_at_mut(digests.len() / 2);
+    let (left_root, left_digests) = left_half.split_last_mut().unwrap();
+    let (right_root, right_digests) = right_half.split_first_mut().unwrap();
+    let half = leaf_count / 2;
+    *left_root = fill_subtree_layout(left_digests, nodes, level_offsets, start_leaf, half);
+    *right_root = fill_subtree_layout(right_digests, nodes, level_offsets, start_leaf + half, half);
+
+    let level = leaf_count.ilog2() as usize;
+    read_node(nodes, level_offsets[level], start_leaf / leaf_count)
+}
+
+fn read_node<F: RichField>(nodes: &[u64], level_offset: usize, index: usize) -> HashOut<F> {
+    let offset = level_offset + index * 4;
+    HashOut {
+        elements: core::array::from_fn(|i| F::from_canonical_u64(nodes[offset + i])),
+    }
 }
 
 #[cfg(test)]
@@ -2046,13 +1345,8 @@ mod tests {
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field64, PrimeField64};
-    use crate::gates::gate::Gate;
-    use crate::gates::poseidon2::Poseidon2Gate;
-    use crate::gates::selectors::UNUSED_SELECTOR;
-    use crate::hash::hash_types::HashOut;
-    use crate::hash::merkle_tree::{capacity_up_to_mut, fill_digests_buf, merkle_tree_prove};
+    use crate::hash::merkle_tree::{capacity_up_to_mut, fill_digests_buf};
     use crate::hash::poseidon2::hash::Poseidon2Hash;
-    use crate::plonk::vars::EvaluationVarsBaseBatch;
 
     fn gpu_duration(command_buffer: &CommandBuffer, wall: Duration) -> Duration {
         let gpu_start: f64 = unsafe {
@@ -2071,486 +1365,6 @@ mod tests {
             Duration::from_secs_f64(gpu_end - gpu_start)
         } else {
             wall
-        }
-    }
-
-    #[test]
-    fn metal_poseidon2_gate_quotient_matches_cpu() {
-        type F = GoldilocksField;
-        const D: usize = 2;
-        const WIRE_COLUMNS: usize = 135;
-        const CONSTRAINTS: usize = 123;
-        const QUOTIENT_ROWS: usize = 64;
-        const SELECTOR_COLUMN: usize = 1;
-        const GATE_INDEX: usize = 3;
-        const ALPHA_OFFSET: usize = 11;
-
-        let context = shared_context().expect("Metal context must initialize");
-        let gate = Poseidon2Gate::<F, D>::new();
-        assert_eq!(gate.num_wires(), WIRE_COLUMNS);
-        assert_eq!(gate.num_constraints(), CONSTRAINTS);
-        let alphas = [F::from_canonical_u64(3), F::from_canonical_u64(5)];
-        let group = 1..5;
-
-        for step in [1, 4] {
-            let full_rows = QUOTIENT_ROWS * step;
-            let mut wires = context
-                .allocate_columns::<F>(full_rows, WIRE_COLUMNS)
-                .expect("wire columns must allocate");
-            let mut constants = context
-                .allocate_columns::<F>(full_rows, 3)
-                .expect("constant columns must allocate");
-            let mut rng = StdRng::seed_from_u64(0x5eed_0000 + step as u64);
-            for column in wires.columns_mut().expect("unique wire columns") {
-                for value in column {
-                    *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
-                }
-            }
-            for column in constants.columns_mut().expect("unique constant columns") {
-                for value in column {
-                    *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
-                }
-            }
-
-            let mut gathered_wires = Vec::with_capacity(WIRE_COLUMNS * QUOTIENT_ROWS);
-            for column in 0..WIRE_COLUMNS {
-                gathered_wires.extend(
-                    (0..QUOTIENT_ROWS).map(|row| wires.col(column)[row * step]),
-                );
-            }
-            let filters = (0..QUOTIENT_ROWS)
-                .map(|row| {
-                    let selector = constants.col(SELECTOR_COLUMN)[row * step];
-                    group
-                        .clone()
-                        .filter(|&i| i != GATE_INDEX)
-                        .chain(core::iter::once(UNUSED_SELECTOR))
-                        .fold(F::ONE, |filter, i| {
-                            filter * (F::from_canonical_usize(i) - selector)
-                        })
-                })
-                .collect::<Vec<_>>();
-            let vars = EvaluationVarsBaseBatch::new(
-                QUOTIENT_ROWS,
-                &[],
-                &gathered_wires,
-                &HashOut::ZERO,
-            );
-            let mut filtered_constraints = vec![F::ZERO; CONSTRAINTS * QUOTIENT_ROWS];
-            gate.eval_unfiltered_base_batch_accumulate(
-                vars,
-                &filters,
-                &mut filtered_constraints,
-            );
-            let mut expected = vec![F::ZERO; 2 * QUOTIENT_ROWS];
-            for row in 0..QUOTIENT_ROWS {
-                for (challenge, &alpha) in alphas.iter().enumerate() {
-                    let mut power = alpha.exp_u64(ALPHA_OFFSET as u64);
-                    let mut sum = F::ZERO;
-                    for constraint in 0..CONSTRAINTS {
-                        sum += filtered_constraints[constraint * QUOTIENT_ROWS + row] * power;
-                        power *= alpha;
-                    }
-                    expected[row * 2 + challenge] = sum;
-                }
-            }
-
-            let job = start_poseidon2_gate_quotient(
-                &wires,
-                &constants,
-                QUOTIENT_ROWS,
-                step,
-                SELECTOR_COLUMN,
-                GATE_INDEX,
-                group.clone(),
-                true,
-                &alphas,
-                ALPHA_OFFSET,
-            )
-            .expect("Metal quotient job must start");
-            let actual = job.finish().expect("Metal quotient job must finish");
-            assert_eq!(actual.len(), expected.len());
-            for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
-                assert_eq!(
-                    actual.to_canonical_u64(),
-                    expected.to_canonical_u64(),
-                    "Poseidon2 gate quotient mismatch at word {i}, step {step}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn metal_range_check_gate_quotient_matches_cpu() {
-        type F = GoldilocksField;
-        const WIRE_COLUMNS: usize = 136;
-        const QUOTIENT_ROWS: usize = 64;
-        const ALPHA_OFFSET: usize = 13;
-
-        let context = shared_context().expect("Metal context must initialize");
-        let alphas = [F::from_canonical_u64(3), F::from_canonical_u64(5)];
-        // The even sizes are the three production gate variants. The odd
-        // entry exercises the narrower final-limb range as well.
-        let specs = vec![
-            RangeCheckQuotientSpec {
-                selector_column: 0,
-                gate_index: 2,
-                group: 1..4,
-                include_unused_selector: true,
-                num_ops: 15,
-                bit_size: 16,
-            },
-            RangeCheckQuotientSpec {
-                selector_column: 1,
-                gate_index: 5,
-                group: 4..7,
-                include_unused_selector: true,
-                num_ops: 8,
-                bit_size: 32,
-            },
-            RangeCheckQuotientSpec {
-                selector_column: 2,
-                gate_index: 8,
-                group: 7..10,
-                include_unused_selector: true,
-                num_ops: 5,
-                bit_size: 48,
-            },
-            RangeCheckQuotientSpec {
-                selector_column: 3,
-                gate_index: 11,
-                group: 10..13,
-                include_unused_selector: true,
-                num_ops: 15,
-                bit_size: 15,
-            },
-        ];
-
-        for step in [1, 4] {
-            let full_rows = QUOTIENT_ROWS * step;
-            let mut wires = context
-                .allocate_columns::<F>(full_rows, WIRE_COLUMNS)
-                .expect("wire columns must allocate");
-            let mut constants = context
-                .allocate_columns::<F>(full_rows, specs.len())
-                .expect("selector columns must allocate");
-            let mut rng = StdRng::seed_from_u64(0xface_0000 + step as u64);
-            for column in wires.columns_mut().expect("unique wire columns") {
-                for value in column {
-                    *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
-                }
-            }
-            let constants_columns = constants.columns_mut().expect("unique selector columns");
-            for (spec, column) in specs.iter().zip(constants_columns) {
-                let other_gate = spec
-                    .group
-                    .clone()
-                    .find(|&gate| gate != spec.gate_index)
-                    .unwrap();
-                for row in 0..full_rows {
-                    column[row] = match (row / step) & 3 {
-                        0 => F::from_canonical_usize(spec.gate_index),
-                        1 => F::from_canonical_usize(other_gate),
-                        2 => F::from_canonical_usize(UNUSED_SELECTOR),
-                        _ => F::from_canonical_u64(rng.next_u64() % F::ORDER),
-                    };
-                }
-            }
-
-            let mut expected = vec![F::ZERO; QUOTIENT_ROWS * 2];
-            for row in 0..QUOTIENT_ROWS {
-                let source_row = row * step;
-                for spec in &specs {
-                    let selector = constants.col(spec.selector_column)[source_row];
-                    let filter = spec
-                        .group
-                        .clone()
-                        .filter(|&gate| gate != spec.gate_index)
-                        .chain(core::iter::once(UNUSED_SELECTOR))
-                        .fold(F::ONE, |filter, gate| {
-                            filter * (F::from_canonical_usize(gate) - selector)
-                        });
-                    let num_aux = spec.bit_size.div_ceil(2);
-                    let mut sums = [F::ZERO; 2];
-                    let mut powers = alphas.map(|alpha| alpha.exp_u64(ALPHA_OFFSET as u64));
-                    for op in 0..spec.num_ops {
-                        let aux_base = spec.num_ops + num_aux * op;
-                        let mut computed = wires.col(aux_base + num_aux - 1)[source_row];
-                        for j in (0..num_aux - 1).rev() {
-                            computed = computed * F::from_canonical_u64(4)
-                                + wires.col(aux_base + j)[source_row];
-                        }
-                        let constraint = computed - wires.col(op)[source_row];
-                        for challenge in 0..2 {
-                            sums[challenge] += constraint * powers[challenge];
-                            powers[challenge] *= alphas[challenge];
-                        }
-                        for j in 0..num_aux {
-                            let x = wires.col(aux_base + j)[source_row];
-                            let constraint = if j + 1 == num_aux && spec.bit_size & 1 == 1 {
-                                x * (x - F::ONE)
-                            } else {
-                                let y = x * (x - F::from_canonical_u64(3));
-                                y * (y + F::TWO)
-                            };
-                            for challenge in 0..2 {
-                                sums[challenge] += constraint * powers[challenge];
-                                powers[challenge] *= alphas[challenge];
-                            }
-                        }
-                    }
-                    for challenge in 0..2 {
-                        expected[row * 2 + challenge] += filter * sums[challenge];
-                    }
-                }
-            }
-
-            let job = start_range_check_gate_quotient(
-                &wires,
-                &constants,
-                QUOTIENT_ROWS,
-                step,
-                &specs,
-                &[],
-                &alphas,
-                ALPHA_OFFSET,
-            )
-            .expect("Metal RangeCheck quotient job must start");
-            let actual = job.finish().expect("Metal RangeCheck quotient job must finish");
-            assert_eq!(actual.len(), expected.len());
-            for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
-                assert_eq!(
-                    actual.to_canonical_u64(),
-                    expected.to_canonical_u64(),
-                    "RangeCheck gate quotient mismatch at word {i}, step {step}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn metal_u32_gate_quotient_matches_cpu() {
-        type F = GoldilocksField;
-        const WIRE_COLUMNS: usize = 136;
-        const QUOTIENT_ROWS: usize = 64;
-        const ALPHA_OFFSET: usize = 17;
-
-        let context = shared_context().expect("Metal context must initialize");
-        let alphas = [F::from_canonical_u64(7), F::from_canonical_u64(11)];
-        let mut specs = vec![
-            U32QuotientSpec {
-                selector_column: 0,
-                gate_index: 2,
-                group: 1..4,
-                include_unused_selector: true,
-                num_ops: 3,
-                kind: U32QuotientKind::Arithmetic,
-            },
-            U32QuotientSpec {
-                selector_column: 1,
-                gate_index: 5,
-                group: 4..7,
-                include_unused_selector: true,
-                num_ops: 6,
-                kind: U32QuotientKind::Subtraction,
-            },
-        ];
-        // Exercise every production AddMany shape, including both places
-        // where its operation count drops as routed/full wire pressure wins.
-        for num_addends in 2..=16 {
-            let num_ops = (WIRE_COLUMNS / (num_addends + 21)).min(80 / (num_addends + 3));
-            let selector_column = specs.len();
-            let gate_index = 8 + 3 * (num_addends - 2);
-            specs.push(U32QuotientSpec {
-                selector_column,
-                gate_index,
-                group: gate_index - 1..gate_index + 2,
-                include_unused_selector: true,
-                num_ops,
-                kind: U32QuotientKind::AddMany { num_addends },
-            });
-        }
-
-        for step in [1, 4] {
-            let full_rows = QUOTIENT_ROWS * step;
-            let mut wires = context
-                .allocate_columns::<F>(full_rows, WIRE_COLUMNS)
-                .expect("wire columns must allocate");
-            let mut constants = context
-                .allocate_columns::<F>(full_rows, specs.len())
-                .expect("selector columns must allocate");
-            let mut rng = StdRng::seed_from_u64(0x3200_0000 + step as u64);
-            for column in wires.columns_mut().expect("unique wire columns") {
-                for value in column {
-                    *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
-                }
-            }
-            for (spec, column) in specs
-                .iter()
-                .zip(constants.columns_mut().expect("unique selector columns"))
-            {
-                let other_gate = spec
-                    .group
-                    .clone()
-                    .find(|&gate| gate != spec.gate_index)
-                    .unwrap();
-                for row in 0..full_rows {
-                    column[row] = match (row / step) & 3 {
-                        0 => F::from_canonical_usize(spec.gate_index),
-                        1 => F::from_canonical_usize(other_gate),
-                        2 => F::from_canonical_usize(UNUSED_SELECTOR),
-                        _ => F::from_canonical_u64(rng.next_u64() % F::ORDER),
-                    };
-                }
-            }
-
-            let mut expected = vec![F::ZERO; QUOTIENT_ROWS * 2];
-            let four = F::from_canonical_u64(4);
-            let three = F::from_canonical_u64(3);
-            let base32 = F::from_canonical_u64(1u64 << 32);
-            let u32_max = F::from_canonical_u64(u32::MAX as u64);
-            for row in 0..QUOTIENT_ROWS {
-                let source_row = row * step;
-                for spec in &specs {
-                    let selector = constants.col(spec.selector_column)[source_row];
-                    let filter = spec
-                        .group
-                        .clone()
-                        .filter(|&gate| gate != spec.gate_index)
-                        .chain(core::iter::once(UNUSED_SELECTOR))
-                        .fold(F::ONE, |filter, gate| {
-                            filter * (F::from_canonical_usize(gate) - selector)
-                        });
-                    let mut constraints = Vec::new();
-                    match spec.kind {
-                        U32QuotientKind::Arithmetic => {
-                            for op in 0..spec.num_ops {
-                                let routed = 6 * op;
-                                let multiplicand_0 = wires.col(routed)[source_row];
-                                let multiplicand_1 = wires.col(routed + 1)[source_row];
-                                let addend = wires.col(routed + 2)[source_row];
-                                let output_low = wires.col(routed + 3)[source_row];
-                                let output_high = wires.col(routed + 4)[source_row];
-                                let inverse = wires.col(routed + 5)[source_row];
-                                constraints.push(
-                                    (inverse * (u32_max - output_high) - F::ONE) * output_low,
-                                );
-                                constraints.push(
-                                    output_high * base32 + output_low
-                                        - (multiplicand_0 * multiplicand_1 + addend),
-                                );
-                                let limb_base = 6 * spec.num_ops + 32 * op;
-                                let mut combined_low = F::ZERO;
-                                let mut combined_high = F::ZERO;
-                                for j in (0..32).rev() {
-                                    let x = wires.col(limb_base + j)[source_row];
-                                    let y = x * (x - three);
-                                    constraints.push(y * (y + F::TWO));
-                                    if j < 16 {
-                                        combined_low = combined_low * four + x;
-                                    } else {
-                                        combined_high = combined_high * four + x;
-                                    }
-                                }
-                                constraints.push(combined_low - output_low);
-                                constraints.push(combined_high - output_high);
-                            }
-                            assert_eq!(constraints.len(), spec.num_ops * 36);
-                        }
-                        U32QuotientKind::Subtraction => {
-                            for op in 0..spec.num_ops {
-                                let routed = 5 * op;
-                                let input_x = wires.col(routed)[source_row];
-                                let input_y = wires.col(routed + 1)[source_row];
-                                let input_borrow = wires.col(routed + 2)[source_row];
-                                let output_result = wires.col(routed + 3)[source_row];
-                                let output_borrow = wires.col(routed + 4)[source_row];
-                                constraints.push(
-                                    output_result
-                                        - (input_x - input_y - input_borrow
-                                            + base32 * output_borrow),
-                                );
-                                let limb_base = 5 * spec.num_ops + 16 * op;
-                                let mut recomposed = F::ZERO;
-                                for j in (0..16).rev() {
-                                    let x = wires.col(limb_base + j)[source_row];
-                                    let y = x * (x - three);
-                                    constraints.push(y * (y + F::TWO));
-                                    recomposed = recomposed * four + x;
-                                }
-                                constraints.push(recomposed - output_result);
-                                constraints.push(output_borrow * (F::ONE - output_borrow));
-                            }
-                            assert_eq!(constraints.len(), spec.num_ops * 19);
-                        }
-                        U32QuotientKind::AddMany { num_addends } => {
-                            let routed_per_op = num_addends + 3;
-                            for op in 0..spec.num_ops {
-                                let routed = routed_per_op * op;
-                                let carry = wires.col(routed + num_addends)[source_row];
-                                let output_result =
-                                    wires.col(routed + num_addends + 1)[source_row];
-                                let output_carry =
-                                    wires.col(routed + num_addends + 2)[source_row];
-                                let mut computed = carry;
-                                for j in 0..num_addends {
-                                    computed += wires.col(routed + j)[source_row];
-                                }
-                                constraints.push(
-                                    output_carry * base32 + output_result - computed,
-                                );
-                                let limb_base = routed_per_op * spec.num_ops + 18 * op;
-                                let mut combined_result = F::ZERO;
-                                let mut combined_carry = F::ZERO;
-                                for j in (0..18).rev() {
-                                    let x = wires.col(limb_base + j)[source_row];
-                                    let y = x * (x - three);
-                                    constraints.push(y * (y + F::TWO));
-                                    if j < 16 {
-                                        combined_result = combined_result * four + x;
-                                    } else {
-                                        combined_carry = combined_carry * four + x;
-                                    }
-                                }
-                                constraints.push(combined_result - output_result);
-                                constraints.push(combined_carry - output_carry);
-                            }
-                            assert_eq!(constraints.len(), spec.num_ops * 21);
-                        }
-                    }
-
-                    for (challenge, &alpha) in alphas.iter().enumerate() {
-                        let mut power = alpha.exp_u64(ALPHA_OFFSET as u64);
-                        let mut sum = F::ZERO;
-                        for &constraint in &constraints {
-                            sum += constraint * power;
-                            power *= alpha;
-                        }
-                        expected[row * 2 + challenge] += filter * sum;
-                    }
-                }
-            }
-
-            let job = start_range_check_gate_quotient(
-                &wires,
-                &constants,
-                QUOTIENT_ROWS,
-                step,
-                &[],
-                &specs,
-                &alphas,
-                ALPHA_OFFSET,
-            )
-            .expect("Metal U32 quotient job must start");
-            let actual = job.finish().expect("Metal U32 quotient job must finish");
-            assert_eq!(actual.len(), expected.len());
-            for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
-                assert_eq!(
-                    actual.to_canonical_u64(),
-                    expected.to_canonical_u64(),
-                    "U32 gate quotient mismatch at word {i}, step {step}"
-                );
-            }
         }
     }
 
@@ -3209,9 +2023,7 @@ kernel void goldilocks_mul_bench_native(
                     .map(|row| row.to_vec())
                     .collect();
                 let cpu = cpu_tree(&rows, cap_height);
-                let gpu = (gpu_digests, gpu_cap);
-                assert_tree_eq(&gpu, &cpu, cols, cap_height);
-                assert_all_paths_match_cpu(&gpu, &cpu, lde_size, cap_height);
+                assert_tree_eq(&(gpu_digests, gpu_cap), &cpu, cols, cap_height);
             }
         }
     }
@@ -3283,60 +2095,7 @@ kernel void goldilocks_mul_bench_native(
             let rows: Vec<Vec<GoldilocksField>> =
                 flat.chunks(cols).map(|row| row.to_vec()).collect();
             let cpu = cpu_tree(&rows, cap_height);
-            let gpu = (gpu_digests, gpu_cap);
-            assert_tree_eq(&gpu, &cpu, cols, cap_height);
-            assert_all_paths_match_cpu(&gpu, &cpu, lde_size, cap_height);
-        }
-    }
-
-    #[test]
-    fn shared_column_hash_matches_staged_full_tree_and_paths() {
-        let mut rng = StdRng::seed_from_u64(0x5348_4152_4544);
-        let context = CONTEXT.as_ref().unwrap_or_else(|error| panic!("{error}"));
-
-        // Exercise both sides of the 8-element sponge rate, multiple
-        // absorptions, and caps at the root, middle, and leaf levels.
-        for (rows, cap_height) in [(32usize, 0usize), (256, 3), (1024, 10)] {
-            for cols in [1usize, 4, 5, 8, 9, 16, 17, 31] {
-                let columns: Vec<Vec<GoldilocksField>> = (0..cols)
-                    .map(|column| {
-                        (0..rows)
-                            .map(|row| {
-                                let raw = match (column * rows + row) & 7 {
-                                    0 => 0,
-                                    1 => 1,
-                                    2 => GoldilocksField::ORDER - 1,
-                                    3 => GoldilocksField::ORDER,
-                                    4 => GoldilocksField::ORDER + 1,
-                                    5 => u64::MAX,
-                                    _ => rng.next_u64(),
-                                };
-                                GoldilocksField(raw)
-                            })
-                            .collect()
-                    })
-                    .collect();
-
-                let staged = context
-                    .build(LeafSource::Columns(&columns), cols, rows, cap_height)
-                    .unwrap();
-
-                let mut shared = context
-                    .allocate_columns::<GoldilocksField>(rows, cols)
-                    .unwrap();
-                shared
-                    .columns_mut()
-                    .unwrap()
-                    .into_iter()
-                    .zip(&columns)
-                    .for_each(|(destination, source)| destination.copy_from_slice(source));
-                let direct = context
-                    .build(LeafSource::Shared(&shared), cols, rows, cap_height)
-                    .unwrap();
-
-                assert_tree_raw_eq(&direct, &staged, cols, cap_height);
-                assert_all_paths_raw_eq(&direct, &staged, rows, cap_height);
-            }
+            assert_tree_eq(&(gpu_digests, gpu_cap), &cpu, cols, cap_height);
         }
     }
 
@@ -3392,7 +2151,6 @@ kernel void goldilocks_mul_bench_native(
                     .unwrap();
                 let cpu = cpu_tree(&leaves, cap_height);
                 assert_tree_eq(&gpu, &cpu, width, cap_height);
-                assert_all_paths_match_cpu(&gpu, &cpu, leaves.len(), cap_height);
 
                 let gpu_cols = context
                     .build(
@@ -3403,45 +2161,8 @@ kernel void goldilocks_mul_bench_native(
                     )
                     .unwrap();
                 assert_tree_eq(&gpu_cols, &cpu, width, cap_height);
-                assert_all_paths_match_cpu(&gpu_cols, &cpu, leaves.len(), cap_height);
             }
         }
-    }
-
-    /// The staging copy in [`tree_from_levels`] pairs `STAGING_CHUNK / 4`-sized
-    /// digest chunks with `STAGING_CHUNK`-sized limb chunks, and its `set_len`
-    /// is sound only if that pairing covers every slot including a short final
-    /// chunk. Every other differential builds a tree that fits in one chunk;
-    /// this one spans two (node count `2 * (1 << 17) - 16 = 262128`, i.e. one
-    /// full 131072-digest chunk plus a 131056-digest remainder).
-    #[test]
-    fn metal_merkle_matches_cpu_across_staging_chunks() {
-        const WIDTH: usize = 4;
-        let leaf_count = 1usize << 17;
-        let cap_height = 4;
-        let node_count = 2 * leaf_count - (1usize << cap_height);
-        assert!(node_count > STAGING_CHUNK / 4 && node_count % (STAGING_CHUNK / 4) != 0);
-
-        let mut rng = StdRng::seed_from_u64(0x5354_4147_4348_4e4b);
-        let leaves: Vec<Vec<GoldilocksField>> = (0..leaf_count)
-            .map(|_| {
-                (0..WIDTH)
-                    .map(|_| GoldilocksField(rng.next_u64() % GoldilocksField::ORDER))
-                    .collect()
-            })
-            .collect();
-        let flat: Vec<GoldilocksField> =
-            leaves.iter().flat_map(|leaf| leaf.iter().copied()).collect();
-
-        let context = CONTEXT
-            .as_ref()
-            .unwrap_or_else(|error| panic!("{error}"));
-        let gpu = context
-            .build(LeafSource::Rows(&flat), WIDTH, leaf_count, cap_height)
-            .unwrap();
-        assert_eq!(gpu.0.nodes.len(), node_count);
-        let cpu = cpu_tree(&leaves, cap_height);
-        assert_tree_eq(&gpu, &cpu, WIDTH, cap_height);
     }
 
     fn cpu_tree(
@@ -3469,21 +2190,16 @@ kernel void goldilocks_mul_bench_native(
         (digests, cap)
     }
 
-    type GpuTree = (
-        LevelOrderDigests<HashOut<GoldilocksField>>,
-        Vec<HashOut<GoldilocksField>>,
-    );
-
     fn assert_tree_eq(
-        actual: &GpuTree,
+        actual: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
         expected: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
         width: usize,
         cap_height: usize,
     ) {
-        let actual_digests = actual.0.to_interleaved();
-        assert_eq!(actual_digests.len(), expected.0.len());
+        assert_eq!(actual.0.len(), expected.0.len());
         assert_eq!(actual.1.len(), expected.1.len());
-        for (index, (actual, expected)) in actual_digests
+        for (index, (actual, expected)) in actual
+            .0
             .iter()
             .chain(&actual.1)
             .zip(expected.0.iter().chain(&expected.1))
@@ -3495,75 +2211,6 @@ kernel void goldilocks_mul_bench_native(
                 actual, expected,
                 "width {width}, cap height {cap_height}, node {index}"
             );
-        }
-    }
-
-    fn assert_tree_raw_eq(actual: &GpuTree, expected: &GpuTree, width: usize, cap_height: usize) {
-        assert_eq!(actual.0.level_offsets, expected.0.level_offsets);
-        assert_eq!(actual.0.nodes.len(), expected.0.nodes.len());
-        assert_eq!(actual.1.len(), expected.1.len());
-        for (index, (actual, expected)) in actual
-            .0
-            .nodes
-            .iter()
-            .chain(&actual.1)
-            .zip(expected.0.nodes.iter().chain(&expected.1))
-            .enumerate()
-        {
-            let actual = actual.elements.map(|value| value.to_noncanonical_u64());
-            let expected = expected.elements.map(|value| value.to_noncanonical_u64());
-            assert_eq!(
-                actual, expected,
-                "raw width {width}, cap height {cap_height}, node {index}"
-            );
-        }
-    }
-
-    fn assert_all_paths_raw_eq(
-        actual: &GpuTree,
-        expected: &GpuTree,
-        rows: usize,
-        cap_height: usize,
-    ) {
-        let num_layers = rows.ilog2() as usize - cap_height;
-        for leaf in 0..rows {
-            let actual_path = actual.0.prove_siblings(leaf);
-            let expected_path = expected.0.prove_siblings(leaf);
-            assert_eq!(actual_path.len(), num_layers);
-            assert_eq!(expected_path.len(), num_layers);
-            for (level, (actual, expected)) in actual_path.iter().zip(&expected_path).enumerate() {
-                let actual = actual.elements.map(|value| value.to_noncanonical_u64());
-                let expected = expected.elements.map(|value| value.to_noncanonical_u64());
-                assert_eq!(
-                    actual, expected,
-                    "raw Merkle path mismatch at leaf {leaf}, level {level}"
-                );
-            }
-        }
-    }
-
-    /// Differential check of the level-order proving path: for every leaf the
-    /// siblings read out of the GPU level-order storage must equal the ones
-    /// `merkle_tree_prove` extracts from the CPU interleaved layout.
-    fn assert_all_paths_match_cpu(
-        gpu: &GpuTree,
-        cpu: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
-        rows: usize,
-        cap_height: usize,
-    ) {
-        for leaf in 0..rows {
-            let gpu_path = gpu.0.prove_siblings(leaf);
-            let cpu_path =
-                merkle_tree_prove::<GoldilocksField, Poseidon2Hash>(leaf, rows, cap_height, &cpu.0);
-            assert_eq!(gpu_path.len(), cpu_path.len());
-            for (level, (gpu, cpu)) in gpu_path.iter().zip(&cpu_path).enumerate() {
-                let gpu = gpu.elements.map(|value| value.to_canonical_u64());
-                let cpu = cpu.elements.map(|value| value.to_canonical_u64());
-                assert_eq!(
-                    gpu, cpu,
-                    "Merkle path mismatch vs CPU at leaf {leaf}, level {level}"
-                );
-            }
         }
     }
 }

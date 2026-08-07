@@ -1,3 +1,4 @@
+use core::arch::asm;
 use core::fmt;
 use core::iter::{Product, Sum};
 use core::ops::{Add, AddAssign, Div, Mul, MulAssign, Neg, Sub, SubAssign};
@@ -7,7 +8,7 @@ use super::neon_goldilocks_field::NeonGoldilocksField;
 use crate::goldilocks_field::GoldilocksField;
 use crate::ops::Square;
 use crate::packed::PackedField;
-use crate::types::Field;
+use crate::types::{Field, Field64};
 
 /// Four packed Goldilocks elements implemented as two independent AArch64 lane pairs.
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -112,11 +113,9 @@ impl Mul<Self> for WideGoldilocksField {
 
     #[inline]
     fn mul(self, rhs: Self) -> Self {
-        // Two independent two-lane reduction blocks rather than one four-lane block.
-        // The nine-instruction pair kernel needs only seven registers, so the four
-        // lanes still issue back-to-back while the register allocator keeps the
-        // butterfly's loads, twiddles and accumulators live across the call.
-        Self([self.0[0] * rhs.0[0], self.0[1] * rhs.0[1]])
+        let lhs = self.lanes().map(|value| value.0);
+        let rhs = rhs.lanes().map(|value| value.0);
+        Self::from_lanes(mul_reduce_quad(lhs, rhs).map(GoldilocksField))
     }
 }
 
@@ -215,24 +214,22 @@ unsafe impl PackedField for WideGoldilocksField {
         }
     }
 
-    /// Delegates to the two `NeonGoldilocksField` halves, each of which fuses
-    /// its lane pair into one interleaved multiply-accumulate-reduce block.
-    /// Routing lane by lane through the scalar path instead would emit four
-    /// separate assembly blocks; the compiler schedules a block as a unit, so
-    /// their serial dependency chains could not overlap.
     #[inline]
     fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
-        Self([
-            self.0[0].multiply_accumulate(x.0[0], y.0[0]),
-            self.0[1].multiply_accumulate(x.0[1], y.0[1]),
-        ])
+        let out = self.lanes();
+        let lhs = x.lanes();
+        let rhs = y.lanes();
+        Self::from_lanes(core::array::from_fn(|lane| {
+            Field::multiply_accumulate(&out[lane], lhs[lane], rhs[lane])
+        }))
     }
 }
 
 impl Square for WideGoldilocksField {
     #[inline]
     fn square(&self) -> Self {
-        Self([self.0[0].square(), self.0[1].square()])
+        let values = self.lanes().map(|value| value.0);
+        Self::from_lanes(mul_reduce_quad(values, values).map(GoldilocksField))
     }
 }
 
@@ -282,6 +279,85 @@ impl Sum for WideGoldilocksField {
     fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
         iter.reduce(|x, y| x + y).unwrap_or(Self::ZEROS)
     }
+}
+
+/// Reduce four independent 128-bit products modulo `2^64 - 2^32 + 1`.
+///
+/// Each lane reuses its two input registers after the product is available. This keeps four
+/// independent reduction chains in one assembly block without exhausting AArch64's register file.
+#[inline(always)]
+fn mul_reduce_quad(lhs: [u64; 4], rhs: [u64; 4]) -> [u64; 4] {
+    let [mut result0, mut result1, mut result2, mut result3] = lhs;
+    let [scratch0, scratch1, scratch2, scratch3] = rhs;
+
+    unsafe {
+        asm!(
+            "umulh {hi0}, {result0}, {scratch0}",
+            "umulh {hi1}, {result1}, {scratch1}",
+            "umulh {hi2}, {result2}, {scratch2}",
+            "umulh {hi3}, {result3}, {scratch3}",
+            "mul   {result0}, {result0}, {scratch0}",
+            "mul   {result1}, {result1}, {scratch1}",
+            "mul   {result2}, {result2}, {scratch2}",
+            "mul   {result3}, {result3}, {scratch3}",
+            "lsr   {scratch0}, {hi0}, #32",
+            "lsr   {scratch1}, {hi1}, #32",
+            "lsr   {scratch2}, {hi2}, #32",
+            "lsr   {scratch3}, {hi3}, #32",
+            "subs  {result0}, {result0}, {scratch0}",
+            "csetm {scratch0:w}, cc",
+            "subs  {result1}, {result1}, {scratch1}",
+            "csetm {scratch1:w}, cc",
+            "subs  {result2}, {result2}, {scratch2}",
+            "csetm {scratch2:w}, cc",
+            "subs  {result3}, {result3}, {scratch3}",
+            "csetm {scratch3:w}, cc",
+            "sub   {result0}, {result0}, {scratch0}",
+            "sub   {result1}, {result1}, {scratch1}",
+            "sub   {result2}, {result2}, {scratch2}",
+            "sub   {result3}, {result3}, {scratch3}",
+            "and   {scratch0}, {hi0}, {epsilon}",
+            "and   {scratch1}, {hi1}, {epsilon}",
+            "and   {scratch2}, {hi2}, {epsilon}",
+            "and   {scratch3}, {hi3}, {epsilon}",
+            "lsl   {hi0}, {scratch0}, #32",
+            "lsl   {hi1}, {scratch1}, #32",
+            "lsl   {hi2}, {scratch2}, #32",
+            "lsl   {hi3}, {scratch3}, #32",
+            "sub   {hi0}, {hi0}, {scratch0}",
+            "sub   {hi1}, {hi1}, {scratch1}",
+            "sub   {hi2}, {hi2}, {scratch2}",
+            "sub   {hi3}, {hi3}, {scratch3}",
+            "adds  {result0}, {result0}, {hi0}",
+            "csetm {scratch0:w}, cs",
+            "adds  {result1}, {result1}, {hi1}",
+            "csetm {scratch1:w}, cs",
+            "adds  {result2}, {result2}, {hi2}",
+            "csetm {scratch2:w}, cs",
+            "adds  {result3}, {result3}, {hi3}",
+            "csetm {scratch3:w}, cs",
+            "add   {result0}, {result0}, {scratch0}",
+            "add   {result1}, {result1}, {scratch1}",
+            "add   {result2}, {result2}, {scratch2}",
+            "add   {result3}, {result3}, {scratch3}",
+            result0 = inout(reg) result0,
+            result1 = inout(reg) result1,
+            result2 = inout(reg) result2,
+            result3 = inout(reg) result3,
+            scratch0 = inout(reg) scratch0 => _,
+            scratch1 = inout(reg) scratch1 => _,
+            scratch2 = inout(reg) scratch2 => _,
+            scratch3 = inout(reg) scratch3 => _,
+            hi0 = out(reg) _,
+            hi1 = out(reg) _,
+            hi2 = out(reg) _,
+            hi3 = out(reg) _,
+            epsilon = in(reg) GoldilocksField::ORDER.wrapping_neg(),
+            options(pure, nomem, nostack),
+        );
+    }
+
+    [result0, result1, result2, result3]
 }
 
 #[cfg(test)]
@@ -372,77 +448,6 @@ mod tests {
                     packed_a.square().as_slice(),
                     core::array::from_fn::<_, 4, _>(|lane| a[lane].square())
                 );
-            }
-        }
-    }
-
-    /// The packed `multiply_accumulate` override must agree with the scalar one
-    /// on the RAW `u64` representative, not merely modulo `ORDER`.
-    ///
-    /// `GoldilocksField`'s `PartialEq` canonicalises, so the assertions above
-    /// would pass for any congruent value. Non-canonical representatives do
-    /// reach Merkle hashing and witness comparison in this prover, so the
-    /// packed and scalar paths must be bit-identical.
-    #[test]
-    fn multiply_accumulate_matches_scalar_raw_representative() {
-        fn raw(x: GoldilocksField) -> u64 {
-            x.0
-        }
-
-        let values = boundary_values();
-        // xorshift64*, so the test needs no rng dependency and is reproducible.
-        let mut s: u64 = 0xDEAD_BEEF_CAFE_F00D;
-        let mut next = move || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            GoldilocksField(s)
-        };
-
-        let mut check = |acc: [GoldilocksField; 4],
-                         x: [GoldilocksField; 4],
-                         y: [GoldilocksField; 4]| {
-            let packed = WideGoldilocksField::from_slice(&acc)
-                .multiply_accumulate(*WideGoldilocksField::from_slice(&x), *WideGoldilocksField::from_slice(&y));
-            let got: [u64; 4] = core::array::from_fn(|lane| raw(packed.as_slice()[lane]));
-            let want: [u64; 4] = core::array::from_fn(|lane| {
-                raw(Field::multiply_accumulate(&acc[lane], x[lane], y[lane]))
-            });
-            assert_eq!(got, want, "acc={acc:?} x={x:?} y={y:?}");
-        };
-
-        // Every boundary triple, rotated across lanes so each lane sees a
-        // different combination (and therefore a different borrow/carry mix).
-        for i in 0..values.len() {
-            for j in 0..values.len() {
-                for k in 0..values.len() {
-                    let acc = core::array::from_fn(|lane| values[(i + lane) % values.len()]);
-                    let x = core::array::from_fn(|lane| values[(j + 2 * lane) % values.len()]);
-                    let y = core::array::from_fn(|lane| values[(k + 3 * lane) % values.len()]);
-                    check(acc, x, y);
-                }
-            }
-        }
-
-        for _ in 0..200_000 {
-            let acc = core::array::from_fn(|_| next());
-            let x = core::array::from_fn(|_| next());
-            let y = core::array::from_fn(|_| next());
-            check(acc, x, y);
-        }
-
-        // Random accumulator against boundary operands: where a wrong carry
-        // fold hides.
-        for &v in values.iter() {
-            for _ in 0..2_000 {
-                let acc = core::array::from_fn(|_| next());
-                let x = core::array::from_fn(|_| v);
-                let y = core::array::from_fn(|_| next());
-                check(acc, x, y);
-                let acc = core::array::from_fn(|_| v);
-                let x = core::array::from_fn(|_| next());
-                let y = core::array::from_fn(|_| next());
-                check(acc, x, y);
             }
         }
     }
