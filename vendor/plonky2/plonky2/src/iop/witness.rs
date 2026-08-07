@@ -338,16 +338,13 @@ pub struct PartitionWitness<'a, F: Field> {
     /// Bitmap with one bit per slot of `values`; bit `i` of word `i / 64` is set iff slot `i` has
     /// been assigned a value.
     pub set_bitmap: Vec<u64>,
-    /// Representative index of every target, as `u32`. Halving the entry width halves the bytes
-    /// this table costs per read; every value is zero-extended at the indexing site, so the slots
-    /// selected in `values`/`set_bitmap` are unchanged.
-    pub representative_map: &'a [u32],
+    pub representative_map: &'a [usize],
     pub num_wires: usize,
     pub degree: usize,
 }
 
 impl<'a, F: Field> PartitionWitness<'a, F> {
-    pub fn new(num_wires: usize, degree: usize, representative_map: &'a [u32]) -> Self {
+    pub fn new(num_wires: usize, degree: usize, representative_map: &'a [usize]) -> Self {
         let len = representative_map.len();
         Self {
             values: vec![F::ZERO; len],
@@ -372,7 +369,7 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     /// Set a `Target`. On success, returns the representative index of the newly-set target. If the
     /// target was already set, returns `None`.
     pub fn set_target_returning_rep(&mut self, target: Target, value: F) -> Result<Option<usize>> {
-        let rep_index = self.representative_map[self.target_index(target)] as usize;
+        let rep_index = self.representative_map[self.target_index(target)];
         if self.is_set_by_rep_index(rep_index) {
             let old_value = self.values[rep_index];
             if value != old_value {
@@ -435,9 +432,8 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
                     let mut wire_index = chunk * chunk_rows * num_wires;
                     for i in 0..rows {
                         for column in columns.iter_mut() {
-                            column[i].write(
-                                self.values[self.representative_map[wire_index] as usize],
-                            );
+                            column[i]
+                                .write(self.values[self.representative_map[wire_index]]);
                             wire_index += 1;
                         }
                     }
@@ -463,7 +459,7 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
             for column in wire_values.iter_mut() {
                 // Unset slots hold `F::ZERO` in the dense `values` vector, so this is exactly
                 // the old `values[rep].unwrap_or(F::ZERO)` without touching the bitmap.
-                column.push(self.values[self.representative_map[wire_index] as usize]);
+                column.push(self.values[self.representative_map[wire_index]]);
                 wire_index += 1;
             }
         }
@@ -480,7 +476,7 @@ impl<F: Field> WitnessWrite<F> for PartitionWitness<'_, F> {
 
 impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
     fn try_get_target(&self, target: Target) -> Option<F> {
-        let rep_index = self.representative_map[self.target_index(target)] as usize;
+        let rep_index = self.representative_map[self.target_index(target)];
         if self.is_set_by_rep_index(rep_index) {
             Some(self.values[rep_index])
         } else {
