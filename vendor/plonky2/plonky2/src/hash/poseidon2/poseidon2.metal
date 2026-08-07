@@ -619,7 +619,7 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
-        } else {
+        } else if (kind == 2u) {
             // U16/U32 AddManyGate: num_addends inputs, carry/result/output-carry,
             // then `result_limbs` result and `num_carry_limbs` carry base-4
             // limbs per operation.
@@ -673,6 +673,70 @@ kernel void range_check_gate_quotient(
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(combined_carry, output_carry),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 3u) {
+            // ByteDecompositionGate: each operation has one sum followed by
+            // num_limbs byte wires. All routed operations precede four
+            // base-4 auxiliary limbs per byte and operation. The byte-limb
+            // count rides the `num_addends` metadata word.
+            uint num_limbs = num_addends;
+            uint routed_per_op = num_limbs + 1u;
+            uint aux_per_op = 4u * num_limbs;
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong routed_base = (ulong)op * routed_per_op;
+                ulong aux_base =
+                    (ulong)routed_per_op * num_ops + (ulong)op * aux_per_op;
+
+                // Match the CPU gate exactly: all auxiliary range products
+                // for this operation come before any recomposition rows.
+                for (uint j = 0; j < aux_per_op; ++j) {
+                    ulong x = wires[(aux_base + j) * lde_rows + source_row];
+                    ulong y = gl_mul(x, gl_sub(x, 3));
+                    range_check_gate_emit(
+                        gl_mul(y, gl_add(y, 2)),
+                        alpha_powers,
+                        alpha_stride,
+                        gate_accumulators,
+                        constraint_index++);
+                }
+
+                // Each byte is little-endian in four base-4 limbs.
+                for (uint byte_index = 0; byte_index < num_limbs; ++byte_index) {
+                    ulong limb_base = aux_base + (ulong)byte_index * 4u;
+                    ulong recomposed =
+                        wires[(limb_base + 3u) * lde_rows + source_row];
+                    for (uint remaining = 3u; remaining > 0u; --remaining) {
+                        uint j = remaining - 1u;
+                        recomposed = gl_add(
+                            gl_mul(recomposed, 4),
+                            wires[(limb_base + j) * lde_rows + source_row]);
+                    }
+                    ulong byte_value = wires[
+                        (routed_base + 1u + byte_index) * lde_rows + source_row];
+                    range_check_gate_emit(
+                        gl_sub(recomposed, byte_value),
+                        alpha_powers,
+                        alpha_stride,
+                        gate_accumulators,
+                        constraint_index++);
+                }
+
+                // The sum is little-endian in the byte wires.
+                ulong recomposed_sum = wires[
+                    (routed_base + num_limbs) * lde_rows + source_row];
+                for (uint remaining = num_limbs - 1u; remaining > 0u; --remaining) {
+                    uint byte_index = remaining - 1u;
+                    recomposed_sum = gl_add(
+                        gl_mul(recomposed_sum, 256),
+                        wires[(routed_base + 1u + byte_index) * lde_rows + source_row]);
+                }
+                ulong expected_sum = wires[routed_base * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(recomposed_sum, expected_sum),
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,

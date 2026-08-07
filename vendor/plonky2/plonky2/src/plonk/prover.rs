@@ -1030,7 +1030,12 @@ fn start_gpu_range_check_gate_quotient<
     for (gate_index, gate) in common_data.gates.iter().enumerate() {
         let range = gate.0.range_check_quotient_gate();
         let u32_gate = gate.0.u32_quotient_gate();
-        if range.is_some() && u32_gate.is_some() {
+        let byte_gate = gate.0.byte_decomposition_quotient_gate();
+        let advertised_layouts = [range.is_some(), u32_gate.is_some(), byte_gate.is_some()]
+            .into_iter()
+            .filter(|&advertised| advertised)
+            .count();
+        if advertised_layouts > 1 {
             if gpu_poseidon_quotient_diagnostics_enabled() {
                 eprintln!(
                     "[gpu-range-quotient] gate {gate_index} advertised conflicting layouts"
@@ -1156,10 +1161,41 @@ fn start_gpu_range_check_gate_quotient<
             });
             gate_indices.push(gate_index);
         }
+        if let Some(byte_gate) = byte_gate {
+            let per_op = byte_gate.num_limbs.checked_mul(5)?.checked_add(1)?;
+            let expected = byte_gate.num_ops.checked_mul(per_op)?;
+            if byte_gate.num_ops == 0
+                || byte_gate.num_limbs == 0
+                || gate.0.num_wires() != expected
+                || gate.0.num_constraints() != expected
+            {
+                if gpu_poseidon_quotient_diagnostics_enabled() {
+                    eprintln!(
+                        "[gpu-range-quotient] byte layout mismatch gate={gate_index} \
+                         metadata={byte_gate:?} wires={} constraints={} expected={expected}",
+                        gate.0.num_wires(),
+                        gate.0.num_constraints(),
+                    );
+                }
+                return None;
+            }
+            let selector_column = common_data.selectors_info.selector_indices[gate_index];
+            u32_specs.push(U32QuotientSpec {
+                selector_column,
+                gate_index,
+                group: common_data.selectors_info.groups[selector_column].clone(),
+                include_unused_selector,
+                num_ops: byte_gate.num_ops,
+                kind: U32QuotientKind::ByteDecomposition {
+                    num_limbs: byte_gate.num_limbs,
+                },
+            });
+            gate_indices.push(gate_index);
+        }
     }
     if specs.is_empty() && u32_specs.is_empty() {
         if gpu_poseidon_quotient_diagnostics_enabled() {
-            eprintln!("[gpu-range-quotient] no advertised RangeCheck/U32 gates");
+            eprintln!("[gpu-range-quotient] no advertised RangeCheck/U32/Byte gates");
         }
         return None;
     }

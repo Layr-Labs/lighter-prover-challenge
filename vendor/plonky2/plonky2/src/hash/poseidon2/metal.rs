@@ -163,6 +163,11 @@ pub(crate) enum U32QuotientKind {
         result_limbs: usize,
         num_carry_limbs: usize,
     },
+    /// One routed sum plus `num_limbs` routed bytes per operation, each byte
+    /// range-checked through four base-4 auxiliary limbs.
+    ByteDecomposition {
+        num_limbs: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -609,6 +614,16 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                             .checked_mul(num_addends.checked_add(3)?.checked_add(limbs)?)?,
                         spec.num_ops.checked_mul(limbs.checked_add(3)?)?,
                     )
+                }
+                U32QuotientKind::ByteDecomposition { num_limbs } => {
+                    if num_limbs == 0 {
+                        return None;
+                    }
+                    // The byte-limb count rides the `num_addends` metadata
+                    // word; the width words are unused by this kind.
+                    let per_op = num_limbs.checked_mul(5)?.checked_add(1)?;
+                    let count = spec.num_ops.checked_mul(per_op)?;
+                    (3usize, num_limbs, 0usize, 0usize, count, count)
                 }
             };
         if wire_count > wires.cols
@@ -2445,6 +2460,26 @@ mod tests {
                 },
             });
         }
+        // Exercise representative ByteDecomposition shapes around the
+        // production eight-byte case. The operation-count cap mirrors
+        // `ByteDecompositionGate::new_from_config`.
+        for (byte_shape, num_limbs) in [1usize, 2, 4, 8, 16, 24].into_iter().enumerate() {
+            let per_op = 1 + 5 * num_limbs;
+            let num_ops = (80 / (1 + num_limbs))
+                .min(WIRE_COLUMNS / per_op)
+                .min(123 / per_op)
+                .max(1);
+            let selector_column = specs.len();
+            let gate_index = 110 + 3 * byte_shape;
+            specs.push(U32QuotientSpec {
+                selector_column,
+                gate_index,
+                group: gate_index - 1..gate_index + 2,
+                include_unused_selector: true,
+                num_ops,
+                kind: U32QuotientKind::ByteDecomposition { num_limbs },
+            });
+        }
 
         for step in [1, 4] {
             let full_rows = QUOTIENT_ROWS * step;
@@ -2600,6 +2635,39 @@ mod tests {
                                 constraints.push(combined_carry - output_carry);
                             }
                             assert_eq!(constraints.len(), spec.num_ops * (total_limbs + 3));
+                        }
+                        U32QuotientKind::ByteDecomposition { num_limbs } => {
+                            let byte_base = F::from_canonical_u64(256);
+                            let routed_per_op = num_limbs + 1;
+                            let aux_per_op = 4 * num_limbs;
+                            for op in 0..spec.num_ops {
+                                let routed = routed_per_op * op;
+                                let aux_base = routed_per_op * spec.num_ops + aux_per_op * op;
+                                for j in 0..aux_per_op {
+                                    let x = wires.col(aux_base + j)[source_row];
+                                    let y = x * (x - three);
+                                    constraints.push(y * (y + F::TWO));
+                                }
+                                for byte_index in 0..num_limbs {
+                                    let limb_base = aux_base + 4 * byte_index;
+                                    let mut recomposed = F::ZERO;
+                                    for j in (0..4).rev() {
+                                        recomposed = recomposed * four
+                                            + wires.col(limb_base + j)[source_row];
+                                    }
+                                    let byte_value =
+                                        wires.col(routed + 1 + byte_index)[source_row];
+                                    constraints.push(recomposed - byte_value);
+                                }
+                                let mut recomposed_sum = F::ZERO;
+                                for byte_index in (0..num_limbs).rev() {
+                                    recomposed_sum = recomposed_sum * byte_base
+                                        + wires.col(routed + 1 + byte_index)[source_row];
+                                }
+                                let expected_sum = wires.col(routed)[source_row];
+                                constraints.push(recomposed_sum - expected_sum);
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * (5 * num_limbs + 1));
                         }
                     }
 
