@@ -388,9 +388,11 @@ inline void range_check_gate_emit(
 //   then two unused words that keep both record kinds the same stride.
 // It is followed by promoted-family records with the same five selector words,
 // then kind (arithmetic=0, subtraction=1, add-many=2, byte-decomposition=3,
-// quintic-multiplication=4, quintic-squaring=5, random-access=6), operation or
-// copy count, and three explicit kind words. Random access uses the final words
-// for index bits, extra constants, and the raw constant-column base.
+// quintic-multiplication=4, quintic-squaring=5, random-access=6, base-sum=7,
+// exponentiation=8), operation or copy count, and three explicit kind words.
+// Random access uses the final words for index bits, extra constants, and the
+// raw constant-column base; base-sum carries the limb count and the base (2 or
+// 4); exponentiation carries the power-bit count.
 // The result-limb count is what makes the subtraction and add-many branches
 // width-generic: a `2 * result_limbs`-bit word recomposes from that many
 // base-4 limbs and its overflow weight is `1 << (2 * result_limbs)`, which
@@ -974,6 +976,85 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
+        } else if (kind == 7u) {
+            // BaseSumGate: one routed sum wire then `num_limbs` limb wires
+            // (the metadata addend word carries the limb count and the
+            // result-limb word the base, 2 or 4). Constraint order matches
+            // the CPU gate exactly: the base-B recomposition minus the sum,
+            // then one range product per limb in ascending wire order.
+            uint num_limbs = num_addends;
+            ulong sum_base = (ulong)result_limbs;
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong routed_base = (ulong)op * (1u + num_limbs);
+                ulong recomposed =
+                    wires[(routed_base + num_limbs) * lde_rows + source_row];
+                for (uint remaining = num_limbs - 1u; remaining > 0u; --remaining) {
+                    uint j = remaining - 1u;
+                    recomposed = gl_add(
+                        gl_mul(recomposed, sum_base),
+                        wires[(routed_base + 1u + j) * lde_rows + source_row]);
+                }
+                ulong sum = wires[routed_base * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(recomposed, sum),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+                for (uint j = 0; j < num_limbs; ++j) {
+                    ulong x = wires[(routed_base + 1u + j) * lde_rows + source_row];
+                    ulong constraint;
+                    if (sum_base == 2u) {
+                        constraint = gl_mul(x, gl_sub(x, 1));
+                    } else {
+                        // x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3).
+                        ulong y = gl_mul(x, gl_sub(x, 3));
+                        constraint = gl_mul(y, gl_add(y, 2));
+                    }
+                    range_check_gate_emit(
+                        constraint,
+                        alpha_powers,
+                        alpha_stride,
+                        gate_accumulators,
+                        constraint_index++);
+                }
+            }
+        } else if (kind == 8u) {
+            // ExponentiationGate: routed base wire, `num_power_bits` routed
+            // bit wires (little-endian), routed output wire, then
+            // `num_power_bits` unrouted intermediates. Constraint order
+            // matches the CPU gate exactly: one square-and-multiply step per
+            // intermediate, consuming the bits from most significant down,
+            // then the output row.
+            uint num_power_bits = num_addends;
+            ulong base_value = wires[source_row];
+            ulong prev = 1;
+            for (uint i = 0; i < num_power_bits; ++i) {
+                ulong cur_bit = wires[
+                    (ulong)(1u + (num_power_bits - i - 1u)) * lde_rows + source_row];
+                ulong computed = gl_mul(
+                    prev,
+                    gl_add(gl_mul(cur_bit, base_value), gl_sub(1, cur_bit)));
+                ulong intermediate = wires[
+                    (ulong)(2u + num_power_bits + i) * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(computed, intermediate),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+                prev = gl_mul(intermediate, intermediate);
+            }
+            ulong output_value = wires[
+                (ulong)(1u + num_power_bits) * lde_rows + source_row];
+            ulong last_intermediate = wires[
+                (ulong)(2u + 2u * num_power_bits - 1u) * lde_rows + source_row];
+            range_check_gate_emit(
+                gl_sub(output_value, last_intermediate),
+                alpha_powers,
+                alpha_stride,
+                gate_accumulators,
+                constraint_index++);
         } else {
             // The Rust encoder rejects unknown discriminants; if a malformed
             // record reaches the shader, make its selected row unsatisfiable.

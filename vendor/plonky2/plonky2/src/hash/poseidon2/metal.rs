@@ -182,6 +182,20 @@ pub(crate) enum U32QuotientKind {
         num_extra_constants: usize,
         constant_base: usize,
     },
+    /// Base-`base` little-endian decomposition: one routed sum wire followed
+    /// by `num_limbs` limb wires, `1 + num_limbs` rows. Single operation per
+    /// gate; only bases 2 and 4 are supported.
+    BaseSum {
+        num_limbs: usize,
+        base: usize,
+    },
+    /// Square-and-multiply exponentiation: routed base wire,
+    /// `num_power_bits` routed bit wires, routed output wire, then
+    /// `num_power_bits` unrouted intermediates; `num_power_bits + 1` rows.
+    /// Single operation per gate.
+    Exponentiation {
+        num_power_bits: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -681,6 +695,31 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                         return None;
                     }
                     (6usize, bits, num_extra_constants, constant_base, wire_count, num_constraints)
+                }
+                // The limb count rides in the addend-count word and the base
+                // (2 or 4) in the result-limb word, mirroring the
+                // byte-decomposition convention of reusing spare words.
+                U32QuotientKind::BaseSum { num_limbs, base } => {
+                    if num_limbs == 0 || num_limbs > 128 || !matches!(base, 2 | 4) {
+                        return None;
+                    }
+                    let count = spec.num_ops.checked_mul(num_limbs.checked_add(1)?)?;
+                    (7usize, num_limbs, base, 0usize, count, count)
+                }
+                // The power-bit count rides in the addend-count word.
+                U32QuotientKind::Exponentiation { num_power_bits } => {
+                    if num_power_bits == 0 || num_power_bits > 128 {
+                        return None;
+                    }
+                    (
+                        8usize,
+                        num_power_bits,
+                        0usize,
+                        0usize,
+                        spec.num_ops
+                            .checked_mul(num_power_bits.checked_mul(2)?.checked_add(2)?)?,
+                        spec.num_ops.checked_mul(num_power_bits.checked_add(1)?)?,
+                    )
                 }
             };
         if wire_count > wires.cols
@@ -2756,6 +2795,35 @@ mod tests {
             ),
             (5, UnionShape::U32(U32QuotientKind::QuinticMultiplication)),
             (6, UnionShape::U32(U32QuotientKind::QuinticSquaring)),
+            // BaseSumGate ships as single-operation gates: base 2 with 63
+            // limbs and base 4 with 31 limbs under the 80-routed config.
+            (
+                1,
+                UnionShape::U32(U32QuotientKind::BaseSum {
+                    num_limbs: 63,
+                    base: 2,
+                }),
+            ),
+            (
+                1,
+                UnionShape::U32(U32QuotientKind::BaseSum {
+                    num_limbs: 31,
+                    base: 4,
+                }),
+            ),
+            // ExponentiationGate ships as a single-operation gate; 66 power
+            // bits fills the 136-wire config, and a small shape exercises the
+            // short-chain edge.
+            (
+                1,
+                UnionShape::U32(U32QuotientKind::Exponentiation {
+                    num_power_bits: 66,
+                }),
+            ),
+            (
+                1,
+                UnionShape::U32(U32QuotientKind::Exponentiation { num_power_bits: 2 }),
+            ),
             (15, UnionShape::RangeCheck { bit_size: 16 }),
             (
                 6,
@@ -3130,6 +3198,44 @@ mod tests {
                                 constraints.push(combined_high - output_high);
                             }
                             assert_eq!(constraints.len(), spec.num_ops * 36);
+                        }
+                        U32QuotientKind::BaseSum { num_limbs, base } => {
+                            let base_f = F::from_canonical_usize(base);
+                            for op in 0..spec.num_ops {
+                                let routed = (1 + num_limbs) * op;
+                                let mut acc = wire(routed + num_limbs);
+                                for j in (0..num_limbs - 1).rev() {
+                                    acc = acc * base_f + wire(routed + 1 + j);
+                                }
+                                constraints.push(acc - wire(routed));
+                                for j in 0..num_limbs {
+                                    let x = wire(routed + 1 + j);
+                                    constraints.push(if base == 2 {
+                                        x * (x - F::ONE)
+                                    } else {
+                                        let y = x * (x - three);
+                                        y * (y + F::TWO)
+                                    });
+                                }
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * (1 + num_limbs));
+                        }
+                        U32QuotientKind::Exponentiation { num_power_bits } => {
+                            let base_value = wire(0);
+                            let mut prev = F::ONE;
+                            for i in 0..num_power_bits {
+                                let cur_bit = wire(1 + (num_power_bits - i - 1));
+                                let computed =
+                                    prev * (cur_bit * base_value + (F::ONE - cur_bit));
+                                let intermediate = wire(2 + num_power_bits + i);
+                                constraints.push(computed - intermediate);
+                                prev = intermediate * intermediate;
+                            }
+                            constraints.push(
+                                wire(1 + num_power_bits)
+                                    - wire(2 + 2 * num_power_bits - 1),
+                            );
+                            assert_eq!(constraints.len(), num_power_bits + 1);
                         }
                         U32QuotientKind::RandomAccess {
                             bits,

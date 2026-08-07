@@ -76,6 +76,15 @@ pub enum U32QuotientGate {
         num_ops: usize,
         num_extra_constants: usize,
     },
+    /// Base-`base` little-endian decomposition: one routed sum wire followed
+    /// by `num_limbs` limb wires, `1 + num_limbs` constraint rows (the
+    /// recomposition then one range product per limb). Only bases 2 and 4
+    /// are supported by the quotient backend.
+    BaseSum { num_limbs: usize, base: usize },
+    /// Square-and-multiply exponentiation: routed base wire, `num_power_bits`
+    /// routed bit wires, routed output wire, then `num_power_bits` unrouted
+    /// intermediate wires; `num_power_bits + 1` constraint rows.
+    Exponentiation { num_power_bits: usize },
 }
 
 /// A custom gate.

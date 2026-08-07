@@ -140,6 +140,13 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> Gate<F, D> fo
         vec![WitnessGeneratorRef::new(gen.adapter())]
     }
 
+    fn u32_quotient_gate(&self) -> Option<crate::gates::gate::U32QuotientGate> {
+        (B == 2 || B == 4).then_some(crate::gates::gate::U32QuotientGate::BaseSum {
+            num_limbs: self.num_limbs,
+            base: B,
+        })
+    }
+
     // 1 for the sum then `num_limbs` for the limbs.
     fn num_wires(&self) -> usize {
         1 + self.num_limbs

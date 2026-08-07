@@ -1238,6 +1238,39 @@ fn start_gpu_range_check_gate_quotient<
                         expected_constraints,
                     )
                 }
+                U32QuotientGate::BaseSum { num_limbs, base } => {
+                    if num_limbs == 0 || num_limbs > 128 || !matches!(base, 2 | 4) {
+                        if gpu_poseidon_quotient_diagnostics_enabled() {
+                            eprintln!(
+                                "[gpu-range-quotient] invalid base-sum metadata: {u32_gate:?}"
+                            );
+                        }
+                        return None;
+                    }
+                    (
+                        U32QuotientKind::BaseSum { num_limbs, base },
+                        1,
+                        num_limbs.checked_add(1)?,
+                        num_limbs.checked_add(1)?,
+                    )
+                }
+                U32QuotientGate::Exponentiation { num_power_bits } => {
+                    if num_power_bits == 0 || num_power_bits > 128 {
+                        if gpu_poseidon_quotient_diagnostics_enabled() {
+                            eprintln!(
+                                "[gpu-range-quotient] invalid exponentiation metadata: \
+                                 {u32_gate:?}"
+                            );
+                        }
+                        return None;
+                    }
+                    (
+                        U32QuotientKind::Exponentiation { num_power_bits },
+                        1,
+                        num_power_bits.checked_mul(2)?.checked_add(2)?,
+                        num_power_bits.checked_add(1)?,
+                    )
+                }
             };
             if num_ops == 0
                 || gate.0.num_wires() != expected_wires
