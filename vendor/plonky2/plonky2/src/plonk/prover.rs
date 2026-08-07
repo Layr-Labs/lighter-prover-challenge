@@ -1182,6 +1182,63 @@ fn start_gpu_range_check_gate_quotient<
                     num_ops.checked_mul(20)?,
                     num_ops.checked_mul(15)?,
                 ),
+                // Bit interleaving: two routed words and 32 bit wires per
+                // operation, all 34 rows constrained (recomposition, base-4
+                // recomposition, then bit range checks).
+                U32QuotientGate::Interleave { num_ops } => (
+                    U32QuotientKind::Interleave,
+                    num_ops,
+                    num_ops.checked_mul(34)?,
+                    num_ops.checked_mul(34)?,
+                ),
+                // De-interleaving: four routed words and 64 bit wires per
+                // operation, all 68 rows constrained (canonicity, combined
+                // recomposition, even/odd halves, then bit range checks).
+                U32QuotientGate::UninterleaveToU32 { num_ops } => (
+                    U32QuotientKind::UninterleaveToU32,
+                    num_ops,
+                    num_ops.checked_mul(68)?,
+                    num_ops.checked_mul(68)?,
+                ),
+                // Generic mul-add: four routed wires per operation, one
+                // constraint row per operation, two shared constants.
+                U32QuotientGate::MulAdd { num_ops } => (
+                    U32QuotientKind::MulAdd {
+                        constant_base: raw_constant_base,
+                    },
+                    num_ops,
+                    num_ops.checked_mul(4)?,
+                    num_ops,
+                ),
+                // Generic two-term linear combination: three routed wires per
+                // operation, one constraint row per operation.
+                U32QuotientGate::Addition { num_ops } => (
+                    U32QuotientKind::Addition {
+                        constant_base: raw_constant_base,
+                    },
+                    num_ops,
+                    num_ops.checked_mul(3)?,
+                    num_ops,
+                ),
+                // Select between two elements: four routed wires and one
+                // temporary per operation, two constraint rows per operation.
+                U32QuotientGate::Selection { num_ops } => (
+                    U32QuotientKind::Selection,
+                    num_ops,
+                    num_ops.checked_mul(5)?,
+                    num_ops.checked_mul(2)?,
+                ),
+                // Equality: three routed and three temporary wires per
+                // operation, four constraint rows per operation, one shared
+                // constant.
+                U32QuotientGate::Equality { num_ops } => (
+                    U32QuotientKind::Equality {
+                        constant_base: raw_constant_base,
+                    },
+                    num_ops,
+                    num_ops.checked_mul(6)?,
+                    num_ops.checked_mul(4)?,
+                ),
                 U32QuotientGate::RandomAccess {
                     bits,
                     num_ops,
@@ -1435,6 +1492,14 @@ fn compute_quotient_polys<
         let _ = allow_gpu_poseidon;
         Vec::new()
     };
+    // The GPU offload decision is fixed for the whole proof, so the ascending
+    // list of gates that survive on the CPU is also fixed. Materialize it once
+    // and drive both the CPU wire-width computation and every 32-point batch
+    // from it, instead of re-scanning `excluded_gate_indices` for every gate
+    // in every batch.
+    let cpu_gate_indices = (0..common_data.gates.len())
+        .filter(|gate_index| !excluded_gate_indices.contains(gate_index))
+        .collect::<Vec<_>>();
 
     let z_h_on_coset = ZeroPolyOnCoset::new(common_data.degree_bits(), quotient_degree_bits);
     // The `L_0` denominator inverses consumed by `eval_l_0` depend only on
@@ -1506,17 +1571,9 @@ fn compute_quotient_polys<
     // remaining gates, while the permutation argument always needs the routed
     // prefix. Do not gather dead high columns for offloaded Poseidon/Range
     // gates into every 32-point CPU scratch batch.
-    //
-    // Materialize the ascending survivor list once: the Metal offload decision
-    // is fixed for the whole proof, so re-scanning `excluded_gate_indices`
-    // inside every 32-point batch (~1.1M times on the public fixture) is pure
-    // dead control work. The same slice drives wire-width and gate evaluation.
-    let cpu_gate_indices = (0..common_data.gates.len())
-        .filter(|gate_index| !excluded_gate_indices.contains(gate_index))
-        .collect::<Vec<_>>();
     let cpu_num_wires = cpu_gate_indices
         .iter()
-        .map(|&i| common_data.gates[i].0.num_wires())
+        .map(|&gate_index| common_data.gates[gate_index].0.num_wires())
         .max()
         .unwrap_or(0)
         .max(num_routed_wires);

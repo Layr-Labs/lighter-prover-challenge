@@ -69,6 +69,30 @@ pub enum U32QuotientGate {
     /// words (input and output limbs) plus ten temporary wires per
     /// operation, fifteen constraint rows per operation.
     QuinticSquaring { num_ops: usize },
+    /// Bit-interleaving a U32 with zeroes: two routed words and 32 bit wires
+    /// per operation, with 34 constraint rows per operation (recomposition of
+    /// the routed value, recomposition of the base-4 interleaved value, then
+    /// 32 bit range checks).
+    Interleave { num_ops: usize },
+    /// De-interleaving a 64-bit interleaved word into its even and odd U32
+    /// halves: four routed words and 64 bit wires per operation, with 68
+    /// constraint rows per operation (a 2^32 canonicity check, the combined
+    /// recomposition, the even/odd half recompositions, then 64 bit range
+    /// checks).
+    UninterleaveToU32 { num_ops: usize },
+    /// Generic mul-add: four routed wires per operation (multiplicand_0,
+    /// multiplicand_1, addend, output) with one constraint row per operation
+    /// and two shared gate constants.
+    MulAdd { num_ops: usize },
+    /// Generic two-term linear combination: three routed wires per operation
+    /// with one constraint row per operation and two shared gate constants.
+    Addition { num_ops: usize },
+    /// Select between two elements: four routed wires and one temporary wire
+    /// per operation, with two constraint rows per operation.
+    Selection { num_ops: usize },
+    /// Equality check: three routed and three temporary wires per operation,
+    /// with four constraint rows per operation and one shared gate constant.
+    Equality { num_ops: usize },
     /// Random access with a little-endian binary index, `2^bits` list items
     /// per copy, and optional routed local constants.
     RandomAccess {
@@ -405,19 +429,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Serialize for GateRef<F, D> {
 #[derive(Clone, Debug, Default)]
 pub struct CurrentSlot<F: RichField + Extendable<D>, const D: usize> {
     pub current_slot: HashMap<Vec<F>, (usize, usize)>,
-    /// Memoized [`Gate::num_ops`] for the gate this entry is keyed by.
-    ///
-    /// The default `Gate::num_ops` *materializes* the gate's generator list and returns its
-    /// length, so every call allocates one `WitnessGeneratorRef` (an `Arc`) per operation plus
-    /// the `Vec` holding them, and drops all of it immediately. `find_slot` calls it once per
-    /// packed operation, which is where the overwhelming majority of the circuit's operations
-    /// are placed. Caching it here evaluates it once per distinct gate value instead.
-    ///
-    /// Keying on the entry is exact: `CurrentSlot` entries are keyed by `GateRef`, whose `Eq`
-    /// is `Gate::id()` equality, and every gate's `id()` is a `Debug` rendering of its complete
-    /// configuration. Gates that compare equal therefore have identical fields, and `num_ops`
-    /// is a pure function of those fields.
-    pub num_ops: Option<usize>,
 }
 
 /// A gate along with any constants used to configure it.

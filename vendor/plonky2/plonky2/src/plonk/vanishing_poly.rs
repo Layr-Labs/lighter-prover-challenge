@@ -175,10 +175,9 @@ pub(crate) struct VanishingScratch<F> {
     pub vanishing_all_lookup_terms: Vec<F>,
     pub lookup_selectors: Vec<F>,
     pub constraint_terms_batch: Vec<F>,
-    /// Reused selector-filter buffer for the CPU gate loop. Content is fully
-    /// overwritten by each `eval_filtered_base_batch` call; capacity is retained
-    /// across the ~1.1M 32-point batches per public proof.
-    pub gate_filters: Vec<F>,
+    /// Per-point gate-filter vector reused across every 32-point batch (and
+    /// across every gate within a batch) instead of one allocation per batch.
+    pub filters: Vec<F>,
 }
 
 /// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
@@ -278,9 +277,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     beta_k_is: &[F],
     deltas: &[F],
     alphas: &[F],
-    // Ascending indices of gates still evaluated on the CPU for this proof.
-    // Formed once after the offload decision; iterating it is exactly the same
-    // sequence as scanning all gates and skipping exclusions.
     cpu_gate_indices: &[usize],
     z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
@@ -305,12 +301,12 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     let num_gate_constraints = common_data.num_gate_constraints;
 
-    evaluate_gate_constraints_base_batch_into_cpu_gates::<F, D>(
+    evaluate_gate_constraints_base_batch_into_excluding_many::<F, D>(
         common_data,
         vars_batch,
         &mut scratch.constraint_terms_batch,
+        &mut scratch.filters,
         cpu_gate_indices,
-        &mut scratch.gate_filters,
     );
     let constraint_terms_batch = &scratch.constraint_terms_batch;
     debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
@@ -999,18 +995,30 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding<
     excluded_gate_index: Option<usize>,
 ) {
     match excluded_gate_index {
-        Some(index) => evaluate_gate_constraints_base_batch_into_excluding_many(
-            common_data,
-            vars_batch,
-            constraints_batch,
-            core::slice::from_ref(&index),
-        ),
-        None => evaluate_gate_constraints_base_batch_into_excluding_many(
-            common_data,
-            vars_batch,
-            constraints_batch,
-            &[],
-        ),
+        Some(index) => {
+            let cpu_gate_indices = (0..common_data.gates.len())
+                .filter(|&i| i != index)
+                .collect::<Vec<_>>();
+            let mut filters = Vec::with_capacity(vars_batch.len());
+            evaluate_gate_constraints_base_batch_into_excluding_many(
+                common_data,
+                vars_batch,
+                constraints_batch,
+                &mut filters,
+                &cpu_gate_indices,
+            );
+        }
+        None => {
+            let cpu_gate_indices = (0..common_data.gates.len()).collect::<Vec<_>>();
+            let mut filters = Vec::with_capacity(vars_batch.len());
+            evaluate_gate_constraints_base_batch_into_excluding_many(
+                common_data,
+                vars_batch,
+                constraints_batch,
+                &mut filters,
+                &cpu_gate_indices,
+            );
+        }
     }
 }
 
@@ -1023,34 +1031,8 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
     common_data: &CommonCircuitData<F, D>,
     vars_batch: EvaluationVarsBaseBatch<F>,
     constraints_batch: &mut Vec<F>,
-    excluded_gate_indices: &[usize],
-) {
-    // Compatibility wrapper for test / single-exclude helpers: materialize the
-    // survivor list once and reuse the hot-path evaluator.
-    let cpu_gate_indices = (0..common_data.gates.len())
-        .filter(|i| !excluded_gate_indices.contains(i))
-        .collect::<Vec<_>>();
-    let mut filters = Vec::with_capacity(vars_batch.len());
-    evaluate_gate_constraints_base_batch_into_cpu_gates(
-        common_data,
-        vars_batch,
-        constraints_batch,
-        &cpu_gate_indices,
-        &mut filters,
-    );
-}
-
-/// Hot-path CPU gate evaluation: iterate a precomputed ascending survivor list
-/// and reuse a caller-owned selector-filter buffer across batches.
-pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
-    F: RichField + Extendable<D>,
-    const D: usize,
->(
-    common_data: &CommonCircuitData<F, D>,
-    vars_batch: EvaluationVarsBaseBatch<F>,
-    constraints_batch: &mut Vec<F>,
-    cpu_gate_indices: &[usize],
     filters: &mut Vec<F>,
+    cpu_gate_indices: &[usize],
 ) {
     constraints_batch.clear();
     constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);

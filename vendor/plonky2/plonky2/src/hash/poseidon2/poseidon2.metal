@@ -974,6 +974,233 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
+        } else if (kind == 7u) {
+            // U32InterleaveGate: two routed words (x, x_interleaved) followed
+            // by 32 big-endian bit wires per operation. Constraint order
+            // matches the CPU evaluator exactly: the base-2 recomposition of
+            // x, the base-4 recomposition of x_interleaved, then 32 bit range
+            // checks.
+            uint routed_per_op = 2u;
+            uint bits_per_op = 32u;
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong routed_base = (ulong)op * routed_per_op;
+                ulong bit_base = (ulong)routed_per_op * num_ops
+                    + (ulong)op * bits_per_op;
+
+                ulong acc_x = 0;
+                ulong acc_interleaved = 0;
+                for (uint j = 0; j < bits_per_op; ++j) {
+                    ulong bit = wires[(bit_base + j) * lde_rows + source_row];
+                    acc_x = gl_add(gl_mul(acc_x, 2), bit);
+                    acc_interleaved = gl_add(gl_mul(acc_interleaved, 4), bit);
+                }
+                range_check_gate_emit(
+                    gl_sub(acc_x, wires[(routed_base + 0u) * lde_rows + source_row]),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(acc_interleaved, wires[(routed_base + 1u) * lde_rows + source_row]),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+                for (uint j = 0; j < bits_per_op; ++j) {
+                    ulong bit = wires[(bit_base + j) * lde_rows + source_row];
+                    range_check_gate_emit(
+                        gl_mul(bit, gl_sub(bit, 1)),
+                        alpha_powers,
+                        alpha_stride,
+                        gate_accumulators,
+                        constraint_index++);
+                }
+            }
+        } else if (kind == 8u) {
+            // UninterleaveToU32Gate: four routed words (x_interleaved,
+            // x_evens, x_odds, inverse) followed by 64 big-endian bit wires
+            // per operation. Constraint order matches the CPU evaluator:
+            // the 2^32 canonicity check, the combined recomposition, the
+            // even/odd half recompositions, then 64 bit range checks.
+            uint routed_per_op = 4u;
+            uint bits_per_op = 64u;
+            uint half_bits = 32u;
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong routed_base = (ulong)op * routed_per_op;
+                ulong bit_base = (ulong)routed_per_op * num_ops
+                    + (ulong)op * bits_per_op;
+
+                ulong acc_high = 0;
+                ulong acc_low = 0;
+                ulong acc_evens = 0;
+                ulong acc_odds = 0;
+                for (uint j = 0; j < bits_per_op; ++j) {
+                    ulong bit = wires[(bit_base + j) * lde_rows + source_row];
+                    if (j < half_bits) {
+                        acc_high = gl_add(gl_mul(acc_high, 2), bit);
+                    } else {
+                        acc_low = gl_add(gl_mul(acc_low, 2), bit);
+                    }
+                    if ((j & 1u) == 0u) {
+                        acc_evens = gl_add(gl_mul(acc_evens, 2), bit);
+                    } else {
+                        acc_odds = gl_add(gl_mul(acc_odds, 2), bit);
+                    }
+                }
+
+                ulong inverse = wires[(routed_base + 3u) * lde_rows + source_row];
+                ulong high_diff = gl_sub(0xffffffffUL, acc_high);
+                ulong high_not_max = gl_sub(gl_mul(inverse, high_diff), 1);
+                range_check_gate_emit(
+                    gl_mul(high_not_max, acc_low),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+                ulong combined = gl_add(gl_mul(acc_high, 4294967296UL), acc_low);
+                range_check_gate_emit(
+                    gl_sub(combined, wires[(routed_base + 0u) * lde_rows + source_row]),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(acc_evens, wires[(routed_base + 1u) * lde_rows + source_row]),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(acc_odds, wires[(routed_base + 2u) * lde_rows + source_row]),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+                for (uint j = 0; j < bits_per_op; ++j) {
+                    ulong bit = wires[(bit_base + j) * lde_rows + source_row];
+                    range_check_gate_emit(
+                        gl_mul(bit, gl_sub(bit, 1)),
+                        alpha_powers,
+                        alpha_stride,
+                        gate_accumulators,
+                        constraint_index++);
+                }
+            }
+        } else if (kind == 9u) {
+            // Generic mul-add: four routed wires per operation
+            // (multiplicand_0, multiplicand_1, addend, output) and one
+            // constraint row each, with two shared gate constants at the
+            // constant base carried in metadata word 9.
+            uint routed_per_op = 4u;
+            uint constant_base = num_carry_limbs;
+            ulong const_0 = constants[(constant_base + 0u) * lde_rows + source_row];
+            ulong const_1 = constants[(constant_base + 1u) * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong routed = (ulong)op * routed_per_op;
+                ulong m0 = wires[(routed + 0u) * lde_rows + source_row];
+                ulong m1 = wires[(routed + 1u) * lde_rows + source_row];
+                ulong addend = wires[(routed + 2u) * lde_rows + source_row];
+                ulong output = wires[(routed + 3u) * lde_rows + source_row];
+                ulong computed = gl_add(
+                    gl_mul(gl_mul(m0, m1), const_0),
+                    gl_mul(addend, const_1));
+                range_check_gate_emit(
+                    gl_sub(output, computed),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 10u) {
+            // Generic two-term linear combination: three routed wires per
+            // operation (addend_0, addend_1, output) and one constraint row
+            // each, with two shared gate constants.
+            uint routed_per_op = 3u;
+            uint constant_base = num_carry_limbs;
+            ulong const_0 = constants[(constant_base + 0u) * lde_rows + source_row];
+            ulong const_1 = constants[(constant_base + 1u) * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong routed = (ulong)op * routed_per_op;
+                ulong a0 = wires[(routed + 0u) * lde_rows + source_row];
+                ulong a1 = wires[(routed + 1u) * lde_rows + source_row];
+                ulong output = wires[(routed + 2u) * lde_rows + source_row];
+                ulong computed = gl_add(gl_mul(a0, const_0), gl_mul(a1, const_1));
+                range_check_gate_emit(
+                    gl_sub(output, computed),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 11u) {
+            // Select between two elements: four routed wires (selector,
+            // element_0, element_1, output) and one temporary wire per
+            // operation, with two constraint rows each.
+            uint routed_per_op = 4u;
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong routed = (ulong)op * routed_per_op;
+                ulong b = wires[(routed + 0u) * lde_rows + source_row];
+                ulong x = wires[(routed + 1u) * lde_rows + source_row];
+                ulong y = wires[(routed + 2u) * lde_rows + source_row];
+                ulong result = wires[(routed + 3u) * lde_rows + source_row];
+                ulong temp = wires[((ulong)routed_per_op * num_ops + op)
+                    * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(gl_sub(gl_mul(b, y), y), temp),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_sub(gl_mul(b, x), temp), result),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 12u) {
+            // Equality check: three routed wires (element_0, element_1,
+            // output) and three temporary wires per operation, with four
+            // constraint rows each and one shared gate constant.
+            uint routed_per_op = 3u;
+            uint not_routed_per_op = 3u;
+            uint constant_base = num_carry_limbs;
+            ulong const_0 = constants[(constant_base + 0u) * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong routed = (ulong)op * routed_per_op;
+                ulong x = wires[(routed + 0u) * lde_rows + source_row];
+                ulong y = wires[(routed + 1u) * lde_rows + source_row];
+                ulong equal = wires[(routed + 2u) * lde_rows + source_row];
+                ulong temp_base = (ulong)routed_per_op * num_ops
+                    + (ulong)not_routed_per_op * op;
+                ulong diff = wires[(temp_base + 0u) * lde_rows + source_row];
+                ulong invdiff = wires[(temp_base + 1u) * lde_rows + source_row];
+                ulong prod = wires[(temp_base + 2u) * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(gl_sub(x, y), diff),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_mul(diff, invdiff), prod),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_mul(prod, diff), diff),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_sub(const_0, prod), equal),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+            }
         } else {
             // The Rust encoder rejects unknown discriminants; if a malformed
             // record reaches the shader, make its selected row unsatisfiable.
