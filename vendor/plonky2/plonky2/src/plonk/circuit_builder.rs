@@ -43,9 +43,8 @@ use crate::iop::generator::{
 use crate::iop::target::{BoolTarget, Target};
 use crate::iop::wire::Wire;
 use crate::plonk::circuit_data::{
-    CircuitConfig, CircuitData, CommonCircuitData, GeneratorWatchIndex, MockCircuitData,
-    ProverCircuitData, ProverOnlyCircuitData, VerifierCircuitData, VerifierCircuitTarget,
-    VerifierOnlyCircuitData,
+    CircuitConfig, CircuitData, CommonCircuitData, MockCircuitData, ProverCircuitData,
+    ProverOnlyCircuitData, VerifierCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
 };
 use crate::plonk::config::{AlgebraicHasher, GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::copy_constraint::CopyConstraint;
@@ -1302,8 +1301,6 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             indices.dedup();
             indices.shrink_to_fit();
         }
-        let generator_indices_by_watches =
-            GeneratorWatchIndex::from_map(generator_indices_by_watches);
 
         let num_gate_constraints = gates
             .iter()

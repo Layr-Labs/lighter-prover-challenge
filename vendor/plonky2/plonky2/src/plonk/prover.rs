@@ -447,6 +447,16 @@ fn all_wires_permutation_partial_products<
     let num_routed_wires = common_data.config.num_routed_wires;
     debug_assert_eq!(betas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
+    if num_challenges == 2 {
+        return two_challenge_wires_permutation_partial_products_and_zs(
+            witness,
+            betas,
+            beta_k_is,
+            gammas,
+            prover_data,
+            common_data,
+        );
+    }
     (0..common_data.config.num_challenges)
         .map(|i| {
             wires_permutation_partial_products_and_zs(
@@ -459,6 +469,121 @@ fn all_wires_permutation_partial_products<
             )
         })
         .collect()
+}
+
+fn z_polynomials_from_quotient_chunk_products<F: Field>(
+    all_quotient_chunk_products: Vec<F>,
+    num_prods: usize,
+) -> Vec<PolynomialValues<F>> {
+    let num_chunks = num_prods + 1;
+    debug_assert_eq!(all_quotient_chunk_products.len() % num_chunks, 0);
+    let n_points = all_quotient_chunk_products.len() / num_chunks;
+    let mut columns: Vec<Vec<F>> = (0..num_chunks)
+        .map(|_| Vec::with_capacity(n_points))
+        .collect();
+    let mut z_x = F::ONE;
+    for quotient_chunk_products in all_quotient_chunk_products.chunks_exact(num_chunks) {
+        let mut acc = z_x;
+        for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
+            acc *= quotient_chunk_product;
+            if k == num_prods {
+                // The last term is Z(gx), but we store Z(x) in its place,
+                // otherwise Z would end up shifted.
+                columns[k].push(z_x);
+                z_x = acc;
+            } else {
+                columns[k].push(acc);
+            }
+        }
+    }
+
+    columns.into_iter().map(PolynomialValues::new).collect()
+}
+
+/// Compute both production permutation challenges in one pass over the witness and sigma rows.
+/// Each challenge keeps its original multiplication and batch-inversion order; only the shared
+/// memory traversal and Rayon scheduling are fused.
+fn two_challenge_wires_permutation_partial_products_and_zs<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &MatrixWitness<F>,
+    betas: &[F],
+    beta_k_is: &[F],
+    gammas: &[F],
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+) -> Vec<Vec<PolynomialValues<F>>> {
+    debug_assert_eq!(betas.len(), 2);
+    debug_assert_eq!(gammas.len(), 2);
+    let degree = common_data.quotient_degree_factor;
+    let subgroup = &prover_data.subgroup;
+    let num_prods = common_data.num_partial_products;
+    let num_routed_wires = common_data.config.num_routed_wires;
+    let num_chunks = num_prods + 1;
+    debug_assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
+    debug_assert_eq!(beta_k_is.len(), 2 * num_routed_wires);
+    let (beta_k_is_0, beta_k_is_1) = beta_k_is.split_at(num_routed_wires);
+    let (beta_0, beta_1) = (betas[0], betas[1]);
+    let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
+
+    const INV_BATCH: usize = 128;
+    let products_len = subgroup.len() * num_chunks;
+    let mut quotient_products_0 = vec![F::ZERO; products_len];
+    let mut quotient_products_1 = vec![F::ZERO; products_len];
+    quotient_products_0
+        .par_chunks_mut(INV_BATCH * num_chunks)
+        .zip(quotient_products_1.par_chunks_mut(INV_BATCH * num_chunks))
+        .zip(subgroup.par_chunks(INV_BATCH))
+        .enumerate()
+        .for_each_init(
+            || {
+                (
+                    Vec::with_capacity(num_chunks * INV_BATCH),
+                    Vec::with_capacity(num_chunks * INV_BATCH),
+                    Vec::with_capacity(num_chunks * INV_BATCH),
+                )
+            },
+            |scratch, (chunk_idx, ((products_0, products_1), xs))| {
+                let base = chunk_idx * INV_BATCH;
+                let (denominators_0, denominators_1, denominator_inverses) = scratch;
+                denominators_0.clear();
+                denominators_1.clear();
+                for (t, &x) in xs.iter().enumerate() {
+                    let i = base + t;
+                    let s_sigmas = &prover_data.sigmas[i];
+                    for chunk in 0..num_chunks {
+                        let start = chunk * degree;
+                        let end = min(start + degree, num_routed_wires);
+                        let mut numerator_0 = F::ONE;
+                        let mut numerator_1 = F::ONE;
+                        let mut denominator_0 = F::ONE;
+                        let mut denominator_1 = F::ONE;
+                        for j in start..end {
+                            let wire_value = witness.get_wire(i, j);
+                            let sigma = s_sigmas[j];
+                            numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
+                            numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
+                            denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
+                            denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                        }
+                        let output = t * num_chunks + chunk;
+                        products_0[output] = numerator_0;
+                        products_1[output] = numerator_1;
+                        denominators_0.push(denominator_0);
+                        denominators_1.push(denominator_1);
+                    }
+                }
+                divide_chunk_products(products_0, denominators_0, denominator_inverses);
+                divide_chunk_products(products_1, denominators_1, denominator_inverses);
+            },
+        );
+
+    vec![
+        z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
+        z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
+    ]
 }
 
 #[inline]
@@ -547,27 +672,7 @@ fn wires_permutation_partial_products_and_zs<
     // and the whole-phase transpose. Values and their order are identical: for
     // each point, column k receives the k-th running product, and the last
     // column receives the previous Z(x) exactly as the swap-based version did.
-    let n_points = subgroup.len();
-    let mut columns: Vec<Vec<F>> = (0..num_prods + 1)
-        .map(|_| Vec::with_capacity(n_points))
-        .collect();
-    let mut z_x = F::ONE;
-    for quotient_chunk_products in all_quotient_chunk_products.chunks_exact(num_chunks) {
-        let mut acc = z_x;
-        for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
-            acc *= quotient_chunk_product;
-            if k == num_prods {
-                // The last term is Z(gx), but we store Z(x) in its place,
-                // otherwise Z would end up shifted.
-                columns[k].push(z_x);
-                z_x = acc;
-            } else {
-                columns[k].push(acc);
-            }
-        }
-    }
-
-    columns.into_iter().map(PolynomialValues::new).collect()
+    z_polynomials_from_quotient_chunk_products(all_quotient_chunk_products, num_prods)
 }
 
 /// Computes lookup polynomials for a given challenge.
@@ -1162,7 +1267,10 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{
+        precomputed, two_challenge_wires_permutation_partial_products_and_zs,
+        wires_permutation_partial_products_and_zs, BatchLayout, COMPARE_QUOTIENT_LAYOUTS,
+    };
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field, Field64};
     use crate::iop::witness::{PartialWitness, WitnessWrite};
@@ -1261,6 +1369,50 @@ mod quotient_layout_tests {
         commitment.fill_lde_batch_contiguous(indices[0], indices.len(), range, &mut contiguous);
 
         assert_eq!(contiguous, indexed);
+    }
+
+    #[test]
+    fn two_challenge_permutation_scan_matches_independent_scans() -> Result<()> {
+        let (data, pw) = small_circuit();
+        assert_eq!(data.common.config.num_challenges, 2);
+        let witness = crate::iop::generator::generate_partial_witness(
+            pw,
+            &data.prover_only,
+            &data.common,
+        )?
+        .full_witness();
+        let betas = [F::from_canonical_u64(7), F::from_canonical_u64(11)];
+        let gammas = [F::from_canonical_u64(13), F::from_canonical_u64(17)];
+        let beta_k_is = betas
+            .iter()
+            .flat_map(|&beta| data.common.k_is.iter().map(move |&k_i| beta * k_i))
+            .collect::<Vec<_>>();
+        let num_routed_wires = data.common.config.num_routed_wires;
+
+        let expected = (0..2)
+            .map(|challenge| {
+                wires_permutation_partial_products_and_zs(
+                    &witness,
+                    betas[challenge],
+                    &beta_k_is
+                        [challenge * num_routed_wires..(challenge + 1) * num_routed_wires],
+                    gammas[challenge],
+                    &data.prover_only,
+                    &data.common,
+                )
+            })
+            .collect::<Vec<_>>();
+        let actual = two_challenge_wires_permutation_partial_products_and_zs(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            &data.prover_only,
+            &data.common,
+        );
+
+        assert_eq!(actual, expected);
+        Ok(())
     }
 
     /// Scratch reuse: `fill_lde_batch` writes every cell of `out` before any
