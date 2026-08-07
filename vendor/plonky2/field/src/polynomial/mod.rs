@@ -12,7 +12,9 @@ use plonky2_util::log2_strict;
 use serde::{Deserialize, Serialize};
 
 use crate::extension::{Extendable, FieldExtension};
-use crate::fft::{FftRootTable, fft, fft_with_options, ifft};
+use crate::fft::{
+    FftRootTable, fft, fft_with_options, fft_with_options_prefix_bit_reversed, ifft,
+};
 use crate::types::Field;
 
 /// A polynomial in point-value form.
@@ -269,6 +271,17 @@ impl<F: Field> PolynomialCoeffs<F> {
         root_table: Option<&FftRootTable<F>>,
     ) -> PolynomialValues<F> {
         fft_with_options(self, zero_factor, root_table)
+    }
+
+    /// [`Self::fft_with_options`] for coefficients whose live prefix
+    /// (`coeffs[..len >> zero_factor]`) the caller has already bit-reversed.
+    /// See [`crate::fft::fft_with_options_prefix_bit_reversed`].
+    pub fn fft_with_options_prefix_bit_reversed(
+        self,
+        zero_factor: Option<usize>,
+        root_table: Option<&FftRootTable<F>>,
+    ) -> PolynomialValues<F> {
+        fft_with_options_prefix_bit_reversed(self, zero_factor, root_table)
     }
 
     /// Returns the evaluation of the polynomial on the coset `shift*H`.
