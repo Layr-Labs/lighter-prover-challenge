@@ -337,6 +337,42 @@ impl<F: Field> WitnessWrite<F> for PartitionSeeder<'_, '_, F> {
     }
 }
 
+/// Like [`PartitionSeeder`], but for resuming an already-running generation:
+/// it also skips expired generators and records which unfinished generators
+/// became newly runnable, exactly as [`PendingPartitionWitness::feed`] does
+/// while draining a `PartialWitness`.
+#[allow(missing_debug_implementations)]
+pub struct PartitionFeeder<'a, 'b, F: Field> {
+    witness: &'b mut PartitionWitness<'a, F>,
+    unresolved_watches: &'b mut [usize],
+    generator_is_expired: &'b [bool],
+    generator_indices_by_watches: &'b BTreeMap<usize, Vec<usize>>,
+    pending_generator_indices: Vec<usize>,
+}
+
+impl<F: Field> WitnessWrite<F> for PartitionFeeder<'_, '_, F> {
+    fn set_target(&mut self, target: Target, value: F) -> Result<()> {
+        if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
+            if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
+                for &generator_idx in watchers {
+                    if !self.generator_is_expired[generator_idx] {
+                        debug_assert_ne!(self.unresolved_watches[generator_idx], 0);
+                        self.unresolved_watches[generator_idx] -= 1;
+                        self.pending_generator_indices.push(generator_idx);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<F: Field> Witness<F> for PartitionFeeder<'_, '_, F> {
+    fn try_get_target(&self, target: Target) -> Option<F> {
+        self.witness.try_get_target(target)
+    }
+}
+
 impl<F: Field> Witness<F> for PartitionSeeder<'_, '_, F> {
     fn try_get_target(&self, target: Target) -> Option<F> {
         self.witness.try_get_target(target)
@@ -490,6 +526,38 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
     /// Sets newly available inputs and resumes witness generation. Only the unfinished watchers of
     /// newly populated representatives are queued; every other unfinished generator was already
     /// run to quiescence and cannot make progress without new values.
+    /// Like [`Self::feed`], but the caller writes the newly available inputs
+    /// through a [`PartitionSeeder`] instead of staging them in a
+    /// `PartialWitness` hash map first. Feeding a recursive proof means tens
+    /// of thousands of targets, so this removes a full map build and drain
+    /// per call. The seeder performs the same
+    /// `set_target_returning_rep` calls and the same watcher bookkeeping, so
+    /// the resumed worklist is identical.
+    pub fn feed_seeded(
+        &mut self,
+        seed: impl FnOnce(&mut PartitionFeeder<'a, '_, F>) -> Result<()>,
+    ) -> Result<()> {
+        let mut feeder = PartitionFeeder {
+            witness: &mut self.witness,
+            unresolved_watches: &mut self.unresolved_watches,
+            generator_is_expired: &self.generator_is_expired,
+            generator_indices_by_watches: &self.prover_data.generator_indices_by_watches,
+            pending_generator_indices: Vec::new(),
+        };
+        seed(&mut feeder)?;
+        let pending_generator_indices = feeder.pending_generator_indices;
+
+        run_generator_worklist(
+            &mut self.witness,
+            self.prover_data,
+            &mut self.unresolved_watches,
+            &mut self.generator_is_expired,
+            &mut self.remaining_generators,
+            pending_generator_indices,
+            self.parallel_threshold,
+        )
+    }
+
     pub fn feed(&mut self, inputs: PartialWitness<F>) -> Result<()> {
         let generator_indices_by_watches = &self.prover_data.generator_indices_by_watches;
 
