@@ -195,6 +195,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for MulExtensionGa
         self.num_ops * 3 * D
     }
 
+    fn u32_quotient_gate(&self) -> Option<crate::gates::gate::U32QuotientGate> {
+        Some(crate::gates::gate::U32QuotientGate::MulExtension {
+            num_ops: self.num_ops,
+            d: D,
+        })
+    }
+
     fn num_constants(&self) -> usize {
         1
     }

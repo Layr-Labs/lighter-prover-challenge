@@ -872,6 +872,65 @@ fn gpu_poseidon_quotient_diagnostics_enabled() -> bool {
     })
 }
 
+/// Per-circuit gate census, printed once per distinct circuit shape when the
+/// GPU quotient diagnostics env var is set.
+///
+/// This exists because **a sampling profiler structurally cannot attribute gate
+/// work to a circuit here**: every gate-eval sample roots at the rayon worker
+/// pool, and work-stealing severs the frames that name the circuit
+/// (`prove_path`, `chain_step_proof`, `prove_block`). Phase attribution works;
+/// circuit attribution does not. This is the only instrument that closes that
+/// gap, and it has already produced three results nothing else could — the
+/// 136 -> 100 gather narrowing, the `M` collapse from 88 to 4 driving the
+/// constraint-row saving from ~32% to ~79%, and the finding that
+/// `U32InterleaveGate`/`UninterleaveToU32Gate` are absent from both transaction
+/// circuits (which retired an offload lead worth ~0.9%).
+///
+/// Env-gated and cfg-gated, so it is inert in the ranked sandbox, which clears
+/// the environment. It was lost once to a base race; please keep it.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn gate_census_once<F: RichField + Extendable<D>, const D: usize>(
+    common_data: &CommonCircuitData<F, D>,
+    excluded_gate_indices: &[usize],
+    cpu_num_wires: usize,
+) {
+    use std::collections::HashSet;
+    use std::fmt::Write as _;
+    use std::sync::Mutex;
+
+    static SEEN: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+
+    let mut report = String::new();
+    let _ = writeln!(
+        report,
+        "[gate-census] degree_bits={} gates={} selectors={} num_gate_constraints={} \
+         gather={cpu_num_wires}/{} excluded={excluded_gate_indices:?}",
+        common_data.degree_bits(),
+        common_data.gates.len(),
+        common_data.selectors_info.num_selectors(),
+        common_data.num_gate_constraints,
+        common_data.config.num_wires,
+    );
+    for (index, gate) in common_data.gates.iter().enumerate() {
+        let _ = writeln!(
+            report,
+            "[gate-census]   {index:>2} wires={:>3} constraints={:>3} degree={} selector={} \
+             off={} id={}",
+            gate.0.num_wires(),
+            gate.0.num_constraints(),
+            gate.0.degree(),
+            common_data.selectors_info.selector_indices[index],
+            excluded_gate_indices.contains(&index) as u8,
+            gate.0.id(),
+        );
+    }
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut seen = seen.lock().unwrap();
+    if seen.insert(report.clone()) {
+        eprint!("{report}");
+    }
+}
+
 /// A deliberately expensive, opt-in production differential: when enabled,
 /// every no-lookup proof recomputes the quotient with the GPU gate disabled
 /// and compares canonical coefficients. This is intended for validation runs,
@@ -1238,6 +1297,111 @@ fn start_gpu_range_check_gate_quotient<
                         expected_constraints,
                     )
                 }
+                U32QuotientGate::BaseSum { num_limbs, base } => {
+                    // The shader unrolls the range product, so the base is
+                    // capped; both live bases (2 and 4) are well inside it.
+                    if num_limbs == 0 || !(2..=8).contains(&base) {
+                        if gpu_poseidon_quotient_diagnostics_enabled() {
+                            eprintln!(
+                                "[gpu-range-quotient] invalid base-sum metadata: {u32_gate:?}"
+                            );
+                        }
+                        return None;
+                    }
+                    (
+                        U32QuotientKind::BaseSum { base },
+                        num_limbs,
+                        num_limbs.checked_add(1)?,
+                        num_limbs.checked_add(1)?,
+                    )
+                }
+                U32QuotientGate::Exponentiation { num_power_bits } => {
+                    if num_power_bits == 0 {
+                        return None;
+                    }
+                    (
+                        U32QuotientKind::Exponentiation,
+                        num_power_bits,
+                        num_power_bits.checked_mul(2)?.checked_add(2)?,
+                        num_power_bits.checked_add(1)?,
+                    )
+                }
+                // The four families below read their coefficients from the
+                // gate's own constants, which start at `raw_constant_base`.
+                U32QuotientGate::BaseAddition { num_ops } => {
+                    if gate.0.num_constants() != 2
+                        || raw_constant_base.checked_add(2)? > common_data.num_constants
+                    {
+                        return None;
+                    }
+                    (
+                        U32QuotientKind::BaseAddition {
+                            constant_base: raw_constant_base,
+                        },
+                        num_ops,
+                        num_ops.checked_mul(3)?,
+                        num_ops,
+                    )
+                }
+                U32QuotientGate::BaseArithmetic { num_ops } => {
+                    if gate.0.num_constants() != 2
+                        || raw_constant_base.checked_add(2)? > common_data.num_constants
+                    {
+                        return None;
+                    }
+                    (
+                        U32QuotientKind::BaseArithmetic {
+                            constant_base: raw_constant_base,
+                        },
+                        num_ops,
+                        num_ops.checked_mul(4)?,
+                        num_ops,
+                    )
+                }
+                U32QuotientGate::Selection { num_ops } => (
+                    U32QuotientKind::Selection,
+                    num_ops,
+                    num_ops.checked_mul(5)?,
+                    num_ops.checked_mul(2)?,
+                ),
+                U32QuotientGate::Equality { num_ops } => {
+                    if gate.0.num_constants() != 1
+                        || raw_constant_base.checked_add(1)? > common_data.num_constants
+                    {
+                        return None;
+                    }
+                    (
+                        U32QuotientKind::Equality {
+                            constant_base: raw_constant_base,
+                        },
+                        num_ops,
+                        num_ops.checked_mul(6)?,
+                        num_ops.checked_mul(4)?,
+                    )
+                }
+                U32QuotientGate::MulExtension { num_ops, d } => {
+                    // The kernel implements the quadratic extension only.
+                    if d != 2
+                        || gate.0.num_constants() != 1
+                        || raw_constant_base.checked_add(1)? > common_data.num_constants
+                    {
+                        if gpu_poseidon_quotient_diagnostics_enabled() {
+                            eprintln!(
+                                "[gpu-range-quotient] unsupported mul-extension metadata: \
+                                 {u32_gate:?}"
+                            );
+                        }
+                        return None;
+                    }
+                    (
+                        U32QuotientKind::MulExtension {
+                            constant_base: raw_constant_base,
+                        },
+                        num_ops,
+                        num_ops.checked_mul(6)?,
+                        num_ops.checked_mul(2)?,
+                    )
+                }
             };
             if num_ops == 0
                 || gate.0.num_wires() != expected_wires
@@ -1516,12 +1680,22 @@ fn compute_quotient_polys<
         .unwrap_or(0)
         .max(num_routed_wires);
     debug_assert!(cpu_num_wires <= common_data.config.num_wires);
+    // Same argument, applied to the shared constraint rows instead of the wire
+    // gather: an excluded gate's rows stay zero, so the CPU only ever writes
+    // the prefix below and the per-batch memset and Horner reduction can stop
+    // there. Hoisted out of the batch loop exactly like `cpu_num_wires`.
+    let cpu_num_gate_constraints =
+        crate::plonk::vanishing_poly::cpu_gate_constraint_rows(common_data, &excluded_gate_indices);
+    debug_assert!(cpu_num_gate_constraints <= common_data.num_gate_constraints);
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if gpu_poseidon_quotient_diagnostics_enabled() && !excluded_gate_indices.is_empty() {
         eprintln!(
-            "[gpu-gate-quotient] CPU wire gather width {cpu_num_wires}/{}; excluded={excluded_gate_indices:?}",
+            "[gpu-gate-quotient] CPU wire gather width {cpu_num_wires}/{}; \
+             constraint rows {cpu_num_gate_constraints}/{}; excluded={excluded_gate_indices:?}",
             common_data.config.num_wires,
+            common_data.num_gate_constraints,
         );
+        gate_census_once(common_data, &excluded_gate_indices, cpu_num_wires);
     }
 
     // The zero-fill this used to do existed only to seed the Horner chain in
@@ -1770,6 +1944,7 @@ fn compute_quotient_polys<
                     deltas,
                     alphas,
                     &excluded_gate_indices,
+                    cpu_num_gate_constraints,
                     &z_h_on_coset,
                     &lut_re_poly_evals_refs,
                     &mut scratch.vanishing,

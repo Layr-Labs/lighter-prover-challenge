@@ -179,6 +179,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for SelectionGate 
         self.num_ops * Self::TOTAL_PER_OP
     }
 
+    fn u32_quotient_gate(&self) -> Option<crate::gates::gate::U32QuotientGate> {
+        Some(crate::gates::gate::U32QuotientGate::Selection {
+            num_ops: self.num_ops,
+        })
+    }
+
     fn num_constants(&self) -> usize {
         0
     }

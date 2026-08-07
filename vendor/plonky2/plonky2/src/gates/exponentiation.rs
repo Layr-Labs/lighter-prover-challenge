@@ -204,6 +204,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for Exponentiation
         self.wire_intermediate_value(self.num_power_bits - 1) + 1
     }
 
+    fn u32_quotient_gate(&self) -> Option<crate::gates::gate::U32QuotientGate> {
+        Some(crate::gates::gate::U32QuotientGate::Exponentiation {
+            num_power_bits: self.num_power_bits,
+        })
+    }
+
     fn num_constants(&self) -> usize {
         0
     }
