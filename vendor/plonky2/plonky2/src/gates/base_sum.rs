@@ -170,16 +170,34 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> PackedEvaluab
     ) {
         let sum = vars.local_wires[Self::WIRE_SUM];
         let limbs = vars.local_wires.view(self.limbs());
-        let computed_sum = reduce_with_powers(limbs, F::from_canonical_usize(B));
 
-        yield_constr.one(computed_sum - sum);
+        if B == 2 {
+            // Production instantiation. Same terms, same order, same values as the
+            // generic path below: `reduce_with_powers` is Horner from the most
+            // significant limb down, and doubling is `x + x` in any field; the
+            // per-limb range product `prod_{i<2}(limb - i)` is `limb * (limb - 1)`.
+            // Written out so the generic base-`B` product loop and its
+            // `from_canonical_usize` per term disappear for the case that actually runs.
+            let mut computed_sum = P::ZEROS;
+            for &limb in limbs.iter().rev() {
+                computed_sum = computed_sum + computed_sum + limb;
+            }
+            yield_constr.one(computed_sum - sum);
 
-        let constraints_iter = limbs.iter().map(|&limb| {
-            (0..B)
-                .map(|i| limb - F::from_canonical_usize(i))
-                .product::<P>()
-        });
-        yield_constr.many(constraints_iter);
+            let constraints_iter = limbs.iter().map(|&limb| limb * (limb - F::ONE));
+            yield_constr.many(constraints_iter);
+        } else {
+            let computed_sum = reduce_with_powers(limbs, F::from_canonical_usize(B));
+
+            yield_constr.one(computed_sum - sum);
+
+            let constraints_iter = limbs.iter().map(|&limb| {
+                (0..B)
+                    .map(|i| limb - F::from_canonical_usize(i))
+                    .product::<P>()
+            });
+            yield_constr.many(constraints_iter);
+        }
     }
 }
 
@@ -261,5 +279,51 @@ mod tests {
         type C = PoseidonGoldilocksConfig;
         type F = <C as GenericConfig<D>>::F;
         test_eval_fns::<F, C, _, D>(BaseSumGate::<6>::new(11))
+    }
+
+    /// Manual timing harness for the packed accumulate path of the production
+    /// `B = 2` gate. Run with:
+    /// `cargo test --release -p plonky2 base_sum_accumulate_micro -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual timing harness"]
+    fn base_sum_accumulate_microbenchmark() {
+        use core::hint::black_box;
+        use std::time::Instant;
+
+        use plonky2_field::types::{Field, Sample};
+
+        use crate::gates::gate::Gate;
+        use crate::plonk::vars::EvaluationVarsBaseBatch;
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+        let gate = BaseSumGate::<2>::new(32);
+        let n = 32;
+        let wires = F::rand_vec(<BaseSumGate<2> as Gate<F, D>>::num_wires(&gate) * n);
+        let constants: Vec<F> = Vec::new();
+        let hash = crate::hash::hash_types::HashOut::ZERO;
+        let filters = F::rand_vec(n);
+        let nc = <BaseSumGate<2> as Gate<F, D>>::num_constraints(&gate);
+        let mut combined = vec![F::ZERO; nc * n];
+        let iters = 50_000u32;
+        let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+
+        let mut t = 0.0f64;
+        for _ in 0..4 {
+            let s = Instant::now();
+            for _ in 0..iters {
+                <BaseSumGate<2> as Gate<F, D>>::eval_unfiltered_base_batch_accumulate(
+                    &gate,
+                    vars,
+                    &filters,
+                    black_box(&mut combined),
+                );
+            }
+            t += s.elapsed().as_secs_f64();
+        }
+        println!(
+            "base_sum B=2 accumulate per batch (n=32): {:.3} us",
+            t / (4.0 * iters as f64) * 1e6
+        );
     }
 }
