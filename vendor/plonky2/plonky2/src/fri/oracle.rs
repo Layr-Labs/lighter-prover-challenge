@@ -205,17 +205,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 let lde_len = degree << rate_bits;
                 let mut buffer = Vec::with_capacity(lde_len);
                 buffer.extend_from_slice(&p.coeffs);
-                if rate_bits == 0 || degree < 2 {
-                    buffer.resize(lde_len, F::ZERO);
-                } else {
-                    // SAFETY: capacity is exactly `lde_len`. With `Some(rate_bits)`
-                    // the zero-padded FFT reads only the first `degree` coefficients
-                    // and writes every tail element before reading it (all expansion
-                    // paths fill back-to-front), so the tail never needs the memset.
-                    // `degree < 2` is excluded: the first-layer block writes nothing
-                    // for a single live coefficient.
-                    unsafe { buffer.set_len(lde_len) };
-                }
+                buffer.resize(lde_len, F::ZERO);
                 batch_multiply_inplace(&mut buffer[..degree], &coset_powers);
                 PolynomialCoeffs::new(buffer)
                     .fft_with_options(Some(rate_bits), fft_root_table)

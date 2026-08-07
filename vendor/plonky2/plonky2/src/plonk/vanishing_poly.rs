@@ -946,6 +946,13 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
     constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
     let mut filters = Vec::with_capacity(vars_batch.len());
     for (i, gate) in common_data.gates.iter().enumerate() {
+        // Gates with no constraints (ConstantGate, NoopGate, ...) contribute
+        // nothing: skip their selector-filter computation entirely. The filter
+        // product is only consumed by this gate's own constraints, so no other
+        // gate observes it.
+        if gate.0.num_constraints() == 0 {
+            continue;
+        }
         let selector_index = common_data.selectors_info.selector_indices[i];
         gate.0.eval_filtered_base_batch(
             vars_batch,
