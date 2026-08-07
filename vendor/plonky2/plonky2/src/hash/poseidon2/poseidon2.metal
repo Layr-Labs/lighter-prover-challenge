@@ -439,6 +439,7 @@ kernel void range_check_gate_quotient(
     constant uint& alpha_stride [[buffer(8)]],
     constant uint& range_count [[buffer(9)]],
     constant uint& u32_count [[buffer(10)]],
+    constant uint& base_sum_count [[buffer(11)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= quotient_rows) {
         return;
@@ -982,6 +983,53 @@ kernel void range_check_gate_quotient(
                 constraint_index++);
         }
 
+        total[0] = gl_add(total[0], gl_mul(filter, gate_accumulators[0]));
+        total[1] = gl_add(total[1], gl_mul(filter, gate_accumulators[1]));
+    }
+
+    // BaseSumGate<B>: sum on wire 0, base-B limbs on 1..1+num_limbs. The CPU
+    // emits `reduce_with_powers(limbs, B) - sum` (Horner from the most
+    // significant limb downward) then `prod_{i < B} (limb - i)` per limb.
+    constant uint* base_sum_metadata = metadata + (range_count + u32_count) * 10u;
+    for (uint bs_index = 0; bs_index < base_sum_count; ++bs_index) {
+        constant uint* spec = base_sum_metadata + bs_index * 10u;
+        uint selector_column = spec[0];
+        uint gate_index = spec[1];
+        uint group_start = spec[2];
+        uint group_end = spec[3];
+        uint include_unused_selector = spec[4];
+        uint num_limbs = spec[5];
+        uint base = spec[6];
+
+        ulong selector = constants[(ulong)selector_column * lde_rows + source_row];
+        ulong filter = 1;
+        for (uint i = group_start; i < group_end; ++i) {
+            if (i != gate_index) {
+                filter = gl_mul(filter, gl_sub((ulong)i, selector));
+            }
+        }
+        if (include_unused_selector != 0u) {
+            filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
+        }
+
+        ulong gate_accumulators[2] = { 0, 0 };
+        uint constraint_index = 0;
+        ulong acc = wires[(ulong)num_limbs * lde_rows + source_row];
+        for (uint j = num_limbs; j > 1u; --j) {
+            acc = gl_add(gl_mul(acc, (ulong)base),
+                         wires[(ulong)(j - 1u) * lde_rows + source_row]);
+        }
+        range_check_gate_emit(gl_sub(acc, wires[source_row]), alpha_powers,
+                              alpha_stride, gate_accumulators, constraint_index++);
+        for (uint j = 0; j < num_limbs; ++j) {
+            ulong x = wires[(ulong)(j + 1u) * lde_rows + source_row];
+            ulong product = 1;
+            for (uint i = 0; i < base; ++i) {
+                product = gl_mul(product, gl_sub(x, (ulong)i));
+            }
+            range_check_gate_emit(product, alpha_powers, alpha_stride,
+                                  gate_accumulators, constraint_index++);
+        }
         total[0] = gl_add(total[0], gl_mul(filter, gate_accumulators[0]));
         total[1] = gl_add(total[1], gl_mul(filter, gate_accumulators[1]));
     }

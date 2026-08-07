@@ -25,6 +25,15 @@ use crate::plonk::vars::{
 };
 use crate::util::serialization::{Buffer, IoResult};
 
+/// Static wire-layout metadata for `BaseSumGate<B>`: the sum on wire 0 and
+/// `num_limbs` base-`base` limbs after it. Constraints are one Horner
+/// recomposition then one range product per limb.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BaseSumQuotientGate {
+    pub num_limbs: usize,
+    pub base: usize,
+}
+
 /// Static wire-layout metadata for the base-4 range-check gate quotient
 /// specialization. This lives in the core gate trait so downstream custom
 /// gate crates can opt in without making `plonky2` depend on those crates.
@@ -333,6 +342,11 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
     /// Advertises one of the exact promoted gate layouts to optional quotient
     /// backends. The default leaves unrelated gates on the CPU.
     fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+        None
+    }
+
+    /// Advertises the `BaseSumGate` layout to optional quotient backends.
+    fn base_sum_quotient_gate(&self) -> Option<BaseSumQuotientGate> {
         None
     }
 
