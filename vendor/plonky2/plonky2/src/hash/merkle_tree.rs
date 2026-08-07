@@ -446,14 +446,7 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
 
         // Rayon task creation dominates the tiny subtrees near the leaves. Keep
         // enough parallelism at the upper levels, then recurse synchronously.
-        // This cutoff predates the interleaved base cases above. When it was
-        // last tuned (32 -> 16), a 16-leaf subtree was 31 sequential scalar
-        // sponges, so splitting it further clearly paid. It is now a single
-        // level-order block in which 30 of those 31 hashes run interleaved,
-        // so the work behind one task is larger and cheaper per hash and the
-        // join overhead per unit of useful work went up. A sweep of 16/64/
-        // 128/256 on the public fixture put the minimum at 64.
-        let (left_digest, right_digest) = if num_leaves > 64 {
+        let (left_digest, right_digest) = if num_leaves > 16 {
             plonky2_maybe_rayon::join(
                 || fill_subtree_flat::<F, H>(left_digests_buf, left_leaves, leaf_width, half),
                 || fill_subtree_flat::<F, H>(right_digests_buf, right_leaves, leaf_width, half),
