@@ -135,6 +135,40 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for QuinticMultipl
         self.eval_unfiltered_base_batch_packed(vars_base)
     }
 
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        let const_3 = F::from_canonical_u64(3);
+        let mut chunks = combined_gate_constraints.chunks_exact_mut(n);
+
+        for i in 0..self.num_ops {
+            let a_cols: [&[F]; 5] =
+                core::array::from_fn(|j| col(self.wire_ith_multiplicand_jth_limb_0(i, j)));
+            let b_cols: [&[F]; 5] =
+                core::array::from_fn(|j| col(self.wire_ith_multiplicand_jth_limb_1(i, j)));
+            let c_cols: [&[F]; 5] =
+                core::array::from_fn(|j| col(self.wire_ith_output_jth_limb(i, j)));
+            let mut outs: [&mut [F]; 5] = core::array::from_fn(|_| chunks.next().unwrap());
+
+            for p in 0..n {
+                let a: [F; 5] = core::array::from_fn(|j| a_cols[j][p]);
+                let b: [F; 5] = core::array::from_fn(|j| b_cols[j][p]);
+                let limbs = quintic_mul_limbs(&a, &b, const_3);
+                for k in 0..5 {
+                    outs[k][p] += filters[p] * (limbs[k] - c_cols[k][p]);
+                }
+            }
+        }
+    }
+
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,
