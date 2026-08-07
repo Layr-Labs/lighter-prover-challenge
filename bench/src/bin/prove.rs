@@ -62,7 +62,7 @@ fn main() {
         PUBLIC_LIGHT_TX_COUNT,
     )
     .expect("invalid prover fixture");
-    let proof = prover::prove_block(block, &Circuits::new());
+    let proof = prover::prove_block(block, Circuits::new());
     let mut writer = BufWriter::with_capacity(
         PROOF_OUTPUT_BUFFER_BYTES,
         File::create(output).expect("cannot create proof output"),
