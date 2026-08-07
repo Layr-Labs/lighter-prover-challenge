@@ -43,12 +43,22 @@ const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
 // still keeping the genuinely CPU-favored tiny shapes (2^15 width-8 measured
 // 1.37) on the CPU.
 const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
-/// Upper bound on concurrently in-flight GPU tree builds. One set serializes
-/// GPU tree builds exactly like the promoted base's global context mutex: a
-/// 3-set experiment measured 13-18% faster locally but scored -21.6% on the
-/// official ranked host (submission 41467098), so concurrent GPU submission is
-/// intentionally disabled.
-const MAX_BUFFER_SETS: usize = 1;
+/// Upper bound on concurrently *owned* GPU buffer sets.
+///
+/// This is deliberately larger than the number of concurrently *submitted*
+/// command buffers, which `MetalShared::submit` still pins at exactly one: a
+/// 3-set experiment that also let three command buffers run at once measured
+/// 13-18% faster locally but scored -21.6% on the official ranked host
+/// (submission 41467098), so concurrent GPU submission stays disabled.
+///
+/// Owning a second set only lets one thread copy finished digests out of its
+/// own output buffer while another thread drives the GPU. That copy is pure
+/// CPU work, and instrumenting a public run showed it held the single set for
+/// 3.735 s of the 12.737 s the set was held at all (29%), while 6.827 s of
+/// acquisition wait piled up behind it. For the 2^17-leaf trees that only the
+/// serial chain-fold spine builds, the copy-out (29.3 ms mean) cost longer
+/// than the GPU work it was serializing behind (24.6 ms mean).
+const MAX_BUFFER_SETS: usize = 2;
 /// Parallel staging copy granularity in u64 elements (4 MiB chunks).
 const STAGING_CHUNK: usize = 1 << 19;
 
@@ -70,6 +80,11 @@ struct MetalShared {
     range_check_gate_quotient_pipeline: Option<ComputePipelineState>,
     parameters: Buffer,
     pool: Mutex<BufferPool>,
+    /// Serializes command-buffer submission so exactly one Merkle build occupies
+    /// the GPU at a time, preserving the promoted single-stream behaviour. Held
+    /// only across encode/commit/wait, never across the CPU-side staging copy or
+    /// the digest copy-out.
+    submit: Mutex<()>,
     available: Condvar,
     /// Per-`log2(lde_size)` concatenated FFT twiddle rows (canonical u64), with
     /// `offsets[lg_half_m]` giving each stage row's element offset.
@@ -963,6 +978,7 @@ impl MetalShared {
                 poseidon_gate_quotient_pipeline,
                 range_check_gate_quotient_pipeline,
                 parameters,
+                submit: Mutex::new(()),
                 pool: Mutex::new(BufferPool {
                     free: Vec::new(),
                     created: 0,
@@ -1883,6 +1899,15 @@ impl MetalShared {
         let output_buffer = set.output.as_ref().unwrap();
 
         let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
+        // Everything from here through `wait_until_completed` is the GPU
+        // submission proper and stays strictly serialized. The staging copy
+        // above and the digest copy-out below are CPU work and deliberately run
+        // outside this lock, so the second buffer-set owner can overlap them
+        // with this thread's GPU stream.
+        let submitted = self
+            .submit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let leaf_count_u32 = leaf_count as u32;
             let leaf_width_u32 = leaf_width as u32;
@@ -1956,11 +1981,10 @@ impl MetalShared {
         });
 
         command_buffer.wait_until_completed();
-        if command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(format!(
-                "command buffer ended with status {:?}",
-                command_buffer.status()
-            ));
+        let status = command_buffer.status();
+        drop(submitted);
+        if status != MTLCommandBufferStatus::Completed {
+            return Err(format!("command buffer ended with status {status:?}"));
         }
 
         let nodes =
