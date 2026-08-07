@@ -9,8 +9,13 @@ use crate::types::Field;
 pub struct ZeroPolyOnCoset<F: Field> {
     /// `n = |H|`.
     n: F,
-    /// `rate = |K|/|H|`.
-    rate: usize,
+    /// `rate - 1`. `rate = |K|/|H| = 1 << rate_bits` is a power of two by
+    /// construction, so the wrap-around index `i % rate` used by [`Self::eval`]
+    /// and [`Self::eval_inverse`] is exactly `i & rate_mask` — same value, but a
+    /// single-cycle AND instead of the hardware integer division the modulus
+    /// compiles to (`rate` is a runtime field, so the power-of-two form is not
+    /// visible to the optimizer at the use sites).
+    rate_mask: usize,
     /// Holds `g^n * (w^n)^i - 1 = g^n * v^i - 1` for `i in 0..rate`, with `w` a generator of `K` and `v` a
     /// `rate`-primitive root of unity.
     evals: Vec<F>,
@@ -35,7 +40,7 @@ impl<F: Field> ZeroPolyOnCoset<F> {
         let inverses = F::batch_multiplicative_inverse(&evals);
         Self {
             n: F::from_canonical_usize(1 << n_log),
-            rate: 1 << rate_bits,
+            rate_mask: (1 << rate_bits) - 1,
             evals,
             inverses,
             l_0_denominator_inverses: None,
@@ -52,12 +57,12 @@ impl<F: Field> ZeroPolyOnCoset<F> {
 
     /// Returns `Z_H(g * w^i)`.
     pub fn eval(&self, i: usize) -> F {
-        self.evals[i % self.rate]
+        self.evals[i & self.rate_mask]
     }
 
     /// Returns `1 / Z_H(g * w^i)`.
     pub fn eval_inverse(&self, i: usize) -> F {
-        self.inverses[i % self.rate]
+        self.inverses[i & self.rate_mask]
     }
 
     /// Like `eval_inverse`, but for a range of indices starting with `i_start`.
@@ -78,5 +83,35 @@ impl<F: Field> ZeroPolyOnCoset<F> {
             return self.eval(i) * table[i];
         }
         self.eval(i) * (self.n * (x - F::ONE)).inverse()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::goldilocks_field::GoldilocksField;
+
+    /// `eval` / `eval_inverse` index with `i & rate_mask`; that must be
+    /// raw-`u64` identical to the `i % rate` it replaced, over every index the
+    /// quotient pass can reach (`0..n * rate`) and then some.
+    #[test]
+    fn masked_index_matches_modulus() {
+        type F = GoldilocksField;
+
+        for n_log in [0usize, 1, 4, 8] {
+            for rate_bits in [0usize, 1, 3, 4] {
+                let z = ZeroPolyOnCoset::<F>::new(n_log, rate_bits);
+                let rate = 1usize << rate_bits;
+                assert_eq!(z.rate_mask, rate - 1);
+                for i in 0..(1usize << n_log) * rate + 2 * rate {
+                    assert_eq!(z.eval(i).0, z.evals[i % rate].0, "eval({i})");
+                    assert_eq!(
+                        z.eval_inverse(i).0,
+                        z.inverses[i % rate].0,
+                        "eval_inverse({i})"
+                    );
+                }
+            }
+        }
     }
 }

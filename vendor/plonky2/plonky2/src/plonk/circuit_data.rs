@@ -371,6 +371,16 @@ pub struct ProverOnlyCircuitData<
     /// Generator indices (within the `Vec` above), indexed by the representative of each target
     /// they watch.
     pub generator_indices_by_watches: BTreeMap<usize, Vec<usize>>,
+    /// For each generator (indexed as in `generators`), the number of *distinct* representatives
+    /// it watches — equivalently, the number of entries of `generator_indices_by_watches` whose
+    /// watcher list contains that generator.
+    ///
+    /// Derived once inside the builder's `generator_indices_by_watches` construction pass so that
+    /// witness generation can seed its `unresolved_watches` counters by cloning this vector and
+    /// decrementing on first population, instead of traversing the entire watcher map at the
+    /// start of every proof. Runtime-only: it is a pure function of `generator_indices_by_watches`
+    /// and is reconstructed on deserialization, so the serialized format is unchanged.
+    pub generator_watch_counts: Vec<usize>,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.
@@ -381,7 +391,11 @@ pub struct ProverOnlyCircuitData<
     pub public_inputs: Vec<Target>,
     /// A map from each `Target`'s index to the index of its representative in the disjoint-set
     /// forest.
-    pub representative_map: Vec<usize>,
+    ///
+    /// Stored as `u32` (see [`crate::plonk::permutation_argument::Forest`]); values are
+    /// zero-extended at every indexing site. The serialized encoding keeps the legacy 8-byte
+    /// per-entry format.
+    pub representative_map: Vec<u32>,
     /// Pre-computed roots for faster FFT.
     pub fft_root_table: Option<FftRootTable<F>>,
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to
