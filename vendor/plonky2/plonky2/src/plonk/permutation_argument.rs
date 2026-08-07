@@ -13,7 +13,10 @@ use crate::iop::wire::Wire;
 /// sequentially for every column. `par_chunks` is an indexed parallel iterator, so the collected
 /// column order and the sequential element order within every column are unchanged; only task
 /// placement moves. Flip to `false` to restore the previous sequential-outer schedule exactly.
-const OUTER_PARALLEL_SIGMA_COLUMNS: bool = false;
+// Enable outer-parallel column map: one Rayon job per sigma column rather than
+// sequential-outer + inner par_iter. Indexed par_chunks preserves column order
+// and element order within each column.
+const OUTER_PARALLEL_SIGMA_COLUMNS: bool = true;
 
 /// Disjoint Set Forest data-structure following <https://en.wikipedia.org/wiki/Disjoint-set_data_structure>.
 pub struct Forest {
@@ -114,17 +117,31 @@ impl Forest {
     /// loop reaches it. Roots are stable during this pass, so the final `parents` vector is
     /// identical to calling `find(i)` for every `i`.
     pub(crate) fn compress_paths(&mut self) {
-        for i in 0..self.parents.len() {
-            let parent = self.parents[i];
-            if parent as usize == i {
-                continue;
-            }
-            let mut root = parent;
-            while self.parents[root as usize] != root {
-                root = self.parents[root as usize];
-            }
-            self.parents[i] = root;
+        let n = self.parents.len();
+        if n == 0 {
+            return;
         }
+        // Path-halving rounds collapse deep chains so parallel root-finds are short.
+        for _ in 0..3 {
+            for i in 0..n {
+                let p = self.parents[i] as usize;
+                self.parents[i] = self.parents[p];
+            }
+        }
+        // Parallel read-only root-find into a fresh map. Final parents are
+        // bit-identical to sequential one-write compression (every node → root).
+        let parents = &self.parents;
+        let reps: Vec<u32> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mut x = i as u32;
+                while parents[x as usize] != x {
+                    x = parents[x as usize];
+                }
+                x
+            })
+            .collect();
+        self.parents = reps;
     }
 
     /// Assumes `compress_paths` has already been called.

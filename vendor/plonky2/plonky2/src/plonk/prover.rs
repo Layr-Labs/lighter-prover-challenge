@@ -493,8 +493,10 @@ fn wires_permutation_partial_products_and_zs<
 
     // The permutation argument only consumes one numerator/denominator ratio per quotient-degree
     // chunk. Form those products before Montgomery inversion, shrinking each inversion batch by
-    // `degree` and reading every witness wire only once.
-    const INV_BATCH: usize = 128;
+    // `degree` and reading every witness wire only once. Raised 128 → 256: halves the number of
+    // actual field inversions while the scratch still fits in L1; field inverses are unique so
+    // every quotient value is bit-identical.
+    const INV_BATCH: usize = 256;
     let mut all_quotient_chunk_products = vec![F::ZERO; subgroup.len() * num_chunks];
     all_quotient_chunk_products
         .par_chunks_mut(INV_BATCH * num_chunks)

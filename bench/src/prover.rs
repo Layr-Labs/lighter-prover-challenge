@@ -30,7 +30,10 @@ enum TxPath {
     Light,
 }
 
-const LIGHT_TX_PROOF_WINDOW: usize = 2;
+// One extra light-chunk proof ahead of the serial chain consumer. Window 3 is
+// the measured local optimum on this lineage (window 4 regressed under memory
+// pressure); ~0.6 GB extra peak vs window 2, well within runner RAM.
+const LIGHT_TX_PROOF_WINDOW: usize = 3; // near-miss-resubmit-v1 (11.250 on m4-30548 vs 11.321)
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
