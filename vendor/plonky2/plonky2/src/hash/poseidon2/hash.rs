@@ -1,8 +1,6 @@
 use core::fmt::Debug;
 
 use plonky2_field::ops::Square;
-use plonky2_field::packable::Packable;
-use plonky2_field::packed::PackedField;
 
 use super::config::*;
 use crate::field::extension::{Extendable, FieldExtension};
@@ -468,23 +466,6 @@ fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
 
 impl Poseidon2 for F {
     #[inline]
-    fn internal_linear_layer(state: &mut [Self; WIDTH]) {
-        type Packing = <F as Packable>::Packing;
-
-        // The 12-lane state is three contiguous four-lane AArch64 vectors.
-        // Multiplying before adding preserves the scalar fused result exactly.
-        debug_assert_eq!(<Packing as PackedField>::WIDTH, 4);
-        let sum = Packing::from(sum_12(state));
-        let diagonal: [F; WIDTH] =
-            core::array::from_fn(|i| F::from_canonical_u64(MATRIX_DIAG_12_U64[i]));
-        let packed_state = Packing::pack_slice_mut(state);
-        let packed_diagonal = Packing::pack_slice(&diagonal);
-        for (state, &diagonal) in packed_state.iter_mut().zip(packed_diagonal) {
-            *state = sum + *state * diagonal;
-        }
-    }
-
-    #[inline]
     fn sbox_p(a: &Self) -> Self {
         let a2 = a.square();
         let a4 = a2.square();
@@ -561,11 +542,39 @@ impl<T> AsRef<[T]> for Poseidon2Permutation<T> {
 
 trait Permuter: Sized {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH];
+
+    /// Four-state variant of `Self::permute`; each output is bit-identical to
+    /// `Self::permute` on the corresponding input. The default is a scalar
+    /// loop; Poseidon2 overrides it with the interleaved `poseidon2_x4`.
+    #[inline]
+    fn permute_x4(
+        input_a: [Self; WIDTH],
+        input_b: [Self; WIDTH],
+        input_c: [Self; WIDTH],
+        input_d: [Self; WIDTH],
+    ) -> ([Self; WIDTH], [Self; WIDTH], [Self; WIDTH], [Self; WIDTH]) {
+        (
+            Self::permute(input_a),
+            Self::permute(input_b),
+            Self::permute(input_c),
+            Self::permute(input_d),
+        )
+    }
 }
 
 impl<F: Poseidon2> Permuter for F {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH] {
         <F as Poseidon2>::poseidon2(input)
+    }
+
+    #[inline]
+    fn permute_x4(
+        input_a: [Self; WIDTH],
+        input_b: [Self; WIDTH],
+        input_c: [Self; WIDTH],
+        input_d: [Self; WIDTH],
+    ) -> ([Self; WIDTH], [Self; WIDTH], [Self; WIDTH], [Self; WIDTH]) {
+        <F as Poseidon2>::poseidon2_x4(input_a, input_b, input_c, input_d)
     }
 }
 
@@ -607,6 +616,15 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
 
     fn permute(&mut self) {
         self.state = T::permute(self.state);
+    }
+
+    fn permute_x4(a: &mut Self, b: &mut Self, c: &mut Self, d: &mut Self) {
+        let (a_state, b_state, c_state, d_state) =
+            T::permute_x4(a.state, b.state, c.state, d.state);
+        a.state = a_state;
+        b.state = b_state;
+        c.state = c_state;
+        d.state = d_state;
     }
 
     fn squeeze(&self) -> &[T] {

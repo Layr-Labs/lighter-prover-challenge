@@ -4,11 +4,6 @@ use core::cmp::{max, min};
 use plonky2_util::{log2_strict, reverse_index_bits_in_place};
 use unroll::unroll_for_loops;
 
-#[cfg(target_arch = "aarch64")]
-use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
-#[cfg(target_arch = "aarch64")]
-use crate::goldilocks_field::mul_16th_root_powers;
-
 use crate::packable::Packable;
 use crate::packed::PackedField;
 use crate::polynomial::{PolynomialCoeffs, PolynomialValues};
@@ -457,33 +452,6 @@ fn fft_zero_padded_first_layer_block<P: PackedField>(
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn fft_zero_padded_rate_8_first_layer_block(
-    packed_values: &mut [WideGoldilocksField],
-    source_start: usize,
-    nonzero_len: usize,
-    destination: usize,
-) {
-    debug_assert!(nonzero_len >= 2);
-
-    for pair in (0..nonzero_len / 2).rev() {
-        let source = source_start + pair * 2;
-        let u = packed_values[source / 4].as_slice()[source % 4];
-        let v = packed_values[(source + 1) / 4].as_slice()[(source + 1) % 4];
-        let products = mul_16th_root_powers(v);
-        let low = *WideGoldilocksField::from_slice(&products[..4]);
-        let high = *WideGoldilocksField::from_slice(&products[4..]);
-        let u = WideGoldilocksField::from(u);
-        let pair_destination = destination + pair * 4;
-
-        packed_values[pair_destination] = u + low;
-        packed_values[pair_destination + 1] = u + high;
-        packed_values[pair_destination + 2] = u - low;
-        packed_values[pair_destination + 3] = u - high;
-    }
-}
-
 /// Expand a bit-reversed nonzero prefix and perform its first nontrivial FFT layer in one pass.
 ///
 /// This is called only when each repeated run contains at least one packed vector.
@@ -522,34 +490,6 @@ fn fft_zero_padded_cache_blocks<P: PackedField>(
     for block in (0..num_blocks).rev() {
         let source_start = block * nonzero_per_block;
         let destination = block * packed_block_len;
-        #[cfg(target_arch = "aarch64")]
-        if r == 3 && core::any::TypeId::of::<P>() == core::any::TypeId::of::<WideGoldilocksField>()
-        {
-            let wide_values = unsafe {
-                // SAFETY: The TypeId check proves this is the exact concrete packed type;
-                // only the generic spelling of the slice differs at this point.
-                core::slice::from_raw_parts_mut(
-                    packed_values.as_mut_ptr().cast::<WideGoldilocksField>(),
-                    packed_values.len(),
-                )
-            };
-            fft_zero_padded_rate_8_first_layer_block(
-                wide_values,
-                source_start,
-                nonzero_per_block,
-                destination,
-            );
-        } else {
-            fft_zero_padded_first_layer_block(
-                packed_values,
-                source_start,
-                nonzero_per_block,
-                destination,
-                packed_repeat,
-                omega_table,
-            );
-        }
-        #[cfg(not(target_arch = "aarch64"))]
         fft_zero_padded_first_layer_block(
             packed_values,
             source_start,

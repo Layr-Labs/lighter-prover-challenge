@@ -15,7 +15,7 @@ use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
@@ -247,21 +247,50 @@ pub(crate) fn fri_proof_of_work<
     // state with any inputs (excluding the PoW witness candidate). The second step is to overwrite
     // one more element of our sponge state with the candidate, then apply the permutation,
     // obtaining our duplex's post-state which contains the PoW response.
+    //
+    // We evaluate four candidates per permutation, batching the four independent
+    // duplex permutations in lockstep via `Permutation::permute_x4`. Results are
+    // bit-identical to a scalar search; only the instruction stream is fused.
     let mut duplex_intermediate_state = challenger.sponge_state;
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
+    let max_candidate = F::NEG_ONE.to_canonical_u64();
+    let block_count = max_candidate / 4 + 1;
+    let pow_witness = (0..block_count)
         .into_par_iter()
-        .find_any(|&candidate| {
-            let mut duplex_state = duplex_intermediate_state;
-            duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-            duplex_state.permute();
-            let pow_response = duplex_state.squeeze().iter().last().unwrap();
-            let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-            leading_zeros >= min_leading_zeros
+        .find_map_any(|block| {
+            let base = block * 4;
+            let mut states = [duplex_intermediate_state; 4];
+            let mut n = 0;
+            for (i, state) in states.iter_mut().enumerate() {
+                let candidate = base + i as u64;
+                if candidate > max_candidate {
+                    break;
+                }
+                state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+                n = i + 1;
+            }
+            if n == 4 {
+                let [mut s0, mut s1, mut s2, mut s3] = states;
+                <<C as GenericConfig<D>>::Hasher as Hasher<F>>::Permutation::permute_x4(
+                    &mut s0, &mut s1, &mut s2, &mut s3,
+                );
+                states = [s0, s1, s2, s3];
+            } else {
+                for state in states.iter_mut().take(n) {
+                    state.permute();
+                }
+            }
+            for (i, state) in states.iter().take(n).enumerate() {
+                let pow_response = state.squeeze().iter().last().unwrap();
+                let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
+                if leading_zeros >= min_leading_zeros {
+                    return Some(F::from_canonical_u64(base + i as u64));
+                }
+            }
+            None
         })
-        .map(F::from_canonical_u64)
         .expect("Proof of work failed. This is highly unlikely!");
 
     // Recompute pow_response using our normal Challenger code, and make sure it matches.
