@@ -268,6 +268,40 @@ impl BlockTxChainCircuit {
         Ok(pw)
     }
 
+    /// [`Self::witness_inputs_early`] written directly into `w` (e.g. a
+    /// `PartitionSeeder`) instead of a `PartialWitness` map. The same targets
+    /// receive the same values as the template-plus-clone path — first
+    /// population wins in both, and no map is built, cloned, or replayed.
+    pub fn witness_inputs_early_into<W: WitnessWrite<F>>(
+        w: &mut W,
+        target: &BlockTxChainTarget,
+        circuit_data: &CircuitData<F, C, D>,
+        dummy_proof_cyclic: &ProofWithPublicInputs<F, C, D>,
+        recursion_step: u64,
+        current_block_tx_proof: &ProofWithPublicInputs<F, C, D>,
+    ) -> Result<()> {
+        w.set_verifier_data_target(&target.self_verifier_data, &circuit_data.verifier_only)?;
+        // This will take place of `DummyProofGenerator`
+        w.set_proof_with_pis_target(
+            &target.dummy_proof_with_pis_target_cyclic,
+            dummy_proof_cyclic,
+        )?;
+        w.set_proof_with_pis_target(&target.tx_proof, current_block_tx_proof)?;
+        w.set_target(target.recursion_step, F::from_canonical_u64(recursion_step))?;
+        Ok(())
+    }
+
+    /// [`Self::witness_inputs_cyclic`] written directly into `w` (e.g. a
+    /// `FeedSeeder`) instead of a `PartialWitness` map.
+    pub fn witness_inputs_cyclic_into<W: WitnessWrite<F>>(
+        w: &mut W,
+        target: &BlockTxChainTarget,
+        cyclic_proof: &ProofWithPublicInputs<F, C, D>,
+    ) -> Result<()> {
+        w.set_proof_with_pis_target(&target.cyclic_proof, cyclic_proof)?;
+        Ok(())
+    }
+
     /// Proves a chain step whose witness inputs were supplied through a
     /// [`PendingPartitionWitness`].
     pub fn prove_prepared(

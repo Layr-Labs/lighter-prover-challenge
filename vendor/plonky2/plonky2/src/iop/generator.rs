@@ -343,6 +343,49 @@ impl<F: Field> Witness<F> for PartitionSeeder<'_, '_, F> {
     }
 }
 
+/// Direct-feeding adapter for [`PendingPartitionWitness::feed_seeded`]: writes
+/// values straight into the partition's representative slots with the same
+/// per-value bookkeeping as [`PendingPartitionWitness::feed`] — unfinished
+/// watchers of each newly populated representative are decremented and queued
+/// exactly once — without routing the values through a `PartialWitness` map
+/// first.
+pub struct FeedSeeder<'a, 'b, F: Field> {
+    witness: &'b mut PartitionWitness<'a, F>,
+    unresolved_watches: &'b mut [usize],
+    generator_is_expired: &'b [bool],
+    generator_indices_by_watches: &'b BTreeMap<usize, Vec<usize>>,
+    pending_generator_indices: &'b mut Vec<usize>,
+}
+
+impl<F: Field> Debug for FeedSeeder<'_, '_, F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FeedSeeder").finish_non_exhaustive()
+    }
+}
+
+impl<F: Field> WitnessWrite<F> for FeedSeeder<'_, '_, F> {
+    fn set_target(&mut self, target: Target, value: F) -> Result<()> {
+        if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
+            if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
+                for &watching_generator_idx in watchers {
+                    if !self.generator_is_expired[watching_generator_idx] {
+                        debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
+                        self.unresolved_watches[watching_generator_idx] -= 1;
+                        self.pending_generator_indices.push(watching_generator_idx);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<F: Field> Witness<F> for FeedSeeder<'_, '_, F> {
+    fn try_get_target(&self, target: Target) -> Option<F> {
+        self.witness.try_get_target(target)
+    }
+}
+
 /// Resumable witness generation: [`Self::start`] seeds an initial set of inputs and runs every
 /// generator that can already make progress, each [`Self::feed`] sets newly available inputs and
 /// resumes only the generators watching them, and [`Self::finish`] performs the same completeness
@@ -507,6 +550,35 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
                 }
             }
         }
+
+        run_generator_worklist(
+            &mut self.witness,
+            self.prover_data,
+            &mut self.unresolved_watches,
+            &mut self.generator_is_expired,
+            &mut self.remaining_generators,
+            pending_generator_indices,
+            self.parallel_threshold,
+        )
+    }
+
+    /// Like [`Self::feed`], but the inputs are written by `seed` directly into
+    /// the partition through a [`FeedSeeder`] — no intermediate
+    /// `PartialWitness` map is built or replayed. The resumed worklist is the
+    /// same: the unfinished watchers of every newly populated representative,
+    /// each decremented and queued exactly once.
+    pub fn feed_seeded(
+        &mut self,
+        seed: impl FnOnce(&mut FeedSeeder<'a, '_, F>) -> Result<()>,
+    ) -> Result<()> {
+        let mut pending_generator_indices = Vec::new();
+        seed(&mut FeedSeeder {
+            witness: &mut self.witness,
+            unresolved_watches: &mut self.unresolved_watches,
+            generator_is_expired: &self.generator_is_expired,
+            generator_indices_by_watches: &self.prover_data.generator_indices_by_watches,
+            pending_generator_indices: &mut pending_generator_indices,
+        })?;
 
         run_generator_worklist(
             &mut self.witness,
@@ -1348,6 +1420,76 @@ mod tests {
         )?;
         outer.verify(single_shot_proof)?;
         outer.verify(two_phase_proof)
+    }
+
+    /// Differential: `start_seeded` + `feed_seeded` (direct partition writes)
+    /// must equal `start` + `feed` (map-replay) on every deterministic witness
+    /// position, and the resulting proof must verify.
+    #[test]
+    fn seeded_start_and_feed_match_map_paths_for_recursive_circuit() -> Result<()> {
+        let (outer, early_inputs, late_inputs) = two_inner_proof_fixture()?;
+
+        let mut map_pending = PendingPartitionWitness::start(
+            early_inputs.clone(),
+            &outer.prover_only,
+            &outer.common,
+        )?;
+        map_pending.feed(late_inputs.clone())?;
+        let map_witness = map_pending.finish()?;
+
+        // A second map-path run isolates the positions written by the
+        // circuit's `RandomValueGenerator`s.
+        let mut map_pending_repeat = PendingPartitionWitness::start(
+            early_inputs.clone(),
+            &outer.prover_only,
+            &outer.common,
+        )?;
+        map_pending_repeat.feed(late_inputs.clone())?;
+        let map_witness_repeat = map_pending_repeat.finish()?;
+        let num_random_generators = count_random_generators(&outer.prover_only);
+
+        let mut seeded_pending =
+            PendingPartitionWitness::start_seeded(&outer.prover_only, &outer.common, |seeder| {
+                for (&t, &v) in &early_inputs.target_values {
+                    seeder.set_target(t, v)?;
+                }
+                Ok(())
+            })?;
+        // A feed with no new targets must be a no-op.
+        seeded_pending.feed_seeded(|_| Ok(()))?;
+        seeded_pending.feed_seeded(|seeder| {
+            for (&t, &v) in &late_inputs.target_values {
+                seeder.set_target(t, v)?;
+            }
+            Ok(())
+        })?;
+        let seeded_witness = seeded_pending.finish()?;
+
+        let mut nondeterministic_positions = 0usize;
+        for ((map_value, repeat), seeded) in map_witness
+            .values
+            .iter()
+            .zip(&map_witness_repeat.values)
+            .zip(&seeded_witness.values)
+        {
+            if map_value == repeat {
+                assert_eq!(map_value, seeded);
+            } else {
+                nondeterministic_positions += 1;
+            }
+        }
+        assert!(
+            nondeterministic_positions <= num_random_generators,
+            "{nondeterministic_positions} nondeterministic positions exceed the {num_random_generators} random generators"
+        );
+
+        let seeded_proof = crate::plonk::prover::prove_with_partition_witness(
+            &outer.prover_only,
+            &outer.common,
+            seeded_witness,
+            &mut crate::util::timing::TimingTree::default(),
+        )?;
+        outer.verify(seeded_proof)
     }
 
     #[test]
