@@ -175,6 +175,13 @@ pub(crate) enum U32QuotientKind {
     /// Degree-5 extension squaring: ten routed words plus ten temporaries
     /// per operation, fifteen rows per operation.
     QuinticSquaring,
+    /// Audited random-access layout. The ten-word record stores bits, extra
+    /// constants, and the raw constant-column base in its final three words.
+    RandomAccess {
+        bits: usize,
+        num_extra_constants: usize,
+        constant_base: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -499,10 +506,10 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
     }
 }
 
-/// Starts one whole-domain kernel which evaluates every advertised RangeCheck
-/// and U32 arithmetic gate, applies each gate's selector filter, and reduces
-/// the shared constraint rows with the same two alpha challenges as the CPU
-/// quotient.
+/// Starts one whole-domain kernel which evaluates every advertised RangeCheck,
+/// width-generic integer, byte, quintic, and audited random-access gate, applies
+/// each selector filter, and reduces the shared constraint rows with the same
+/// two alpha challenges as the CPU quotient.
 pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     wires: &MetalColumns<F>,
     constants: &MetalColumns<F>,
@@ -649,6 +656,32 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                     spec.num_ops.checked_mul(20)?,
                     spec.num_ops.checked_mul(15)?,
                 ),
+                U32QuotientKind::RandomAccess {
+                    bits,
+                    num_extra_constants,
+                    constant_base,
+                } => {
+                    if !matches!(
+                        (bits, spec.num_ops, num_extra_constants),
+                        (3, 8, 0) | (4, 4, 2) | (6, 1, 2)
+                    ) {
+                        return None;
+                    }
+                    let vec_size = 1usize.checked_shl(u32::try_from(bits).ok()?)?;
+                    let routed_per_copy = vec_size.checked_add(2)?;
+                    let routed_wires = routed_per_copy
+                        .checked_mul(spec.num_ops)?
+                        .checked_add(num_extra_constants)?;
+                    let wire_count = routed_wires.checked_add(spec.num_ops.checked_mul(bits)?)?;
+                    let num_constraints = spec
+                        .num_ops
+                        .checked_mul(bits.checked_add(2)?)?
+                        .checked_add(num_extra_constants)?;
+                    if constant_base.checked_add(num_extra_constants)? > constants.cols {
+                        return None;
+                    }
+                    (6usize, bits, num_extra_constants, constant_base, wire_count, num_constraints)
+                }
             };
         if wire_count > wires.cols
             || spec.selector_column >= constants.cols
@@ -659,6 +692,8 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             || spec.group.end > u32::MAX as usize
             || spec.num_ops > u32::MAX as usize
             || num_addends > u32::MAX as usize
+            || result_limbs > u32::MAX as usize
+            || carry_limbs > u32::MAX as usize
         {
             return None;
         }
@@ -2703,12 +2738,10 @@ mod tests {
         let context = shared_context().expect("Metal context must initialize");
         let alphas = [F::from_canonical_u64(13), F::from_canonical_u64(17)];
 
-        // Production shapes for the 136-wire / 80-routed ranked config: the
-        // ByteDecompositionGate ships as (num_limbs 8, num_ops 3); the
-        // quintic gates as 5 and 6 operations. The smaller byte shapes,
-        // RangeCheck, subtraction and add-many specs exercise the union
-        // reduction across all live kinds.
-        let shapes = [
+        // Production shapes for the 136-wire / 80-routed ranked config. This
+        // one random-invalid job contains every current promoted kind, plus
+        // every audited RandomAccess tuple.
+        let mut shapes = vec![
             (
                 3,
                 UnionShape::U32(U32QuotientKind::ByteDecomposition { num_limbs: 8 }),
@@ -2736,7 +2769,22 @@ mod tests {
                     num_carry_limbs: 2,
                 }),
             ),
+            (3, UnionShape::U32(U32QuotientKind::Arithmetic)),
         ];
+        let raw_constant_base = shapes.len() + 3;
+        for (bits, num_ops, num_extra_constants) in
+            [(3usize, 8usize, 0usize), (4, 4, 2), (6, 1, 2)]
+        {
+            shapes.push((
+                num_ops,
+                UnionShape::U32(U32QuotientKind::RandomAccess {
+                    bits,
+                    num_extra_constants,
+                    constant_base: raw_constant_base,
+                }),
+            ));
+        }
+        assert_eq!(shapes.len(), raw_constant_base);
 
         let mut range_specs = Vec::new();
         let mut u32_specs = Vec::new();
@@ -2785,14 +2833,14 @@ mod tests {
             2_441_288_194_761_790_662,
         ];
 
-        for step in [1, 4] {
+        for step in [1, 2, 4, 8] {
             let full_rows = QUOTIENT_ROWS * step;
             let mut wires = context
                 .allocate_columns::<F>(full_rows, WIRE_COLUMNS)
                 .expect("wire columns must allocate");
             let mut constants = context
-                .allocate_columns::<F>(full_rows, shapes.len())
-                .expect("selector columns must allocate");
+                .allocate_columns::<F>(full_rows, shapes.len() + 2)
+                .expect("constant columns must allocate");
             let mut rng = StdRng::seed_from_u64(0x0b17_0000 + step as u64);
             for (column_index, column) in wires
                 .columns_mut()
@@ -2803,6 +2851,20 @@ mod tests {
                 for (row, value) in column.iter_mut().enumerate() {
                     *value = if (row + column_index) % 5 == 0 {
                         GoldilocksField(boundary[(row + 7 * column_index) % boundary.len()])
+                    } else {
+                        F::from_canonical_u64(rng.next_u64() % F::ORDER)
+                    };
+                }
+            }
+            for (column_index, column) in constants
+                .columns_mut()
+                .expect("unique constant columns")
+                .into_iter()
+                .enumerate()
+            {
+                for (row, value) in column.iter_mut().enumerate() {
+                    *value = if (row + 3 * column_index) % 7 == 0 {
+                        GoldilocksField(boundary[(row + 5 * column_index) % boundary.len()])
                     } else {
                         F::from_canonical_u64(rng.next_u64() % F::ORDER)
                     };
@@ -2840,6 +2902,8 @@ mod tests {
             let four = F::from_canonical_u64(4);
             let six = F::from_canonical_u64(6);
             let base256 = F::from_canonical_u64(256);
+            let base32 = F::from_canonical_u64(1u64 << 32);
+            let u32_max = F::from_canonical_u64(u32::MAX as u64);
             for row in 0..QUOTIENT_ROWS {
                 let source_row = row * step;
                 let wire = |column: usize| wires.col(column)[source_row];
@@ -3034,7 +3098,85 @@ mod tests {
                             assert_eq!(constraints.len(), spec.num_ops * 15);
                         }
                         U32QuotientKind::Arithmetic => {
-                            unreachable!("not exercised by this test");
+                            for op in 0..spec.num_ops {
+                                let routed = 6 * op;
+                                let multiplicand_0 = wire(routed);
+                                let multiplicand_1 = wire(routed + 1);
+                                let addend = wire(routed + 2);
+                                let output_low = wire(routed + 3);
+                                let output_high = wire(routed + 4);
+                                let inverse = wire(routed + 5);
+                                constraints.push(
+                                    (inverse * (u32_max - output_high) - F::ONE) * output_low,
+                                );
+                                constraints.push(
+                                    output_high * base32 + output_low
+                                        - (multiplicand_0 * multiplicand_1 + addend),
+                                );
+                                let limb_base = 6 * spec.num_ops + 32 * op;
+                                let mut combined_low = F::ZERO;
+                                let mut combined_high = F::ZERO;
+                                for j in (0..32).rev() {
+                                    let x = wire(limb_base + j);
+                                    let y = x * (x - three);
+                                    constraints.push(y * (y + F::TWO));
+                                    if j < 16 {
+                                        combined_low = combined_low * four + x;
+                                    } else {
+                                        combined_high = combined_high * four + x;
+                                    }
+                                }
+                                constraints.push(combined_low - output_low);
+                                constraints.push(combined_high - output_high);
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * 36);
+                        }
+                        U32QuotientKind::RandomAccess {
+                            bits,
+                            num_extra_constants,
+                            constant_base,
+                        } => {
+                            let vec_size = 1usize << bits;
+                            let routed_per_copy = vec_size + 2;
+                            let extra_wire_base = routed_per_copy * spec.num_ops;
+                            let bit_base = extra_wire_base + num_extra_constants;
+                            for copy in 0..spec.num_ops {
+                                let copy_base = routed_per_copy * copy;
+                                for i in 0..bits {
+                                    let b = wire(bit_base + copy * bits + i);
+                                    constraints.push(b * (b - F::ONE));
+                                }
+                                let mut reconstructed_index = F::ZERO;
+                                for i in (0..bits).rev() {
+                                    reconstructed_index = reconstructed_index.double()
+                                        + wire(bit_base + copy * bits + i);
+                                }
+                                constraints.push(reconstructed_index - wire(copy_base));
+
+                                let mut items =
+                                    (0..vec_size).map(|i| wire(copy_base + 2 + i)).collect::<Vec<_>>();
+                                let mut level_size = vec_size;
+                                for i in 0..bits {
+                                    let b = wire(bit_base + copy * bits + i);
+                                    for k in 0..level_size / 2 {
+                                        let x = items[2 * k];
+                                        let y = items[2 * k + 1];
+                                        items[k] = x + b * (y - x);
+                                    }
+                                    level_size /= 2;
+                                }
+                                constraints.push(items[0] - wire(copy_base + 1));
+                            }
+                            for i in 0..num_extra_constants {
+                                constraints.push(
+                                    constants.col(constant_base + i)[source_row]
+                                        - wire(extra_wire_base + i),
+                                );
+                            }
+                            assert_eq!(
+                                constraints.len(),
+                                spec.num_ops * (bits + 2) + num_extra_constants
+                            );
                         }
                     }
 
