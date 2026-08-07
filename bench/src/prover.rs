@@ -363,76 +363,81 @@ fn prove_path(
 }
 
 pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
-    // The pre-execution proof runs strictly before any other proving work, so
-    // the serialized GPU stream is otherwise idle: route its mid-size column
-    // trees to the GPU for just this phase.
-    plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-    let pre_proof = BlockPreExecutionCircuit::prove(
-        &circuits.pre_data,
-        &BlockPreExec::from_block(&block),
-        &circuits.pre_target,
-    )
-    .expect("block pre-execution proof failed");
-    plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
-    let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
-    let state_metadata_hash = pre_output.new_state_metadata.hash();
-
-    let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
-    let mut heavy_chunks: Vec<(usize, Vec<Tx<F>>)> = Vec::new();
-    let mut light_chunks: Vec<(usize, Vec<Tx<F>>)> = Vec::with_capacity(tx_chunks.len());
-    for (chunk_index, txs) in tx_chunks.drain(..).enumerate() {
-        if chunk_is_light(&txs) {
-            light_chunks.push((chunk_index, txs));
-        } else {
-            heavy_chunks.push((chunk_index, txs));
-        }
-    }
-    block.tx_chunks = tx_chunks;
-    block.tx_chunks.push(Vec::new());
-
-    let (light_chain_proof, heavy_chain_proof, block_target, block_data) =
-        std::thread::scope(|scope| {
-            // The final block circuit depends only on already-built circuit data
-            // and is not needed until the final proof, so it builds concurrently
-            // with the entire transaction/chain proving pipeline.
+    let (pre_proof, light_chain_proof, heavy_chain_proof, block_target, block_data) =
+        std::thread::scope(|block_scope| {
+            // The final block circuit depends only on already-built circuit data.
+            // Start building it before pre-execution so its CPU work can overlap
+            // both GPU-exclusive pre proving and the transaction/chain pipeline.
             let block_circuit_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, || circuits.build_block_circuit())
+                .spawn_scoped(block_scope, || circuits.build_block_circuit())
                 .expect("block circuit build thread must start");
-            let heavy_handle = std::thread::Builder::new()
-                .name("heavy-tx-chain".into())
-                .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, || {
-                    prove_path(
-                        TxPath::Heavy,
-                        heavy_chunks,
-                        circuits,
-                        block.block_number,
-                        block.created_at,
-                        block.old_account_delta_tree_root,
-                        &pre_output,
-                        state_metadata_hash,
-                    )
-                })
-                .expect("heavy transaction chain thread must start");
-            let light_chain_proof = prove_path(
-                TxPath::Light,
-                light_chunks,
-                circuits,
-                block.block_number,
-                block.created_at,
-                block.old_account_delta_tree_root,
-                &pre_output,
-                state_metadata_hash,
-            );
-            let heavy_chain_proof = heavy_handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+
+            // Pre-execution still runs before transaction proving, so the
+            // serialized GPU stream is otherwise idle: route its mid-size
+            // column trees to the GPU for just this phase.
+            plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
+            let pre_proof = BlockPreExecutionCircuit::prove(
+                &circuits.pre_data,
+                &BlockPreExec::from_block(&block),
+                &circuits.pre_target,
+            )
+            .expect("block pre-execution proof failed");
+            plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+            let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
+            let state_metadata_hash = pre_output.new_state_metadata.hash();
+
+            let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
+            let mut heavy_chunks: Vec<(usize, Vec<Tx<F>>)> = Vec::new();
+            let mut light_chunks: Vec<(usize, Vec<Tx<F>>)> = Vec::with_capacity(tx_chunks.len());
+            for (chunk_index, txs) in tx_chunks.drain(..).enumerate() {
+                if chunk_is_light(&txs) {
+                    light_chunks.push((chunk_index, txs));
+                } else {
+                    heavy_chunks.push((chunk_index, txs));
+                }
+            }
+            block.tx_chunks = tx_chunks;
+            block.tx_chunks.push(Vec::new());
+
+            let (light_chain_proof, heavy_chain_proof) = std::thread::scope(|path_scope| {
+                let heavy_handle = std::thread::Builder::new()
+                    .name("heavy-tx-chain".into())
+                    .stack_size(PROVER_THREAD_STACK_BYTES)
+                    .spawn_scoped(path_scope, || {
+                        prove_path(
+                            TxPath::Heavy,
+                            heavy_chunks,
+                            circuits,
+                            block.block_number,
+                            block.created_at,
+                            block.old_account_delta_tree_root,
+                            &pre_output,
+                            state_metadata_hash,
+                        )
+                    })
+                    .expect("heavy transaction chain thread must start");
+                let light_chain_proof = prove_path(
+                    TxPath::Light,
+                    light_chunks,
+                    circuits,
+                    block.block_number,
+                    block.created_at,
+                    block.old_account_delta_tree_root,
+                    &pre_output,
+                    state_metadata_hash,
+                );
+                let heavy_chain_proof = heavy_handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                (light_chain_proof, heavy_chain_proof)
+            });
             let (block_target, block_data) = block_circuit_handle
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             (
+                pre_proof,
                 light_chain_proof,
                 heavy_chain_proof,
                 block_target,
