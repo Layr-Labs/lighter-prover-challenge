@@ -382,18 +382,12 @@ inline void range_check_gate_emit(
         gl_mul(constraint, alpha_powers[alpha_stride + constraint_index]));
 }
 
-// Each RangeCheck metadata record is ten uints:
+// Each RangeCheck metadata record is eight uints:
 //   selector column, gate index, group start/end, include UNUSED selector,
-//   operation count, base-4 limbs per operation, final-limb range (2 or 4),
-//   then two unused words that keep both record kinds the same stride.
-// It is followed by U32-family records with the same five selector words, then:
+//   operation count, base-4 limbs per operation, final-limb range (2 or 4).
+// It is followed by U32 records with the same five selector words, then:
 //   kind (arithmetic=0, subtraction=1, add-many=2), operation count,
-//   addend count (zero except for add-many), base-4 result limbs, and carry
-//   limbs (zero except for add-many).
-// The result-limb count is what makes the subtraction and add-many branches
-// width-generic: a `2 * result_limbs`-bit word recomposes from that many
-// base-4 limbs and its overflow weight is `1 << (2 * result_limbs)`, which
-// covers the 16-, 32- and 48-bit production gates with one code path.
+//   addend count (zero except for add-many).
 // Every gate starts again at constraint row zero. This matches the CPU's
 // shared row accumulator: reducing each filtered gate locally with the same
 // alpha powers and then adding the results is linear in those row values.
@@ -417,7 +411,7 @@ kernel void range_check_gate_quotient(
     uint source_row = gid * step;
     ulong total[2] = { 0, 0 };
     for (uint range_index = 0; range_index < range_count; ++range_index) {
-        constant uint* spec = metadata + range_index * 10u;
+        constant uint* spec = metadata + range_index * 8u;
         uint selector_column = spec[0];
         uint gate_index = spec[1];
         uint group_start = spec[2];
@@ -480,9 +474,9 @@ kernel void range_check_gate_quotient(
         total[1] = gl_add(total[1], gl_mul(filter, gate_accumulators[1]));
     }
 
-    constant uint* u32_metadata = metadata + range_count * 10u;
+    constant uint* u32_metadata = metadata + range_count * 8u;
     for (uint u32_index = 0; u32_index < u32_count; ++u32_index) {
-        constant uint* spec = u32_metadata + u32_index * 10u;
+        constant uint* spec = u32_metadata + u32_index * 8u;
         uint selector_column = spec[0];
         uint gate_index = spec[1];
         uint group_start = spec[2];
@@ -491,10 +485,6 @@ kernel void range_check_gate_quotient(
         uint kind = spec[5];
         uint num_ops = spec[6];
         uint num_addends = spec[7];
-        uint result_limbs = spec[8];
-        uint num_carry_limbs = spec[9];
-        // Overflow weight of the recomposed word: 2^16, 2^32 or 2^48.
-        ulong word_base = 1UL << (2u * result_limbs);
 
         ulong selector = constants[(ulong)selector_column * lde_rows + source_row];
         ulong filter = 1;
@@ -572,8 +562,8 @@ kernel void range_check_gate_quotient(
                     constraint_index++);
             }
         } else if (kind == 1u) {
-            // U16/U32/U48 SubtractionGate: five routed words followed by
-            // `result_limbs` base-4 result limbs per operation.
+            // U32SubtractionGate: five routed words followed by 16 base-4
+            // result limbs per operation.
             for (uint op = 0; op < num_ops; ++op) {
                 ulong routed_base = (ulong)op * 5u;
                 ulong input_x = wires[(routed_base + 0u) * lde_rows + source_row];
@@ -584,7 +574,7 @@ kernel void range_check_gate_quotient(
                 ulong result_initial = gl_sub(gl_sub(input_x, input_y), input_borrow);
                 ulong borrowed = gl_add(
                     result_initial,
-                    gl_mul(word_base, output_borrow));
+                    gl_mul(4294967296UL, output_borrow));
                 range_check_gate_emit(
                     gl_sub(output_result, borrowed),
                     alpha_powers,
@@ -592,9 +582,9 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
 
-                ulong limb_base = (ulong)num_ops * 5u + (ulong)op * result_limbs;
+                ulong limb_base = (ulong)num_ops * 5u + (ulong)op * 16u;
                 ulong recomposed = 0;
-                for (uint remaining = result_limbs; remaining > 0u; --remaining) {
+                for (uint remaining = 16u; remaining > 0u; --remaining) {
                     uint j = remaining - 1u;
                     ulong x = wires[(limb_base + j) * lde_rows + source_row];
                     ulong y = gl_mul(x, gl_sub(x, 3));
@@ -620,9 +610,8 @@ kernel void range_check_gate_quotient(
                     constraint_index++);
             }
         } else {
-            // U16/U32 AddManyGate: num_addends inputs, carry/result/output-carry,
-            // then `result_limbs` result and `num_carry_limbs` carry base-4
-            // limbs per operation.
+            // U32AddManyGate: num_addends inputs, carry/result/output-carry,
+            // then 16 result and two carry base-4 limbs per operation.
             uint routed_per_op = num_addends + 3u;
             for (uint op = 0; op < num_ops; ++op) {
                 ulong routed_base = (ulong)op * routed_per_op;
@@ -636,7 +625,7 @@ kernel void range_check_gate_quotient(
                     wires[(routed_base + num_addends + 1u) * lde_rows + source_row];
                 ulong output_carry =
                     wires[(routed_base + num_addends + 2u) * lde_rows + source_row];
-                ulong combined = gl_add(gl_mul(output_carry, word_base), output_result);
+                ulong combined = gl_add(gl_mul(output_carry, 4294967296UL), output_result);
                 range_check_gate_emit(
                     gl_sub(combined, computed),
                     alpha_powers,
@@ -644,12 +633,11 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
 
-                uint total_limbs = result_limbs + num_carry_limbs;
                 ulong limb_base =
-                    (ulong)routed_per_op * num_ops + (ulong)op * total_limbs;
+                    (ulong)routed_per_op * num_ops + (ulong)op * 18u;
                 ulong combined_result = 0;
                 ulong combined_carry = 0;
-                for (uint remaining = total_limbs; remaining > 0u; --remaining) {
+                for (uint remaining = 18u; remaining > 0u; --remaining) {
                     uint j = remaining - 1u;
                     ulong x = wires[(limb_base + j) * lde_rows + source_row];
                     ulong y = gl_mul(x, gl_sub(x, 3));
@@ -659,7 +647,7 @@ kernel void range_check_gate_quotient(
                         alpha_stride,
                         gate_accumulators,
                         constraint_index++);
-                    if (j < result_limbs) {
+                    if (j < 16u) {
                         combined_result = gl_add(gl_mul(combined_result, 4), x);
                     } else {
                         combined_carry = gl_add(gl_mul(combined_carry, 4), x);

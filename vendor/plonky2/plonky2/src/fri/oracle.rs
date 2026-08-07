@@ -27,12 +27,23 @@ use crate::util::{log2_strict, reverse_bits};
 pub const SALT_SIZE: usize = 4;
 
 /// Route the whole commitment (NTT + hashing) through the GPU backend.
-/// Official ranked A/B: submission 644c4257 (this on, over the 8.0011
-/// frontier) scored 6.2323 despite a +4.6% controlled local win — the NTT
-/// stages extend each tree's exclusive occupancy of the serialized GPU
-/// stream, which is the ranked critical path. Keep off; hashing-only GPU
-/// trees (`new_columns`) remain on.
-const GPU_NTT_COMMITMENTS: bool = false;
+///
+/// Official ranked A/B: submission 644c4257 (this on unconditionally, over
+/// the 8.0011 frontier) scored 6.2323 despite a +4.6% controlled local win.
+/// The stated cause was that the NTT stages extend each tree's *exclusive*
+/// occupancy of the serialized GPU stream, which is the ranked critical
+/// path — a pipelined chunk commitment holding the stream for its NTT as
+/// well as its hashing delays everything queued behind it.
+///
+/// That cost is specific to the pipelined phases. During an exclusive serial
+/// phase — the pre-execution proof, the chain drain and the final block
+/// proof — nothing else is contending for the stream by construction, so
+/// there is no queue to extend, while the FFT work being offloaded sits
+/// squarely on the sequential critical path. So enable it exactly there and
+/// nowhere else, rather than globally on or globally off.
+fn gpu_ntt_commitments_enabled() -> bool {
+    crate::hash::poseidon2::in_exclusive_gpu_phase()
+}
 
 /// Output layout for [`PolynomialBatch::fill_lde_batch`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,7 +91,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
-        if GPU_NTT_COMMITMENTS && !blinding {
+        if gpu_ntt_commitments_enabled() && !blinding {
             let value_columns: Vec<&[F]> =
                 values.iter().map(|v| v.values.as_slice()).collect();
             if let Some((columns, digests, cap, coeff_columns)) = timed!(
@@ -134,7 +145,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) -> Self {
         let degree = polynomials[0].len();
 
-        if GPU_NTT_COMMITMENTS && !blinding {
+        if gpu_ntt_commitments_enabled() && !blinding {
             let coeff_columns: Vec<&[F]> = polynomials
                 .iter()
                 .map(|p| p.coeffs.as_slice())

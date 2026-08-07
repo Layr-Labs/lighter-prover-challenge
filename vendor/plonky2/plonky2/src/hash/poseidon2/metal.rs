@@ -153,16 +153,8 @@ pub(crate) struct RangeCheckQuotientSpec {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum U32QuotientKind {
     Arithmetic,
-    /// `result_limbs` base-4 limbs recompose the `2 * result_limbs`-bit
-    /// difference; the borrow weight is `1 << (2 * result_limbs)`.
-    Subtraction {
-        result_limbs: usize,
-    },
-    AddMany {
-        num_addends: usize,
-        result_limbs: usize,
-        num_carry_limbs: usize,
-    },
+    Subtraction,
+    AddMany { num_addends: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -283,6 +275,10 @@ static EXCLUSIVE_GPU_PHASE: core::sync::atomic::AtomicBool =
 /// Marks the start/end of an exclusive serial proving phase during which the
 /// GPU routing cutoff drops to [`EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS`].
 /// Callers must guarantee no other proof runs concurrently while enabled.
+pub fn in_exclusive_gpu_phase() -> bool {
+    EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn set_exclusive_gpu_phase(enabled: bool) {
     EXCLUSIVE_GPU_PHASE.store(enabled, core::sync::atomic::Ordering::Relaxed);
 }
@@ -501,7 +497,7 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     alphas: &[F],
     alpha_offset: usize,
 ) -> Option<RangeCheckGateQuotientJob<F>> {
-    const SPEC_WORDS: usize = 10;
+    const SPEC_WORDS: usize = 8;
     const MAX_INLINE_BYTES: usize = 4096;
 
     let spec_count = specs.len().checked_add(u32_specs.len())?;
@@ -556,61 +552,37 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             spec.num_ops as u32,
             num_aux as u32,
             if spec.bit_size & 1 == 1 { 2 } else { 4 },
-            0,
-            0,
         ]);
     }
     for spec in u32_specs {
         if spec.num_ops == 0 {
             return None;
         }
-        let (kind, num_addends, result_limbs, carry_limbs, wire_count, num_constraints) =
-            match spec.kind {
-                U32QuotientKind::Arithmetic => (
-                    0usize,
-                    0usize,
-                    16usize,
-                    0usize,
-                    spec.num_ops.checked_mul(38)?,
-                    spec.num_ops.checked_mul(36)?,
-                ),
-                U32QuotientKind::Subtraction { result_limbs } => {
-                    if !matches!(result_limbs, 8 | 16 | 24) {
-                        return None;
-                    }
-                    (
-                        1usize,
-                        0usize,
-                        result_limbs,
-                        0usize,
-                        spec.num_ops.checked_mul(result_limbs.checked_add(5)?)?,
-                        spec.num_ops.checked_mul(result_limbs.checked_add(3)?)?,
-                    )
+        let (kind, num_addends, wire_count, num_constraints) = match spec.kind {
+            U32QuotientKind::Arithmetic => (
+                0usize,
+                0usize,
+                spec.num_ops.checked_mul(38)?,
+                spec.num_ops.checked_mul(36)?,
+            ),
+            U32QuotientKind::Subtraction => (
+                1usize,
+                0usize,
+                spec.num_ops.checked_mul(21)?,
+                spec.num_ops.checked_mul(19)?,
+            ),
+            U32QuotientKind::AddMany { num_addends } => {
+                if num_addends == 0 || num_addends > 16 {
+                    return None;
                 }
-                U32QuotientKind::AddMany {
+                (
+                    2usize,
                     num_addends,
-                    result_limbs,
-                    num_carry_limbs,
-                } => {
-                    if num_addends == 0
-                        || num_addends > 16
-                        || num_carry_limbs == 0
-                        || !matches!(result_limbs, 8 | 16 | 24)
-                    {
-                        return None;
-                    }
-                    let limbs = result_limbs.checked_add(num_carry_limbs)?;
-                    (
-                        2usize,
-                        num_addends,
-                        result_limbs,
-                        num_carry_limbs,
-                        spec.num_ops
-                            .checked_mul(num_addends.checked_add(3)?.checked_add(limbs)?)?,
-                        spec.num_ops.checked_mul(limbs.checked_add(3)?)?,
-                    )
-                }
-            };
+                    spec.num_ops.checked_mul(num_addends.checked_add(21)?)?,
+                    spec.num_ops.checked_mul(21)?,
+                )
+            }
+        };
         if wire_count > wires.cols
             || spec.selector_column >= constants.cols
             || spec.group.start > spec.gate_index
@@ -633,8 +605,6 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             kind as u32,
             spec.num_ops as u32,
             num_addends as u32,
-            result_limbs as u32,
-            carry_limbs as u32,
         ]);
     }
     if alpha_stride == 0
@@ -1040,7 +1010,7 @@ impl MetalShared {
             .range_check_gate_quotient_pipeline
             .as_ref()
             .ok_or("RangeCheck gate quotient pipeline unavailable")?;
-        if metadata.len() != (range_count + u32_count) * 10
+        if metadata.len() != (range_count + u32_count) * 8
             || alpha_powers.len() != alpha_stride * 2
         {
             return Err("invalid RangeCheck quotient metadata".to_string());
@@ -2386,63 +2356,22 @@ mod tests {
                 group: 4..7,
                 include_unused_selector: true,
                 num_ops: 6,
-                kind: U32QuotientKind::Subtraction { result_limbs: 16 },
-            },
-            // The 16- and 48-bit subtraction gates share the 32-bit layout
-            // with a different limb count, so they exercise the same branch
-            // at both ends of the supported width range.
-            U32QuotientSpec {
-                selector_column: 2,
-                gate_index: 8,
-                group: 7..10,
-                include_unused_selector: true,
-                num_ops: 9,
-                kind: U32QuotientKind::Subtraction { result_limbs: 8 },
-            },
-            U32QuotientSpec {
-                selector_column: 3,
-                gate_index: 11,
-                group: 10..13,
-                include_unused_selector: true,
-                num_ops: 4,
-                kind: U32QuotientKind::Subtraction { result_limbs: 24 },
+                kind: U32QuotientKind::Subtraction,
             },
         ];
-        // 16-bit add-many, every production arity.
-        for num_addends in 2..=16 {
-            let num_ops = (WIRE_COLUMNS / (num_addends + 13)).min(80 / (num_addends + 3));
-            let selector_column = specs.len();
-            let gate_index = 14 + 3 * (num_addends - 2);
-            specs.push(U32QuotientSpec {
-                selector_column,
-                gate_index,
-                group: gate_index - 1..gate_index + 2,
-                include_unused_selector: true,
-                num_ops,
-                kind: U32QuotientKind::AddMany {
-                    num_addends,
-                    result_limbs: 8,
-                    num_carry_limbs: 2,
-                },
-            });
-        }
         // Exercise every production AddMany shape, including both places
         // where its operation count drops as routed/full wire pressure wins.
         for num_addends in 2..=16 {
             let num_ops = (WIRE_COLUMNS / (num_addends + 21)).min(80 / (num_addends + 3));
             let selector_column = specs.len();
-            let gate_index = 62 + 3 * (num_addends - 2);
+            let gate_index = 8 + 3 * (num_addends - 2);
             specs.push(U32QuotientSpec {
                 selector_column,
                 gate_index,
                 group: gate_index - 1..gate_index + 2,
                 include_unused_selector: true,
                 num_ops,
-                kind: U32QuotientKind::AddMany {
-                    num_addends,
-                    result_limbs: 16,
-                    num_carry_limbs: 2,
-                },
+                kind: U32QuotientKind::AddMany { num_addends },
             });
         }
 
@@ -2532,9 +2461,7 @@ mod tests {
                             }
                             assert_eq!(constraints.len(), spec.num_ops * 36);
                         }
-                        U32QuotientKind::Subtraction { result_limbs } => {
-                            let word_base =
-                                F::from_canonical_u64(1u64 << (2 * result_limbs as u64));
+                        U32QuotientKind::Subtraction => {
                             for op in 0..spec.num_ops {
                                 let routed = 5 * op;
                                 let input_x = wires.col(routed)[source_row];
@@ -2545,11 +2472,11 @@ mod tests {
                                 constraints.push(
                                     output_result
                                         - (input_x - input_y - input_borrow
-                                            + word_base * output_borrow),
+                                            + base32 * output_borrow),
                                 );
-                                let limb_base = 5 * spec.num_ops + result_limbs * op;
+                                let limb_base = 5 * spec.num_ops + 16 * op;
                                 let mut recomposed = F::ZERO;
-                                for j in (0..result_limbs).rev() {
+                                for j in (0..16).rev() {
                                     let x = wires.col(limb_base + j)[source_row];
                                     let y = x * (x - three);
                                     constraints.push(y * (y + F::TWO));
@@ -2558,16 +2485,9 @@ mod tests {
                                 constraints.push(recomposed - output_result);
                                 constraints.push(output_borrow * (F::ONE - output_borrow));
                             }
-                            assert_eq!(constraints.len(), spec.num_ops * (result_limbs + 3));
+                            assert_eq!(constraints.len(), spec.num_ops * 19);
                         }
-                        U32QuotientKind::AddMany {
-                            num_addends,
-                            result_limbs,
-                            num_carry_limbs,
-                        } => {
-                            let word_base =
-                                F::from_canonical_u64(1u64 << (2 * result_limbs as u64));
-                            let total_limbs = result_limbs + num_carry_limbs;
+                        U32QuotientKind::AddMany { num_addends } => {
                             let routed_per_op = num_addends + 3;
                             for op in 0..spec.num_ops {
                                 let routed = routed_per_op * op;
@@ -2581,16 +2501,16 @@ mod tests {
                                     computed += wires.col(routed + j)[source_row];
                                 }
                                 constraints.push(
-                                    output_carry * word_base + output_result - computed,
+                                    output_carry * base32 + output_result - computed,
                                 );
-                                let limb_base = routed_per_op * spec.num_ops + total_limbs * op;
+                                let limb_base = routed_per_op * spec.num_ops + 18 * op;
                                 let mut combined_result = F::ZERO;
                                 let mut combined_carry = F::ZERO;
-                                for j in (0..total_limbs).rev() {
+                                for j in (0..18).rev() {
                                     let x = wires.col(limb_base + j)[source_row];
                                     let y = x * (x - three);
                                     constraints.push(y * (y + F::TWO));
-                                    if j < result_limbs {
+                                    if j < 16 {
                                         combined_result = combined_result * four + x;
                                     } else {
                                         combined_carry = combined_carry * four + x;
@@ -2599,7 +2519,7 @@ mod tests {
                                 constraints.push(combined_result - output_result);
                                 constraints.push(combined_carry - output_carry);
                             }
-                            assert_eq!(constraints.len(), spec.num_ops * (total_limbs + 3));
+                            assert_eq!(constraints.len(), spec.num_ops * 21);
                         }
                     }
 
