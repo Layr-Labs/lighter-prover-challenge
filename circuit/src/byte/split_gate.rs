@@ -4,6 +4,7 @@
 use core::ops::Range;
 
 use anyhow::Result;
+use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
@@ -191,6 +192,94 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
             }
         }
         res
+    }
+
+    /// Fused filtered accumulate: each constraint column is produced into one
+    /// reusable scratch buffer and multiply-added straight into the shared
+    /// constraint buffer, deleting the `n * num_constraints` intermediate
+    /// `Vec` that `eval_unfiltered_base_batch` allocates on every call and the
+    /// second pass over it. The per-constraint expressions and the order in
+    /// which they are emitted are exactly those of `eval_unfiltered_base_batch`
+    /// above, so every accumulated value is bit-identical.
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        assert!(
+            combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n
+        );
+
+        let wires = vars_base.local_wires;
+        let three = F::from_canonical_usize(3);
+        let four = F::from_canonical_usize(4);
+        let base = F::from_canonical_usize(256);
+        let mut scratch = vec![F::ZERO; n];
+        let mut constraint_index = 0usize;
+
+        for i in 0..self.num_ops {
+            let aux = self.i_th_aux_limbs(i);
+            // Range products per aux limb: x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3).
+            for limb_wire in aux.clone() {
+                let col = &wires[limb_wire * n..][..n];
+                for p in 0..n {
+                    let x = col[p];
+                    let y = x * (x - three);
+                    scratch[p] = y * (y + F::TWO);
+                }
+                let combined = &mut combined_gate_constraints
+                    [constraint_index * n..(constraint_index + 1) * n];
+                batch_multiply_add_inplace(combined, &scratch, filters);
+                constraint_index += 1;
+            }
+
+            // Each byte equals its four aux limbs combined by powers of 4,
+            // accumulated per point by Horner from the most significant limb.
+            let bytes = self.i_th_limbs(i);
+            for (byte_index, byte_wire) in bytes.clone().enumerate() {
+                let chunk_start = aux.start + 4 * byte_index;
+                scratch.copy_from_slice(&wires[(chunk_start + 3) * n..][..n]);
+                for k in (0..3).rev() {
+                    let limb = &wires[(chunk_start + k) * n..][..n];
+                    for p in 0..n {
+                        scratch[p] = scratch[p] * four + limb[p];
+                    }
+                }
+                let byte_col = &wires[byte_wire * n..][..n];
+                for p in 0..n {
+                    scratch[p] -= byte_col[p];
+                }
+                let combined = &mut combined_gate_constraints
+                    [constraint_index * n..(constraint_index + 1) * n];
+                batch_multiply_add_inplace(combined, &scratch, filters);
+                constraint_index += 1;
+            }
+
+            // The sum equals the bytes combined by powers of 256.
+            scratch.copy_from_slice(&wires[(bytes.end - 1) * n..][..n]);
+            for byte_wire in (bytes.start..bytes.end - 1).rev() {
+                let col = &wires[byte_wire * n..][..n];
+                for p in 0..n {
+                    scratch[p] = scratch[p] * base + col[p];
+                }
+            }
+            let sum_col = &wires[self.i_th_sum(i) * n..][..n];
+            for p in 0..n {
+                scratch[p] -= sum_col[p];
+            }
+            let combined =
+                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
+            batch_multiply_add_inplace(combined, &scratch, filters);
+            constraint_index += 1;
+        }
+
+        debug_assert_eq!(
+            constraint_index,
+            <Self as Gate<F, D>>::num_constraints(self)
+        );
     }
 
     fn eval_unfiltered_circuit(
@@ -405,6 +494,85 @@ mod tests {
         type C = PoseidonGoldilocksConfig;
         type F = <C as GenericConfig<D>>::F;
         test_eval_fns::<F, C, _, D>(ByteDecompositionGate::new(1, 1))
+    }
+
+    /// Differential test for the fused `eval_unfiltered_base_batch_accumulate`
+    /// override: starting from a random accumulator buffer, the fused path must
+    /// add exactly `filter[p] * constraint[j](p)` to every cell, matching
+    /// per-point `eval_unfiltered`. `(8, 3)` is the production shape built by
+    /// `new_from_config(CIRCUIT_CONFIG, 8)` (123 constraints).
+    #[test]
+    fn accumulate_matches_eval_unfiltered_across_batch() {
+        use crate::gate_batch_testing::assert_accumulate_matches_eval_unfiltered;
+
+        for (num_limbs, num_ops) in [(1, 1), (2, 2), (4, 2), (8, 1), (8, 3)] {
+            assert_accumulate_matches_eval_unfiltered(&ByteDecompositionGate::new(
+                num_limbs, num_ops,
+            ));
+        }
+    }
+
+    /// The fused accumulate must be bit-identical to the fallback contract:
+    /// `eval_unfiltered_base_batch` followed by a per-row multiply-add. Raw u64
+    /// comparison, so a canonical/non-canonical divergence would be caught.
+    #[test]
+    fn accumulate_matches_base_batch_fallback_raw() {
+        use plonky2::field::batch_util::batch_multiply_add_inplace;
+        use plonky2::field::types::{Field64, PrimeField64};
+        use plonky2::hash::hash_types::HashOut;
+        use plonky2::plonk::vars::EvaluationVarsBaseBatch;
+        use rand::Rng;
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+
+        let mut rng = rand::thread_rng();
+        for (num_limbs, num_ops) in [(1, 1), (2, 2), (4, 2), (8, 1), (8, 3)] {
+            let gate = ByteDecompositionGate::new(num_limbs, num_ops);
+            for &n in &[1usize, 4, 32] {
+                let num_wires = <ByteDecompositionGate as Gate<F, D>>::num_wires(&gate);
+                let num_constraints =
+                    <ByteDecompositionGate as Gate<F, D>>::num_constraints(&gate);
+                let wires: Vec<F> = (0..num_wires * n)
+                    .map(|_| F::from_canonical_u64(rng.gen_range(0..GoldilocksField::ORDER)))
+                    .collect();
+                let filters: Vec<F> = (0..n)
+                    .map(|_| F::from_canonical_u64(rng.gen_range(0..GoldilocksField::ORDER)))
+                    .collect();
+                let initial: Vec<F> = (0..num_constraints * n)
+                    .map(|_| F::from_canonical_u64(rng.gen_range(0..GoldilocksField::ORDER)))
+                    .collect();
+                let public_inputs_hash = HashOut::<F>::ZERO;
+                let vars = EvaluationVarsBaseBatch::new(n, &[], &wires, &public_inputs_hash);
+
+                // Fallback contract, exactly as the default trait method does it.
+                let mut expected = initial.clone();
+                let res = <ByteDecompositionGate as Gate<F, D>>::eval_unfiltered_base_batch(
+                    &gate, vars,
+                );
+                for (combined, row) in expected
+                    .chunks_exact_mut(n)
+                    .zip(res.chunks_exact(n))
+                {
+                    batch_multiply_add_inplace(combined, row, &filters);
+                }
+
+                let mut actual = initial;
+                <ByteDecompositionGate as Gate<F, D>>::eval_unfiltered_base_batch_accumulate(
+                    &gate,
+                    vars,
+                    &filters,
+                    &mut actual,
+                );
+
+                let raw = |v: &[F]| v.iter().map(|x| x.to_canonical_u64()).collect::<Vec<_>>();
+                assert_eq!(
+                    raw(&actual),
+                    raw(&expected),
+                    "num_limbs {num_limbs}, num_ops {num_ops}, n {n}"
+                );
+            }
+        }
     }
 
     // `test_eval_fns` only checks a batch of one point; compare the batched
