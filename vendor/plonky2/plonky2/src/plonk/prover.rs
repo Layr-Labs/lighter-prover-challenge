@@ -1020,7 +1020,11 @@ fn start_gpu_range_check_gate_quotient<
     crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
 )> {
     use core::sync::atomic::Ordering;
+    use crate::gates::equality_base::EqualityGate;
+    use crate::gates::exponentiation::ExponentiationGate;
     use crate::gates::gate::U32QuotientGate;
+    use crate::gates::reducing::ReducingGate;
+    use crate::gates::reducing_extension::ReducingExtensionGate;
     use crate::hash::poseidon2::metal::{
         RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec,
     };
@@ -1268,6 +1272,99 @@ fn start_gpu_range_check_gate_quotient<
             } else {
                 gate_indices.push(gate_index);
             }
+        }
+        // These vendored gates sit at the top of the surviving wire span in
+        // the production circuits and are pure arithmetic, so they are matched
+        // by type here instead of through the downstream-crate trait hooks
+        // (those hooks exist only to avoid a `plonky2` -> circuit-crate dep).
+        let native = if let Some(exponentiation) =
+            gate.0.as_any().downcast_ref::<ExponentiationGate<F, D>>()
+        {
+            let num_power_bits = exponentiation.num_power_bits;
+            Some((
+                U32QuotientKind::Exponentiation,
+                num_power_bits,
+                num_power_bits.checked_mul(2)?.checked_add(2)?,
+                num_power_bits.checked_add(1)?,
+            ))
+        } else if let Some(equality) = gate.0.as_any().downcast_ref::<EqualityGate>() {
+            // The gate reads its single constant (the "one" value) as local
+            // constant 0, i.e. the column immediately after the selector
+            // prefix of the constants/sigmas commitment.
+            let constant_column = common_data.selectors_info.num_selectors();
+            Some((
+                U32QuotientKind::Equality { constant_column },
+                equality.num_ops,
+                equality.num_ops.checked_mul(6)?,
+                equality.num_ops.checked_mul(4)?,
+            ))
+        } else if let Some(reducing) = gate.0.as_any().downcast_ref::<ReducingGate<D>>() {
+            // The kernel's extension arithmetic is specialised to the
+            // quadratic Goldilocks extension.
+            if D != 2 {
+                None
+            } else {
+                Some((
+                    U32QuotientKind::Reducing {
+                        extension_coeffs: false,
+                    },
+                    reducing.num_coeffs,
+                    reducing.num_coeffs.checked_mul(3)?.checked_add(4)?,
+                    reducing.num_coeffs.checked_mul(2)?,
+                ))
+            }
+        } else if let Some(reducing) =
+            gate.0.as_any().downcast_ref::<ReducingExtensionGate<D>>()
+        {
+            if D != 2 {
+                None
+            } else {
+                Some((
+                    U32QuotientKind::Reducing {
+                        extension_coeffs: true,
+                    },
+                    reducing.num_coeffs,
+                    reducing.num_coeffs.checked_mul(4)?.checked_add(4)?,
+                    reducing.num_coeffs.checked_mul(2)?,
+                ))
+            }
+        } else {
+            None
+        };
+        if let Some((kind, num_ops, expected_wires, expected_constraints)) = native {
+            if range.is_some() || u32_gate.is_some() {
+                if gpu_poseidon_quotient_diagnostics_enabled() {
+                    eprintln!(
+                        "[gpu-range-quotient] gate {gate_index} advertised conflicting layouts"
+                    );
+                }
+                return None;
+            }
+            if num_ops == 0
+                || gate.0.num_wires() != expected_wires
+                || gate.0.num_constraints() != expected_constraints
+            {
+                if gpu_poseidon_quotient_diagnostics_enabled() {
+                    eprintln!(
+                        "[gpu-range-quotient] native layout mismatch gate={gate_index} \
+                         kind={kind:?} wires={} constraints={} expected_wires={expected_wires} \
+                         expected_constraints={expected_constraints}",
+                        gate.0.num_wires(),
+                        gate.0.num_constraints(),
+                    );
+                }
+                return None;
+            }
+            let selector_column = common_data.selectors_info.selector_indices[gate_index];
+            u32_specs.push(U32QuotientSpec {
+                selector_column,
+                gate_index,
+                group: common_data.selectors_info.groups[selector_column].clone(),
+                include_unused_selector,
+                num_ops,
+                kind,
+            });
+            gate_indices.push(gate_index);
         }
     }
     if specs.is_empty() && u32_specs.is_empty() {
