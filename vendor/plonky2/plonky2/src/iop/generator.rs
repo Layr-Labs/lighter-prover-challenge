@@ -1,12 +1,15 @@
 #[cfg(not(feature = "std"))]
 use alloc::{
     boxed::Box,
+    collections::BTreeMap,
     string::{String, ToString},
     vec,
     vec::Vec,
 };
 use core::fmt::Debug;
 use core::marker::PhantomData;
+#[cfg(feature = "std")]
+use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow};
 use plonky2_maybe_rayon::*;
@@ -18,7 +21,7 @@ use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::Target;
 use crate::iop::wire::Wire;
 use crate::iop::witness::{PartialWitness, PartitionWitness, Witness, WitnessWrite};
-use crate::plonk::circuit_data::{CommonCircuitData, GeneratorWatchIndex, ProverOnlyCircuitData};
+use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
 use crate::plonk::config::GenericConfig;
 use crate::util::serialization::{Buffer, IoResult, Read, Write};
 
@@ -157,7 +160,7 @@ fn run_generator_worklist<
             #[allow(clippy::type_complexity)]
             let round_outputs: Vec<(
                 Vec<(usize, bool, usize)>,
-                Vec<(Target, F, Option<&[usize]>)>,
+                Vec<(Target, F, Option<&Vec<usize>>)>,
             )> = pending_generator_indices
                 .par_chunks(PARALLEL_WORKLIST_CHUNK)
                 .map(|chunk| {
@@ -283,7 +286,7 @@ fn seed_inputs_and_unresolved_watches<F: Field>(
     witness: &mut PartitionWitness<F>,
     inputs: PartialWitness<F>,
     generator_watch_counts: &[usize],
-    generator_indices_by_watches: &GeneratorWatchIndex,
+    generator_indices_by_watches: &BTreeMap<usize, Vec<usize>>,
 ) -> Result<Vec<usize>> {
     let mut unresolved_watches = generator_watch_counts.to_vec();
 
@@ -311,7 +314,7 @@ fn seed_inputs_and_unresolved_watches<F: Field>(
 pub struct PartitionSeeder<'a, 'b, F: Field> {
     witness: &'b mut PartitionWitness<'a, F>,
     unresolved_watches: &'b mut [usize],
-    generator_indices_by_watches: &'b GeneratorWatchIndex,
+    generator_indices_by_watches: &'b BTreeMap<usize, Vec<usize>>,
 }
 
 impl<F: Field> Debug for PartitionSeeder<'_, '_, F> {
@@ -350,7 +353,7 @@ pub struct PartitionFeeder<'a, 'b, F: Field> {
     unresolved_watches: &'b mut [usize],
     generator_is_expired: &'b [bool],
     pending_generator_indices: &'b mut Vec<usize>,
-    generator_indices_by_watches: &'b GeneratorWatchIndex,
+    generator_indices_by_watches: &'b BTreeMap<usize, Vec<usize>>,
 }
 
 impl<F: Field> Debug for PartitionFeeder<'_, '_, F> {
@@ -1185,7 +1188,7 @@ mod tests {
         }
 
         let mut unresolved_watches = vec![0usize; prover_data.generators.len()];
-        for (watch, watchers) in prover_data.generator_indices_by_watches.iter() {
+        for (&watch, watchers) in &prover_data.generator_indices_by_watches {
             if !witness.is_set_by_rep_index(watch) {
                 for &generator_idx in watchers {
                     unresolved_watches[generator_idx] += 1;
@@ -1206,7 +1209,7 @@ mod tests {
         // The builder-derived counts must equal the number of watcher-list occurrences of each
         // generator across the whole map (the "no representative is populated yet" case).
         let mut occurrences = vec![0usize; prover_data.generators.len()];
-        for (_, watchers) in prover_data.generator_indices_by_watches.iter() {
+        for watchers in prover_data.generator_indices_by_watches.values() {
             for &generator_idx in watchers {
                 occurrences[generator_idx] += 1;
             }
@@ -1217,11 +1220,11 @@ mod tests {
         );
 
         // Watcher lists are deduplicated, so a count is the number of *distinct* representatives.
-        for (_, watchers) in prover_data.generator_indices_by_watches.iter() {
-            let mut sorted = watchers.to_vec();
+        for watchers in prover_data.generator_indices_by_watches.values() {
+            let mut sorted = watchers.clone();
             sorted.sort_unstable();
             sorted.dedup();
-            assert_eq!(sorted, watchers, "watcher list is not deduplicated/sorted");
+            assert_eq!(&sorted, watchers, "watcher list is not deduplicated/sorted");
         }
 
         for inputs in [
