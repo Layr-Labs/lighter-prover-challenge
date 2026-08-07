@@ -349,8 +349,36 @@ pub struct PartitionWitness<'a, F: Field> {
 impl<'a, F: Field> PartitionWitness<'a, F> {
     pub fn new(num_wires: usize, degree: usize, representative_map: &'a [u32]) -> Self {
         let len = representative_map.len();
+        // `F` is a plain struct with no `IsZero` specialization, so
+        // `vec![F::ZERO; len]` is a real single-threaded store loop, not
+        // `alloc_zeroed`. At `num_wires = 136` that is ~17 MiB for a d14
+        // circuit and ~68 MiB for d16, written serially at the very head of
+        // witness generation — before any generator runs — so it is pure added
+        // latency on the critical path of every one of the ~106 proofs, a few
+        // GiB of serial stores per worker process.
+        //
+        // The zeros are still semantically required (`full_witness` reads
+        // unset slots and expects `F::ZERO`), so this is not a deletion: the
+        // same bytes are written, just across all cores instead of one. Values
+        // are element-for-element identical to `vec![F::ZERO; len]`.
+        let mut values: Vec<F> = Vec::with_capacity(len);
+        {
+            use plonky2_maybe_rayon::*;
+            let slots: &mut [core::mem::MaybeUninit<F>] =
+                crate::hash::merkle_tree::capacity_up_to_mut(&mut values, len);
+            // Chunked so each worker fills a contiguous run; 64 Ki elements is
+            // large enough to amortize the task and small enough to balance.
+            slots.par_chunks_mut(1 << 16).for_each(|chunk| {
+                for slot in chunk.iter_mut() {
+                    slot.write(F::ZERO);
+                }
+            });
+        }
+        // SAFETY: `par_chunks_mut` partitions the whole `len`-element region
+        // and every slot in every chunk is written exactly once above.
+        unsafe { values.set_len(len) };
         Self {
-            values: vec![F::ZERO; len],
+            values,
             set_bitmap: vec![0u64; len.div_ceil(64)],
             representative_map,
             num_wires,
