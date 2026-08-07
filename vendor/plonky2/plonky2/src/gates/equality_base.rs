@@ -261,6 +261,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EqualityGate {
         2
     }
 
+    fn u32_quotient_gate(&self) -> Option<crate::gates::gate::U32QuotientGate> {
+        Some(crate::gates::gate::U32QuotientGate::Equality {
+            num_ops: self.num_ops,
+        })
+    }
+
     fn num_constraints(&self) -> usize {
         self.num_ops * 4
     }

@@ -182,6 +182,18 @@ pub(crate) enum U32QuotientKind {
         num_extra_constants: usize,
         constant_base: usize,
     },
+    /// Base-`base` decomposition: one routed sum word then `num_limbs` limb
+    /// words; `1 + num_limbs` rows.
+    BaseSum {
+        num_limbs: usize,
+        base: usize,
+    },
+    /// Equality: three routed words plus three temporaries per operation,
+    /// four rows per operation. `const_column` is the absolute constants
+    /// column of the gate's single local constant.
+    Equality {
+        const_column: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -745,6 +757,35 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                         return None;
                     }
                     (6usize, bits, num_extra_constants, constant_base, wire_count, num_constraints)
+                }
+                U32QuotientKind::BaseSum { num_limbs, base } => {
+                    if num_limbs == 0 || !matches!(base, 2 | 4) {
+                        return None;
+                    }
+                    // `num_limbs` and `base` ride in the addend and
+                    // result-limb slots; the ten-word record is unchanged.
+                    (
+                        7usize,
+                        num_limbs,
+                        base,
+                        0usize,
+                        num_limbs.checked_add(1)?,
+                        num_limbs.checked_add(1)?,
+                    )
+                }
+                U32QuotientKind::Equality { const_column } => {
+                    if const_column >= constants.cols {
+                        return None;
+                    }
+                    // The gate's local-constant column rides in the addend slot.
+                    (
+                        8usize,
+                        const_column,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_mul(6)?,
+                        spec.num_ops.checked_mul(4)?,
+                    )
                 }
             };
         if wire_count > wires.cols
@@ -2997,6 +3038,15 @@ mod tests {
                 1,
                 UnionShape::U32(U32QuotientKind::ByteDecomposition { num_limbs: 1 }),
             ),
+            // BaseSum at both production bases; the 63-limb binary shape is
+            // the one carried on the recursion spine.
+            (1, UnionShape::U32(U32QuotientKind::BaseSum { num_limbs: 63, base: 2 })),
+            (1, UnionShape::U32(U32QuotientKind::BaseSum { num_limbs: 16, base: 2 })),
+            (1, UnionShape::U32(U32QuotientKind::BaseSum { num_limbs: 32, base: 4 })),
+            (1, UnionShape::U32(U32QuotientKind::BaseSum { num_limbs: 4, base: 4 })),
+            // Equality at the production op count and a small one; exercises
+            // the local-constant column read.
+            (22, UnionShape::U32(U32QuotientKind::Equality { const_column: 0 })),
             (5, UnionShape::U32(U32QuotientKind::QuinticMultiplication)),
             (6, UnionShape::U32(U32QuotientKind::QuinticSquaring)),
             (15, UnionShape::RangeCheck { bit_size: 16 }),
@@ -3373,6 +3423,43 @@ mod tests {
                                 constraints.push(combined_high - output_high);
                             }
                             assert_eq!(constraints.len(), spec.num_ops * 36);
+                        }
+                        U32QuotientKind::BaseSum { num_limbs, base } => {
+                            let base_f = F::from_canonical_usize(base);
+                            let mut computed_sum = F::ZERO;
+                            for j in (0..num_limbs).rev() {
+                                computed_sum =
+                                    computed_sum * base_f + wires.col(1 + j)[source_row];
+                            }
+                            constraints.push(computed_sum - wires.col(0)[source_row]);
+                            for j in 0..num_limbs {
+                                let limb = wires.col(1 + j)[source_row];
+                                // Literal residue product, deliberately not the
+                                // shader's factored form.
+                                let product = (0..base)
+                                    .map(|i| limb - F::from_canonical_usize(i))
+                                    .product::<F>();
+                                constraints.push(product);
+                            }
+                            assert_eq!(constraints.len(), num_limbs + 1);
+                        }
+                        U32QuotientKind::Equality { const_column } => {
+                            let const_0 = constants.col(const_column)[source_row];
+                            for op in 0..spec.num_ops {
+                                let routed = 3 * op;
+                                let temp = 3 * spec.num_ops + 3 * op;
+                                let x = wires.col(routed)[source_row];
+                                let y = wires.col(routed + 1)[source_row];
+                                let equal = wires.col(routed + 2)[source_row];
+                                let diff = wires.col(temp)[source_row];
+                                let invdiff = wires.col(temp + 1)[source_row];
+                                let prod = wires.col(temp + 2)[source_row];
+                                constraints.push((x - y) - diff);
+                                constraints.push((diff * invdiff) - prod);
+                                constraints.push((prod * diff) - diff);
+                                constraints.push((const_0 - prod) - equal);
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * 4);
                         }
                         U32QuotientKind::RandomAccess {
                             bits,

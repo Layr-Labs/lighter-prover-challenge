@@ -974,6 +974,76 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
+        } else if (kind == 7u) {
+            // BaseSumGate<base>: one routed sum word followed by `num_limbs`
+            // limb words. Row zero is the little-endian recomposition, then
+            // one range row per limb in ascending order, matching the CPU
+            // evaluator's emission order exactly. `num_limbs` and `base` ride
+            // in the addend and result-limb slots.
+            uint num_limbs = num_addends;
+            uint base = (uint)result_limbs;
+            ulong computed_sum = 0;
+            for (uint remaining = num_limbs; remaining > 0u; --remaining) {
+                uint j = remaining - 1u;
+                ulong limb = wires[(ulong)(1u + j) * lde_rows + source_row];
+                computed_sum = gl_add(gl_mul(computed_sum, (ulong)base), limb);
+            }
+            range_check_gate_emit(
+                gl_sub(computed_sum, wires[source_row]),
+                alpha_powers,
+                alpha_stride,
+                gate_accumulators,
+                constraint_index++);
+            for (uint j = 0; j < num_limbs; ++j) {
+                ulong limb = wires[(ulong)(1u + j) * lde_rows + source_row];
+                ulong product;
+                if (base == 2u) {
+                    product = gl_mul(limb, gl_sub(limb, 1));
+                } else {
+                    // limb(limb-1)(limb-2)(limb-3) = y(y+2), y = limb(limb-3)
+                    ulong y = gl_mul(limb, gl_sub(limb, 3));
+                    product = gl_mul(y, gl_add(y, 2));
+                }
+                range_check_gate_emit(
+                    product,
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 8u) {
+            // EqualityGate: three routed words per operation (x, y, equal)
+            // then three temporaries (diff, invdiff, prod), four rows per
+            // operation in the exact CPU emission order. The gate's single
+            // local-constant column rides in the addend slot.
+            ulong const_0 =
+                constants[(ulong)num_addends * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong routed_base = (ulong)op * 3u;
+                ulong temp_base = (ulong)num_ops * 3u + (ulong)op * 3u;
+                ulong x = wires[(routed_base + 0u) * lde_rows + source_row];
+                ulong y = wires[(routed_base + 1u) * lde_rows + source_row];
+                ulong equal = wires[(routed_base + 2u) * lde_rows + source_row];
+                ulong diff = wires[(temp_base + 0u) * lde_rows + source_row];
+                ulong invdiff = wires[(temp_base + 1u) * lde_rows + source_row];
+                ulong prod = wires[(temp_base + 2u) * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(gl_sub(x, y), diff),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_mul(diff, invdiff), prod),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_mul(prod, diff), diff),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_sub(const_0, prod), equal),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
         } else {
             // The Rust encoder rejects unknown discriminants; if a malformed
             // record reaches the shader, make its selected row unsatisfiable.

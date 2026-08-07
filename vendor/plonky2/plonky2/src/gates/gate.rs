@@ -76,6 +76,16 @@ pub enum U32QuotientGate {
         num_ops: usize,
         num_extra_constants: usize,
     },
+    /// Base-`base` decomposition: one routed sum word followed by
+    /// `num_limbs` limb words. Row zero checks the little-endian
+    /// recomposition; the remaining `num_limbs` rows are the per-limb range
+    /// products `prod_{i<base} (limb - i)`.
+    BaseSum { num_limbs: usize, base: usize },
+    /// Equality: three routed words per operation (the two elements and the
+    /// boolean output) followed by three temporaries (difference, its
+    /// inverse, and the product); four constraint rows per operation. Reads
+    /// the gate's single local constant.
+    Equality { num_ops: usize },
 }
 
 /// A custom gate.

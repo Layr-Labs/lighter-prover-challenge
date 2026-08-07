@@ -1238,6 +1238,24 @@ fn start_gpu_range_check_gate_quotient<
                         expected_constraints,
                     )
                 }
+                // One sum word plus `num_limbs` limb words; one recomposition
+                // row plus one range row per limb. Single implicit operation.
+                U32QuotientGate::BaseSum { num_limbs, base } => (
+                    U32QuotientKind::BaseSum { num_limbs, base },
+                    1usize,
+                    num_limbs.checked_add(1)?,
+                    num_limbs.checked_add(1)?,
+                ),
+                // The gate's local constants follow the selector columns; the
+                // no-lookup guard above means there are no lookup selectors.
+                U32QuotientGate::Equality { num_ops } => (
+                    U32QuotientKind::Equality {
+                        const_column: common_data.selectors_info.num_selectors(),
+                    },
+                    num_ops,
+                    num_ops.checked_mul(6)?,
+                    num_ops.checked_mul(4)?,
+                ),
             };
             if num_ops == 0
                 || gate.0.num_wires() != expected_wires
