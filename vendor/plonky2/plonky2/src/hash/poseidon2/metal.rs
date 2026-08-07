@@ -173,6 +173,29 @@ pub fn set_exclusive_gpu_phase(enabled: bool) {
     EXCLUSIVE_GPU_PHASE.store(enabled, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Number of Merkle builds currently occupying the serialized GPU stream
+/// (from buffer acquisition through `wait_until_completed`). Routing reads
+/// this to decide whether a small serial-path tree would enqueue behind
+/// in-flight work; the count is a heuristic only — either routing outcome
+/// hashes the identical tree, so races are benign.
+static GPU_JOBS_IN_FLIGHT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+struct GpuJobGuard;
+
+impl GpuJobGuard {
+    fn begin() -> Self {
+        GPU_JOBS_IN_FLIGHT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        GpuJobGuard
+    }
+}
+
+impl Drop for GpuJobGuard {
+    fn drop(&mut self) {
+        GPU_JOBS_IN_FLIGHT.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bool {
     let leaf_permutations = if leaf_width <= 4 {
         0
@@ -180,7 +203,8 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
         leaf_width.div_ceil(8) * leaf_count
     };
     let parent_permutations = leaf_count - (1usize << cap_height);
-    let min_permutations = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
+    let exclusive = EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed);
+    let min_permutations = if exclusive {
         EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS
     } else {
         MIN_GPU_PERMUTATIONS
@@ -189,11 +213,25 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     // serial circuits (chain steps and pre-execution; the pipelined chunk
     // circuits commit at 2^19 leaves and their FRI folds at 2^16 and below).
     // Those trees sit on the strictly sequential critical path in every
-    // phase and measured ~2x faster on the GPU (2^17 width-8: CPU 14.9 ms vs
-    // GPU 7.8 ms), so route them to the GPU regardless of phase; each build
-    // occupies the serialized GPU stream only briefly.
+    // phase and measured ~2x faster on the GPU when the stream is idle
+    // (2^17 width-8: CPU 14.9 ms vs GPU 7.8 ms). But command buffers execute
+    // FIFO per queue, so when a pipelined 2^19-leaf chunk tree is already in
+    // flight the fold tree waits behind it: phase-level spans on an M-series
+    // host measured the fold's commit phases at 200-320 ms under pipeline
+    // load versus 10-50 ms alone, while its pure-CPU phases inflated <1.3x.
+    // The ~15 ms CPU build beats that queue wait by an order of magnitude
+    // for the narrow shapes (width <= 64: the Z/partial-product and quotient
+    // trees), so route those to the GPU only while its stream is unoccupied.
+    // The width-135 wires tree stays on the GPU unconditionally: its CPU
+    // build (~17 permutations per leaf) costs about as much as the queue
+    // wait and measurably starves the fold's pure-CPU phases.
     let serial_critical_shape = leaf_count == 1 << 17 && leaf_width > 4;
-    serial_critical_shape || leaf_permutations + parent_permutations >= min_permutations
+    if serial_critical_shape {
+        return exclusive
+            || leaf_width > 64
+            || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
+    }
+    leaf_permutations + parent_permutations >= min_permutations
 }
 
 fn shared_context() -> Option<&'static MetalShared> {
@@ -574,6 +612,7 @@ impl MetalShared {
         let cap_count = 1usize << cap_height;
         let total_node_count = 2 * lde_size - cap_count;
 
+        let _job = GpuJobGuard::begin();
         let value_len = degree
             .checked_mul(cols)
             .ok_or("NTT value length overflow")?;
@@ -832,6 +871,7 @@ impl MetalShared {
         let cap_count = 1usize << cap_height;
         let total_node_count = 2 * lde_size - cap_count;
 
+        let _job = GpuJobGuard::begin();
         let coeff_len = degree
             .checked_mul(cols)
             .ok_or("NTT coefficient length overflow")?;
@@ -1074,6 +1114,7 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("Metal Merkle output size overflow")?;
 
+        let _job = GpuJobGuard::begin();
         let mut set = self.acquire_set()?;
         let result = self.build_with_set(
             &mut set,
