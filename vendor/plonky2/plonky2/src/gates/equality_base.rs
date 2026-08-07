@@ -249,6 +249,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EqualityGate {
         self.num_ops
     }
 
+    fn equality_quotient_gate(&self) -> Option<crate::gates::gate::EqualityQuotientGate> {
+        Some(crate::gates::gate::EqualityQuotientGate { num_ops: self.num_ops })
+    }
+
     fn num_wires(&self) -> usize {
         self.num_ops * Self::TOTAL_PER_OP
     }
