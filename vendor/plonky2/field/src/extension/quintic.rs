@@ -110,6 +110,29 @@ impl<F: Extendable<5>> Sample for QuinticExtension<F> {
     }
 }
 
+impl<F: Extendable<5>> QuinticExtension<F> {
+    /// Split inversion into an extension-field cofactor and its base-field norm.
+    /// Several independent norms can be batch-inverted before finishing each inverse.
+    #[inline]
+    pub fn inverse_norm_parts(&self) -> Option<(Self, F)> {
+        if self.is_zero() {
+            return None;
+        }
+
+        let d = self.frobenius();
+        let e = d * d.frobenius();
+        let cofactor = e * e.repeated_frobenius(2);
+        let norm = self.mul_first_coeff(&cofactor);
+        Some((cofactor, norm))
+    }
+
+    /// Complete an inverse from a cofactor and an already-inverted base-field norm.
+    #[inline]
+    pub fn finish_inverse_from_norm(cofactor: Self, inverse_norm: F) -> Self {
+        FieldExtension::<5>::scalar_mul(&cofactor, inverse_norm)
+    }
+}
+
 impl<F: Extendable<5>> Field for QuinticExtension<F> {
     const ZERO: Self = Self([F::ZERO; 5]);
     const ONE: Self = Self([F::ONE, F::ZERO, F::ZERO, F::ZERO, F::ZERO]);
@@ -138,25 +161,8 @@ impl<F: Extendable<5>> Field for QuinticExtension<F> {
 
     // Algorithm 11.3.4 in Handbook of Elliptic and Hyperelliptic Curve Cryptography.
     fn try_inverse(&self) -> Option<Self> {
-        if self.is_zero() {
-            return None;
-        }
-
-        // Writing 'a' for self:
-        let d = self.frobenius(); // d = a^p
-        let e = d * d.frobenius(); // e = a^(p + p^2)
-        let f = e * e.repeated_frobenius(2); // f = a^(p + p^2 + p^3 + p^4)
-
-        // f contains a^(r-1) and a^r is in the base field.
-        debug_assert!(FieldExtension::<5>::is_in_basefield(&(*self * f)));
-
-        // g = a^r is in the base field, so only compute that
-        // coefficient rather than the full product. The equation is
-        // extracted from Mul::mul(...) below and, like Mul itself, is
-        // specialized for Goldilocks with delayed reduction.
-        let g = self.mul_first_coeff(&f);
-
-        Some(FieldExtension::<5>::scalar_mul(&f, g.inverse()))
+        self.inverse_norm_parts()
+            .map(|(cofactor, norm)| Self::finish_inverse_from_norm(cofactor, norm.inverse()))
     }
 
     fn from_noncanonical_biguint(n: BigUint) -> Self {
