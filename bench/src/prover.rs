@@ -1,6 +1,8 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
@@ -45,6 +47,32 @@ fn chunk_is_light(txs: &[Tx<F>]) -> bool {
 
 fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
     (light, heavy)
+}
+
+/// Whether the calling transaction path may claim the process-global exclusive
+/// GPU phase for its chain tail.
+///
+/// `set_exclusive_gpu_phase` lowers the CPU/GPU Merkle routing cutoff and makes
+/// the 2^17-leaf narrow commitment trees (the chain steps' Z/partial-product and
+/// quotient trees) bypass the GPU occupancy check entirely. Its documented
+/// contract is that no other proof runs concurrently while it is enabled, because
+/// Metal command buffers execute FIFO on one queue: a fold's ~8 ms tree enqueued
+/// behind a pipelined 2^19-leaf chunk tree waits hundreds of milliseconds instead
+/// of ~15 ms on the CPU.
+///
+/// The tail-drain condition each path can test locally — "this path spawns no
+/// further chunk work" — is *not* that contract. The heavy path has three chunks
+/// and the light path forty-nine, so the heavy path reaches its drain while the
+/// light pipeline is at full saturation. Claiming the exclusive phase there
+/// disables occupancy-conditional routing process-wide for the light pipeline and
+/// simultaneously force-routes this path's own fold trees behind the light
+/// pipeline's chunk trees — it hurts both sides. The claim is legitimate only for
+/// the path that is the last one still proving, which this counter identifies.
+///
+/// Routing is a scheduling heuristic: either outcome hashes the identical tree,
+/// so a stale read here is benign and no proof byte depends on the answer.
+fn claims_exclusive_gpu_phase(active_paths: &AtomicUsize) -> bool {
+    active_paths.load(Ordering::Acquire) == 1
 }
 
 /// Marks the calling thread as latency-critical to the macOS scheduler.
@@ -230,6 +258,7 @@ fn prove_path(
     old_account_delta_tree_root: HashOut<F>,
     pre_output: &BlockPreExecWitness<F>,
     state_metadata_hash: HashOut<F>,
+    active_paths: &AtomicUsize,
 ) -> Proof {
     assert!(
         !chunks.is_empty(),
@@ -277,7 +306,7 @@ fn prove_path(
     jump = next_jump;
 
 
-    std::thread::scope(|scope| {
+    let chain_proof = std::thread::scope(|scope| {
         let base = &base_proof;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
@@ -382,8 +411,13 @@ fn prove_path(
         // Past this point the pipeline spawns no new chunk work: the drain
         // below is the strictly sequential chain tail, so its mid-size
         // commitment trees can use the mostly idle GPU exactly like the
-        // pre-execution and final block phases.
-        plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
+        // pre-execution and final block phases — but only once this path is the
+        // last one proving, since the switch is process-global (see
+        // [`claims_exclusive_gpu_phase`]).
+        let exclusive_drain = claims_exclusive_gpu_phase(active_paths);
+        if exclusive_drain {
+            plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
+        }
         while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
             let tx_proof = proof_handle
                 .join()
@@ -403,9 +437,16 @@ fn prove_path(
         let chain_proof = chain
             .map(ChainState::wait)
             .expect("transaction path must produce a chain proof");
-        plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+        if exclusive_drain {
+            plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+        }
         chain_proof
-    })
+    });
+    // This path has produced its last proof. Retiring it here — after the scope,
+    // so every thread it spawned has joined — is what lets the sibling path's
+    // drain observe that it is alone and claim the exclusive GPU phase.
+    active_paths.fetch_sub(1, Ordering::Release);
+    chain_proof
 }
 
 pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
@@ -436,10 +477,17 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
     block.tx_chunks = tx_chunks;
     block.tx_chunks.push(Vec::new());
 
+    // Both transaction paths prove concurrently and each ends in a strictly
+    // sequential chain tail, but the exclusive-GPU switch that tail wants is
+    // process-global. This counter lets a path tell "my own pipeline is done"
+    // apart from "no other proof is running": each path retires itself when its
+    // chain proof is finished, so only the last one standing claims the phase.
+    let active_paths = AtomicUsize::new(2);
     let (light_chain_proof, heavy_chain_proof, block_target, block_data, block_pending) = {
         // The pipeline only ever reads the circuits; the borrow ends with this
         // block so the finished extensions can be released below.
         let circuits = &circuits;
+        let active_paths = &active_paths;
         std::thread::scope(|scope| {
             // The final block circuit depends only on already-built circuit data
             // and is not needed until the final proof, so it builds concurrently
@@ -472,6 +520,7 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
                         block.old_account_delta_tree_root,
                         &pre_output,
                         state_metadata_hash,
+                        active_paths,
                     )
                 })
                 .expect("heavy transaction chain thread must start");
@@ -520,6 +569,7 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
                 block.old_account_delta_tree_root,
                 &pre_output,
                 state_metadata_hash,
+                active_paths,
             );
             let (block_target, block_data, block_pending, heavy_chain_proof) =
                 block_circuit_handle
@@ -605,6 +655,23 @@ mod tests {
             .expect("orchestration test thread must start")
             .join()
             .expect("orchestration test thread must finish");
+    }
+
+    #[test]
+    fn exclusive_gpu_phase_is_claimed_only_by_the_last_running_path() {
+        // Two paths proving: the one that reaches its drain first (the three-chunk
+        // heavy path) must not claim the process-global exclusive phase while the
+        // forty-nine-chunk light pipeline is still running.
+        let active_paths = AtomicUsize::new(2);
+        assert!(!claims_exclusive_gpu_phase(&active_paths));
+
+        // The heavy path retires; the light path's drain is now genuinely alone.
+        active_paths.fetch_sub(1, Ordering::Release);
+        assert!(claims_exclusive_gpu_phase(&active_paths));
+
+        // Both retired: nothing is proving, so nothing claims the phase either.
+        active_paths.fetch_sub(1, Ordering::Release);
+        assert!(!claims_exclusive_gpu_phase(&active_paths));
     }
 
     #[test]
