@@ -329,19 +329,22 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D> for
             let bits = vars.local_wires.view(self.wires_ith_bit_decomposition(i));
 
             // Check 1: Ensure that the decomposition matches the input
-            let computed_x =
-                reduce_with_powers(bits.iter().rev(), F::from_canonical_usize(Self::B));
+            let mut computed_x = bits[0];
+            for &bit in bits.iter().skip(1) {
+                computed_x = computed_x + computed_x + bit;
+            }
 
             yield_constr.one(computed_x - x);
 
             // Check 2: Ensure that the bit decomposition matches the interleaved representation
             let x_interleaved = vars.local_wires[self.wire_ith_x_interleaved(i)];
 
-            // Reduce with powers, but use 4 instead of 2 as the base
-            let computed_x_interleaved = reduce_with_powers(
-                bits.iter().rev(),
-                F::from_canonical_usize(Self::B * Self::B),
-            );
+            // Fold with base 4 instead of 2, via two doublings per step
+            let mut computed_x_interleaved = bits[0];
+            for &bit in bits.iter().skip(1) {
+                let d = computed_x_interleaved + computed_x_interleaved;
+                computed_x_interleaved = d + d + bit;
+            }
 
             yield_constr.one(computed_x_interleaved - x_interleaved);
 
