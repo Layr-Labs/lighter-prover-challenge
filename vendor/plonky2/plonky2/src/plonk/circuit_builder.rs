@@ -1016,18 +1016,12 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             self.virtual_target_index,
         );
 
-        for gate in 0..degree {
-            for input in 0..config.num_wires {
-                forest.add(Target::Wire(Wire {
-                    row: gate,
-                    column: input,
-                }));
-            }
-        }
-
-        for index in 0..self.virtual_target_index {
-            forest.add(Target::VirtualTarget { index });
-        }
+        // Dense bulk init: same index order as the old nested add loops
+        // (row-major wires, then virtual targets 0..N). Avoids tens of millions
+        // of single push calls. Capacity already asserted in Forest::new.
+        let n = config.num_wires * degree + self.virtual_target_index;
+        debug_assert!(forest.parents.is_empty());
+        forest.parents.extend((0..n as u32));
 
         for &CopyConstraint { pair: (a, b), .. } in &self.copy_constraints {
             forest.merge(a, b);
