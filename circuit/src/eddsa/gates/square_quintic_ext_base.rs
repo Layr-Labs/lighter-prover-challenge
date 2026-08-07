@@ -157,9 +157,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for QuinticSquarin
         assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
         let wires = vars_base.local_wires;
         let col = |w: usize| &wires[w * n..][..n];
-        let const_2 = F::from_canonical_u64(2);
-        let const_3 = F::from_canonical_u64(3);
-        let const_6 = F::from_canonical_u64(6);
+        let times2 = |x: F| x + x;
+        let times3 = |x: F| x + x + x;
+        let times6 = |x: F| {
+            let d = x + x;
+            d + d + d
+        };
         let mut chunks = combined_gate_constraints.chunks_exact_mut(n);
 
         for i in 0..self.num_ops {
@@ -172,26 +175,27 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for QuinticSquarin
             for p in 0..n {
                 let ap: [F; 5] = core::array::from_fn(|j| a[j][p]);
                 let f = filters[p];
-                // Identical expressions and order to `eval_unfiltered_base_packed`.
+                // Same constraint order as `eval_unfiltered_base_packed`; the
+                // small constant multiples use exact addition chains.
                 outs[0][p] += f * (ap[0] * ap[0] - extra[0][p]);
-                outs[1][p] += f * ((const_6 * ap[1] * ap[4] + extra[0][p]) - extra[1][p]);
-                outs[2][p] += f * ((const_6 * ap[2] * ap[3] + extra[1][p]) - c[0][p]);
+                outs[1][p] += f * ((times6(ap[1] * ap[4]) + extra[0][p]) - extra[1][p]);
+                outs[2][p] += f * ((times6(ap[2] * ap[3]) + extra[1][p]) - c[0][p]);
 
-                outs[3][p] += f * (const_3 * ap[3] * ap[3] - extra[2][p]);
-                outs[4][p] += f * ((const_2 * ap[0] * ap[1] + extra[2][p]) - extra[3][p]);
-                outs[5][p] += f * ((const_6 * ap[2] * ap[4] + extra[3][p]) - c[1][p]);
+                outs[3][p] += f * (times3(ap[3] * ap[3]) - extra[2][p]);
+                outs[4][p] += f * ((times2(ap[0] * ap[1]) + extra[2][p]) - extra[3][p]);
+                outs[5][p] += f * ((times6(ap[2] * ap[4]) + extra[3][p]) - c[1][p]);
 
                 outs[6][p] += f * (ap[1] * ap[1] - extra[4][p]);
-                outs[7][p] += f * ((const_2 * ap[0] * ap[2] + extra[4][p]) - extra[5][p]);
-                outs[8][p] += f * ((const_6 * ap[3] * ap[4] + extra[5][p]) - c[2][p]);
+                outs[7][p] += f * ((times2(ap[0] * ap[2]) + extra[4][p]) - extra[5][p]);
+                outs[8][p] += f * ((times6(ap[3] * ap[4]) + extra[5][p]) - c[2][p]);
 
-                outs[9][p] += f * ((const_3 * ap[4] * ap[4]) - extra[6][p]);
-                outs[10][p] += f * ((const_2 * ap[0] * ap[3] + extra[6][p]) - extra[7][p]);
-                outs[11][p] += f * ((const_2 * ap[1] * ap[2] + extra[7][p]) - c[3][p]);
+                outs[9][p] += f * (times3(ap[4] * ap[4]) - extra[6][p]);
+                outs[10][p] += f * ((times2(ap[0] * ap[3]) + extra[6][p]) - extra[7][p]);
+                outs[11][p] += f * ((times2(ap[1] * ap[2]) + extra[7][p]) - c[3][p]);
 
                 outs[12][p] += f * (ap[2] * ap[2] - extra[8][p]);
-                outs[13][p] += f * ((const_2 * ap[0] * ap[4] + extra[8][p]) - extra[9][p]);
-                outs[14][p] += f * ((const_2 * ap[1] * ap[3] + extra[9][p]) - c[4][p]);
+                outs[13][p] += f * ((times2(ap[0] * ap[4]) + extra[8][p]) - extra[9][p]);
+                outs[14][p] += f * ((times2(ap[1] * ap[3]) + extra[9][p]) - c[4][p]);
             }
         }
     }
