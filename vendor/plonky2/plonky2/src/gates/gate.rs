@@ -71,6 +71,17 @@ pub enum U32QuotientGate {
     QuinticSquaring { num_ops: usize },
 }
 
+/// Static wire-layout metadata for the random-access gate: per copy, an
+/// access index, a claimed element, and `2^bits` routed list items, with the
+/// binary index decomposition in unrouted wires after the routed region and
+/// `num_extra_constants` routed constant mirrors after all copies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RandomAccessQuotientGate {
+    pub num_copies: usize,
+    pub bits: usize,
+    pub num_extra_constants: usize,
+}
+
 /// A custom gate.
 ///
 /// Vanilla Plonk arithmetization only supports basic fan-in 2 / fan-out 1 arithmetic gates,
@@ -326,6 +337,12 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
     /// Advertises one of the exact downstream U32 gate layouts to optional
     /// quotient backends. The default leaves unrelated gates on the CPU.
     fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+        None
+    }
+
+    /// Advertises the exact random-access layout to optional quotient
+    /// backends. The default leaves unrelated gates on the CPU.
+    fn random_access_quotient_gate(&self) -> Option<RandomAccessQuotientGate> {
         None
     }
 

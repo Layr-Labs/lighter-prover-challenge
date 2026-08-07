@@ -771,7 +771,7 @@ kernel void range_check_gate_quotient(
                         constraint_index++);
                 }
             }
-        } else {
+        } else if (kind == 5u) {
             // QuinticSquaringGate: ten routed words per operation (input
             // limbs a then output limbs c) plus ten temporary wires. Each
             // constraint checks one accumulation step of the squaring
@@ -859,6 +859,92 @@ kernel void range_check_gate_quotient(
                 range_check_gate_emit(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[1]), a[3]), extra[9]), c[4]),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 6u) {
+            // RandomAccessGate: per copy, [access_index, claimed_element,
+            // 2^bits list items] routed at stride (2 + 2^bits); the
+            // extra-constant mirror wires follow all copies, and the binary
+            // index decomposition sits after the routed region at `bits`
+            // wires per copy. The bit count rides the `num_addends` word,
+            // the extra-constant count the `result_limbs` word, and the
+            // absolute first gate-constant column the `num_carry_limbs`
+            // word. The host dispatches only bits <= 5, so the fold fits a
+            // fixed 32-slot array.
+            uint bits = num_addends;
+            uint num_extra_constants = result_limbs;
+            uint constants_base = num_carry_limbs;
+            uint vec_size = 1u << bits;
+            uint stride = 2u + vec_size;
+            uint routed_wires = stride * num_ops + num_extra_constants;
+            ulong items[32];
+            for (uint copy = 0; copy < num_ops; ++copy) {
+                ulong routed_base = (ulong)copy * stride;
+                ulong bit_base = (ulong)routed_wires + (ulong)copy * bits;
+
+                // Assert that each bit wire value is boolean, in ascending
+                // bit order exactly as the CPU accumulate path emits them.
+                for (uint i = 0; i < bits; ++i) {
+                    ulong b = wires[(bit_base + i) * lde_rows + source_row];
+                    range_check_gate_emit(
+                        gl_mul(b, gl_sub(b, 1)),
+                        alpha_powers,
+                        alpha_stride,
+                        gate_accumulators,
+                        constraint_index++);
+                }
+
+                // Assert that the binary decomposition matches the index.
+                ulong reconstructed = 0;
+                for (uint remaining = bits; remaining > 0u; --remaining) {
+                    uint i = remaining - 1u;
+                    reconstructed = gl_add(
+                        gl_add(reconstructed, reconstructed),
+                        wires[(bit_base + i) * lde_rows + source_row]);
+                }
+                ulong access_index = wires[routed_base * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(reconstructed, access_index),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+
+                // Fold the list pairwise, selecting by each bit in turn.
+                for (uint i = 0; i < vec_size; ++i) {
+                    items[i] = wires[(routed_base + 2u + i) * lde_rows + source_row];
+                }
+                uint level_size = vec_size;
+                for (uint i = 0; i < bits; ++i) {
+                    ulong b = wires[(bit_base + i) * lde_rows + source_row];
+                    for (uint k = 0; k < level_size / 2u; ++k) {
+                        ulong x = items[2u * k];
+                        ulong y = items[2u * k + 1u];
+                        items[k] = gl_add(x, gl_mul(b, gl_sub(y, x)));
+                    }
+                    level_size /= 2u;
+                }
+                ulong claimed_element =
+                    wires[(routed_base + 1u) * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(items[0], claimed_element),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+            }
+
+            // Constant mirrors: gate constant i must equal its routed wire.
+            for (uint i = 0; i < num_extra_constants; ++i) {
+                ulong constant_value = constants[
+                    (ulong)(constants_base + i) * lde_rows + source_row];
+                ulong wire = wires[
+                    ((ulong)stride * num_ops + i) * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(constant_value, wire),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
                     constraint_index++);
             }
         }

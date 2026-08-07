@@ -644,6 +644,8 @@ mod tests {
     use rand::Rng;
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::byte::split_gate::ByteDecompositionGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::uint::u32::gates::add_many_u32::U32AddManyGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::uint::u32::gates::arithmetic_u32::U32ArithmeticGate;
@@ -712,6 +714,19 @@ mod tests {
             builder.connect(input, Target::wire(row, gate.wire_ith_input(op)));
             inputs.push((input, bit_size));
         }
+        let byte_gate = ByteDecompositionGate::new_from_config(&config, 8);
+        let (row, op) = builder.find_slot(byte_gate, &[], &[]);
+        let byte_input = builder.add_virtual_target();
+        builder.connect(byte_input, Target::wire(row, byte_gate.i_th_sum(op)));
+
+        // Production random-access shape: bits=4 over a 16-element list, with
+        // the gate's extra-constant mirrors active.
+        let ra_index = builder.add_virtual_target();
+        let ra_list = (0..16)
+            .map(|_| builder.add_virtual_target())
+            .collect::<Vec<_>>();
+        let _ra_selected = builder.random_access(ra_index, ra_list.clone());
+
         let mut u32_inputs = Vec::new();
         let arithmetic = U32ArithmeticGate::<F, D>::new_from_config(&config);
         let (row, op) = builder.find_slot(arithmetic, &[], &[]);
@@ -764,6 +779,11 @@ mod tests {
                 _ => unreachable!(),
             };
             pw.set_target(input, F::from_canonical_u64(value))?;
+        }
+        pw.set_target(byte_input, F::from_canonical_u64(0x1234_5678_9abc_def0))?;
+        pw.set_target(ra_index, F::from_canonical_u64(5))?;
+        for (i, item) in ra_list.iter().enumerate() {
+            pw.set_target(*item, F::from_canonical_u64(0x1000 + 7 * i as u64))?;
         }
         for (input, value) in u32_inputs {
             pw.set_target(input, F::from_canonical_u64(value))?;

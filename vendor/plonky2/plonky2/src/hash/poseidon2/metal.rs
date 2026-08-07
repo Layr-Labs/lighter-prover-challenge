@@ -175,6 +175,16 @@ pub(crate) enum U32QuotientKind {
     /// Degree-5 extension squaring: ten routed words plus ten temporaries
     /// per operation, fifteen rows per operation.
     QuinticSquaring,
+    /// Per copy, an access index, a claimed element, and `2^bits` routed list
+    /// items, folded by a bit-selected binary tree; `num_extra_constants`
+    /// routed constant mirrors follow all copies, compared against the gate
+    /// constant columns starting at absolute column `constants_base` of the
+    /// constants/sigmas store.
+    RandomAccess {
+        bits: usize,
+        num_extra_constants: usize,
+        constants_base: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -649,6 +659,34 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                     spec.num_ops.checked_mul(20)?,
                     spec.num_ops.checked_mul(15)?,
                 ),
+                U32QuotientKind::RandomAccess {
+                    bits,
+                    num_extra_constants,
+                    constants_base,
+                } => {
+                    // The kernel folds the list in a fixed 32-slot register
+                    // array, so only `bits <= 5` is dispatchable.
+                    if bits == 0 || bits > 5 {
+                        return None;
+                    }
+                    let vec_size = 1usize << bits;
+                    if constants_base.checked_add(num_extra_constants)? > constants.cols {
+                        return None;
+                    }
+                    let routed = vec_size
+                        .checked_add(2)?
+                        .checked_mul(spec.num_ops)?
+                        .checked_add(num_extra_constants)?;
+                    let wire_count = routed.checked_add(spec.num_ops.checked_mul(bits)?)?;
+                    let count = spec
+                        .num_ops
+                        .checked_mul(bits.checked_add(2)?)?
+                        .checked_add(num_extra_constants)?;
+                    // Bits ride the `num_addends` word, the extra-constant
+                    // count the `result_limbs` word, and the absolute first
+                    // gate-constant column the `num_carry_limbs` word.
+                    (6usize, bits, num_extra_constants, constants_base, wire_count, count)
+                }
             };
         if wire_count > wires.cols
             || spec.selector_column >= constants.cols
@@ -2484,6 +2522,34 @@ mod tests {
                 },
             });
         }
+        // Every dispatchable RandomAccess width, with the production bits=4
+        // shape carrying the production two extra constants. The gate
+        // constant columns sit after every selector column.
+        const RANDOM_ACCESS_SHAPES: [(usize, usize); 5] =
+            [(1, 0), (2, 1), (3, 0), (4, 2), (5, 0)];
+        let random_access_constants_base = specs.len() + RANDOM_ACCESS_SHAPES.len();
+        for (ra_shape, (bits, num_extra_constants)) in
+            RANDOM_ACCESS_SHAPES.into_iter().enumerate()
+        {
+            let vec_size = 1 << bits;
+            let stride = 2 + vec_size;
+            let num_ops = ((WIRE_COLUMNS - num_extra_constants) / (stride + bits)).min(4);
+            let selector_column = specs.len();
+            let gate_index = 130 + 3 * ra_shape;
+            specs.push(U32QuotientSpec {
+                selector_column,
+                gate_index,
+                group: gate_index - 1..gate_index + 2,
+                include_unused_selector: true,
+                num_ops,
+                kind: U32QuotientKind::RandomAccess {
+                    bits,
+                    num_extra_constants,
+                    constants_base: random_access_constants_base,
+                },
+            });
+        }
+        const EXTRA_CONSTANT_COLUMNS: usize = 2;
 
         for step in [1, 4] {
             let full_rows = QUOTIENT_ROWS * step;
@@ -2491,10 +2557,22 @@ mod tests {
                 .allocate_columns::<F>(full_rows, WIRE_COLUMNS)
                 .expect("wire columns must allocate");
             let mut constants = context
-                .allocate_columns::<F>(full_rows, specs.len())
+                .allocate_columns::<F>(full_rows, specs.len() + EXTRA_CONSTANT_COLUMNS)
                 .expect("selector columns must allocate");
             let mut rng = StdRng::seed_from_u64(0x3200_0000 + step as u64);
             for column in wires.columns_mut().expect("unique wire columns") {
+                for value in column {
+                    *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
+                }
+            }
+            // Fill the gate-constant columns after the selectors with random
+            // values so the RandomAccess constant-mirror rows are nontrivial.
+            for column in constants
+                .columns_mut()
+                .expect("unique selector columns")
+                .into_iter()
+                .skip(specs.len())
+            {
                 for value in column {
                     *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
                 }
@@ -2639,6 +2717,49 @@ mod tests {
                                 constraints.push(combined_carry - output_carry);
                             }
                             assert_eq!(constraints.len(), spec.num_ops * (total_limbs + 3));
+                        }
+                        U32QuotientKind::RandomAccess {
+                            bits,
+                            num_extra_constants,
+                            constants_base,
+                        } => {
+                            let vec_size = 1 << bits;
+                            let stride = 2 + vec_size;
+                            let routed_wires = stride * spec.num_ops + num_extra_constants;
+                            for copy in 0..spec.num_ops {
+                                let routed = stride * copy;
+                                let bit_base = routed_wires + copy * bits;
+                                for i in 0..bits {
+                                    let b = wires.col(bit_base + i)[source_row];
+                                    constraints.push(b * (b - F::ONE));
+                                }
+                                let mut reconstructed = F::ZERO;
+                                for i in (0..bits).rev() {
+                                    reconstructed = reconstructed.double()
+                                        + wires.col(bit_base + i)[source_row];
+                                }
+                                constraints.push(reconstructed - wires.col(routed)[source_row]);
+                                let mut items = (0..vec_size)
+                                    .map(|i| wires.col(routed + 2 + i)[source_row])
+                                    .collect::<Vec<_>>();
+                                for i in 0..bits {
+                                    let b = wires.col(bit_base + i)[source_row];
+                                    items = items
+                                        .chunks_exact(2)
+                                        .map(|pair| pair[0] + b * (pair[1] - pair[0]))
+                                        .collect();
+                                }
+                                constraints.push(items[0] - wires.col(routed + 1)[source_row]);
+                            }
+                            for i in 0..num_extra_constants {
+                                let constant = constants.col(constants_base + i)[source_row];
+                                let wire = wires.col(stride * spec.num_ops + i)[source_row];
+                                constraints.push(constant - wire);
+                            }
+                            assert_eq!(
+                                constraints.len(),
+                                spec.num_ops * (bits + 2) + num_extra_constants
+                            );
                         }
                         _ => unreachable!(
                             "covered by metal_byte_and_quintic_gate_quotient_matches_cpu"
@@ -3033,7 +3154,7 @@ mod tests {
                             }
                             assert_eq!(constraints.len(), spec.num_ops * 15);
                         }
-                        U32QuotientKind::Arithmetic => {
+                        U32QuotientKind::Arithmetic | U32QuotientKind::RandomAccess { .. } => {
                             unreachable!("not exercised by this test");
                         }
                     }

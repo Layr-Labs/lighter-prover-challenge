@@ -1030,7 +1030,12 @@ fn start_gpu_range_check_gate_quotient<
     for (gate_index, gate) in common_data.gates.iter().enumerate() {
         let range = gate.0.range_check_quotient_gate();
         let u32_gate = gate.0.u32_quotient_gate();
-        if range.is_some() && u32_gate.is_some() {
+        let ra_gate = gate.0.random_access_quotient_gate();
+        let advertised_layouts = [range.is_some(), u32_gate.is_some(), ra_gate.is_some()]
+            .into_iter()
+            .filter(|&advertised| advertised)
+            .count();
+        if advertised_layouts > 1 {
             if gpu_poseidon_quotient_diagnostics_enabled() {
                 eprintln!(
                     "[gpu-range-quotient] gate {gate_index} advertised conflicting layouts"
@@ -1186,10 +1191,69 @@ fn start_gpu_range_check_gate_quotient<
             });
             gate_indices.push(gate_index);
         }
+        if let Some(ra_gate) = ra_gate {
+            let expected = (|| {
+                let vec_size = 1usize.checked_shl(ra_gate.bits as u32)?;
+                let routed = vec_size
+                    .checked_add(2)?
+                    .checked_mul(ra_gate.num_copies)?
+                    .checked_add(ra_gate.num_extra_constants)?;
+                let wires = routed.checked_add(ra_gate.num_copies.checked_mul(ra_gate.bits)?)?;
+                let constraints = ra_gate
+                    .num_copies
+                    .checked_mul(ra_gate.bits.checked_add(2)?)?
+                    .checked_add(ra_gate.num_extra_constants)?;
+                Some((wires, constraints))
+            })();
+            let Some((expected_wires, expected_constraints)) = expected else {
+                return None;
+            };
+            if ra_gate.num_copies == 0
+                || gate.0.num_wires() != expected_wires
+                || gate.0.num_constraints() != expected_constraints
+                || gate.0.num_constants() != ra_gate.num_extra_constants
+            {
+                if gpu_poseidon_quotient_diagnostics_enabled() {
+                    eprintln!(
+                        "[gpu-range-quotient] random-access layout mismatch gate={gate_index} \
+                         metadata={ra_gate:?} wires={} constraints={} \
+                         expected_wires={expected_wires} expected_constraints={expected_constraints}",
+                        gate.0.num_wires(),
+                        gate.0.num_constraints(),
+                    );
+                }
+                return None;
+            }
+            // The kernel folds the list in a fixed 32-slot array; wider or
+            // degenerate shapes stay on the CPU without failing the job.
+            if (1..=5).contains(&ra_gate.bits) {
+                let selector_column = common_data.selectors_info.selector_indices[gate_index];
+                u32_specs.push(U32QuotientSpec {
+                    selector_column,
+                    gate_index,
+                    group: common_data.selectors_info.groups[selector_column].clone(),
+                    include_unused_selector,
+                    num_ops: ra_gate.num_copies,
+                    kind: U32QuotientKind::RandomAccess {
+                        bits: ra_gate.bits,
+                        num_extra_constants: ra_gate.num_extra_constants,
+                        constants_base: common_data.selectors_info.num_selectors()
+                            + common_data.num_lookup_selectors,
+                    },
+                });
+                gate_indices.push(gate_index);
+            } else if gpu_poseidon_quotient_diagnostics_enabled() {
+                eprintln!(
+                    "[gpu-range-quotient] random-access gate {gate_index} bits {} \
+                     outside kernel support; kept on CPU",
+                    ra_gate.bits,
+                );
+            }
+        }
     }
     if specs.is_empty() && u32_specs.is_empty() {
         if gpu_poseidon_quotient_diagnostics_enabled() {
-            eprintln!("[gpu-range-quotient] no advertised RangeCheck/U32 gates");
+            eprintln!("[gpu-range-quotient] no advertised RangeCheck/U32/Byte gates");
         }
         return None;
     }
