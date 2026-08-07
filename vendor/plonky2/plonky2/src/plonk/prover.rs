@@ -1237,12 +1237,18 @@ fn start_gpu_range_check_gate_quotient<
                         expected_wires,
                         expected_constraints,
                     )
-                }
-            };
-            if num_ops == 0
-                || gate.0.num_wires() != expected_wires
-                || gate.0.num_constraints() != expected_constraints
-            {
+                                    },
+                                    U32QuotientGate::BaseSum { num_ops, num_limbs, base } => (
+                                                                            U32QuotientKind::BaseSum { num_limbs, base },
+                                                                            num_ops,
+                                                                            num_ops.checked_mul(1 + num_limbs)?,
+                                                                            num_ops.checked_mul(1 + num_limbs)?,
+                                                                        ),
+                                                                    };
+                                                                if num_ops == 0
+                                                                        || gate.0.num_wires() != expected_wires
+                                                                        || gate.0.num_constraints() != expected_constraints
+                                                                    {
                 if gpu_poseidon_quotient_diagnostics_enabled() {
                     eprintln!(
                         "[gpu-range-quotient] U32 layout mismatch gate={gate_index} \

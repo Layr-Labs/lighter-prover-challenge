@@ -72,11 +72,18 @@ pub enum U32QuotientGate {
     /// Random access with a little-endian binary index, `2^bits` list items
     /// per copy, and optional routed local constants.
     RandomAccess {
-        bits: usize,
-        num_ops: usize,
-        num_extra_constants: usize,
-    },
-}
+            bits: usize,
+            num_ops: usize,
+            num_extra_constants: usize,
+        },
+        /// Base-B decomposition: `1 + num_limbs` routed words (sum then limbs),
+            /// `1 + num_limbs` constraint rows per operation.
+            BaseSum {
+                num_ops: usize,
+                base: usize,
+                num_limbs: usize,
+            },
+    }
 
 /// A custom gate.
 ///

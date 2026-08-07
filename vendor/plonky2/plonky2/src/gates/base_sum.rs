@@ -8,6 +8,7 @@ use crate::field::extension::Extendable;
 use crate::field::packed::PackedField;
 use crate::field::types::{Field, Field64};
 use crate::gates::gate::Gate;
+use crate::gates::gate::U32QuotientGate;
 use crate::gates::packed_util::PackedEvaluableBase;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -156,12 +157,16 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> Gate<F, D> fo
 
     // 1 for checking the sum then `num_limbs` for range-checking the limbs.
     fn num_constraints(&self) -> usize {
-        1 + self.num_limbs
-    }
-}
+            1 + self.num_limbs
+        }
 
-impl<F: RichField + Extendable<D>, const D: usize, const B: usize> PackedEvaluableBase<F, D>
-    for BaseSumGate<B>
+        fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+                Some(U32QuotientGate::BaseSum { num_ops: 1, base: B, num_limbs: self.num_limbs })
+            }
+    }
+
+    impl<F: RichField + Extendable<D>, const D: usize, const B: usize> PackedEvaluableBase<F, D>
+        for BaseSumGate<B>
 {
     fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
         &self,

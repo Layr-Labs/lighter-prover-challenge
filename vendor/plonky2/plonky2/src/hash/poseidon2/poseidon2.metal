@@ -974,13 +974,41 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
-        } else {
-            // The Rust encoder rejects unknown discriminants; if a malformed
-            // record reaches the shader, make its selected row unsatisfiable.
-            range_check_gate_emit(
-                1, alpha_powers, alpha_stride, gate_accumulators,
-                constraint_index++);
-        }
+        } else if (kind == 7u) {
+                    // BaseSumGate: per operation, one routed sum wire and result_limbs
+                    // routed limb wires. num_addends = decomposition base (B).
+                    uint the_base = num_addends;
+                    uint num_limbs = result_limbs;
+                    uint routed_per_op = 1u + num_limbs;
+                    for (uint op = 0; op < num_ops; ++op) {
+                        ulong routed_base = (ulong)op * routed_per_op;
+                        ulong sum_wire = wires[(routed_base) * lde_rows + source_row];
+                        ulong horner = wires[(routed_base + num_limbs) * lde_rows + source_row];
+                        for (uint i = num_limbs; i > 1u; --i) {
+                            ulong limb = wires[(routed_base + i - 1u) * lde_rows + source_row];
+                            horner = gl_add(gl_mul(horner, the_base), limb);
+                        }
+                        range_check_gate_emit(gl_sub(horner, sum_wire),
+                            alpha_powers, alpha_stride, gate_accumulators,
+                            constraint_index++);
+                        for (uint i = 0; i < num_limbs; ++i) {
+                            ulong limb = wires[(routed_base + 1u + i) * lde_rows + source_row];
+                            ulong constraint = 1;
+                            for (uint b = 0; b < the_base; ++b) {
+                                constraint = gl_mul(constraint, gl_sub(limb, b));
+                            }
+                            range_check_gate_emit(constraint,
+                                alpha_powers, alpha_stride, gate_accumulators,
+                                constraint_index++);
+                        }
+                    }
+                } else {
+                    // The Rust encoder rejects unknown discriminants; if a malformed
+                    // record reaches the shader, make its selected row unsatisfiable.
+                    range_check_gate_emit(
+                        1, alpha_powers, alpha_stride, gate_accumulators,
+                        constraint_index++);
+                }
 
         total[0] = gl_add(total[0], gl_mul(filter, gate_accumulators[0]));
         total[1] = gl_add(total[1], gl_mul(filter, gate_accumulators[1]));

@@ -178,11 +178,16 @@ pub(crate) enum U32QuotientKind {
     /// Audited random-access layout. The ten-word record stores bits, extra
     /// constants, and the raw constant-column base in its final three words.
     RandomAccess {
-        bits: usize,
-        num_extra_constants: usize,
-        constant_base: usize,
-    },
-}
+            bits: usize,
+            num_extra_constants: usize,
+            constant_base: usize,
+        },
+        /// Base-B decomposition: `1 + num_limbs` rows per operation.
+                BaseSum {
+                    num_limbs: usize,
+                    base: usize,
+                },
+    }
 
 #[derive(Clone, Debug)]
 pub(crate) struct U32QuotientSpec {
@@ -720,7 +725,11 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                     spec.num_ops.checked_mul(20)?,
                     spec.num_ops.checked_mul(15)?,
                 ),
-                U32QuotientKind::RandomAccess {
+                                U32QuotientKind::BaseSum { num_limbs, base } => {
+                                                                    let count = spec.num_ops.checked_mul(1 + num_limbs)?;
+                                                                    (7usize, base, num_limbs, 0usize, count, count)
+                                                                }
+                                U32QuotientKind::RandomAccess {
                     bits,
                     num_extra_constants,
                     constant_base,
