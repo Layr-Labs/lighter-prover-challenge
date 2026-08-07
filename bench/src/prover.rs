@@ -33,8 +33,17 @@ enum TxPath {
 }
 
 const LIGHT_TX_PROOF_WINDOW: usize = 2;
-// Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
-const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
+// The fixed three-chunk heavy path finishes in ~3 s versus the light path's
+// ~20 s, and the GPU Merkle stream is a single FIFO queue shared by both
+// paths, so allowing the light tx-proof overlap window from the very first
+// step cannot outrun heavy on the GPU: it only lets light's CPU-side
+// quotient/FFT/FRI work start hiding behind whichever proof the serialized
+// stream is already running. The previous step-3 guard serialized the first
+// three light tx proofs, leaving that CPU work exposed for ~1 s with no
+// contention benefit. Heavy is delayed at most into its existing slack
+// (it joins the block-circuit lane, which waits for the much longer light
+// path regardless).
+const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 0;
 
 fn chunk_is_light(txs: &[Tx<F>]) -> bool {
     txs.first()
