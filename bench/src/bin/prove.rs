@@ -95,3 +95,5 @@ fn main() {
     // thread, so there is no in-flight background work left to lose here.
     std::process::exit(0);
 }
+
+// rawqubit-campaign-token iter-4
