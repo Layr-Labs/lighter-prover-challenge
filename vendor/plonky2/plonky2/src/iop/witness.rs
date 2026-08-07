@@ -290,6 +290,18 @@ impl<F: Field> MatrixWitness<F> {
     }
 }
 
+#[inline]
+fn representative_row_chunks<'a>(
+    representative_map: &'a [u32],
+    start_row: usize,
+    rows: usize,
+    num_wires: usize,
+) -> impl Iterator<Item = &'a [u32]> {
+    let start = start_row * num_wires;
+    let end = start + rows * num_wires;
+    representative_map[start..end].chunks_exact(num_wires)
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PartialWitness<F: Field> {
     pub target_values: HashMap<Target, F>,
@@ -432,13 +444,20 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
                 .enumerate()
                 .for_each(|(chunk, columns)| {
                     let rows = columns.first().map_or(0, |column| column.len());
-                    let mut wire_index = chunk * chunk_rows * num_wires;
-                    for i in 0..rows {
-                        for column in columns.iter_mut() {
+                    let representative_rows = representative_row_chunks(
+                        self.representative_map,
+                        chunk * chunk_rows,
+                        rows,
+                        num_wires,
+                    );
+                    for (i, representatives) in representative_rows.enumerate() {
+                        debug_assert_eq!(columns.len(), representatives.len());
+                        for (column, &representative) in
+                            columns.iter_mut().zip(representatives)
+                        {
                             column[i].write(
-                                self.values[self.representative_map[wire_index] as usize],
+                                self.values[representative as usize],
                             );
-                            wire_index += 1;
                         }
                     }
                 });
@@ -486,5 +505,23 @@ impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod full_witness_row_tests {
+    use super::representative_row_chunks;
+
+    #[test]
+    fn representative_row_chunks_select_exact_row_range() {
+        let representatives = (0..20u32).collect::<Vec<_>>();
+        let rows = representative_row_chunks(&representatives, 1, 3, 4)
+            .map(<[u32]>::to_vec)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rows,
+            vec![vec![4, 5, 6, 7], vec![8, 9, 10, 11], vec![12, 13, 14, 15]]
+        );
     }
 }
