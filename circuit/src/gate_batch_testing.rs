@@ -279,6 +279,47 @@ where
     }
 }
 
+/// Like [`assert_direct_accumulation_matches_materialized_batch`], but at a
+/// caller-chosen batch size and starting from a non-zero accumulator, so the
+/// differential exercises both sides of a fused fold's stack/heap scratch
+/// threshold and the accumulate (rather than overwrite) contract. Constraint
+/// order and values must be bit-identical.
+pub fn assert_accumulate_matches_materialized_at_batch_size<G>(gate: &G, n: usize)
+where
+    G: Gate<GoldilocksField, 2>,
+{
+    type F = GoldilocksField;
+
+    let wires = (0..gate.num_wires() * n)
+        .map(|i| F::from_canonical_usize(3 * i + 5))
+        .collect::<Vec<_>>();
+    let constants = (0..gate.num_constants() * n)
+        .map(|i| F::from_canonical_usize(7 * i + 11))
+        .collect::<Vec<_>>();
+    let hash = HashOut::ZERO;
+    let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+    let filters = (0..n)
+        .map(|i| F::from_canonical_usize(2 * i + 1))
+        .collect::<Vec<_>>();
+
+    // Non-zero seed: the accumulate contract must add onto prior content.
+    let seed = (0..gate.num_constraints() * n)
+        .map(|i| F::from_canonical_usize(13 * i + 17))
+        .collect::<Vec<_>>();
+
+    let mut expected = seed.clone();
+    let materialized = gate.eval_unfiltered_base_batch(vars);
+    for (acc, constraints) in expected
+        .chunks_exact_mut(n)
+        .zip(materialized.chunks_exact(n))
+    {
+        batch_multiply_add_inplace(acc, constraints, &filters);
+    }
+    let mut actual = seed;
+    gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+    assert_eq!(actual, expected, "gate {} at batch size {}", gate.id(), n);
+}
+
 /// Checks a gate's `eval_unfiltered_base_batch_accumulate` override against
 /// the default path (materialize the full unfiltered constraint matrix, then
 /// `batch_multiply_add_inplace` row by row) across a multi-point batch with
