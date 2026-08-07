@@ -770,3 +770,276 @@ mod tests {
         26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48
     );
 }
+
+/// Differential oracle for the fused LDE coset-scale pass.
+///
+/// `fri/oracle.rs::fill_lde_column_store` previously reached its coset-scaled
+/// state in two passes over `degree` words per column: `copy_from_slice`
+/// followed by `batch_multiply_inplace`. The intermediate unscaled image is
+/// never observed — only the FFT reads the buffer — so the copy is a deletable
+/// materialization. `batch_multiply_into` fuses the two.
+///
+/// The Merkle commitment hashes these words directly, so equality must hold at
+/// the raw-word level, not merely as field values. Lives in the `circuit` crate
+/// because the vendored plonky2 workspace cannot resolve its own dev-deps
+/// offline; it exercises the same public API.
+#[cfg(test)]
+mod lde_fuse_oracle {
+    use plonky2::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
+    use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::field::types::{Field, Field64, PrimeField64};
+
+    type F = GoldilocksField;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn field(&mut self) -> F {
+            match self.next() % 6 {
+                0 => F::ZERO,
+                1 => F::ONE,
+                2 => F::from_noncanonical_u64(F::ORDER),
+                3 => F::from_noncanonical_u64(F::ORDER + (self.next() % 512)),
+                _ => F::from_canonical_u64(self.next() % F::ORDER),
+            }
+        }
+    }
+
+    #[test]
+    fn fused_lde_scale_matches_copy_then_multiply() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        // 0..=200 covers every packing remainder many times over; production
+        // lengths are powers of two (2^14, 2^16) which are also covered by
+        // construction since the packed prefix is maximal.
+        for n in (0..=200usize).chain([1 << 10, (1 << 10) + 3]) {
+            let a: Vec<F> = (0..n).map(|_| rng.field()).collect();
+            let b: Vec<F> = (0..n).map(|_| rng.field()).collect();
+
+            let mut reference = vec![F::ZERO; n];
+            reference.copy_from_slice(&a);
+            batch_multiply_inplace(&mut reference, &b);
+
+            let mut fused = vec![F::ZERO; n];
+            batch_multiply_into(&mut fused, &a, &b);
+
+            for (i, (r, f)) in reference.iter().zip(fused.iter()).enumerate() {
+                assert_eq!(
+                    r.to_canonical_u64(),
+                    f.to_canonical_u64(),
+                    "value mismatch at n={n} i={i}"
+                );
+                assert_eq!(
+                    r.to_noncanonical_u64(),
+                    f.to_noncanonical_u64(),
+                    "raw-word mismatch at n={n} i={i}"
+                );
+            }
+        }
+    }
+}
+
+/// Microbenchmark for the fused LDE coset-scale pass (H8).
+///
+/// End-to-end wall-clock A/B on this host has a paired stdev of ~5.9%, so it
+/// cannot resolve a sub-1% mechanism (it would need ~7000 pairs). Isolating the
+/// mechanism instead makes it measurable in seconds, exactly as the gate
+/// accumulate probe does.
+///
+/// Arm A is the shipped two-pass form (`copy_from_slice` then
+/// `batch_multiply_inplace`); arm B is the fused `batch_multiply_into`. Sizes are
+/// the production degrees: 2^16 for tx circuits, 2^14 for chain/pre.
+///
+/// Run:
+/// `cargo test --release -p circuit --lib -- --ignored --nocapture lde_fuse_bench`
+#[cfg(test)]
+mod lde_fuse_bench {
+    use std::time::Instant;
+
+    use plonky2::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
+    use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::field::types::Field;
+
+    type F = GoldilocksField;
+
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn lde_fuse_bench() {
+        const REPS: usize = 7;
+        println!(
+            "{:<10} {:>6} {:>13} {:>13} {:>9} {:>9}",
+            "degree", "iters", "two_pass_us", "fused_us", "speedup", "spread%"
+        );
+        for (log_degree, iters) in [(14usize, 400usize), (16, 120)] {
+            let degree = 1usize << log_degree;
+            let coeffs: Vec<F> = (0..degree)
+                .map(|i| F::from_canonical_u64((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+                .collect();
+            let powers: Vec<F> = (0..degree)
+                .map(|i| F::from_canonical_u64((i as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9) | 1))
+                .collect();
+            // Fresh destination per arm, sized like one LDE column.
+            let mut dest = vec![F::ZERO; degree];
+
+            let mut two_pass = Vec::new();
+            let mut fused = Vec::new();
+            for _ in 0..REPS {
+                let t = Instant::now();
+                for _ in 0..iters {
+                    let d = std::hint::black_box(&mut dest);
+                    d.copy_from_slice(std::hint::black_box(&coeffs));
+                    batch_multiply_inplace(d, std::hint::black_box(&powers));
+                }
+                two_pass.push(t.elapsed().as_secs_f64() / iters as f64 * 1e6);
+                std::hint::black_box(&dest);
+
+                let t = Instant::now();
+                for _ in 0..iters {
+                    batch_multiply_into(
+                        std::hint::black_box(&mut dest),
+                        std::hint::black_box(&coeffs),
+                        std::hint::black_box(&powers),
+                    );
+                }
+                fused.push(t.elapsed().as_secs_f64() / iters as f64 * 1e6);
+                std::hint::black_box(&dest);
+            }
+
+            let med = |v: &mut Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let spread = |v: &[f64]| {
+                let mn = v.iter().cloned().fold(f64::INFINITY, f64::min);
+                let mx = v.iter().cloned().fold(0.0, f64::max);
+                (mx - mn) / mn * 100.0
+            };
+            let sp = spread(&two_pass).max(spread(&fused));
+            let a = med(&mut two_pass);
+            let b = med(&mut fused);
+            println!(
+                "2^{:<8} {:>6} {:>13.2} {:>13.2} {:>9.3} {:>9.2}",
+                log_degree, iters, a, b, a / b, sp
+            );
+        }
+    }
+}
+
+/// Settling probe for H9: is `fill_lde_batch`'s gather copy pure overhead, or is
+/// it also compacting scattered columns into cache for the consumer?
+///
+/// Arm A models the shipped path: memcpy `n` points from each of `cols` widely
+/// separated LDE columns into one flat buffer, then consume the flat buffer.
+/// Arm B models the borrow: consume the same values directly from the scattered
+/// columns via a slice-of-slices, with no copy.
+///
+/// If B does not win, H9's refactor is not worth its blast radius.
+/// Run: `cargo test --release -p circuit --lib -- --ignored --nocapture h9_gather_probe`
+#[cfg(test)]
+mod h9_gather_probe {
+    use std::time::Instant;
+
+    use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::field::types::Field;
+
+    type F = GoldilocksField;
+
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn h9_gather_probe() {
+        // Production shape: 32-point quotient batches; ~316 columns gathered per
+        // batch across constants/sigmas + wires + zs/partial. Each column is an
+        // LDE of 2^19 elements, so consecutive columns are 4 MiB apart.
+        const N: usize = 32;
+        const COLS: usize = 316;
+        const LDE: usize = 1 << 19;
+
+        let columns: Vec<Vec<F>> = (0..COLS)
+            .map(|c| {
+                (0..LDE)
+                    .map(|i| F::from_canonical_u64(((c * LDE + i) as u64) | 1))
+                    .collect()
+            })
+            .collect();
+
+        let mut flat = vec![F::ZERO; COLS * N];
+        const REPS: usize = 5;
+        const BATCHES: usize = 2000;
+
+        let mut copy_then_read = Vec::new();
+        let mut borrow_read = Vec::new();
+        for _ in 0..REPS {
+            // Arm A: gather (memcpy per column) then consume the flat buffer.
+            let t = Instant::now();
+            let mut acc_a = F::ZERO;
+            for b in 0..BATCHES {
+                let start = (b * N) % (LDE - N);
+                for (ci, col) in columns.iter().enumerate() {
+                    flat[ci * N..(ci + 1) * N].copy_from_slice(&col[start..start + N]);
+                }
+                let f = std::hint::black_box(&flat);
+                for ci in 0..COLS {
+                    let s = &f[ci * N..(ci + 1) * N];
+                    for v in s {
+                        acc_a += *v;
+                    }
+                }
+            }
+            copy_then_read.push(t.elapsed().as_secs_f64() / BATCHES as f64 * 1e6);
+            std::hint::black_box(acc_a);
+
+            // Arm B: build a slice-of-slices and consume in place, no copy.
+            let t = Instant::now();
+            let mut acc_b = F::ZERO;
+            let mut view: Vec<&[F]> = Vec::with_capacity(COLS);
+            for b in 0..BATCHES {
+                let start = (b * N) % (LDE - N);
+                view.clear();
+                for col in columns.iter() {
+                    view.push(&col[start..start + N]);
+                }
+                let v = std::hint::black_box(&view);
+                for s in v.iter() {
+                    for x in s.iter() {
+                        acc_b += *x;
+                    }
+                }
+            }
+            borrow_read.push(t.elapsed().as_secs_f64() / BATCHES as f64 * 1e6);
+            std::hint::black_box(acc_b);
+        }
+
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let spread = |v: &[f64]| {
+            let mn = v.iter().cloned().fold(f64::INFINITY, f64::min);
+            let mx = v.iter().cloned().fold(0.0, f64::max);
+            (mx - mn) / mn * 100.0
+        };
+        let sp = spread(&copy_then_read).max(spread(&borrow_read));
+        let a = med(&mut copy_then_read);
+        let b = med(&mut borrow_read);
+        println!("\nH9 gather probe: {COLS} cols x {N} pts, columns {LDE} apart");
+        println!("  A copy-then-read : {a:>9.3} us/batch");
+        println!("  B borrow-read    : {b:>9.3} us/batch");
+        println!("  speedup (A/B)    : {:>9.3}x   spread {sp:.2}%", a / b);
+        println!(
+            "  verdict: {}",
+            if a / b > 1.15 {
+                "BORROW WINS -- H9 refactor is justified"
+            } else if a / b < 0.95 {
+                "COPY WINS -- gather is doing useful cache compaction; H9 DEAD"
+            } else {
+                "WASH -- not worth the blast radius"
+            }
+        );
+    }
+}

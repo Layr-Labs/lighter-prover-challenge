@@ -121,11 +121,24 @@ where
     C::Hasher: Hasher<F>,
     C::InnerHasher: Hasher<F>,
 {
+    // Measurement-only: witness-generation duration for main-thread proofs
+    // (the final block proof; pipeline proofs run on named worker threads
+    // and stay silent). Env-gated; the trusted verifier clears the
+    // environment, so ranked runs never take this branch.
+    let phase_log_main = std::env::var_os("LIGHTER_PHASE_LOG").is_some()
+        && matches!(std::thread::current().name(), None | Some("main"));
+    let witness_gen_t0 = std::time::Instant::now();
     let partition_witness = timed!(
         timing,
         &format!("run {} generators", prover_data.generators.len()),
         generate_partial_witness(inputs, prover_data, common_data)?
     );
+    if phase_log_main {
+        eprintln!(
+            "SUBPHASE mainthread-witness-gen {:.3}s",
+            witness_gen_t0.elapsed().as_secs_f64()
+        );
+    }
 
     prove_with_partition_witness(prover_data, common_data, partition_witness, timing)
 }
