@@ -21,7 +21,7 @@ use crate::plonk::plonk_common;
 use crate::plonk::plonk_common::eval_l_0_circuit;
 use crate::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBaseBatch};
 use crate::util::partial_products::{
-    check_partial_products, check_partial_products_circuit, check_partial_products_into,
+    check_partial_products, check_partial_products_circuit, check_permutation_partial_products_into,
 };
 use crate::util::reducing::ReducingFactorTarget;
 use crate::with_context;
@@ -509,35 +509,25 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 vanishing_all_lookup_terms.extend(lookup_constraints);
             }
 
-            numerator_values.extend((0..num_routed_wires).map(|j| {
-                let wire_value = vars.local_wires[j];
-                let beta_k_i = beta_k_is[i * num_routed_wires + j];
-                wire_value + beta_k_i * x + gammas[i]
-            }));
-            denominator_values.extend((0..num_routed_wires).map(|j| {
-                let wire_value = vars.local_wires[j];
-                let s_sigma = s_sigmas[j];
-                wire_value + betas[i] * s_sigma + gammas[i]
-            }));
-
             // The partial products considered for this iteration of `i`.
             let current_partial_products = &partial_products[i * num_prods..(i + 1) * num_prods];
-            // Check the numerator partial products, appending the terms directly to the
-            // worker-local scratch vector instead of collecting a fresh ten-element `Vec`
-            // per point and challenge. Not cleared between challenges: challenge `i + 1`
-            // must append after challenge `i` for the same point.
-            check_partial_products_into(
-                numerator_values,
-                denominator_values,
+            let current_beta_k_is = &beta_k_is[i * num_routed_wires..(i + 1) * num_routed_wires];
+            // Build each numerator/denominator chunk product directly from the wire and
+            // sigma evaluations, avoiding two materialized routed-wire arrays.
+            check_permutation_partial_products_into(
+                num_routed_wires,
+                |j| vars.local_wires[j],
+                s_sigmas,
+                current_beta_k_is,
+                betas[i],
+                gammas[i],
+                x,
                 current_partial_products,
                 z_x,
                 z_gx,
                 max_degree,
                 vanishing_partial_products_terms,
             );
-
-            numerator_values.clear();
-            denominator_values.clear();
         }
 
         let vanishing_terms = vanishing_z_1_terms
