@@ -348,15 +348,29 @@ fn fft_classic_simd_single_layer<P: PackedField>(
     let half_packed_m = packed_m / 2;
     debug_assert!(half_packed_m != 0);
 
-    // Omega values for this iteration, as a slice of vectors.
+    // Omega slice is taken *before* the packed values: a short twiddle row must
+    // still panic (as the indexed form did) rather than silently performing
+    // fewer butterflies via `zip` stopping early.
     let omega_table = P::pack_slice(&root_table[lg_half_m]);
-    for k in (0..packed_values.len()).step_by(packed_m) {
-        for j in 0..half_packed_m {
-            let omega = omega_table[j];
-            let t = omega * packed_values[k + half_packed_m + j];
-            let u = packed_values[k + j];
-            packed_values[k + j] = u + t;
-            packed_values[k + half_packed_m + j] = u - t;
+    let omega_table = &omega_table[..half_packed_m];
+
+    // `chunks_exact_mut` + `split_at_mut` + `zip` discharge every packed-index
+    // bounds check by construction. Same butterflies, same order, same raw
+    // Goldilocks limbs — but the inner loop no longer carries panic branches
+    // the compiler cannot prove dead. Ranked near-miss evidence (mega-dmitriy
+    // 55c3f1f): ~−6.5% on the butterfly microbench, −8.4% instruction count
+    // in the inlined production form.
+    for block in packed_values.chunks_exact_mut(packed_m) {
+        let (lower, upper) = block.split_at_mut(half_packed_m);
+        for ((u_slot, t_slot), &omega) in lower
+            .iter_mut()
+            .zip(upper.iter_mut())
+            .zip(omega_table.iter())
+        {
+            let t = omega * *t_slot;
+            let u = *u_slot;
+            *u_slot = u + t;
+            *t_slot = u - t;
         }
     }
 }
@@ -411,20 +425,14 @@ fn fft_classic_simd_layers<P: PackedField>(
     root_table: &FftRootTable<P::Scalar>,
 ) {
     let lg_packed_width = log2_strict(P::WIDTH);
-    let mut lg_half_m = start;
-    // Odd stage count: run the first stage unfused so the remainder pairs up.
-    if (end - start) % 2 == 1 {
+    // Defused production path. The fused two-layer kernel is bit-identical in
+    // butterfly order but allocates ~30 of 31 GPRs and spills ~28 times per
+    // iteration on Apple Silicon; two single layers use ~19–23 GPRs and never
+    // spill. Ranked near-miss evidence (mega-dmitriy 55c3f1f): −3% to −7%
+    // across shapes/thread counts for defusion alone. The fused helper is kept
+    // for its differential tests.
+    for lg_half_m in start..end {
         fft_classic_simd_single_layer(packed_values, lg_half_m, lg_packed_width, root_table);
-        lg_half_m += 1;
-    }
-    while lg_half_m < end {
-        fft_classic_simd_fused_two_layers(
-            packed_values,
-            lg_half_m,
-            lg_packed_width,
-            root_table,
-        );
-        lg_half_m += 2;
     }
 }
 
