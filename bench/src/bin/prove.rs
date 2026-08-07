@@ -43,9 +43,22 @@ static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
+fn rayon_worker_count() -> usize {
+    // Proof construction has a long serial chain spine outside Rayon while its
+    // transaction and commitment work continues inside Rayon. Add one worker
+    // beyond the logical-CPU count so the spine does not implicitly shrink the
+    // bulk pool whenever both paths are runnable; macOS can still preempt a
+    // pool worker when the latency-critical chain thread needs a core.
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .saturating_add(1)
+}
+
 fn main() {
     env_logger::init();
     rayon::ThreadPoolBuilder::new()
+        .num_threads(rayon_worker_count())
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
         .expect("cannot configure prover thread pool");
