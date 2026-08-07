@@ -93,17 +93,36 @@ impl Forest {
     /// loop reaches it. Roots are stable during this pass, so the final `parents` vector is
     /// identical to calling `find(i)` for every `i`.
     pub(crate) fn compress_paths(&mut self) {
+        let t0 = std::time::Instant::now();
+        let mut steps: u64 = 0;
+        let mut maxdepth: u64 = 0;
+        let mut nonroot: u64 = 0;
         for i in 0..self.parents.len() {
             let parent = self.parents[i];
             if parent == i {
                 continue;
             }
+            nonroot += 1;
+            let mut d = 0u64;
             let mut root = parent;
             while self.parents[root] != root {
                 root = self.parents[root];
+                d += 1;
+            }
+            steps += d;
+            if d > maxdepth {
+                maxdepth = d;
             }
             self.parents[i] = root;
         }
+        eprintln!(
+            "COMPRESS_PATHS len={} nonroot={} steps={} maxdepth={} elapsed_ms={}",
+            self.parents.len(),
+            nonroot,
+            steps,
+            maxdepth,
+            t0.elapsed().as_millis()
+        );
     }
 
     /// Assumes `compress_paths` has already been called.

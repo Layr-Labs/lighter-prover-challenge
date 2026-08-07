@@ -2,6 +2,8 @@
 use alloc::{vec, vec::Vec};
 use core::borrow::Borrow;
 
+use plonky2_maybe_rayon::*;
+
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::packed::PackedField;
 use crate::field::polynomial::PolynomialCoeffs;
@@ -93,15 +95,53 @@ impl<F: Field> ReducingFactor<F> {
         // per-power scalar products are accumulated in the same order), but
         // without one degree-sized temporary allocation + two clone passes per
         // polynomial.
-        let mut acc: Vec<F> = Vec::new();
-        for (base_power, poly) in self.base.powers().zip(polys) {
-            self.count += 1;
-            let coeffs = &poly.borrow().coeffs;
-            if coeffs.len() > acc.len() {
-                acc.resize(coeffs.len(), F::ZERO);
-            }
-            for (a, &c) in acc.iter_mut().zip(coeffs.iter()) {
-                *a += <F as FieldExtension<D>>::scalar_mul(&base_power, c);
+        //
+        // The accumulator slots are independent of one another, so the sweep is
+        // split across workers by *slot range*: within each range every
+        // polynomial is still applied in ascending index order with the same
+        // `base.powers()` chain, so each slot receives exactly the same
+        // sequence of `+= scalar_mul(base^j, coeffs[j][i])` operations, in the
+        // same order, as the serial loop. This is the largest remaining
+        // single-threaded pass on the per-proof spine (~250 polynomials by
+        // degree, twice per proof).
+        let polys: Vec<_> = polys.into_iter().collect();
+        let slices: Vec<&[BF]> = polys
+            .iter()
+            .map(|poly| poly.borrow().coeffs.as_slice())
+            .collect();
+        let max_len = slices.iter().map(|coeffs| coeffs.len()).max().unwrap_or(0);
+        // Same serial multiplication chain as `self.base.powers()`, materialized
+        // so every worker reads identical powers.
+        let powers: Vec<F> = self.base.powers().take(slices.len()).collect();
+        self.count += slices.len() as u64;
+
+        let mut acc: Vec<F> = vec![F::ZERO; max_len];
+        // Wide enough that per-range polynomial bookkeeping is amortized, small
+        // enough to keep every worker's slice of `acc` cache-resident.
+        const SLOT_BLOCK: usize = 2048;
+        if slices.len() > 1 && max_len >= 2 * SLOT_BLOCK {
+            acc.par_chunks_mut(SLOT_BLOCK)
+                .enumerate()
+                .for_each(|(block, out)| {
+                    let start = block * SLOT_BLOCK;
+                    for (base_power, coeffs) in powers.iter().zip(&slices) {
+                        // The serial loop's `zip` stops at the shorter of the
+                        // accumulator and this polynomial, so slots at or past
+                        // `coeffs.len()` receive nothing from it.
+                        if coeffs.len() <= start {
+                            continue;
+                        }
+                        let live = (coeffs.len() - start).min(out.len());
+                        for (a, &c) in out[..live].iter_mut().zip(&coeffs[start..start + live]) {
+                            *a += <F as FieldExtension<D>>::scalar_mul(base_power, c);
+                        }
+                    }
+                });
+        } else {
+            for (base_power, coeffs) in powers.iter().zip(&slices) {
+                for (a, &c) in acc.iter_mut().zip(coeffs.iter()) {
+                    *a += <F as FieldExtension<D>>::scalar_mul(base_power, c);
+                }
             }
         }
         PolynomialCoeffs::new(acc)
@@ -303,6 +343,68 @@ mod tests {
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
     use crate::plonk::verifier::verify;
+
+    /// The slot-range-parallel `reduce_polys_base` must be raw-limb identical to
+    /// the serial accumulate loop, and must leave the same `count`, at sizes
+    /// below, at, and above the parallel threshold, with ragged polynomial
+    /// lengths (the accumulator-growth path) included.
+    #[test]
+    fn reduce_polys_base_matches_serial_reference() {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type FE = <F as Extendable<D>>::Extension;
+
+        // Serial reference: the pre-parallel implementation, verbatim.
+        fn reference(base: FE, polys: &[PolynomialCoeffs<F>]) -> (Vec<FE>, u64) {
+            let mut count = 0u64;
+            let mut acc: Vec<FE> = Vec::new();
+            for (base_power, poly) in base.powers().zip(polys) {
+                count += 1;
+                let coeffs = &poly.coeffs;
+                if coeffs.len() > acc.len() {
+                    acc.resize(coeffs.len(), FE::ZERO);
+                }
+                for (a, &c) in acc.iter_mut().zip(coeffs.iter()) {
+                    *a += <FE as FieldExtension<D>>::scalar_mul(&base_power, c);
+                }
+            }
+            (acc, count)
+        }
+
+        for &(num_polys, len) in &[
+            (1usize, 8usize),
+            (3, 1024),
+            (5, 4096),
+            (17, 4097),
+            (33, 8192),
+        ] {
+            let base = FE::rand();
+            // Ragged lengths exercise the accumulator-growth and short-poly paths.
+            let polys: Vec<PolynomialCoeffs<F>> = (0..num_polys)
+                .map(|i| {
+                    let this_len = if i % 3 == 1 { len / 2 + 1 } else { len };
+                    PolynomialCoeffs::new(F::rand_vec(this_len))
+                })
+                .collect();
+
+            let (expected, expected_count) = reference(base, &polys);
+
+            let mut alpha = ReducingFactor::new(base);
+            let actual = alpha.reduce_polys_base::<F, D>(polys.iter());
+
+            assert_eq!(actual.coeffs.len(), expected.len(), "len for {num_polys}x{len}");
+            assert_eq!(alpha.count, expected_count, "count for {num_polys}x{len}");
+            for (i, (a, b)) in actual.coeffs.iter().zip(&expected).enumerate() {
+                let a_limbs = <FE as FieldExtension<D>>::to_basefield_array(a).map(|x: F| x.0);
+                let b_limbs = <FE as FieldExtension<D>>::to_basefield_array(b).map(|x: F| x.0);
+                assert_eq!(
+                    a_limbs, b_limbs,
+                    "raw limb mismatch at coefficient {i} for {num_polys}x{len}"
+                );
+            }
+        }
+    }
 
     fn test_reduce_gadget_base(n: usize) -> Result<()> {
         const D: usize = 2;
