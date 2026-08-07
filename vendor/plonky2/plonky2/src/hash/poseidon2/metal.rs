@@ -22,7 +22,7 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// (6654d43) ranked-validated this raised value inside its composition; my
 /// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
 /// window and is treated as contaminated evidence.
-const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
+const MIN_GPU_PERMUTATIONS: usize = 1 << 17;
 /// Lower routing threshold used only while an exclusive serial proving phase
 /// is active (see [`set_exclusive_gpu_phase`]). During the pre-execution and
 /// final block proofs nothing else can contend for the serialized GPU stream,
