@@ -105,33 +105,79 @@ pub(crate) struct RangeCheckGateQuotientJob<F> {
     _job: GpuJobGuard,
     _phantom: PhantomData<F>,
 }
+
+/// CPU-visible output detached from a completed quotient command. Owning the
+/// Metal buffer keeps the words alive while the CPU applies `Z_H` scaling and
+/// merges them, but deliberately does not keep the global GPU routing guard:
+/// once the command is terminal, another proof may use the serialized queue.
+pub(crate) struct QuotientReadback<F> {
+    output: Buffer,
+    len: usize,
+    _phantom: PhantomData<F>,
+}
+
+impl<F: RichField> core::ops::Deref for QuotientReadback<F> {
+    type Target = [F];
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: construction is restricted to an 8-byte Goldilocks field,
+        // and the completed kernel canonicalized every output word. The owned
+        // buffer remains alive for the lifetime of the returned slice.
+        unsafe { slice::from_raw_parts(self.output.contents().cast::<F>(), self.len) }
+    }
+}
+
 impl<F: RichField> PoseidonGateQuotientJob<F> {
-    pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
-        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
+    pub(crate) fn finish(self) -> Result<QuotientReadback<F>, String> {
+        let Self {
+            command_buffer,
+            output,
+            len,
+            _job,
+            _phantom: _,
+        } = self;
+        command_buffer.wait_until_completed();
+        let status = command_buffer.status();
+        if status != MTLCommandBufferStatus::Completed {
             return Err(format!(
-                "Poseidon2 gate quotient command buffer ended with status {:?}",
-                self.command_buffer.status()
+                "Poseidon2 gate quotient command buffer ended with status {status:?}"
             ));
         }
-        // SAFETY: construction is restricted to an 8-byte Goldilocks field,
-        // and the completed kernel canonicalized every output word.
-        Ok(unsafe { slice::from_raw_parts(self.output.contents().cast::<F>(), self.len) })
+        // A completed command no longer needs to occupy the routing heuristic.
+        // Keep only its output resource alive for the following CPU merge.
+        drop(command_buffer);
+        drop(_job);
+        Ok(QuotientReadback {
+            output,
+            len,
+            _phantom: PhantomData,
+        })
     }
 }
 
 impl<F: RichField> RangeCheckGateQuotientJob<F> {
-    pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
-        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
+    pub(crate) fn finish(self) -> Result<QuotientReadback<F>, String> {
+        let Self {
+            command_buffer,
+            output,
+            len,
+            _job,
+            _phantom: _,
+        } = self;
+        command_buffer.wait_until_completed();
+        let status = command_buffer.status();
+        if status != MTLCommandBufferStatus::Completed {
             return Err(format!(
-                "RangeCheck gate quotient command buffer ended with status {:?}",
-                self.command_buffer.status()
+                "RangeCheck gate quotient command buffer ended with status {status:?}"
             ));
         }
-        // SAFETY: construction is restricted to an 8-byte Goldilocks field,
-        // and the completed kernel canonicalized every output word.
-        Ok(unsafe { slice::from_raw_parts(self.output.contents().cast::<F>(), self.len) })
+        drop(command_buffer);
+        drop(_job);
+        Ok(QuotientReadback {
+            output,
+            len,
+            _phantom: PhantomData,
+        })
     }
 }
 
@@ -2405,6 +2451,105 @@ mod tests {
         assert_eq!(pending.finish(), expected);
     }
 
+    #[test]
+    #[ignore = "focused Metal quotient completion/routing boundary"]
+    fn completed_quotient_jobs_release_guards_before_readback_drop() {
+        type F = GoldilocksField;
+
+        const QUOTIENT_ROWS: usize = 8;
+        let context = shared_context().expect("Metal context must initialize");
+        let mut wires = context
+            .allocate_columns::<F>(QUOTIENT_ROWS, 135)
+            .expect("wire columns must allocate");
+        let mut constants = context
+            .allocate_columns::<F>(QUOTIENT_ROWS, 2)
+            .expect("constant columns must allocate");
+        for column in wires.columns_mut().expect("unique wire columns") {
+            column.fill(F::ZERO);
+        }
+        for column in constants.columns_mut().expect("unique constants") {
+            column.fill(F::ZERO);
+        }
+
+        let before = GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed);
+        assert_eq!(before, 0, "run this focused test without other Metal tests");
+        let poseidon_job = start_poseidon2_gate_quotient(
+            &wires,
+            &constants,
+            QUOTIENT_ROWS,
+            1,
+            0,
+            0,
+            0..1,
+            false,
+            &[F::from_canonical_u64(3), F::from_canonical_u64(5)],
+            0,
+        )
+        .expect("Metal Poseidon quotient job must start");
+        let range_job = start_range_check_gate_quotient(
+            &wires,
+            &constants,
+            QUOTIENT_ROWS,
+            1,
+            &[RangeCheckQuotientSpec {
+                selector_column: 1,
+                gate_index: 0,
+                group: 0..1,
+                include_unused_selector: false,
+                num_ops: 1,
+                bit_size: 2,
+            }],
+            &[],
+            &[F::from_canonical_u64(3), F::from_canonical_u64(5)],
+            0,
+        )
+        .expect("Metal RangeCheck quotient job must start");
+        assert_eq!(
+            GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed),
+            2
+        );
+
+        // Reproduce the old boundary: the first FIFO command is terminal, but
+        // until both jobs are consumed the routing heuristic remains occupied
+        // and a different thread sends a narrow serial-critical tree to CPU.
+        poseidon_job.command_buffer.wait_until_completed();
+        assert_eq!(
+            poseidon_job.command_buffer.status(),
+            MTLCommandBufferStatus::Completed
+        );
+        assert!(!std::thread::spawn(|| gpu_worthwhile(8, 1 << 17, 4))
+            .join()
+            .expect("routing thread"));
+
+        let poseidon_readback = poseidon_job.finish().expect("Poseidon readback");
+        assert_eq!(
+            GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed),
+            1,
+            "the second optional job must retain its guard until it is terminal"
+        );
+        assert!(!std::thread::spawn(|| gpu_worthwhile(8, 1 << 17, 4))
+            .join()
+            .expect("routing thread"));
+
+        let range_readback = range_job.finish().expect("RangeCheck readback");
+        assert_eq!(
+            GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed),
+            0,
+            "neither output owner may retain a GPU routing guard"
+        );
+        assert!(std::thread::spawn(|| gpu_worthwhile(8, 1 << 17, 4))
+            .join()
+            .expect("routing thread"));
+
+        // Both detached buffers remain readable after both terminal commands
+        // and both routing guards have been released.
+        for readback in [&*poseidon_readback, &*range_readback] {
+            assert_eq!(readback.len(), 2 * QUOTIENT_ROWS);
+            assert!(readback
+                .iter()
+                .all(|value| value.to_canonical_u64() < F::ORDER));
+        }
+    }
     fn gpu_duration(command_buffer: &CommandBuffer, wall: Duration) -> Duration {
         let gpu_start: f64 = unsafe {
             command_buffer

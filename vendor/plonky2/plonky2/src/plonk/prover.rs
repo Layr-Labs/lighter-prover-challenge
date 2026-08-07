@@ -1788,39 +1788,83 @@ fn compute_quotient_polys<
             },
         );
 
+    // Complete and detach both queued quotient outputs before inspecting
+    // either result or doing either CPU merge. This is deliberately not
+    // short-circuiting: if the first command failed, the second command must
+    // still reach a terminal state before its routing guard can be released.
+    // The successful readbacks own only their output buffers, so neither keeps
+    // small concurrent trees on the CPU during `Z_H` scaling and accumulation.
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
-            Ok(values) => {
-                GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
-            }
-            Err(error) => {
-                GPU_POSEIDON_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                log::warn!(
-                    "Metal Poseidon2 gate quotient failed; recomputing quotient on CPU: {error}"
-                );
-                if gpu_poseidon_quotient_diagnostics_enabled() {
-                    eprintln!(
-                        "[gpu-poseidon-quotient] runtime failure; falling back to CPU: {error}"
-                    );
-                }
-                return compute_quotient_polys(
-                    common_data,
-                    prover_data,
-                    public_inputs_hash,
-                    wires_commitment,
-                    zs_partial_products_and_lookup_commitment,
-                    betas,
-                    gammas,
-                    beta_k_is,
-                    deltas,
-                    alphas,
-                    col_major_perm,
-                    false,
+    let gpu_poseidon_result = gpu_poseidon.map(|(_, job)| job.finish());
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_range_result = gpu_range.map(|(_, job)| job.finish());
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_failed = {
+        let mut failed = false;
+        if let Some(Err(error)) = &gpu_poseidon_result {
+            failed = true;
+            GPU_POSEIDON_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            log::warn!(
+                "Metal Poseidon2 gate quotient failed; recomputing quotient on CPU: {error}"
+            );
+            if gpu_poseidon_quotient_diagnostics_enabled() {
+                eprintln!(
+                    "[gpu-poseidon-quotient] runtime failure; falling back to CPU: {error}"
                 );
             }
-        };
+        }
+        if let Some(Err(error)) = &gpu_range_result {
+            failed = true;
+            GPU_RANGE_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            log::warn!(
+                "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
+            );
+            if gpu_poseidon_quotient_diagnostics_enabled() {
+                eprintln!(
+                    "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
+                );
+            }
+        }
+        failed
+    };
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    if gpu_failed {
+        // Avoid retaining either completed output or the initialized quotient
+        // vector across the recursive all-CPU recomputation.
+        drop(gpu_poseidon_result);
+        drop(gpu_range_result);
+        drop(quotient_values);
+        return compute_quotient_polys(
+            common_data,
+            prover_data,
+            public_inputs_hash,
+            wires_commitment,
+            zs_partial_products_and_lookup_commitment,
+            betas,
+            gammas,
+            beta_k_is,
+            deltas,
+            alphas,
+            col_major_perm,
+            false,
+        );
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_poseidon_values = gpu_poseidon_result.map(|result| {
+        GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        result.expect("GPU failure handled above")
+    });
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_range_values = gpu_range_result.map(|result| {
+        GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        result.expect("GPU failure handled above")
+    });
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    if let Some(gpu_values) = gpu_poseidon_values {
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
         quotient_values
             .par_chunks_exact_mut(num_challenges)
@@ -1835,38 +1879,7 @@ fn compute_quotient_polys<
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
-            Ok(values) => {
-                GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
-            }
-            Err(error) => {
-                GPU_RANGE_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                log::warn!(
-                    "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
-                );
-                if gpu_poseidon_quotient_diagnostics_enabled() {
-                    eprintln!(
-                        "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
-                    );
-                }
-                return compute_quotient_polys(
-                    common_data,
-                    prover_data,
-                    public_inputs_hash,
-                    wires_commitment,
-                    zs_partial_products_and_lookup_commitment,
-                    betas,
-                    gammas,
-                    beta_k_is,
-                    deltas,
-                    alphas,
-                    col_major_perm,
-                    false,
-                );
-            }
-        };
+    if let Some(gpu_values) = gpu_range_values {
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
         quotient_values
             .par_chunks_exact_mut(num_challenges)
