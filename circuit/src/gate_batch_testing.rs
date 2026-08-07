@@ -9,11 +9,17 @@
 use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::{Extendable, FieldExtension};
 use plonky2::field::goldilocks_field::GoldilocksField;
-use plonky2::field::types::{Field, Field64};
+use plonky2::field::types::{Field, Field64, PrimeField64};
 use plonky2::gates::gate::Gate;
 use plonky2::hash::hash_types::HashOut;
 use plonky2::plonk::vars::{EvaluationVars, EvaluationVarsBaseBatch};
 use rand::Rng;
+
+/// Batch widths used by every differential in this module: values on both sides of the packed
+/// field width (2 lanes for Goldilocks under NEON, 4 under AVX2) and of the 32-point quotient
+/// batch, so leftover-tail handling and any width assumption in a hand-written batched evaluator
+/// are exercised, not only the aligned production width.
+const BATCH_WIDTHS: [usize; 10] = [1, 2, 3, 4, 5, 7, 8, 11, 31, 32];
 
 #[cfg(test)]
 mod vendored_gate_tests {
@@ -25,6 +31,28 @@ mod vendored_gate_tests {
     fn poseidon2_base_batch_matches_eval_unfiltered_across_batch() {
         let gate = Poseidon2Gate::<GoldilocksField, 2>::new();
         assert_base_batch_matches_eval_unfiltered(&gate);
+    }
+
+    /// The two vendored gates whose filtered accumulation is fused but which have no
+    /// circuit-side differential: both must agree with per-point `eval_unfiltered` in value and
+    /// with the default matrix-then-fold accumulate in raw `u64` representation, at every batch
+    /// width.
+    #[test]
+    fn poseidon2_accumulate_matches_materialized_batch() {
+        let gate = Poseidon2Gate::<GoldilocksField, 2>::new();
+        assert_accumulate_matches_eval_unfiltered(&gate);
+        assert_direct_accumulation_matches_materialized_batch(&gate);
+    }
+
+    #[test]
+    fn equality_accumulate_matches_materialized_batch() {
+        use plonky2::gates::equality_base::EqualityGate;
+
+        for num_ops in [1usize, 2, 7, 22] {
+            let gate = EqualityGate { num_ops };
+            assert_accumulate_matches_eval_unfiltered(&gate);
+            assert_direct_accumulation_matches_materialized_batch(&gate);
+        }
     }
 
     #[test]
@@ -210,11 +238,20 @@ pub fn assert_accumulate_matches_eval_unfiltered<G>(gate: &G)
 where
     G: Gate<GoldilocksField, 2>,
 {
+    for n in BATCH_WIDTHS {
+        assert_accumulate_matches_eval_unfiltered_n(gate, n);
+    }
+}
+
+/// [`assert_accumulate_matches_eval_unfiltered`] at one specific batch width.
+pub fn assert_accumulate_matches_eval_unfiltered_n<G>(gate: &G, n: usize)
+where
+    G: Gate<GoldilocksField, 2>,
+{
     const D: usize = 2;
     type F = GoldilocksField;
 
     let mut rng = rand::thread_rng();
-    let n = 32;
     let num_wires = gate.num_wires();
     let num_constants = gate.num_constants();
     let num_constraints = gate.num_constraints();
@@ -288,35 +325,86 @@ pub fn assert_direct_accumulation_matches_materialized_batch<G>(gate: &G)
 where
     G: Gate<GoldilocksField, 2>,
 {
-    type F = GoldilocksField;
-    const N: usize = 11;
+    for n in BATCH_WIDTHS {
+        assert_direct_accumulation_matches_materialized_batch_n(gate, n);
+    }
+}
 
-    let wires = (0..gate.num_wires() * N)
+/// [`assert_direct_accumulation_matches_materialized_batch`] at one specific batch width.
+///
+/// Three properties are pinned that a single-width, zero-initialised, value-level check does not:
+///
+/// * **Batch width.** Widths that are not multiples of the packed-field width (2 lanes for
+///   Goldilocks under NEON, 4 under AVX2) drive the scalar leftover tail of
+///   `batch_multiply_add_inplace`, and widths below the 32-point quotient batch catch a
+///   hand-written evaluator that assumes the production width.
+/// * **Accumulation, not assignment.** The destination starts from pseudo-random values, so an
+///   override that *writes* its rows instead of adding to them is caught. Starting from zero
+///   cannot distinguish the two.
+/// * **Raw representation.** Equality is checked on `to_noncanonical_u64`. Goldilocks
+///   multiplication may leave a result in `[ORDER, 2^64)`, so raw equality is strictly stronger
+///   than `==`, which compares canonical values.
+///
+/// Both arms fold with the *same* `batch_multiply_add_inplace`, so the comparison isolates the
+/// deleted constraint matrix and its second pass rather than any difference in how the filter is
+/// applied.
+pub fn assert_direct_accumulation_matches_materialized_batch_n<G>(gate: &G, n: usize)
+where
+    G: Gate<GoldilocksField, 2>,
+{
+    type F = GoldilocksField;
+
+    let wires = (0..gate.num_wires() * n)
         .map(|i| F::from_canonical_usize(3 * i + 5))
         .collect::<Vec<_>>();
-    let constants = (0..gate.num_constants() * N)
+    let constants = (0..gate.num_constants() * n)
         .map(|i| F::from_canonical_usize(7 * i + 11))
         .collect::<Vec<_>>();
     let hash = HashOut::ZERO;
-    let vars = EvaluationVarsBaseBatch::new(N, &constants, &wires, &hash);
-    let filters = (0..N)
+    let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+    let filters = (0..n)
         .map(|i| F::from_canonical_usize(2 * i + 1))
         .collect::<Vec<_>>();
+    let initial = (0..gate.num_constraints() * n)
+        .map(|i| F::from_canonical_usize(13 * i + 17))
+        .collect::<Vec<_>>();
 
-    let mut expected = vec![F::ZERO; gate.num_constraints() * N];
+    let mut expected = initial.clone();
     let materialized = gate.eval_unfiltered_base_batch(vars);
+    assert_eq!(materialized.len(), gate.num_constraints() * n);
     for (acc, constraints) in expected
-        .chunks_exact_mut(N)
-        .zip(materialized.chunks_exact(N))
+        .chunks_exact_mut(n)
+        .zip(materialized.chunks_exact(n))
     {
         batch_multiply_add_inplace(acc, constraints, &filters);
     }
-    let mut actual = vec![F::ZERO; expected.len()];
+
+    let mut actual = initial;
     gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
-    assert_eq!(actual, expected, "gate {}", gate.id());
+
+    for j in 0..gate.num_constraints() {
+        for p in 0..n {
+            assert_eq!(
+                actual[j * n + p].to_noncanonical_u64(),
+                expected[j * n + p].to_noncanonical_u64(),
+                "gate {} (n = {n}), point {p}, constraint {j}: raw representation differs",
+                gate.id()
+            );
+        }
+    }
 }
 
 pub fn assert_base_batch_matches_eval_unfiltered<G>(gate: &G)
+where
+    G: Gate<GoldilocksField, 2>,
+{
+    for n in BATCH_WIDTHS {
+        assert_base_batch_matches_eval_unfiltered_n(gate, n);
+    }
+}
+
+/// [`assert_base_batch_matches_eval_unfiltered`] at one specific batch width.
+pub fn assert_base_batch_matches_eval_unfiltered_n<G>(gate: &G, n: usize)
 where
     G: Gate<GoldilocksField, 2>,
 {
@@ -324,7 +412,6 @@ where
     type F = GoldilocksField;
 
     let mut rng = rand::thread_rng();
-    let n = 32;
     let num_wires = gate.num_wires();
     let num_constants = gate.num_constants();
     let num_constraints = gate.num_constraints();
