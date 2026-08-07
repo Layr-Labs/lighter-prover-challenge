@@ -3,7 +3,7 @@ use core::marker::PhantomData;
 use core::mem::{size_of, size_of_val};
 use core::slice;
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::{Condvar, LazyLock, Mutex};
 
 use metal::{
     Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
@@ -83,7 +83,6 @@ pub struct MetalColumns<F> {
     buffer: Buffer,
     rows: usize,
     cols: usize,
-    uniqueness: Arc<()>,
     _phantom: PhantomData<F>,
 }
 
@@ -93,7 +92,6 @@ impl<F> Clone for MetalColumns<F> {
             buffer: self.buffer.clone(),
             rows: self.rows,
             cols: self.cols,
-            uniqueness: self.uniqueness.clone(),
             _phantom: PhantomData,
         }
     }
@@ -119,20 +117,6 @@ impl<F: RichField> MetalColumns<F> {
                 self.rows,
             )
         }
-    }
-
-    pub(crate) fn columns_mut(&mut self) -> Option<Vec<&mut [F]>> {
-        if Arc::strong_count(&self.uniqueness) != 1 {
-            return None;
-        }
-        // SAFETY: allocation is restricted to the 8-byte Goldilocks field, for
-        // which every u64 bit pattern is valid. The uniqueness token and
-        // exclusive access to the handle guarantee that no cloned handle, CPU
-        // reader, or GPU reader can observe the buffer during initialization.
-        let values = unsafe {
-            slice::from_raw_parts_mut(self.buffer.contents().cast::<F>(), self.rows * self.cols)
-        };
-        Some(values.chunks_exact_mut(self.rows).collect())
     }
 }
 
@@ -281,72 +265,6 @@ pub(crate) fn build_merkle_tree_columns<F: RichField>(
     }
 }
 
-/// Allocates the final retained column store before the CPU LDE is computed,
-/// so the same shared buffer can be bound directly as the Metal leaf input.
-pub(crate) fn allocate_columns<F: RichField>(
-    cols: usize,
-    rows: usize,
-    cap_height: usize,
-) -> Option<MetalColumns<F>> {
-    if F::ORDER != 0xffff_ffff_0000_0001
-        || size_of::<F>() != size_of::<u64>()
-        || cols == 0
-        || rows == 0
-        || !rows.is_power_of_two()
-        || rows > u32::MAX as usize
-        || cols > u32::MAX as usize
-        || cap_height > rows.ilog2() as usize
-        || !gpu_worthwhile(cols, rows, cap_height)
-    {
-        return None;
-    }
-
-    let context = shared_context()?;
-    match context.allocate_columns(rows, cols) {
-        Ok(columns) => Some(columns),
-        Err(error) => {
-            log::warn!("Metal column allocation failed; using CPU storage: {error}");
-            None
-        }
-    }
-}
-
-/// Hashes retained shared columns without copying them through the pooled
-/// staging buffer.
-pub(crate) fn build_merkle_tree_shared<F: RichField>(
-    columns: &MetalColumns<F>,
-    cap_height: usize,
-) -> Option<(Vec<HashOut<F>>, Vec<HashOut<F>>)> {
-    let leaf_width = columns.cols;
-    let leaf_count = columns.rows;
-    if F::ORDER != 0xffff_ffff_0000_0001
-        || size_of::<F>() != size_of::<u64>()
-        || leaf_width == 0
-        || leaf_count == 0
-        || !leaf_count.is_power_of_two()
-        || leaf_count > u32::MAX as usize
-        || leaf_width > u32::MAX as usize
-        || cap_height > leaf_count.ilog2() as usize
-        || !gpu_worthwhile(leaf_width, leaf_count, cap_height)
-    {
-        return None;
-    }
-
-    let context = shared_context()?;
-    match context.build(
-        LeafSource::Shared(columns),
-        leaf_width,
-        leaf_count,
-        cap_height,
-    ) {
-        Ok(tree) => Some(tree),
-        Err(error) => {
-            log::warn!("Metal shared-column hashing failed; using CPU Merkle hashing: {error}");
-            None
-        }
-    }
-}
-
 /// Computes the coset LDE of every coefficient column on the GPU and hashes the
 /// resulting Merkle tree in the same command buffer. Returns the retained
 /// CPU-visible LDE columns plus the digests and cap. `None` falls back to the
@@ -437,9 +355,6 @@ enum LeafSource<'a, F> {
     /// Natural-order poly-major columns; tree leaf `i` is
     /// `columns[j][reverse_bits(i)]`, handled by the col-major kernel.
     Columns(&'a [Vec<F>]),
-    /// Natural-order poly-major columns already resident in shared Metal
-    /// storage. Hash directly without a staging copy.
-    Shared(&'a MetalColumns<F>),
 }
 
 impl MetalShared {
@@ -517,30 +432,6 @@ impl MetalShared {
                 ntt_shifts: Mutex::new(HashMap::new()),
                 ntt_ones: Mutex::new(HashMap::new()),
             })
-        })
-    }
-
-    fn allocate_columns<F: RichField>(
-        &self,
-        rows: usize,
-        cols: usize,
-    ) -> Result<MetalColumns<F>, String> {
-        let len = rows
-            .checked_mul(cols)
-            .ok_or("Metal column length overflow")?;
-        let bytes = len
-            .checked_mul(size_of::<u64>())
-            .ok_or("Metal column size overflow")?;
-        let buffer = autoreleasepool(|| {
-            self.device
-                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
-        });
-        Ok(MetalColumns {
-            buffer,
-            rows,
-            cols,
-            uniqueness: Arc::new(()),
-            _phantom: PhantomData,
         })
     }
 
@@ -920,7 +811,6 @@ impl MetalShared {
                 buffer: column_buffer,
                 rows: lde_size,
                 cols,
-                uniqueness: Arc::new(()),
                 _phantom: PhantomData,
             },
             digests,
@@ -994,7 +884,6 @@ impl MetalShared {
                 buffer: column_buffer,
                 rows: lde_size,
                 cols,
-                uniqueness: Arc::new(()),
                 _phantom: PhantomData,
             },
             digests,
@@ -1216,11 +1105,10 @@ impl MetalShared {
     ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
         let cap_count = 1usize << cap_height;
 
-        let needs_staging = !matches!(&source, LeafSource::Shared(_));
-        if needs_staging
-            && set.input.as_ref().map_or(true, |buffer| {
-                buffer.length() < input_bytes.max(size_of::<u64>()) as u64
-            })
+        if set
+            .input
+            .as_ref()
+            .map_or(true, |buffer| buffer.length() < input_bytes.max(size_of::<u64>()) as u64)
         {
             set.input = Some(autoreleasepool(|| {
                 self.device.new_buffer(
@@ -1229,11 +1117,11 @@ impl MetalShared {
                 )
             }));
         }
-        if needs_staging && leaf_width != 0 {
+        let input_buffer = set.input.as_ref().unwrap();
+        if leaf_width != 0 {
             // `F` is guaranteed by the caller to be the 8-byte Goldilocks field, whose
             // in-memory representation is its (possibly noncanonical) u64 value, so the
             // staging copy is a plain parallel memcpy in either layout.
-            let input_buffer = set.input.as_ref().unwrap();
             let destination = unsafe {
                 slice::from_raw_parts_mut(input_buffer.contents().cast::<u64>(), input_len)
             };
@@ -1263,13 +1151,8 @@ impl MetalShared {
                             destination.copy_from_slice(source);
                         });
                 }
-                LeafSource::Shared(_) => unreachable!("shared columns do not use staging"),
             }
         }
-        let input_buffer = match &source {
-            LeafSource::Rows(_) | LeafSource::Columns(_) => set.input.as_ref().unwrap(),
-            LeafSource::Shared(columns) => &columns.buffer,
-        };
 
         if set
             .output
@@ -1290,7 +1173,7 @@ impl MetalShared {
             let log_leaf_count_u32 = leaf_count.ilog2();
             let leaf_pipeline = match &source {
                 LeafSource::Rows(_) => &self.leaf_pipeline,
-                LeafSource::Columns(_) | LeafSource::Shared(_) => &self.leaf_colmajor_pipeline,
+                LeafSource::Columns(_) => &self.leaf_colmajor_pipeline,
             };
             let command_buffer = self.queue.new_command_buffer();
             let leaf_encoder = command_buffer.new_compute_command_encoder();
@@ -1308,7 +1191,7 @@ impl MetalShared {
                 size_of::<u32>() as NSUInteger,
                 (&leaf_count_u32 as *const u32).cast::<c_void>(),
             );
-            if matches!(&source, LeafSource::Columns(_) | LeafSource::Shared(_)) {
+            if matches!(&source, LeafSource::Columns(_)) {
                 leaf_encoder.set_bytes(
                     5,
                     size_of::<u32>() as NSUInteger,
@@ -1510,7 +1393,7 @@ mod tests {
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field64, PrimeField64};
-    use crate::hash::merkle_tree::{capacity_up_to_mut, fill_digests_buf, merkle_tree_prove};
+    use crate::hash::merkle_tree::{capacity_up_to_mut, fill_digests_buf};
     use crate::hash::poseidon2::hash::Poseidon2Hash;
 
     fn gpu_duration(command_buffer: &CommandBuffer, wall: Duration) -> Duration {
@@ -2265,57 +2148,6 @@ kernel void goldilocks_mul_bench_native(
     }
 
     #[test]
-    fn shared_column_hash_matches_staged_full_tree_and_paths() {
-        let mut rng = StdRng::seed_from_u64(0x5348_4152_4544);
-        let context = CONTEXT.as_ref().unwrap_or_else(|error| panic!("{error}"));
-
-        // Exercise both sides of the 8-element sponge rate, multiple
-        // absorptions, and caps at the root, middle, and leaf levels.
-        for (rows, cap_height) in [(32usize, 0usize), (256, 3), (1024, 10)] {
-            for cols in [1usize, 4, 5, 8, 9, 16, 17, 31] {
-                let columns: Vec<Vec<GoldilocksField>> = (0..cols)
-                    .map(|column| {
-                        (0..rows)
-                            .map(|row| {
-                                let raw = match (column * rows + row) & 7 {
-                                    0 => 0,
-                                    1 => 1,
-                                    2 => GoldilocksField::ORDER - 1,
-                                    3 => GoldilocksField::ORDER,
-                                    4 => GoldilocksField::ORDER + 1,
-                                    5 => u64::MAX,
-                                    _ => rng.next_u64(),
-                                };
-                                GoldilocksField(raw)
-                            })
-                            .collect()
-                    })
-                    .collect();
-
-                let staged = context
-                    .build(LeafSource::Columns(&columns), cols, rows, cap_height)
-                    .unwrap();
-
-                let mut shared = context
-                    .allocate_columns::<GoldilocksField>(rows, cols)
-                    .unwrap();
-                shared
-                    .columns_mut()
-                    .unwrap()
-                    .into_iter()
-                    .zip(&columns)
-                    .for_each(|(destination, source)| destination.copy_from_slice(source));
-                let direct = context
-                    .build(LeafSource::Shared(&shared), cols, rows, cap_height)
-                    .unwrap();
-
-                assert_tree_raw_eq(&direct, &staged, cols, cap_height);
-                assert_all_paths_raw_eq(&direct, &staged, rows, cap_height);
-            }
-        }
-    }
-
-    #[test]
     fn metal_merkle_matches_cpu_across_sponge_boundaries() {
         let mut rng = StdRng::seed_from_u64(0x4d45_5441_4c32);
         for width in [0, 1, 4, 5, 8, 9, 16, 17, 31, 64, 137] {
@@ -2427,58 +2259,6 @@ kernel void goldilocks_mul_bench_native(
                 actual, expected,
                 "width {width}, cap height {cap_height}, node {index}"
             );
-        }
-    }
-
-    fn assert_tree_raw_eq(
-        actual: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
-        expected: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
-        width: usize,
-        cap_height: usize,
-    ) {
-        assert_eq!(actual.0.len(), expected.0.len());
-        assert_eq!(actual.1.len(), expected.1.len());
-        for (index, (actual, expected)) in actual
-            .0
-            .iter()
-            .chain(&actual.1)
-            .zip(expected.0.iter().chain(&expected.1))
-            .enumerate()
-        {
-            let actual = actual.elements.map(|value| value.to_noncanonical_u64());
-            let expected = expected.elements.map(|value| value.to_noncanonical_u64());
-            assert_eq!(
-                actual, expected,
-                "raw width {width}, cap height {cap_height}, node {index}"
-            );
-        }
-    }
-
-    fn assert_all_paths_raw_eq(
-        actual: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
-        expected: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
-        rows: usize,
-        cap_height: usize,
-    ) {
-        for leaf in 0..rows {
-            let actual_path = merkle_tree_prove::<GoldilocksField, Poseidon2Hash>(
-                leaf, rows, cap_height, &actual.0,
-            );
-            let expected_path = merkle_tree_prove::<GoldilocksField, Poseidon2Hash>(
-                leaf,
-                rows,
-                cap_height,
-                &expected.0,
-            );
-            assert_eq!(actual_path.len(), expected_path.len());
-            for (level, (actual, expected)) in actual_path.iter().zip(&expected_path).enumerate() {
-                let actual = actual.elements.map(|value| value.to_noncanonical_u64());
-                let expected = expected.elements.map(|value| value.to_noncanonical_u64());
-                assert_eq!(
-                    actual, expected,
-                    "raw Merkle path mismatch at leaf {leaf}, level {level}"
-                );
-            }
         }
     }
 }

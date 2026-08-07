@@ -126,6 +126,7 @@ mod accumulate_microbench {
     use plonky2::field::batch_util::batch_multiply_add_inplace;
     use plonky2::gates::arithmetic_extension::ArithmeticExtensionGate;
     use plonky2::gates::multiplication_extension::MulExtensionGate;
+    use plonky2::gates::packed_util::PackedEvaluableBase;
     use plonky2::gates::random_access::RandomAccessGate;
     use plonky2::gates::reducing::ReducingGate;
     use plonky2::gates::reducing_extension::ReducingExtensionGate;
@@ -180,6 +181,72 @@ mod accumulate_microbench {
             old.as_secs_f64() / new.as_secs_f64(),
             gate.id(),
         );
+    }
+
+    /// Paired microbenchmark for a gate whose `eval_unfiltered_base_batch_accumulate`
+    /// override replaces the *generic packed* accumulate rather than the
+    /// materialize-then-add default: it times
+    /// `PackedEvaluableBase::eval_unfiltered_base_batch_accumulate_packed`
+    /// (the path the override displaces) against the override itself, and
+    /// asserts the two agree cell for cell before reporting.
+    fn bench_gate_vs_packed<G>(gate: &G, iters: usize)
+    where
+        G: Gate<GoldilocksField, 2> + PackedEvaluableBase<GoldilocksField, 2>,
+    {
+        type F = GoldilocksField;
+
+        let mut rng = rand::thread_rng();
+        let n = 32;
+        let wires_batch: Vec<F> = (0..gate.num_wires() * n)
+            .map(|_| F::from_canonical_u64(rng.gen_range(0..GoldilocksField::ORDER)))
+            .collect();
+        let constants_batch: Vec<F> = (0..gate.num_constants() * n)
+            .map(|_| F::from_canonical_u64(rng.gen_range(0..GoldilocksField::ORDER)))
+            .collect();
+        let filters: Vec<F> = (0..n)
+            .map(|_| F::from_canonical_u64(rng.gen_range(0..GoldilocksField::ORDER)))
+            .collect();
+        let public_inputs_hash = HashOut::<F>::ZERO;
+        let vars_batch =
+            EvaluationVarsBaseBatch::new(n, &constants_batch, &wires_batch, &public_inputs_hash);
+
+        let mut old_buf = vec![F::ZERO; gate.num_constraints() * n];
+        let start = Instant::now();
+        for _ in 0..iters {
+            gate.eval_unfiltered_base_batch_accumulate_packed(vars_batch, &filters, &mut old_buf);
+        }
+        let old = start.elapsed();
+
+        let mut new_buf = vec![F::ZERO; gate.num_constraints() * n];
+        let start = Instant::now();
+        for _ in 0..iters {
+            gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut new_buf);
+        }
+        let new = start.elapsed();
+
+        assert_eq!(old_buf, new_buf, "paths diverged for {}", gate.id());
+
+        println!(
+            "{:>10.3}us/iter -> {:>10.3}us/iter ({:.2}x)  {}",
+            old.as_secs_f64() * 1e6 / iters as f64,
+            new.as_secs_f64() * 1e6 / iters as f64,
+            old.as_secs_f64() / new.as_secs_f64(),
+            gate.id(),
+        );
+    }
+
+    /// The two u32 interleave gates override the generic packed accumulate, so
+    /// they are timed against that path rather than against materialize-then-add.
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn interleave_accumulate_microbench() {
+        use crate::uint::u32::gates::interleave_u32::U32InterleaveGate;
+        use crate::uint::u32::gates::uninterleave_to_u32::UninterleaveToU32Gate;
+
+        const ITERS: usize = 20_000;
+        // `num_ops` at the production `standard_recursion_config` shape.
+        bench_gate_vs_packed(&U32InterleaveGate { num_ops: 3 }, ITERS);
+        bench_gate_vs_packed(&UninterleaveToU32Gate { num_ops: 1 }, ITERS);
     }
 
     #[test]
@@ -314,6 +381,52 @@ where
     let mut actual = vec![F::ZERO; expected.len()];
     gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
     assert_eq!(actual, expected, "gate {}", gate.id());
+}
+
+/// Same differential as [`assert_direct_accumulation_matches_materialized_batch`]
+/// but at a caller-chosen batch size, and starting from a non-zero accumulator
+/// so that the override is forced to *add* rather than overwrite.
+///
+/// Hand-written accumulate overrides typically size a stack scratch buffer for
+/// the batch sizes this prover actually uses and fall back to the heap above a
+/// threshold; passing batch sizes on both sides of that threshold exercises
+/// both arms. It also catches column-indexing mistakes that a single fixed
+/// batch size can alias past.
+pub fn assert_accumulate_matches_materialized_at_batch_size<G>(gate: &G, n: usize)
+where
+    G: Gate<GoldilocksField, 2>,
+{
+    type F = GoldilocksField;
+
+    let wires = (0..gate.num_wires() * n)
+        .map(|i| F::from_canonical_usize(3 * i + 5))
+        .collect::<Vec<_>>();
+    let constants = (0..gate.num_constants() * n)
+        .map(|i| F::from_canonical_usize(7 * i + 11))
+        .collect::<Vec<_>>();
+    let hash = HashOut::ZERO;
+    let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+    let filters = (0..n)
+        .map(|i| F::from_canonical_usize(2 * i + 1))
+        .collect::<Vec<_>>();
+
+    // Non-zero seed: the contract is `combined += filter * constraint`, so an
+    // override that overwrites instead of accumulating must fail here.
+    let seed = (0..gate.num_constraints() * n)
+        .map(|i| F::from_canonical_usize(13 * i + 17))
+        .collect::<Vec<_>>();
+
+    let mut expected = seed.clone();
+    let materialized = gate.eval_unfiltered_base_batch(vars);
+    for (acc, constraints) in expected
+        .chunks_exact_mut(n)
+        .zip(materialized.chunks_exact(n))
+    {
+        batch_multiply_add_inplace(acc, constraints, &filters);
+    }
+    let mut actual = seed;
+    gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+    assert_eq!(actual, expected, "gate {}, batch size {n}", gate.id());
 }
 
 pub fn assert_base_batch_matches_eval_unfiltered<G>(gate: &G)

@@ -151,7 +151,15 @@ impl<F: Field> ReducingFactor<F> {
             .zip(base_powers.par_chunks(PARALLEL_CHUNK))
             .map(|(ps, powers)| accumulate_chunk(ps, powers))
             .collect();
-        let mut acc = vec![F::ZERO; max_len];
+        // The same direct-construction trick on the merge side: the first
+        // partial *is* the accumulator, so the second `vec![F::ZERO; max_len]`
+        // and the full-length read-back that would have folded it in both
+        // disappear. `ZERO + x == x` exactly, every partial is `max_len` long,
+        // and `num_polys > PARALLEL_CHUNK` guarantees at least one chunk.
+        let mut partials = partials.into_iter();
+        let mut acc = partials
+            .next()
+            .expect("a batch larger than one chunk yields at least one partial");
         for partial in partials {
             for (a, p) in acc.iter_mut().zip(partial) {
                 *a += p;
@@ -470,7 +478,7 @@ mod tests {
 
         // Length shapes: uniform, growing (first shortest), shrinking, an empty
         // first polynomial, all empty, and the empty batch.
-        let shapes: Vec<Vec<usize>> = vec![
+        let mut shapes: Vec<Vec<usize>> = vec![
             vec![],
             vec![0],
             vec![0, 0, 0],
@@ -481,6 +489,21 @@ mod tests {
             vec![0, 5, 2, 9],
             vec![0, 0, 6],
         ];
+        // All of the above stay on the serial path. These cross the 16-poly
+        // `PARALLEL_CHUNK` boundary, so they exercise the chunked reduce and
+        // the partial-vector merge — including the merge accumulator seeded
+        // from the first partial instead of a zero vector. The `legacy`
+        // reference stays a single serial fold, so agreement also pins that
+        // regrouping the sum by chunk is raw-`u64` exact.
+        for num_polys in [15usize, 16, 17, 33, 258] {
+            shapes.push(vec![32; num_polys]);
+        }
+        // Ragged batches spanning several chunks: a later chunk's first
+        // polynomial is shorter than `max_len`, and short chunks reach the
+        // merge, so the merge's first partial is not uniformly populated.
+        shapes.push((0..40).map(|i| i % 7).collect());
+        shapes.push((0..40).map(|i| 40 - i).collect());
+        shapes.push((0..40).map(|i| if i == 0 { 0 } else { 40 }).collect());
 
         for lens in &shapes {
             let alpha = FF::rand();

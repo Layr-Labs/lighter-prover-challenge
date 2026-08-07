@@ -9,16 +9,14 @@ use circuit::block_tx::{BlockTx, JumpState, JumpStateTarget};
 use circuit::block_tx_chain_constraints::{
     BlockTxChainCircuit, BlockTxChainTarget, cyclic_base_witness,
 };
-use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget};
-#[cfg(test)]
-use circuit::block_tx_constraints::Circuit as _;
+use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _};
 use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
-use plonky2::iop::generator::{ParallelWitnessGuard, PendingPartitionWitness};
-#[cfg(test)]
-use plonky2::iop::generator::generate_partial_witness;
+use plonky2::iop::generator::{
+    ParallelWitnessGuard, PendingPartitionWitness, generate_partial_witness,
+};
 use plonky2::iop::witness::{PartitionWitness, Witness};
 use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::prover::prove_with_partition_witness;
@@ -173,19 +171,17 @@ fn generate_tx_witness<'a>(
         old_jump,
         txs,
     };
-    // Write witness values directly into the partition's representative
-    // slots (array-indexed), bypassing the PartialWitness hash map and its
-    // per-target hashing for the ~10^5 inputs of every transaction chunk,
-    // while maintaining the same unresolved-watch counters.
-    let partition_witness = PendingPartitionWitness::start_seeded(
-        &tx_data.prover_only,
-        &tx_data.common,
-        |seeder| BlockTxCircuit::generate_witness_into(&block_tx, tx_target, seeder),
-    )
-    .and_then(PendingPartitionWitness::finish)
-    .unwrap_or_else(|error| {
-        panic!("{path:?} block transaction chunk #{chunk_index} witness generation failed: {error:?}")
-    });
+    let partial_witness =
+        BlockTxCircuit::generate_witness(&block_tx, tx_target).unwrap_or_else(|error| {
+            panic!("{path:?} block transaction chunk #{chunk_index} witness failed: {error:?}")
+        });
+    let partition_witness =
+        generate_partial_witness::<F, C, D>(partial_witness, &tx_data.prover_only, &tx_data.common)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{path:?} block transaction chunk #{chunk_index} generators failed: {error:?}"
+                )
+            });
     let new_jump = jump_from_witness(&partition_witness, &tx_target.new_jump);
     (partition_witness, new_jump)
 }
