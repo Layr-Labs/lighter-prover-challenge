@@ -32,6 +32,8 @@ use plonky2::plonk::vars::{
 };
 use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
 
+use crate::gate_accumulate::accumulate_base4_range_product;
+
 /// A gate to perform a basic mul-add on 32-bit values (we assume they are range-checked beforehand).
 #[derive(Copy, Clone, Debug, Default)]
 pub struct U32ArithmeticGate<F: RichField + Extendable<D>, const D: usize> {
@@ -315,14 +317,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32ArithmeticG
             debug_assert_eq!(1 << Self::limb_bits(), 4);
             for j in (0..Self::num_limbs()).rev() {
                 let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
-                for p in 0..n {
-                    let x = limb[p];
-                    let y = x * (x - three);
-                    scratch[p] = y * (y + F::TWO);
-                }
                 let combined = &mut combined_gate_constraints
                     [constraint_index * n..(constraint_index + 1) * n];
-                batch_multiply_add_inplace(combined, &scratch, filters);
+                accumulate_base4_range_product(combined, limb, filters, three);
                 constraint_index += 1;
             }
 

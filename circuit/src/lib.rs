@@ -48,6 +48,7 @@ pub mod delta;
 pub mod deserializers;
 pub mod ecdsa;
 pub mod eddsa;
+pub mod gate_accumulate;
 pub mod hash_utils;
 pub mod hints;
 pub mod keccak;

@@ -25,6 +25,7 @@ use plonky2::plonk::vars::{
 };
 use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
 
+use crate::gate_accumulate::accumulate_base4_range_product;
 use crate::types::config::{D, F};
 
 /// A gate which can decompose a number into bytes
@@ -226,14 +227,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
             // Range products per aux limb: x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3).
             for limb_wire in aux.clone() {
                 let col = &wires[limb_wire * n..][..n];
-                for p in 0..n {
-                    let x = col[p];
-                    let y = x * (x - three);
-                    scratch[p] = y * (y + F::TWO);
-                }
                 let combined = &mut combined_gate_constraints
                     [constraint_index * n..(constraint_index + 1) * n];
-                batch_multiply_add_inplace(combined, &scratch, filters);
+                accumulate_base4_range_product(combined, col, filters, three);
                 constraint_index += 1;
             }
 
