@@ -343,6 +343,47 @@ impl<F: Field> Witness<F> for PartitionSeeder<'_, '_, F> {
     }
 }
 
+/// Writes resumed inputs directly into a [`PendingPartitionWitness`]'s partition, applying
+/// [`PendingPartitionWitness::feed`]'s exact decrement-and-queue rule per newly populated
+/// representative: unexpired watchers are decremented at most once per representative (first
+/// population only, via `set_target_returning_rep`) and queued for the resumed worklist.
+pub struct PartitionFeeder<'a, 'b, F: Field> {
+    witness: &'b mut PartitionWitness<'a, F>,
+    unresolved_watches: &'b mut [usize],
+    generator_is_expired: &'b [bool],
+    generator_indices_by_watches: &'b BTreeMap<usize, Vec<usize>>,
+    pending_generator_indices: &'b mut Vec<usize>,
+}
+
+impl<F: Field> Debug for PartitionFeeder<'_, '_, F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PartitionFeeder").finish_non_exhaustive()
+    }
+}
+
+impl<F: Field> WitnessWrite<F> for PartitionFeeder<'_, '_, F> {
+    fn set_target(&mut self, target: Target, value: F) -> Result<()> {
+        if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
+            if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
+                for &generator_idx in watchers {
+                    if !self.generator_is_expired[generator_idx] {
+                        debug_assert_ne!(self.unresolved_watches[generator_idx], 0);
+                        self.unresolved_watches[generator_idx] -= 1;
+                        self.pending_generator_indices.push(generator_idx);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<F: Field> Witness<F> for PartitionFeeder<'_, '_, F> {
+    fn try_get_target(&self, target: Target) -> Option<F> {
+        self.witness.try_get_target(target)
+    }
+}
+
 /// Resumable witness generation: [`Self::start`] seeds an initial set of inputs and runs every
 /// generator that can already make progress, each [`Self::feed`] sets newly available inputs and
 /// resumes only the generators watching them, and [`Self::finish`] performs the same completeness
@@ -507,6 +548,34 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
                 }
             }
         }
+
+        run_generator_worklist(
+            &mut self.witness,
+            self.prover_data,
+            &mut self.unresolved_watches,
+            &mut self.generator_is_expired,
+            &mut self.remaining_generators,
+            pending_generator_indices,
+            self.parallel_threshold,
+        )
+    }
+
+    /// Like [`Self::feed`], but the inputs are written by `seed` directly into the partition
+    /// through a [`PartitionFeeder`] — no intermediate `PartialWitness` map is built or replayed.
+    /// The decrement-and-queue rule per newly populated representative is identical to
+    /// [`Self::feed`]'s, so the resumed worklist sees exactly the same pending set.
+    pub fn feed_seeded(
+        &mut self,
+        seed: impl FnOnce(&mut PartitionFeeder<'a, '_, F>) -> Result<()>,
+    ) -> Result<()> {
+        let mut pending_generator_indices = Vec::new();
+        seed(&mut PartitionFeeder {
+            witness: &mut self.witness,
+            unresolved_watches: &mut self.unresolved_watches,
+            generator_is_expired: &self.generator_is_expired,
+            generator_indices_by_watches: &self.prover_data.generator_indices_by_watches,
+            pending_generator_indices: &mut pending_generator_indices,
+        })?;
 
         run_generator_worklist(
             &mut self.witness,

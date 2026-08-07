@@ -104,31 +104,38 @@ fn chain_step_proof(
     chain_step: u64,
     previous: Option<ChainState<'_>>,
     base_proof: &Proof,
-    constant_inputs: &plonky2::iop::witness::PartialWitness<F>,
+    constant_inputs: &[(plonky2::iop::target::Target, F)],
     tx_proof: &Proof,
 ) -> Proof {
     mark_spine_thread_latency_critical();
     let result = (|| {
         // Phase 1: run every generator that does not depend on the previous chain proof while
-        // that proof may still be in flight.
-        let early_inputs = BlockTxChainCircuit::witness_inputs_early_from_template(
-            constant_inputs,
-            chain_target,
-            chain_step,
-            tx_proof,
-        )?;
-        let mut pending = PendingPartitionWitness::start(
-            early_inputs,
+        // that proof may still be in flight. The constant template entries, the transaction
+        // proof, and the step index seed the partition directly — no per-step template clone,
+        // map insertion hashing, or replay pass.
+        let mut pending = PendingPartitionWitness::start_seeded(
             &chain_data.prover_only,
             &chain_data.common,
+            |seeder| {
+                BlockTxChainCircuit::seed_witness_early_from_template(
+                    constant_inputs,
+                    chain_target,
+                    chain_step,
+                    tx_proof,
+                    seeder,
+                )
+            },
         )?;
 
         // Phase 2: wait for the previous chain proof, feed it, and prove.
         let previous_proof = previous.map(ChainState::wait);
-        pending.feed(BlockTxChainCircuit::witness_inputs_cyclic(
-            chain_target,
-            previous_proof.as_ref().unwrap_or(base_proof),
-        )?)?;
+        pending.feed_seeded(|feeder| {
+            BlockTxChainCircuit::seed_witness_cyclic(
+                chain_target,
+                previous_proof.as_ref().unwrap_or(base_proof),
+                feeder,
+            )
+        })?;
         BlockTxChainCircuit::prove_prepared(pending, chain_data)
     })();
     result.unwrap_or_else(|error| {
@@ -268,12 +275,16 @@ fn prove_path(
     );
     jump = next_jump;
 
-    let chain_constant_inputs = BlockTxChainCircuit::witness_inputs_constant(
-        chain_target,
-        chain_data,
-        dummy_proof,
-    )
-    .expect("chain constant witness inputs failed");
+    // The constant witness template, flattened once per path into a plain entry list the
+    // seeded per-step writes iterate directly. HashMap iteration order is irrelevant: the
+    // same (target, value) set is written either way, and first-population watch-count
+    // decrements are order-independent.
+    let chain_constant_inputs: Vec<(plonky2::iop::target::Target, F)> =
+        BlockTxChainCircuit::witness_inputs_constant(chain_target, chain_data, dummy_proof)
+            .expect("chain constant witness inputs failed")
+            .target_values
+            .into_iter()
+            .collect();
 
     std::thread::scope(|scope| {
         let base = &base_proof;
@@ -713,6 +724,99 @@ mod tests {
                 .finish()
                 .expect("chain step witness must be complete");
             let phase2_elapsed = phase2_start.elapsed();
+
+            // Seeded-transport arm: same inputs, written straight into a fresh
+            // partition via seed/feed closures with a cached flat template.
+            let template: Vec<(plonky2::iop::target::Target, F)> =
+                BlockTxChainCircuit::witness_inputs_constant(
+                    &circuits.chain_target,
+                    &circuits.chain_data,
+                    &circuits.dummy_proof,
+                )
+                .expect("constant witness inputs failed")
+                .target_values
+                .into_iter()
+                .collect();
+            let seeded_p1_start = Instant::now();
+            let mut pending_seeded = PendingPartitionWitness::start_seeded(
+                &circuits.chain_data.prover_only,
+                &circuits.chain_data.common,
+                |seeder| {
+                    BlockTxChainCircuit::seed_witness_early_from_template(
+                        &template,
+                        &circuits.chain_target,
+                        chain_step,
+                        &tx_proof,
+                        seeder,
+                    )
+                },
+            )
+            .expect("seeded early witness generation failed");
+            let seeded_p1 = seeded_p1_start.elapsed();
+            let seeded_p2_start = Instant::now();
+            pending_seeded
+                .feed_seeded(|feeder| {
+                    BlockTxChainCircuit::seed_witness_cyclic(
+                        &circuits.chain_target,
+                        cyclic_proof,
+                        feeder,
+                    )
+                })
+                .expect("seeded cyclic witness generation failed");
+            let witness_seeded = pending_seeded
+                .finish()
+                .expect("seeded chain step witness must be complete");
+            let seeded_p2 = seeded_p2_start.elapsed();
+            println!(
+                "chain step {chain_step}: SEEDED phase1 {seeded_p1:?}, phase2 {seeded_p2:?}"
+            );
+            // Control: a second map-fed run, to distinguish transport-caused divergence
+            // from pre-existing worklist scheduling nondeterminism.
+            let witness_map2 = {
+                let early2 = BlockTxChainCircuit::witness_inputs_early(
+                    &circuits.chain_target,
+                    &circuits.chain_data,
+                    chain_step,
+                    &circuits.dummy_proof,
+                    &tx_proof,
+                )
+                .expect("early witness inputs failed");
+                let mut pending2 = PendingPartitionWitness::start(
+                    early2,
+                    &circuits.chain_data.prover_only,
+                    &circuits.chain_data.common,
+                )
+                .expect("early witness generation failed");
+                pending2
+                    .feed(
+                        BlockTxChainCircuit::witness_inputs_cyclic(
+                            &circuits.chain_target,
+                            cyclic_proof,
+                        )
+                        .expect("cyclic witness inputs failed"),
+                    )
+                    .expect("cyclic witness generation failed");
+                pending2.finish().expect("map2 witness must be complete")
+            };
+            let diff_map_map = witness_map2
+                .values
+                .iter()
+                .zip(&witness.values)
+                .filter(|(a, b)| a != b)
+                .count();
+            let diff_seed_map = witness_seeded
+                .values
+                .iter()
+                .zip(&witness.values)
+                .filter(|(a, b)| a != b)
+                .count();
+            let bitmap_diff_seed = witness_seeded.set_bitmap != witness.set_bitmap;
+            let bitmap_diff_map2 = witness_map2.set_bitmap != witness.set_bitmap;
+            println!(
+                "chain step {chain_step}: diverging slots map-vs-map {diff_map_map},                  seeded-vs-map {diff_seed_map}, bitmap diff map2 {bitmap_diff_map2} seeded {bitmap_diff_seed}"
+            );
+            drop(witness_map2);
+            drop(witness_seeded);
 
             let prove_start = Instant::now();
             let mut timing = TimingTree::new("chain-step-prove", log::Level::Debug);

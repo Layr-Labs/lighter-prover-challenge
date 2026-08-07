@@ -268,6 +268,36 @@ impl BlockTxChainCircuit {
         Ok(pw)
     }
 
+    /// Seeded form of [`Self::witness_inputs_early_from_template`]: writes the same targets the
+    /// map-based path would accumulate — the constant template entries, the current transaction
+    /// proof, and the recursion step — directly through `w`, with no intermediate `PartialWitness`
+    /// clone, insertion hashing, or replay pass. Same values to the same targets; only the
+    /// transport changes.
+    pub fn seed_witness_early_from_template<W: WitnessWrite<F>>(
+        template_entries: &[(Target, F)],
+        target: &BlockTxChainTarget,
+        recursion_step: u64,
+        current_block_tx_proof: &ProofWithPublicInputs<F, C, D>,
+        w: &mut W,
+    ) -> Result<()> {
+        for &(t, v) in template_entries {
+            w.set_target(t, v)?;
+        }
+        w.set_proof_with_pis_target(&target.tx_proof, current_block_tx_proof)?;
+        w.set_target(target.recursion_step, F::from_canonical_u64(recursion_step))?;
+        Ok(())
+    }
+
+    /// Seeded form of [`Self::witness_inputs_cyclic`]: writes the previous chain proof directly
+    /// through `w` instead of building a one-shot `PartialWitness` map for it.
+    pub fn seed_witness_cyclic<W: WitnessWrite<F>>(
+        target: &BlockTxChainTarget,
+        cyclic_proof: &ProofWithPublicInputs<F, C, D>,
+        w: &mut W,
+    ) -> Result<()> {
+        w.set_proof_with_pis_target(&target.cyclic_proof, cyclic_proof)
+    }
+
     /// Proves a chain step whose witness inputs were supplied through a
     /// [`PendingPartitionWitness`].
     pub fn prove_prepared(
