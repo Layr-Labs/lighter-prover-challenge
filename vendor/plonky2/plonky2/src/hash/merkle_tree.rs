@@ -75,6 +75,16 @@ impl<F: RichField> ColumnStore<F> {
             ColumnStore::Shared(columns) => columns.col(j),
         }
     }
+
+    pub(crate) fn columns_mut(&mut self) -> Option<Vec<&mut [F]>> {
+        match self {
+            ColumnStore::Owned(columns) => {
+                Some(columns.iter_mut().map(Vec::as_mut_slice).collect())
+            }
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            ColumnStore::Shared(columns) => columns.columns_mut(),
+        }
+    }
 }
 
 /// Backing storage for the Merkle tree leaves.
@@ -472,22 +482,24 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     /// without materializing the transposed leaf matrix. Leaf `i` is
     /// `columns[j][reverse_bits(i, log_rows)]`.
     pub fn new_columns(columns: Vec<Vec<F>>, cap_height: usize) -> Self {
-        let num_leaves = columns.first().map_or(0, Vec::len);
-        debug_assert!(columns.iter().all(|column| column.len() == num_leaves));
+        Self::new_column_store(ColumnStore::Owned(columns), cap_height)
+    }
+
+    /// Build a tree from retained natural-order poly-major column storage.
+    pub(crate) fn new_column_store(columns: ColumnStore<F>, cap_height: usize) -> Self {
+        let num_leaves = columns.num_rows();
+        debug_assert!((0..columns.num_cols()).all(|j| columns.col(j).len() == num_leaves));
         let log_rows = log2_strict(num_leaves);
         assert!(
             cap_height <= log_rows,
             "cap_height={cap_height} should be at most log2(leaves.len())={log_rows}"
         );
 
-        if let Some((digests, cap)) = H::try_build_merkle_tree_columns(&columns, cap_height) {
+        if let Some((digests, cap)) = H::try_build_merkle_tree_column_store(&columns, cap_height) {
             debug_assert_eq!(digests.len(), 2 * (num_leaves - (1 << cap_height)));
             debug_assert_eq!(cap.len(), 1 << cap_height);
             return Self {
-                leaves: MerkleLeaves::Columns {
-                    columns: ColumnStore::Owned(columns),
-                    log_rows,
-                },
+                leaves: MerkleLeaves::Columns { columns, log_rows },
                 num_leaves,
                 digests,
                 cap: MerkleCap(cap),
@@ -495,14 +507,26 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         }
 
         // CPU fallback: materialize the bit-reversed row-major matrix and hash it.
-        let flat = crate::util::transpose_to_bitrev_flat(&columns);
-        let (digests, cap) =
-            Self::cpu_digests(&flat, columns.len(), num_leaves, cap_height);
+        let num_columns = columns.num_cols();
+        let flat = match &columns {
+            ColumnStore::Owned(owned) => crate::util::transpose_to_bitrev_flat(owned),
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            ColumnStore::Shared(_) => {
+                let mut flat = vec![F::ZERO; num_leaves * num_columns];
+                flat.par_chunks_mut(num_columns)
+                    .enumerate()
+                    .for_each(|(leaf, row)| {
+                        let natural = crate::util::reverse_bits(leaf, log_rows);
+                        for (column, value) in row.iter_mut().enumerate() {
+                            *value = columns.col(column)[natural];
+                        }
+                    });
+                flat
+            }
+        };
+        let (digests, cap) = Self::cpu_digests(&flat, num_columns, num_leaves, cap_height);
         Self {
-            leaves: MerkleLeaves::Columns {
-                columns: ColumnStore::Owned(columns),
-                log_rows,
-            },
+            leaves: MerkleLeaves::Columns { columns, log_rows },
             num_leaves,
             digests,
             cap: MerkleCap(cap),

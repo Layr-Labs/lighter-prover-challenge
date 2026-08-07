@@ -115,6 +115,19 @@ fn fft_dispatch<F: Field>(
     fft_classic(input, zero_factor.unwrap_or(0), &computed_root_table);
 }
 
+/// Computes an FFT in the caller-provided buffer.
+///
+/// This is equivalent to [`fft_with_options`], but permits buffers backed by
+/// shared CPU/GPU memory to remain in place.
+#[inline]
+pub fn fft_in_place_with_options<F: Field>(
+    buffer: &mut [F],
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+) {
+    fft_dispatch(buffer, zero_factor, root_table);
+}
+
 #[inline]
 pub fn fft<F: Field>(poly: PolynomialCoeffs<F>) -> PolynomialValues<F> {
     fft_with_options(poly, None, None)
