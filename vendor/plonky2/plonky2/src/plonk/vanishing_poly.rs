@@ -945,6 +945,9 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
     constraints_batch.clear();
     constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
     let mut filters = Vec::with_capacity(vars_batch.len());
+    // One typed buffer for every gate's materialized constraints, reused
+    // across gates and (via the caller's `Vec`) across batches.
+    let mut constraint_scratch: Vec<F> = Vec::new();
     for (i, gate) in common_data.gates.iter().enumerate() {
         let selector_index = common_data.selectors_info.selector_indices[i];
         gate.0.eval_filtered_base_batch(
@@ -955,6 +958,7 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
             common_data.selectors_info.num_selectors(),
             common_data.num_lookup_selectors,
             &mut filters,
+            &mut constraint_scratch,
             constraints_batch,
         );
     }
