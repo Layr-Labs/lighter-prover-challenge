@@ -6,7 +6,9 @@ use alloc::string::ToString;
 
 use anyhow::Result;
 
+use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::Extendable;
+use crate::field::packable::Packable;
 use crate::field::packed::PackedField;
 use crate::gates::gate::Gate;
 use crate::gates::packed_util::PackedEvaluableBase;
@@ -116,6 +118,91 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for SelectionGate 
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
         self.eval_unfiltered_base_batch_packed(vars_base)
+    }
+
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        assert!(
+            combined_gate_constraints.len()
+                >= <Self as Gate<F, D>>::num_constraints(self) * n
+        );
+
+        let wires = vars_base.local_wires;
+        let col = |wire: usize| &wires[wire * n..][..n];
+
+        let mut scratch_stack = [F::ZERO; 64];
+        let mut scratch_heap = Vec::new();
+        let scratch: &mut [F] = if n <= scratch_stack.len() {
+            &mut scratch_stack[..n]
+        } else {
+            scratch_heap.resize(n, F::ZERO);
+            &mut scratch_heap
+        };
+
+        let packed_len = n - n % <F as Packable>::Packing::WIDTH;
+        for i in 0..self.num_ops {
+            let b = col(self.wire_ith_selector(i));
+            let x = col(self.wire_ith_element_0(i));
+            let y = col(self.wire_ith_element_1(i));
+            let result = col(self.wire_ith_output(i));
+            let temp = col(self.wire_ith_temporary(i, 0));
+
+            {
+                let scratch_packed =
+                    <F as Packable>::Packing::pack_slice_mut(&mut scratch[..packed_len]);
+                let b_packed = <F as Packable>::Packing::pack_slice(&b[..packed_len]);
+                let y_packed = <F as Packable>::Packing::pack_slice(&y[..packed_len]);
+                let temp_packed = <F as Packable>::Packing::pack_slice(&temp[..packed_len]);
+                for (((out, &b), &y), &temp) in scratch_packed
+                    .iter_mut()
+                    .zip(b_packed)
+                    .zip(y_packed)
+                    .zip(temp_packed)
+                {
+                    *out = (b * y - y) - temp;
+                }
+                for p in packed_len..n {
+                    scratch[p] = (b[p] * y[p] - y[p]) - temp[p];
+                }
+            }
+            batch_multiply_add_inplace(
+                &mut combined_gate_constraints[(2 * i) * n..][..n],
+                scratch,
+                filters,
+            );
+
+            {
+                let scratch_packed =
+                    <F as Packable>::Packing::pack_slice_mut(&mut scratch[..packed_len]);
+                let b_packed = <F as Packable>::Packing::pack_slice(&b[..packed_len]);
+                let x_packed = <F as Packable>::Packing::pack_slice(&x[..packed_len]);
+                let temp_packed = <F as Packable>::Packing::pack_slice(&temp[..packed_len]);
+                let result_packed = <F as Packable>::Packing::pack_slice(&result[..packed_len]);
+                for ((((out, &b), &x), &temp), &result) in scratch_packed
+                    .iter_mut()
+                    .zip(b_packed)
+                    .zip(x_packed)
+                    .zip(temp_packed)
+                    .zip(result_packed)
+                {
+                    *out = (b * x - temp) - result;
+                }
+                for p in packed_len..n {
+                    scratch[p] = (b[p] * x[p] - temp[p]) - result[p];
+                }
+            }
+            batch_multiply_add_inplace(
+                &mut combined_gate_constraints[(2 * i + 1) * n..][..n],
+                scratch,
+                filters,
+            );
+        }
     }
 
     fn eval_unfiltered_circuit(

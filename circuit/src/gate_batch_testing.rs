@@ -102,6 +102,17 @@ mod vendored_gate_tests {
     }
 
     #[test]
+    fn selection_accumulate_matches_eval_unfiltered_across_batch() {
+        use plonky2::gates::select_base::SelectionGate;
+
+        for num_ops in [1, 2, 20] {
+            let gate = SelectionGate { num_ops };
+            assert_accumulate_matches_eval_unfiltered(&gate);
+            assert_direct_accumulation_matches_materialized_batch(&gate);
+        }
+    }
+
+    #[test]
     fn coset_interpolation_accumulate_matches_eval_unfiltered_across_batch() {
         use plonky2::gates::coset_interpolation::CosetInterpolationGate;
 
@@ -129,6 +140,7 @@ mod accumulate_microbench {
     use plonky2::gates::random_access::RandomAccessGate;
     use plonky2::gates::reducing::ReducingGate;
     use plonky2::gates::reducing_extension::ReducingExtensionGate;
+    use plonky2::gates::select_base::SelectionGate;
     use plonky2::plonk::circuit_data::CircuitConfig;
 
     use super::*;
@@ -199,6 +211,10 @@ mod accumulate_microbench {
                 ITERS,
             );
         }
+        bench_gate(
+            &SelectionGate::new_from_config(&CircuitConfig::standard_recursion_config()),
+            ITERS,
+        );
     }
 }
 
