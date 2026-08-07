@@ -43,9 +43,30 @@ static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
+// Keep Rayon bulk proof workers on macOS's user-initiated QoS tier. The serial
+// chain spine raises itself to user-interactive while active, so this preserves
+// its preemption advantage without leaving bulk workers at unspecified/default
+// QoS where the scheduler may place compute-heavy proof work on efficiency cores.
+#[cfg(target_os = "macos")]
+fn mark_rayon_worker_user_initiated() {
+    // `QOS_CLASS_USER_INITIATED` is 0x19 in <sys/qos.h>.
+    #[allow(non_camel_case_types)]
+    type qos_class_t = u32;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
+    }
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(0x19, 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mark_rayon_worker_user_initiated() {}
+
 fn main() {
     env_logger::init();
     rayon::ThreadPoolBuilder::new()
+        .start_handler(|_| mark_rayon_worker_user_initiated())
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
         .expect("cannot configure prover thread pool");
