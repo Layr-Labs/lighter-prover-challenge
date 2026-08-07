@@ -251,58 +251,60 @@ impl Sum for NeonGoldilocksField {
 
 /// Reduce two independent 128-bit products modulo
 /// `2^64 - 2^32 + 1`, interleaving the instruction streams for ILP.
+///
+/// Nine instructions per multiply, computing bit-for-bit the same intermediates as the
+/// scalar `reduce128`:
+///
+/// * `subs {result}, {result}, {hi}, lsr #32` folds the `lsr` that isolates `x_hi_hi`
+///   into the subtraction's shifted-register operand (AArch64 data-processing
+///   instructions take a free `LSR #imm` on the second source).
+/// * `umull {scratch}, {hi:w}, {epsilon:w}` is the 32x32 -> 64 widening multiply, which
+///   computes `(x_hi & EPSILON) * EPSILON` in one instruction. It replaces the
+///   `and` / `lsl #32` / `sub` triple that built the same product out of shifts: the
+///   `W`-register operands mask to the low 32 bits for free, and both factors are
+///   below `2^32`, so the 64-bit product is exact.
+///
+/// The two conditional folds stay branchless and stay separate: merging them into a
+/// single signed carry counter would produce a value congruent mod `ORDER` but with a
+/// different `u64` representative, and `GoldilocksField` values are compared and hashed
+/// in their raw non-canonical form.
+///
+/// Seven registers per pair (down from fifteen), which lets the surrounding butterfly
+/// keep its loads, twiddles and accumulators in flight.
 #[inline(always)]
 fn mul_reduce_pair(a0: u64, b0: u64, a1: u64, b1: u64) -> (u64, u64) {
-    let result0: u64;
-    let result1: u64;
+    let mut result0 = a0;
+    let mut result1 = a1;
+    let scratch0 = b0;
+    let scratch1 = b1;
 
     unsafe {
         asm!(
-            "mul   {lo0}, {a0}, {b0}",
-            "mul   {lo1}, {a1}, {b1}",
-            "umulh {hi0}, {a0}, {b0}",
-            "umulh {hi1}, {a1}, {b1}",
-            "lsr   {hi_hi0}, {hi0}, #32",
-            "lsr   {hi_hi1}, {hi1}, #32",
-            "subs  {tmp0}, {lo0}, {hi_hi0}",
-            "csetm {adjust0:w}, cc",
-            "subs  {tmp1}, {lo1}, {hi_hi1}",
-            "csetm {adjust1:w}, cc",
-            "sub   {tmp0}, {tmp0}, {adjust0}",
-            "sub   {tmp1}, {tmp1}, {adjust1}",
-            "and   {hi_lo0}, {hi0}, {epsilon}",
-            "and   {hi_lo1}, {hi1}, {epsilon}",
-            "lsl   {fold0}, {hi_lo0}, #32",
-            "lsl   {fold1}, {hi_lo1}, #32",
-            "sub   {fold0}, {fold0}, {hi_lo0}",
-            "sub   {fold1}, {fold1}, {hi_lo1}",
-            "adds  {result0}, {tmp0}, {fold0}",
-            "csetm {adjust0:w}, cs",
-            "adds  {result1}, {tmp1}, {fold1}",
-            "csetm {adjust1:w}, cs",
-            "add   {result0}, {result0}, {adjust0}",
-            "add   {result1}, {result1}, {adjust1}",
-            a0 = in(reg) a0,
-            b0 = in(reg) b0,
-            a1 = in(reg) a1,
-            b1 = in(reg) b1,
-            epsilon = in(reg) GoldilocksField::ORDER.wrapping_neg(),
-            lo0 = out(reg) _,
-            lo1 = out(reg) _,
+            "umulh {hi0}, {result0}, {scratch0}",
+            "umulh {hi1}, {result1}, {scratch1}",
+            "mul   {result0}, {result0}, {scratch0}",
+            "mul   {result1}, {result1}, {scratch1}",
+            "umull {scratch0}, {hi0:w}, {epsilon:w}",
+            "umull {scratch1}, {hi1:w}, {epsilon:w}",
+            "subs  {result0}, {result0}, {hi0}, lsr #32",
+            "csetm {hi0:w}, cc",
+            "subs  {result1}, {result1}, {hi1}, lsr #32",
+            "csetm {hi1:w}, cc",
+            "sub   {result0}, {result0}, {hi0}",
+            "sub   {result1}, {result1}, {hi1}",
+            "adds  {result0}, {result0}, {scratch0}",
+            "csetm {scratch0:w}, cs",
+            "adds  {result1}, {result1}, {scratch1}",
+            "csetm {scratch1:w}, cs",
+            "add   {result0}, {result0}, {scratch0}",
+            "add   {result1}, {result1}, {scratch1}",
+            result0 = inout(reg) result0,
+            result1 = inout(reg) result1,
+            scratch0 = inout(reg) scratch0 => _,
+            scratch1 = inout(reg) scratch1 => _,
             hi0 = out(reg) _,
             hi1 = out(reg) _,
-            hi_hi0 = out(reg) _,
-            hi_hi1 = out(reg) _,
-            tmp0 = out(reg) _,
-            tmp1 = out(reg) _,
-            hi_lo0 = out(reg) _,
-            hi_lo1 = out(reg) _,
-            fold0 = out(reg) _,
-            fold1 = out(reg) _,
-            adjust0 = out(reg) _,
-            adjust1 = out(reg) _,
-            result0 = out(reg) result0,
-            result1 = out(reg) result1,
+            epsilon = in(reg) GoldilocksField::ORDER.wrapping_neg(),
             options(pure, nomem, nostack),
         );
     }
