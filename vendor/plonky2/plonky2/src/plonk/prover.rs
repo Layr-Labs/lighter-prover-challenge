@@ -774,12 +774,14 @@ fn compute_quotient_polys<
     // steps away since we work on an LDE of degree `max_filtered_constraint_degree`.
     let next_step = 1 << quotient_degree_bits;
 
-    // Process-global cached subgroup (bit-identical to computing it here): the
-    // serial 2^19-length dependent multiply chain runs once per process
-    // instead of once per proof.
-    let points =
-        precomputed::two_adic_subgroup::<F>(common_data.degree_bits() + quotient_degree_bits);
-    let lde_size = points.len();
+    // Process-global cached shifted quotient domain (bit-identical to the
+    // per-batch `coset_shift * x` map): both the subgroup construction and the
+    // full multiply-and-write traversal run once per process instead of once
+    // per proof.
+    let shifted_points = precomputed::shifted_two_adic_subgroup::<F>(
+        common_data.degree_bits() + quotient_degree_bits,
+    );
+    let lde_size = shifted_points.len();
 
     let z_h_on_coset = ZeroPolyOnCoset::new(common_data.degree_bits(), quotient_degree_bits);
     // The `L_0` denominator inverses consumed by `eval_l_0` depend only on
@@ -830,13 +832,12 @@ fn compute_quotient_polys<
     let lut_re_poly_evals_refs: Vec<&[F]> =
         lut_re_poly_evals.iter().map(|v| v.as_slice()).collect();
 
-    let points_batches = points.par_chunks(BATCH_SIZE);
-    let num_batches = points.len().div_ceil(BATCH_SIZE);
+    let points_batches = shifted_points.par_chunks(BATCH_SIZE);
+    let num_batches = shifted_points.len().div_ceil(BATCH_SIZE);
 
     struct QuotientScratch<F: RichField> {
         indices: Vec<usize>,
         indices_next: Vec<usize>,
-        shifted_xs: Vec<F>,
         local_constants: Vec<F>,
         local_wires: Vec<F>,
         s_sigmas_flat: Vec<F>,
@@ -849,7 +850,7 @@ fn compute_quotient_polys<
     let zs_row_width = zs_partial_products_and_lookup_commitment.lde_row_width();
     let num_routed_wires = common_data.config.num_routed_wires;
 
-    let mut quotient_values = vec![F::ZERO; points.len() * num_challenges];
+    let mut quotient_values = vec![F::ZERO; shifted_points.len() * num_challenges];
     quotient_values
         .par_chunks_mut(BATCH_SIZE * num_challenges)
         .zip(points_batches)
@@ -858,7 +859,6 @@ fn compute_quotient_polys<
             || QuotientScratch::<F> {
                 indices: Vec::with_capacity(BATCH_SIZE),
                 indices_next: Vec::with_capacity(BATCH_SIZE),
-                shifted_xs: Vec::with_capacity(BATCH_SIZE),
                 local_constants: Vec::new(),
                 local_wires: Vec::new(),
                 s_sigmas_flat: Vec::new(),
@@ -882,11 +882,6 @@ fn compute_quotient_polys<
                 scratch
                     .indices_next
                     .extend(scratch.indices.iter().map(|&i| (i + next_step) % lde_size));
-
-                scratch.shifted_xs.clear();
-                scratch
-                    .shifted_xs
-                    .extend(xs_batch.iter().map(|&x| F::coset_shift() * x));
 
                 prover_data.constants_sigmas_commitment.fill_lde_batch(
                     &scratch.indices,
@@ -1021,7 +1016,7 @@ fn compute_quotient_polys<
                 eval_vanishing_poly_base_batch::<F, D>(
                     common_data,
                     indices_batch,
-                    &scratch.shifted_xs,
+                    xs_batch,
                     vars_batch,
                     perm,
                     &local_lookup_batch,
@@ -1049,7 +1044,10 @@ fn compute_quotient_polys<
             },
         );
 
-    debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
+    debug_assert_eq!(
+        quotient_values.len(),
+        shifted_points.len() * num_challenges
+    );
     (0..num_challenges)
         .into_par_iter()
         .map(|challenge| {
@@ -1065,13 +1063,13 @@ fn compute_quotient_polys<
 }
 
 /// Process-global caches for deterministic per-degree precomputations that
-/// were being redone per proof: the quotient-domain two-adic subgroup (a
-/// serial dependent multiply chain over 2^19 points) and the coset-shift power
-/// table used by every `PolynomialBatch` LDE. Entries are keyed by field type
-/// and size; the stored vectors are exactly what the direct computation
-/// returns, computed once, so every lookup is bit-identical to computing in
-/// place. (Kept here rather than in `plonky2_field` so the file set stays
-/// disjoint from pending `fft.rs` work.)
+/// were being redone per proof: the quotient-domain two-adic subgroup, its
+/// coset-shifted points, and the coset-shift power table used by every
+/// `PolynomialBatch` LDE. Entries are keyed by field type and size; the stored
+/// vectors are exactly what the direct computation returns, computed once, so
+/// every lookup is bit-identical to computing in place. (Kept here rather than
+/// in `plonky2_field` so the file set stays disjoint from pending `fft.rs`
+/// work.)
 pub(crate) mod precomputed {
     #[cfg(feature = "std")]
     mod imp {
@@ -1084,6 +1082,7 @@ pub(crate) mod precomputed {
         type Map = RwLock<HashMap<(TypeId, usize), Arc<dyn Any + Send + Sync>>>;
 
         static SUBGROUPS: OnceLock<Map> = OnceLock::new();
+        static SHIFTED_SUBGROUPS: OnceLock<Map> = OnceLock::new();
         static COSET_POWERS: OnceLock<Map> = OnceLock::new();
 
         fn get_or_compute<F: Field>(
@@ -1117,6 +1116,18 @@ pub(crate) mod precomputed {
             get_or_compute(&SUBGROUPS, n_log, || F::two_adic_subgroup(n_log))
         }
 
+        /// Cached `F::two_adic_subgroup(n_log)`, multiplied pointwise by the
+        /// field's coset shift with the same operation order as the quotient
+        /// loop it replaces.
+        pub(crate) fn shifted_two_adic_subgroup<F: Field>(n_log: usize) -> Arc<Vec<F>> {
+            get_or_compute(&SHIFTED_SUBGROUPS, n_log, || {
+                two_adic_subgroup::<F>(n_log)
+                    .iter()
+                    .map(|&x| F::coset_shift() * x)
+                    .collect()
+            })
+        }
+
         /// Cached `F::coset_shift().powers().take(degree)`.
         pub(crate) fn coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
             get_or_compute(&COSET_POWERS, degree, || {
@@ -1138,12 +1149,23 @@ pub(crate) mod precomputed {
             Arc::new(F::two_adic_subgroup(n_log))
         }
 
+        pub(crate) fn shifted_two_adic_subgroup<F: Field>(n_log: usize) -> Arc<Vec<F>> {
+            Arc::new(
+                F::two_adic_subgroup(n_log)
+                    .into_iter()
+                    .map(|x| F::coset_shift() * x)
+                    .collect(),
+            )
+        }
+
         pub(crate) fn coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
             Arc::new(F::coset_shift().powers().take(degree).collect::<Vec<F>>())
         }
     }
 
-    pub(crate) use imp::{coset_shift_powers, two_adic_subgroup};
+    pub(crate) use imp::{coset_shift_powers, shifted_two_adic_subgroup};
+    #[cfg(test)]
+    pub(crate) use imp::two_adic_subgroup;
 }
 
 #[cfg(test)]
@@ -1297,6 +1319,19 @@ mod quotient_layout_tests {
                 *precomputed::two_adic_subgroup::<F>(n_log),
                 F::two_adic_subgroup(n_log)
             );
+
+            let direct_shifted = F::two_adic_subgroup(n_log)
+                .into_iter()
+                .map(|x| F::coset_shift() * x)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                *precomputed::shifted_two_adic_subgroup::<F>(n_log),
+                direct_shifted
+            );
+            assert_eq!(
+                *precomputed::shifted_two_adic_subgroup::<F>(n_log),
+                direct_shifted
+            );
         }
         for degree in [8usize, 64, 512] {
             let direct: Vec<F> = F::coset_shift().powers().take(degree).collect();
@@ -1332,6 +1367,7 @@ mod l_0_table_cache {
 
     use plonky2_maybe_rayon::*;
 
+    use super::precomputed;
     use crate::field::types::Field;
 
     /// Keyed by field type and `(degree_bits, quotient_degree_bits)`; the coset shift is a
@@ -1346,9 +1382,9 @@ mod l_0_table_cache {
     /// independent, so the parallel map changes nothing.
     fn build<F: Field>(degree_bits: usize, quotient_degree_bits: usize) -> Vec<F> {
         let n = F::from_canonical_usize(1 << degree_bits);
-        F::two_adic_subgroup(degree_bits + quotient_degree_bits)
-            .into_par_iter()
-            .map(|x| (n * (F::coset_shift() * x - F::ONE)).inverse())
+        precomputed::shifted_two_adic_subgroup::<F>(degree_bits + quotient_degree_bits)
+            .par_iter()
+            .map(|&x| (n * (x - F::ONE)).inverse())
             .collect()
     }
 
