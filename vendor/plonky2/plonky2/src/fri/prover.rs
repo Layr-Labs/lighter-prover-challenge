@@ -15,7 +15,7 @@ use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
@@ -247,21 +247,54 @@ pub(crate) fn fri_proof_of_work<
     // state with any inputs (excluding the PoW witness candidate). The second step is to overwrite
     // one more element of our sponge state with the candidate, then apply the permutation,
     // obtaining our duplex's post-state which contains the PoW response.
+    //
+    // We evaluate eight candidates per Rayon task, batching each half through
+    // `Permutation::permute_x4`. Amortizing Rayon scheduling and iterator work
+    // across two fused permutations preserves the scalar candidate semantics.
     let mut duplex_intermediate_state = challenger.sponge_state;
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
+    const CANDIDATES_PER_TASK: u64 = 8;
+    let max_candidate = F::NEG_ONE.to_canonical_u64();
+    let block_count = max_candidate / CANDIDATES_PER_TASK + 1;
+    let pow_witness = (0..block_count)
         .into_par_iter()
-        .find_any(|&candidate| {
-            let mut duplex_state = duplex_intermediate_state;
-            duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-            duplex_state.permute();
-            let pow_response = duplex_state.squeeze().iter().last().unwrap();
-            let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-            leading_zeros >= min_leading_zeros
+        .find_map_any(|block| {
+            let base = block * CANDIDATES_PER_TASK;
+            let mut states = [duplex_intermediate_state; CANDIDATES_PER_TASK as usize];
+            let mut n = 0;
+            for (i, state) in states.iter_mut().enumerate() {
+                let candidate = base + i as u64;
+                if candidate > max_candidate {
+                    break;
+                }
+                state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+                n = i + 1;
+            }
+            if n == CANDIDATES_PER_TASK as usize {
+                let [mut s0, mut s1, mut s2, mut s3, mut s4, mut s5, mut s6, mut s7] = states;
+                <<C as GenericConfig<D>>::Hasher as Hasher<F>>::Permutation::permute_x4(
+                    &mut s0, &mut s1, &mut s2, &mut s3,
+                );
+                <<C as GenericConfig<D>>::Hasher as Hasher<F>>::Permutation::permute_x4(
+                    &mut s4, &mut s5, &mut s6, &mut s7,
+                );
+                states = [s0, s1, s2, s3, s4, s5, s6, s7];
+            } else {
+                for state in states.iter_mut().take(n) {
+                    state.permute();
+                }
+            }
+            for (i, state) in states.iter().take(n).enumerate() {
+                let pow_response = state.squeeze().iter().last().unwrap();
+                let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
+                if leading_zeros >= min_leading_zeros {
+                    return Some(F::from_canonical_u64(base + i as u64));
+                }
+            }
+            None
         })
-        .map(F::from_canonical_u64)
         .expect("Proof of work failed. This is highly unlikely!");
 
     // Recompute pow_response using our normal Challenger code, and make sure it matches.
@@ -334,6 +367,29 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::fri::reduction_strategies::FriReductionStrategy;
+    use crate::hash::poseidon2::hash::Poseidon2Hash;
+    use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    #[test]
+    fn batched_proof_of_work_finds_a_valid_witness() {
+        type F = GoldilocksField;
+
+        let config = FriConfig {
+            rate_bits: 2,
+            cap_height: 4,
+            proof_of_work_bits: 16,
+            reduction_strategy: FriReductionStrategy::Fixed(Vec::new()),
+            num_query_rounds: 28,
+        };
+        let mut challenger = Challenger::<F, Poseidon2Hash>::new();
+        challenger.observe_elements(&[F::ONE, F::TWO, F::NEG_ONE]);
+
+        let _witness = fri_proof_of_work::<F, Poseidon2GoldilocksConfig, 2>(
+            &mut challenger,
+            &config,
+        );
+    }
 
     /// `bitrev_flatten` must be raw-`u64`-identical to the serial
     /// gather-and-extend loop it replaced, for every leaf and every limb.

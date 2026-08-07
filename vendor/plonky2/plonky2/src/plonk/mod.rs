@@ -8,7 +8,7 @@ pub mod circuit_data;
 pub mod config;
 pub(crate) mod copy_constraint;
 mod get_challenges;
-pub mod permutation_argument;
+pub(crate) mod permutation_argument;
 pub mod plonk_common;
 pub mod proof;
 pub mod prover;

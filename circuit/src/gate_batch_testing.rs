@@ -316,43 +316,6 @@ where
     assert_eq!(actual, expected, "gate {}", gate.id());
 }
 
-/// Batch-size-parameterized form of
-/// [`assert_direct_accumulation_matches_materialized_batch`]: the same
-/// materialize-then-multiply-add reference semantics, checked at an explicit
-/// batch size so callers can cover packing remainders and boundary widths.
-/// (The frontier's u32 interleave/uninterleave tests reference this helper but
-/// the composition that promoted them lost its definition; restored here.)
-pub fn assert_accumulate_matches_materialized_at_batch_size<G>(gate: &G, n: usize)
-where
-    G: Gate<GoldilocksField, 2>,
-{
-    type F = GoldilocksField;
-
-    let wires = (0..gate.num_wires() * n)
-        .map(|i| F::from_canonical_usize(3 * i + 5))
-        .collect::<Vec<_>>();
-    let constants = (0..gate.num_constants() * n)
-        .map(|i| F::from_canonical_usize(7 * i + 11))
-        .collect::<Vec<_>>();
-    let hash = HashOut::ZERO;
-    let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
-    let filters = (0..n)
-        .map(|i| F::from_canonical_usize(2 * i + 1))
-        .collect::<Vec<_>>();
-
-    let mut expected = vec![F::ZERO; gate.num_constraints() * n];
-    let materialized = gate.eval_unfiltered_base_batch(vars);
-    for (acc, constraints) in expected
-        .chunks_exact_mut(n)
-        .zip(materialized.chunks_exact(n))
-    {
-        batch_multiply_add_inplace(acc, constraints, &filters);
-    }
-    let mut actual = vec![F::ZERO; expected.len()];
-    gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
-    assert_eq!(actual, expected, "gate {} at batch size {n}", gate.id());
-}
-
 pub fn assert_base_batch_matches_eval_unfiltered<G>(gate: &G)
 where
     G: Gate<GoldilocksField, 2>,

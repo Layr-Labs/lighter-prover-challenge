@@ -195,6 +195,20 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32InterleaveG
         self.eval_unfiltered_base_batch_packed(vars_base)
     }
 
+    /// Fused accumulate: folds the filtered constraints straight into the
+    /// caller's buffer instead of materializing the whole constraint matrix
+    /// first. The bit columns are read exactly once per op: the same pass
+    /// folds them into the base-2 and base-4 recompositions and emits the
+    /// per-bit range product.
+    ///
+    /// Value-exactness versus the generic
+    /// [`PackedEvaluableBase::eval_unfiltered_base_batch_accumulate_packed`]
+    /// this replaces: `reduce_with_powers(bits.iter().rev(), b)` folds the
+    /// doubly-reversed (i.e. wire-order) bits by Horner, which is the
+    /// `acc = acc * b + bit` recurrence below; the range product
+    /// `(0..B).map(|i| bit - i).product()` is `bit * (bit - 1)` at `B == 2`;
+    /// and each row lands in the buffer through the same
+    /// `combined[j * n + p] += constraint * filters[p]` product-accumulate.
     fn eval_unfiltered_base_batch_accumulate(
         &self,
         vars_base: EvaluationVarsBaseBatch<F>,
@@ -210,6 +224,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32InterleaveG
         let base = F::from_canonical_usize(Self::B);
         let base_sq = F::from_canonical_usize(Self::B * Self::B);
 
+        // Three scratch rows: the base-2 recomposition, the base-4
+        // (interleaved) recomposition, and the per-bit range product. Batches
+        // are 32 points in this prover; keep them on the stack and fall back
+        // to the heap only for oversized batches.
         let mut scratch_stack = [F::ZERO; 3 * 64];
         let mut scratch_heap;
         let scratch: &mut [F] = if n <= 64 {
@@ -223,6 +241,8 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32InterleaveG
 
         let mut constraint_index = 0;
         for i in 0..self.num_ops {
+            // `eval_unfiltered` pushes the two recomposition constraints
+            // first, then one range check per bit.
             let x_row = constraint_index;
             let interleaved_row = constraint_index + 1;
             constraint_index += 2;
@@ -233,6 +253,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32InterleaveG
                 let col = &wires[bit_wire * n..][..n];
                 for p in 0..n {
                     let bit = col[p];
+                    // The bits are big-endian, so Horner from the front is the
+                    // same reduction `reduce_with_powers` performs over the
+                    // reversed (little-endian) view.
                     acc_x[p] = acc_x[p] * base + bit;
                     acc_interleaved[p] = acc_interleaved[p] * base_sq + bit;
                     range[p] = bit * (bit - F::ONE);
@@ -446,7 +469,10 @@ mod tests {
     use plonky2::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     use super::*;
-    use crate::gate_batch_testing::assert_accumulate_matches_eval_unfiltered;
+    use crate::gate_batch_testing::{
+        assert_accumulate_matches_eval_unfiltered,
+        assert_accumulate_matches_materialized_at_batch_size,
+    };
 
     #[test]
     fn low_degree() {
@@ -461,10 +487,29 @@ mod tests {
         test_eval_fns::<F, C, _, D>(U32InterleaveGate { num_ops: 2 })
     }
 
+    /// Differential for the fused `eval_unfiltered_base_batch_accumulate`
+    /// override against per-point `eval_unfiltered`, which is the definition
+    /// of the gate's constraints. Catches recomposition-base, constraint-order
+    /// and column-indexing mistakes in the hand-written fold.
     #[test]
     fn accumulate_matches_eval_unfiltered() {
         for num_ops in [1, 2, 3] {
             assert_accumulate_matches_eval_unfiltered(&U32InterleaveGate { num_ops });
+        }
+    }
+
+    /// Differential against the materialize-then-add path the override
+    /// replaces, on both sides of the fused fold's stack/heap scratch
+    /// threshold (64 points) and starting from a non-zero accumulator.
+    #[test]
+    fn accumulate_matches_materialized_across_batch_sizes() {
+        for num_ops in [1, 2, 3] {
+            for n in [1, 2, 11, 32, 63, 64, 65, 100] {
+                assert_accumulate_matches_materialized_at_batch_size(
+                    &U32InterleaveGate { num_ops },
+                    n,
+                );
+            }
         }
     }
 }

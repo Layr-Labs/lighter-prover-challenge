@@ -84,7 +84,7 @@ where
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default, serde::Serialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct ApiKeyTarget {
     pub api_key_index: Target,
 

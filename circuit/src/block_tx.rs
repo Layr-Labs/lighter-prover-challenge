@@ -84,7 +84,7 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy)]
 pub struct JumpStateTarget {
     pub last_active_tx_index: Target,
     pub prev_new_state_root: HashOutTarget,

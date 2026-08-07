@@ -25,59 +25,6 @@ use crate::plonk::vars::{
 };
 use crate::util::serialization::{Buffer, IoResult};
 
-/// Static wire-layout metadata for the base-4 range-check gate quotient
-/// specialization. This lives in the core gate trait so downstream custom
-/// gate crates can opt in without making `plonky2` depend on those crates.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RangeCheckQuotientGate {
-    pub num_ops: usize,
-    pub bit_size: usize,
-}
-
-/// Static wire-layout metadata for gates supported by the optional combined
-/// quotient backend. Keeping only layout values here avoids a dependency from
-/// `plonky2` back to downstream circuit crates.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum U32QuotientGate {
-    Arithmetic {
-        num_ops: usize,
-    },
-    /// Borrowing subtraction of two `base_bits`-wide words. The layout is
-    /// identical at every width: five routed words per operation followed by
-    /// `base_bits / 2` base-4 result limbs.
-    Subtraction {
-        num_ops: usize,
-        base_bits: usize,
-    },
-    /// Addition of `num_addends` `base_bits`-wide words plus a carry, with
-    /// `base_bits / 2` result limbs and `num_carry_limbs` carry limbs.
-    AddMany {
-        num_ops: usize,
-        num_addends: usize,
-        base_bits: usize,
-        num_carry_limbs: usize,
-    },
-    /// Byte decomposition: `1 + num_limbs` routed words (sum then bytes)
-    /// plus `4 * num_limbs` base-4 aux limbs per operation,
-    /// `1 + 5 * num_limbs` constraint rows per operation.
-    ByteDecomposition { num_ops: usize, num_limbs: usize },
-    /// Degree-5 extension-field multiplication over the base field: fifteen
-    /// routed words per operation (five limbs each for the two inputs and
-    /// the output), five constraint rows per operation.
-    QuinticMultiplication { num_ops: usize },
-    /// Degree-5 extension-field squaring over the base field: ten routed
-    /// words (input and output limbs) plus ten temporary wires per
-    /// operation, fifteen constraint rows per operation.
-    QuinticSquaring { num_ops: usize },
-    /// Random access with a little-endian binary index, `2^bits` list items
-    /// per copy, and optional routed local constants.
-    RandomAccess {
-        bits: usize,
-        num_ops: usize,
-        num_extra_constants: usize,
-    },
-}
-
 /// A custom gate.
 ///
 /// Vanilla Plonk arithmetization only supports basic fan-in 2 / fan-out 1 arithmetic gates,
@@ -322,18 +269,6 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
     fn num_ops(&self) -> usize {
         self.generators(0, &vec![F::ZERO; self.num_constants()])
             .len()
-    }
-
-    /// Advertises the exact base-4 range-check layout to optional quotient
-    /// backends. The default keeps every other gate backend-agnostic.
-    fn range_check_quotient_gate(&self) -> Option<RangeCheckQuotientGate> {
-        None
-    }
-
-    /// Advertises one of the exact promoted gate layouts to optional quotient
-    /// backends. The default leaves unrelated gates on the CPU.
-    fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
-        None
     }
 
     /// Enables gates to store some "routed constants", if they have both unused constants and

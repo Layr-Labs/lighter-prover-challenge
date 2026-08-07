@@ -522,24 +522,6 @@ fn reduce128(x: u128) -> GoldilocksField {
     GoldilocksField(t2)
 }
 
-#[cfg(target_arch = "aarch64")]
-#[inline]
-pub(crate) fn mul_16th_root_powers(value: GoldilocksField) -> [GoldilocksField; 8] {
-    let x = value.0 as u128;
-    let root_1_product = (x << 64) - ((x << 32) - x - (x << 12));
-    let root_2_product = (x << 64) - ((x << 32) - x - (x << 24));
-    [
-        value,
-        reduce128(root_1_product),
-        reduce128(root_2_product),
-        reduce128(x << 36),
-        reduce128(x << 48),
-        reduce128(x << 60),
-        reduce128((x << 40) - (x << 8)),
-        reduce128((x << 52) - (x << 20)),
-    ]
-}
-
 #[inline]
 const fn split(x: u128) -> (u64, u64) {
     (x as u64, (x >> 64) as u64)

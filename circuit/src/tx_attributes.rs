@@ -98,7 +98,7 @@ impl Default for TxAttributes {
     }
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct TxAttributesTarget {
     inner_types: [Target; NB_ATTRIBUTES_PER_TX],
     inner_values: [Target; NB_ATTRIBUTES_PER_TX],

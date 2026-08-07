@@ -46,7 +46,7 @@ pub struct L2StrategyTransferTx {
     pub amount: BigUint, // 60 bits
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug)]
 pub struct L2StrategyTransferTxTarget {
     pub account_index: Target,
     pub api_key_index: Target,

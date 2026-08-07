@@ -48,7 +48,7 @@ pub struct L1UpdateAssetTx {
     pub index_price: i64, // Given by sequencer
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug)]
 pub struct L1UpdateAssetTxTarget {
     pub asset_index: Target,
     pub min_transfer_amount: BigUintTarget,

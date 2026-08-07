@@ -197,8 +197,7 @@ use crate::types::tx_type::{TxTypeTargets, TxTypeVerifyTargets};
 use crate::uint::u8::{CircuitBuilderU8, U8Target};
 use crate::utils::CircuitBuilderUtils;
 
-#[serde_with::serde_as]
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug)]
 pub struct TxTarget {
     pub tx_type: Target,
     pub tx_index: Target,
@@ -291,12 +290,9 @@ pub struct TxTarget {
     /*****************************/
     /*  State Tree Merkle Proofs */
     /*****************************/
-    #[serde_as(as = "[[_; ACCOUNT_MERKLE_LEVELS]; NB_ACCOUNTS_PER_TX]")]
     pub account_tree_merkle_proofs: [[HashOutTarget; ACCOUNT_MERKLE_LEVELS]; NB_ACCOUNTS_PER_TX],
-    #[serde_as(as = "[[_; ACCOUNT_MERKLE_LEVELS]; NB_ACCOUNTS_PER_TX]")]
     pub account_pub_data_tree_merkle_proofs:
         [[HashOutTarget; ACCOUNT_MERKLE_LEVELS]; NB_ACCOUNTS_PER_TX],
-    #[serde_as(as = "[[_; ACCOUNT_MERKLE_LEVELS]; NB_ACCOUNTS_PER_TX]")]
     pub account_delta_tree_merkle_proofs:
         [[HashOutTarget; ACCOUNT_MERKLE_LEVELS]; NB_ACCOUNTS_PER_TX],
     pub asset_tree_merkle_proofs:
@@ -309,20 +305,16 @@ pub struct TxTarget {
     pub position_delta_merkle_proofs:
         [[HashOutTarget; POSITION_MERKLE_LEVELS]; NB_ACCOUNTS_PER_TX - 1],
     pub api_key_tree_merkle_proof: [HashOutTarget; API_KEY_MERKLE_LEVELS],
-    #[serde_as(as = "[[_; ACCOUNT_ORDERS_MERKLE_LEVELS]; NB_ACCOUNT_ORDERS_PATHS_PER_TX]")]
     pub account_orders_tree_merkle_proof:
         [[HashOutTarget; ACCOUNT_ORDERS_MERKLE_LEVELS]; NB_ACCOUNT_ORDERS_PATHS_PER_TX],
     pub market_tree_merkle_proof: [HashOutTarget; MARKET_MERKLE_LEVELS],
     pub market_details_tree_merkle_proof: [HashOutTarget; MARKET_DETAILS_TREE_HEIGHT],
-    #[serde_as(as = "[_; ORDER_BOOK_MERKLE_LEVELS]")]
     pub order_book_tree_path: [OrderBookNodeTarget; ORDER_BOOK_MERKLE_LEVELS],
 
     pub system_config_before: SystemConfigTarget,
     pub register_stack_before: RegisterStackTarget,
-    #[serde_as(as = "[_; ASSET_LIST_SIZE]")]
     pub all_assets_before: [AssetTarget; ASSET_LIST_SIZE],
     pub all_margined_assets_before: [MarginedAssetTarget; MARGINED_ASSET_LIST_SIZE],
-    #[serde_as(as = "[_; POSITION_LIST_SIZE]")]
     pub all_market_risk_details_before: [MarketRiskDetailsTarget; POSITION_LIST_SIZE],
 
     pub old_account_tree_root: HashOutTarget,
@@ -341,9 +333,7 @@ pub struct TxTarget {
     /*************************/
     pub impact_ask_order: OrderTarget,
     pub impact_bid_order: OrderTarget,
-    #[serde_as(as = "[_; ORDER_BOOK_MERKLE_LEVELS]")]
     pub impact_ask_order_book_tree_path: [OrderBookNodeTarget; ORDER_BOOK_MERKLE_LEVELS],
-    #[serde_as(as = "[_; ORDER_BOOK_MERKLE_LEVELS]")]
     pub impact_bid_order_book_tree_path: [OrderBookNodeTarget; ORDER_BOOK_MERKLE_LEVELS],
 
     /******************/

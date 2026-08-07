@@ -415,44 +415,6 @@ impl GeneratorWatchIndex {
         }
     }
 
-    /// The raw CSR offset table (`representative -> [start, end)` into
-    /// [`Self::watchers`]). Exposed for compact serialization of the index.
-    pub fn offsets(&self) -> &[u32] {
-        &self.offsets
-    }
-
-    /// The flat, concatenated watcher lists indexed by [`Self::offsets`].
-    pub fn watchers(&self) -> &[usize] {
-        &self.watchers
-    }
-
-    /// Rebuilds the index from its raw CSR parts (as exposed by
-    /// [`Self::offsets`] and [`Self::watchers`]); the `entries` count is a pure
-    /// function of the offsets and is re-derived. The offsets must be
-    /// monotonically nondecreasing, start at 0 and end at `watchers.len()`,
-    /// exactly as [`Self::from_map`] produces them.
-    pub fn from_parts(offsets: Vec<u32>, watchers: Vec<usize>) -> Self {
-        assert!(!offsets.is_empty(), "watch index offsets must be non-empty");
-        assert_eq!(offsets[0], 0, "watch index offsets must start at zero");
-        assert_eq!(
-            *offsets.last().unwrap() as usize,
-            watchers.len(),
-            "watch index offsets must cover the watcher list"
-        );
-        let mut entries = 0usize;
-        for bounds in offsets.windows(2) {
-            assert!(bounds[0] <= bounds[1], "watch index offsets must be sorted");
-            if bounds[0] != bounds[1] {
-                entries += 1;
-            }
-        }
-        Self {
-            offsets,
-            watchers,
-            entries,
-        }
-    }
-
     #[inline]
     pub fn get(&self, representative: &usize) -> Option<&[usize]> {
         let end_index = representative.checked_add(1)?;
@@ -524,21 +486,6 @@ pub struct ProverOnlyCircuitData<
     pub lookup_rows: Vec<LookupWire>,
     /// A vector of (looking_in, looking_out) pairs for each lookup table index.
     pub lut_to_lookups: Vec<Lookup>,
-    /// Quotient-domain values of the constants and sigma columns (PolyMajor:
-    /// all `constants_range().len() + sigmas_range().len()` columns, each a
-    /// `constants_sigmas_quotient_domain`-length slice, constants first), plus
-    /// the gather parameters they were extracted with. The constants and sigma
-    /// polynomials are circuit-fixed, so these strided LDE values are
-    /// identical for every proof of this circuit; the quotient batch loop
-    /// copies from here instead of re-walking the LDE. `None` when the
-    /// commitment is not column-backed or the cache would be too large.
-    /// Runtime-only: not serialized (the quotient path falls back to the
-    /// strided gather on a deserialized circuit).
-    pub constants_sigmas_quotient_cache: Option<Vec<F>>,
-    /// Stride used to extract [`Self::constants_sigmas_quotient_cache`].
-    pub constants_sigmas_quotient_step: usize,
-    /// Quotient domain size used to extract [`Self::constants_sigmas_quotient_cache`].
-    pub constants_sigmas_quotient_domain: usize,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
@@ -842,7 +789,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
 /// is intentionally missing certain fields, such as `CircuitConfig`, because we support only a
 /// limited form of dynamic inner circuits. We can't practically make things like the wire count
 /// dynamic, at least not without setting a maximum wire count and paying for the worst case.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifierCircuitTarget {
     /// A commitment to each constant polynomial and each permutation polynomial.
     pub constants_sigmas_cap: MerkleCapTarget,

@@ -157,8 +157,7 @@ where
         }
     }
 }
-#[serde_with::serde_as]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct AccountTarget {
     pub master_account_index: Target,
     pub account_index: Target,
@@ -168,7 +167,6 @@ pub struct AccountTarget {
 
     pub margined_assets: [AccountMarginedAssetTarget; MARGINED_ASSET_LIST_SIZE],
     pub aggregated_balances: [BigIntTarget; NB_ASSETS_PER_TX],
-    #[serde_as(as = "[_; POSITION_LIST_SIZE]")]
     pub positions: [AccountPositionTarget; POSITION_LIST_SIZE],
 
     pub approved_integrators: [ApprovedIntegratorTarget; MAX_APPROVED_INTEGRATORS],

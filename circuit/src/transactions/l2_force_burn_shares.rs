@@ -40,7 +40,7 @@ pub struct L2ForceBurnSharesTx {
     pub share_amount: i64,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug)]
 pub struct L2ForceBurnSharesTxTarget {
     pub account_index: Target,
     pub api_key_index: Target,
