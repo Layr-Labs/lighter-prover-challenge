@@ -219,7 +219,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16Subtraction
 
         let wires = vars_base.local_wires;
         let three = F::from_canonical_usize(3);
-        let limb_base = F::from_canonical_u64(1u64 << Self::limb_bits());
         let base = F::from_canonical_u64(1 << 16u64);
         // Batches are 32 points in this prover; keep the scratch row on the
         // stack and fall back to the heap only for oversized batches.
@@ -266,11 +265,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16Subtraction
             }
 
             // Recomposition, folded high-to-low exactly as the batch path.
-            scratch.fill(F::ZERO);
-            for j in (0..Self::num_limbs()).rev() {
+            scratch.copy_from_slice(
+                &wires[self.wire_ith_output_jth_limb(i, Self::num_limbs() - 1) * n..][..n],
+            );
+            for j in (0..Self::num_limbs() - 1).rev() {
                 let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
                 for p in 0..n {
-                    scratch[p] = scratch[p] * limb_base + limb[p];
+                    scratch[p] = scratch[p].double().double() + limb[p];
                 }
             }
             for p in 0..n {

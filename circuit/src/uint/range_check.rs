@@ -7,7 +7,6 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 use log::warn;
-use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
@@ -354,78 +353,86 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
         let num_aux = self.aux_limbs_per_input();
         let base = F::from_canonical_usize(Self::BASE);
         let three = F::from_canonical_usize(3);
-        // Quotient evaluation uses batches of at most 32 points.
-        let mut stack_scratch = [F::ZERO; 32];
-        let scratch = &mut stack_scratch[..n];
-        let mut constraint_index = 0;
+        let last_is_half = self.bit_size % 2 == 1;
 
+        // Single-sweep fusion. The previous shape ran 3k+1 separate n-point
+        // passes per op (k = aux limbs): a Horner sweep into a heap-allocated
+        // scratch buffer, then one `batch_multiply_add_inplace` pass per
+        // constraint slot, re-reading every limb column a second time for its
+        // range check and the filter column k+1 times. This walks each batch
+        // point once per op: each limb is loaded exactly once and feeds both
+        // its Horner step and its range quartic from a register, and every
+        // constraint value is MACed straight into its output slot with the
+        // same scalar `multiply_accumulate` the batch helper applies per
+        // lane. Every field operation runs on the same operands as before —
+        // no reassociation; only the accumulation order across the disjoint
+        // output slots changes, and each slot still receives exactly one MAC.
+        // The scratch stores/reloads (9k+4 -> 3k+4 memory ops per op-point)
+        // and the per-call `vec!` disappear. The fused `- input` fold
+        // retained below deleted one such pass and was ranked-measurable;
+        // this deletes the remaining 3k-1.
         for i in 0..self.num_ops {
             let input = &wires[self.wire_ith_input(i) * n..][..n];
-            let top = self.wire_ith_input_jth_aux_limb(i, num_aux - 1);
-
-            scratch.copy_from_slice(&wires[top * n..][..n]);
-            // Fold the `- input` sweep into the last Horner step rather than
-            // making a second full read-modify-write pass over the batch
-            // scratch. The same three field operations run on the same
-            // operands in the same order (multiply by base, add limb, subtract
-            // input); only the store and reload of `scratch[p]` between the
-            // Horner step and the subtraction disappears. That makes this
-            // raw-representative-exact, not merely ring-identical — there is
-            // no reassociation. One whole 32-point pass per op per evaluation
-            // batch is deleted, in the gate that is the second-largest compute
-            // symbol in this prover's profile.
-            //
-            // Deliberately NOT taken: replacing `* base` (base = 4) with two
-            // doublings. That variant measured 118.18 s against a 107.08 s
-            // matched control in a rejected submission — LLVM already
-            // strength-reduces the constant multiply inside `reduce_128`.
-            if num_aux == 1 {
-                // The Horner loop body never runs here, so there is no step to
-                // fold the subtraction into.
-                for p in 0..n {
-                    scratch[p] -= input[p];
-                }
-            } else {
-                for j in (0..num_aux - 1).rev() {
-                    let limb = &wires[self.wire_ith_input_jth_aux_limb(i, j) * n..][..n];
-                    if j == 0 {
-                        for p in 0..n {
-                            scratch[p] = scratch[p] * base + limb[p] - input[p];
-                        }
-                    } else {
-                        for p in 0..n {
-                            scratch[p] = scratch[p] * base + limb[p];
-                        }
-                    }
-                }
-            }
+            // The aux limbs of op i occupy `num_aux` consecutive wire
+            // columns, so one slice covers them all: limb j of point p sits
+            // at `limbs[j * n + p]`.
+            let limbs = &wires[self.wire_ith_input_jth_aux_limb(i, 0) * n..][..num_aux * n];
             let combined =
-                &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
-            batch_multiply_add_inplace(combined, &scratch, filters);
-            constraint_index += 1;
+                &mut combined_gate_constraints[i * (1 + num_aux) * n..][..(1 + num_aux) * n];
 
-            for j in 0..num_aux {
-                let limb = &wires[self.wire_ith_input_jth_aux_limb(i, j) * n..][..n];
-                if j == num_aux - 1 && self.bit_size % 2 == 1 {
-                    for p in 0..n {
-                        let x = limb[p];
-                        scratch[p] = x * (x - F::ONE);
-                    }
+            for p in 0..n {
+                let filter = filters[p];
+
+                // Top limb: seeds the Horner accumulator and takes the
+                // half-range product l(l-1) instead of the full quartic when
+                // the bit size is odd.
+                let top = limbs[(num_aux - 1) * n + p];
+                let q = if last_is_half {
+                    // Product over (0..2): l(l-1).
+                    top * (top - F::ONE)
                 } else {
-                    for p in 0..n {
-                        let x = limb[p];
+                    let y = top * (top - three);
+                    y * (y + F::TWO)
+                };
+                let out = &mut combined[num_aux * n + p];
+                *out = out.multiply_accumulate(q, filter);
+
+                // Fold the `- input` sweep into the last Horner step rather
+                // than a separate read-modify-write pass. The same three
+                // field operations run on the same operands in the same order
+                // (multiply by base, add limb, subtract input); this is
+                // raw-representative-exact, not merely ring-identical — there
+                // is no reassociation.
+                //
+                // Deliberately NOT taken: replacing `* base` (base = 4) with
+                // two doublings. That variant measured 118.18 s against a
+                // 107.08 s matched control in a rejected submission — LLVM
+                // already strength-reduces the constant multiply inside
+                // `reduce_128`.
+                let mut sum = top;
+                if num_aux == 1 {
+                    // The Horner loop body never runs here, so there is no
+                    // step to fold the subtraction into.
+                    sum -= input[p];
+                } else {
+                    for j in (1..num_aux - 1).rev() {
+                        let x = limbs[j * n + p];
+                        sum = sum * base + x;
                         let y = x * (x - three);
-                        scratch[p] = y * (y + F::TWO);
+                        let q = y * (y + F::TWO);
+                        let out = &mut combined[(1 + j) * n + p];
+                        *out = out.multiply_accumulate(q, filter);
                     }
+                    let x = limbs[p];
+                    sum = sum * base + x - input[p];
+                    let y = x * (x - three);
+                    let q = y * (y + F::TWO);
+                    let out = &mut combined[n + p];
+                    *out = out.multiply_accumulate(q, filter);
                 }
-                let combined = &mut combined_gate_constraints
-                    [constraint_index * n..(constraint_index + 1) * n];
-                batch_multiply_add_inplace(combined, &scratch, filters);
-                constraint_index += 1;
+                combined[p] = combined[p].multiply_accumulate(sum, filter);
             }
         }
-
-        debug_assert_eq!(constraint_index, self.num_constraints());
     }
 
     fn eval_unfiltered_circuit(
@@ -627,6 +634,7 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
 mod tests {
     use anyhow::Result;
     use paste::paste;
+    use plonky2::field::batch_util::batch_multiply_add_inplace;
     use plonky2::field::goldilocks_field::GoldilocksField;
     use plonky2::field::types::Field;
     #[allow(unused_imports)]

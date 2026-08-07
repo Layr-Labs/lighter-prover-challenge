@@ -240,7 +240,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16AddManyGate
 
         let wires = vars_base.local_wires;
         let three = F::from_canonical_usize(3);
-        let base_limb = F::from_canonical_u64(1u64 << Self::limb_bits());
         let base16 = F::from_canonical_u64(1 << 16u64);
         // Batches are 32 points in this prover; keep the scratch row on the
         // stack and fall back to the heap only for oversized batches.
@@ -292,11 +291,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16AddManyGate
 
             // Result/carry recompositions, folded high-to-low over each group
             // exactly as the interleaved accumulation in the batch path.
-            scratch.fill(F::ZERO);
-            for j in (0..Self::num_result_limbs()).rev() {
+            scratch.copy_from_slice(
+                &wires[self.wire_ith_output_jth_limb(i, Self::num_result_limbs() - 1) * n..][..n],
+            );
+            for j in (0..Self::num_result_limbs() - 1).rev() {
                 let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
                 for p in 0..n {
-                    scratch[p] = scratch[p] * base_limb + limb[p];
+                    scratch[p] = scratch[p].double().double() + limb[p];
                 }
             }
             for p in 0..n {
@@ -307,11 +308,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16AddManyGate
             batch_multiply_add_inplace(combined, &scratch, filters);
             constraint_index += 1;
 
-            scratch.fill(F::ZERO);
-            for j in (Self::num_result_limbs()..Self::num_limbs()).rev() {
+            scratch.copy_from_slice(
+                &wires[self.wire_ith_output_jth_limb(i, Self::num_limbs() - 1) * n..][..n],
+            );
+            for j in (Self::num_result_limbs()..Self::num_limbs() - 1).rev() {
                 let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
                 for p in 0..n {
-                    scratch[p] = scratch[p] * base_limb + limb[p];
+                    scratch[p] = scratch[p].double().double() + limb[p];
                 }
             }
             for p in 0..n {
