@@ -354,7 +354,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
         let num_aux = self.aux_limbs_per_input();
         let base = F::from_canonical_usize(Self::BASE);
         let three = F::from_canonical_usize(3);
-        let mut scratch = vec![F::ZERO; n];
+        // Quotient evaluation uses batches of at most 32 points.
+        let mut stack_scratch = [F::ZERO; 32];
+        let scratch = &mut stack_scratch[..n];
         let mut constraint_index = 0;
 
         for i in 0..self.num_ops {

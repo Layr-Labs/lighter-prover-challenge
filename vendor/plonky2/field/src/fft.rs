@@ -4,6 +4,11 @@ use core::cmp::{max, min};
 use plonky2_util::{log2_strict, reverse_index_bits_in_place};
 use unroll::unroll_for_loops;
 
+#[cfg(target_arch = "aarch64")]
+use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
+#[cfg(target_arch = "aarch64")]
+use crate::goldilocks_field::mul_16th_root_powers;
+
 use crate::packable::Packable;
 use crate::packed::PackedField;
 use crate::polynomial::{PolynomialCoeffs, PolynomialValues};
@@ -45,6 +50,7 @@ pub fn fft_root_table<F: Field>(n: usize) -> FftRootTable<F> {
 /// `MAX_LG_N`) fall back to a fresh, value-identical computation.
 #[cfg(feature = "std")]
 mod root_table_cache {
+    use alloc::vec::Vec;
     use core::any::{Any, TypeId};
     use std::sync::{Arc, OnceLock};
 
@@ -95,6 +101,43 @@ mod root_table_cache {
         }
         Arc::new(fft_root_table::<F>(1 << lg_n))
     }
+
+    static GOLDILOCKS_SUBGROUPS: [Slot; MAX_LG_N] = [EMPTY_SLOT; MAX_LG_N];
+
+    /// The dedicated subgroup slot array for `F`, if `F` is a cached type.
+    /// Only the base field is cached: subgroup elements of an extension's
+    /// two-adic subgroup are not needed on any hot path.
+    fn per_type_subgroups<F: Field>() -> Option<&'static [Slot; MAX_LG_N]> {
+        (TypeId::of::<F>() == TypeId::of::<GoldilocksField>()).then_some(&GOLDILOCKS_SUBGROUPS)
+    }
+
+    /// `F::two_adic_subgroup(lg_n)` through the same process-wide cache
+    /// discipline as the root tables: deterministic per (field, size), so a
+    /// hit returns exactly the values a fresh computation would.
+    pub(super) fn get_subgroup<F: Field>(lg_n: usize) -> Arc<Vec<F>> {
+        if let Some(tables) = per_type_subgroups::<F>() {
+            if let Some(slot) = tables.get(lg_n) {
+                let erased = slot.get_or_init(|| Arc::new(F::two_adic_subgroup(lg_n)));
+                if let Ok(subgroup) = Arc::clone(erased).downcast::<Vec<F>>() {
+                    return subgroup;
+                }
+            }
+        }
+        Arc::new(F::two_adic_subgroup(lg_n))
+    }
+}
+
+/// Process-wide cached `F::two_adic_subgroup(lg_n)`, value-identical to a
+/// fresh computation. Avoids the per-call primitive-root exponentiation and
+/// power chain on hot paths that need a small fixed subgroup repeatedly.
+#[cfg(feature = "std")]
+pub fn cached_two_adic_subgroup<F: Field>(lg_n: usize) -> alloc::sync::Arc<Vec<F>> {
+    root_table_cache::get_subgroup::<F>(lg_n)
+}
+
+#[cfg(not(feature = "std"))]
+pub fn cached_two_adic_subgroup<F: Field>(lg_n: usize) -> alloc::sync::Arc<Vec<F>> {
+    alloc::sync::Arc::new(F::two_adic_subgroup(lg_n))
 }
 
 #[inline]
@@ -202,6 +245,45 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
                 buffer[j] = coeffs_j;
             }
         }
+    }
+    PolynomialCoeffs { coeffs: buffer }
+}
+
+/// `ifft` of a borrowed column without the caller-side copy: the initial
+/// bit-reversal permutation is applied as an out-of-place gather from
+/// `values` into the fresh buffer (the same permutation `fft_classic`'s
+/// in-place pass would apply to a clone), after which the identical
+/// butterfly layers and coefficient reversal/scaling run. Value-identical
+/// to `ifft(PolynomialValues::new(values.to_vec()))`.
+pub fn ifft_borrowed<F: Field>(values: &[F]) -> PolynomialCoeffs<F> {
+    let n = values.len();
+    let lg_n = log2_strict(n);
+    let n_inv = F::inverse_2exp(lg_n);
+
+    let mut buffer = plonky2_util::reverse_index_bits(values);
+
+    #[cfg(feature = "std")]
+    let root_table = root_table_cache::get::<F>(lg_n);
+    #[cfg(not(feature = "std"))]
+    let root_table = fft_root_table::<F>(n);
+
+    let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
+    if lg_n <= lg_packed_width {
+        fft_classic_simd::<F>(&mut buffer, 0, lg_n, &root_table);
+    } else {
+        fft_classic_simd::<<F as Packable>::Packing>(&mut buffer, 0, lg_n, &root_table);
+    }
+
+    // Identical post-pass to `ifft_with_options`: reverse all values except
+    // the first, dividing each by n.
+    buffer[0] *= n_inv;
+    buffer[n / 2] *= n_inv;
+    for i in 1..(n / 2) {
+        let j = n - i;
+        let coeffs_i = buffer[j] * n_inv;
+        let coeffs_j = buffer[i] * n_inv;
+        buffer[i] = coeffs_i;
+        buffer[j] = coeffs_j;
     }
     PolynomialCoeffs { coeffs: buffer }
 }
@@ -375,6 +457,33 @@ fn fft_zero_padded_first_layer_block<P: PackedField>(
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fft_zero_padded_rate_8_first_layer_block(
+    packed_values: &mut [WideGoldilocksField],
+    source_start: usize,
+    nonzero_len: usize,
+    destination: usize,
+) {
+    debug_assert!(nonzero_len >= 2);
+
+    for pair in (0..nonzero_len / 2).rev() {
+        let source = source_start + pair * 2;
+        let u = packed_values[source / 4].as_slice()[source % 4];
+        let v = packed_values[(source + 1) / 4].as_slice()[(source + 1) % 4];
+        let products = mul_16th_root_powers(v);
+        let low = *WideGoldilocksField::from_slice(&products[..4]);
+        let high = *WideGoldilocksField::from_slice(&products[4..]);
+        let u = WideGoldilocksField::from(u);
+        let pair_destination = destination + pair * 4;
+
+        packed_values[pair_destination] = u + low;
+        packed_values[pair_destination + 1] = u + high;
+        packed_values[pair_destination + 2] = u - low;
+        packed_values[pair_destination + 3] = u - high;
+    }
+}
+
 /// Expand a bit-reversed nonzero prefix and perform its first nontrivial FFT layer in one pass.
 ///
 /// This is called only when each repeated run contains at least one packed vector.
@@ -413,6 +522,34 @@ fn fft_zero_padded_cache_blocks<P: PackedField>(
     for block in (0..num_blocks).rev() {
         let source_start = block * nonzero_per_block;
         let destination = block * packed_block_len;
+        #[cfg(target_arch = "aarch64")]
+        if r == 3 && core::any::TypeId::of::<P>() == core::any::TypeId::of::<WideGoldilocksField>()
+        {
+            let wide_values = unsafe {
+                // SAFETY: The TypeId check proves this is the exact concrete packed type;
+                // only the generic spelling of the slice differs at this point.
+                core::slice::from_raw_parts_mut(
+                    packed_values.as_mut_ptr().cast::<WideGoldilocksField>(),
+                    packed_values.len(),
+                )
+            };
+            fft_zero_padded_rate_8_first_layer_block(
+                wide_values,
+                source_start,
+                nonzero_per_block,
+                destination,
+            );
+        } else {
+            fft_zero_padded_first_layer_block(
+                packed_values,
+                source_start,
+                nonzero_per_block,
+                destination,
+                packed_repeat,
+                omega_table,
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         fft_zero_padded_first_layer_block(
             packed_values,
             source_start,
@@ -526,6 +663,30 @@ mod tests {
     use crate::packed::PackedField;
     use crate::polynomial::{PolynomialCoeffs, PolynomialValues};
     use crate::types::Field;
+
+    /// `ifft_borrowed` must be bit-identical to `ifft` of a copy across
+    /// sizes straddling the packed width and the small/large bit-reversal
+    /// strategies, for both a cached-table field type and an uncached one.
+    #[test]
+    fn ifft_borrowed_matches_ifft() {
+        use crate::extension::quartic::QuarticExtension;
+        use crate::fft::ifft_borrowed;
+        use crate::types::Sample;
+
+        fn check<F: Field + Sample>() {
+            for lg_n in [1usize, 2, 4, 6, 7, 10, 13] {
+                let n = 1 << lg_n;
+                let values = F::rand_vec(n);
+                let expected = ifft(PolynomialValues::new(values.clone()));
+                let actual = ifft_borrowed(&values);
+                assert_eq!(expected.coeffs, actual.coeffs);
+            }
+        }
+
+        check::<GoldilocksField>();
+        check::<QuadraticExtension<GoldilocksField>>();
+        check::<QuarticExtension<GoldilocksField>>();
+    }
 
     /// The cached-table dispatch path (no caller-supplied table) must return
     /// bit-identical results to an explicitly computed fresh table, on both
