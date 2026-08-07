@@ -175,6 +175,7 @@ pub(crate) struct VanishingScratch<F> {
     pub vanishing_all_lookup_terms: Vec<F>,
     pub lookup_selectors: Vec<F>,
     pub constraint_terms_batch: Vec<F>,
+    pub gate_filters: Vec<F>,
 }
 
 /// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
@@ -274,7 +275,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     beta_k_is: &[F],
     deltas: &[F],
     alphas: &[F],
-    excluded_gate_indices: &[usize],
+    cpu_gate_indices: &[usize],
     z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
     scratch: &mut VanishingScratch<F>,
@@ -298,11 +299,12 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     let num_gate_constraints = common_data.num_gate_constraints;
 
-    evaluate_gate_constraints_base_batch_into_excluding_many::<F, D>(
+    evaluate_gate_constraints_base_batch_into_for_gate_indices::<F, D>(
         common_data,
         vars_batch,
         &mut scratch.constraint_terms_batch,
-        excluded_gate_indices,
+        cpu_gate_indices,
+        &mut scratch.gate_filters,
     );
     let constraint_terms_batch = &scratch.constraint_terms_batch;
     debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
@@ -1038,6 +1040,39 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
     }
 }
 
+/// Quotient hot-path variant over a precomputed, ascending list of CPU gates.
+/// Keeping both the list and the filter buffer outside the per-batch loop avoids
+/// rediscovering the same survivors and allocating one filter vector per batch.
+fn evaluate_gate_constraints_base_batch_into_for_gate_indices<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    vars_batch: EvaluationVarsBaseBatch<F>,
+    constraints_batch: &mut Vec<F>,
+    gate_indices: &[usize],
+    filters: &mut Vec<F>,
+) {
+    constraints_batch.clear();
+    constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
+    debug_assert!(gate_indices.iter().all(|&i| i < common_data.gates.len()));
+    debug_assert!(gate_indices.windows(2).all(|pair| pair[0] < pair[1]));
+    for &i in gate_indices {
+        let gate = &common_data.gates[i];
+        let selector_index = common_data.selectors_info.selector_indices[i];
+        gate.0.eval_filtered_base_batch(
+            vars_batch,
+            i,
+            selector_index,
+            common_data.selectors_info.groups[selector_index].clone(),
+            common_data.selectors_info.num_selectors(),
+            common_data.num_lookup_selectors,
+            filters,
+            constraints_batch,
+        );
+    }
+}
+
 pub fn evaluate_gate_constraints_circuit<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     common_data: &CommonCircuitData<F, D>,
@@ -1249,6 +1284,73 @@ mod tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
 
     use super::*;
+    use crate::hash::hash_types::HashOut;
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::circuit_data::CircuitConfig;
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+
+    #[test]
+    fn precomputed_cpu_gate_list_matches_per_batch_exclusion_scan() {
+        type F = GoldilocksField;
+        const D: usize = 2;
+
+        let mut builder =
+            CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let x = builder.add_virtual_target();
+        let y = builder.add_virtual_target();
+        let product = builder.mul_add(x, y, x);
+        builder.register_public_input(product);
+        let data = builder.build::<PoseidonGoldilocksConfig>();
+        let common_data = &data.common;
+        assert!(common_data.gates.len() > 1);
+
+        let batch_size = 7;
+        let constants = (0..common_data.num_constants * batch_size)
+            .map(|i| F::from_canonical_usize(3 * i + 1))
+            .collect::<Vec<_>>();
+        let wires = (0..common_data.config.num_wires * batch_size)
+            .map(|i| F::from_canonical_usize(5 * i + 2))
+            .collect::<Vec<_>>();
+        let public_inputs_hash = HashOut::ZERO;
+        let vars_batch =
+            EvaluationVarsBaseBatch::new(batch_size, &constants, &wires, &public_inputs_hash);
+
+        let last_gate = common_data.gates.len() - 1;
+        for excluded_gate_indices in [vec![], vec![0], vec![last_gate], vec![0, last_gate]] {
+            let mut expected = Vec::new();
+            evaluate_gate_constraints_base_batch_into_excluding_many::<F, D>(
+                common_data,
+                vars_batch,
+                &mut expected,
+                &excluded_gate_indices,
+            );
+
+            let cpu_gate_indices = (0..common_data.gates.len())
+                .filter(|i| !excluded_gate_indices.contains(i))
+                .collect::<Vec<_>>();
+            let mut actual = Vec::new();
+            let mut filters = Vec::new();
+            evaluate_gate_constraints_base_batch_into_for_gate_indices::<F, D>(
+                common_data,
+                vars_batch,
+                &mut actual,
+                &cpu_gate_indices,
+                &mut filters,
+            );
+            assert_eq!(actual, expected, "excluded gates {excluded_gate_indices:?}");
+
+            let filter_capacity = filters.capacity();
+            evaluate_gate_constraints_base_batch_into_for_gate_indices::<F, D>(
+                common_data,
+                vars_batch,
+                &mut actual,
+                &cpu_gate_indices,
+                &mut filters,
+            );
+            assert_eq!(filters.capacity(), filter_capacity);
+            assert_eq!(actual, expected, "reused filter buffer");
+        }
+    }
 
     #[test]
     fn constraint_major_reduction_preserves_pointwise_horner_order() {
