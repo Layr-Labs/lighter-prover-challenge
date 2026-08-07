@@ -644,11 +644,19 @@ mod tests {
     use rand::Rng;
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::byte::split_gate::ByteDecompositionGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::uint::u16::gates::add_many_u16::U16AddManyGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::uint::u16::gates::subtraction_u16::U16SubtractionGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::uint::u32::gates::add_many_u32::U32AddManyGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::uint::u32::gates::arithmetic_u32::U32ArithmeticGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::uint::u32::gates::subtraction_u32::U32SubtractionGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::uint::u48::subtraction_u48::U48SubtractionGate;
 
     use super::*;
 
@@ -712,7 +720,37 @@ mod tests {
             builder.connect(input, Target::wire(row, gate.wire_ith_input(op)));
             inputs.push((input, bit_size));
         }
-        let mut u32_inputs = Vec::new();
+
+        let byte_gate = ByteDecompositionGate::new_from_config(&config, 8);
+        let (row, op) = builder.find_slot(byte_gate, &[], &[]);
+        let byte_input = builder.add_virtual_target();
+        builder.connect(byte_input, Target::wire(row, byte_gate.i_th_sum(op)));
+
+        let mut promoted_inputs = Vec::new();
+        let subtraction16 = U16SubtractionGate::<F, D>::new_from_config(&config);
+        let (row, op) = builder.find_slot(subtraction16, &[], &[]);
+        for (wire, value) in [
+            (subtraction16.wire_ith_input_x(op), 0x1020),
+            (subtraction16.wire_ith_input_y(op), 0x5060),
+            (subtraction16.wire_ith_input_borrow(op), 1),
+        ] {
+            let input = builder.add_virtual_target();
+            builder.connect(input, Target::wire(row, wire));
+            promoted_inputs.push((input, value));
+        }
+
+        let subtraction48 = U48SubtractionGate::<F, D>::new_from_config(&config);
+        let (row, op) = builder.find_slot(subtraction48, &[], &[]);
+        for (wire, value) in [
+            (subtraction48.wire_ith_input_x(op), 0x1020_3040_5060),
+            (subtraction48.wire_ith_input_y(op), 0x5060_7080_90a0),
+            (subtraction48.wire_ith_input_borrow(op), 1),
+        ] {
+            let input = builder.add_virtual_target();
+            builder.connect(input, Target::wire(row, wire));
+            promoted_inputs.push((input, value));
+        }
+
         let arithmetic = U32ArithmeticGate::<F, D>::new_from_config(&config);
         let (row, op) = builder.find_slot(arithmetic, &[], &[]);
         for (wire, value) in [
@@ -722,7 +760,7 @@ mod tests {
         ] {
             let input = builder.add_virtual_target();
             builder.connect(input, Target::wire(row, wire));
-            u32_inputs.push((input, value));
+            promoted_inputs.push((input, value));
         }
 
         let subtraction = U32SubtractionGate::<F, D>::new_from_config(&config);
@@ -734,19 +772,33 @@ mod tests {
         ] {
             let input = builder.add_virtual_target();
             builder.connect(input, Target::wire(row, wire));
-            u32_inputs.push((input, value));
+            promoted_inputs.push((input, value));
         }
+
+        let add_many16 = U16AddManyGate::<F, D>::new_from_config(&config, 16);
+        let (row, op) = builder.find_slot(add_many16, &[F::from_canonical_usize(16)], &[]);
+        for j in 0..16 {
+            let input = builder.add_virtual_target();
+            builder.connect(
+                input,
+                Target::wire(row, add_many16.wire_ith_op_jth_addend(op, j)),
+            );
+            promoted_inputs.push((input, 0x0102 + j as u64));
+        }
+        let carry = builder.add_virtual_target();
+        builder.connect(carry, Target::wire(row, add_many16.wire_ith_carry(op)));
+        promoted_inputs.push((carry, 7));
 
         let add_many = U32AddManyGate::<F, D>::new_from_config(&config, 16);
         let (row, op) = builder.find_slot(add_many, &[F::from_canonical_usize(16)], &[]);
         for j in 0..16 {
             let input = builder.add_virtual_target();
             builder.connect(input, Target::wire(row, add_many.wire_ith_op_jth_addend(op, j)));
-            u32_inputs.push((input, 0x0102_0304 + j as u64));
+            promoted_inputs.push((input, 0x0102_0304 + j as u64));
         }
         let carry = builder.add_virtual_target();
         builder.connect(carry, Target::wire(row, add_many.wire_ith_carry(op)));
-        u32_inputs.push((carry, 7));
+        promoted_inputs.push((carry, 7));
 
         // 4097 rows pad to degree 8192. Its rate-8 constants/sigmas and wire
         // commitments both exceed the retained-Metal routing threshold.
@@ -765,7 +817,8 @@ mod tests {
             };
             pw.set_target(input, F::from_canonical_u64(value))?;
         }
-        for (input, value) in u32_inputs {
+        pw.set_target(byte_input, F::from_canonical_u64(0x1234_5678_9abc_def0))?;
+        for (input, value) in promoted_inputs {
             pw.set_target(input, F::from_canonical_u64(value))?;
         }
 

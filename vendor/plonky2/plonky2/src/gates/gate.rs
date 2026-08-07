@@ -59,6 +59,15 @@ pub enum U32QuotientGate {
     },
 }
 
+/// Static wire-layout metadata for the downstream byte-decomposition gate.
+/// The backend validates the advertised dimensions before excluding the gate
+/// from the CPU quotient path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ByteDecompositionQuotientGate {
+    pub num_ops: usize,
+    pub num_limbs: usize,
+}
+
 /// A custom gate.
 ///
 /// Vanilla Plonk arithmetization only supports basic fan-in 2 / fan-out 1 arithmetic gates,
@@ -314,6 +323,12 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
     /// Advertises one of the exact downstream U32 gate layouts to optional
     /// quotient backends. The default leaves unrelated gates on the CPU.
     fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+        None
+    }
+
+    /// Advertises the exact downstream byte-decomposition layout to optional
+    /// quotient backends. The default leaves unrelated gates on the CPU.
+    fn byte_decomposition_quotient_gate(&self) -> Option<ByteDecompositionQuotientGate> {
         None
     }
 

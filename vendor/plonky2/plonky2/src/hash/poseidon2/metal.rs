@@ -147,11 +147,11 @@ pub(crate) struct RangeCheckQuotientSpec {
     pub bit_size: usize,
 }
 
-/// Exact wire layout of a downstream U32 gate. These variants are evaluated
-/// in the same command buffer and accumulated into the same two-word output
-/// as the RangeCheck specializations.
+/// Exact wire layout of a downstream gate promoted into the RangeCheck
+/// quotient command buffer. The kind is carried explicitly into Metal; no
+/// unrecognized kind is interpreted as a valid gate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum U32QuotientKind {
+pub(crate) enum PromotedQuotientKind {
     Arithmetic,
     /// `result_limbs` base-4 limbs recompose the `2 * result_limbs`-bit
     /// difference; the borrow weight is `1 << (2 * result_limbs)`.
@@ -163,16 +163,19 @@ pub(crate) enum U32QuotientKind {
         result_limbs: usize,
         num_carry_limbs: usize,
     },
+    ByteDecomposition {
+        num_limbs: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct U32QuotientSpec {
+pub(crate) struct PromotedQuotientSpec {
     pub selector_column: usize,
     pub gate_index: usize,
     pub group: core::ops::Range<usize>,
     pub include_unused_selector: bool,
     pub num_ops: usize,
-    pub kind: U32QuotientKind,
+    pub kind: PromotedQuotientKind,
 }
 
 /// LDE columns computed and retained in a CPU-visible Metal shared buffer.
@@ -487,24 +490,24 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
     }
 }
 
-/// Starts one whole-domain kernel which evaluates every advertised RangeCheck
-/// and U32 arithmetic gate, applies each gate's selector filter, and reduces
-/// the shared constraint rows with the same two alpha challenges as the CPU
-/// quotient.
+/// Starts one whole-domain kernel which evaluates every advertised RangeCheck,
+/// width-generic arithmetic, and byte-decomposition gate, applies each gate's
+/// selector filter, and reduces the shared constraint rows with the same two
+/// alpha challenges as the CPU quotient.
 pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     wires: &MetalColumns<F>,
     constants: &MetalColumns<F>,
     quotient_rows: usize,
     step: usize,
     specs: &[RangeCheckQuotientSpec],
-    u32_specs: &[U32QuotientSpec],
+    promoted_specs: &[PromotedQuotientSpec],
     alphas: &[F],
     alpha_offset: usize,
 ) -> Option<RangeCheckGateQuotientJob<F>> {
     const SPEC_WORDS: usize = 10;
     const MAX_INLINE_BYTES: usize = 4096;
 
-    let spec_count = specs.len().checked_add(u32_specs.len())?;
+    let spec_count = specs.len().checked_add(promoted_specs.len())?;
 
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
@@ -560,13 +563,13 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             0,
         ]);
     }
-    for spec in u32_specs {
+    for spec in promoted_specs {
         if spec.num_ops == 0 {
             return None;
         }
-        let (kind, num_addends, result_limbs, carry_limbs, wire_count, num_constraints) =
+        let (kind, parameter, result_limbs, carry_limbs, wire_count, num_constraints) =
             match spec.kind {
-                U32QuotientKind::Arithmetic => (
+                PromotedQuotientKind::Arithmetic => (
                     0usize,
                     0usize,
                     16usize,
@@ -574,7 +577,7 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                     spec.num_ops.checked_mul(38)?,
                     spec.num_ops.checked_mul(36)?,
                 ),
-                U32QuotientKind::Subtraction { result_limbs } => {
+                PromotedQuotientKind::Subtraction { result_limbs } => {
                     if !matches!(result_limbs, 8 | 16 | 24) {
                         return None;
                     }
@@ -587,7 +590,7 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                         spec.num_ops.checked_mul(result_limbs.checked_add(3)?)?,
                     )
                 }
-                U32QuotientKind::AddMany {
+                PromotedQuotientKind::AddMany {
                     num_addends,
                     result_limbs,
                     num_carry_limbs,
@@ -610,6 +613,14 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                         spec.num_ops.checked_mul(limbs.checked_add(3)?)?,
                     )
                 }
+                PromotedQuotientKind::ByteDecomposition { num_limbs } => {
+                    if num_limbs == 0 {
+                        return None;
+                    }
+                    let per_op = num_limbs.checked_mul(5)?.checked_add(1)?;
+                    let count = spec.num_ops.checked_mul(per_op)?;
+                    (3usize, num_limbs, 0usize, 0usize, count, count)
+                }
             };
         if wire_count > wires.cols
             || spec.selector_column >= constants.cols
@@ -619,7 +630,7 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             || spec.gate_index > u32::MAX as usize
             || spec.group.end > u32::MAX as usize
             || spec.num_ops > u32::MAX as usize
-            || num_addends > u32::MAX as usize
+            || parameter > u32::MAX as usize
         {
             return None;
         }
@@ -632,7 +643,7 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             spec.include_unused_selector as u32,
             kind as u32,
             spec.num_ops as u32,
-            num_addends as u32,
+            parameter as u32,
             result_limbs as u32,
             carry_limbs as u32,
         ]);
@@ -663,7 +674,7 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
         step,
         &metadata,
         specs.len(),
-        u32_specs.len(),
+        promoted_specs.len(),
         &alpha_powers,
         alpha_stride,
     ) {
@@ -1032,7 +1043,7 @@ impl MetalShared {
         step: usize,
         metadata: &[u32],
         range_count: usize,
-        u32_count: usize,
+        promoted_count: usize,
         alpha_powers: &[u64],
         alpha_stride: usize,
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
@@ -1040,7 +1051,7 @@ impl MetalShared {
             .range_check_gate_quotient_pipeline
             .as_ref()
             .ok_or("RangeCheck gate quotient pipeline unavailable")?;
-        if metadata.len() != (range_count + u32_count) * 10
+        if metadata.len() != (range_count + promoted_count) * 10
             || alpha_powers.len() != alpha_stride * 2
         {
             return Err("invalid RangeCheck quotient metadata".to_string());
@@ -1078,7 +1089,7 @@ impl MetalShared {
             set_u32(encoder, 7, step as u32);
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
-            set_u32(encoder, 10, u32_count as u32);
+            set_u32(encoder, 10, promoted_count as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             command_buffer.commit();
@@ -2363,7 +2374,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_u32_gate_quotient_matches_cpu() {
+    fn metal_promoted_gate_quotient_matches_cpu_on_random_invalid_wires() {
         type F = GoldilocksField;
         const WIRE_COLUMNS: usize = 136;
         const QUOTIENT_ROWS: usize = 64;
@@ -2372,40 +2383,40 @@ mod tests {
         let context = shared_context().expect("Metal context must initialize");
         let alphas = [F::from_canonical_u64(7), F::from_canonical_u64(11)];
         let mut specs = vec![
-            U32QuotientSpec {
+            PromotedQuotientSpec {
                 selector_column: 0,
                 gate_index: 2,
                 group: 1..4,
                 include_unused_selector: true,
                 num_ops: 3,
-                kind: U32QuotientKind::Arithmetic,
+                kind: PromotedQuotientKind::Arithmetic,
             },
-            U32QuotientSpec {
+            PromotedQuotientSpec {
                 selector_column: 1,
                 gate_index: 5,
                 group: 4..7,
                 include_unused_selector: true,
                 num_ops: 6,
-                kind: U32QuotientKind::Subtraction { result_limbs: 16 },
+                kind: PromotedQuotientKind::Subtraction { result_limbs: 16 },
             },
             // The 16- and 48-bit subtraction gates share the 32-bit layout
             // with a different limb count, so they exercise the same branch
             // at both ends of the supported width range.
-            U32QuotientSpec {
+            PromotedQuotientSpec {
                 selector_column: 2,
                 gate_index: 8,
                 group: 7..10,
                 include_unused_selector: true,
                 num_ops: 9,
-                kind: U32QuotientKind::Subtraction { result_limbs: 8 },
+                kind: PromotedQuotientKind::Subtraction { result_limbs: 8 },
             },
-            U32QuotientSpec {
+            PromotedQuotientSpec {
                 selector_column: 3,
                 gate_index: 11,
                 group: 10..13,
                 include_unused_selector: true,
                 num_ops: 4,
-                kind: U32QuotientKind::Subtraction { result_limbs: 24 },
+                kind: PromotedQuotientKind::Subtraction { result_limbs: 24 },
             },
         ];
         // 16-bit add-many, every production arity.
@@ -2413,13 +2424,13 @@ mod tests {
             let num_ops = (WIRE_COLUMNS / (num_addends + 13)).min(80 / (num_addends + 3));
             let selector_column = specs.len();
             let gate_index = 14 + 3 * (num_addends - 2);
-            specs.push(U32QuotientSpec {
+            specs.push(PromotedQuotientSpec {
                 selector_column,
                 gate_index,
                 group: gate_index - 1..gate_index + 2,
                 include_unused_selector: true,
                 num_ops,
-                kind: U32QuotientKind::AddMany {
+                kind: PromotedQuotientKind::AddMany {
                     num_addends,
                     result_limbs: 8,
                     num_carry_limbs: 2,
@@ -2432,17 +2443,35 @@ mod tests {
             let num_ops = (WIRE_COLUMNS / (num_addends + 21)).min(80 / (num_addends + 3));
             let selector_column = specs.len();
             let gate_index = 62 + 3 * (num_addends - 2);
-            specs.push(U32QuotientSpec {
+            specs.push(PromotedQuotientSpec {
                 selector_column,
                 gate_index,
                 group: gate_index - 1..gate_index + 2,
                 include_unused_selector: true,
                 num_ops,
-                kind: U32QuotientKind::AddMany {
+                kind: PromotedQuotientKind::AddMany {
                     num_addends,
                     result_limbs: 16,
                     num_carry_limbs: 2,
                 },
+            });
+        }
+        // Exercise representative production ByteDecomposition shapes. The
+        // constraint cap mirrors `ByteDecompositionGate::new_from_config`.
+        for (byte_shape, num_limbs) in [1usize, 2, 4, 8, 16, 24].into_iter().enumerate() {
+            let per_op = 1 + 5 * num_limbs;
+            let num_ops = (80 / (1 + num_limbs))
+                .min(WIRE_COLUMNS / per_op)
+                .min(123 / per_op);
+            let selector_column = specs.len();
+            let gate_index = 110 + 3 * byte_shape;
+            specs.push(PromotedQuotientSpec {
+                selector_column,
+                gate_index,
+                group: gate_index - 1..gate_index + 2,
+                include_unused_selector: true,
+                num_ops,
+                kind: PromotedQuotientKind::ByteDecomposition { num_limbs },
             });
         }
 
@@ -2498,7 +2527,7 @@ mod tests {
                         });
                     let mut constraints = Vec::new();
                     match spec.kind {
-                        U32QuotientKind::Arithmetic => {
+                        PromotedQuotientKind::Arithmetic => {
                             for op in 0..spec.num_ops {
                                 let routed = 6 * op;
                                 let multiplicand_0 = wires.col(routed)[source_row];
@@ -2532,7 +2561,7 @@ mod tests {
                             }
                             assert_eq!(constraints.len(), spec.num_ops * 36);
                         }
-                        U32QuotientKind::Subtraction { result_limbs } => {
+                        PromotedQuotientKind::Subtraction { result_limbs } => {
                             let word_base =
                                 F::from_canonical_u64(1u64 << (2 * result_limbs as u64));
                             for op in 0..spec.num_ops {
@@ -2560,7 +2589,7 @@ mod tests {
                             }
                             assert_eq!(constraints.len(), spec.num_ops * (result_limbs + 3));
                         }
-                        U32QuotientKind::AddMany {
+                        PromotedQuotientKind::AddMany {
                             num_addends,
                             result_limbs,
                             num_carry_limbs,
@@ -2601,6 +2630,40 @@ mod tests {
                             }
                             assert_eq!(constraints.len(), spec.num_ops * (total_limbs + 3));
                         }
+                        PromotedQuotientKind::ByteDecomposition { num_limbs } => {
+                            let routed_per_op = 1 + num_limbs;
+                            let aux_per_op = 4 * num_limbs;
+                            for op in 0..spec.num_ops {
+                                let routed = routed_per_op * op;
+                                let aux = routed_per_op * spec.num_ops + aux_per_op * op;
+
+                                // ByteDecompositionGate emits every auxiliary
+                                // range product before any recomposition row.
+                                for j in 0..aux_per_op {
+                                    let x = wires.col(aux + j)[source_row];
+                                    let y = x * (x - three);
+                                    constraints.push(y * (y + F::TWO));
+                                }
+                                for byte_index in 0..num_limbs {
+                                    let limb_base = aux + 4 * byte_index;
+                                    let mut recomposed = wires.col(limb_base + 3)[source_row];
+                                    for j in (0..3).rev() {
+                                        recomposed = recomposed * four
+                                            + wires.col(limb_base + j)[source_row];
+                                    }
+                                    constraints.push(
+                                        recomposed - wires.col(routed + 1 + byte_index)[source_row],
+                                    );
+                                }
+                                let mut recomposed_sum = wires.col(routed + num_limbs)[source_row];
+                                for byte_index in (0..num_limbs - 1).rev() {
+                                    recomposed_sum = recomposed_sum * F::from_canonical_u64(256)
+                                        + wires.col(routed + 1 + byte_index)[source_row];
+                                }
+                                constraints.push(recomposed_sum - wires.col(routed)[source_row]);
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * (1 + 5 * num_limbs));
+                        }
                     }
 
                     for (challenge, &alpha) in alphas.iter().enumerate() {
@@ -2625,14 +2688,16 @@ mod tests {
                 &alphas,
                 ALPHA_OFFSET,
             )
-            .expect("Metal U32 quotient job must start");
-            let actual = job.finish().expect("Metal U32 quotient job must finish");
+            .expect("Metal promoted quotient job must start");
+            let actual = job
+                .finish()
+                .expect("Metal promoted quotient job must finish");
             assert_eq!(actual.len(), expected.len());
             for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
                 assert_eq!(
                     actual.to_canonical_u64(),
                     expected.to_canonical_u64(),
-                    "U32 gate quotient mismatch at word {i}, step {step}"
+                    "promoted gate quotient mismatch at word {i}, step {step}"
                 );
             }
         }
