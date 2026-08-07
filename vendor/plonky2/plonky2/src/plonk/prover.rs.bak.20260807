@@ -1414,19 +1414,6 @@ fn compute_quotient_polys<
     debug_assert_eq!(shifted_points.len(), lde_size);
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    // Serial spine circuits (degree-2^14 chain steps) run while the shared
-    // FIFO GPU queue is already occupied by pipelined chunk commitment work,
-    // and their tiny CPU gate loop (~482 constraints across 14 gates) reaches
-    // GPU parity after very few offloaded gates. Ranked A/B evidence on this
-    // tree (BaseSum +0.14%, BaseSum + Equality -4.92%) shows the range/u32
-    // quotient union has crossed its balance point on this shape, so keep
-    // those gates on the CPU here. The Poseidon2 gate quotient stays
-    // offloaded (one big gate; still shorter than the CPU loop). Exclusive
-    // phases (pre-execution, chain tail, final block) keep the full union:
-    // the GPU stream is otherwise idle in those phases.
-    let serial_spine = common_data.degree_bits() <= 14
-        && !crate::hash::poseidon2::metal::exclusive_gpu_phase_active();
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let gpu_poseidon = allow_gpu_poseidon
         .then(|| {
             start_gpu_poseidon_gate_quotient(
@@ -1440,7 +1427,7 @@ fn compute_quotient_polys<
         })
         .flatten();
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_range = (allow_gpu_poseidon && !serial_spine)
+    let gpu_range = allow_gpu_poseidon
         .then(|| {
             start_gpu_range_check_gate_quotient(
                 common_data,

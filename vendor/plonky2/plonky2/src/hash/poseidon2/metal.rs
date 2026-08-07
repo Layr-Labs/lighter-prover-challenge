@@ -370,6 +370,13 @@ pub fn set_exclusive_gpu_phase(enabled: bool) {
     EXCLUSIVE_GPU_PHASE.store(enabled, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether the caller has declared the GPU stream exclusive to this proof's
+/// phase (pre-execution, chain tail, final block), so routing heuristics may
+/// assume the queue is otherwise idle.
+pub(crate) fn exclusive_gpu_phase_active() -> bool {
+    EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Number of Merkle builds currently occupying the serialized GPU stream
 /// (from buffer acquisition through `wait_until_completed`). Routing reads
 /// this to decide whether a small serial-path tree would enqueue behind
