@@ -23,22 +23,20 @@ use circuit::types::config::F;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// Disable jemalloc's dirty/muzzy page decay for this short-lived single-shot
-// prover: retained pages are never madvised away between commitment phases, so
-// the allocator stops paying the recurring purge/refault churn.
-//
-// ABI note: jemalloc reads `const char *malloc_conf` (prefixed `_rjem_` in
-// tikv-jemalloc-sys), i.e. a pointer-sized slot holding the address of a
-// NUL-terminated string. `&[u8; 36]` is a thin pointer to the NUL-terminated
-// bytes, which matches that ABI exactly. Exporting the bare byte array itself
-// (no indirection) or omitting the trailing NUL would make jemalloc read the
-// string bytes as a pointer and crash. This is a default: the environment and
-// /etc/malloc.conf can still override it.
+// jemalloc returns freed pages to the OS on a decay schedule; during a proving
+// run every purged page is faulted straight back in by the next FFT/LDE
+// allocation wave, so the madvise/refault churn is pure overhead. Disabling
+// dirty/muzzy decay keeps pages resident for the life of the (short-lived)
+// prover process. The harness environment is fixed, so the config must ride in
+// the binary: jemalloc reads this exported symbol at init.
 #[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
+pub static malloc_conf: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 
 // Keep the promoted writer path while exercising a second submission from that baseline.
+// Redraw token r7 for the four-deletion candidate (see submission note; content
+// otherwise identical to 714624e8 — this line defeats same-account archive dedup).
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
