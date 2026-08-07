@@ -69,6 +69,11 @@ pub enum U32QuotientGate {
     /// words (input and output limbs) plus ten temporary wires per
     /// operation, fifteen constraint rows per operation.
     QuinticSquaring { num_ops: usize },
+    /// Base-`base` decomposition: one routed sum word followed by
+    /// `num_limbs` limb words. Row zero checks the little-endian
+    /// recomposition; the remaining `num_limbs` rows are the per-limb range
+    /// products `prod_{i<base} (limb - i)`.
+    BaseSum { num_limbs: usize, base: usize },
 }
 
 /// A custom gate.
