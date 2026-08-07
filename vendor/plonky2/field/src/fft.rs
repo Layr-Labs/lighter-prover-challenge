@@ -102,9 +102,16 @@ fn fft_dispatch<F: Field>(
     input: &mut [F],
     zero_factor: Option<usize>,
     root_table: Option<&FftRootTable<F>>,
+    live_prefix_bit_reversed: bool,
 ) {
+    // `live_prefix_bit_reversed` is a literal at every caller and this function
+    // is `#[inline]`, so the branch is const-folded away per entry point.
     if let Some(table) = root_table {
-        fft_classic(input, zero_factor.unwrap_or(0), table);
+        if live_prefix_bit_reversed {
+            fft_classic_maybe_prereversed(input, zero_factor.unwrap_or(0), table, true);
+        } else {
+            fft_classic(input, zero_factor.unwrap_or(0), table);
+        }
         return;
     }
     #[cfg(feature = "std")]
@@ -112,7 +119,11 @@ fn fft_dispatch<F: Field>(
     #[cfg(not(feature = "std"))]
     let computed_root_table = fft_root_table::<F>(input.len());
 
-    fft_classic(input, zero_factor.unwrap_or(0), &computed_root_table);
+    if live_prefix_bit_reversed {
+        fft_classic_maybe_prereversed(input, zero_factor.unwrap_or(0), &computed_root_table, true);
+    } else {
+        fft_classic(input, zero_factor.unwrap_or(0), &computed_root_table);
+    }
 }
 
 /// Computes an FFT in the caller-provided buffer.
@@ -125,7 +136,18 @@ pub fn fft_in_place_with_options<F: Field>(
     zero_factor: Option<usize>,
     root_table: Option<&FftRootTable<F>>,
 ) {
-    fft_dispatch(buffer, zero_factor, root_table);
+    fft_dispatch(buffer, zero_factor, root_table, false);
+}
+
+/// [`fft_in_place_with_options`] for a caller that has already bit-reversed the
+/// live coefficient prefix. See [`fft_with_options_prefix_bit_reversed`].
+#[inline]
+pub fn fft_in_place_with_options_prefix_bit_reversed<F: Field>(
+    buffer: &mut [F],
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+) {
+    fft_dispatch(buffer, zero_factor, root_table, true);
 }
 
 #[inline]
@@ -140,7 +162,28 @@ pub fn fft_with_options<F: Field>(
     root_table: Option<&FftRootTable<F>>,
 ) -> PolynomialValues<F> {
     let PolynomialCoeffs { coeffs: mut buffer } = poly;
-    fft_dispatch(&mut buffer, zero_factor, root_table);
+    fft_dispatch(&mut buffer, zero_factor, root_table, false);
+    PolynomialValues::new(buffer)
+}
+
+/// [`fft_with_options`] for a caller that has already bit-reversed the live
+/// coefficient prefix — `coeffs[..len >> zero_factor]`, the exact range this
+/// FFT would otherwise reverse itself (the whole buffer when `zero_factor` is
+/// `None` or `Some(0)`).
+///
+/// A producer that writes that prefix can perform the permutation as it writes
+/// (see [`plonky2_util::fill_bit_reversed`]) instead of sweeping the buffer
+/// again afterwards. Everything downstream of the permutation is unchanged, so
+/// the result is bit-identical to [`fft_with_options`] on the unpermuted
+/// coefficients.
+#[inline]
+pub fn fft_with_options_prefix_bit_reversed<F: Field>(
+    poly: PolynomialCoeffs<F>,
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+) -> PolynomialValues<F> {
+    let PolynomialCoeffs { coeffs: mut buffer } = poly;
+    fft_dispatch(&mut buffer, zero_factor, root_table, true);
     PolynomialValues::new(buffer)
 }
 
@@ -159,7 +202,7 @@ pub fn ifft_with_options<F: Field>(
     let n_inv = F::inverse_2exp(lg_n);
 
     let PolynomialValues { values: mut buffer } = poly;
-    fft_dispatch(&mut buffer, zero_factor, root_table);
+    fft_dispatch(&mut buffer, zero_factor, root_table, false);
 
     // We reverse all values except the first, and divide each by n.
     buffer[0] *= n_inv;
@@ -289,8 +332,10 @@ fn fft_classic_simd_fused_two_layers<P: PackedField>(
     }
 }
 
+/// Stage-major traversal of layers `start..end`: every layer (or fused layer
+/// pair) sweeps the whole buffer once.
 #[inline(always)]
-fn fft_classic_simd_layers<P: PackedField>(
+fn fft_classic_simd_layers_flat<P: PackedField>(
     packed_values: &mut [P],
     start: usize,
     end: usize,
@@ -311,6 +356,332 @@ fn fft_classic_simd_layers<P: PackedField>(
             root_table,
         );
         lg_half_m += 2;
+    }
+}
+
+/// Byte budget for one second-level-cache-resident block of upper-layer work.
+///
+/// Apple Silicon's performance clusters share one L2 between the cores in the
+/// cluster (16 MiB across five cores on an M4 Pro), and the prover runs one
+/// LDE column per worker, so a block has to stay well inside a single core's
+/// share with room for the twiddle rows those layers stream alongside the
+/// data. Swept over 2^14..2^18 elements at the production shape; 512 KiB was
+/// the best or tied-best at every site and leaves the most headroom under
+/// cluster sharing.
+const L2_BLOCK_BYTES: usize = 1 << 19;
+
+/// `log2` of how many `elem_bytes`-sized elements fit in `budget` bytes.
+const fn lg_block_elems(elem_bytes: usize, budget: usize) -> usize {
+    let mut count = budget / if elem_bytes == 0 { 1 } else { elem_bytes };
+    let mut lg = 0;
+    while count > 1 {
+        count >>= 1;
+        lg += 1;
+    }
+    lg
+}
+
+/// `log2` of the L1-resident block length used by the low layers: the block
+/// plus the largest twiddle row it reads stays inside Apple Silicon's 128 KiB
+/// L1D (about 96 KiB for both the base field and the quadratic extension).
+const fn lg_l1_block_elems(elem_bytes: usize) -> usize {
+    match elem_bytes {
+        0..=8 => 13,
+        9..=16 => 12,
+        _ => 11,
+    }
+}
+
+#[inline(always)]
+fn fft_classic_simd_layers<P: PackedField>(
+    packed_values: &mut [P],
+    start: usize,
+    end: usize,
+    root_table: &FftRootTable<P::Scalar>,
+) {
+    fft_classic_simd_layers_tuned(packed_values, start, end, root_table, L2_BLOCK_BYTES);
+}
+
+/// Smallest column window worth streaming, in bytes.
+///
+/// The column-blocked traversal replaces one sequential sweep per layer pair
+/// with `2^(end - lg_row)` interleaved runs of this length. Below roughly a
+/// 16 KiB run the extra stream starts and the lost prefetch depth cost more
+/// than the deleted passes save, so the decomposition lifts `lg_row` (adding
+/// a contiguous-block phase) rather than narrowing the window past it.
+const MIN_COLUMN_RUN_BYTES: usize = 1 << 14;
+
+/// Layers `start..end` of a length-`2^end` transform, cache-blocked when the
+/// buffer is larger than one L2 block.
+///
+/// Above layer `lg_row` the buffer is `2^(end - lg_row)` completed transforms
+/// ("rows") of length `2^lg_row` laid out contiguously, and every remaining
+/// butterfly pairs two rows at the *same* offset within the row. Columns are
+/// therefore independent across the entire remaining layer list, so a window
+/// of consecutive columns can be carried through all of them in one residency
+/// instead of every fused layer pair sweeping the whole buffer.
+///
+/// The butterflies, their operands and their twiddles are exactly those of
+/// [`fft_classic_simd_layers_flat`]; only the order in which independent
+/// columns are visited changes, so the buffer ends bit-identical.
+fn fft_classic_simd_layers_tuned<P: PackedField>(
+    packed_values: &mut [P],
+    start: usize,
+    end: usize,
+    root_table: &FftRootTable<P::Scalar>,
+    l2_block_bytes: usize,
+) {
+    debug_assert_eq!(packed_values.len() * P::WIDTH, 1usize << end);
+    let elem_bytes = core::mem::size_of::<P::Scalar>();
+    let lg_block = lg_block_elems(elem_bytes, l2_block_bytes);
+    let lg_min_cols = lg_block_elems(elem_bytes, MIN_COLUMN_RUN_BYTES);
+    let lg_packed_width = log2_strict(P::WIDTH);
+    // Nothing to gain while the whole transform already fits one block, and
+    // nothing to work with unless a minimum window is at least one vector.
+    //
+    // A field with no packed kernel (`WIDTH == 1`) is skipped as well: its
+    // per-element arithmetic is expensive enough — the quadratic extension
+    // costs about 3.3x a base-field butterfly for 2x the bytes — that these
+    // layers sit far below the memory roofline, and the per-window setup the
+    // blocking adds is then pure overhead (measured 5-9% slower on the
+    // extension-field FRI coset FFT at 2^19).
+    if P::WIDTH == 1 || end <= lg_block || lg_min_cols < lg_packed_width || lg_min_cols >= lg_block
+    {
+        fft_classic_simd_layers_flat(packed_values, start, end, root_table);
+        return;
+    }
+
+    // Rows are independent below layer `lg_row`; finish each one while it is
+    // still L1-resident, which is also what gives the column phase a row long
+    // enough to carve wide windows out of.
+    let lg_row = max(start, min(lg_l1_block_elems(elem_bytes), end));
+    if lg_row > start {
+        let packed_row = (1usize << lg_row) >> lg_packed_width;
+        for row in packed_values.chunks_mut(packed_row) {
+            fft_classic_simd_layers_flat(row, start, lg_row, root_table);
+        }
+    }
+    fft_upper_layers_blocked(
+        packed_values,
+        lg_row,
+        end,
+        lg_block,
+        lg_min_cols,
+        root_table,
+    );
+}
+
+/// Layers `lg_row..end` over a buffer already grouped into completed rows of
+/// length `2^lg_row`.
+///
+/// A single column-blocked phase can only span so many layers before the
+/// window it can afford — `2^(lg_block + lg_row - end)` columns — drops below
+/// [`MIN_COLUMN_RUN_BYTES`]. When it does, the layers are split: contiguous
+/// blocks of `2^mid` elements are independent below layer `mid`, so those
+/// layers are finished block by block (recursively, so each block is itself
+/// blocked if it is still too large), and the column phase then starts from
+/// the wider row `mid` with exactly the minimum window.
+fn fft_upper_layers_blocked<P: PackedField>(
+    packed_values: &mut [P],
+    lg_row: usize,
+    end: usize,
+    lg_block: usize,
+    lg_min_cols: usize,
+    root_table: &FftRootTable<P::Scalar>,
+) {
+    debug_assert!(lg_row <= end);
+    if end <= lg_block || lg_row >= end {
+        fft_classic_simd_layers_flat(packed_values, lg_row, end, root_table);
+        return;
+    }
+
+    // Narrowest row the column phase can start from and still stream well.
+    let mid = end + lg_min_cols - lg_block;
+    if mid <= lg_row {
+        fft_upper_layers_column_blocked(
+            packed_values,
+            lg_row,
+            end,
+            lg_block + lg_row - end,
+            root_table,
+        );
+        return;
+    }
+    if mid >= end {
+        // The layer span is too wide for even one split to help.
+        fft_classic_simd_layers_flat(packed_values, lg_row, end, root_table);
+        return;
+    }
+
+    let packed_mid = (1usize << mid) >> log2_strict(P::WIDTH);
+    for block in packed_values.chunks_mut(packed_mid) {
+        fft_upper_layers_blocked(block, lg_row, mid, lg_block, lg_min_cols, root_table);
+    }
+    fft_upper_layers_column_blocked(packed_values, mid, end, lg_min_cols, root_table);
+}
+
+/// One upper layer restricted to the column window `[col, col + 2^lg_cols)` of
+/// every row. Layer `lg_row + stage` pairs rows `q` and `q + 2^stage` at each
+/// column `p` with twiddle `root_table[lg_row + stage][(q % 2^stage) * 2^lg_row + p]`,
+/// which is the same butterfly the stage-major kernel performs at flat index
+/// `q * 2^lg_row + p`.
+#[inline(always)]
+fn fft_upper_single_layer_cols<P: PackedField>(
+    packed_values: &mut [P],
+    lg_row: usize,
+    stage: usize,
+    col: usize,
+    lg_cols: usize,
+    lg_packed_width: usize,
+    root_table: &FftRootTable<P::Scalar>,
+) {
+    let row_len = 1usize << lg_row;
+    let cols = 1usize << lg_cols;
+    let packed_row = row_len >> lg_packed_width;
+    let packed_col = col >> lg_packed_width;
+    let packed_cols = cols >> lg_packed_width;
+    let rows = packed_values.len() / packed_row;
+    let half = 1usize << stage;
+    let omegas = &root_table[lg_row + stage];
+
+    for base in (0..rows).step_by(2 * half) {
+        for a in 0..half {
+            let offset = a * row_len + col;
+            let omega = P::pack_slice(&omegas[offset..offset + cols]);
+            let lo_row = base + a;
+            let (lo_side, hi_side) = packed_values.split_at_mut((lo_row + half) * packed_row);
+            let lo = &mut lo_side[lo_row * packed_row + packed_col..][..packed_cols];
+            let hi = &mut hi_side[packed_col..][..packed_cols];
+            for j in 0..packed_cols {
+                let t = omega[j] * hi[j];
+                let u = lo[j];
+                lo[j] = u + t;
+                hi[j] = u - t;
+            }
+        }
+    }
+}
+
+/// [`fft_upper_single_layer_cols`] for two consecutive upper layers fused into
+/// one radix-4 traversal of four row segments, mirroring
+/// [`fft_classic_simd_fused_two_layers`] with rows in place of packed offsets.
+#[inline(always)]
+fn fft_upper_fused_two_layers_cols<P: PackedField>(
+    packed_values: &mut [P],
+    lg_row: usize,
+    stage: usize,
+    col: usize,
+    lg_cols: usize,
+    lg_packed_width: usize,
+    root_table: &FftRootTable<P::Scalar>,
+) {
+    let row_len = 1usize << lg_row;
+    let cols = 1usize << lg_cols;
+    let packed_row = row_len >> lg_packed_width;
+    let packed_col = col >> lg_packed_width;
+    let packed_cols = cols >> lg_packed_width;
+    let rows = packed_values.len() / packed_row;
+    let half = 1usize << stage;
+    let stage1_omegas = &root_table[lg_row + stage];
+    let stage2_omegas = &root_table[lg_row + stage + 1];
+
+    for base in (0..rows).step_by(4 * half) {
+        for a in 0..half {
+            // Rows `r0 < r0 + half < r0 + 2 * half < r0 + 3 * half`. The first
+            // layer pairs them as (0, 1) and (2, 3) with one twiddle row; the
+            // second pairs (0, 2) and (1, 3), the latter half a block further
+            // into the next twiddle row.
+            let offset = a * row_len + col;
+            let w1 = P::pack_slice(&stage1_omegas[offset..offset + cols]);
+            let w2_lo = P::pack_slice(&stage2_omegas[offset..offset + cols]);
+            let offset_hi = offset + half * row_len;
+            let w2_hi = P::pack_slice(&stage2_omegas[offset_hi..offset_hi + cols]);
+
+            let r0 = base + a;
+            let (s0, rest) = packed_values.split_at_mut((r0 + half) * packed_row);
+            let (s1, rest) = rest.split_at_mut(half * packed_row);
+            let (s2, s3) = rest.split_at_mut(half * packed_row);
+            let va = &mut s0[r0 * packed_row + packed_col..][..packed_cols];
+            let vb = &mut s1[packed_col..][..packed_cols];
+            let vc = &mut s2[packed_col..][..packed_cols];
+            let vd = &mut s3[packed_col..][..packed_cols];
+
+            for j in 0..packed_cols {
+                let w = w1[j];
+                let a_val = va[j];
+                let b_val = vb[j];
+                let c_val = vc[j];
+                let d_val = vd[j];
+
+                let t = w * b_val;
+                let (ab0, ab1) = (a_val + t, a_val - t);
+                let t = w * d_val;
+                let (cd0, cd1) = (c_val + t, c_val - t);
+
+                let t = w2_lo[j] * cd0;
+                va[j] = ab0 + t;
+                vc[j] = ab0 - t;
+                let t = w2_hi[j] * cd1;
+                vb[j] = ab1 + t;
+                vd[j] = ab1 - t;
+            }
+        }
+    }
+}
+
+/// Layers `lg_row..end` run one column window at a time, each window carried
+/// through every remaining layer while it is L2-resident.
+fn fft_upper_layers_column_blocked<P: PackedField>(
+    packed_values: &mut [P],
+    lg_row: usize,
+    end: usize,
+    lg_cols: usize,
+    root_table: &FftRootTable<P::Scalar>,
+) {
+    for col in (0..1usize << lg_row).step_by(1 << lg_cols) {
+        fft_upper_layers_one_column_window(packed_values, lg_row, end, lg_cols, col, root_table);
+    }
+}
+
+/// Every layer in `lg_row..end`, for the single column window starting at
+/// `col`. This is the unit of residency: the window's `2^(end - lg_row)` row
+/// segments are read in for the first layer and written back after the last.
+#[inline(always)]
+fn fft_upper_layers_one_column_window<P: PackedField>(
+    packed_values: &mut [P],
+    lg_row: usize,
+    end: usize,
+    lg_cols: usize,
+    col: usize,
+    root_table: &FftRootTable<P::Scalar>,
+) {
+    let lg_packed_width = log2_strict(P::WIDTH);
+    let layers = end - lg_row;
+    let mut stage = 0;
+    // Odd layer count: run the first layer unfused so the remainder pairs up.
+    if layers % 2 == 1 {
+        fft_upper_single_layer_cols(
+            packed_values,
+            lg_row,
+            stage,
+            col,
+            lg_cols,
+            lg_packed_width,
+            root_table,
+        );
+        stage += 1;
+    }
+    while stage < layers {
+        fft_upper_fused_two_layers_cols(
+            packed_values,
+            lg_row,
+            stage,
+            col,
+            lg_cols,
+            lg_packed_width,
+            root_table,
+        );
+        stage += 2;
     }
 }
 
@@ -408,22 +779,18 @@ fn prepare_zero_padded_fft<F: Field>(
 ) -> usize {
     debug_assert!(r > 0 && r <= lg_n);
 
-    // A zero-padded input only has n/2^r live coefficients. Bit-reversing the full buffer would
-    // place those coefficients at multiples of 2^r, after which the skipped FFT layers copy each
-    // one across its following 2^r-element run. Produce that exact state directly by reversing
-    // just the live prefix.
+    // A zero-padded input only has n/2^r live coefficients, and the caller has
+    // already bit-reversed exactly that prefix (bit-reversing the full buffer
+    // would place those coefficients at multiples of 2^r, after which the
+    // skipped FFT layers copy each one across its following 2^r-element run;
+    // reversing just the live prefix produces that state directly).
     let repeat = 1 << r;
     let nonzero_len = values.len() >> r;
-    reverse_index_bits_in_place(&mut values[..nonzero_len]);
 
     if r >= lg_packed_width && r < lg_n {
         // Keep values plus the largest local twiddle row within Apple Silicon's 128 KiB L1D.
         // Both 2^13 base-field and 2^12 quadratic-extension blocks use about 96 KiB.
-        let lg_block_n = match core::mem::size_of::<F>() {
-            0..=8 => 13,
-            9..=16 => 12,
-            _ => 11,
-        };
+        let lg_block_n = lg_l1_block_elems(core::mem::size_of::<F>());
         if r + 1 < lg_block_n && lg_block_n <= lg_n {
             fft_zero_padded_cache_blocks::<<F as Packable>::Packing>(
                 values, r, lg_block_n, root_table,
@@ -451,6 +818,20 @@ fn prepare_zero_padded_fft<F: Field>(
 /// input may be non-zero, but the last 1 - 1/2^r entries are
 /// definitely zero.
 pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &FftRootTable<F>) {
+    fft_classic_maybe_prereversed(values, r, root_table, false);
+}
+
+/// [`fft_classic`], optionally skipping the initial bit-reversal because the
+/// caller already produced `values[..n >> r]` in bit-reversed order. That
+/// prefix is the only range the reversal touches (the whole buffer when
+/// `r == 0`), so skipping it is the sole difference; every later stage is
+/// reached in an identical state.
+fn fft_classic_maybe_prereversed<F: Field>(
+    values: &mut [F],
+    r: usize,
+    root_table: &FftRootTable<F>,
+    live_prefix_bit_reversed: bool,
+) {
     let n = values.len();
     let lg_n = log2_strict(n);
 
@@ -462,9 +843,13 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
         );
     }
 
+    if !live_prefix_bit_reversed {
+        // `n >> 0 == n`, so this is the full-buffer reversal when `r == 0`.
+        reverse_index_bits_in_place(&mut values[..n >> r]);
+    }
+
     let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
     let first_layer = if r == 0 {
-        reverse_index_bits_in_place(values);
         0
     } else {
         prepare_zero_padded_fft(values, r, lg_n, lg_packed_width, root_table)
@@ -792,6 +1177,299 @@ mod tests {
         }
     }
 
+    /// The two-level cache blocking of the upper layers must be a pure
+    /// reordering: `fft_classic_simd_layers_tuned` has to leave the buffer
+    /// bit-identical to the stage-major `fft_classic_simd_layers_flat` for
+    /// every block budget the tuning sweep considers, at every layer boundary
+    /// the FFT entry points can hand it (the packed-width floor, an L1 block
+    /// boundary, and both sides of it), on raw limbs.
+    #[test]
+    fn column_blocked_layers_match_flat_layers() {
+        use crate::extension::FieldExtension;
+        use crate::fft::{fft_classic_simd_layers_flat, fft_classic_simd_layers_tuned};
+        use crate::types::{PrimeField64, Sample};
+
+        fn check<F: Field + Sample + Packable, const D: usize>(
+            starts: &[usize],
+            raw: fn(&[F]) -> Vec<u64>,
+        ) where
+            F: FieldExtension<D>,
+        {
+            const BUDGETS: [usize; 3] = [1 << 19, 1 << 20, 1 << 21];
+
+            for lg_n in [16usize, 17, 18, 19] {
+                let n = 1usize << lg_n;
+                let roots = fft_root_table::<F>(n);
+                let input = F::rand_vec(n);
+                for &start in starts {
+                    let mut expected = input.clone();
+                    fft_classic_simd_layers_flat(
+                        <F as Packable>::Packing::pack_slice_mut(&mut expected),
+                        start,
+                        lg_n,
+                        &roots,
+                    );
+                    let expected = raw(&expected);
+                    for budget in BUDGETS {
+                        let mut actual = input.clone();
+                        fft_classic_simd_layers_tuned(
+                            <F as Packable>::Packing::pack_slice_mut(&mut actual),
+                            start,
+                            lg_n,
+                            &roots,
+                            budget,
+                        );
+                        assert_eq!(
+                            raw(&actual),
+                            expected,
+                            "2^{lg_n}, start {start}, budget {budget}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // `start` must be at least the packing width for the packed kernels.
+        check::<GoldilocksField, 1>(&[2, 5, 11, 12, 13, 14], |values| {
+            values.iter().map(|x| x.to_noncanonical_u64()).collect()
+        });
+        check::<QuadraticExtension<GoldilocksField>, 2>(&[0, 5, 11, 12, 13], |values| {
+            values
+                .iter()
+                .flat_map(|x| FieldExtension::<2>::to_basefield_array(x))
+                .map(|c: GoldilocksField| c.to_noncanonical_u64())
+                .collect()
+        });
+    }
+
+    /// End-to-end differential for the cache-blocked FFT against the original
+    /// stage-major implementation, over the LDE sizes where the second-level
+    /// blocking engages, every production `rate_bits` and both prover field
+    /// types. Raw limbs.
+    #[test]
+    fn cache_blocked_fft_matches_stage_major_reference_at_lde_sizes() {
+        use crate::extension::FieldExtension;
+        use crate::types::{PrimeField64, Sample};
+
+        fn check<F: Field + Sample, const D: usize>(raw: fn(&[F]) -> Vec<u64>)
+        where
+            F: FieldExtension<D>,
+        {
+            for lg_n in 14usize..=19 {
+                let n = 1usize << lg_n;
+                let roots = fft_root_table::<F>(n);
+                for rate_bits in 0..=3usize {
+                    let live = n >> rate_bits;
+                    let mut coeffs = F::rand_vec(live);
+                    coeffs.resize(n, F::ZERO);
+
+                    let mut expected = coeffs.clone();
+                    fft_classic_reference(&mut expected, rate_bits, &roots);
+                    let expected = raw(&expected);
+
+                    let mut actual = coeffs.clone();
+                    fft_classic(&mut actual, rate_bits, &roots);
+                    assert_eq!(
+                        raw(&actual),
+                        expected,
+                        "classic entry, 2^{lg_n}, rate_bits {rate_bits}"
+                    );
+                }
+            }
+        }
+
+        check::<GoldilocksField, 1>(|values| {
+            values.iter().map(|x| x.to_noncanonical_u64()).collect()
+        });
+        check::<QuadraticExtension<GoldilocksField>, 2>(|values| {
+            values
+                .iter()
+                .flat_map(|x| FieldExtension::<2>::to_basefield_array(x))
+                .map(|c: GoldilocksField| c.to_noncanonical_u64())
+                .collect()
+        });
+    }
+
+    /// Micro-benchmark for the upper-layer cache blocking (ignored by default).
+    /// `cargo test --release -p plonky2_field --lib micro_fft_cache_blocking -- --ignored --nocapture`
+    ///
+    /// Both parts run three arms rotated through the slot order on every
+    /// repetition: the stage-major kernel, a byte-identical *second call to the
+    /// same stage-major kernel* (the null, whose spread against the first is
+    /// the measurement floor on this box), and the blocked kernel. Reported as
+    /// min-of-reps plus the paired win rate over the per-repetition ratios.
+    #[cfg(feature = "std")]
+    #[test]
+    #[ignore]
+    fn micro_fft_cache_blocking() {
+        use std::time::Instant;
+
+        use crate::fft::{
+            L2_BLOCK_BYTES, fft_classic_simd_layers_flat, fft_classic_simd_layers_tuned,
+            prepare_zero_padded_fft,
+        };
+        use crate::types::Sample;
+
+        type F = GoldilocksField;
+        type P = <F as Packable>::Packing;
+        type Ext2 = QuadraticExtension<GoldilocksField>;
+
+        const REPS: usize = 41;
+
+        /// (A) The layers the blocking rewrites, in isolation, at each layer
+        /// boundary the production FFT sites hand over at.
+        fn sweep<F: Field + Sample + Packable>(label: &str, start: usize, lg_n: usize) {
+            let n = 1usize << lg_n;
+            let roots = fft_root_table::<F>(n);
+            let mut buf = F::rand_vec(n);
+            let iters = ((1usize << 22) / n).max(4);
+
+            let mut best = [f64::MAX; 3];
+            let mut ratios: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+            for rep in 0..REPS {
+                let mut t = [0.0f64; 3];
+                for slot in 0..3 {
+                    let arm = (slot + rep) % 3;
+                    let start_time = Instant::now();
+                    for _ in 0..iters {
+                        if arm == 2 {
+                            fft_classic_simd_layers_tuned(
+                                <F as Packable>::Packing::pack_slice_mut(&mut buf),
+                                start,
+                                lg_n,
+                                &roots,
+                                L2_BLOCK_BYTES,
+                            );
+                        } else {
+                            fft_classic_simd_layers_flat(
+                                <F as Packable>::Packing::pack_slice_mut(&mut buf),
+                                start,
+                                lg_n,
+                                &roots,
+                            );
+                        }
+                        core::hint::black_box(&buf);
+                    }
+                    t[arm] = start_time.elapsed().as_secs_f64() / iters as f64;
+                }
+                if rep > 1 {
+                    for k in 0..3 {
+                        best[k] = best[k].min(t[k]);
+                    }
+                    for k in 0..2 {
+                        ratios[k].push(t[0] / t[k + 1]);
+                    }
+                }
+            }
+            let labels = ["null(flat)", "blocked"];
+            print!("{label:<30} flat={:9.1}us", best[0] * 1e6);
+            for k in 0..2 {
+                ratios[k].sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let wins = ratios[k].iter().filter(|r| **r > 1.0).count();
+                print!(
+                    "  {}={:9.1}us min={:5.3}x med-paired={:5.3}x wins {wins}/{}",
+                    labels[k],
+                    best[k + 1] * 1e6,
+                    best[0] / best[k + 1],
+                    ratios[k][ratios[k].len() / 2],
+                    ratios[k].len()
+                );
+            }
+            println!();
+        }
+
+        println!("-- rewritten layers only --");
+        // LDE FFT, 172 per proof: zero-padded expansion stops at layer 13.
+        sweep::<F>("lde fft   base 2^19 from 13", 13, 19);
+        // Quotient coset IFFT, 2 per proof: no zero padding, starts at the
+        // packing width.
+        sweep::<F>("quotient  base 2^19 from  2", 2, 19);
+        // FRI final-polynomial coset FFT over the extension field, which the
+        // `P::WIDTH == 1` gate keeps on the flat path.
+        sweep::<Ext2>("fri coset ext2 2^19 from 12", 12, 19);
+
+        // (B) The full LDE column pipeline at the shipped block size: prefix
+        // copy, zero-padded expansion with L1-blocked low layers, then the
+        // upper layers.
+        println!("-- full lde column pipeline (rate_bits = 3) --");
+        let lg_packed_width = log2_strict(P::WIDTH);
+        for lg_degree in [14usize, 16] {
+            let rate_bits = 3usize;
+            let lg_n = lg_degree + rate_bits;
+            let n = 1usize << lg_n;
+            let degree = 1usize << lg_degree;
+            let roots = fft_root_table::<F>(n);
+            let coeffs = F::rand_vec(degree);
+            let mut buf: Vec<F> = Vec::with_capacity(n);
+            unsafe { buf.set_len(n) };
+            let iters = ((1usize << 22) / n).max(4);
+
+            let mut best = [f64::MAX; 3];
+            let mut ratios: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+            let mut sink = 0u64;
+            for rep in 0..REPS {
+                let mut t = [0.0f64; 3];
+                for slot in 0..3 {
+                    let arm = (slot + rep) % 3;
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        buf[..degree].copy_from_slice(&coeffs);
+                        let first = prepare_zero_padded_fft(
+                            &mut buf,
+                            rate_bits,
+                            lg_n,
+                            lg_packed_width,
+                            &roots,
+                        );
+                        if arm == 2 {
+                            fft_classic_simd_layers_tuned(
+                                P::pack_slice_mut(&mut buf),
+                                first,
+                                lg_n,
+                                &roots,
+                                L2_BLOCK_BYTES,
+                            );
+                        } else {
+                            fft_classic_simd_layers_flat(
+                                P::pack_slice_mut(&mut buf),
+                                first,
+                                lg_n,
+                                &roots,
+                            );
+                        }
+                        core::hint::black_box(&buf);
+                    }
+                    t[arm] = start.elapsed().as_secs_f64() / iters as f64;
+                    sink ^= buf[0].0;
+                }
+
+                if rep > 1 {
+                    for k in 0..3 {
+                        best[k] = best[k].min(t[k]);
+                    }
+                    for k in 0..2 {
+                        ratios[k].push(t[0] / t[k + 1]);
+                    }
+                }
+            }
+            let labels = ["null(flat)", "blocked"];
+            print!("deg=2^{lg_degree} lde=2^{lg_n}  flat={:9.1}us", best[0] * 1e6);
+            for k in 0..2 {
+                ratios[k].sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let wins = ratios[k].iter().filter(|r| **r > 1.0).count();
+                print!(
+                    "  {}={:9.1}us min={:5.3}x med-paired={:5.3}x wins {wins}/{}",
+                    labels[k],
+                    best[k + 1] * 1e6,
+                    best[0] / best[k + 1],
+                    ratios[k][ratios[k].len() / 2],
+                    ratios[k].len()
+                );
+            }
+            println!("  sink={}", sink & 1);
+        }
+    }
+
     #[test]
     fn zero_padded_extension_fft_matches_reference() {
         type F = GoldilocksField;
@@ -815,4 +1493,77 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    /// `fft_with_options_prefix_bit_reversed` must return exactly what
+    /// `fft_with_options` returns on the same (unpermuted) coefficients, once
+    /// the caller has applied the permutation the FFT would have applied
+    /// itself. Swept over both dispatch paths of `reverse_index_bits_in_place`
+    /// (2^11..2^13 small, 2^14..2^17 chunked, odd exponents hitting the
+    /// two-transpose case), every production `rate_bits`, and both the base
+    /// field and the quadratic extension. Compared on raw limbs. The
+    /// in-place entry point is checked alongside, against the same reference.
+    #[test]
+    fn prefix_bit_reversed_fft_matches_classic() {
+        use plonky2_util::fill_bit_reversed;
+
+        use crate::extension::FieldExtension;
+        use crate::fft::fft_in_place_with_options_prefix_bit_reversed;
+        use crate::types::{PrimeField64, Sample};
+
+        fn check<F: Field + Sample, const D: usize>(raw: fn(&[F]) -> Vec<u64>)
+        where
+            F: FieldExtension<D>,
+        {
+            for lg_n in [11usize, 12, 13, 14, 15, 16, 17] {
+                let n = 1usize << lg_n;
+                for rate_bits in 0..=3usize {
+                    // The FFT reverses `coeffs[..n >> rate_bits]`; the rest is
+                    // the zero tail it never reads.
+                    let live = n >> rate_bits;
+                    let mut coeffs = F::rand_vec(live);
+                    coeffs.resize(n, F::ZERO);
+
+                    let expected = PolynomialCoeffs::new(coeffs.clone())
+                        .fft_with_options(Some(rate_bits), None)
+                        .values;
+
+                    let mut prereversed = coeffs.clone();
+                    fill_bit_reversed(&mut prereversed[..live], |out, start| {
+                        out.copy_from_slice(&coeffs[start..start + out.len()]);
+                    });
+
+                    let actual = PolynomialCoeffs::new(prereversed.clone())
+                        .fft_with_options_prefix_bit_reversed(Some(rate_bits), None)
+                        .values;
+                    assert_eq!(
+                        raw(&actual),
+                        raw(&expected),
+                        "owned entry, 2^{lg_n}, rate_bits {rate_bits}"
+                    );
+
+                    let mut in_place = prereversed;
+                    fft_in_place_with_options_prefix_bit_reversed(
+                        &mut in_place,
+                        Some(rate_bits),
+                        None,
+                    );
+                    assert_eq!(
+                        raw(&in_place),
+                        raw(&expected),
+                        "in-place entry, 2^{lg_n}, rate_bits {rate_bits}"
+                    );
+                }
+            }
+        }
+
+        check::<GoldilocksField, 1>(|values| {
+            values.iter().map(|x| x.to_noncanonical_u64()).collect()
+        });
+        check::<QuadraticExtension<GoldilocksField>, 2>(|values| {
+            values
+                .iter()
+                .flat_map(|x| FieldExtension::<2>::to_basefield_array(x))
+                .map(|c: GoldilocksField| c.to_noncanonical_u64())
+                .collect()
+        });
+    }
 }

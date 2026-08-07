@@ -1482,63 +1482,35 @@ fn tree_from_levels<F: RichField>(
     let cap_count = 1usize << cap_height;
     let subtree_leaf_count = leaf_count / cap_count;
     let subtree_digest_count = 2 * (subtree_leaf_count - 1);
-    let digest_count = 2 * (leaf_count - cap_count);
-
-    // The scatter below writes every one of these slots before any is read, so
-    // pre-filling them with `HashOut::ZERO` is dead work — and it is *serial*
-    // dead work inside the exclusive buffer-set hold (`MAX_BUFFER_SETS == 1`),
-    // ahead of a 16-way parallel write, so it also converts a parallel phase
-    // into serial-then-parallel. For a 2^19-leaf tree that is 32 MiB of stores
-    // per commitment, ~318 commitments per worker process.
-    //
-    // `HashOut<F>` is a plain struct with no `IsZero` specialization, so
-    // `vec![HashOut::ZERO; n]` really is a store loop rather than `alloc_zeroed`.
-    let mut digests: Vec<HashOut<F>> = Vec::with_capacity(digest_count);
-    let mut cap: Vec<HashOut<F>> = Vec::with_capacity(cap_count);
-    let digests_uninit = crate::hash::merkle_tree::capacity_up_to_mut(&mut digests, digest_count);
-    let cap_uninit = crate::hash::merkle_tree::capacity_up_to_mut(&mut cap, cap_count);
+    let mut digests = vec![HashOut::ZERO; 2 * (leaf_count - cap_count)];
+    let mut cap = vec![HashOut::ZERO; cap_count];
 
     if subtree_digest_count == 0 {
-        cap_uninit
-            .par_iter_mut()
+        cap.par_iter_mut()
             .enumerate()
             .for_each(|(cap_index, root)| {
-                root.write(read_node(nodes, level_offsets[0], cap_index));
+                *root = read_node(nodes, level_offsets[0], cap_index);
             });
     } else {
-        digests_uninit
+        digests
             .par_chunks_exact_mut(subtree_digest_count)
-            .zip(cap_uninit.par_iter_mut())
+            .zip(cap.par_iter_mut())
             .enumerate()
             .for_each(|(cap_index, (subtree_digests, root))| {
-                root.write(fill_subtree_layout(
+                *root = fill_subtree_layout(
                     subtree_digests,
                     nodes,
                     level_offsets,
                     cap_index * subtree_leaf_count,
                     subtree_leaf_count,
-                ));
+                );
             });
-    }
-    // SAFETY: every slot of both buffers was written exactly once above.
-    // `cap`: one write per index, either by the degenerate branch or as each
-    // subtree's root. `digests`: `par_chunks_exact_mut(subtree_digest_count)`
-    // partitions it exactly (`cap_count * 2 * (subtree_leaf_count - 1)
-    // == 2 * (leaf_count - cap_count)`, no remainder), and `fill_subtree_layout`
-    // writes exactly `2 * (n - 1)` slots for an `n`-leaf subtree — by induction
-    // it splits into left_digests, left_root, right_root, right_digests, a
-    // disjoint partition of the whole slice, with the `n == 1` base case
-    // receiving an empty slice. This is the same argument that already licenses
-    // `capacity_up_to_mut` in `MerkleTree::cpu_digests`.
-    unsafe {
-        digests.set_len(digest_count);
-        cap.set_len(cap_count);
     }
     (digests, cap)
 }
 
 fn fill_subtree_layout<F: RichField>(
-    digests: &mut [core::mem::MaybeUninit<HashOut<F>>],
+    digests: &mut [HashOut<F>],
     nodes: &[u64],
     level_offsets: &[usize],
     start_leaf: usize,
@@ -1552,22 +1524,8 @@ fn fill_subtree_layout<F: RichField>(
     let (left_root, left_digests) = left_half.split_last_mut().unwrap();
     let (right_root, right_digests) = right_half.split_first_mut().unwrap();
     let half = leaf_count / 2;
-    // The two halves and the two root slots are a disjoint partition of
-    // `digests`, so every slot is initialized exactly once.
-    left_root.write(fill_subtree_layout(
-        left_digests,
-        nodes,
-        level_offsets,
-        start_leaf,
-        half,
-    ));
-    right_root.write(fill_subtree_layout(
-        right_digests,
-        nodes,
-        level_offsets,
-        start_leaf + half,
-        half,
-    ));
+    *left_root = fill_subtree_layout(left_digests, nodes, level_offsets, start_leaf, half);
+    *right_root = fill_subtree_layout(right_digests, nodes, level_offsets, start_leaf + half, half);
 
     let level = leaf_count.ilog2() as usize;
     read_node(nodes, level_offsets[level], start_leaf / leaf_count)

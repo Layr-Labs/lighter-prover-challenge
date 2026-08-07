@@ -4,10 +4,11 @@ use alloc::{format, vec::Vec};
 use itertools::Itertools;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
+use plonky2_util::fill_bit_reversed;
 
-use crate::field::batch_util::batch_multiply_inplace;
+use crate::field::batch_util::batch_multiply_to;
 use crate::field::extension::Extendable;
-use crate::field::fft::{fft_in_place_with_options, FftRootTable};
+use crate::field::fft::{fft_in_place_with_options_prefix_bit_reversed, FftRootTable};
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
@@ -239,21 +240,37 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // with the packed batch multiply over the precomputed table.
                 let lde_len = degree << rate_bits;
                 let mut buffer = Vec::with_capacity(lde_len);
-                buffer.extend_from_slice(&p.coeffs);
+                // SAFETY: capacity is exactly `lde_len`. `fill_bit_reversed`
+                // below writes every element of the live prefix. With
+                // `Some(rate_bits)` the zero-padded FFT reads only the first
+                // `degree` coefficients and writes every tail element before
+                // reading it (all expansion paths fill back-to-front), so the
+                // tail never needs the memset; the excluded cases (`rate_bits
+                // == 0`, and `degree < 2`, where the first-layer block writes
+                // nothing for a single live coefficient) zero it explicitly.
+                unsafe { buffer.set_len(lde_len) };
+                // Three passes over the live prefix fused into one: the copy of
+                // `p.coeffs` into the LDE buffer, the coset-shift multiply, and
+                // the first (chunk-permutation) step of the FFT's bit-reversal.
+                // `fill_bit_reversed` hands out the prefix one chunk at a time,
+                // already at its permuted home, and `batch_multiply_to` writes
+                // `coeffs * power` straight into it. Bit-identical to
+                // copy/multiply/reverse: same packed split and same `Mul` on the
+                // same operands, and the skipped reversal step is a pure
+                // relabelling of chunks.
+                fill_bit_reversed(&mut buffer[..degree], |out, start| {
+                    let len = out.len();
+                    batch_multiply_to(
+                        out,
+                        &p.coeffs[start..start + len],
+                        &coset_powers[start..start + len],
+                    );
+                });
                 if rate_bits == 0 || degree < 2 {
-                    buffer.resize(lde_len, F::ZERO);
-                } else {
-                    // SAFETY: capacity is exactly `lde_len`. With `Some(rate_bits)`
-                    // the zero-padded FFT reads only the first `degree` coefficients
-                    // and writes every tail element before reading it (all expansion
-                    // paths fill back-to-front), so the tail never needs the memset.
-                    // `degree < 2` is excluded: the first-layer block writes nothing
-                    // for a single live coefficient.
-                    unsafe { buffer.set_len(lde_len) };
+                    buffer[degree..].fill(F::ZERO);
                 }
-                batch_multiply_inplace(&mut buffer[..degree], &coset_powers);
                 PolynomialCoeffs::new(buffer)
-                    .fft_with_options(Some(rate_bits), fft_root_table)
+                    .fft_with_options_prefix_bit_reversed(Some(rate_bits), fft_root_table)
                     .values
             })
             .chain(
@@ -284,15 +301,28 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .zip(polynomials.par_iter())
             .for_each(|(destination, polynomial)| {
                 assert_eq!(polynomial.len(), degree, "Polynomial degrees inconsistent");
-                destination[..degree].copy_from_slice(&polynomial.coeffs);
+                // Same three-pass prefix fusion as `lde_values`, writing
+                // straight into the retained shared column buffer: one pass
+                // produces `coeffs * coset_power` at its bit-reversed home.
+                fill_bit_reversed(&mut destination[..degree], |out, start| {
+                    let len = out.len();
+                    batch_multiply_to(
+                        out,
+                        &polynomial.coeffs[start..start + len],
+                        &coset_powers[start..start + len],
+                    );
+                });
                 if rate_bits == 0 || degree < 2 {
                     destination[degree..].fill(F::ZERO);
                 }
                 // For a nontrivial zero-padded FFT, the expansion path writes
                 // every tail element before reading it. This is the same
                 // invariant used by `lde_values` to avoid a dead tail memset.
-                batch_multiply_inplace(&mut destination[..degree], &coset_powers);
-                fft_in_place_with_options(destination, Some(rate_bits), fft_root_table);
+                fft_in_place_with_options_prefix_bit_reversed(
+                    destination,
+                    Some(rate_bits),
+                    fft_root_table,
+                );
             });
         true
     }
@@ -529,30 +559,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // the clone-then-resize that `lde(&self)` performs.
         let mut lde_final_poly = final_poly;
         let live_coeffs = lde_final_poly.len();
-        let lde_len = live_coeffs << fri_params.config.rate_bits;
-        // Only a prefix of the padded tail is ever read. `coset_fft_zero_tail`
-        // consumes `[..live_coeffs]`; the first commit round then folds
-        // `[..live_chunks * arity]`, i.e. `live_coeffs` rounded up to the first
-        // round's arity, after which `coeffs` is replaced wholesale by the
-        // folded vector and this buffer is dropped. Zero-fill exactly that read
-        // window instead of the whole `8x` buffer — for a d18 block proof the
-        // deleted memset is 28 MiB per proof (~7 MiB at d16), all of it either
-        // immediately overwritten or never touched.
-        let first_arity = 1usize
-            << fri_params
-                .reduction_arity_bits
-                .first()
-                .copied()
-                .unwrap_or(0);
-        let read_bound = live_coeffs.next_multiple_of(first_arity).min(lde_len);
-        lde_final_poly.coeffs.reserve_exact(lde_len - live_coeffs);
-        lde_final_poly.coeffs.resize(read_bound, F::Extension::ZERO);
-        // SAFETY: `reserve_exact` guarantees capacity `lde_len`, and every
-        // element in `[0, read_bound)` is initialized above. Elements beyond
-        // `read_bound` are never read: the zero-tail FFT consumes only the live
-        // prefix, and the fold consumes only `[..live_chunks * arity]`, which is
-        // `<= read_bound`. Same pattern as the promoted `lde_values` fast path.
-        unsafe { lde_final_poly.coeffs.set_len(lde_len) };
+        lde_final_poly
+            .coeffs
+            .resize(live_coeffs << fri_params.config.rate_bits, F::Extension::ZERO);
         let lde_final_values = timed!(
             timing,
             &format!("perform final FFT {}", lde_final_poly.len()),
@@ -955,6 +964,319 @@ mod tests {
 
             assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
             assert_eq!(raw(&actual.coeffs), raw(&expected_in_place.coeffs));
+        }
+    }
+
+    /// `lde_values` builds its LDE buffer with a single fused
+    /// copy / coset-multiply / bit-reverse pass instead of `extend_from_slice`,
+    /// `batch_multiply_inplace` and the FFT's own prefix reversal. The result
+    /// must be bit-identical (raw u64) to that verbatim pre-fusion sequence at
+    /// every rate, including the two branches that still need an explicit tail
+    /// memset (`rate_bits == 0`, `degree < 2`) and the `degree == 2` boundary
+    /// just above them.
+    #[test]
+    fn fused_lde_buffer_matches_prefusion_sequence() {
+        use crate::field::batch_util::batch_multiply_inplace;
+        use crate::field::types::PrimeField64;
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        /// The exact pre-fusion body of `lde_values`.
+        fn reference(polynomials: &[PolynomialCoeffs<F>], rate_bits: usize) -> Vec<Vec<F>> {
+            let degree = polynomials[0].len();
+            let coset_powers = crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
+            polynomials
+                .iter()
+                .map(|p| {
+                    let lde_len = degree << rate_bits;
+                    let mut buffer = Vec::with_capacity(lde_len);
+                    buffer.extend_from_slice(&p.coeffs);
+                    if rate_bits == 0 || degree < 2 {
+                        buffer.resize(lde_len, F::ZERO);
+                    } else {
+                        // SAFETY: as in the pre-fusion `lde_values`.
+                        unsafe { buffer.set_len(lde_len) };
+                    }
+                    batch_multiply_inplace(&mut buffer[..degree], &coset_powers);
+                    PolynomialCoeffs::new(buffer)
+                        .fft_with_options(Some(rate_bits), None)
+                        .values
+                })
+                .collect()
+        }
+
+        fn raw(values: &[Vec<F>]) -> Vec<Vec<u64>> {
+            values
+                .iter()
+                .map(|column| column.iter().map(|x| x.to_noncanonical_u64()).collect())
+                .collect()
+        }
+
+        // 2^13 and below keep the prefix on `reverse_index_bits_in_place`'s
+        // small path; 2^14..2^17 exceed `SMALL_ARR_SIZE` and take the chunked
+        // path the fusion actually rewrites, with the odd exponents covering
+        // its two-transpose case.
+        for lg_degree in [0usize, 1, 2, 3, 5, 8, 11, 12, 13, 14, 15, 16, 17] {
+            let degree = 1usize << lg_degree;
+            let num_polys = if lg_degree >= 14 { 2 } else { 3 };
+            let polynomials = (0..num_polys)
+                .map(|_| PolynomialCoeffs::new(F::rand_vec(degree)))
+                .collect::<Vec<_>>();
+            for rate_bits in 0..=3usize {
+                let expected = reference(&polynomials, rate_bits);
+                let actual =
+                    PolynomialBatch::<F, C, D>::lde_values(&polynomials, rate_bits, false, None);
+                assert_eq!(
+                    raw(&actual),
+                    raw(&expected),
+                    "LDE mismatch at degree 2^{lg_degree}, rate_bits {rate_bits}"
+                );
+            }
+        }
+    }
+
+    /// Stage-level micro-benchmark for the `lde_values` column body, at the two
+    /// production shapes (degree 2^16 for the pipelined chunk circuits, 2^14
+    /// for the serial chain circuits). One column at a time, on the calling
+    /// thread — `lde_values` fans its columns out over `par_iter`, and at one
+    /// column that fan-out costs far more than the fusion it wraps, so the
+    /// rayon plumbing is excluded here rather than measured. Four arms rotated
+    /// through the slot order every repetition:
+    ///
+    /// * **A (pre-fusion)** `extend_from_slice`, `batch_multiply_inplace`,
+    ///   then the FFT (which bit-reverses the prefix itself);
+    /// * **A' (null)** a byte-identical second copy of A, whose spread against
+    ///   A is the measurement floor on this box;
+    /// * **B (half fusion)** `batch_multiply_to` writing coeffs*power straight
+    ///   into the uninitialised buffer, then the same FFT;
+    /// * **C (full fusion, shipped)** `fill_bit_reversed` + `batch_multiply_to`
+    ///   into the permuted homes, then the pre-reversed FFT entry.
+    ///
+    /// The isolated prefix benchmark (`plonky2_field`'s `micro_lde_prefix`)
+    /// reuses one buffer across iterations; here every arm allocates a fresh
+    /// LDE buffer per column exactly as the prover does, so first-touch order
+    /// is part of the measurement. Ignored by default; run with
+    /// `cargo test --release -p plonky2 --lib micro_lde_values -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn micro_lde_values() {
+        use std::time::Instant;
+
+        use plonky2_util::fill_bit_reversed;
+
+        use crate::field::batch_util::batch_multiply_inplace;
+
+        type F = GoldilocksField;
+
+        /// Arm A: the exact pre-fusion column body of `lde_values`.
+        fn arm_a(coeffs: &[F], coset_powers: &[F], rate_bits: usize) -> Vec<F> {
+            let degree = coeffs.len();
+            let lde_len = degree << rate_bits;
+            let mut buffer = Vec::with_capacity(lde_len);
+            buffer.extend_from_slice(coeffs);
+            unsafe { buffer.set_len(lde_len) };
+            batch_multiply_inplace(&mut buffer[..degree], coset_powers);
+            PolynomialCoeffs::new(buffer)
+                .fft_with_options(Some(rate_bits), None)
+                .values
+        }
+
+        /// Arm A': a byte-identical second copy of arm A. Its spread against A
+        /// is the measurement floor, which matters because the effect under
+        /// test is well under 1%.
+        fn arm_a_null(coeffs: &[F], coset_powers: &[F], rate_bits: usize) -> Vec<F> {
+            let degree = coeffs.len();
+            let lde_len = degree << rate_bits;
+            let mut buffer = Vec::with_capacity(lde_len);
+            buffer.extend_from_slice(coeffs);
+            unsafe { buffer.set_len(lde_len) };
+            batch_multiply_inplace(&mut buffer[..degree], coset_powers);
+            PolynomialCoeffs::new(buffer)
+                .fft_with_options(Some(rate_bits), None)
+                .values
+        }
+
+        /// Arm B: fuse only copy+multiply; the FFT still bit-reverses.
+        fn arm_b(coeffs: &[F], coset_powers: &[F], rate_bits: usize) -> Vec<F> {
+            let degree = coeffs.len();
+            let lde_len = degree << rate_bits;
+            let mut buffer = Vec::with_capacity(lde_len);
+            unsafe { buffer.set_len(lde_len) };
+            batch_multiply_to(&mut buffer[..degree], coeffs, coset_powers);
+            PolynomialCoeffs::new(buffer)
+                .fft_with_options(Some(rate_bits), None)
+                .values
+        }
+
+        /// Arm C: the shipped column body.
+        fn arm_c(coeffs: &[F], coset_powers: &[F], rate_bits: usize) -> Vec<F> {
+            let degree = coeffs.len();
+            let lde_len = degree << rate_bits;
+            let mut buffer = Vec::with_capacity(lde_len);
+            unsafe { buffer.set_len(lde_len) };
+            fill_bit_reversed(&mut buffer[..degree], |out, start| {
+                let len = out.len();
+                batch_multiply_to(
+                    out,
+                    &coeffs[start..start + len],
+                    &coset_powers[start..start + len],
+                );
+            });
+            PolynomialCoeffs::new(buffer)
+                .fft_with_options_prefix_bit_reversed(Some(rate_bits), None)
+                .values
+        }
+
+        for lg_degree in [14usize, 16] {
+            let degree = 1usize << lg_degree;
+            let coeffs = F::rand_vec(degree);
+            let coset_powers = crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
+
+            const REPS: usize = 41;
+            let mut best = [f64::MAX; 4];
+            let mut ratios: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            let mut sink = 0u64;
+            for rep in 0..REPS {
+                let mut t = [0.0f64; 4];
+                for slot in 0..4 {
+                    let arm = (slot + rep) % 4;
+                    let start = Instant::now();
+                    let out = match arm {
+                        0 => arm_a(&coeffs, &coset_powers, 3),
+                        1 => arm_a_null(&coeffs, &coset_powers, 3),
+                        2 => arm_b(&coeffs, &coset_powers, 3),
+                        _ => arm_c(&coeffs, &coset_powers, 3),
+                    };
+                    t[arm] = start.elapsed().as_secs_f64();
+                    sink = sink.wrapping_add(out[0].0 ^ out[out.len() - 1].0);
+                }
+
+                if rep > 2 {
+                    for k in 0..4 {
+                        best[k] = best[k].min(t[k]);
+                    }
+                    for k in 0..3 {
+                        ratios[k].push(t[0] / t[k + 1]);
+                    }
+                }
+            }
+            let labels = ["null(pre)", "B(mul_to)", "C(shipped)"];
+            print!(
+                "degree=2^{lg_degree} rate_bits=3  A(pre)={:8.1}us",
+                best[0] * 1e6
+            );
+            for k in 0..3 {
+                ratios[k].sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let wins = ratios[k].iter().filter(|r| **r > 1.0).count();
+                print!(
+                    "  {}={:8.1}us min={:5.3}x med-paired={:5.3}x wins {wins}/{}",
+                    labels[k],
+                    best[k + 1] * 1e6,
+                    best[0] / best[k + 1],
+                    ratios[k][ratios[k].len() / 2],
+                    ratios[k].len()
+                );
+            }
+            println!("  sink={}", sink & 1);
+        }
+
+        // The production path is `fill_lde_column_store`, which writes into a
+        // caller-owned destination rather than a fresh `Vec`. Timed twice: with
+        // a destination allocated fresh for every call (what
+        // `Hasher::try_allocate_merkle_tree_columns` does today — every
+        // commitment gets a brand new Metal buffer) and with one destination
+        // reused across calls, which isolates the fusion from first-touch page
+        // faults. Arms: A (copy + multiply-in-place + in-place FFT), A' (null),
+        // C (fill_bit_reversed + batch_multiply_to + pre-reversed in-place FFT).
+        println!("-- column-store body --");
+        fn store_arm_a(dst: &mut [F], coeffs: &[F], coset_powers: &[F], rate_bits: usize) {
+            let degree = coeffs.len();
+            dst[..degree].copy_from_slice(coeffs);
+            batch_multiply_inplace(&mut dst[..degree], coset_powers);
+            crate::field::fft::fft_in_place_with_options(dst, Some(rate_bits), None);
+        }
+        fn store_arm_a_null(dst: &mut [F], coeffs: &[F], coset_powers: &[F], rate_bits: usize) {
+            let degree = coeffs.len();
+            dst[..degree].copy_from_slice(coeffs);
+            batch_multiply_inplace(&mut dst[..degree], coset_powers);
+            crate::field::fft::fft_in_place_with_options(dst, Some(rate_bits), None);
+        }
+        fn store_arm_c(dst: &mut [F], coeffs: &[F], coset_powers: &[F], rate_bits: usize) {
+            let degree = coeffs.len();
+            fill_bit_reversed(&mut dst[..degree], |out, start| {
+                let len = out.len();
+                batch_multiply_to(
+                    out,
+                    &coeffs[start..start + len],
+                    &coset_powers[start..start + len],
+                );
+            });
+            fft_in_place_with_options_prefix_bit_reversed(dst, Some(rate_bits), None);
+        }
+
+        for lg_degree in [14usize, 16] {
+            for reuse in [false, true] {
+                let degree = 1usize << lg_degree;
+                let lde_len = degree << 3;
+                let coeffs = F::rand_vec(degree);
+                let coset_powers =
+                    crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
+                let mut reused: Vec<F> = Vec::with_capacity(lde_len);
+                unsafe { reused.set_len(lde_len) };
+
+                const REPS: usize = 41;
+                let mut best = [f64::MAX; 3];
+                let mut ratios: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+                let mut sink = 0u64;
+                for rep in 0..REPS {
+                    let mut t = [0.0f64; 3];
+                    for slot in 0..3 {
+                        let arm = (slot + rep) % 3;
+                        let mut fresh: Vec<F> = Vec::with_capacity(if reuse { 0 } else { lde_len });
+                        if !reuse {
+                            unsafe { fresh.set_len(lde_len) };
+                        }
+                        let dst: &mut [F] = if reuse { &mut reused } else { &mut fresh };
+                        let start = Instant::now();
+                        match arm {
+                            0 => store_arm_a(dst, &coeffs, &coset_powers, 3),
+                            1 => store_arm_a_null(dst, &coeffs, &coset_powers, 3),
+                            _ => store_arm_c(dst, &coeffs, &coset_powers, 3),
+                        }
+                        t[arm] = start.elapsed().as_secs_f64();
+                        sink = sink.wrapping_add(dst[0].0 ^ dst[lde_len - 1].0);
+                    }
+                    if rep > 2 {
+                        for k in 0..3 {
+                            best[k] = best[k].min(t[k]);
+                        }
+                        for k in 0..2 {
+                            ratios[k].push(t[0] / t[k + 1]);
+                        }
+                    }
+                }
+                let labels = ["null(pre)", "C(shipped)"];
+                print!(
+                    "degree=2^{lg_degree} {:<14} A(pre)={:8.1}us",
+                    if reuse { "reused-dst" } else { "fresh-dst" },
+                    best[0] * 1e6
+                );
+                for k in 0..2 {
+                    ratios[k].sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let wins = ratios[k].iter().filter(|r| **r > 1.0).count();
+                    print!(
+                        "  {}={:8.1}us min={:5.3}x med-paired={:5.3}x wins {wins}/{}",
+                        labels[k],
+                        best[k + 1] * 1e6,
+                        best[0] / best[k + 1],
+                        ratios[k][ratios[k].len() / 2],
+                        ratios[k].len()
+                    );
+                }
+                println!("  sink={}", sink & 1);
+            }
         }
     }
 }

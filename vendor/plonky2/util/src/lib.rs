@@ -233,6 +233,62 @@ pub fn reverse_index_bits_in_place<T>(arr: &mut [T]) {
     }
 }
 
+/// Fill `dst` with the bit-reversal of a sequence a producer writes on demand.
+///
+/// `fill(out, start)` must write logical elements `start .. start + out.len()`
+/// of the unpermuted sequence into `out`; `fill` is called on disjoint,
+/// power-of-two-aligned windows that together cover `0..dst.len()` exactly
+/// once. On return, `dst[reverse_bits(i)] == logical[i]`.
+///
+/// This is a *pass fusion*: [`reverse_index_bits_in_place`]'s large-array path
+/// is `chunk-permute -> transpose -> chunk-permute`, and its first step is
+/// nothing but a relabelling of whole chunks. A producer that writes each
+/// chunk to its permuted home performs that step for free, so the sequence
+/// "materialize the buffer, then bit-reverse it" loses one full read+write
+/// sweep. The remaining steps are the untouched originals, and step one is a
+/// pure permutation of chunks either way, so the result is bit-identical to
+/// `fill(dst, 0); reverse_index_bits_in_place(dst)`.
+pub fn fill_bit_reversed<T>(dst: &mut [T], mut fill: impl FnMut(&mut [T], usize)) {
+    let n = dst.len();
+    let lb_n = log2_strict(n);
+
+    // Mirror `reverse_index_bits_in_place`'s dispatch exactly: on the small
+    // path the chunked decomposition does not apply, so fall back to
+    // materialize-then-reverse.
+    if size_of::<T>() << lb_n <= SMALL_ARR_SIZE || size_of::<T>() >= BIG_T_SIZE {
+        fill(dst, 0);
+        unsafe {
+            reverse_index_bits_in_place_small(dst, lb_n);
+        }
+        return;
+    }
+
+    debug_assert!(n >= 4);
+    let lb_num_chunks = lb_n >> 1;
+    let lb_chunk_size = lb_n - lb_num_chunks;
+    let chunk_size = 1 << lb_chunk_size;
+
+    // Step 1, fused into the producer: logical chunk `i` is written straight
+    // into slot `reverse_bits(i)`. Reads stay sequential in the producer's
+    // source and every write is a full contiguous chunk.
+    for i in 0..1usize << lb_num_chunks {
+        let j = i
+            .reverse_bits()
+            .wrapping_shr(usize::BITS - lb_num_chunks as u32);
+        fill(&mut dst[j * chunk_size..(j + 1) * chunk_size], i * chunk_size);
+    }
+
+    // Steps 2 and 3, verbatim from `reverse_index_bits_in_place`.
+    unsafe {
+        transpose_in_place_square(dst, lb_chunk_size, lb_num_chunks, 0);
+        if lb_num_chunks != lb_chunk_size {
+            let dst_with_offset = &mut dst[1 << lb_num_chunks..];
+            transpose_in_place_square(dst_with_offset, lb_chunk_size, lb_num_chunks, 0);
+        }
+        reverse_index_bits_in_place_chunks(dst, lb_num_chunks, lb_chunk_size);
+    }
+}
+
 // Lookup table of 6-bit reverses.
 // NB: 2^6=64 bytes is a cacheline. A smaller table wastes cache space.
 #[rustfmt::skip]
@@ -329,6 +385,46 @@ mod tests {
                     assert_eq!(got, expect);
                 }
             }
+        }
+    }
+
+    /// `fill_bit_reversed` must be indistinguishable from materializing the
+    /// sequence and then bit-reversing it, on both dispatch paths (small
+    /// arrays and the chunked large-array path) and for both even and odd
+    /// `log2(len)`, where the large path performs a second transpose. `u64`
+    /// exercises the exact element size the field buffers use.
+    #[test]
+    fn fill_bit_reversed_matches_fill_then_reverse() {
+        // 2^1..2^7 stay on the small path; 2^13..2^18 (64 KiB..2 MiB of u64)
+        // are past `SMALL_ARR_SIZE` and take the chunked path, with odd
+        // exponents covering the two-transpose case.
+        for lb_n in [0usize, 1, 2, 3, 7, 13, 14, 15, 16, 17, 18] {
+            let n = 1usize << lb_n;
+            let logical: Vec<u64> = (0..n as u64)
+                .map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+                .collect();
+
+            let mut expect = logical.clone();
+            super::reverse_index_bits_in_place(&mut expect);
+
+            // A chunk-granular producer, as a real caller would supply.
+            let mut actual = vec![0u64; n];
+            super::fill_bit_reversed(&mut actual, |out, start| {
+                out.copy_from_slice(&logical[start..start + out.len()]);
+            });
+            assert_eq!(actual, expect, "chunked producer at 2^{lb_n}");
+
+            // The windows must tile `0..n` exactly once.
+            let mut covered = vec![0u32; n];
+            super::fill_bit_reversed(&mut vec![0u64; n], |out, start| {
+                for k in 0..out.len() {
+                    covered[start + k] += 1;
+                }
+            });
+            assert!(
+                covered.iter().all(|&c| c == 1),
+                "windows do not tile 0..n at 2^{lb_n}"
+            );
         }
     }
 
