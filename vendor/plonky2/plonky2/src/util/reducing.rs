@@ -84,56 +84,65 @@ impl<F: Field> ReducingFactor<F> {
 
     pub fn reduce_polys_base<BF: Extendable<D, Extension = F>, const D: usize>(
         &mut self,
-        polys: impl IntoIterator<Item = impl Borrow<PolynomialCoeffs<BF>> + Sync>,
+        polys: impl IntoIterator<Item = impl Borrow<PolynomialCoeffs<BF>>>,
     ) -> PolynomialCoeffs<F>
     where
         F: FieldExtension<D, BaseField = BF>,
     {
-        // Fused multiply-accumulate: each base coefficient is read exactly
-        // once and multiplied by its polynomial's power of the reducing base.
-        // For the large opening batches this runs on the serial per-proof
-        // spine, so split the polynomials into chunks reduced in parallel and
-        // then sum the per-chunk partial vectors. Coefficient `i` of the
-        // result is `sum_j base^j * c_{j,i}` either way — field addition is
-        // exact, commutative and associative, so regrouping the sum by chunk
-        // produces the identical field element for every coefficient.
+        // Fused multiply-accumulate: one extension accumulator, each base
+        // coefficient read exactly once. Equivalent to the old
+        // `map(mul_extension).sum()` (field arithmetic is exact and the
+        // per-power scalar products are accumulated in the same order), but
+        // without one degree-sized temporary allocation + two clone passes per
+        // polynomial.
+        // The accumulator slots are mutually independent, so this sweep — the
+        // largest remaining single-threaded pass on the per-proof spine, ~250
+        // polynomials by degree, once per opening batch in every proof — is
+        // split by *slot range* across workers. Within each range every
+        // polynomial is applied in ascending index order against the same
+        // `base.powers()` chain, so each slot receives exactly the same
+        // sequence of `+= scalar_mul(base^j, coeffs[j][i])` operations, in the
+        // same order, as the serial loop; only the mapping of slots to threads
+        // changes. The base's first-polynomial direct construction is retained
+        // and generalized: slot `i` is *initialized* from the first polynomial
+        // that reaches it rather than zero-filled and then added into.
         let polys: Vec<_> = polys.into_iter().collect();
-        let num_polys = polys.len();
-        let max_len = polys
+        let slices: Vec<&[BF]> = polys
             .iter()
-            .map(|p| p.borrow().coeffs.len())
-            .max()
-            .unwrap_or(0);
-        let base_powers: Vec<F> = self.base.powers().take(num_polys).collect();
-        self.count += num_polys as u64;
+            .map(|poly| poly.borrow().coeffs.as_slice())
+            .collect();
+        let max_len = slices.iter().map(|coeffs| coeffs.len()).max().unwrap_or(0);
+        // Materialized so every worker reads the identical serial power chain.
+        let powers: Vec<F> = self.base.powers().take(slices.len()).collect();
+        self.count += slices.len() as u64;
 
-        let accumulate_chunk = |ps: &[_], powers: &[F]| -> Vec<F> {
-            let mut acc: Vec<F> = vec![F::ZERO; max_len];
-            for (base_power, poly) in powers.iter().zip(ps) {
-                let coeffs: &PolynomialCoeffs<BF> = Borrow::borrow(poly);
-                for (a, &c) in acc.iter_mut().zip(coeffs.coeffs.iter()) {
+        let mut acc: Vec<F> = vec![F::ZERO; max_len];
+        // Wide enough to amortize per-range polynomial bookkeeping, small
+        // enough to keep each worker's window of `acc` cache-resident.
+        const SLOT_BLOCK: usize = 2048;
+        if slices.len() > 1 && max_len >= 2 * SLOT_BLOCK {
+            acc.par_chunks_mut(SLOT_BLOCK)
+                .enumerate()
+                .for_each(|(block, out)| {
+                    let start = block * SLOT_BLOCK;
+                    for (base_power, coeffs) in powers.iter().zip(&slices) {
+                        // The serial loop's `zip` stops at the shorter of the
+                        // accumulator and this polynomial, so slots at or past
+                        // `coeffs.len()` receive nothing from it.
+                        if coeffs.len() <= start {
+                            continue;
+                        }
+                        let live = (coeffs.len() - start).min(out.len());
+                        for (a, &c) in out[..live].iter_mut().zip(&coeffs[start..start + live]) {
+                            *a += <F as FieldExtension<D>>::scalar_mul(base_power, c);
+                        }
+                    }
+                });
+        } else {
+            for (base_power, coeffs) in powers.iter().zip(&slices) {
+                for (a, &c) in acc.iter_mut().zip(coeffs.iter()) {
                     *a += <F as FieldExtension<D>>::scalar_mul(base_power, c);
                 }
-            }
-            acc
-        };
-
-        // Small batches (the `g * zeta` batch has two polynomials) are not
-        // worth the parallel dispatch or the partial-vector merge.
-        const PARALLEL_CHUNK: usize = 16;
-        if num_polys <= PARALLEL_CHUNK {
-            return PolynomialCoeffs::new(accumulate_chunk(&polys, &base_powers));
-        }
-
-        let partials: Vec<Vec<F>> = polys
-            .par_chunks(PARALLEL_CHUNK)
-            .zip(base_powers.par_chunks(PARALLEL_CHUNK))
-            .map(|(ps, powers)| accumulate_chunk(ps, powers))
-            .collect();
-        let mut acc = vec![F::ZERO; max_len];
-        for partial in partials {
-            for (a, p) in acc.iter_mut().zip(partial) {
-                *a += p;
             }
         }
         PolynomialCoeffs::new(acc)
@@ -416,5 +425,70 @@ mod tests {
     #[test]
     fn test_reduce_gadget_100() -> Result<()> {
         test_reduce_gadget(100)
+    }
+
+    /// The direct-construction first term in `reduce_polys_base` must be
+    /// raw-`u64` identical to the grow-and-zero-then-accumulate form it
+    /// replaced, including when the first polynomial is empty or shorter than a
+    /// later one (so the accumulator still has to grow mid-fold).
+    #[test]
+    fn reduce_polys_base_matches_grow_and_zero() {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type FF = <C as GenericConfig<D>>::FE;
+
+        // Reference: the pre-change body, verbatim.
+        fn legacy(alpha: FF, lens: &[usize], polys: &[PolynomialCoeffs<F>]) -> Vec<FF> {
+            let mut rf = ReducingFactor::new(alpha);
+            let mut acc: Vec<FF> = Vec::new();
+            for (base_power, poly) in rf.base.powers().zip(polys.iter()) {
+                rf.count += 1;
+                let coeffs = &poly.coeffs;
+                if coeffs.len() > acc.len() {
+                    acc.resize(coeffs.len(), FF::ZERO);
+                }
+                for (a, &c) in acc.iter_mut().zip(coeffs.iter()) {
+                    *a += <FF as FieldExtension<D>>::scalar_mul(&base_power, c);
+                }
+            }
+            let _ = lens;
+            acc
+        }
+
+        // Length shapes: uniform, growing (first shortest), shrinking, an empty
+        // first polynomial, all empty, and the empty batch.
+        let shapes: Vec<Vec<usize>> = vec![
+            vec![],
+            vec![0],
+            vec![0, 0, 0],
+            vec![8],
+            vec![4, 4, 4, 4],
+            vec![1, 3, 7, 16],
+            vec![16, 7, 3, 1],
+            vec![0, 5, 2, 9],
+            vec![0, 0, 6],
+        ];
+
+        for lens in &shapes {
+            let alpha = FF::rand();
+            let polys: Vec<PolynomialCoeffs<F>> = lens
+                .iter()
+                .map(|&n| PolynomialCoeffs::new(F::rand_vec(n)))
+                .collect();
+
+            let expected = legacy(alpha, lens, &polys);
+            let actual =
+                ReducingFactor::new(alpha).reduce_polys_base::<F, D>(polys.iter());
+
+            assert_eq!(actual.coeffs.len(), expected.len(), "length for {lens:?}");
+            for (i, (a, e)) in actual.coeffs.iter().zip(expected.iter()).enumerate() {
+                let a: [F; D] = a.to_basefield_array();
+                let e: [F; D] = e.to_basefield_array();
+                for d in 0..D {
+                    assert_eq!(a[d].0, e[d].0, "coeff {i} limb {d} for {lens:?}");
+                }
+            }
+        }
     }
 }

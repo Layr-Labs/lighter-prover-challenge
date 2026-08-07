@@ -348,7 +348,17 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
             }};
         }
 
-        let mut states = vec![[F::ZERO; WIDTH]; n];
+        // Like the constraint-row scratch above: batches are 32 points, so the
+        // per-point permutation states live on the stack too, with a heap
+        // fallback only for oversized batches.
+        let mut states_stack = [[F::ZERO; WIDTH]; 64];
+        let mut states_heap;
+        let states: &mut [[F; WIDTH]] = if n <= 64 {
+            &mut states_stack[..n]
+        } else {
+            states_heap = vec![[F::ZERO; WIDTH]; n];
+            &mut states_heap
+        };
 
         // Assert that `swap` is binary.
         let swap = col(Self::WIRE_SWAP);
@@ -638,6 +648,37 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
     }
 }
 
+/// Returns the four `delta` wire values for a Poseidon2 row, and whether the
+/// generator must apply the input swap.
+///
+/// `WIRE_SWAP` is constrained Boolean by the gate, so the generic product
+/// `swap * (state[i + 4] - state[i])` can only ever evaluate to `0` or to the
+/// plain difference. Branching once on the wire value and emitting the closed
+/// form deletes the four field multiplications per permutation (and, in the
+/// `ZERO` arm, the four subtractions too).
+///
+/// The gate *constraints* enforce booleanness, but the generator runs during
+/// witness generation, before any constraint is checked, so a caller that wires
+/// a non-Boolean value into `WIRE_SWAP` reaches this code with it (outside
+/// debug builds, where `debug_assert` catches it). The final arm therefore
+/// keeps the original product form verbatim: the generated witness stays
+/// value-identical to the pre-specialization code for *every* input, not just
+/// Boolean ones, and such a witness still fails the gate's own Boolean
+/// constraint downstream exactly as before.
+#[inline]
+fn swap_deltas<F: Field>(state: &[F; WIDTH], swap_value: F) -> ([F; 4], bool) {
+    if swap_value == F::ZERO {
+        ([F::ZERO; 4], false)
+    } else if swap_value == F::ONE {
+        (core::array::from_fn(|i| state[i + 4] - state[i]), true)
+    } else {
+        (
+            core::array::from_fn(|i| swap_value * (state[i + 4] - state[i])),
+            false,
+        )
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Poseidon2Generator<F: RichField + Extendable<D> + Poseidon2, const D: usize> {
     row: usize,
@@ -676,12 +717,12 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> SimpleGenerator<F
         let swap_value = witness.get_wire(local_wire(Poseidon2Gate::<F, D>::WIRE_SWAP));
         debug_assert!(swap_value == F::ZERO || swap_value == F::ONE);
 
+        let (deltas, do_swap) = swap_deltas(&state, swap_value);
         for i in 0..4 {
-            let delta_i = swap_value * (state[i + 4] - state[i]);
-            out_buffer.set_wire(local_wire(Poseidon2Gate::<F, D>::wire_delta(i)), delta_i)?;
+            out_buffer.set_wire(local_wire(Poseidon2Gate::<F, D>::wire_delta(i)), deltas[i])?;
         }
 
-        if swap_value == F::ONE {
+        if do_swap {
             for i in 0..4 {
                 state.swap(i, 4 + i);
             }
@@ -757,6 +798,7 @@ mod tests {
 
     use super::{Poseidon2Gate, *};
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::Sample;
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
     use crate::gates::poseidon::PoseidonGate;
     use crate::iop::generator::generate_partial_witness;
@@ -888,5 +930,113 @@ mod tests {
         let mut actual = vec![F::ZERO; expected.len()];
         gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
         assert_eq!(actual, expected);
+    }
+
+    /// The Boolean-specialized `swap_deltas` must be raw-`u64` identical to the
+    /// unconditional `swap * (state[i + 4] - state[i])` product it replaced —
+    /// on both Boolean wire values *and* on non-Boolean ones, which the
+    /// fallback arm still has to reproduce because witness generation runs
+    /// before any constraint check.
+    #[test]
+    fn swap_deltas_matches_product_form() {
+        type F = GoldilocksField;
+
+        let mut swaps = vec![F::ZERO, F::ONE, F::TWO, F::NEG_ONE];
+        swaps.extend((0..8).map(|_| F::rand()));
+
+        for trial in 0..16 {
+            let state: [F; WIDTH] =
+                core::array::from_fn(|i| F::from_canonical_usize(trial * WIDTH + i) * F::rand());
+
+            for &swap_value in &swaps {
+                // Reference: the pre-specialization code, verbatim.
+                let expected: [F; 4] =
+                    core::array::from_fn(|i| swap_value * (state[i + 4] - state[i]));
+                let expected_swap = swap_value == F::ONE;
+
+                let (actual, do_swap) = swap_deltas(&state, swap_value);
+                assert_eq!(do_swap, expected_swap, "swap flag for {swap_value}");
+                for i in 0..4 {
+                    assert_eq!(actual[i].0, expected[i].0, "delta {i} for {swap_value}");
+                }
+            }
+        }
+    }
+
+    /// End-to-end through the real generator: for each Boolean `WIRE_SWAP`
+    /// value, every `delta` and `output` wire the generator writes must equal
+    /// the reference permutation applied to the (conditionally swapped) inputs.
+    #[test]
+    fn generated_deltas_and_outputs_for_both_swap_values() {
+        const D: usize = 2;
+        type C = Poseidon2GoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type Gate = Poseidon2Gate<F, D>;
+
+        let config = CircuitConfig {
+            num_wires: 143,
+            ..CircuitConfig::standard_recursion_config()
+        };
+        let mut builder = CircuitBuilder::new(config);
+        let row = builder.add_gate(Gate::new(), vec![]);
+        let circuit = builder.build_prover::<C>();
+
+        for swap_value in [F::ZERO, F::ONE] {
+            let permutation_inputs: [F; WIDTH] =
+                core::array::from_fn(|i| F::from_canonical_usize(7 * i + 3));
+
+            let mut inputs = PartialWitness::new();
+            inputs
+                .set_wire(
+                    Wire {
+                        row,
+                        column: Gate::WIRE_SWAP,
+                    },
+                    swap_value,
+                )
+                .unwrap();
+            for i in 0..WIDTH {
+                inputs
+                    .set_wire(
+                        Wire {
+                            row,
+                            column: Gate::wire_input(i),
+                        },
+                        permutation_inputs[i],
+                    )
+                    .unwrap();
+            }
+
+            let witness =
+                generate_partial_witness(inputs, &circuit.prover_only, &circuit.common).unwrap();
+
+            let mut swapped = permutation_inputs;
+            if swap_value == F::ONE {
+                for i in 0..4 {
+                    swapped.swap(i, 4 + i);
+                }
+            }
+            let expected_outputs: [F; WIDTH] = F::poseidon2(swapped);
+
+            for i in 0..4 {
+                let expected =
+                    swap_value * (permutation_inputs[i + 4] - permutation_inputs[i]);
+                let got = witness.get_wire(Wire {
+                    row,
+                    column: Gate::wire_delta(i),
+                });
+                assert_eq!(got.0, expected.0, "delta {i} for swap = {swap_value}");
+            }
+            for i in 0..WIDTH {
+                let got = witness.get_wire(Wire {
+                    row,
+                    column: Gate::wire_output(i),
+                });
+                assert_eq!(
+                    got.0, expected_outputs[i].0,
+                    "output {i} for swap = {swap_value}"
+                );
+            }
+        }
     }
 }
