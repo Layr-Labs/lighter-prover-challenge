@@ -32,8 +32,10 @@ enum TxPath {
     Light,
 }
 
-const LIGHT_TX_PROOF_WINDOW: usize = 2;
+const LIGHT_TX_PROOF_WINDOW: usize = 3;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
+// Once that path drains, admit a third light transaction proof so the 64-core
+// official host spends less time below saturation while the chain spine runs.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
 fn chunk_is_light(txs: &[Tx<F>]) -> bool {
