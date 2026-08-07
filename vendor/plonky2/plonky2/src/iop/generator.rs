@@ -222,16 +222,50 @@ fn run_generator_worklist<
             continue;
         }
 
-        for &generator_idx in &pending_generator_indices {
+        // Some ready simple generators reduce an extension-field division to one
+        // base-field inverse. Gather those independent inverse inputs once per
+        // sequential round and replace N scalar inversions with one Montgomery
+        // batch inversion. The prepared payload is read from the same witness
+        // snapshot; every dependency is already populated and immutable.
+        let mut batch_works = Vec::new();
+        for (position, &generator_idx) in pending_generator_indices.iter().enumerate() {
+            if generator_is_expired[generator_idx] || unresolved_watches[generator_idx] != 0 {
+                continue;
+            }
+            if let Some(work) = generators[generator_idx].0.prepare_batch_inverse(witness) {
+                batch_works.push((position, work));
+            }
+        }
+        let inverse_inputs = batch_works
+            .iter()
+            .map(|(_, work)| work.inverse_input)
+            .collect::<Vec<_>>();
+        let inverse_values = F::batch_multiplicative_inverse(&inverse_inputs);
+        let mut batch_works = batch_works.into_iter().zip(inverse_values).peekable();
+
+        for (position, &generator_idx) in pending_generator_indices.iter().enumerate() {
             if generator_is_expired[generator_idx] {
                 continue;
             }
 
-            let finished = generators[generator_idx].0.run_with_ready_hint(
-                witness,
-                &mut buffer,
-                unresolved_watches[generator_idx] == 0,
-            );
+            let finished = if batch_works
+                .peek()
+                .is_some_and(|((batch_position, _), _)| *batch_position == position)
+            {
+                let ((_, work), inverse) = batch_works.next().unwrap();
+                generators[generator_idx].0.run_with_batch_inverse(
+                    witness,
+                    &work,
+                    inverse,
+                    &mut buffer,
+                )
+            } else {
+                generators[generator_idx].0.run_with_ready_hint(
+                    witness,
+                    &mut buffer,
+                    unresolved_watches[generator_idx] == 0,
+                )
+            };
             if finished {
                 generator_is_expired[generator_idx] = true;
                 *remaining_generators -= 1;
@@ -445,6 +479,25 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
         self.run(witness, out_buffer)
     }
 
+    /// Optionally prepare a base-field inverse that can be batched with other
+    /// ready generators in the same witness round.
+    #[doc(hidden)]
+    fn prepare_batch_inverse(&self, _witness: &PartitionWitness<F>) -> Option<BatchInverseWork<F>> {
+        None
+    }
+
+    /// Finish a generator using the batch-computed inverse for its prepared work.
+    #[doc(hidden)]
+    fn run_with_batch_inverse(
+        &self,
+        _witness: &PartitionWitness<F>,
+        _work: &BatchInverseWork<F>,
+        _inverse: F,
+        _out_buffer: &mut GeneratedValues<F>,
+    ) -> bool {
+        false
+    }
+
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()>;
 
     fn deserialize(src: &mut Buffer, common_data: &CommonCircuitData<F, D>) -> IoResult<Self>
@@ -482,6 +535,15 @@ impl<F: RichField + Extendable<D>, const D: usize> Debug for WitnessGeneratorRef
 #[derive(Debug)]
 pub struct GeneratedValues<F: Field> {
     pub target_values: Vec<(Target, F)>,
+}
+
+/// Fixed-size payload for a generator whose expensive base-field inverse can
+/// be shared through a Montgomery batch. The ten auxiliary values are enough
+/// for a quintic numerator and its inversion cofactor without heap allocation.
+#[derive(Debug)]
+pub struct BatchInverseWork<F: Field> {
+    pub inverse_input: F,
+    pub auxiliary: [F; 10],
 }
 
 impl<F: Field> From<Vec<(Target, F)>> for GeneratedValues<F> {
@@ -543,6 +605,20 @@ pub trait SimpleGenerator<F: RichField + Extendable<D>, const D: usize>:
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()>;
 
+    fn prepare_batch_inverse(&self, _witness: &PartitionWitness<F>) -> Option<BatchInverseWork<F>> {
+        None
+    }
+
+    fn run_with_batch_inverse(
+        &self,
+        _witness: &PartitionWitness<F>,
+        _work: &BatchInverseWork<F>,
+        _inverse: F,
+        _out_buffer: &mut GeneratedValues<F>,
+    ) -> Result<()> {
+        Err(anyhow!("generator does not support batch inversion"))
+    }
+
     fn adapter(self) -> SimpleGeneratorAdapter<F, Self, D>
     where
         Self: Sized,
@@ -596,6 +672,22 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
         all_watches_populated: bool,
     ) -> bool {
         all_watches_populated && self.inner.run_once(witness, out_buffer).is_ok()
+    }
+
+    fn prepare_batch_inverse(&self, witness: &PartitionWitness<F>) -> Option<BatchInverseWork<F>> {
+        self.inner.prepare_batch_inverse(witness)
+    }
+
+    fn run_with_batch_inverse(
+        &self,
+        witness: &PartitionWitness<F>,
+        work: &BatchInverseWork<F>,
+        inverse: F,
+        out_buffer: &mut GeneratedValues<F>,
+    ) -> bool {
+        self.inner
+            .run_with_batch_inverse(witness, work, inverse, out_buffer)
+            .is_ok()
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {

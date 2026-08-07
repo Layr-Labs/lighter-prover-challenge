@@ -100,39 +100,13 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // buffer directly (leaf `i` is the `arity`-chunk of the bit-reversed
         // codeword starting at `i * arity`), instead of a random-access
         // in-place permutation followed by a separate flattening pass with a
-        // heap allocation per element. The gather is a pure permutation —
-        // output slot `i` reads only `values[reverse_bits(i, log_n)]` — so
-        // the output rows are carved into disjoint `MaybeUninit` chunks
-        // written in parallel (the same `capacity_up_to_mut` pattern the
-        // Merkle tree builder uses); every slot is written exactly once
-        // before the final `set_len`, and the buffer contents are
-        // element-for-element identical to the serial pass.
+        // heap allocation per element.
         let n = values.values.len();
         let log_n = log2_strict(n);
-        const GATHER_ROWS_PER_TASK: usize = 4096;
         let mut flat_values: Vec<F> = Vec::with_capacity(n * D);
-        {
-            let spare =
-                crate::hash::merkle_tree::capacity_up_to_mut(&mut flat_values, n * D);
-            let src = &values.values;
-            spare
-                .par_chunks_mut(GATHER_ROWS_PER_TASK * D)
-                .enumerate()
-                .for_each(|(chunk_index, chunk)| {
-                    let first_row = chunk_index * GATHER_ROWS_PER_TASK;
-                    for (row, slot) in chunk.chunks_exact_mut(D).enumerate() {
-                        let x = src[reverse_bits(first_row + row, log_n)].to_basefield_array();
-                        for (s, v) in slot.iter_mut().zip(x) {
-                            s.write(v);
-                        }
-                    }
-                });
-        }
-        // SAFETY: `n * D` is a multiple of `D`, every chunk above is a whole
-        // number of `D`-sized rows, and the disjoint chunks cover all
-        // `n * D` slots, each written exactly once.
-        unsafe {
-            flat_values.set_len(n * D);
+        for i in 0..n {
+            let x = values.values[reverse_bits(i, log_n)];
+            flat_values.extend_from_slice(&x.to_basefield_array());
         }
         let tree = MerkleTree::<F, C::Hasher>::new_flat(
             flat_values,

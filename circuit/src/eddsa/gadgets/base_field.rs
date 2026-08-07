@@ -10,7 +10,7 @@ use plonky2::field::extension::quintic::QuinticExtension;
 use plonky2::field::extension::{Extendable, FieldExtension};
 use plonky2::field::types::{Field, PrimeField64};
 use plonky2::hash::hash_types::RichField;
-use plonky2::iop::generator::{GeneratedValues, SimpleGenerator};
+use plonky2::iop::generator::{BatchInverseWork, GeneratedValues, SimpleGenerator};
 use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_data::CommonCircuitData;
@@ -1043,6 +1043,54 @@ impl<F: RichField + Extendable<5> + Extendable<D>, const D: usize> SimpleGenerat
             out_buffer.set_target(lhs, rhs)?;
         }
 
+        Ok(())
+    }
+
+    fn prepare_batch_inverse(&self, witness: &PartitionWitness<F>) -> Option<BatchInverseWork<F>> {
+        let numerator = self
+            .numerator
+            .to_target_array()
+            .map(|target| witness.get_target(target));
+        let denominator = QuinticExtension::<F>::from_basefield_array(
+            self.denominator
+                .to_target_array()
+                .map(|target| witness.get_target(target)),
+        );
+        let (cofactor, norm) = denominator.inverse_norm_parts()?;
+        let cofactor: [F; 5] =
+            <QuinticExtension<F> as FieldExtension<5>>::to_basefield_array(&cofactor);
+        let mut auxiliary = [F::ZERO; 10];
+        auxiliary[..5].copy_from_slice(&numerator);
+        auxiliary[5..].copy_from_slice(&cofactor);
+        Some(BatchInverseWork {
+            inverse_input: norm,
+            auxiliary,
+        })
+    }
+
+    fn run_with_batch_inverse(
+        &self,
+        _witness: &PartitionWitness<F>,
+        work: &BatchInverseWork<F>,
+        inverse_norm: F,
+        out_buffer: &mut GeneratedValues<F>,
+    ) -> Result<()> {
+        let numerator_limbs: [F; 5] = work.auxiliary[..5].try_into().unwrap();
+        let cofactor_limbs: [F; 5] = work.auxiliary[5..].try_into().unwrap();
+        let numerator = <QuinticExtension<F> as FieldExtension<5>>::from_basefield_array(
+            numerator_limbs,
+        );
+        let cofactor = <QuinticExtension<F> as FieldExtension<5>>::from_basefield_array(
+            cofactor_limbs,
+        );
+        let denominator_inverse =
+            QuinticExtension::<F>::finish_inverse_from_norm(cofactor, inverse_norm);
+        let quotient = numerator * denominator_inverse;
+        for (target, value) in self.quotient.to_target_array().into_iter().zip(
+            <QuinticExtension<F> as FieldExtension<5>>::to_basefield_array(&quotient),
+        ) {
+            out_buffer.set_target(target, value)?;
+        }
         Ok(())
     }
 
