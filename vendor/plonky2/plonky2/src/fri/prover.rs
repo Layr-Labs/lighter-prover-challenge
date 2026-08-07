@@ -251,16 +251,46 @@ pub(crate) fn fri_proof_of_work<
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
-        .into_par_iter()
-        .find_any(|&candidate| {
-            let mut duplex_state = duplex_intermediate_state;
-            duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-            duplex_state.permute();
-            let pow_response = duplex_state.squeeze().iter().last().unwrap();
-            let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-            leading_zeros >= min_leading_zeros
-        })
+    // Deterministic parallel grind: scan fixed blocks of candidates in order,
+    // evaluate each block fully in parallel, and take the *minimum* satisfying
+    // candidate of the first non-empty block — which is the globally smallest
+    // valid nonce, independent of thread scheduling.
+    //
+    // The two obvious alternatives both fail one requirement each. `find_any`
+    // (upstream) returns whichever worker wins the race: fast (~expected
+    // 2^pow_bits/threads permutations of wall time) but nondeterministic — the
+    // nonce, and with it the FRI query indices and every downstream proof
+    // byte, differ run to run on identical witnesses. `find_first` is
+    // deterministic but its wall time is pinned to the first-position hit:
+    // ~2^pow_bits permutations on a single thread (~13 ms at 16 bits) while
+    // the remaining workers burn pool capacity the saturated pipeline needs —
+    // ranked draws measured that at several percent end to end. The blocked
+    // scan is deterministic by construction and keeps the block's permutations
+    // spread across the pool: expected total work is ~1.6 blocks of 2^16, and
+    // wall time is within ~2x of `find_any`'s.
+    const POW_SCAN_BLOCK: u64 = 1 << 16;
+    let max_candidate = F::NEG_ONE.to_canonical_u64();
+    let mut pow_witness = None;
+    let mut block_start = 0u64;
+    while pow_witness.is_none() {
+        let block_end = block_start.saturating_add(POW_SCAN_BLOCK - 1).min(max_candidate);
+        pow_witness = (block_start..=block_end)
+            .into_par_iter()
+            .filter(|&candidate| {
+                let mut duplex_state = duplex_intermediate_state;
+                duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+                duplex_state.permute();
+                let pow_response = duplex_state.squeeze().iter().last().unwrap();
+                let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
+                leading_zeros >= min_leading_zeros
+            })
+            .min();
+        if block_end == max_candidate {
+            break;
+        }
+        block_start = block_end + 1;
+    }
+    let pow_witness = pow_witness
         .map(F::from_canonical_u64)
         .expect("Proof of work failed. This is highly unlikely!");
 

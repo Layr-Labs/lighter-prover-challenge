@@ -224,14 +224,7 @@ impl Field for GoldilocksField {
     #[inline]
     fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
         // u64 + u64 * u64 cannot overflow.
-        #[cfg(target_arch = "aarch64")]
-        {
-            Self(mul_acc_reduce(self.0, x.0, y.0))
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            reduce128((self.0 as u128) + (x.0 as u128) * (y.0 as u128))
-        }
+        reduce128((self.0 as u128) + (x.0 as u128) * (y.0 as u128))
     }
 }
 
@@ -451,59 +444,6 @@ fn reduce128_with_96_bits(x: u128) -> GoldilocksField {
     GoldilocksField(t2)
 }
 
-/// `reduce128(acc + a * b)` in eleven AArch64 instructions, computing bit-for-bit
-/// the same intermediates — and therefore the same non-canonical `u64`
-/// representative — as the portable expression it replaces.
-///
-/// The widening multiply and the 128-bit accumulate are four instructions
-/// (`mul`/`umulh` for the product, `adds`/`adc` to fold `acc` in with its carry;
-/// the sum cannot overflow 128 bits because `(2^64-1)^2 + (2^64-1) < 2^128`).
-/// The remaining seven are exactly the reduction the promoted `mul_reduce_pair`
-/// already uses:
-///
-/// * `subs {res}, {lo}, {hi}, lsr #32` folds the shift that isolates `x_hi_hi`
-///   into the subtraction's shifted-register operand.
-/// * `csetm {t:w}, cc` materialises `EPSILON` (a `W`-register `csetm` is
-///   `0x00000000FFFFFFFF`) exactly on the borrow, so the rare-borrow correction
-///   stays branchless instead of taking `reduce128`'s `branch_hint` path.
-/// * `umull {t}, {hi:w}, {epsilon:w}` is `(x_hi & EPSILON) * EPSILON` in one
-///   widening 32x32 multiply; both factors are below `2^32`, so it is exact.
-/// * `adds` / `csetm {t:w}, cs` / `add` is `add_no_canonicalize_trashing_input`.
-///
-/// The two conditional folds stay separate for the same reason they do there:
-/// merging them would give a value congruent mod `ORDER` but with a different
-/// `u64` representative, and `GoldilocksField` is compared and hashed raw.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn mul_acc_reduce(acc: u64, a: u64, b: u64) -> u64 {
-    let mut result = a;
-    let scratch = b;
-
-    unsafe {
-        core::arch::asm!(
-            "umulh {hi}, {result}, {scratch}",
-            "mul   {result}, {result}, {scratch}",
-            "adds  {result}, {result}, {acc}",
-            "adc   {hi}, {hi}, xzr",
-            "umull {scratch}, {hi:w}, {epsilon:w}",
-            "subs  {result}, {result}, {hi}, lsr #32",
-            "csetm {hi:w}, cc",
-            "sub   {result}, {result}, {hi}",
-            "adds  {result}, {result}, {scratch}",
-            "csetm {scratch:w}, cs",
-            "add   {result}, {result}, {scratch}",
-            result = inout(reg) result,
-            scratch = inout(reg) scratch => _,
-            hi = out(reg) _,
-            acc = in(reg) acc,
-            epsilon = in(reg) GoldilocksField::ORDER.wrapping_neg(),
-            options(pure, nomem, nostack),
-        );
-    }
-
-    result
-}
-
 /// Reduces to a 64-bit value. The result might not be in canonical form; it could be in between the
 /// field order and `2^64`.
 #[inline]
@@ -616,108 +556,6 @@ mod tests {
 
     test_prime_field_arithmetic!(crate::goldilocks_field::GoldilocksField);
     test_field_arithmetic!(crate::goldilocks_field::GoldilocksField);
-
-    /// Differential test for the AArch64 `multiply_accumulate` inline assembly
-    /// against the portable expression it replaces.
-    ///
-    /// The contract is raw-`u64` equality, not congruence mod `ORDER`:
-    /// `GoldilocksField` stores non-canonical representatives and is compared
-    /// and hashed in that raw form, so a value that is merely congruent would
-    /// corrupt witness comparisons and Merkle digests downstream.
-    #[cfg(target_arch = "aarch64")]
-    mod multiply_accumulate_differential {
-        use crate::goldilocks_field::GoldilocksField;
-        use crate::types::Field;
-
-        /// The exact expression the aarch64 path replaces.
-        #[inline(never)]
-        fn reference(acc: u64, a: u64, b: u64) -> u64 {
-            super::super::reduce128((acc as u128) + (a as u128) * (b as u128)).0
-        }
-
-        #[inline(never)]
-        fn candidate(acc: u64, a: u64, b: u64) -> u64 {
-            Field::multiply_accumulate(
-                &GoldilocksField(acc),
-                GoldilocksField(a),
-                GoldilocksField(b),
-            )
-            .0
-        }
-
-        fn check(acc: u64, a: u64, b: u64) {
-            assert_eq!(
-                candidate(acc, a, b),
-                reference(acc, a, b),
-                "multiply_accumulate({acc:#x}, {a:#x}, {b:#x})"
-            );
-        }
-
-        /// Values chosen to exercise every branch of the reduction: the borrow
-        /// in `x_lo - x_hi_hi`, the carry out of the final addition, the
-        /// `EPSILON` boundaries of the 32-bit split, and the non-canonical
-        /// range between `ORDER` and `2^64`.
-        const EDGES: &[u64] = &[
-            0,
-            1,
-            2,
-            0xFFFF_FFFF,             // EPSILON
-            0x1_0000_0000,           // 2^32
-            0x1_0000_0001,
-            0xFFFF_FFFE_FFFF_FFFF,
-            0xFFFF_FFFF_0000_0000,
-            0xFFFF_FFFF_0000_0001,   // ORDER
-            0xFFFF_FFFF_0000_0002,   // non-canonical
-            0xFFFF_FFFF_FFFF_FFFE,
-            u64::MAX,                // non-canonical
-        ];
-
-        #[test]
-        fn matches_reference_on_edges() {
-            for &acc in EDGES {
-                for &a in EDGES {
-                    for &b in EDGES {
-                        check(acc, a, b);
-                    }
-                }
-            }
-        }
-
-        #[test]
-        fn matches_reference_on_random_inputs() {
-            // xorshift64*, so the test needs no rng dependency and is reproducible.
-            let mut s: u64 = 0x2545_F491_4F6C_DD1D;
-            let mut next = move || {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                s
-            };
-            for _ in 0..2_000_000 {
-                check(next(), next(), next());
-            }
-        }
-
-        /// Mixed random/edge triples: a random accumulator against boundary
-        /// operands is where a wrong carry fold hides.
-        #[test]
-        fn matches_reference_on_mixed_inputs() {
-            let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
-            let mut next = move || {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                s
-            };
-            for _ in 0..200_000 {
-                for &e in EDGES {
-                    check(next(), e, next());
-                    check(e, next(), next());
-                    check(next(), next(), e);
-                }
-            }
-        }
-    }
 
     mod try_inverse_differential {
         //! Differential tests: the new Euclidean `try_inverse` against the historical

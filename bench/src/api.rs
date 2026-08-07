@@ -1,4 +1,3 @@
-// Redraw marker 36
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
@@ -10,7 +9,6 @@ use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, BlockTxChainTarge
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _};
 use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
-use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::proof::ProofWithPublicInputs;
 
@@ -79,6 +77,10 @@ impl PathCircuits {
 }
 
 impl Circuits {
+    /// Builds every circuit before any proving starts. The scored binary uses
+    /// the pipelined startup in `prover::prove_block_pipelined` instead; this
+    /// stays for the reference orchestration and the differential oracle.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         let ((pre_target, pre_data), (heavy, light)) = rayon::join(
             || {
@@ -105,46 +107,6 @@ impl Circuits {
             light_chain_data: light.chain_data,
             dummy_heavy_proof: heavy.dummy_proof,
             dummy_light_proof: light.dummy_proof,
-        }
-    }
-
-    /// Releases the extended (LDE) constants/sigmas commitment of every circuit
-    /// whose proving has already finished when the final block proof starts.
-    ///
-    /// `ProverOnlyCircuitData::constants_sigmas_commitment` holds a rate-`2^3`
-    /// low-degree extension of that circuit's preprocessed columns, built once
-    /// at circuit-build time and otherwise kept alive for the whole process. It
-    /// is read only by proofs *of that circuit* — the quotient evaluation's
-    /// `fill_lde_batch` and the FRI query openings — so once the pre-execution
-    /// proof and both transaction chains have produced their proofs, the
-    /// pre-execution, transaction and chain extensions are unreachable: the
-    /// final block proof reads only `block_data`, those three finished proofs
-    /// and the block itself.
-    ///
-    /// Those five extensions are `2 * 2^19 * 88 + 3 * 2^17 * 86` field elements
-    /// = 1.01 GB, and on this host they are resident in CPU-visible Metal
-    /// shared buffers whose release returns the pages to the OS immediately.
-    /// The final block proof is the process's peak-RSS moment — it stacks its
-    /// own `2^21`-row wires, Z and quotient extensions (2.89 GB) on top of
-    /// every retained extension — so releasing these first takes 1.01 GB
-    /// straight off the high-water mark.
-    ///
-    /// Nothing else is released here. Generators, representative maps and
-    /// witness buffers are CPU-heap objects, and this binary runs jemalloc with
-    /// `dirty_decay_ms:-1,muzzy_decay_ms:-1`: freeing them cannot lower RSS,
-    /// while their recursive drop is not free.
-    ///
-    /// Value-exact: no quantity is computed differently, only storage that no
-    /// subsequent read can reach is returned early.
-    pub fn release_finished_circuit_extensions(&mut self) {
-        for data in [
-            &mut self.pre_data,
-            &mut self.light_tx_data,
-            &mut self.heavy_tx_data,
-            &mut self.light_chain_data,
-            &mut self.heavy_chain_data,
-        ] {
-            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
         }
     }
 

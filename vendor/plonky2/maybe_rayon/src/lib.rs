@@ -240,6 +240,10 @@ pub trait ParallelIteratorMock {
     where
         P: Fn(&Self::Item) -> bool + Sync + Send;
 
+    fn find_first<P>(self, predicate: P) -> Option<Self::Item>
+    where
+        P: Fn(&Self::Item) -> bool + Sync + Send;
+
     fn flat_map_iter<U, F>(self, map_op: F) -> FlatMap<Self, U, F>
     where
         Self: Sized,
@@ -252,6 +256,13 @@ impl<T: Iterator> ParallelIteratorMock for T {
     type Item = T::Item;
 
     fn find_any<P>(mut self, predicate: P) -> Option<Self::Item>
+    where
+        P: Fn(&Self::Item) -> bool + Sync + Send,
+    {
+        self.find(predicate)
+    }
+
+    fn find_first<P>(mut self, predicate: P) -> Option<Self::Item>
     where
         P: Fn(&Self::Item) -> bool + Sync + Send,
     {
