@@ -92,6 +92,22 @@ impl Circuits {
                 )
             },
         );
+        let mut light = light;
+        // Cache the light transaction circuit's gate filter columns.
+        //
+        // A gate's filter over the quotient domain is a deterministic function
+        // of the circuit alone — the selector constant column it reads is a
+        // column of `constants_sigmas_commitment`, and the gate row, selector
+        // group and selector count are circuit constants — so the filter values
+        // the quotient evaluation derives are bit-identical in every proof of a
+        // given circuit, yet are recomputed from scratch in each one.
+        //
+        // Only this circuit opts in: it is proved 49 times per block against 3
+        // for the heavy transaction circuit and one each for the pre-execution,
+        // chain and block circuits, so it carries essentially all of the
+        // available saving while paying for the storage once. The columns are
+        // released with the extensions below, before the peak-RSS block proof.
+        light.tx_data.prover_only.gate_filters.set_enabled(true);
         Self {
             heavy_tx_target: heavy.tx_target,
             heavy_tx_data: heavy.tx_data,
@@ -145,6 +161,10 @@ impl Circuits {
             &mut self.heavy_chain_data,
         ] {
             data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            // Same reachability argument, applied to the derived gate filter
+            // columns: they are read only by proofs of their own circuit, all of
+            // which have finished here.
+            data.prover_only.gate_filters.clear();
         }
     }
 

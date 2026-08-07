@@ -316,6 +316,52 @@ where
     assert_eq!(actual, expected, "gate {}", gate.id());
 }
 
+/// Same differential as [`assert_direct_accumulation_matches_materialized_batch`]
+/// but at a caller-chosen batch size, and starting from a non-zero accumulator
+/// so that the override is forced to *add* rather than overwrite.
+///
+/// Hand-written accumulate overrides typically size a stack scratch buffer for
+/// the batch sizes this prover actually uses and fall back to the heap above a
+/// threshold; passing batch sizes on both sides of that threshold exercises
+/// both arms. It also catches column-indexing mistakes that a single fixed
+/// batch size can alias past.
+pub fn assert_accumulate_matches_materialized_at_batch_size<G>(gate: &G, n: usize)
+where
+    G: Gate<GoldilocksField, 2>,
+{
+    type F = GoldilocksField;
+
+    let wires = (0..gate.num_wires() * n)
+        .map(|i| F::from_canonical_usize(3 * i + 5))
+        .collect::<Vec<_>>();
+    let constants = (0..gate.num_constants() * n)
+        .map(|i| F::from_canonical_usize(7 * i + 11))
+        .collect::<Vec<_>>();
+    let hash = HashOut::ZERO;
+    let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+    let filters = (0..n)
+        .map(|i| F::from_canonical_usize(2 * i + 1))
+        .collect::<Vec<_>>();
+
+    // Non-zero seed: the contract is `combined += filter * constraint`, so an
+    // override that overwrites instead of accumulating must fail here.
+    let seed = (0..gate.num_constraints() * n)
+        .map(|i| F::from_canonical_usize(13 * i + 17))
+        .collect::<Vec<_>>();
+
+    let mut expected = seed.clone();
+    let materialized = gate.eval_unfiltered_base_batch(vars);
+    for (acc, constraints) in expected
+        .chunks_exact_mut(n)
+        .zip(materialized.chunks_exact(n))
+    {
+        batch_multiply_add_inplace(acc, constraints, &filters);
+    }
+    let mut actual = seed;
+    gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+    assert_eq!(actual, expected, "gate {}, batch size {n}", gate.id());
+}
+
 pub fn assert_base_batch_matches_eval_unfiltered<G>(gate: &G)
 where
     G: Gate<GoldilocksField, 2>,
@@ -419,6 +465,24 @@ mod added_gate_tests {
     use super::assert_accumulate_matches_default;
 
 
+
+    #[test]
+    fn evaluate_sequence_accumulate_matches_default() {
+        use crate::delta::evaluate_sequence::EvaluateSequenceGate;
+
+        let gate =
+            EvaluateSequenceGate::new_from_config(&CircuitConfig::standard_recursion_config());
+        assert_accumulate_matches_default(&gate);
+    }
+
+    #[test]
+    fn evaluate_bitstream_accumulate_matches_default() {
+        use crate::blob::evaluate_bitstream::EvaluateBitstreamGate;
+
+        let gate =
+            EvaluateBitstreamGate::new_from_config(&CircuitConfig::standard_recursion_config());
+        assert_accumulate_matches_default(&gate);
+    }
 
     #[test]
     fn quintic_square_accumulate_matches_default() {

@@ -32,7 +32,7 @@ use crate::fri::structure::{
     FriPolynomialInfo,
 };
 use crate::fri::{FriConfig, FriParams};
-use crate::gates::gate::GateRef;
+use crate::gates::gate::{GateFilterCache, GateRef};
 use crate::gates::lookup::Lookup;
 use crate::gates::lookup_table::LookupTable;
 use crate::gates::selectors::SelectorsInfo;
@@ -486,6 +486,13 @@ pub struct ProverOnlyCircuitData<
     pub lookup_rows: Vec<LookupWire>,
     /// A vector of (looking_in, looking_out) pairs for each lookup table index.
     pub lut_to_lookups: Vec<Lookup>,
+    /// Cache of this circuit's gate filter columns over the quotient domain.
+    ///
+    /// Runtime-only and off by default: it carries no serialized bytes, is a
+    /// pure function of this circuit's gates, selectors and preprocessed
+    /// commitment, and is materialized lazily by the first proof of a circuit
+    /// that has opted in. See [`GateFilterCache`].
+    pub gate_filters: GateFilterCache<F>,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>

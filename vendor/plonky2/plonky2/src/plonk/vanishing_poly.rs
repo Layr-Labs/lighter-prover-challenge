@@ -276,6 +276,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     alphas: &[F],
     z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
+    cached_filters: Option<CachedFilters<'_, F>>,
     scratch: &mut VanishingScratch<F>,
     res_out: &mut [F],
 ) {
@@ -300,6 +301,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     evaluate_gate_constraints_base_batch_into::<F, D>(
         common_data,
         vars_batch,
+        cached_filters,
         &mut scratch.constraint_terms_batch,
     );
     let constraint_terms_batch = &scratch.constraint_terms_batch;
@@ -959,19 +961,90 @@ pub fn evaluate_gate_constraints_base_batch<F: RichField + Extendable<D>, const 
     vars_batch: EvaluationVarsBaseBatch<F>,
 ) -> Vec<F> {
     let mut constraints_batch = Vec::new();
-    evaluate_gate_constraints_base_batch_into::<F, D>(common_data, vars_batch, &mut constraints_batch);
+    evaluate_gate_constraints_base_batch_into::<F, D>(
+        common_data,
+        vars_batch,
+        None,
+        &mut constraints_batch,
+    );
     constraints_batch
 }
 
-/// Like [`evaluate_gate_constraints_base_batch`], but reuses the caller's buffer.
+/// A circuit's gate filter column cache, positioned at one batch of the
+/// quotient domain: `columns` is indexed by gate (an empty entry means "this
+/// gate is not cached") and `offset` is the index, within the quotient domain,
+/// of this batch's first point.
+#[derive(Clone, Copy)]
+pub(crate) struct CachedFilters<'a, F> {
+    pub columns: &'a [Vec<F>],
+    pub offset: usize,
+}
+
+impl<'a, F> CachedFilters<'a, F> {
+    /// This batch's slice of gate `gate_index`'s filter column, or `None` when
+    /// that gate is not cached.
+    fn gate(&self, gate_index: usize, n: usize) -> Option<&'a [F]> {
+        let column = self.columns.get(gate_index)?;
+        (!column.is_empty()).then(|| &column[self.offset..self.offset + n])
+    }
+}
+
+/// Like [`evaluate_gate_constraints_base_batch`], but reuses the caller's buffer
+/// and can take this batch's gate filters from the circuit's filter cache.
 pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
     vars_batch: EvaluationVarsBaseBatch<F>,
+    cached_filters: Option<CachedFilters<'_, F>>,
     constraints_batch: &mut Vec<F>,
 ) {
-    constraints_batch.clear();
-    constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
-    let mut filters = Vec::with_capacity(vars_batch.len());
+    let batch_size = vars_batch.len();
+    let num_rows = common_data.num_gate_constraints;
+
+    // Constraint row `j` takes a contribution from every gate whose
+    // `num_constraints()` exceeds `j`, accumulated in gate order. Walking the
+    // gates in that same order, gate `g` is the *first* writer of rows
+    // `running_max..g.num_constraints()` whenever that range is nonempty, and a
+    // pure accumulator into `0..running_max`. A first writer that honours
+    // `store_from` can **store** its first-written rows instead of accumulating
+    // into zeros — bit-identically, see
+    // `Gate::eval_unfiltered_base_batch_accumulate_store` — so only the rows
+    // whose first writer has not opted in still need zeroing. Gate order is
+    // never changed, so every row's summation order is exactly as before; the
+    // lazy Goldilocks `Add` does not canonicalize, so reordering here would
+    // *not* be raw-limb safe.
+    //
+    // The zero-fill this replaces is `num_gate_constraints * batch_size` stores
+    // on every batch (136 rows on the transaction circuits over a 2^19-point
+    // quotient domain, 123 on the chain circuits over 2^17) and it is a real
+    // inlined store loop, not a `memset` call.
+    //
+    // `resize` alone would leave a previous longer batch's values in rows it
+    // does not cover, so the length is fixed first and the rows that still need
+    // it are zeroed explicitly.
+    constraints_batch.resize(num_rows * batch_size, F::ZERO);
+    {
+        let mut running_max = 0usize;
+        for gate in common_data.gates.iter() {
+            let num_constraints = gate.0.num_constraints();
+            if num_constraints > running_max {
+                if !gate.0.supports_store_from() {
+                    constraints_batch[running_max * batch_size..num_constraints * batch_size]
+                        .fill(F::ZERO);
+                }
+                running_max = num_constraints;
+            }
+        }
+        // `num_gate_constraints` is the max over gates, so this tail is empty in
+        // practice; zero it anyway so the buffer is fully defined even if a
+        // circuit ever reports a larger row count than any gate writes.
+        debug_assert_eq!(running_max, num_rows);
+        if running_max < num_rows {
+            constraints_batch[running_max * batch_size..num_rows * batch_size].fill(F::ZERO);
+        }
+    }
+
+    let mut filters = Vec::with_capacity(batch_size);
+    let mut running_max = 0usize;
     for (i, gate) in common_data.gates.iter().enumerate() {
         let selector_index = common_data.selectors_info.selector_indices[i];
         gate.0.eval_filtered_base_batch(
@@ -981,9 +1054,12 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
             common_data.selectors_info.groups[selector_index].clone(),
             common_data.selectors_info.num_selectors(),
             common_data.num_lookup_selectors,
+            cached_filters.and_then(|c| c.gate(i, batch_size)),
             &mut filters,
             constraints_batch,
+            running_max,
         );
+        running_max = running_max.max(gate.0.num_constraints());
     }
 }
 
@@ -1198,6 +1274,133 @@ mod tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
 
     use super::*;
+
+    /// Store-on-first-write must be **raw-limb** identical to zero-fill-then-accumulate.
+    ///
+    /// Goldilocks does not canonicalize — `reduce128`'s own doc says the result
+    /// "might not be in canonical form" and `Add` is the lazy variant — so field-value
+    /// equality would not be good enough here; this compares `GoldilocksField.0`.
+    #[test]
+    fn store_on_first_write_matches_zero_fill_raw_limbs() {
+        use crate::field::types::{Field as _, Sample};
+        use crate::hash::hash_types::HashOut;
+        use crate::plonk::circuit_builder::CircuitBuilder;
+        use crate::plonk::circuit_data::CircuitConfig;
+        use crate::plonk::config::PoseidonGoldilocksConfig;
+        use crate::plonk::vars::EvaluationVarsBaseBatch;
+
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = GoldilocksField;
+
+        // A circuit with a spread of gate types, so `common.gates` contains both
+        // gates that opt into `store_from` and gates that do not, and so several
+        // distinct gates are the first writer of some constraint-row range.
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let x = builder.add_virtual_target();
+        let mut cur = x;
+        for i in 0..32 {
+            cur = builder.mul_add(cur, cur, x);
+            let c = builder.constant(F::from_canonical_usize(i + 1));
+            cur = builder.add(cur, c);
+            if i % 8 == 0 {
+                let bits = builder.split_le(cur, 32);
+                cur = builder.le_sum(bits.iter());
+            }
+        }
+        let h = builder.hash_n_to_hash_no_pad::<<C as crate::plonk::config::GenericConfig<D>>::InnerHasher>(vec![cur, x]);
+        builder.register_public_input(h.elements[0]);
+        let data = builder.build::<C>();
+        let common = &data.common;
+
+        let num_gates = common.gates.len();
+        let num_constants = common.num_constants;
+        let num_wires = common.config.num_wires;
+        let num_rows = common.num_gate_constraints;
+        assert!(num_gates > 1 && num_rows > 0);
+
+        // The old path, verbatim: zero the whole buffer, then every gate
+        // accumulates. `usize::MAX` means "store nothing".
+        fn reference(
+            common: &CommonCircuitData<F, D>,
+            vars_batch: EvaluationVarsBaseBatch<F>,
+            out: &mut Vec<F>,
+        ) {
+            out.clear();
+            out.resize(common.num_gate_constraints * vars_batch.len(), F::ZERO);
+            let mut filters = Vec::with_capacity(vars_batch.len());
+            for (i, gate) in common.gates.iter().enumerate() {
+                let selector_index = common.selectors_info.selector_indices[i];
+                gate.0.eval_filtered_base_batch(
+                    vars_batch,
+                    i,
+                    selector_index,
+                    common.selectors_info.groups[selector_index].clone(),
+                    common.selectors_info.num_selectors(),
+                    common.num_lookup_selectors,
+                    None,
+                    &mut filters,
+                    out,
+                    usize::MAX,
+                );
+            }
+        }
+
+        let public_inputs_hash = HashOut::<F>::rand();
+        // Batch sizes straddling the packed width (4) and its multiples, so the
+        // packed body, the leftover tail, and a batch shorter than one packed
+        // vector are all exercised.
+        for &n in &[1usize, 2, 3, 4, 5, 7, 8, 31, 32, 33] {
+            let mut local_constants = F::rand_vec(num_constants * n);
+            let local_wires = F::rand_vec(num_wires * n);
+
+            // Force real selector values into the selector columns so that some
+            // points filter to exactly zero for most gates — the case where a
+            // stored row must still write zero rather than be skipped. Point `p`
+            // is assigned to gate `p % num_gates`; the rest stay random.
+            for selector in 0..common.selectors_info.num_selectors() {
+                for p in 0..n {
+                    if p % 2 == 0 {
+                        local_constants[selector * n + p] =
+                            F::from_canonical_usize((p / 2) % num_gates);
+                    }
+                }
+            }
+
+            let vars_batch = EvaluationVarsBaseBatch::new(
+                n,
+                &local_constants,
+                &local_wires,
+                &public_inputs_hash,
+            );
+
+            let mut expected = Vec::new();
+            reference(common, vars_batch, &mut expected);
+
+            // Reuse one buffer across batch sizes, and prime it with garbage, so a
+            // stale slot from a previous longer batch would surface here.
+            let mut actual: Vec<F> = F::rand_vec(num_rows * 33);
+            evaluate_gate_constraints_base_batch_into::<F, D>(common, vars_batch, None, &mut actual);
+
+            assert_eq!(actual.len(), expected.len(), "length mismatch at n={n}");
+            for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(
+                    a.0,
+                    e.0,
+                    "raw-limb mismatch at n={n}, row={}, point={}",
+                    i / n,
+                    i % n
+                );
+            }
+            // A buffer that came out all-zero would satisfy the comparison
+            // vacuously and hide a store that never ran.
+            assert!(
+                actual.iter().any(|v| v.0 != 0),
+                "constraint buffer is entirely zero at n={n}; the differential would be vacuous"
+            );
+        }
+    }
 
     #[test]
     fn constraint_major_reduction_preserves_pointwise_horner_order() {

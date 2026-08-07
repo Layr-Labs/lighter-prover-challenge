@@ -15,6 +15,7 @@ use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::fri::oracle::{BatchLayout, PolynomialBatch};
+use crate::gates::gate::{fill_filter_column, filter_is_trivial};
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
 use crate::gates::selectors::LookupSelectors;
@@ -29,7 +30,7 @@ use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{
-    eval_vanishing_poly_base_batch, get_lut_poly, PermutationBatch, VanishingScratch,
+    eval_vanishing_poly_base_batch, get_lut_poly, CachedFilters, PermutationBatch, VanishingScratch,
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
@@ -755,6 +756,59 @@ fn compute_all_lookup_polys<
 
 const BATCH_SIZE: usize = 32;
 
+/// Materializes every gate's filter column over the quotient domain, for the
+/// circuit described by `common_data`.
+///
+/// The values are produced by [`fill_filter_column`], the same function the
+/// per-batch evaluator calls, over the same selector column values the per-batch
+/// evaluator gathers (`fill_lde_batch` on the leading `num_selectors` columns of
+/// `constants_range()`, which is where `eval_filtered_base_batch` reads its
+/// selector from). Each output element is an independent product chain over its
+/// own selector value, so cutting the domain into whole-column runs here rather
+/// than 32-point batches leaves every element raw-limb identical.
+///
+/// Gates whose filter is the constant one (`filter_is_trivial`) get an empty
+/// entry: caching them would store a domain-sized run of ones to save nothing.
+fn build_gate_filter_columns<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    constants_sigmas_commitment: &PolynomialBatch<F, C, D>,
+    lde_size: usize,
+    step: usize,
+) -> Vec<Vec<F>> {
+    let selectors_info = &common_data.selectors_info;
+    let num_selectors = selectors_info.num_selectors();
+    let indices: Vec<usize> = (0..lde_size).collect();
+    let mut selector_cols = Vec::new();
+    constants_sigmas_commitment.fill_lde_batch(
+        &indices,
+        step,
+        0..num_selectors,
+        BatchLayout::PolyMajor,
+        &mut selector_cols,
+    );
+    drop(indices);
+
+    let columns = (0..common_data.gates.len())
+        .into_par_iter()
+        .map(|row| {
+            let selector_index = selectors_info.selector_indices[row];
+            let group_range = selectors_info.groups[selector_index].clone();
+            if filter_is_trivial(row, group_range.clone(), num_selectors) {
+                return Vec::new();
+            }
+            let selector_col = &selector_cols[selector_index * lde_size..][..lde_size];
+            let mut column = Vec::with_capacity(lde_size);
+            fill_filter_column(row, group_range, num_selectors, selector_col, &mut column);
+            column
+        })
+        .collect();
+    columns
+}
+
 /// Test-only switch: when set, `compute_quotient_polys` evaluates the quotient
 /// values twice — once through the default column-major (`PolyMajor`)
 /// permutation path and once through the per-point (`PointMajor`) reference
@@ -870,6 +924,22 @@ fn compute_quotient_polys<
 
     let lut_re_poly_evals_refs: Vec<&[F]> =
         lut_re_poly_evals.iter().map(|v| v.as_slice()).collect();
+
+    // Per-circuit gate filter columns. Every input to a gate's filter is
+    // circuit-fixed — the selector constant column is a column of
+    // `constants_sigmas_commitment`, and `row`/`group_range`/`num_selectors`
+    // are circuit constants — so the whole column is identical in every proof
+    // of this circuit and is materialized at most once per process. Disabled by
+    // default; the caller opts a circuit in when it is proved often enough to
+    // pay for the storage.
+    let filter_columns: Option<&[Vec<F>]> = prover_data.gate_filters.get_or_init(|| {
+        build_gate_filter_columns(
+            common_data,
+            &prover_data.constants_sigmas_commitment,
+            lde_size,
+            step,
+        )
+    });
 
     let points_batches = points.par_chunks(BATCH_SIZE);
     let num_batches = points.len().div_ceil(BATCH_SIZE);
@@ -1093,6 +1163,10 @@ fn compute_quotient_polys<
                     alphas,
                     &z_h_on_coset,
                     &lut_re_poly_evals_refs,
+                    filter_columns.map(|columns| CachedFilters {
+                        columns,
+                        offset: BATCH_SIZE * batch_i,
+                    }),
                     &mut scratch.vanishing,
                     quotient_values_batch,
                 );
@@ -1264,7 +1338,11 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{
+        build_gate_filter_columns, log2_ceil, precomputed, BatchLayout, BATCH_SIZE,
+        COMPARE_QUOTIENT_LAYOUTS,
+    };
+    use crate::gates::gate::compute_filter;
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field, Field64};
     use crate::iop::witness::{PartialWitness, WitnessWrite};
@@ -1394,6 +1472,83 @@ mod quotient_layout_tests {
                 scratch.fill(poison);
             }
         }
+    }
+
+    /// Gate filter cache, on a real circuit's real selector columns: the
+    /// materialized column for every gate must be raw-limb identical to the
+    /// filter the quotient loop would compute for that gate at that point.
+    ///
+    /// The walk below reproduces `compute_quotient_polys`'s domain traversal
+    /// exactly — same `fill_lde_batch` gather of `constants_range()` in
+    /// `PolyMajor`, same 32-point batching, same `selector_index` slicing — and
+    /// compares against the untouched per-point `compute_filter`. That covers
+    /// the two things the synthetic unit tests in `gates::gate` cannot: that the
+    /// cache builder reads the *right* commitment column for each gate, and that
+    /// it does so for the circuit's real mix of selector groups.
+    #[test]
+    fn gate_filter_columns_match_per_point_filters() {
+        let (data, _) = small_circuit();
+        let common = &data.common;
+        let commitment = &data.prover_only.constants_sigmas_commitment;
+        let quotient_degree_bits = log2_ceil(common.quotient_degree_factor);
+        let step = 1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
+        let lde_size = 1usize << (common.degree_bits() + quotient_degree_bits);
+        let num_selectors = common.selectors_info.num_selectors();
+        assert!(num_selectors > 1, "test circuit has a single selector group");
+
+        let columns = build_gate_filter_columns(common, commitment, lde_size, step);
+        assert_eq!(columns.len(), common.gates.len());
+
+        let mut local_constants = Vec::new();
+        for batch_i in 0..lde_size.div_ceil(BATCH_SIZE) {
+            let offset = BATCH_SIZE * batch_i;
+            let n = BATCH_SIZE.min(lde_size - offset);
+            let indices: Vec<usize> = (offset..offset + n).collect();
+            commitment.fill_lde_batch(
+                &indices,
+                step,
+                common.constants_range(),
+                BatchLayout::PolyMajor,
+                &mut local_constants,
+            );
+            for row in 0..common.gates.len() {
+                let selector_index = common.selectors_info.selector_indices[row];
+                let group_range = common.selectors_info.groups[selector_index].clone();
+                let selector_col = &local_constants[selector_index * n..][..n];
+                for (k, &s) in selector_col.iter().enumerate() {
+                    let want = compute_filter(row, group_range.clone(), s, num_selectors > 1);
+                    let got = if columns[row].is_empty() {
+                        F::ONE
+                    } else {
+                        columns[row][offset + k]
+                    };
+                    assert_eq!(
+                        got.0,
+                        want.0,
+                        "raw limb mismatch: gate {row} ({}), point {}",
+                        common.gates[row].0.id(),
+                        offset + k
+                    );
+                }
+            }
+        }
+    }
+
+    /// End to end: a circuit proved with the filter cache on must produce a
+    /// verifying proof, and the cache must survive being reused across proofs
+    /// (first proof materializes it, later proofs read it).
+    #[test]
+    fn proofs_verify_with_the_filter_cache_enabled() -> Result<()> {
+        let (mut data, pw) = small_circuit();
+        data.prover_only.gate_filters.set_enabled(true);
+        for _ in 0..3 {
+            let proof = data.prove(pw.clone())?;
+            data.verify(proof)?;
+        }
+        data.prover_only.gate_filters.clear();
+        let proof = data.prove(pw)?;
+        data.verify(proof)?;
+        Ok(())
     }
 
     /// C1/C2: cached tables must be bit-identical to direct computation, on

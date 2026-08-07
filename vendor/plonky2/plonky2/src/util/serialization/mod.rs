@@ -953,6 +953,7 @@ pub trait Read {
             circuit_digest,
             lookup_rows,
             lut_to_lookups,
+            gate_filters: Default::default(),
         })
     }
 
@@ -1926,6 +1927,9 @@ pub trait Write {
             circuit_digest,
             lookup_rows,
             lut_to_lookups,
+            // Runtime-only derived cache, off by default: contributes no bytes and is
+            // rebuilt on demand, so the serialized format is unchanged.
+            gate_filters: _,
         } = prover_only_circuit_data;
 
         self.write_usize(generators.len())?;

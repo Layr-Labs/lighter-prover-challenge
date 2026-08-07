@@ -4,7 +4,7 @@
 use core::ops::Range;
 
 use anyhow::Result;
-use plonky2::field::batch_util::batch_multiply_add_inplace;
+use plonky2::field::batch_util::{batch_multiply_add_inplace, batch_multiply_into};
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
@@ -140,7 +140,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
         let n = vars_base.len();
         let wires = vars_base.local_wires;
         let three = F::from_canonical_usize(3);
-        let four = F::from_canonical_usize(4);
         let base = F::from_canonical_usize(256);
         let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
         let mut chunks = res.chunks_exact_mut(n);
@@ -168,7 +167,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
                 for k in (0..3).rev() {
                     let limb = &wires[(chunk_start + k) * n..][..n];
                     for p in 0..n {
-                        out[p] = out[p] * four + limb[p];
+                        out[p] = out[p].double().double() + limb[p];
                     }
                 }
                 let byte_col = &wires[byte_wire * n..][..n];
@@ -200,6 +199,26 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
         filters: &[F],
         combined_gate_constraints: &mut [F],
     ) {
+        // `store_from == num_constraints()` stores nothing: pure accumulation.
+        self.eval_unfiltered_base_batch_accumulate_store(
+            vars_base,
+            filters,
+            combined_gate_constraints,
+            <Self as Gate<F, D>>::num_constraints(self),
+        );
+    }
+
+    fn supports_store_from(&self) -> bool {
+        true
+    }
+
+    fn eval_unfiltered_base_batch_accumulate_store(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+        store_from: usize,
+    ) {
         let n = vars_base.len();
         assert_eq!(filters.len(), n);
         let num_constraints = <Self as Gate<F, D>>::num_constraints(self);
@@ -207,7 +226,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
 
         let wires = vars_base.local_wires;
         let three = F::from_canonical_usize(3);
-        let four = F::from_canonical_usize(4);
         let base = F::from_canonical_usize(256);
         // Batches are 32 points in this prover; keep the scratch row on the
         // stack and fall back to the heap only for oversized batches.
@@ -233,7 +251,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
                 }
                 let combined = &mut combined_gate_constraints
                     [constraint_index * n..(constraint_index + 1) * n];
-                batch_multiply_add_inplace(combined, &scratch, filters);
+                // Rows at or past `store_from` are raw zero on entry, so the
+                // store is bit-identical to the accumulate.
+                if constraint_index >= store_from {
+                    batch_multiply_into(combined, &scratch, filters);
+                } else {
+                    batch_multiply_add_inplace(combined, &scratch, filters);
+                }
                 constraint_index += 1;
             }
 
@@ -246,7 +270,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
                 for k in (0..3).rev() {
                     let limb = &wires[(chunk_start + k) * n..][..n];
                     for p in 0..n {
-                        scratch[p] = scratch[p] * four + limb[p];
+                        scratch[p] = scratch[p].double().double() + limb[p];
                     }
                 }
                 let byte_col = &wires[byte_wire * n..][..n];
@@ -255,7 +279,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
                 }
                 let combined = &mut combined_gate_constraints
                     [constraint_index * n..(constraint_index + 1) * n];
-                batch_multiply_add_inplace(combined, &scratch, filters);
+                // Rows at or past `store_from` are raw zero on entry, so the
+                // store is bit-identical to the accumulate.
+                if constraint_index >= store_from {
+                    batch_multiply_into(combined, &scratch, filters);
+                } else {
+                    batch_multiply_add_inplace(combined, &scratch, filters);
+                }
                 constraint_index += 1;
             }
 
@@ -273,7 +303,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
             }
             let combined =
                 &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
-            batch_multiply_add_inplace(combined, &scratch, filters);
+            // Rows at or past `store_from` are raw zero on entry, so the
+            // store is bit-identical to the accumulate.
+            if constraint_index >= store_from {
+                batch_multiply_into(combined, &scratch, filters);
+            } else {
+                batch_multiply_add_inplace(combined, &scratch, filters);
+            }
             constraint_index += 1;
         }
 
