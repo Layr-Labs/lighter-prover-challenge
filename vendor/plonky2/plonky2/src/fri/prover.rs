@@ -59,8 +59,69 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
     );
 
     // Query phase
-    let query_round_proofs =
-        fri_prover_query_rounds::<F, C, D>(initial_merkle_trees, &trees, challenger, n, fri_params);
+    #[cfg(feature = "std")]
+    let shapes_enabled = std::env::var_os("LAB_FRI_SHAPES").is_some();
+    #[cfg(feature = "std")]
+    let query_start = std::time::Instant::now();
+
+    // Query phase: the batched serial tree sweep (lab variant V2). The whole
+    // phase is a few tens of microseconds of pure gathers per instance; the
+    // previous 28-task `par_iter` had to queue behind fat FFT/hash tasks from
+    // concurrently pipelined proofs, inflating the phase's wall time up to
+    // 400x (production shape log: median 690us, p90 6.1ms, max 277ms for
+    // ~60us of work; 1.05s total per prove). Running it pool-independent on
+    // the calling thread is 61% faster at the median under a saturated pool
+    // (lab: 21.6 -> 8.3 ms per 105-instance mix, disjoint distributions) at
+    // the cost of ~1.6ms per prove on a quiet pool.
+    let query_round_proofs = fri_prover_query_rounds_batched::<F, C, D>(
+        initial_merkle_trees,
+        &trees,
+        challenger,
+        n,
+        fri_params,
+    );
+
+    #[cfg(feature = "std")]
+    if shapes_enabled {
+        let el = query_start.elapsed();
+        let init: Vec<String> = initial_merkle_trees
+            .iter()
+            .map(|t| {
+                let kind = match &t.leaves {
+                    crate::hash::merkle_tree::MerkleLeaves::Rows { .. } => "rows",
+                    crate::hash::merkle_tree::MerkleLeaves::Columns { .. } => "cols",
+                };
+                format!(
+                    "{}x{}:{}:{}",
+                    t.num_leaves,
+                    t.leaf_width(),
+                    kind,
+                    if t.level_digests.is_some() { "lvl" } else { "intl" }
+                )
+            })
+            .collect();
+        let commit: Vec<String> = trees
+            .iter()
+            .map(|t| {
+                format!(
+                    "{}x{}:{}",
+                    t.num_leaves,
+                    t.leaf_width(),
+                    if t.level_digests.is_some() { "lvl" } else { "intl" }
+                )
+            })
+            .collect();
+        eprintln!(
+            "LAB_FRI_SHAPE n={} q={} arity={:?} cap={} init=[{}] commit=[{}] query_us={}",
+            n,
+            fri_params.config.num_query_rounds,
+            fri_params.reduction_arity_bits,
+            fri_params.config.cap_height,
+            init.join(","),
+            commit.join(","),
+            el.as_micros()
+        );
+    }
 
     FriProof {
         commit_phase_merkle_caps: trees.iter().map(|t| t.cap.clone()).collect(),
@@ -272,7 +333,8 @@ pub(crate) fn fri_proof_of_work<
     pow_witness
 }
 
-fn fri_prover_query_rounds<
+#[doc(hidden)]
+pub fn fri_prover_query_rounds<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
     const D: usize,
@@ -293,7 +355,196 @@ fn fri_prover_query_rounds<
         .collect()
 }
 
-fn fri_prover_query_round<
+/// Lab variant V1: identical to [`fri_prover_query_rounds`] but extracts the
+/// query rounds serially on the calling thread instead of `par_iter` over the
+/// global rayon pool. The per-round work is a few tens of microseconds of
+/// pure gathers; under pipelined proving the 28-task `par_iter` has to queue
+/// behind fat FFT/hash tasks from concurrent proofs, which the production
+/// shape log showed inflating this phase's wall time by up to 400x
+/// (median 690us, max 277ms on trees whose serial gather cost is ~1ms).
+#[doc(hidden)]
+pub fn fri_prover_query_rounds_serial<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
+    trees: &[MerkleTree<F, C::Hasher>],
+    challenger: &mut Challenger<F, C::Hasher>,
+    n: usize,
+    fri_params: &FriParams,
+) -> Vec<FriQueryRound<F, C::Hasher, D>> {
+    challenger
+        .get_n_challenges(fri_params.config.num_query_rounds)
+        .into_iter()
+        .map(|rand| {
+            let x_index = rand.to_canonical_u64() as usize % n;
+            fri_prover_query_round::<F, C, D>(initial_merkle_trees, trees, x_index, fri_params)
+        })
+        .collect()
+}
+
+/// Lab variant V2: batched per-tree sweep. Draws all query indices up front,
+/// then walks each tree once, extracting all 28 openings from that tree
+/// back-to-back (per-tree metadata, digest-level offsets, and the small top
+/// digest levels stay hot), and finally transposes the per-tree columns into
+/// the per-round `FriQueryRound` structure. Serial; produces element-for-
+/// element identical output to [`fri_prover_query_rounds`].
+#[doc(hidden)]
+pub fn fri_prover_query_rounds_batched<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
+    trees: &[MerkleTree<F, C::Hasher>],
+    challenger: &mut Challenger<F, C::Hasher>,
+    n: usize,
+    fri_params: &FriParams,
+) -> Vec<FriQueryRound<F, C::Hasher, D>> {
+    let num_queries = fri_params.config.num_query_rounds;
+    let x_indices: Vec<usize> = challenger
+        .get_n_challenges(num_queries)
+        .into_iter()
+        .map(|rand| rand.to_canonical_u64() as usize % n)
+        .collect();
+
+    // One sweep per initial tree: all queries against tree `t` in a row.
+    let initial_columns: Vec<Vec<(Vec<F>, crate::hash::merkle_proofs::MerkleProof<F, C::Hasher>)>> =
+        initial_merkle_trees
+            .iter()
+            .map(|t| {
+                x_indices
+                    .iter()
+                    .map(|&x| (t.leaf_vec(x), t.prove(x)))
+                    .collect()
+            })
+            .collect();
+
+    // One sweep per commit-phase tree, with the round-i index pre-shifted by
+    // the cumulative arity of the preceding steps.
+    let mut shift = 0usize;
+    let step_columns: Vec<Vec<FriQueryStep<F, C::Hasher, D>>> = trees
+        .iter()
+        .enumerate()
+        .map(|(i, tree)| {
+            shift += fri_params.reduction_arity_bits[i];
+            let s = shift;
+            x_indices
+                .iter()
+                .map(|&x| {
+                    let idx = x >> s;
+                    FriQueryStep {
+                        evals: unflatten(tree.get(idx)),
+                        merkle_proof: tree.prove(idx),
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    // Transpose the per-tree columns into per-round rows.
+    let mut initial_iters: Vec<_> = initial_columns.into_iter().map(Vec::into_iter).collect();
+    let mut step_iters: Vec<_> = step_columns.into_iter().map(Vec::into_iter).collect();
+    (0..num_queries)
+        .map(|_| FriQueryRound {
+            initial_trees_proof: FriInitialTreeProof {
+                evals_proofs: initial_iters.iter_mut().map(|it| it.next().unwrap()).collect(),
+            },
+            steps: step_iters.iter_mut().map(|it| it.next().unwrap()).collect(),
+        })
+        .collect()
+}
+
+/// Lab variant V3: per-tree sweeps as in V2, but the tree sweeps themselves
+/// run as one flat `par_iter` of `initial_trees.len() + trees.len()` tasks
+/// (7-8 tasks of comparable size instead of 28 tiny round tasks).
+#[doc(hidden)]
+pub fn fri_prover_query_rounds_tree_par<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
+    trees: &[MerkleTree<F, C::Hasher>],
+    challenger: &mut Challenger<F, C::Hasher>,
+    n: usize,
+    fri_params: &FriParams,
+) -> Vec<FriQueryRound<F, C::Hasher, D>> {
+    let num_queries = fri_params.config.num_query_rounds;
+    let x_indices: Vec<usize> = challenger
+        .get_n_challenges(num_queries)
+        .into_iter()
+        .map(|rand| rand.to_canonical_u64() as usize % n)
+        .collect();
+
+    let num_initial = initial_merkle_trees.len();
+    let cum_shift: Vec<usize> = fri_params.reduction_arity_bits[..trees.len()]
+        .iter()
+        .scan(0usize, |acc, &a| {
+            *acc += a;
+            Some(*acc)
+        })
+        .collect();
+
+    enum Column<F: RichField, H: crate::plonk::config::Hasher<F>, const D: usize>
+    where
+        F: Extendable<D>,
+    {
+        Initial(Vec<(Vec<F>, crate::hash::merkle_proofs::MerkleProof<F, H>)>),
+        Step(Vec<FriQueryStep<F, H, D>>),
+    }
+
+    let columns: Vec<Column<F, C::Hasher, D>> = (0..num_initial + trees.len())
+        .into_par_iter()
+        .map(|k| {
+            if k < num_initial {
+                let t = initial_merkle_trees[k];
+                Column::Initial(
+                    x_indices
+                        .iter()
+                        .map(|&x| (t.leaf_vec(x), t.prove(x)))
+                        .collect(),
+                )
+            } else {
+                let tree = &trees[k - num_initial];
+                let s = cum_shift[k - num_initial];
+                Column::Step(
+                    x_indices
+                        .iter()
+                        .map(|&x| {
+                            let idx = x >> s;
+                            FriQueryStep {
+                                evals: unflatten(tree.get(idx)),
+                                merkle_proof: tree.prove(idx),
+                            }
+                        })
+                        .collect(),
+                )
+            }
+        })
+        .collect();
+
+    let mut initial_iters = Vec::with_capacity(num_initial);
+    let mut step_iters = Vec::with_capacity(trees.len());
+    for column in columns {
+        match column {
+            Column::Initial(v) => initial_iters.push(v.into_iter()),
+            Column::Step(v) => step_iters.push(v.into_iter()),
+        }
+    }
+    (0..num_queries)
+        .map(|_| FriQueryRound {
+            initial_trees_proof: FriInitialTreeProof {
+                evals_proofs: initial_iters.iter_mut().map(|it| it.next().unwrap()).collect(),
+            },
+            steps: step_iters.iter_mut().map(|it| it.next().unwrap()).collect(),
+        })
+        .collect()
+}
+
+#[doc(hidden)]
+pub fn fri_prover_query_round<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
     const D: usize,
