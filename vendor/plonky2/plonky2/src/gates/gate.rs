@@ -69,6 +69,11 @@ pub enum U32QuotientGate {
     /// words (input and output limbs) plus ten temporary wires per
     /// operation, fifteen constraint rows per operation.
     QuinticSquaring { num_ops: usize },
+    /// Base-`base` little-endian decomposition: one routed sum wire followed
+    /// by `num_limbs` limb wires, `1 + num_limbs` constraint rows (the
+    /// recomposition then one range product per limb). Only bases 2 and 4
+    /// are supported by the quotient backend.
+    BaseSum { num_limbs: usize, base: usize },
 }
 
 /// A custom gate.
@@ -398,19 +403,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Serialize for GateRef<F, D> {
 #[derive(Clone, Debug, Default)]
 pub struct CurrentSlot<F: RichField + Extendable<D>, const D: usize> {
     pub current_slot: HashMap<Vec<F>, (usize, usize)>,
-    /// Memoized [`Gate::num_ops`] for the gate this entry is keyed by.
-    ///
-    /// The default `Gate::num_ops` *materializes* the gate's generator list and returns its
-    /// length, so every call allocates one `WitnessGeneratorRef` (an `Arc`) per operation plus
-    /// the `Vec` holding them, and drops all of it immediately. `find_slot` calls it once per
-    /// packed operation, which is where the overwhelming majority of the circuit's operations
-    /// are placed. Caching it here evaluates it once per distinct gate value instead.
-    ///
-    /// Keying on the entry is exact: `CurrentSlot` entries are keyed by `GateRef`, whose `Eq`
-    /// is `Gate::id()` equality, and every gate's `id()` is a `Debug` rendering of its complete
-    /// configuration. Gates that compare equal therefore have identical fields, and `num_ops`
-    /// is a pure function of those fields.
-    pub num_ops: Option<usize>,
 }
 
 /// A gate along with any constants used to configure it.
