@@ -28,10 +28,11 @@ use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{
-    eval_vanishing_poly_base_batch, get_lut_poly, PermutationBatch, VanishingScratch,
+    eval_vanishing_poly_base_batch, get_lut_poly, VanishingScratch,
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
+use crate::util::partial_products::quotient_chunk_products;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_ceil};
 
@@ -264,12 +265,6 @@ where
     let lookup_polys =
         compute_all_lookup_polys(&witness, &deltas, prover_data, common_data, has_lookup);
 
-    // The permutation argument and lookup polys were the last readers of the
-    // witness matrix (non-routed columns were already moved out into
-    // `wires_values`). Free the ~80 routed columns now, before the ZS
-    // commitment, quotient evaluation, and FRI phases raise memory pressure.
-    drop(witness);
-
     if has_lookup {
         zs_partial_products.extend(lookup_polys);
     }
@@ -305,42 +300,8 @@ where
             &beta_k_is,
             &deltas,
             &alphas,
-            // Layout seam: flat column-major permutation data when the
-            // circuit has no lookups; the per-point path otherwise.
-            !has_lookup,
         )
     );
-
-    // Differential gate for the layout seam: recompute the quotient through
-    // the per-point reference path on the same witness, commitments and
-    // challenges, and require value-identical polynomials.
-    #[cfg(test)]
-    if !has_lookup && COMPARE_QUOTIENT_LAYOUTS.load(core::sync::atomic::Ordering::Relaxed) {
-        let reference = compute_quotient_polys::<F, C, D>(
-            common_data,
-            prover_data,
-            &public_inputs_hash,
-            &wires_commitment,
-            &partial_products_zs_and_lookup_commitment,
-            &betas,
-            &gammas,
-            &beta_k_is,
-            &deltas,
-            &alphas,
-            false,
-        );
-        assert_eq!(quotient_polys.len(), reference.len());
-        for (p, (a, b)) in quotient_polys.iter().zip(reference.iter()).enumerate() {
-            assert_eq!(a.coeffs.len(), b.coeffs.len());
-            for (i, (x, y)) in a.coeffs.iter().zip(b.coeffs.iter()).enumerate() {
-                assert_eq!(
-                    x.to_canonical_u64(),
-                    y.to_canonical_u64(),
-                    "quotient layout divergence: poly {p}, coeff {i}"
-                );
-            }
-        }
-    }
 
     let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
         timing,
@@ -461,19 +422,6 @@ fn all_wires_permutation_partial_products<
         .collect()
 }
 
-#[inline]
-fn divide_chunk_products<F: Field>(
-    numerator_products: &mut [F],
-    denominator_products: &[F],
-    inverse_scratch: &mut Vec<F>,
-) {
-    debug_assert_eq!(numerator_products.len(), denominator_products.len());
-    F::batch_multiplicative_inverse_into(denominator_products, inverse_scratch);
-    for (product, &inverse) in numerator_products.iter_mut().zip(inverse_scratch.iter()) {
-        *product *= inverse;
-    }
-}
-
 /// Compute the partial products used in the `Z` polynomial.
 /// Returns the polynomials interpolating `partial_products(f / g)`
 /// where `f, g` are the products in the definition of `Z`: `Z(g^i) = f / g`.
@@ -494,65 +442,61 @@ fn wires_permutation_partial_products_and_zs<
     let num_prods = common_data.num_partial_products;
     debug_assert_eq!(beta_k_is.len(), common_data.config.num_routed_wires);
     let num_routed_wires = common_data.config.num_routed_wires;
-    let num_chunks = num_prods + 1;
-    debug_assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
-
-    // The permutation argument only consumes one numerator/denominator ratio per quotient-degree
-    // chunk. Form those products before Montgomery inversion, shrinking each inversion batch by
-    // `degree` and reading every witness wire only once.
+    // Group the denominator inversions across many subgroup points: one
+    // Montgomery-trick batch inversion per 64 points instead of one per
+    // point. Field inverses are unique, so every quotient value is identical
+    // to the per-point version.
     const INV_BATCH: usize = 128;
-    let mut all_quotient_chunk_products = vec![F::ZERO; subgroup.len() * num_chunks];
-    all_quotient_chunk_products
-        .par_chunks_mut(INV_BATCH * num_chunks)
-        .zip(subgroup.par_chunks(INV_BATCH))
+    let all_quotient_chunk_products = subgroup
+        .par_chunks(INV_BATCH)
         .enumerate()
-        .for_each_init(
-            || {
-                (
-                    Vec::with_capacity(num_chunks * INV_BATCH),
-                    Vec::with_capacity(num_chunks * INV_BATCH),
-                )
-            },
-            |scratch, (chunk_idx, (quotient_products, xs))| {
+        .map_init(
+            // One denominator scratch buffer per worker thread.
+            || vec![F::ZERO; num_routed_wires * INV_BATCH],
+            |denominators, (chunk_idx, xs)| {
                 let base = chunk_idx * INV_BATCH;
-                let (denominator_products, denominator_inverses) = scratch;
-                denominator_products.clear();
-                for (t, &x) in xs.iter().enumerate() {
+                let denoms = &mut denominators[..xs.len() * num_routed_wires];
+                for t in 0..xs.len() {
                     let i = base + t;
                     let s_sigmas = &prover_data.sigmas[i];
-                    for chunk in 0..num_chunks {
-                        let start = chunk * degree;
-                        let end = min(start + degree, num_routed_wires);
-                        let mut numerator_product = F::ONE;
-                        let mut denominator_product = F::ONE;
-                        for j in start..end {
-                            let wire_value = witness.get_wire(i, j);
-                            numerator_product *= wire_value + beta_k_is[j] * x + gamma;
-                            denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
-                        }
-                        quotient_products[t * num_chunks + chunk] = numerator_product;
-                        denominator_products.push(denominator_product);
+                    for j in 0..num_routed_wires {
+                        let wire_value = witness.get_wire(i, j);
+                        denoms[t * num_routed_wires + j] = wire_value + beta * s_sigmas[j] + gamma;
                     }
                 }
-                divide_chunk_products(
-                    quotient_products,
-                    denominator_products,
-                    denominator_inverses,
-                );
+                let mut quotient_values = F::batch_multiplicative_inverse(denoms);
+                xs.iter()
+                    .enumerate()
+                    .map(|(t, &x)| {
+                        let i = base + t;
+                        let point_quotients =
+                            &mut quotient_values[t * num_routed_wires..(t + 1) * num_routed_wires];
+                        // Multiply the numerators into the inverse buffer in
+                        // place; the per-point numerator Vecs are gone.
+                        for (j, quotient_value) in point_quotients.iter_mut().enumerate() {
+                            let wire_value = witness.get_wire(i, j);
+                            let numerator = wire_value + beta_k_is[j] * x + gamma;
+                            *quotient_value *= numerator;
+                        }
+                        quotient_chunk_products(point_quotients, degree)
+                    })
+                    .collect::<Vec<_>>()
             },
-        );
+        )
+        .flatten()
+        .collect::<Vec<_>>();
 
     // Accumulate the sequential Z chain directly into the column-major output
     // polynomials, deleting the per-point row Vec, the row-major intermediate,
     // and the whole-phase transpose. Values and their order are identical: for
     // each point, column k receives the k-th running product, and the last
     // column receives the previous Z(x) exactly as the swap-based version did.
-    let n_points = subgroup.len();
+    let n_points = all_quotient_chunk_products.len();
     let mut columns: Vec<Vec<F>> = (0..num_prods + 1)
         .map(|_| Vec::with_capacity(n_points))
         .collect();
     let mut z_x = F::ONE;
-    for quotient_chunk_products in all_quotient_chunk_products.chunks_exact(num_chunks) {
+    for quotient_chunk_products in all_quotient_chunk_products {
         let mut acc = z_x;
         for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
             acc *= quotient_chunk_product;
@@ -728,17 +672,6 @@ fn compute_all_lookup_polys<
 
 const BATCH_SIZE: usize = 32;
 
-/// Test-only switch: when set, `compute_quotient_polys` evaluates the quotient
-/// values twice — once through the default column-major (`PolyMajor`)
-/// permutation path and once through the per-point (`PointMajor`) reference
-/// path — over the same witness, commitments and challenges, and asserts the
-/// two are value-identical. (Cross-run proof-byte comparison is not a usable
-/// oracle in this fork: unused wire slots carry nondeterministic padding, so
-/// two proofs of the same witness legitimately differ byte-wise.)
-#[cfg(test)]
-pub(crate) static COMPARE_QUOTIENT_LAYOUTS: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -755,16 +688,10 @@ fn compute_quotient_polys<
     beta_k_is: &[F],
     deltas: &[F],
     alphas: &[F],
-    col_major_perm: bool,
 ) -> Vec<PolynomialCoeffs<F>> {
     let num_challenges = common_data.config.num_challenges;
 
     let has_lookup = common_data.num_lookup_polys != 0;
-
-    // The lookup constraint evaluator consumes per-point rows, so the
-    // column-major permutation layout is only usable without lookups,
-    // whatever the caller asked for.
-    let col_major_perm = col_major_perm && !has_lookup;
 
     let quotient_degree_bits = log2_ceil(common_data.quotient_degree_factor);
     assert!(
@@ -780,25 +707,10 @@ fn compute_quotient_polys<
     // steps away since we work on an LDE of degree `max_filtered_constraint_degree`.
     let next_step = 1 << quotient_degree_bits;
 
-    // Process-global cached subgroup (bit-identical to computing it here): the
-    // serial 2^19-length dependent multiply chain runs once per process
-    // instead of once per proof.
-    let points =
-        precomputed::two_adic_subgroup::<F>(common_data.degree_bits() + quotient_degree_bits);
+    let points = F::two_adic_subgroup(common_data.degree_bits() + quotient_degree_bits);
     let lde_size = points.len();
 
     let z_h_on_coset = ZeroPolyOnCoset::new(common_data.degree_bits(), quotient_degree_bits);
-    // The `L_0` denominator inverses consumed by `eval_l_0` depend only on
-    // `(degree_bits, quotient_degree_bits, coset shift)` — not on any challenge — so they are
-    // computed once per circuit shape for the process and shared across proofs. Each cached
-    // entry is bit-identical to the per-point inversion it replaces.
-    #[cfg(feature = "std")]
-    let z_h_on_coset = z_h_on_coset.with_l_0_denominator_inverses(
-        l_0_table_cache::l_0_denominator_inverses::<F>(
-            common_data.degree_bits(),
-            quotient_degree_bits,
-        ),
-    );
 
     // Precompute the lookup table evals on the challenges in delta
     // These values are used to produce the final RE constraints for each lut,
@@ -901,25 +813,11 @@ fn compute_quotient_polys<
                     BatchLayout::PolyMajor,
                     &mut scratch.local_constants,
                 );
-                // Layout seam: the no-lookup column evaluator consumes the
-                // PolyMajor gathers as-is (and the "next" gather narrows to
-                // the Z columns, the only ones it reads); the per-point path
-                // keeps the full-width PointMajor gathers and row views.
-                let (batch_layout, zs_local_range, zs_next_range) = if col_major_perm {
-                    (
-                        BatchLayout::PolyMajor,
-                        0..common_data.partial_products_range().end,
-                        common_data.zs_range(),
-                    )
-                } else {
-                    (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
-                };
-
                 prover_data.constants_sigmas_commitment.fill_lde_batch(
                     &scratch.indices,
                     step,
                     common_data.sigmas_range(),
-                    batch_layout,
+                    BatchLayout::PointMajor,
                     &mut scratch.s_sigmas_flat,
                 );
                 wires_commitment.fill_lde_batch(
@@ -932,55 +830,34 @@ fn compute_quotient_polys<
                 zs_partial_products_and_lookup_commitment.fill_lde_batch(
                     &scratch.indices,
                     step,
-                    zs_local_range,
-                    batch_layout,
+                    0..zs_row_width,
+                    BatchLayout::PointMajor,
                     &mut scratch.zs_local_flat,
                 );
                 zs_partial_products_and_lookup_commitment.fill_lde_batch(
                     &scratch.indices_next,
                     step,
-                    zs_next_range,
-                    batch_layout,
+                    0..zs_row_width,
+                    BatchLayout::PointMajor,
                     &mut scratch.zs_next_flat,
                 );
 
                 let indices_batch = &scratch.indices;
-                // Per-point row views over the PointMajor gathers, built only
-                // for the per-point path; the column path passes the flat
-                // buffers straight through, so these four allocations vanish
-                // from the hot (no-lookup) path entirely.
-                type RowViews<'v, F> = (Vec<&'v [F]>, Vec<&'v [F]>, Vec<&'v [F]>, Vec<&'v [F]>);
-                let (local_zs_batch, next_zs_batch, partial_products_batch, s_sigmas_batch): RowViews<'_, F> =
-                    if col_major_perm {
-                        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
-                    } else {
-                        (
-                            (0..n)
-                                .map(|k| {
-                                    &scratch.zs_local_flat[k * zs_row_width..]
-                                        [common_data.zs_range()]
-                                })
-                                .collect(),
-                            (0..n)
-                                .map(|k| {
-                                    &scratch.zs_next_flat[k * zs_row_width..]
-                                        [common_data.zs_range()]
-                                })
-                                .collect(),
-                            (0..n)
-                                .map(|k| {
-                                    &scratch.zs_local_flat[k * zs_row_width..]
-                                        [common_data.partial_products_range()]
-                                })
-                                .collect(),
-                            (0..n)
-                                .map(|k| {
-                                    &scratch.s_sigmas_flat
-                                        [k * num_routed_wires..(k + 1) * num_routed_wires]
-                                })
-                                .collect(),
-                        )
-                    };
+                let local_zs_batch: Vec<&[F]> = (0..n)
+                    .map(|k| &scratch.zs_local_flat[k * zs_row_width..][common_data.zs_range()])
+                    .collect();
+                let next_zs_batch: Vec<&[F]> = (0..n)
+                    .map(|k| &scratch.zs_next_flat[k * zs_row_width..][common_data.zs_range()])
+                    .collect();
+                let partial_products_batch: Vec<&[F]> = (0..n)
+                    .map(|k| {
+                        &scratch.zs_local_flat[k * zs_row_width..]
+                            [common_data.partial_products_range()]
+                    })
+                    .collect();
+                let s_sigmas_batch: Vec<&[F]> = (0..n)
+                    .map(|k| &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires])
+                    .collect();
                 let (local_lookup_batch, next_lookup_batch): (Vec<&[F]>, Vec<&[F]>) = if has_lookup
                 {
                     (
@@ -1001,21 +878,6 @@ fn compute_quotient_polys<
                     (Vec::new(), Vec::new())
                 };
 
-                let perm = if col_major_perm {
-                    PermutationBatch::Cols {
-                        zs_partial_products_cols: &scratch.zs_local_flat,
-                        zs_next_cols: &scratch.zs_next_flat,
-                        s_sigmas_cols: &scratch.s_sigmas_flat,
-                    }
-                } else {
-                    PermutationBatch::Rows {
-                        local_zs_batch: &local_zs_batch,
-                        next_zs_batch: &next_zs_batch,
-                        partial_products_batch: &partial_products_batch,
-                        s_sigmas_batch: &s_sigmas_batch,
-                    }
-                };
-
                 let vars_batch = EvaluationVarsBaseBatch::new(
                     n,
                     &scratch.local_constants,
@@ -1029,9 +891,12 @@ fn compute_quotient_polys<
                     indices_batch,
                     &scratch.shifted_xs,
                     vars_batch,
-                    perm,
+                    &local_zs_batch,
+                    &next_zs_batch,
                     &local_lookup_batch,
                     &next_lookup_batch,
+                    &partial_products_batch,
+                    &s_sigmas_batch,
                     betas,
                     gammas,
                     beta_k_is,
@@ -1056,543 +921,16 @@ fn compute_quotient_polys<
         );
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
-    // One streaming pass splits the interleaved point-major buffer into the
-    // per-challenge columns, instead of `num_challenges` parallel passes each
-    // stride-reading the whole buffer. Same values in the same order; only
-    // which pass writes them changes.
-    let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
-        .map(|_| Vec::with_capacity(points.len()))
-        .collect();
-    for point_values in quotient_values.chunks_exact(num_challenges) {
-        for (column, &value) in challenge_columns.iter_mut().zip(point_values) {
-            column.push(value);
-        }
-    }
-    challenge_columns
+    (0..num_challenges)
         .into_par_iter()
-        .map(|column| PolynomialValues::new(column).coset_ifft(F::coset_shift()))
+        .map(|challenge| {
+            PolynomialValues::new(
+                quotient_values
+                    .chunks_exact(num_challenges)
+                    .map(|point_values| point_values[challenge])
+                    .collect(),
+            )
+        })
+        .map(|values| values.coset_ifft(F::coset_shift()))
         .collect()
-}
-
-/// Process-global caches for deterministic per-degree precomputations that
-/// were being redone per proof: the quotient-domain two-adic subgroup (a
-/// serial dependent multiply chain over 2^19 points) and the coset-shift power
-/// table used by every `PolynomialBatch` LDE. Entries are keyed by field type
-/// and size; the stored vectors are exactly what the direct computation
-/// returns, computed once, so every lookup is bit-identical to computing in
-/// place. (Kept here rather than in `plonky2_field` so the file set stays
-/// disjoint from pending `fft.rs` work.)
-pub(crate) mod precomputed {
-    #[cfg(feature = "std")]
-    mod imp {
-        use core::any::{Any, TypeId};
-        use std::collections::HashMap;
-        use std::sync::{Arc, OnceLock, RwLock};
-
-        use crate::field::types::Field;
-
-        type Map = RwLock<HashMap<(TypeId, usize), Arc<dyn Any + Send + Sync>>>;
-
-        static SUBGROUPS: OnceLock<Map> = OnceLock::new();
-        static COSET_POWERS: OnceLock<Map> = OnceLock::new();
-
-        fn get_or_compute<F: Field>(
-            cache: &'static OnceLock<Map>,
-            len_key: usize,
-            compute: impl FnOnce() -> Vec<F>,
-        ) -> Arc<Vec<F>> {
-            let key = (TypeId::of::<F>(), len_key);
-            let map = cache.get_or_init(|| RwLock::new(HashMap::new()));
-            if let Some(hit) = map.read().unwrap().get(&key) {
-                return Arc::clone(hit)
-                    .downcast::<Vec<F>>()
-                    .ok()
-                    .expect("type-keyed cache entry has the keyed type");
-            }
-            let computed: Arc<Vec<F>> = Arc::new(compute());
-            let mut map = map.write().unwrap();
-            // If another thread inserted concurrently, keep its (identical)
-            // table so all callers share one allocation.
-            let entry = map
-                .entry(key)
-                .or_insert_with(|| computed as Arc<dyn Any + Send + Sync>);
-            Arc::clone(entry)
-                .downcast::<Vec<F>>()
-                .ok()
-                .expect("type-keyed cache entry has the keyed type")
-        }
-
-        /// Cached `F::two_adic_subgroup(n_log)`.
-        pub(crate) fn two_adic_subgroup<F: Field>(n_log: usize) -> Arc<Vec<F>> {
-            get_or_compute(&SUBGROUPS, n_log, || F::two_adic_subgroup(n_log))
-        }
-
-        /// Cached `F::coset_shift().powers().take(degree)`.
-        pub(crate) fn coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
-            get_or_compute(&COSET_POWERS, degree, || {
-                F::coset_shift().powers().take(degree).collect()
-            })
-        }
-    }
-
-    /// Without `std` there is no process-global synchronization; fall back to
-    /// direct (uncached) computation, which is what the callers did before.
-    #[cfg(not(feature = "std"))]
-    mod imp {
-        use alloc::sync::Arc;
-        use alloc::vec::Vec;
-
-        use crate::field::types::Field;
-
-        pub(crate) fn two_adic_subgroup<F: Field>(n_log: usize) -> Arc<Vec<F>> {
-            Arc::new(F::two_adic_subgroup(n_log))
-        }
-
-        pub(crate) fn coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
-            Arc::new(F::coset_shift().powers().take(degree).collect::<Vec<F>>())
-        }
-    }
-
-    pub(crate) use imp::{coset_shift_powers, two_adic_subgroup};
-}
-
-#[cfg(test)]
-mod quotient_layout_tests {
-    use core::sync::atomic::Ordering;
-
-    use anyhow::Result;
-
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
-    use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::{Field, Field64};
-    use crate::iop::witness::{PartialWitness, WitnessWrite};
-    use crate::plonk::circuit_builder::CircuitBuilder;
-    use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
-    use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
-
-    const D: usize = 2;
-    type C = PoseidonGoldilocksConfig;
-    type F = <C as GenericConfig<D>>::F;
-
-    fn small_circuit() -> (CircuitData<F, C, D>, PartialWitness<F>) {
-        let config = CircuitConfig::standard_recursion_config();
-        let mut builder = CircuitBuilder::<F, D>::new(config);
-        let x = builder.add_virtual_target();
-        let mut cur = x;
-        for i in 0..64 {
-            cur = builder.mul_add(cur, cur, x);
-            let c = builder.constant(F::from_canonical_usize(i + 1));
-            cur = builder.add(cur, c);
-        }
-        builder.register_public_input(cur);
-        let data = builder.build::<C>();
-        let mut pw = PartialWitness::new();
-        pw.set_target(x, F::from_canonical_u64(3)).unwrap();
-        (data, pw)
-    }
-
-    /// B1/B2/D1 differential gate: within a single prove call — same witness,
-    /// commitments and challenges — the default column-major (`PolyMajor`)
-    /// quotient path and the per-point (`PointMajor`) reference path must
-    /// produce value-identical quotient polynomials. The element-wise
-    /// comparison itself runs inside `prove` (see `COMPARE_QUOTIENT_LAYOUTS`);
-    /// the proof must also verify.
-    #[test]
-    fn quotient_layout_paths_agree() -> Result<()> {
-        let (data, pw) = small_circuit();
-        assert!(data.common.luts.is_empty());
-
-        COMPARE_QUOTIENT_LAYOUTS.store(true, Ordering::SeqCst);
-        let proof = data.prove(pw);
-        COMPARE_QUOTIENT_LAYOUTS.store(false, Ordering::SeqCst);
-
-        data.verify(proof?)?;
-        Ok(())
-    }
-
-    /// Layout seam: `PolyMajor` output is exactly the transpose of
-    /// `PointMajor` output, element for element (raw u64 compare).
-    #[test]
-    fn fill_lde_batch_layouts_agree() {
-        let (data, _) = small_circuit();
-        let commitment = &data.prover_only.constants_sigmas_commitment;
-        let range = data.common.sigmas_range();
-        let w = range.len();
-        let indices = [0usize, 1, 2, 5, 7, 11, 30];
-        let n = indices.len();
-        let mut point_major = Vec::new();
-        let mut poly_major = Vec::new();
-        commitment.fill_lde_batch(
-            &indices,
-            2,
-            range.clone(),
-            BatchLayout::PointMajor,
-            &mut point_major,
-        );
-        commitment.fill_lde_batch(&indices, 2, range, BatchLayout::PolyMajor, &mut poly_major);
-        assert_eq!(point_major.len(), n * w);
-        assert_eq!(poly_major.len(), n * w);
-        for k in 0..n {
-            for c in 0..w {
-                assert_eq!(point_major[k * w + c].0, poly_major[c * n + k].0);
-            }
-        }
-    }
-
-    /// A contiguous PolyMajor gather must produce the same column slices as
-    /// the generic indexed gather. This catches off-by-one source ranges and
-    /// accidental point-major writes in the quotient fast path.
-    #[test]
-    fn contiguous_lde_batch_matches_indexed_gather() {
-        let (data, _) = small_circuit();
-        let commitment = &data.prover_only.constants_sigmas_commitment;
-        let range = data.common.sigmas_range();
-        let indices = [3usize, 4, 5, 6, 7, 8, 9];
-        let mut indexed = Vec::new();
-        let mut contiguous = Vec::new();
-
-        commitment.fill_lde_batch(
-            &indices,
-            1,
-            range.clone(),
-            BatchLayout::PolyMajor,
-            &mut indexed,
-        );
-        commitment.fill_lde_batch_contiguous(indices[0], indices.len(), range, &mut contiguous);
-
-        assert_eq!(contiguous, indexed);
-    }
-
-    /// Scratch reuse: `fill_lde_batch` writes every cell of `out` before any
-    /// is read, so dropping the zero-fill of an already correctly sized buffer
-    /// must be invisible. A poisoned reused buffer has to gather exactly what
-    /// a freshly allocated one does, for both layouts, across the full batch
-    /// and the short final batch (which shrinks the buffer).
-    #[test]
-    fn fill_lde_batch_overwrites_dirty_scratch() {
-        let (data, _) = small_circuit();
-        let commitment = &data.prover_only.constants_sigmas_commitment;
-        let range = data.common.sigmas_range();
-        let indices = [0usize, 1, 2, 5, 7, 11, 30];
-        let poison = F::from_canonical_u64(0x1234_5678_9abc_def0);
-        for layout in [BatchLayout::PointMajor, BatchLayout::PolyMajor] {
-            // One buffer reused across a full batch then a short one, exactly
-            // as the quotient loop's `for_each_init` scratch is.
-            let mut scratch = vec![poison; 3];
-            for n in [indices.len(), 3, 3] {
-                let mut fresh = Vec::new();
-                commitment.fill_lde_batch(&indices[..n], 2, range.clone(), layout, &mut fresh);
-                commitment.fill_lde_batch(&indices[..n], 2, range.clone(), layout, &mut scratch);
-                assert_eq!(scratch.len(), fresh.len());
-                for (actual, expected) in scratch.iter().zip(&fresh) {
-                    assert_eq!(actual.0, expected.0);
-                }
-                // Poison every cell so the next iteration starts from a dirty
-                // buffer of the right length (the reuse case being deleted).
-                scratch.fill(poison);
-            }
-        }
-    }
-
-    /// C1/C2: cached tables must be bit-identical to direct computation, on
-    /// both the miss and hit paths.
-    #[test]
-    fn precomputed_tables_match_direct() {
-        for n_log in [1usize, 4, 9] {
-            assert_eq!(
-                *precomputed::two_adic_subgroup::<F>(n_log),
-                F::two_adic_subgroup(n_log)
-            );
-            assert_eq!(
-                *precomputed::two_adic_subgroup::<F>(n_log),
-                F::two_adic_subgroup(n_log)
-            );
-        }
-        for degree in [8usize, 64, 512] {
-            let direct: Vec<F> = F::coset_shift().powers().take(degree).collect();
-            assert_eq!(*precomputed::coset_shift_powers::<F>(degree), direct);
-            assert_eq!(*precomputed::coset_shift_powers::<F>(degree), direct);
-        }
-    }
-
-    /// D1: `ONE * a == a` bitwise for Goldilocks, canonical or not, so peeling
-    /// the first factor of each chunk product into a direct assignment is
-    /// value-exact.
-    #[test]
-    fn mul_by_one_is_bitwise_identity() {
-        let order = GoldilocksField::ORDER;
-        for raw in [0u64, 1, 1234567, order - 1, order, order + 12345, u64::MAX] {
-            let x = GoldilocksField::from_noncanonical_u64(raw);
-            assert_eq!((GoldilocksField::ONE * x).0, x.0);
-        }
-    }
-}
-
-/// Process-global cache of the `L_0(x)` denominator inverses `(n * (x - 1))^-1` consumed by
-/// `ZeroPolyOnCoset::eval_l_0` in the quotient pass: one entry per LDE point `x = g * w^i`,
-/// `2^(degree_bits + quotient_degree_bits)` per circuit shape. The values depend only on
-/// `(degree_bits, quotient_degree_bits)` and the field's coset shift, so they are built once
-/// per process and shared across proofs, mirroring the precomputed-table style of
-/// `field::fft::fft_root_table`.
-#[cfg(feature = "std")]
-mod l_0_table_cache {
-    use core::any::{Any, TypeId};
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, OnceLock};
-
-    use plonky2_maybe_rayon::*;
-
-    use crate::field::types::Field;
-
-    /// Keyed by field type and `(degree_bits, quotient_degree_bits)`; the coset shift is a
-    /// constant of the field type.
-    static CACHE: OnceLock<Mutex<HashMap<(TypeId, usize, usize), Arc<dyn Any + Send + Sync>>>> =
-        OnceLock::new();
-
-    /// Builds the table with, per entry, exactly the operations of the uncached
-    /// `eval_l_0(i, g * w^i)` path: `x = g * w^i` from the same `two_adic_subgroup` points the
-    /// prover feeds it, then `(n * (x - ONE)).inverse()` — the same inverse of the same
-    /// product, so every entry is bit-identical to the value it replaces. Entries are
-    /// independent, so the parallel map changes nothing.
-    fn build<F: Field>(degree_bits: usize, quotient_degree_bits: usize) -> Vec<F> {
-        let n = F::from_canonical_usize(1 << degree_bits);
-        F::two_adic_subgroup(degree_bits + quotient_degree_bits)
-            .into_par_iter()
-            .map(|x| (n * (F::coset_shift() * x - F::ONE)).inverse())
-            .collect()
-    }
-
-    pub(super) fn l_0_denominator_inverses<F: Field>(
-        degree_bits: usize,
-        quotient_degree_bits: usize,
-    ) -> Arc<Vec<F>> {
-        let key = (TypeId::of::<F>(), degree_bits, quotient_degree_bits);
-        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Some(entry) = cache.lock().unwrap().get(&key) {
-            return Arc::clone(entry).downcast::<Vec<F>>().unwrap();
-        }
-        // Built outside the lock so a slow build never serializes other keys; concurrent
-        // builders of the same key produce identical tables and the first insert wins.
-        let table: Arc<Vec<F>> = Arc::new(build::<F>(degree_bits, quotient_degree_bits));
-        let mut guard = cache.lock().unwrap();
-        let entry = guard
-            .entry(key)
-            .or_insert_with(|| table as Arc<dyn Any + Send + Sync>);
-        Arc::clone(entry).downcast::<Vec<F>>().unwrap()
-    }
-}
-
-#[cfg(test)]
-mod flat_chunk_products_tests {
-    use plonky2_field::goldilocks_field::GoldilocksField;
-    use plonky2_field::types::{Field, PrimeField64};
-
-    use crate::util::partial_products::quotient_chunk_products_into;
-
-    use super::divide_chunk_products;
-
-    type F = GoldilocksField;
-
-    #[test]
-    fn chunk_before_inversion_matches_individual_ratios() {
-        for (width, chunk_size) in [(1, 2), (7, 3), (8, 8), (9, 8), (79, 8), (80, 8), (81, 8)] {
-            let numerators = (0..width)
-                .map(|i| F::from_canonical_usize(17 * i + 3))
-                .collect::<Vec<_>>();
-            let denominators = (0..width)
-                .map(|i| F::from_canonical_usize(29 * i + 5))
-                .collect::<Vec<_>>();
-
-            let expected = numerators
-                .chunks(chunk_size)
-                .zip(denominators.chunks(chunk_size))
-                .map(|(ns, ds)| {
-                    ns.iter()
-                        .zip(ds)
-                        .map(|(&n, &d)| n * d.inverse())
-                        .product::<F>()
-                })
-                .collect::<Vec<_>>();
-            let mut actual = numerators
-                .chunks(chunk_size)
-                .map(|chunk| chunk.iter().copied().product())
-                .collect::<Vec<_>>();
-            let denominator_products = denominators
-                .chunks(chunk_size)
-                .map(|chunk| chunk.iter().copied().product())
-                .collect::<Vec<_>>();
-            let mut scratch = vec![F::ONE; width + 3];
-
-            divide_chunk_products(&mut actual, &denominator_products, &mut scratch);
-            assert_eq!(actual, expected, "width={width}, chunk_size={chunk_size}");
-            assert_eq!(scratch.len(), actual.len());
-        }
-    }
-
-    /// Deterministic, mostly-noncanonical values so raw-representation comparisons are
-    /// meaningful.
-    fn noncanonical_vec(len: usize, seed: u64) -> Vec<F> {
-        (0..len as u64)
-            .map(|i| {
-                F::from_noncanonical_u64(
-                    u64::MAX - seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(3 * i),
-                )
-            })
-            .collect()
-    }
-
-    fn raw(values: &[F]) -> Vec<u64> {
-        values.iter().map(|x| x.to_noncanonical_u64()).collect()
-    }
-
-    /// The Z accumulation exactly as `wires_permutation_partial_products_and_zs` performs it,
-    /// over one point's chunk products.
-    fn accumulate_point(columns: &mut [Vec<F>], z_x: &mut F, chunk_products: &[F]) {
-        let num_prods = columns.len() - 1;
-        let mut acc = *z_x;
-        for (k, &quotient_chunk_product) in chunk_products.iter().enumerate() {
-            acc *= quotient_chunk_product;
-            if k == num_prods {
-                columns[k].push(*z_x);
-                *z_x = acc;
-            } else {
-                columns[k].push(acc);
-            }
-        }
-    }
-
-    /// Differential test for the flat chunk-products refactor: the legacy pipeline (a fresh
-    /// per-point `collect()` of chunk products into a `Vec<Vec<F>>`, then the Z chain over
-    /// those rows) against the shipping pipeline (`quotient_chunk_products_into` writing
-    /// batch-aligned slices of one flat buffer, then the Z chain over `chunks_exact`). Every
-    /// column entry must match in raw representation. Uses the production shape (80 routed
-    /// wires, quotient degree 8) and point counts spanning partial and multiple inversion
-    /// batches.
-    #[test]
-    fn flat_chunk_products_and_z_chain_match_legacy() {
-        const INV_BATCH: usize = 128;
-        let num_routed_wires = 80usize;
-        let degree = 8usize;
-        let num_chunks = num_routed_wires.div_ceil(degree);
-        let num_prods = num_chunks - 1;
-
-        for &n_points in &[1usize, 5, 128, 300] {
-            let points: Vec<Vec<F>> = (0..n_points)
-                .map(|i| noncanonical_vec(num_routed_wires, i as u64 + 1))
-                .collect();
-
-            // Legacy pipeline.
-            let legacy_products: Vec<Vec<F>> = points
-                .iter()
-                .map(|quotient_values| {
-                    quotient_values
-                        .chunks(degree)
-                        .map(|chunk| chunk.iter().copied().product())
-                        .collect()
-                })
-                .collect();
-            let mut legacy_columns: Vec<Vec<F>> = (0..num_chunks)
-                .map(|_| Vec::with_capacity(n_points))
-                .collect();
-            let mut z_x = F::ONE;
-            for chunk_products in &legacy_products {
-                assert_eq!(chunk_products.len(), num_chunks);
-                accumulate_point(&mut legacy_columns, &mut z_x, chunk_products);
-            }
-
-            // Shipping pipeline: batch-aligned writes into one flat buffer, exactly as the
-            // prover slices it.
-            let mut flat = vec![F::ZERO; n_points * num_chunks];
-            for (xs, out_chunk) in points
-                .chunks(INV_BATCH)
-                .zip(flat.chunks_mut(INV_BATCH * num_chunks))
-            {
-                for (t, quotient_values) in xs.iter().enumerate() {
-                    quotient_chunk_products_into(
-                        quotient_values,
-                        degree,
-                        &mut out_chunk[t * num_chunks..(t + 1) * num_chunks],
-                    );
-                }
-            }
-            let mut flat_columns: Vec<Vec<F>> = (0..num_chunks)
-                .map(|_| Vec::with_capacity(n_points))
-                .collect();
-            let mut z_x = F::ONE;
-            for chunk_products in flat.chunks_exact(num_chunks) {
-                accumulate_point(&mut flat_columns, &mut z_x, chunk_products);
-            }
-
-            for (k, (flat_column, legacy_column)) in
-                flat_columns.iter().zip(&legacy_columns).enumerate()
-            {
-                assert_eq!(
-                    raw(flat_column),
-                    raw(legacy_column),
-                    "column {k} mismatch for {n_points} points"
-                );
-            }
-        }
-    }
-}
-
-#[cfg(all(test, feature = "std"))]
-mod l_0_table_tests {
-    use plonky2_field::goldilocks_field::GoldilocksField;
-    use plonky2_field::types::Field;
-    use plonky2_field::zero_poly_coset::ZeroPolyOnCoset;
-
-    use super::l_0_table_cache::l_0_denominator_inverses;
-
-    type F = GoldilocksField;
-
-    const COMBOS: [(usize, usize); 5] = [(1, 1), (3, 2), (4, 3), (6, 2), (8, 3)];
-
-    /// Every cached entry must equal the legacy per-point computation
-    /// `(n * (g * w^i - 1)).inverse()` bit-for-bit (raw u64 representation, not just field
-    /// value), for several (degree_bits, quotient_degree_bits) combos.
-    #[test]
-    fn table_entries_match_legacy_per_point_inversion() {
-        for (degree_bits, quotient_degree_bits) in COMBOS {
-            let table = l_0_denominator_inverses::<F>(degree_bits, quotient_degree_bits);
-            let points = F::two_adic_subgroup(degree_bits + quotient_degree_bits);
-            assert_eq!(table.len(), points.len());
-            let n = F::from_canonical_usize(1 << degree_bits);
-            for (i, &point) in points.iter().enumerate() {
-                // The prover's shifted point, computed exactly as `compute_quotient_polys`
-                // computes `shifted_xs`.
-                let x = F::coset_shift() * point;
-                let legacy = (n * (x - F::ONE)).inverse();
-                assert_eq!(
-                    table[i].0, legacy.0,
-                    "entry {i} of table ({degree_bits}, {quotient_degree_bits})"
-                );
-            }
-        }
-    }
-
-    /// `eval_l_0` with the table attached must return raw-identical values to the uncached
-    /// path at every LDE point.
-    #[test]
-    fn eval_l_0_with_table_matches_uncached() {
-        for (degree_bits, quotient_degree_bits) in COMBOS {
-            let plain = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits);
-            let cached = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits)
-                .with_l_0_denominator_inverses(l_0_denominator_inverses::<F>(
-                    degree_bits,
-                    quotient_degree_bits,
-                ));
-            for (i, point) in F::two_adic_subgroup(degree_bits + quotient_degree_bits)
-                .into_iter()
-                .enumerate()
-            {
-                let x = F::coset_shift() * point;
-                assert_eq!(
-                    cached.eval_l_0(i, x).0,
-                    plain.eval_l_0(i, x).0,
-                    "eval_l_0({i}) for ({degree_bits}, {quotient_degree_bits})"
-                );
-            }
-        }
-    }
 }

@@ -120,18 +120,14 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     let num_gates = gates.len();
     let max_gate_degree = gates.last().expect("No gates?").0.degree();
 
-    // Pre-index the sorted gate list by gate ID so each row instance resolves its
-    // sorted position with one `Gate::id()` call plus one expected-constant-time
-    // hash lookup, instead of a linear scan that re-generates every candidate
-    // gate's ID (`Gate::id()` allocates a fresh `String`, typically via
-    // `format!`). `entry().or_insert()` keeps first-position semantics for
-    // duplicate IDs, matching the previous `.position()` behavior. The map is
-    // used only for lookup, so its iteration order never influences any output.
-    let mut gate_index = HashMap::with_capacity(num_gates);
-    for (i, g) in gates.iter().enumerate() {
-        gate_index.entry(g.0.id()).or_insert(i);
+    let mut gate_indices = HashMap::with_capacity(num_gates);
+    for (i, gate) in gates.iter().enumerate() {
+        gate_indices.entry(gate.0.id()).or_insert(i);
     }
-    let index = |id| *gate_index.get(&id).unwrap();
+    let index = |gate_ref: &GateRef<F, D>| {
+        let id = gate_ref.0.id();
+        *gate_indices.get(&id).unwrap()
+    };
 
     // Special case if we can use only one selector polynomial.
     if max_gate_degree + num_gates - 1 <= max_degree {
@@ -142,7 +138,7 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
             vec![PolynomialValues::new(
                 instances
                     .iter()
-                    .map(|g| F::from_canonical_usize(index(g.gate_ref.0.id())))
+                    .map(|g| F::from_canonical_usize(index(&g.gate_ref)))
                     .collect(),
             )],
             SelectorsInfo {
@@ -174,23 +170,16 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
     let group = |i| groups.iter().position(|range| range.contains(&i)).unwrap();
 
     // `selector_indices[i] = j` iff the `i`-th gate uses the `j`-th selector polynomial.
-    let selector_indices: Vec<usize> = (0..num_gates).map(group).collect();
+    let selector_indices = (0..num_gates).map(group).collect::<Vec<_>>();
 
     // Placeholder value to indicate that a gate doesn't use a selector polynomial.
     let unused = F::from_canonical_usize(UNUSED_SELECTOR);
 
-    // Initialize every selector cell to the inactive sentinel, then write only
-    // the active cell per row. The final value rule is unchanged:
-    //     selector[column][row] = sorted_gate_index  if column is the row
-    //                                                gate's selector group;
-    //                             UNUSED_SELECTOR    otherwise.
-    // The row loop reuses the already-materialized `selector_indices` mapping
-    // instead of re-scanning `groups` for every row.
-    let mut polynomials = vec![PolynomialValues::constant(unused, n); groups.len()];
-    for (j, g) in instances.iter().enumerate() {
-        let GateInstance { gate_ref, .. } = g;
-        let i = index(gate_ref.0.id());
-        polynomials[selector_indices[i]].values[j] = F::from_canonical_usize(i);
+    let mut polynomials = vec![PolynomialValues::new(vec![unused; n]); groups.len()];
+    for (row, instance) in instances.iter().enumerate() {
+        let i = index(&instance.gate_ref);
+        let selector = selector_indices[i];
+        polynomials[selector].values[row] = F::from_canonical_usize(i);
     }
 
     (
@@ -204,227 +193,76 @@ pub(crate) fn selector_polynomials<F: RichField + Extendable<D>, const D: usize>
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{selector_polynomials, GateInstance, GateRef, UNUSED_SELECTOR};
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::Field;
     use crate::gates::arithmetic_base::ArithmeticGate;
-    use crate::gates::base_sum::BaseSumGate;
-    use crate::gates::constant::ConstantGate;
     use crate::gates::noop::NoopGate;
-    use crate::gates::poseidon::PoseidonGate;
     use crate::gates::public_input::PublicInputGate;
-    use crate::gates::random_access::RandomAccessGate;
-    use crate::plonk::circuit_data::CircuitConfig;
 
-    type F = GoldilocksField;
     const D: usize = 2;
+    type F = GoldilocksField;
 
-    /// Verbatim copy of the pre-optimization `selector_polynomials`, kept as the
-    /// reference implementation for pointwise equivalence.
-    fn legacy_selector_polynomials(
-        gates: &[GateRef<F, D>],
-        instances: &[GateInstance<F, D>],
-        max_degree: usize,
-    ) -> (Vec<PolynomialValues<F>>, SelectorsInfo) {
-        let n = instances.len();
-        let num_gates = gates.len();
-        let max_gate_degree = gates.last().expect("No gates?").0.degree();
-
-        let index = |id| gates.iter().position(|g| g.0.id() == id).unwrap();
-
-        // Special case if we can use only one selector polynomial.
-        if max_gate_degree + num_gates - 1 <= max_degree {
-            #[allow(clippy::single_range_in_vec_init)]
-            return (
-                vec![PolynomialValues::new(
-                    instances
-                        .iter()
-                        .map(|g| F::from_canonical_usize(index(g.gate_ref.0.id())))
-                        .collect(),
-                )],
-                SelectorsInfo {
-                    selector_indices: vec![0; num_gates],
-                    groups: vec![0..num_gates],
-                },
-            );
-        }
-
-        if max_gate_degree >= max_degree {
-            panic!(
-                "{} has too high degree. Consider increasing `quotient_degree_factor`.",
-                gates.last().unwrap().0.id()
-            );
-        }
-
-        // Greedily construct the groups.
-        let mut groups = Vec::new();
-        let mut start = 0;
-        while start < num_gates {
-            let mut size = 0;
-            while (start + size < gates.len())
-                && (size + gates[start + size].0.degree() < max_degree)
-            {
-                size += 1;
-            }
-            groups.push(start..start + size);
-            start += size;
-        }
-
-        let group = |i| groups.iter().position(|range| range.contains(&i)).unwrap();
-
-        let selector_indices = (0..num_gates).map(group).collect();
-
-        let unused = F::from_canonical_usize(UNUSED_SELECTOR);
-
-        let mut polynomials = vec![PolynomialValues::zero(n); groups.len()];
-        for (j, g) in instances.iter().enumerate() {
-            let GateInstance { gate_ref, .. } = g;
-            let i = index(gate_ref.0.id());
-            let gr = group(i);
-            for g in 0..groups.len() {
-                polynomials[g].values[j] = if g == gr {
-                    F::from_canonical_usize(i)
-                } else {
-                    unused
-                };
-            }
-        }
-
-        (
-            polynomials,
-            SelectorsInfo {
-                selector_indices,
-                groups,
-            },
-        )
-    }
-
-    /// Sorts gates exactly as `CircuitBuilder::build` does before calling
-    /// `selector_polynomials`.
-    fn sorted_gates(mut gates: Vec<GateRef<F, D>>) -> Vec<GateRef<F, D>> {
-        gates.sort_unstable_by_key(|g| (g.0.degree(), g.0.id()));
-        gates
-    }
-
-    /// Deterministic mixed-order row assignment touching every gate type.
-    fn instances_in_mixed_order(gates: &[GateRef<F, D>], n: usize) -> Vec<GateInstance<F, D>> {
-        (0..n)
-            .map(|row| GateInstance {
-                gate_ref: gates[(row * 7 + row / 3) % gates.len()].clone(),
+    fn gates_and_instances() -> (Vec<GateRef<F, D>>, Vec<GateInstance<F, D>>, Vec<usize>) {
+        let gates = vec![
+            GateRef::new(NoopGate),
+            GateRef::new(PublicInputGate),
+            GateRef::new(ArithmeticGate { num_ops: 1 }),
+        ];
+        let row_gate_indices = vec![0, 1, 2, 0, 2, 1, 1, 0];
+        let instances = row_gate_indices
+            .iter()
+            .map(|&i| GateInstance {
+                gate_ref: gates[i].clone(),
                 constants: vec![],
             })
-            .collect()
-    }
-
-    /// The gate mix used by the production-config tests: distinct IDs across a
-    /// spread of degrees (0 through 7), like the challenge circuits' gate sets.
-    fn production_style_gates(config: &CircuitConfig) -> Vec<GateRef<F, D>> {
-        sorted_gates(vec![
-            GateRef::new(NoopGate),
-            GateRef::new(PublicInputGate),
-            GateRef::new(ConstantGate::new(config.num_constants)),
-            GateRef::new(BaseSumGate::<2>::new(8)),
-            GateRef::new(ArithmeticGate::new_from_config(config)),
-            GateRef::new(RandomAccessGate::new_from_config(config, 4)),
-            GateRef::new(PoseidonGate::new()),
-        ])
-    }
-
-    fn assert_pointwise_equal(
-        gates: &[GateRef<F, D>],
-        instances: &[GateInstance<F, D>],
-        max_degree: usize,
-    ) {
-        let (legacy_polys, legacy_info) = legacy_selector_polynomials(gates, instances, max_degree);
-        let (polys, info) = selector_polynomials(gates, instances, max_degree);
-        // `PolynomialValues` equality is exact field-element (u64) equality, so
-        // this is a pointwise byte-identity check against the legacy
-        // construction.
-        assert_eq!(polys, legacy_polys);
-        assert_eq!(info, legacy_info);
+            .collect();
+        (gates, instances, row_gate_indices)
     }
 
     #[test]
-    fn selector_polynomials_match_legacy_on_production_config() {
-        // The builder calls `selector_polynomials(gates, instances,
-        // quotient_degree_factor + 1)`; both production configs in the
-        // challenge use `max_quotient_degree_factor = 8`.
-        let config = CircuitConfig::standard_recursion_config();
-        assert_eq!(config.max_quotient_degree_factor, 8);
-        let max_degree = config.max_quotient_degree_factor + 1;
+    fn selector_polynomials_single_group_have_exact_values() {
+        let (gates, instances, row_gate_indices) = gates_and_instances();
+        let (polynomials, info) = selector_polynomials(&gates, &instances, 5);
 
-        let gates = production_style_gates(&config);
-        let instances = instances_in_mixed_order(&gates, 128);
-        // Degree-7 Poseidon plus 6 more gates cannot fit one selector group at
-        // max_degree 9, so this exercises the multi-selector branch.
-        assert!(gates.last().unwrap().0.degree() + gates.len() - 1 > max_degree);
-        assert_pointwise_equal(&gates, &instances, max_degree);
-    }
-
-    #[test]
-    fn selector_polynomials_match_legacy_single_group() {
-        let config = CircuitConfig::standard_recursion_config();
-        let gates = sorted_gates(vec![
-            GateRef::new(NoopGate),
-            GateRef::new(PublicInputGate),
-            GateRef::new(ArithmeticGate::new_from_config(&config)),
-        ]);
-        let instances = instances_in_mixed_order(&gates, 64);
-        // Max degree 3 with 3 gates fits in one group at max_degree 9.
-        assert!(gates.last().unwrap().0.degree() + gates.len() - 1 <= 9);
-        assert_pointwise_equal(&gates, &instances, 9);
-
-        let (_, info) = selector_polynomials(&gates, &instances, 9);
         assert_eq!(info.groups, vec![0..3]);
         assert_eq!(info.selector_indices, vec![0, 0, 0]);
+        assert_eq!(polynomials.len(), 1);
+        assert_eq!(
+            polynomials[0].values,
+            row_gate_indices
+                .into_iter()
+                .map(F::from_canonical_usize)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
-    fn selector_polynomials_match_legacy_forced_multi_group() {
-        // A tighter degree bound forces more, smaller groups. The gate set
-        // tops out at degree 3 (ArithmeticGate) so every swept `max_degree`
-        // stays above the largest gate degree, as `selector_polynomials`
-        // requires.
-        let config = CircuitConfig::standard_recursion_config();
-        let gates = sorted_gates(vec![
-            GateRef::new(NoopGate),
-            GateRef::new(PublicInputGate),
-            GateRef::new(ConstantGate::new(config.num_constants)),
-            GateRef::new(BaseSumGate::<2>::new(8)),
-            GateRef::new(ArithmeticGate::new_from_config(&config)),
-        ]);
-        let max_gate_degree = gates.last().unwrap().0.degree();
-        for max_degree in [4, 5, 6] {
-            // Stay in the multi-group branch without tripping the
-            // too-high-degree panic.
-            assert!(max_gate_degree < max_degree);
-            assert!(max_gate_degree + gates.len() - 1 > max_degree);
-            let instances = instances_in_mixed_order(&gates, 128);
-            assert_pointwise_equal(&gates, &instances, max_degree);
-        }
-    }
-
-    #[test]
-    fn selector_polynomials_inactive_cells_are_unused_sentinel() {
-        let config = CircuitConfig::standard_recursion_config();
-        let gates = production_style_gates(&config);
-        let instances = instances_in_mixed_order(&gates, 128);
-        let max_degree = config.max_quotient_degree_factor + 1;
-        let (polys, info) = selector_polynomials(&gates, &instances, max_degree);
-        assert!(info.groups.len() > 1);
-
-        let index = |id: String| gates.iter().position(|g| g.0.id() == id).unwrap();
+    fn selector_polynomials_multiple_groups_have_exact_values() {
+        let (gates, instances, row_gate_indices) = gates_and_instances();
+        let (polynomials, info) = selector_polynomials(&gates, &instances, 4);
         let unused = F::from_canonical_usize(UNUSED_SELECTOR);
-        for (j, inst) in instances.iter().enumerate() {
-            let i = index(inst.gate_ref.0.id());
-            let gr = info.selector_indices[i];
-            for (g, poly) in polys.iter().enumerate() {
-                if g == gr {
-                    assert_eq!(poly.values[j], F::from_canonical_usize(i));
+
+        assert_eq!(info.groups, vec![0..2, 2..3]);
+        assert_eq!(info.selector_indices, vec![0, 0, 1]);
+        assert_eq!(polynomials.len(), 2);
+        for (row, gate_index) in row_gate_indices.into_iter().enumerate() {
+            assert_eq!(
+                polynomials[0].values[row],
+                if gate_index < 2 {
+                    F::from_canonical_usize(gate_index)
                 } else {
-                    assert_eq!(poly.values[j], unused);
+                    unused
                 }
-            }
+            );
+            assert_eq!(
+                polynomials[1].values[row],
+                if gate_index == 2 {
+                    F::from_canonical_usize(gate_index)
+                } else {
+                    unused
+                }
+            );
         }
     }
 }
