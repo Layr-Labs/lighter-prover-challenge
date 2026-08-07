@@ -665,8 +665,8 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let a = FF::from_noncanonical_biguint(witness.get_biguint_target(self.a.value.clone()));
-        let b = FF::from_noncanonical_biguint(witness.get_biguint_target(self.b.value.clone()));
+        let a = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.a.value));
+        let b = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.b.value));
         let a_biguint = a.to_canonical_biguint();
         let b_biguint = b.to_canonical_biguint();
         let sum_biguint = a_biguint + b_biguint;
@@ -778,7 +778,7 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
             .summands
             .iter()
             .map(|summand| {
-                FF::from_noncanonical_biguint(witness.get_biguint_target(summand.value.clone()))
+                FF::from_noncanonical_biguint(witness.get_biguint_target(&summand.value))
             })
             .collect();
         let summand_biguints: Vec<_> = summands
@@ -898,8 +898,8 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let a = FF::from_noncanonical_biguint(witness.get_biguint_target(self.a.value.clone()));
-        let b = FF::from_noncanonical_biguint(witness.get_biguint_target(self.b.value.clone()));
+        let a = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.a.value));
+        let b = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.b.value));
         let a_biguint = a.to_canonical_biguint();
         let b_biguint = b.to_canonical_biguint();
 
@@ -1016,8 +1016,8 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let a = FF::from_noncanonical_biguint(witness.get_biguint_target(self.a.value.clone()));
-        let b = FF::from_noncanonical_biguint(witness.get_biguint_target(self.b.value.clone()));
+        let a = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.a.value));
+        let b = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.b.value));
         let a_biguint = a.to_canonical_biguint();
         let b_biguint = b.to_canonical_biguint();
 
@@ -1146,9 +1146,9 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let a = FF::from_noncanonical_biguint(witness.get_biguint_target(self.a.value.clone()));
-        let b = FF::from_noncanonical_biguint(witness.get_biguint_target(self.b.value.clone()));
-        let d = FF::from_noncanonical_biguint(witness.get_biguint_target(self.d.value.clone()));
+        let a = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.a.value));
+        let b = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.b.value));
+        let d = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.d.value));
         let a_biguint = a.to_canonical_biguint();
         let b_biguint = b.to_canonical_biguint();
         let d_biguint = d.to_canonical_biguint();
@@ -1306,7 +1306,7 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let x = FF::from_noncanonical_biguint(witness.get_biguint_target(self.x.value.clone()));
+        let x = FF::from_noncanonical_biguint(witness.get_biguint_target(&self.x.value));
         let inv = x.try_inverse();
         if inv.is_none() {
             out_buffer.set_biguint_target(&self.div, &BigUint::ZERO)?;
@@ -1412,7 +1412,7 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let b = witness.get_biguint_target(self.b.value.clone());
+        let b = witness.get_biguint_target(&self.b.value);
         let b_inv = FF::from_noncanonical_biguint(b.clone()).try_inverse();
         if b_inv.is_none() {
             out_buffer.set_biguint_target(&self.div.value, &BigUint::ZERO)?;
@@ -1421,7 +1421,7 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         }
         let b_inv = b_inv.unwrap();
 
-        let a = witness.get_biguint_target(self.a.value.clone());
+        let a = witness.get_biguint_target(&self.a.value);
 
         let order = FF::order();
         let (_, div) = (&a * b_inv.to_canonical_biguint()).div_rem(&order);

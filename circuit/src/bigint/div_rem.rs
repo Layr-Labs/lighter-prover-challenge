@@ -194,8 +194,45 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let a = witness.get_biguint_target(self.a.clone());
-        let b = witness.get_biguint_target(self.b.clone());
+        // Fast path: inputs of at most four u32 limbs fit in `u128`, so the
+        // whole division runs on machine integers with zero heap allocations.
+        // The matching-engine fee divisions are exactly this shape. Values and
+        // edge behavior are identical to the `BigUint` path: a zero divisor
+        // yields zero quotient and remainder, and an output that exceeds its
+        // target's limb budget panics (the `BigUint` path's length assert).
+        if self.a.num_limbs() <= 4 && self.b.num_limbs() <= 4 {
+            use plonky2::iop::witness::Witness;
+
+            use crate::uint::u32::witness::GeneratedValuesU32;
+            let read_u128 = |t: &BigUintTarget| -> u128 {
+                let mut v = 0u128;
+                for (i, limb) in t.limbs.iter().enumerate() {
+                    let x = witness.get_target(limb.0).to_canonical_u64();
+                    debug_assert!(x < (1u64 << 32), "BigUintTarget limb out of u32 range");
+                    v |= (x as u128) << (32 * i);
+                }
+                v
+            };
+            let write_u128 = |out_buffer: &mut GeneratedValues<F>,
+                              t: &BigUintTarget,
+                              mut v: u128|
+             -> Result<()> {
+                for i in 0..t.num_limbs() {
+                    out_buffer.set_u32_target(t.get_limb(i), (v & 0xFFFF_FFFF) as u32)?;
+                    v >>= 32;
+                }
+                assert!(v == 0, "div_rem output exceeds target limb budget");
+                Ok(())
+            };
+            let a = read_u128(&self.a);
+            let b = read_u128(&self.b);
+            let (div, rem) = if b == 0 { (0, 0) } else { (a / b, a % b) };
+            write_u128(out_buffer, &self.div, div)?;
+            return write_u128(out_buffer, &self.rem, rem);
+        }
+
+        let a = witness.get_biguint_target(&self.a);
+        let b = witness.get_biguint_target(&self.b);
 
         if b.is_zero() {
             out_buffer.set_biguint_target(&self.div, &BigUint::ZERO)?;
