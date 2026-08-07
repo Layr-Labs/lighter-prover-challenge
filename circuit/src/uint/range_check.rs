@@ -362,14 +362,23 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
             let top = self.wire_ith_input_jth_aux_limb(i, num_aux - 1);
 
             scratch.copy_from_slice(&wires[top * n..][..n]);
-            for j in (0..num_aux - 1).rev() {
-                let limb = &wires[self.wire_ith_input_jth_aux_limb(i, j) * n..][..n];
+            if num_aux == 1 {
                 for p in 0..n {
-                    scratch[p] = scratch[p] * base + limb[p];
+                    scratch[p] -= input[p];
                 }
-            }
-            for p in 0..n {
-                scratch[p] -= input[p];
+            } else {
+                for j in (0..num_aux - 1).rev() {
+                    let limb = &wires[self.wire_ith_input_jth_aux_limb(i, j) * n..][..n];
+                    if j == 0 {
+                        for p in 0..n {
+                            scratch[p] = scratch[p] * base + limb[p] - input[p];
+                        }
+                    } else {
+                        for p in 0..n {
+                            scratch[p] = scratch[p] * base + limb[p];
+                        }
+                    }
+                }
             }
             let combined =
                 &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
