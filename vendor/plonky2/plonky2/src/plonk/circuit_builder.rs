@@ -824,14 +824,24 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let num_gates = self.num_gates();
         let num_ops = gate.num_ops();
         let gate_ref = GateRef::new(gate.clone());
-        let gate_slot = self.current_slots.entry(gate_ref.clone()).or_default();
-        let slot = gate_slot.current_slot.get(params);
-        let (gate_idx, slot_idx) = if let Some(&s) = slot {
-            s
-        } else {
-            self.add_gate(gate, constants.to_vec());
-            (num_gates, 0)
-        };
+        // Single map traversal on the hit path: the entry handle stays borrowed
+        // through the slot update, instead of a second `get_mut` lookup. The miss
+        // path needs `&mut self` for `add_gate`, so it re-enters the map afterwards
+        // (misses happen once per `num_ops` hits).
+        let gate_slot = self.current_slots.entry(gate_ref).or_default();
+        if let Some(&(gate_idx, slot_idx)) = gate_slot.current_slot.get(params) {
+            if slot_idx == num_ops - 1 {
+                // We've filled up the slots at this index.
+                gate_slot.current_slot.remove(params);
+            } else {
+                // Increment the slot operation index.
+                gate_slot.current_slot.insert(params.to_vec(), (gate_idx, slot_idx + 1));
+            }
+            return (gate_idx, slot_idx);
+        }
+        let gate_ref = GateRef::new(gate.clone());
+        self.add_gate(gate, constants.to_vec());
+        let (gate_idx, slot_idx) = (num_gates, 0);
         let current_slot = &mut self.current_slots.get_mut(&gate_ref).unwrap().current_slot;
         if slot_idx == num_ops - 1 {
             // We've filled up the slots at this index.
