@@ -953,6 +953,9 @@ pub trait Read {
             circuit_digest,
             lookup_rows,
             lut_to_lookups,
+            constants_sigmas_quotient_cache: None,
+            constants_sigmas_quotient_step: 0,
+            constants_sigmas_quotient_domain: 0,
         })
     }
 
@@ -1917,6 +1920,10 @@ pub trait Write {
             // Runtime-only: reconstructed from `generator_indices_by_watches` on read, so it
             // contributes no bytes and the serialized format is unchanged.
             generator_watch_counts: _,
+            // Runtime-only quotient cache; serialized format is unchanged.
+            constants_sigmas_quotient_cache: _,
+            constants_sigmas_quotient_step: _,
+            constants_sigmas_quotient_domain: _,
             constants_sigmas_commitment,
             sigmas,
             subgroup,

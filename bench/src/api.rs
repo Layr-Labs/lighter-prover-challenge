@@ -145,6 +145,7 @@ impl Circuits {
             &mut self.heavy_chain_data,
         ] {
             data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            data.prover_only.constants_sigmas_quotient_cache = None;
         }
     }
 
