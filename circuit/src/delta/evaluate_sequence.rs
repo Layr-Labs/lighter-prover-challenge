@@ -20,7 +20,7 @@ use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
-use plonky2::plonk::vars::{EvaluationTargets, EvaluationVars};
+use plonky2::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBaseBatch};
 
 use crate::builder::Builder;
 use crate::eddsa::gadgets::base_field::{CircuitBuilderGFp5, QuinticExtensionTarget};
@@ -137,6 +137,43 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EvaluateSequen
             constraints.extend(diff_sum.0);
         }
         constraints
+    }
+
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        let x_cols: [&[F]; 5] = core::array::from_fn(|j| col(self.wire_x().start + j));
+        let mut chunks = combined_gate_constraints.chunks_exact_mut(n);
+
+        for i in 1..self.num_states {
+            let sum_old: [&[F]; 5] = core::array::from_fn(|j| col(self.wire_sum(i - 1).start + j));
+            let sum: [&[F]; 5] = core::array::from_fn(|j| col(self.wire_sum(i).start + j));
+            let current_element = col(self.wire_element(i));
+            let selector = col(self.wire_selector(i));
+            let mut outs: [&mut [F]; 5] = core::array::from_fn(|_| chunks.next().unwrap());
+
+            for p in 0..n {
+                let s = QuintupleBase::<F, D>::new(core::array::from_fn(|j| sum_old[j][p]));
+                let x = QuintupleBase::<F, D>::new(core::array::from_fn(|j| x_cols[j][p]));
+                let u = s.mul_quintic_w_adds(x).add_scalar(current_element[p]);
+                let sel = selector[p];
+                let f = filters[p];
+                //Constraints for sum: sel*u + (1-sel)*s == s + sel*(u - s),
+                //an exact ring identity on the shared selector wire.
+                for j in 0..5 {
+                    let expected = s.0[j] + sel * (u.0[j] - s.0[j]);
+                    outs[j][p] += f * (expected - sum[j][p]);
+                }
+            }
+        }
     }
     fn eval_unfiltered_circuit(
         &self,

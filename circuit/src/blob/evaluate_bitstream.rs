@@ -20,7 +20,7 @@ use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
-use plonky2::plonk::vars::{EvaluationTargets, EvaluationVars};
+use plonky2::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBaseBatch};
 
 use crate::builder::Builder;
 use crate::eddsa::gadgets::base_field::{CircuitBuilderGFp5, QuinticExtensionTarget};
@@ -301,6 +301,93 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EvaluateBitstr
         constraints.push(builder.sub_extension(new_degree, degree_acc));
 
         constraints
+    }
+
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        let field_chunk_max = F::from_canonical_usize(Self::CHUNK_MAX);
+        let x_cols: [&[F]; 5] = core::array::from_fn(|j| col(self.wire_x().start + j));
+
+        // Batches are 32 points in this prover; keep the running degree sum on
+        // the stack and fall back to the heap only for oversized batches.
+        let mut degree_stack = [F::ZERO; 64];
+        let mut degree_heap;
+        let degree_acc: &mut [F] = if n <= 64 {
+            &mut degree_stack[..n]
+        } else {
+            degree_heap = vec![F::ZERO; n];
+            &mut degree_heap
+        };
+        degree_acc.copy_from_slice(col(self.wire_degree_prev()));
+
+        let mut chunks = combined_gate_constraints.chunks_exact_mut(n);
+
+        for i in 1..self.num_states {
+            let sum_old: [&[F]; 5] = core::array::from_fn(|j| col(self.wire_sum(i - 1).start + j));
+            let number_accumulator_old = col(self.wire_number_accumulator(i - 1));
+            let chunks_left_old = col(self.wire_chunks_left(i - 1));
+            let number_ending_old = col(self.wire_number_ending(i - 1));
+            let number_not_ending_old = col(self.wire_not_number_ending(i - 1));
+
+            let sum: [&[F]; 5] = core::array::from_fn(|j| col(self.wire_sum(i).start + j));
+            let number_accumulator = col(self.wire_number_accumulator(i));
+            let chunks_left = col(self.wire_chunks_left(i));
+            let number_ending = col(self.wire_number_ending(i));
+            let number_not_ending = col(self.wire_not_number_ending(i));
+
+            let current_chunk = col(self.wire_chunk(i));
+            let chunks_left_inv = col(self.wire_chunks_left_inv(i));
+
+            let mut outs: [&mut [F]; 10] = core::array::from_fn(|_| chunks.next().unwrap());
+
+            for p in 0..n {
+                let f = filters[p];
+                let cl = chunks_left[p];
+                let nne = number_not_ending[p];
+                let ne = number_ending[p];
+                let acc = number_accumulator[p];
+
+                // Accumulate degree
+                degree_acc[p] += ne;
+
+                //Constraints for number ending
+                //equivalent to zero check of chunks_left
+                outs[0][p] += f * ((cl * chunks_left_inv[p]) - nne);
+                outs[1][p] += f * ((nne * cl) - cl);
+                outs[2][p] += f * ((F::ONE - nne) - ne);
+                //Constraints for chunks_left
+                let expected_chunks_left = (number_ending_old[p] * current_chunk[p])
+                    + number_not_ending_old[p] * (chunks_left_old[p] - F::ONE);
+                outs[3][p] += f * (expected_chunks_left - cl);
+                //Constraints for number_accumulator
+                let expected_number_accumulator = number_not_ending_old[p]
+                    * (number_accumulator_old[p] * field_chunk_max + current_chunk[p]);
+                outs[4][p] += f * (expected_number_accumulator - acc);
+                //Constraints for sum; `number_ending`/`number_not_ending` are
+                //independent wires, so the two-scalar select stays verbatim.
+                let s = QuintupleBase::<F, D>::new(core::array::from_fn(|j| sum_old[j][p]));
+                let x = QuintupleBase::<F, D>::new(core::array::from_fn(|j| x_cols[j][p]));
+                let u = s.mul_quintic_w_adds(x).add_scalar(acc);
+                for j in 0..5 {
+                    outs[5 + j][p] += f * ((ne * u.0[j] + nne * s.0[j]) - sum[j][p]);
+                }
+            }
+        }
+
+        let out = chunks.next().unwrap();
+        let new_degree = col(self.wire_degree());
+        for p in 0..n {
+            out[p] += filters[p] * (new_degree[p] - degree_acc[p]);
+        }
     }
 
     fn generators(&self, row: usize, _local_constants: &[F]) -> Vec<WitnessGeneratorRef<F, D>> {

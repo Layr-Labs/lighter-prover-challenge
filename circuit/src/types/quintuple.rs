@@ -465,6 +465,35 @@ impl<F: RichField + Extendable<D> + Copy, const D: usize> QuintupleBase<F, D> {
         }
         Self(c)
     }
+
+    /// `mul_quintic` with the reduction's `3x` computed as exact adds.
+    #[inline]
+    pub fn mul_quintic_w_adds(self, rhs: Self) -> Self {
+        let a = self.0;
+        let b = rhs.0;
+
+        // convolution d[0..=8]
+        let mut d = [F::ZERO; 9];
+        for s in 0..=8 {
+            let mut acc = F::ZERO;
+            for i in 0..=s {
+                let j = s - i;
+                if i < 5 && j < 5 {
+                    acc += a[i] * b[j];
+                }
+            }
+            d[s] = acc;
+        }
+
+        // reduction: c_k = d_k + 3 * d_{k+5}, k=0..4, with 3x = x + x + x
+        let mut c = [F::ZERO; 5];
+        c.copy_from_slice(&d[0..5]);
+        for s in 5..=8 {
+            let t = d[s];
+            c[s - 5] += t + t + t;
+        }
+        Self(c)
+    }
 }
 
 /* Group ops */
