@@ -1360,6 +1360,36 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             }
         }
 
+        // Cache circuit-fixed constants/sigma quotient values once, bounded so
+        // the single-use final block circuit remains uncached.
+        let quotient_degree_bits = log2_ceil(common.quotient_degree_factor);
+        let constants_sigmas_quotient_step =
+            1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
+        let constants_sigmas_quotient_domain =
+            1 << (common.degree_bits() + quotient_degree_bits);
+        let cache_bytes = (common.constants_range().len() + common.sigmas_range().len())
+            .saturating_mul(constants_sigmas_quotient_domain)
+            .saturating_mul(core::mem::size_of::<F>());
+        let constants_sigmas_quotient_cache = if cache_bytes <= 1 << 30 {
+            constants_sigmas_commitment
+                .extract_lde_batch_columns(
+                    constants_sigmas_quotient_step,
+                    common.constants_range(),
+                    constants_sigmas_quotient_domain,
+                )
+                .zip(constants_sigmas_commitment.extract_lde_batch_columns(
+                    constants_sigmas_quotient_step,
+                    common.sigmas_range(),
+                    constants_sigmas_quotient_domain,
+                ))
+                .map(|(mut constants, sigmas)| {
+                    constants.extend(sigmas);
+                    constants
+                })
+        } else {
+            None
+        };
+
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,
             generator_indices_by_watches,
@@ -1373,6 +1403,9 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             circuit_digest,
             lookup_rows: self.lookup_rows.clone(),
             lut_to_lookups: self.lut_to_lookups.clone(),
+            constants_sigmas_quotient_cache,
+            constants_sigmas_quotient_step,
+            constants_sigmas_quotient_domain,
         };
 
         let verifier_only = VerifierOnlyCircuitData::<C, D> {

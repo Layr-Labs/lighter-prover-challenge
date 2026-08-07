@@ -428,6 +428,27 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         }
     }
 
+    /// Extracts stride-`step` LDE values over a whole quotient domain in
+    /// column-major order.
+    pub(crate) fn extract_lde_batch_columns(
+        &self,
+        step: usize,
+        col_range: core::ops::Range<usize>,
+        q_domain: usize,
+    ) -> Option<Vec<F>> {
+        let mut out = Vec::with_capacity(col_range.len() * q_domain);
+        match &self.merkle_tree.leaves {
+            MerkleLeaves::Columns { columns, .. } => {
+                for column_index in col_range {
+                    let column = columns.col(column_index);
+                    out.extend((0..q_domain).map(|i| column[i * step]));
+                }
+                Some(out)
+            }
+            MerkleLeaves::Rows { .. } => None,
+        }
+    }
+
     /// Like `get_lde_values`, but fetches LDE values from a batch of `P::WIDTH` points, and returns
     /// packed values.
     pub fn get_lde_values_packed<P>(&self, index_start: usize, step: usize) -> Vec<P>

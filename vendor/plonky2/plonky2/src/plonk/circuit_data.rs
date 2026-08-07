@@ -486,6 +486,13 @@ pub struct ProverOnlyCircuitData<
     pub lookup_rows: Vec<LookupWire>,
     /// A vector of (looking_in, looking_out) pairs for each lookup table index.
     pub lut_to_lookups: Vec<Lookup>,
+    /// Circuit-fixed constants and sigma values over the quotient domain,
+    /// stored column-major. Deserialized circuits leave this as `None`.
+    pub constants_sigmas_quotient_cache: Option<Vec<F>>,
+    /// Stride used to extract [`Self::constants_sigmas_quotient_cache`].
+    pub constants_sigmas_quotient_step: usize,
+    /// Domain size used to extract [`Self::constants_sigmas_quotient_cache`].
+    pub constants_sigmas_quotient_domain: usize,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>

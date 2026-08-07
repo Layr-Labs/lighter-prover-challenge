@@ -948,13 +948,6 @@ fn compute_quotient_polys<
                         .all(|(&sx, &x)| sx == F::coset_shift() * x)
                 );
 
-                prover_data.constants_sigmas_commitment.fill_lde_batch(
-                    &scratch.indices,
-                    step,
-                    common_data.constants_range(),
-                    BatchLayout::PolyMajor,
-                    &mut scratch.local_constants,
-                );
                 // Layout seam: the no-lookup column evaluator consumes the
                 // PolyMajor gathers as-is (and the "next" gather narrows to
                 // the Z columns, the only ones it reads); the per-point path
@@ -969,13 +962,54 @@ fn compute_quotient_polys<
                     (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
                 };
 
-                prover_data.constants_sigmas_commitment.fill_lde_batch(
-                    &scratch.indices,
-                    step,
-                    common_data.sigmas_range(),
-                    batch_layout,
-                    &mut scratch.s_sigmas_flat,
-                );
+                let quotient_cache = if col_major_perm {
+                    prover_data.constants_sigmas_quotient_cache.as_ref()
+                } else {
+                    None
+                };
+                if let Some(cache) = quotient_cache {
+                    debug_assert_eq!(prover_data.constants_sigmas_quotient_step, step);
+                    let domain = prover_data.constants_sigmas_quotient_domain;
+                    debug_assert_eq!(domain, points.len());
+                    let batch_start = BATCH_SIZE * batch_i;
+                    let constants_count = common_data.constants_range().len();
+                    let sigmas_count = common_data.sigmas_range().len();
+                    debug_assert_eq!(cache.len(), (constants_count + sigmas_count) * domain);
+
+                    scratch
+                        .local_constants
+                        .resize(constants_count * n, F::ZERO);
+                    for column in 0..constants_count {
+                        scratch.local_constants[column * n..(column + 1) * n].copy_from_slice(
+                            &cache[column * domain + batch_start
+                                ..column * domain + batch_start + n],
+                        );
+                    }
+
+                    scratch.s_sigmas_flat.resize(sigmas_count * n, F::ZERO);
+                    for column in 0..sigmas_count {
+                        let cache_column = constants_count + column;
+                        scratch.s_sigmas_flat[column * n..(column + 1) * n].copy_from_slice(
+                            &cache[cache_column * domain + batch_start
+                                ..cache_column * domain + batch_start + n],
+                        );
+                    }
+                } else {
+                    prover_data.constants_sigmas_commitment.fill_lde_batch(
+                        &scratch.indices,
+                        step,
+                        common_data.constants_range(),
+                        BatchLayout::PolyMajor,
+                        &mut scratch.local_constants,
+                    );
+                    prover_data.constants_sigmas_commitment.fill_lde_batch(
+                        &scratch.indices,
+                        step,
+                        common_data.sigmas_range(),
+                        batch_layout,
+                        &mut scratch.s_sigmas_flat,
+                    );
+                }
                 wires_commitment.fill_lde_batch(
                     &scratch.indices,
                     step,
