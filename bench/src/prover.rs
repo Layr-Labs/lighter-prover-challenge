@@ -32,9 +32,11 @@ enum TxPath {
     Light,
 }
 
-const LIGHT_TX_PROOF_WINDOW: usize = 2;
-// Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
-const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
+const LIGHT_TX_PROOF_WINDOW: usize = 3;
+// Keep only the first light proof serial while the fixed three-chunk heavy path ramps up.
+// Starting bounded light overlap at step 2 exposes one more proof to idle cores without
+// increasing the established three-proof memory window.
+const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 2;
 
 fn chunk_is_light(txs: &[Tx<F>]) -> bool {
     txs.first()
@@ -379,27 +381,34 @@ fn prove_path(
                 .expect("chain step pipeline thread must start");
             chain = Some(ChainState::InFlight(handle));
         }
-        // Past this point the pipeline spawns no new chunk work: the drain
-        // below is the strictly sequential chain tail, so its mid-size
-        // commitment trees can use the mostly idle GPU exactly like the
-        // pre-execution and final block phases.
-        plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-        while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
-            let tx_proof = proof_handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            let previous = chain.take();
-            chain = Some(ChainState::Ready(chain_step_proof(
-                path,
-                chain_target,
-                chain_data,
-                chain_step,
-                previous,
-                base,
-                dummy_proof,
-                &tx_proof,
-            )));
-        }
+          // Keep the predecessor-linked chain pipeline alive while draining buffered
+          // transaction proofs. Each thread can prepare its proof-independent witness
+          // inputs immediately, then waits for the prior chain proof only at the feed.
+          // This removes synchronous witness preparation from the light-path tail.
+          plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
+          while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
+              let tx_proof = proof_handle
+                  .join()
+                  .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+              let previous = chain.take();
+              let handle = std::thread::Builder::new()
+                  .name(format!("{path:?}-chain-step-{chain_step}"))
+                  .stack_size(PROVER_THREAD_STACK_BYTES)
+                  .spawn_scoped(scope, move || {
+                      chain_step_proof(
+                          path,
+                          chain_target,
+                          chain_data,
+                          chain_step,
+                          previous,
+                          base,
+                          dummy_proof,
+                          &tx_proof,
+                      )
+                  })
+                  .expect("chain step drain thread must start");
+              chain = Some(ChainState::InFlight(handle));
+          }
         let chain_proof = chain
             .map(ChainState::wait)
             .expect("transaction path must produce a chain proof");
