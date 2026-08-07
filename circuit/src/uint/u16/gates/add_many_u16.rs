@@ -13,7 +13,7 @@ use core::marker::PhantomData;
 use anyhow::Result;
 use plonky2::field::extension::Extendable;
 use plonky2::field::types::Field;
-use plonky2::gates::gate::Gate;
+use plonky2::gates::gate::{Gate, resize_constraint_scratch};
 use plonky2::gates::util::StridedConstraintConsumer;
 use plonky2::hash::hash_types::RichField;
 use plonky2::iop::ext_target::ExtensionTarget;
@@ -163,13 +163,23 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16AddManyGate
     }
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
+        let mut out = Vec::new();
+        self.eval_unfiltered_base_batch_into(vars_base, &mut out);
+        out
+    }
+
+    fn eval_unfiltered_base_batch_into(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        out: &mut Vec<F>,
+    ) {
         let n = vars_base.len();
         let wires = vars_base.local_wires;
         let three = F::from_canonical_usize(3);
         let base_limb = F::from_canonical_u64(1u64 << Self::limb_bits());
         let base16 = F::from_canonical_u64(1 << 16u64);
-        let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
-        let mut chunks = res.chunks_exact_mut(n);
+        resize_constraint_scratch(out, n * <Self as Gate<F, D>>::num_constraints(self));
+        let mut chunks = out.chunks_exact_mut(n);
         let mut combined_result = vec![F::ZERO; n];
         let mut combined_carry = vec![F::ZERO; n];
 
@@ -223,7 +233,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16AddManyGate
                 out[p] = combined_carry[p] - output_carry[p];
             }
         }
-        res
     }
 
     fn eval_unfiltered_base_one(

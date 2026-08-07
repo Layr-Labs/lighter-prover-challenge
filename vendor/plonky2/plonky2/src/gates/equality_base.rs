@@ -123,6 +123,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EqualityGate {
         vars_base: EvaluationVarsBaseBatch<F>,
         filters: &[F],
         combined_gate_constraints: &mut [F],
+        _scratch: &mut Vec<F>,
     ) {
         let n = vars_base.len();
         assert_eq!(filters.len(), n);
@@ -182,6 +183,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EqualityGate {
         }
 
         debug_assert_eq!(constraint_index, self.num_ops * 4);
+    }
+
+    fn eval_unfiltered_base_batch_into(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        out: &mut Vec<F>,
+    ) {
+        self.eval_unfiltered_base_batch_packed_into(vars_base, out)
     }
 
     fn eval_unfiltered_circuit(
@@ -532,6 +541,7 @@ mod tests {
             vars,
             &filters,
             &mut actual,
+            &mut Vec::new(),
         );
         assert_eq!(actual, expected);
     }

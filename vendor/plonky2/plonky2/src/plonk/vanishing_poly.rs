@@ -9,6 +9,7 @@ use super::vars::EvaluationVarsBase;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
+use crate::gates::gate::{compute_group_filters, resize_constraint_scratch};
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
 use crate::gates::selectors::LookupSelectors;
@@ -175,6 +176,8 @@ pub(crate) struct VanishingScratch<F> {
     pub vanishing_all_lookup_terms: Vec<F>,
     pub lookup_selectors: Vec<F>,
     pub constraint_terms_batch: Vec<F>,
+    pub gate_filters: Vec<F>,
+    pub gate_scratch: Vec<F>,
 }
 
 /// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
@@ -274,6 +277,8 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         common_data,
         vars_batch,
         &mut scratch.constraint_terms_batch,
+        &mut scratch.gate_filters,
+        &mut scratch.gate_scratch,
     );
     let constraint_terms_batch = &scratch.constraint_terms_batch;
     debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
@@ -932,30 +937,56 @@ pub fn evaluate_gate_constraints_base_batch<F: RichField + Extendable<D>, const 
     vars_batch: EvaluationVarsBaseBatch<F>,
 ) -> Vec<F> {
     let mut constraints_batch = Vec::new();
-    evaluate_gate_constraints_base_batch_into::<F, D>(common_data, vars_batch, &mut constraints_batch);
+    let mut filters = Vec::new();
+    let mut scratch = Vec::new();
+    evaluate_gate_constraints_base_batch_into::<F, D>(
+        common_data,
+        vars_batch,
+        &mut constraints_batch,
+        &mut filters,
+        &mut scratch,
+    );
     constraints_batch
 }
 
-/// Like [`evaluate_gate_constraints_base_batch`], but reuses the caller's buffer.
+/// Like [`evaluate_gate_constraints_base_batch`], but reuses the caller's
+/// buffers: `constraints_batch` for the accumulated output, `filters` for the
+/// per-gate selector filter columns (plus one trailing scratch column), and
+/// `scratch` for each gate's raw constraint matrix.
 pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
     vars_batch: EvaluationVarsBaseBatch<F>,
     constraints_batch: &mut Vec<F>,
+    filters: &mut Vec<F>,
+    scratch: &mut Vec<F>,
 ) {
+    let batch_size = vars_batch.len();
     constraints_batch.clear();
-    constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
-    let mut filters = Vec::with_capacity(vars_batch.len());
+    constraints_batch.resize(common_data.num_gate_constraints * batch_size, F::ZERO);
+
+    // One pass computes every gate's filter column; the extra trailing column
+    // is the prefix/suffix running product.
+    let num_gates = common_data.gates.len();
+    let num_selectors = common_data.selectors_info.num_selectors();
+    resize_constraint_scratch(filters, (num_gates + 1) * batch_size);
+    let (filter_columns, run) = filters.split_at_mut(num_gates * batch_size);
+    compute_group_filters(
+        &common_data.selectors_info.groups,
+        vars_batch.local_constants,
+        batch_size,
+        num_selectors,
+        filter_columns,
+        &mut run[..batch_size],
+    );
+
     for (i, gate) in common_data.gates.iter().enumerate() {
-        let selector_index = common_data.selectors_info.selector_indices[i];
         gate.0.eval_filtered_base_batch(
             vars_batch,
-            i,
-            selector_index,
-            common_data.selectors_info.groups[selector_index].clone(),
-            common_data.selectors_info.num_selectors(),
+            &filter_columns[i * batch_size..][..batch_size],
+            num_selectors,
             common_data.num_lookup_selectors,
-            &mut filters,
             constraints_batch,
+            scratch,
         );
     }
 }

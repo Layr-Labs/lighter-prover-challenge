@@ -104,6 +104,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticGate
         self.eval_unfiltered_base_batch_packed(vars_base)
     }
 
+    fn eval_unfiltered_base_batch_into(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        out: &mut Vec<F>,
+    ) {
+        self.eval_unfiltered_base_batch_packed_into(vars_base, out)
+    }
+
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,

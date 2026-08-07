@@ -109,14 +109,34 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
     }
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        let mut res = vec![F::ZERO; vars_base.len() * self.num_constraints()];
+        let mut res = Vec::new();
+        self.eval_unfiltered_base_batch_into(vars_base, &mut res);
+        res
+    }
+
+    /// Like [`Gate::eval_unfiltered_base_batch`], but writes into a caller-owned
+    /// buffer so the quotient loop can reuse one allocation across every gate
+    /// and every batch instead of allocating and zeroing a fresh
+    /// `num_constraints() * batch_size` matrix on each call.
+    ///
+    /// `out` is resized to exactly `num_constraints() * batch_size`. Its prior
+    /// contents are not observable: every implementation writes each cell
+    /// before it is read (a gate that emitted fewer than `num_constraints()`
+    /// constraints would already disagree with `eval_unfiltered` today, which
+    /// the gate test suite checks).
+    fn eval_unfiltered_base_batch_into(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        out: &mut Vec<F>,
+    ) {
+        let batch_size = vars_base.len();
+        resize_constraint_scratch(out, batch_size * self.num_constraints());
         for (i, vars_base_one) in vars_base.iter().enumerate() {
             self.eval_unfiltered_base_one(
                 vars_base_one,
-                StridedConstraintConsumer::new(&mut res, vars_base.len(), i),
+                StridedConstraintConsumer::new(out, batch_size, i),
             );
         }
-        res
     }
 
     fn eval_unfiltered_base_batch_accumulate(
@@ -124,13 +144,17 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         vars_base: EvaluationVarsBaseBatch<F>,
         filters: &[F],
         combined_gate_constraints: &mut [F],
+        scratch: &mut Vec<F>,
     ) {
         let batch_size = vars_base.len();
         assert_eq!(filters.len(), batch_size);
-        let res_batch = self.eval_unfiltered_base_batch(vars_base);
+        let num_constraints = self.num_constraints();
+        self.eval_unfiltered_base_batch_into(vars_base, scratch);
+        // `scratch` may be longer than this gate needs (it is sized by the
+        // widest gate seen so far), so take only this gate's own rows.
         for (combined, res) in combined_gate_constraints
             .chunks_exact_mut(batch_size)
-            .zip(res_batch.chunks_exact(batch_size))
+            .zip(scratch[..batch_size * num_constraints].chunks_exact(batch_size))
         {
             batch_multiply_add_inplace(combined, res, filters);
         }
@@ -171,45 +195,32 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
             .collect()
     }
 
-    /// Adds this gate's filtered base-field constraints directly to the shared constraint buffer.
+    /// Adds this gate's filtered constraints into `combined_gate_constraints`.
     ///
     /// Constraint `j` for point `i` is at index `j * batch_size + i`.
+    ///
+    /// `filters` is this gate's selector filter column, precomputed for the
+    /// whole selector group by [`compute_group_filters`]; `scratch` is a
+    /// reusable raw-constraint buffer shared across every gate.
     fn eval_filtered_base_batch(
         &self,
         mut vars_batch: EvaluationVarsBaseBatch<F>,
-        row: usize,
-        selector_index: usize,
-        group_range: Range<usize>,
+        filters: &[F],
         num_selectors: usize,
         num_lookup_selectors: usize,
-        filters: &mut Vec<F>,
         combined_gate_constraints: &mut [F],
+        scratch: &mut Vec<F>,
     ) {
         let batch_size = vars_batch.len();
         debug_assert!(self.num_constraints() * batch_size <= combined_gate_constraints.len());
-        // Contiguous-column filter computation: read the selector constant
-        // column once and accumulate the same product terms, in the same
-        // order, as the per-point `compute_filter` — identical field values
-        // without the per-point strided views.
-        let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
-        let mut factors = group_range
-            .filter(|&i| i != row)
-            .chain((num_selectors > 1).then_some(UNUSED_SELECTOR));
-        filters.clear();
-        if let Some(i) = factors.next() {
-            let k = F::from_canonical_usize(i);
-            filters.extend(selector_col.iter().map(|&s| k - s));
-        } else {
-            filters.resize(batch_size, F::ONE);
-        }
-        for i in factors {
-            let k = F::from_canonical_usize(i);
-            for (filter, &s) in filters.iter_mut().zip(selector_col) {
-                *filter *= k - s;
-            }
-        }
+        debug_assert_eq!(filters.len(), batch_size);
         vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
-        self.eval_unfiltered_base_batch_accumulate(vars_batch, filters, combined_gate_constraints);
+        self.eval_unfiltered_base_batch_accumulate(
+            vars_batch,
+            filters,
+            combined_gate_constraints,
+            scratch,
+        );
     }
 
     /// Adds this gate's filtered constraints into the `combined_gate_constraints` buffer.
@@ -357,6 +368,77 @@ pub struct PrefixedGate<F: RichField + Extendable<D>, const D: usize> {
 }
 
 /// A gate's filter designed so that it is non-zero if `s = row`.
+/// Ensures `buf` holds at least `len` elements, zero-filling only cells that
+/// did not already exist. The buffer is never shrunk: shrinking and regrowing
+/// it would re-zero the whole thing on the next larger gate, which costs more
+/// than the allocation this scratch exists to avoid. Callers therefore must
+/// treat only `buf[..len]` as theirs and must write every cell before reading.
+pub fn resize_constraint_scratch<F: Field>(buf: &mut Vec<F>, len: usize) {
+    if buf.len() < len {
+        buf.resize(len, F::ZERO);
+    }
+}
+
+/// Computes the selector filter column for every gate in every selector group.
+///
+/// The filter for gate `row` of group `g` is
+/// `prod_{i in g, i != row} (i - s) * (UNUSED_SELECTOR - s)` (the last factor
+/// only when there is more than one selector), where `s` is group `g`'s
+/// selector value at that point. Computing each gate's product independently
+/// costs `O(|g|)` multiplies per gate, i.e. `O(|g|^2)` per group. This computes
+/// all of them in `O(|g|)` total using a forward prefix-product sweep seeded
+/// with the shared `UNUSED_SELECTOR` factor and a backward suffix-product
+/// sweep. Field multiplication is associative and commutative, so each gate's
+/// filter is exactly the same field element as before — only the association
+/// order differs.
+///
+/// `filters` is laid out gate-major: gate `i`'s column is
+/// `filters[i * batch_size..][..batch_size]`. `run` is a `batch_size` scratch.
+pub(crate) fn compute_group_filters<F: Field>(
+    groups: &[Range<usize>],
+    local_constants: &[F],
+    batch_size: usize,
+    num_selectors: usize,
+    filters: &mut [F],
+    run: &mut [F],
+) {
+    let many_selector = num_selectors > 1;
+    let unused = F::from_canonical_usize(UNUSED_SELECTOR);
+    for (selector_index, group) in groups.iter().enumerate() {
+        let selector_col = &local_constants[selector_index * batch_size..][..batch_size];
+
+        // Forward sweep: gate `i` receives the product of every earlier gate's
+        // factor, seeded with the group-wide UNUSED factor.
+        if many_selector {
+            for (r, &s) in run.iter_mut().zip(selector_col) {
+                *r = unused - s;
+            }
+        } else {
+            run.fill(F::ONE);
+        }
+        for i in group.clone() {
+            filters[i * batch_size..][..batch_size].copy_from_slice(run);
+            let k = F::from_canonical_usize(i);
+            for (r, &s) in run.iter_mut().zip(selector_col) {
+                *r *= k - s;
+            }
+        }
+
+        // Backward sweep: multiply in the product of every later gate's factor.
+        run.fill(F::ONE);
+        for i in group.clone().rev() {
+            let k = F::from_canonical_usize(i);
+            let column = &mut filters[i * batch_size..][..batch_size];
+            for (f, &r) in column.iter_mut().zip(run.iter()) {
+                *f *= r;
+            }
+            for (r, &s) in run.iter_mut().zip(selector_col) {
+                *r *= k - s;
+            }
+        }
+    }
+}
+
 fn compute_filter<K: Field>(row: usize, group_range: Range<usize>, s: K, many_selector: bool) -> K {
     debug_assert!(group_range.contains(&row));
     group_range

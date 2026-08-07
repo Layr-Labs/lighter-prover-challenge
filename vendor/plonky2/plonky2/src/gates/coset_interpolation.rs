@@ -311,6 +311,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
         vars_base: EvaluationVarsBaseBatch<F>,
         filters: &[F],
         combined_gate_constraints: &mut [F],
+            _scratch: &mut Vec<F>,
     ) {
         let n = vars_base.len();
         assert_eq!(filters.len(), n);
@@ -780,7 +781,7 @@ mod tests {
             }
 
             let mut actual = initial;
-            gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut actual);
+            gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut actual, &mut Vec::new());
             assert_eq!(actual, expected, "max_degree {max_degree}");
         }
     }
@@ -825,7 +826,7 @@ mod tests {
         let mut combined = vec![F::ZERO; num_constraints * n];
         let start = Instant::now();
         for _ in 0..iters {
-            gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut combined);
+            gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut combined, &mut Vec::new());
         }
         let new: Duration = start.elapsed();
         assert_eq!(old_sink, combined[0], "paths diverged");

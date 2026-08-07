@@ -14,7 +14,7 @@ use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::Extendable;
 use crate::field::packed::PackedField;
 use crate::field::types::Field;
-use crate::gates::gate::Gate;
+use crate::gates::gate::{Gate, resize_constraint_scratch};
 use crate::gates::packed_util::PackedEvaluableBase;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -198,13 +198,23 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
     }
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
+        let mut out = Vec::new();
+        self.eval_unfiltered_base_batch_into(vars_base, &mut out);
+        out
+    }
+
+    fn eval_unfiltered_base_batch_into(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        out: &mut Vec<F>,
+    ) {
         let n = vars_base.len();
         let wires = vars_base.local_wires;
         let constants = vars_base.local_constants;
         let col = |w: usize| &wires[w * n..][..n];
         let vec_size = self.vec_size();
-        let mut res = vec![F::ZERO; n * self.num_constraints()];
-        let mut chunks = res.chunks_exact_mut(n);
+        resize_constraint_scratch(out, n * self.num_constraints());
+        let mut chunks = out.chunks_exact_mut(n);
         // `items` holds vec_size columns of n points, folded in place; the
         // write index k always trails the read indices 2k, 2k+1, which were
         // consumed at an earlier k of the same level.
@@ -267,7 +277,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
                 out[p] = constant[p] - wire[p];
             }
         }
-        res
     }
 
     /// Same contiguous-column evaluation as `eval_unfiltered_base_batch`, but
@@ -278,6 +287,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
         vars_base: EvaluationVarsBaseBatch<F>,
         filters: &[F],
         combined_gate_constraints: &mut [F],
+            _scratch: &mut Vec<F>,
     ) {
         let n = vars_base.len();
         assert_eq!(filters.len(), n);

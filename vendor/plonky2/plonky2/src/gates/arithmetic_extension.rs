@@ -121,6 +121,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticExte
         vars_base: EvaluationVarsBaseBatch<F>,
         filters: &[F],
         combined_gate_constraints: &mut [F],
+            _scratch: &mut Vec<F>,
     ) {
         let n = vars_base.len();
         assert_eq!(filters.len(), n);

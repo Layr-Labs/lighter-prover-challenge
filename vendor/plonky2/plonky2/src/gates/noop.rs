@@ -40,6 +40,15 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for NoopGate {
         Vec::new()
     }
 
+    fn eval_unfiltered_base_batch_into(
+        &self,
+        _vars: EvaluationVarsBaseBatch<F>,
+        _out: &mut Vec<F>,
+    ) {
+        // No constraints. The accumulator takes zero rows from the shared
+        // scratch, which must not be shrunk here.
+    }
+
     fn eval_unfiltered_circuit(
         &self,
         _builder: &mut CircuitBuilder<F, D>,

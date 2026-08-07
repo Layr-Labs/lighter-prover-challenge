@@ -168,7 +168,7 @@ mod accumulate_microbench {
         let mut combined = vec![F::ZERO; gate.num_constraints() * n];
         let start = Instant::now();
         for _ in 0..iters {
-            gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut combined);
+            gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut combined, &mut Vec::new());
         }
         let new = start.elapsed();
         assert_eq!(old_sink, combined[0], "paths diverged for {}", gate.id());
@@ -266,7 +266,7 @@ where
     }
 
     let mut actual = initial;
-    gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut actual);
+    gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut actual, &mut Vec::new());
     for j in 0..num_constraints {
         for p in 0..n {
             assert_eq!(
@@ -312,7 +312,7 @@ where
         batch_multiply_add_inplace(acc, constraints, &filters);
     }
     let mut actual = vec![F::ZERO; expected.len()];
-    gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+    gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual, &mut Vec::new());
     assert_eq!(actual, expected, "gate {}", gate.id());
 }
 
