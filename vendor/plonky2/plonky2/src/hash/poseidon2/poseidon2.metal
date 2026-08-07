@@ -386,8 +386,9 @@ inline void range_check_gate_emit(
 //   selector column, gate index, group start/end, include UNUSED selector,
 //   operation count, base-4 limbs per operation, final-limb range (2 or 4),
 //   then two unused words that keep both record kinds the same stride.
-// It is followed by U32-family records with the same five selector words, then:
-//   kind (arithmetic=0, subtraction=1, add-many=2), operation count,
+// It is followed by promoted-gate records with the same five selector words, then:
+//   kind (arithmetic=0, subtraction=1, add-many=2, quintic multiplication=3,
+//   quintic squaring=4), operation count,
 //   addend count (zero except for add-many), base-4 result limbs, and carry
 //   limbs (zero except for add-many).
 // The result-limb count is what makes the subtraction and add-many branches
@@ -408,7 +409,8 @@ kernel void range_check_gate_quotient(
     constant uint& step [[buffer(7)]],
     constant uint& alpha_stride [[buffer(8)]],
     constant uint& range_count [[buffer(9)]],
-    constant uint& u32_count [[buffer(10)]],
+    constant uint& promoted_count [[buffer(10)]],
+    constant uint& accumulate_output [[buffer(11)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= quotient_rows) {
         return;
@@ -480,9 +482,9 @@ kernel void range_check_gate_quotient(
         total[1] = gl_add(total[1], gl_mul(filter, gate_accumulators[1]));
     }
 
-    constant uint* u32_metadata = metadata + range_count * 10u;
-    for (uint u32_index = 0; u32_index < u32_count; ++u32_index) {
-        constant uint* spec = u32_metadata + u32_index * 10u;
+    constant uint* promoted_metadata = metadata + range_count * 10u;
+    for (uint promoted_index = 0; promoted_index < promoted_count; ++promoted_index) {
+        constant uint* spec = promoted_metadata + promoted_index * 10u;
         uint selector_column = spec[0];
         uint gate_index = spec[1];
         uint group_start = spec[2];
@@ -619,7 +621,7 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
-        } else {
+        } else if (kind == 2u) {
             // U16/U32 AddManyGate: num_addends inputs, carry/result/output-carry,
             // then `result_limbs` result and `num_carry_limbs` carry base-4
             // limbs per operation.
@@ -678,14 +680,89 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
+        } else if (kind == 3u) {
+            // QuinticMultiplicationGate: five limbs each for a, b, and c,
+            // repeated operation-by-operation in routed wires.
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong base = (ulong)op * 15u;
+                ulong a[5];
+                ulong b[5];
+                ulong c[5];
+                for (uint j = 0; j < 5u; ++j) {
+                    a[j] = wires[(base + j) * lde_rows + source_row];
+                    b[j] = wires[(base + 5u + j) * lde_rows + source_row];
+                    c[j] = wires[(base + 10u + j) * lde_rows + source_row];
+                }
+
+                ulong products[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+                for (uint j = 0; j < 5u; ++j) {
+                    for (uint k = 0; k < 5u; ++k) {
+                        products[j + k] = gl_add(products[j + k], gl_mul(a[j], b[k]));
+                    }
+                }
+                for (uint j = 0; j < 5u; ++j) {
+                    ulong reduced = products[j];
+                    if (j < 4u) {
+                        reduced = gl_add(reduced, gl_mul(3, products[j + 5u]));
+                    }
+                    range_check_gate_emit(
+                        gl_sub(reduced, c[j]),
+                        alpha_powers,
+                        alpha_stride,
+                        gate_accumulators,
+                        constraint_index++);
+                }
+            }
+        } else if (kind == 4u) {
+            // QuinticSquaringGate: all a/c routed wires precede ten temporary
+            // wires per operation. Emit the exact CPU constraint sequence.
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong routed = (ulong)op * 10u;
+                ulong temporary = (ulong)num_ops * 10u + (ulong)op * 10u;
+                ulong a[5];
+                ulong c[5];
+                ulong extra[10];
+                for (uint j = 0; j < 5u; ++j) {
+                    a[j] = wires[(routed + j) * lde_rows + source_row];
+                    c[j] = wires[(routed + 5u + j) * lde_rows + source_row];
+                }
+                for (uint j = 0; j < 10u; ++j) {
+                    extra[j] = wires[(temporary + j) * lde_rows + source_row];
+                }
+
+#define QUINTIC_SQUARE_EMIT(value) \
+                range_check_gate_emit((value), alpha_powers, alpha_stride, \
+                    gate_accumulators, constraint_index++)
+                QUINTIC_SQUARE_EMIT(gl_sub(gl_mul(a[0], a[0]), extra[0]));
+                QUINTIC_SQUARE_EMIT(gl_sub(gl_add(gl_mul(gl_mul(6, a[1]), a[4]), extra[0]), extra[1]));
+                QUINTIC_SQUARE_EMIT(gl_sub(gl_add(gl_mul(gl_mul(6, a[2]), a[3]), extra[1]), c[0]));
+                QUINTIC_SQUARE_EMIT(gl_sub(gl_mul(gl_mul(3, a[3]), a[3]), extra[2]));
+                QUINTIC_SQUARE_EMIT(gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[1]), extra[2]), extra[3]));
+                QUINTIC_SQUARE_EMIT(gl_sub(gl_add(gl_mul(gl_mul(6, a[2]), a[4]), extra[3]), c[1]));
+                QUINTIC_SQUARE_EMIT(gl_sub(gl_mul(a[1], a[1]), extra[4]));
+                QUINTIC_SQUARE_EMIT(gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[2]), extra[4]), extra[5]));
+                QUINTIC_SQUARE_EMIT(gl_sub(gl_add(gl_mul(gl_mul(6, a[3]), a[4]), extra[5]), c[2]));
+                QUINTIC_SQUARE_EMIT(gl_sub(gl_mul(gl_mul(3, a[4]), a[4]), extra[6]));
+                QUINTIC_SQUARE_EMIT(gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[3]), extra[6]), extra[7]));
+                QUINTIC_SQUARE_EMIT(gl_sub(gl_add(gl_mul(gl_mul(2, a[1]), a[2]), extra[7]), c[3]));
+                QUINTIC_SQUARE_EMIT(gl_sub(gl_mul(a[2], a[2]), extra[8]));
+                QUINTIC_SQUARE_EMIT(gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[4]), extra[8]), extra[9]));
+                QUINTIC_SQUARE_EMIT(gl_sub(gl_add(gl_mul(gl_mul(2, a[1]), a[3]), extra[9]), c[4]));
+#undef QUINTIC_SQUARE_EMIT
+            }
         }
 
         total[0] = gl_add(total[0], gl_mul(filter, gate_accumulators[0]));
         total[1] = gl_add(total[1], gl_mul(filter, gate_accumulators[1]));
     }
 
-    output[(ulong)gid * 2] = gl_canonicalize(total[0]);
-    output[(ulong)gid * 2 + 1] = gl_canonicalize(total[1]);
+    ulong output_index = (ulong)gid * 2;
+    if (accumulate_output != 0u) {
+        total[0] = gl_add(output[output_index], total[0]);
+        total[1] = gl_add(output[output_index + 1], total[1]);
+    }
+    output[output_index] = gl_canonicalize(total[0]);
+    output[output_index + 1] = gl_canonicalize(total[1]);
 }
 
 kernel void poseidon2_hash_leaves(

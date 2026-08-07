@@ -14,7 +14,7 @@ use plonky2::field::extension::quintic::QuinticExtension;
 use plonky2::field::extension::{Extendable, FieldExtension};
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::packed::PackedField;
-use plonky2::gates::gate::Gate;
+use plonky2::gates::gate::{Gate, QuinticQuotientGate};
 use plonky2::gates::packed_util::PackedEvaluableBase;
 use plonky2::gates::util::StridedConstraintConsumer;
 use plonky2::hash::hash_types::RichField;
@@ -268,6 +268,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for QuinticMultipl
     fn num_constraints(&self) -> usize {
         self.num_ops * 5
     }
+
+    fn quintic_quotient_gate(&self) -> Option<QuinticQuotientGate> {
+        Some(QuinticQuotientGate::Multiplication {
+            num_ops: self.num_ops,
+        })
+    }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
@@ -454,6 +460,22 @@ mod tests {
         let gate =
             QuinticMultiplicationGate::new_from_config(&CircuitConfig::standard_recursion_config());
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    #[test]
+    fn advertises_quintic_quotient_layout() {
+        use crate::plonky2::gates::gate::{Gate, QuinticQuotientGate};
+
+        const D: usize = 2;
+        let gate = QuinticMultiplicationGate::new_from_config(
+            &CircuitConfig::standard_recursion_config(),
+        );
+        assert_eq!(
+            <QuinticMultiplicationGate as Gate<GoldilocksField, D>>::quintic_quotient_gate(&gate),
+            Some(QuinticQuotientGate::Multiplication {
+                num_ops: gate.num_ops,
+            })
+        );
     }
 
     #[test]

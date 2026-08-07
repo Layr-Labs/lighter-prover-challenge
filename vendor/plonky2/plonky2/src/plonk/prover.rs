@@ -812,6 +812,8 @@ pub struct GpuPoseidonQuotientStats {
     pub range_started: usize,
     pub range_completed: usize,
     pub range_fallbacks: usize,
+    pub combined_started: usize,
+    pub combined_completed: usize,
 }
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -838,6 +840,12 @@ static GPU_RANGE_QUOTIENT_COMPLETED: core::sync::atomic::AtomicUsize =
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 static GPU_RANGE_QUOTIENT_FALLBACKS: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+static GPU_COMBINED_QUOTIENT_STARTED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+static GPU_COMBINED_QUOTIENT_COMPLETED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 pub fn gpu_poseidon_quotient_stats() -> GpuPoseidonQuotientStats {
@@ -852,6 +860,8 @@ pub fn gpu_poseidon_quotient_stats() -> GpuPoseidonQuotientStats {
         range_started: GPU_RANGE_QUOTIENT_STARTED.load(Ordering::Relaxed),
         range_completed: GPU_RANGE_QUOTIENT_COMPLETED.load(Ordering::Relaxed),
         range_fallbacks: GPU_RANGE_QUOTIENT_FALLBACKS.load(Ordering::Relaxed),
+        combined_started: GPU_COMBINED_QUOTIENT_STARTED.load(Ordering::Relaxed),
+        combined_completed: GPU_COMBINED_QUOTIENT_COMPLETED.load(Ordering::Relaxed),
     }
 }
 
@@ -1002,14 +1012,15 @@ fn start_gpu_range_check_gate_quotient<
     quotient_rows: usize,
     step: usize,
     alphas: &[F],
+    poseidon_job: Option<&crate::hash::poseidon2::metal::PoseidonGateQuotientJob<F>>,
 ) -> Option<(
     Vec<usize>,
     crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
 )> {
     use core::sync::atomic::Ordering;
-    use crate::gates::gate::U32QuotientGate;
+    use crate::gates::gate::{QuinticQuotientGate, U32QuotientGate};
     use crate::hash::poseidon2::metal::{
-        RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec,
+        PromotedQuotientKind, PromotedQuotientSpec, RangeCheckQuotientSpec,
     };
 
     GPU_RANGE_QUOTIENT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
@@ -1026,11 +1037,16 @@ fn start_gpu_range_check_gate_quotient<
     let include_unused_selector = common_data.selectors_info.num_selectors() > 1;
     let mut gate_indices = Vec::new();
     let mut specs = Vec::new();
-    let mut u32_specs = Vec::new();
+    let mut promoted_specs = Vec::new();
     for (gate_index, gate) in common_data.gates.iter().enumerate() {
         let range = gate.0.range_check_quotient_gate();
         let u32_gate = gate.0.u32_quotient_gate();
-        if range.is_some() && u32_gate.is_some() {
+        let quintic_gate = gate.0.quintic_quotient_gate();
+        let advertised_layouts = [range.is_some(), u32_gate.is_some(), quintic_gate.is_some()]
+            .into_iter()
+            .filter(|&advertised| advertised)
+            .count();
+        if advertised_layouts > 1 {
             if gpu_poseidon_quotient_diagnostics_enabled() {
                 eprintln!(
                     "[gpu-range-quotient] gate {gate_index} advertised conflicting layouts"
@@ -1072,7 +1088,7 @@ fn start_gpu_range_check_gate_quotient<
         if let Some(u32_gate) = u32_gate {
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
                 U32QuotientGate::Arithmetic { num_ops } => (
-                    U32QuotientKind::Arithmetic,
+                    PromotedQuotientKind::Arithmetic,
                     num_ops,
                     num_ops.checked_mul(38)?,
                     num_ops.checked_mul(36)?,
@@ -1091,7 +1107,7 @@ fn start_gpu_range_check_gate_quotient<
                         return None;
                     };
                     (
-                        U32QuotientKind::Subtraction { result_limbs },
+                        PromotedQuotientKind::Subtraction { result_limbs },
                         num_ops,
                         num_ops.checked_mul(result_limbs.checked_add(5)?)?,
                         num_ops.checked_mul(result_limbs.checked_add(3)?)?,
@@ -1119,7 +1135,7 @@ fn start_gpu_range_check_gate_quotient<
                     }
                     let limbs = result_limbs.checked_add(num_carry_limbs)?;
                     (
-                        U32QuotientKind::AddMany {
+                        PromotedQuotientKind::AddMany {
                             num_addends,
                             result_limbs,
                             num_carry_limbs,
@@ -1146,7 +1162,48 @@ fn start_gpu_range_check_gate_quotient<
                 return None;
             }
             let selector_column = common_data.selectors_info.selector_indices[gate_index];
-            u32_specs.push(U32QuotientSpec {
+            promoted_specs.push(PromotedQuotientSpec {
+                selector_column,
+                gate_index,
+                group: common_data.selectors_info.groups[selector_column].clone(),
+                include_unused_selector,
+                num_ops,
+                kind,
+            });
+            gate_indices.push(gate_index);
+        }
+        if let Some(quintic_gate) = quintic_gate {
+            let (kind, num_ops, expected_wires, expected_constraints) = match quintic_gate {
+                QuinticQuotientGate::Multiplication { num_ops } => (
+                    PromotedQuotientKind::QuinticMultiplication,
+                    num_ops,
+                    num_ops.checked_mul(15)?,
+                    num_ops.checked_mul(5)?,
+                ),
+                QuinticQuotientGate::Squaring { num_ops } => (
+                    PromotedQuotientKind::QuinticSquaring,
+                    num_ops,
+                    num_ops.checked_mul(20)?,
+                    num_ops.checked_mul(15)?,
+                ),
+            };
+            if num_ops == 0
+                || gate.0.num_wires() != expected_wires
+                || gate.0.num_constraints() != expected_constraints
+            {
+                if gpu_poseidon_quotient_diagnostics_enabled() {
+                    eprintln!(
+                        "[gpu-range-quotient] quintic layout mismatch gate={gate_index} \
+                         metadata={quintic_gate:?} wires={} constraints={} \
+                         expected_wires={expected_wires} expected_constraints={expected_constraints}",
+                        gate.0.num_wires(),
+                        gate.0.num_constraints(),
+                    );
+                }
+                return None;
+            }
+            let selector_column = common_data.selectors_info.selector_indices[gate_index];
+            promoted_specs.push(PromotedQuotientSpec {
                 selector_column,
                 gate_index,
                 group: common_data.selectors_info.groups[selector_column].clone(),
@@ -1157,9 +1214,9 @@ fn start_gpu_range_check_gate_quotient<
             gate_indices.push(gate_index);
         }
     }
-    if specs.is_empty() && u32_specs.is_empty() {
+    if specs.is_empty() && promoted_specs.is_empty() {
         if gpu_poseidon_quotient_diagnostics_enabled() {
-            eprintln!("[gpu-range-quotient] no advertised RangeCheck/U32 gates");
+            eprintln!("[gpu-range-quotient] no advertised RangeCheck/U32/Quintic gates");
         }
         return None;
     }
@@ -1188,8 +1245,9 @@ fn start_gpu_range_check_gate_quotient<
         constants,
         quotient_rows,
         step,
+        poseidon_job,
         &specs,
-        &u32_specs,
+        &promoted_specs,
         alphas,
         alpha_offset,
     ) else {
@@ -1206,6 +1264,9 @@ fn start_gpu_range_check_gate_quotient<
         return None;
     };
     let started = GPU_RANGE_QUOTIENT_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
+    if job.accumulates_poseidon() {
+        GPU_COMBINED_QUOTIENT_STARTED.fetch_add(1, Ordering::Relaxed);
+    }
     log::info!(
         "Metal RangeCheck quotient active: started={started}, gates={gate_indices:?}, \
          rows={quotient_rows}, step={step}, shared_columns=true"
@@ -1299,6 +1360,7 @@ fn compute_quotient_polys<
                 lde_size,
                 step,
                 alphas,
+                gpu_poseidon.as_ref().map(|(_, job)| job),
             )
         })
         .flatten();
@@ -1675,95 +1737,113 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
-            Ok(values) => {
-                GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
-            }
-            Err(error) => {
-                GPU_POSEIDON_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                log::warn!(
-                    "Metal Poseidon2 gate quotient failed; recomputing quotient on CPU: {error}"
-                );
-                if gpu_poseidon_quotient_diagnostics_enabled() {
-                    eprintln!(
-                        "[gpu-poseidon-quotient] runtime failure; falling back to CPU: {error}"
-                    );
-                }
-                return compute_quotient_polys(
-                    common_data,
-                    prover_data,
-                    public_inputs_hash,
-                    wires_commitment,
-                    zs_partial_products_and_lookup_commitment,
-                    betas,
-                    gammas,
-                    beta_k_is,
-                    deltas,
-                    alphas,
-                    col_major_perm,
-                    false,
-                );
-            }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+    {
+        let range_accumulates_poseidon = gpu_range
+            .as_ref()
+            .map(|(_, job)| job.accumulates_poseidon())
+            .unwrap_or(false);
+        let mut poseidon_values = None;
+        let mut range_values = None;
 
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
-            Ok(values) => {
-                GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
-            }
-            Err(error) => {
-                GPU_RANGE_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                log::warn!(
-                    "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
-                );
-                if gpu_poseidon_quotient_diagnostics_enabled() {
-                    eprintln!(
-                        "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
+        if let Some((_, job)) = &gpu_poseidon {
+            let result = if range_accumulates_poseidon {
+                job.wait_until_completed().map(|()| None)
+            } else {
+                job.finish().map(Some)
+            };
+            match result {
+                Ok(values) => {
+                    GPU_POSEIDON_QUOTIENT_COMPLETED
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if let Some(values) = values {
+                        poseidon_values = Some(values);
+                    }
+                }
+                Err(error) => {
+                    GPU_POSEIDON_QUOTIENT_FALLBACKS
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    log::warn!(
+                        "Metal Poseidon2 gate quotient failed; recomputing quotient on CPU: {error}"
+                    );
+                    if gpu_poseidon_quotient_diagnostics_enabled() {
+                        eprintln!(
+                            "[gpu-poseidon-quotient] runtime failure; falling back to CPU: {error}"
+                        );
+                    }
+                    return compute_quotient_polys(
+                        common_data,
+                        prover_data,
+                        public_inputs_hash,
+                        wires_commitment,
+                        zs_partial_products_and_lookup_commitment,
+                        betas,
+                        gammas,
+                        beta_k_is,
+                        deltas,
+                        alphas,
+                        col_major_perm,
+                        false,
                     );
                 }
-                return compute_quotient_polys(
-                    common_data,
-                    prover_data,
-                    public_inputs_hash,
-                    wires_commitment,
-                    zs_partial_products_and_lookup_commitment,
-                    betas,
-                    gammas,
-                    beta_k_is,
-                    deltas,
-                    alphas,
-                    col_major_perm,
-                    false,
-                );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+        }
+
+        if let Some((_, job)) = &gpu_range {
+            match job.finish() {
+                Ok(values) => {
+                    GPU_RANGE_QUOTIENT_COMPLETED
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    range_values = Some(values);
+                    if range_accumulates_poseidon {
+                        GPU_COMBINED_QUOTIENT_COMPLETED
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
                 }
-            });
+                Err(error) => {
+                    GPU_RANGE_QUOTIENT_FALLBACKS
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    log::warn!(
+                        "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
+                    );
+                    if gpu_poseidon_quotient_diagnostics_enabled() {
+                        eprintln!(
+                            "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
+                        );
+                    }
+                    return compute_quotient_polys(
+                        common_data,
+                        prover_data,
+                        public_inputs_hash,
+                        wires_commitment,
+                        zs_partial_products_and_lookup_commitment,
+                        betas,
+                        gammas,
+                        beta_k_is,
+                        deltas,
+                        alphas,
+                        col_major_perm,
+                        false,
+                    );
+                }
+            }
+        }
+
+        // When both jobs exist, the RangeCheck job owns their combined output;
+        // otherwise exactly one standalone output can be present.
+        debug_assert!(poseidon_values.is_none() || range_values.is_none());
+        if let Some(gpu_values) = range_values.or(poseidon_values) {
+            debug_assert_eq!(gpu_values.len(), quotient_values.len());
+            quotient_values
+                .par_chunks_exact_mut(num_challenges)
+                .zip(gpu_values.par_chunks_exact(num_challenges))
+                .enumerate()
+                .for_each(|(i, (cpu_values, gpu_values))| {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                        *cpu += gpu * denominator_inv;
+                    }
+                });
+        }
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);

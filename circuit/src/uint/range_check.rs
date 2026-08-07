@@ -635,6 +635,8 @@ mod tests {
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use plonky2::gates::noop::NoopGate;
     use plonky2::hash::hash_types::HashOut;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use plonky2::hash::poseidon2::hash::Poseidon2Hash;
     use plonky2::iop::target::Target;
     use plonky2::iop::witness::{PartialWitness, WitnessWrite};
     use plonky2::plonk::circuit_data::CircuitConfig;
@@ -643,6 +645,10 @@ mod tests {
     };
     use rand::Rng;
 
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::eddsa::gates::mul_quintic_ext_base::QuinticMultiplicationGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::eddsa::gates::square_quintic_ext_base::QuinticSquaringGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::uint::u32::gates::add_many_u32::U32AddManyGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -704,6 +710,9 @@ mod tests {
         config.fri_config.proof_of_work_bits = 0;
         config.fri_config.num_query_rounds = 1;
         let mut builder = CircuitBuilder::<F, D>::new(config.clone());
+        let poseidon_inputs = builder.add_virtual_targets(8);
+        let _poseidon_output =
+            builder.hash_n_to_hash_no_pad::<Poseidon2Hash>(poseidon_inputs.clone());
         let mut inputs = Vec::new();
         for bit_size in [16usize, 32, 48] {
             let input = builder.add_virtual_target();
@@ -748,6 +757,34 @@ mod tests {
         builder.connect(carry, Target::wire(row, add_many.wire_ith_carry(op)));
         u32_inputs.push((carry, 7));
 
+        let mut quintic_inputs = Vec::new();
+        let quintic_mul = QuinticMultiplicationGate::new_from_config(&config);
+        let (row, op) = builder.find_slot(quintic_mul.clone(), &[], &[]);
+        for (wire, value) in (0..5)
+            .map(|j| (quintic_mul.wire_ith_multiplicand_jth_limb_0(op, j), 2 + j as u64))
+            .chain((0..5).map(|j| {
+                (
+                    quintic_mul.wire_ith_multiplicand_jth_limb_1(op, j),
+                    11 + j as u64,
+                )
+            }))
+        {
+            let input = builder.add_virtual_target();
+            builder.connect(input, Target::wire(row, wire));
+            quintic_inputs.push((input, value));
+        }
+
+        let quintic_square = QuinticSquaringGate::new_from_config(&config);
+        let (row, op) = builder.find_slot(quintic_square.clone(), &[], &[]);
+        for j in 0..5 {
+            let input = builder.add_virtual_target();
+            builder.connect(
+                input,
+                Target::wire(row, quintic_square.wire_ith_multiplicand_jth_limb(op, j)),
+            );
+            quintic_inputs.push((input, 23 + j as u64));
+        }
+
         // 4097 rows pad to degree 8192. Its rate-8 constants/sigmas and wire
         // commitments both exceed the retained-Metal routing threshold.
         while builder.num_gates() < 4097 {
@@ -768,12 +805,23 @@ mod tests {
         for (input, value) in u32_inputs {
             pw.set_target(input, F::from_canonical_u64(value))?;
         }
+        for (input, value) in quintic_inputs {
+            pw.set_target(input, F::from_canonical_u64(value))?;
+        }
+        for (i, input) in poseidon_inputs.into_iter().enumerate() {
+            pw.set_target(input, F::from_canonical_usize(i + 1))?;
+        }
 
         let before = plonky2::plonk::prover::gpu_poseidon_quotient_stats();
         let proof = data.prove(pw)?;
         let after = plonky2::plonk::prover::gpu_poseidon_quotient_stats();
+        assert!(after.started > before.started);
+        assert!(after.completed > before.completed);
         assert!(after.range_started > before.range_started);
         assert!(after.range_completed > before.range_completed);
+        assert!(after.combined_started > before.combined_started);
+        assert!(after.combined_completed > before.combined_completed);
+        assert_eq!(after.fallbacks, before.fallbacks);
         assert_eq!(after.range_fallbacks, before.range_fallbacks);
         data.verify(proof)?;
         Ok(())
