@@ -273,6 +273,22 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for UninterleaveTo
         self.eval_unfiltered_base_batch_packed(vars_base)
     }
 
+    /// Fused accumulate: folds the filtered constraints straight into the
+    /// caller's buffer instead of materializing the whole constraint matrix
+    /// first. The 64 bit columns are read exactly once per op; that single
+    /// pass folds each bit into the high/low halves, into the even/odd
+    /// recompositions, and emits the per-bit range product.
+    ///
+    /// Value-exactness versus the generic
+    /// [`PackedEvaluableBase::eval_unfiltered_base_batch_accumulate_packed`]
+    /// this replaces: the high/low halves are the same base-2 Horner folds
+    /// over the leading and trailing 32 wire-order bits; the even/odd
+    /// recompositions weight bit `2i` (resp. `2i + 1`) by
+    /// `2^(NUM_BITS / 2 - i - 1)`, which is a base-2 Horner fold over the
+    /// same-parity bits in wire order; the range product
+    /// `(0..B).map(|i| bit - i).product()` is `bit * (bit - 1)` at `B == 2`;
+    /// and each row lands in the buffer through the same
+    /// `combined[j * n + p] += constraint * filters[p]` product-accumulate.
     fn eval_unfiltered_base_batch_accumulate(
         &self,
         vars_base: EvaluationVarsBaseBatch<F>,
@@ -285,10 +301,18 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for UninterleaveTo
         assert!(combined_gate_constraints.len() >= num_constraints * n);
 
         let wires = vars_base.local_wires;
+        // Base for both folds: the halves reduce with `Self::B`, and
+        // `computed_x_evens`/`computed_x_odds` weight their j-th bit by
+        // `2^(NUM_BITS / 2 - j - 1)`, which is the same base-2 Horner fold.
         let base = F::from_canonical_usize(Self::B);
         let split = F::from_canonical_u64(1 << 32u64);
         let u32_max = F::from_canonical_u32(u32::MAX);
 
+        // Five scratch rows: the high/low halves of the bit decomposition, the
+        // even/odd recompositions, and one row reused for the per-bit range
+        // product and the two combined checks. Batches are 32 points in this
+        // prover; keep them on the stack and fall back to the heap only for
+        // oversized batches.
         let mut scratch_stack = [F::ZERO; 5 * 64];
         let mut scratch_heap;
         let scratch: &mut [F] = if n <= 64 {
@@ -304,6 +328,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for UninterleaveTo
 
         let mut constraint_index = 0;
         for i in 0..self.num_ops {
+            // `eval_unfiltered` pushes the canonicity check, the combined
+            // output check, the even and odd checks, then one range check per
+            // bit.
             let canonicity_row = constraint_index;
             let combined_row = constraint_index + 1;
             let evens_row = constraint_index + 2;
@@ -316,6 +343,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for UninterleaveTo
             acc_odds.fill(F::ZERO);
             for (j, bit_wire) in self.wires_ith_bit_decomposition(i).enumerate() {
                 let col = &wires[bit_wire * n..][..n];
+                // The bits are big-endian, so the first 32 are the high half
+                // and Horner from the front matches `reduce_with_powers` over
+                // the reversed (little-endian) view.
                 let half = if j < Self::NUM_BITS / 2 {
                     &mut *acc_high
                 } else {
@@ -338,6 +368,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for UninterleaveTo
                 constraint_index += 1;
             }
 
+            // Canonicity: `(inverse * (u32::MAX - high) - 1) * low`.
             let inverse_col = &wires[self.wire_ith_inverse(i) * n..][..n];
             for p in 0..n {
                 tmp[p] = (inverse_col[p] * (u32_max - acc_high[p]) - F::ONE) * acc_low[p];
@@ -346,6 +377,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for UninterleaveTo
                 &mut combined_gate_constraints[canonicity_row * n..(canonicity_row + 1) * n];
             batch_multiply_add_inplace(combined, tmp, filters);
 
+            // `high * 2^32 + low - x_interleaved`.
             let x_interleaved_col = &wires[self.wire_ith_x_interleaved(i) * n..][..n];
             for p in 0..n {
                 tmp[p] = acc_high[p] * split + acc_low[p] - x_interleaved_col[p];
@@ -605,7 +637,10 @@ mod tests {
     use plonky2::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     use super::*;
-    use crate::gate_batch_testing::assert_accumulate_matches_eval_unfiltered;
+    use crate::gate_batch_testing::{
+        assert_accumulate_matches_eval_unfiltered,
+        assert_accumulate_matches_materialized_at_batch_size,
+    };
 
     #[test]
     fn low_degree() {
@@ -620,10 +655,29 @@ mod tests {
         test_eval_fns::<F, C, _, D>(UninterleaveToU32Gate { num_ops: 2 })
     }
 
+    /// Differential for the fused `eval_unfiltered_base_batch_accumulate`
+    /// override against per-point `eval_unfiltered`, which is the definition
+    /// of the gate's constraints. Covers the high/low split, the even/odd
+    /// parity folds, the canonicity check and the constraint ordering.
     #[test]
     fn accumulate_matches_eval_unfiltered() {
         for num_ops in [1, 2, 3] {
             assert_accumulate_matches_eval_unfiltered(&UninterleaveToU32Gate { num_ops });
+        }
+    }
+
+    /// Differential against the materialize-then-add path the override
+    /// replaces, on both sides of the fused fold's stack/heap scratch
+    /// threshold (64 points) and starting from a non-zero accumulator.
+    #[test]
+    fn accumulate_matches_materialized_across_batch_sizes() {
+        for num_ops in [1, 2, 3] {
+            for n in [1, 2, 11, 32, 63, 64, 65, 100] {
+                assert_accumulate_matches_materialized_at_batch_size(
+                    &UninterleaveToU32Gate { num_ops },
+                    n,
+                );
+            }
         }
     }
 }

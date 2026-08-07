@@ -8,12 +8,11 @@ use plonky2::field::extension::Extendable;
 use plonky2::field::types::{Field, Field64};
 use plonky2::hash::hash_types::{HashOutTarget, RichField};
 use plonky2::iop::target::{BoolTarget, Target};
-use plonky2::iop::generator::PendingPartitionWitness;
-use plonky2::iop::witness::{PartialWitness, Witness, WitnessWrite};
+use plonky2::iop::witness::{PartialWitness, WitnessWrite};
 use plonky2::plonk::circuit_data::{CircuitConfig, CircuitData};
 use plonky2::plonk::config::GenericConfig;
 use plonky2::plonk::proof::ProofWithPublicInputs;
-use plonky2::plonk::prover::{prove, prove_with_partition_witness};
+use plonky2::plonk::prover::prove;
 use plonky2::timed;
 use plonky2::util::timing::TimingTree;
 
@@ -156,21 +155,10 @@ impl Circuit<C, F, D> for BlockPreExecutionCircuit {
     ) -> Result<ProofWithPublicInputs<F, C, D>> {
         let mut timing = TimingTree::new("BlockPreExecutionCircuit::prove", Level::Debug);
 
-        // Seed the partition directly instead of routing the block's inputs through a
-        // `PartialWitness` map and replaying it; same values, same watch-count
-        // decrements, no transport map.
-        let pending = timed!(timing, "witness", {
-            PendingPartitionWitness::start_seeded(&circuit.prover_only, &circuit.common, |seeder| {
-                Self::seed_witness_into(block, target, seeder)
-            })?
+        let pw = timed!(timing, "witness", {
+            Self::generate_witness(block, target)?
         });
-        let partition_witness = pending.finish()?;
-        let proof = prove_with_partition_witness::<F, C, D>(
-            &circuit.prover_only,
-            &circuit.common,
-            partition_witness,
-            &mut timing,
-        )?;
+        let proof = prove::<F, C, D>(&circuit.prover_only, &circuit.common, pw, &mut timing)?;
         // Recursive parents validate this proof in release builds; keep the eager check for tests.
         #[cfg(debug_assertions)]
         timed!(timing, "verify", { circuit.verify(proof.clone())? });
@@ -179,25 +167,11 @@ impl Circuit<C, F, D> for BlockPreExecutionCircuit {
         Ok(proof)
     }
 
-
     fn generate_witness(
         block: &BlockPreExec<F>,
         target: &BlockPreExecutionTarget,
     ) -> Result<PartialWitness<F>> {
         let mut pw = PartialWitness::new();
-        Self::seed_witness_into(block, target, &mut pw)?;
-        Ok(pw)
-    }
-}
-
-impl BlockPreExecutionCircuit {
-    /// Seeded form of [`Circuit::generate_witness`]: writes the same targets directly
-    /// through `pw` (any partition seeder or map).
-    fn seed_witness_into<W: Witness<F> + WitnessWrite<F>>(
-        block: &BlockPreExec<F>,
-        target: &BlockPreExecutionTarget,
-        pw: &mut W,
-    ) -> Result<()> {
 
         pw.set_target(target.created_at, F::from_canonical_i64(block.created_at))?;
         pw.set_target(
@@ -250,9 +224,11 @@ impl BlockPreExecutionCircuit {
 
         pw.set_hash_target(target.old_state_root, block.old_state_root)?;
 
-        Ok(())
+        Ok(pw)
     }
+}
 
+impl BlockPreExecutionCircuit {
     /// Initializes a new block virtual targets for the given number of transactions.
     pub fn new(config: CircuitConfig) -> Self {
         let mut builder = Builder::new(config);

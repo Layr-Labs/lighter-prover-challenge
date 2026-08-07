@@ -852,17 +852,8 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D> for Ran
         _witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        // Deterministic instead of `F::rand()`. These targets are the unused
-        // public-input-gate wires (`randomize_unused_pi_wires`) and, under
-        // `zero_knowledge`, blinding rows — this config never enables ZK. The
-        // randomness existed to give a *retry* an independent chance against
-        // the astronomically rare permutation-argument division by zero
-        // (plonky2 #456); nothing in this prover retries, so a fixed value has
-        // the identical single-shot failure probability while making witness
-        // generation — and therefore entire proofs — bit-reproducible. That
-        // reproducibility is what lets the orchestration differential oracles
-        // compare full proof bytes.
-        out_buffer.set_target(self.target, F::ZERO)
+        let random_value = F::rand();
+        out_buffer.set_target(self.target, random_value)
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
