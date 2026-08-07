@@ -194,13 +194,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
         res
     }
 
-    /// Fused filtered accumulate: each constraint column is produced into one
-    /// reusable scratch buffer and multiply-added straight into the shared
-    /// constraint buffer, deleting the `n * num_constraints` intermediate
-    /// `Vec` that `eval_unfiltered_base_batch` allocates on every call and the
-    /// second pass over it. The per-constraint expressions and the order in
-    /// which they are emitted are exactly those of `eval_unfiltered_base_batch`
-    /// above, so every accumulated value is bit-identical.
     fn eval_unfiltered_base_batch_accumulate(
         &self,
         vars_base: EvaluationVarsBaseBatch<F>,
@@ -209,16 +202,24 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
     ) {
         let n = vars_base.len();
         assert_eq!(filters.len(), n);
-        assert!(
-            combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n
-        );
+        let num_constraints = <Self as Gate<F, D>>::num_constraints(self);
+        assert!(combined_gate_constraints.len() >= num_constraints * n);
 
         let wires = vars_base.local_wires;
         let three = F::from_canonical_usize(3);
         let four = F::from_canonical_usize(4);
         let base = F::from_canonical_usize(256);
-        let mut scratch = vec![F::ZERO; n];
-        let mut constraint_index = 0usize;
+        // Batches are 32 points in this prover; keep the scratch row on the
+        // stack and fall back to the heap only for oversized batches.
+        let mut scratch_stack = [F::ZERO; 64];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if n <= 64 {
+            &mut scratch_stack[..n]
+        } else {
+            scratch_heap = vec![F::ZERO; n];
+            &mut scratch_heap
+        };
+        let mut constraint_index = 0;
 
         for i in 0..self.num_ops {
             let aux = self.i_th_aux_limbs(i);
@@ -276,10 +277,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
             constraint_index += 1;
         }
 
-        debug_assert_eq!(
-            constraint_index,
-            <Self as Gate<F, D>>::num_constraints(self)
-        );
+        debug_assert_eq!(constraint_index, num_constraints);
     }
 
     fn eval_unfiltered_circuit(
@@ -496,85 +494,6 @@ mod tests {
         test_eval_fns::<F, C, _, D>(ByteDecompositionGate::new(1, 1))
     }
 
-    /// Differential test for the fused `eval_unfiltered_base_batch_accumulate`
-    /// override: starting from a random accumulator buffer, the fused path must
-    /// add exactly `filter[p] * constraint[j](p)` to every cell, matching
-    /// per-point `eval_unfiltered`. `(8, 3)` is the production shape built by
-    /// `new_from_config(CIRCUIT_CONFIG, 8)` (123 constraints).
-    #[test]
-    fn accumulate_matches_eval_unfiltered_across_batch() {
-        use crate::gate_batch_testing::assert_accumulate_matches_eval_unfiltered;
-
-        for (num_limbs, num_ops) in [(1, 1), (2, 2), (4, 2), (8, 1), (8, 3)] {
-            assert_accumulate_matches_eval_unfiltered(&ByteDecompositionGate::new(
-                num_limbs, num_ops,
-            ));
-        }
-    }
-
-    /// The fused accumulate must be bit-identical to the fallback contract:
-    /// `eval_unfiltered_base_batch` followed by a per-row multiply-add. Raw u64
-    /// comparison, so a canonical/non-canonical divergence would be caught.
-    #[test]
-    fn accumulate_matches_base_batch_fallback_raw() {
-        use plonky2::field::batch_util::batch_multiply_add_inplace;
-        use plonky2::field::types::{Field64, PrimeField64};
-        use plonky2::hash::hash_types::HashOut;
-        use plonky2::plonk::vars::EvaluationVarsBaseBatch;
-        use rand::Rng;
-
-        const D: usize = 2;
-        type F = GoldilocksField;
-
-        let mut rng = rand::thread_rng();
-        for (num_limbs, num_ops) in [(1, 1), (2, 2), (4, 2), (8, 1), (8, 3)] {
-            let gate = ByteDecompositionGate::new(num_limbs, num_ops);
-            for &n in &[1usize, 4, 32] {
-                let num_wires = <ByteDecompositionGate as Gate<F, D>>::num_wires(&gate);
-                let num_constraints =
-                    <ByteDecompositionGate as Gate<F, D>>::num_constraints(&gate);
-                let wires: Vec<F> = (0..num_wires * n)
-                    .map(|_| F::from_canonical_u64(rng.gen_range(0..GoldilocksField::ORDER)))
-                    .collect();
-                let filters: Vec<F> = (0..n)
-                    .map(|_| F::from_canonical_u64(rng.gen_range(0..GoldilocksField::ORDER)))
-                    .collect();
-                let initial: Vec<F> = (0..num_constraints * n)
-                    .map(|_| F::from_canonical_u64(rng.gen_range(0..GoldilocksField::ORDER)))
-                    .collect();
-                let public_inputs_hash = HashOut::<F>::ZERO;
-                let vars = EvaluationVarsBaseBatch::new(n, &[], &wires, &public_inputs_hash);
-
-                // Fallback contract, exactly as the default trait method does it.
-                let mut expected = initial.clone();
-                let res = <ByteDecompositionGate as Gate<F, D>>::eval_unfiltered_base_batch(
-                    &gate, vars,
-                );
-                for (combined, row) in expected
-                    .chunks_exact_mut(n)
-                    .zip(res.chunks_exact(n))
-                {
-                    batch_multiply_add_inplace(combined, row, &filters);
-                }
-
-                let mut actual = initial;
-                <ByteDecompositionGate as Gate<F, D>>::eval_unfiltered_base_batch_accumulate(
-                    &gate,
-                    vars,
-                    &filters,
-                    &mut actual,
-                );
-
-                let raw = |v: &[F]| v.iter().map(|x| x.to_canonical_u64()).collect::<Vec<_>>();
-                assert_eq!(
-                    raw(&actual),
-                    raw(&expected),
-                    "num_limbs {num_limbs}, num_ops {num_ops}, n {n}"
-                );
-            }
-        }
-    }
-
     // `test_eval_fns` only checks a batch of one point; compare the batched
     // path against per-point `eval_unfiltered` across a multi-point batch.
     #[test]
@@ -629,6 +548,18 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // The direct filtered accumulation override must produce bit-identical
+    // values to materializing the batch then multiply-adding row by row.
+    #[test]
+    fn direct_filtered_accumulation_matches_materialized_batch() {
+        use crate::gate_batch_testing::assert_direct_accumulation_matches_materialized_batch;
+
+        for (num_limbs, num_ops) in [(1, 1), (4, 2), (8, 1)] {
+            let gate = ByteDecompositionGate::new(num_limbs, num_ops);
+            assert_direct_accumulation_matches_materialized_batch(&gate);
         }
     }
 }

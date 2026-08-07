@@ -5,6 +5,7 @@ use alloc::string::ToString;
 
 use anyhow::Result;
 
+use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::Extendable;
 use crate::field::packed::PackedField;
 use crate::gates::gate::Gate;
@@ -115,6 +116,72 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EqualityGate {
 
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
         self.eval_unfiltered_base_batch_packed(vars_base)
+    }
+
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= self.num_ops * 4 * n);
+        let wires = vars_base.local_wires;
+        let col = |w: usize| &wires[w * n..][..n];
+        // First (and only) constant column: the "one" value.
+        let const_0 = &vars_base.local_constants[..n];
+
+        // Batches are 32 points in this prover; keep the scratch row on the
+        // stack and fall back to the heap only for oversized batches.
+        let mut scratch_stack = [F::ZERO; 64];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if n <= 64 {
+            &mut scratch_stack[..n]
+        } else {
+            scratch_heap = vec![F::ZERO; n];
+            &mut scratch_heap
+        };
+        let mut constraint_index = 0;
+        // Mirrors the packed batch path constraint-for-constraint; each row
+        // lands in `scratch` and is folded straight into the shared
+        // accumulator instead of a materialized matrix.
+        macro_rules! emit {
+            () => {{
+                let combined = &mut combined_gate_constraints
+                    [constraint_index * n..(constraint_index + 1) * n];
+                batch_multiply_add_inplace(combined, &scratch, filters);
+                constraint_index += 1;
+            }};
+        }
+
+        for i in 0..self.num_ops {
+            let x = col(self.wire_ith_element_0(i));
+            let y = col(self.wire_ith_element_1(i));
+            let equal = col(self.wire_ith_output(i));
+            let diff = col(self.wire_ith_temporary(i, 0));
+            let invdiff = col(self.wire_ith_temporary(i, 1));
+            let prod = col(self.wire_ith_temporary(i, 2));
+
+            for p in 0..n {
+                scratch[p] = (x[p] - y[p]) - diff[p];
+            }
+            emit!();
+            for p in 0..n {
+                scratch[p] = (diff[p] * invdiff[p]) - prod[p];
+            }
+            emit!();
+            for p in 0..n {
+                scratch[p] = (prod[p] * diff[p]) - diff[p];
+            }
+            emit!();
+            for p in 0..n {
+                scratch[p] = (const_0[p] - prod[p]) - equal[p];
+            }
+            emit!();
+        }
+
+        debug_assert_eq!(constraint_index, self.num_ops * 4);
     }
 
     fn eval_unfiltered_circuit(
@@ -427,6 +494,46 @@ mod tests {
         type F = <C as GenericConfig<D>>::F;
         let gate = EqualityGate::new_from_config(&CircuitConfig::standard_recursion_config());
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    #[test]
+    fn direct_filtered_accumulation_matches_materialized_batch() {
+        const D: usize = 2;
+        const N: usize = 11;
+        type F = GoldilocksField;
+        use crate::gates::gate::Gate;
+
+        let gate = EqualityGate::new_from_config(&CircuitConfig::standard_recursion_config());
+        let num_wires = <EqualityGate as Gate<F, D>>::num_wires(&gate);
+        let num_constants = <EqualityGate as Gate<F, D>>::num_constants(&gate);
+        let num_constraints = <EqualityGate as Gate<F, D>>::num_constraints(&gate);
+        let wires = (0..num_wires * N)
+            .map(|i| F::from_canonical_usize(3 * i + 5))
+            .collect::<Vec<_>>();
+        let constants = (0..num_constants * N)
+            .map(|i| F::from_canonical_usize(7 * i + 2))
+            .collect::<Vec<_>>();
+        let hash = crate::hash::hash_types::HashOut::ZERO;
+        let vars = crate::plonk::vars::EvaluationVarsBaseBatch::new(N, &constants, &wires, &hash);
+        let filters = (0..N)
+            .map(|i| F::from_canonical_usize(2 * i + 1))
+            .collect::<Vec<_>>();
+        let mut expected = vec![F::ZERO; num_constraints * N];
+        let materialized = <EqualityGate as Gate<F, D>>::eval_unfiltered_base_batch(&gate, vars);
+        for (acc, constraints) in expected
+            .chunks_exact_mut(N)
+            .zip(materialized.chunks_exact(N))
+        {
+            crate::field::batch_util::batch_multiply_add_inplace(acc, constraints, &filters);
+        }
+        let mut actual = vec![F::ZERO; expected.len()];
+        <EqualityGate as Gate<F, D>>::eval_unfiltered_base_batch_accumulate(
+            &gate,
+            vars,
+            &filters,
+            &mut actual,
+        );
+        assert_eq!(actual, expected);
     }
 
     #[test]
