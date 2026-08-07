@@ -1,5 +1,11 @@
+<<<<<<< ours
 # Never convert line endings: two tree-wide CRLF clobbers reached the ranked
 # frontier this week (d714e59, 86e4042), each silently reverting promoted
 # mechanisms and breaking the pinned fixture bytes. (Re-roll of 7f5b84fe:
 # host draw 12.1721 vs 12.3276 bar, within host variance of the tip.)
+=======
+# Never convert line endings: tree-wide CRLF clobbers have twice reached
+# the ranked frontier, silently reverting promoted mechanisms and breaking the
+# pinned fixture bytes.
+>>>>>>> theirs
 * -text
