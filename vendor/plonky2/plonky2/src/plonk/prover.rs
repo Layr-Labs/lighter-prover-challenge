@@ -10,6 +10,7 @@ use plonky2_maybe_rayon::*;
 
 use super::circuit_builder::{LookupChallenges, LookupWire};
 use crate::field::extension::Extendable;
+use crate::field::fft::ifft_borrowed;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
@@ -162,21 +163,23 @@ where
 
     // Only the routed columns are read again after this point (the
     // permutation argument covers wires `j < num_routed_wires`; nothing else
-    // consumes the matrix), so move the non-routed columns out instead of
-    // cloning them.
+    // consumes the matrix). Non-routed columns are moved out and IFFT'd in
+    // place; routed columns are IFFT'd from the borrowed witness column
+    // (`ifft_borrowed` fuses the former clone with the FFT's initial
+    // bit-reversal gather), so no witness column is copied.
     let num_routed_wires = common_data.config.num_routed_wires;
-    let wires_values: Vec<PolynomialValues<F>> = timed!(
+    let wires_coeffs: Vec<PolynomialCoeffs<F>> = timed!(
         timing,
-        "compute wire polynomials",
+        "compute wire polynomials (IFFT)",
         witness
             .wire_values
             .par_iter_mut()
             .enumerate()
             .map(|(j, column)| {
                 if j < num_routed_wires {
-                    PolynomialValues::new(column.clone())
+                    ifft_borrowed(column)
                 } else {
-                    PolynomialValues::new(core::mem::take(column))
+                    PolynomialValues::new(core::mem::take(column)).ifft()
                 }
             })
             .collect()
@@ -185,8 +188,8 @@ where
     let wires_commitment = timed!(
         timing,
         "compute wires commitment",
-        PolynomialBatch::<F, C, D>::from_values(
-            wires_values,
+        PolynomialBatch::<F, C, D>::from_coeffs(
+            wires_coeffs,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::WIRES.blinding,
             config.fri_config.cap_height,

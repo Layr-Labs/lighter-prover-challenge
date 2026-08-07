@@ -110,31 +110,33 @@ fn chain_step_proof(
     mark_spine_thread_latency_critical();
     let result = (|| {
         // Phase 1: run every generator that does not depend on the previous chain proof while
-        // that proof may still be in flight. Inputs are written directly into
-        // the partition's representative slots — no PartialWitness map, no
-        // per-path template clone, no replay pass.
+        // that proof may still be in flight. The early inputs are written
+        // array-indexed straight into the partition (the same values the
+        // template-clone-plus-map-replay path would seed), so no per-step
+        // `PartialWitness` map is built, cloned, or replayed.
         let mut pending = PendingPartitionWitness::start_seeded(
             &chain_data.prover_only,
             &chain_data.common,
             |seeder| {
                 BlockTxChainCircuit::witness_inputs_early_into(
+                    seeder,
                     chain_target,
                     chain_data,
-                    chain_step,
                     dummy_proof,
+                    chain_step,
                     tx_proof,
-                    seeder,
                 )
             },
         )?;
 
-        // Phase 2: wait for the previous chain proof, feed it directly, and prove.
+        // Phase 2: wait for the previous chain proof, feed it directly into
+        // the partition, and prove.
         let previous_proof = previous.map(ChainState::wait);
-        pending.feed_seeded(|feeder| {
+        pending.feed_seeded(|seeder| {
             BlockTxChainCircuit::witness_inputs_cyclic_into(
+                seeder,
                 chain_target,
                 previous_proof.as_ref().unwrap_or(base_proof),
-                feeder,
             )
         })?;
         BlockTxChainCircuit::prove_prepared(pending, chain_data)
@@ -276,9 +278,9 @@ fn prove_path(
     );
     jump = next_jump;
 
-
     std::thread::scope(|scope| {
         let base = &base_proof;
+        let dummy = dummy_proof;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
@@ -300,7 +302,7 @@ fn prove_path(
                             chain_step,
                             previous,
                             base,
-                            dummy_proof,
+                            dummy,
                             &tx_proof,
                         )
                     })
@@ -372,7 +374,7 @@ fn prove_path(
                         chain_step,
                         previous,
                         base,
-                        dummy_proof,
+                        dummy,
                         &tx_proof,
                     )
                 })
@@ -396,7 +398,7 @@ fn prove_path(
                 chain_step,
                 previous,
                 base,
-                dummy_proof,
+                dummy,
                 &tx_proof,
             )));
         }
