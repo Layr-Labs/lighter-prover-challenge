@@ -15,7 +15,11 @@ use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
 use plonky2::iop::generator::{
-    ParallelWitnessGuard, PendingPartitionWitness, generate_partial_witness,
+    ParallelWitnessGuard, PendingPartitionWitness,
+};
+#[cfg(test)]
+use plonky2::iop::generator::{
+    generate_partial_witness,
 };
 use plonky2::iop::witness::{PartitionWitness, Witness};
 use plonky2::plonk::circuit_data::CircuitData;
@@ -69,17 +73,16 @@ fn chain_step_proof(
     chain_step: u64,
     previous: Option<ChainState<'_>>,
     base_proof: &Proof,
-    dummy_proof: &Proof,
+    constant_inputs: &plonky2::iop::witness::PartialWitness<F>,
     tx_proof: &Proof,
 ) -> Proof {
     let result = (|| {
         // Phase 1: run every generator that does not depend on the previous chain proof while
         // that proof may still be in flight.
-        let early_inputs = BlockTxChainCircuit::witness_inputs_early(
+        let early_inputs = BlockTxChainCircuit::witness_inputs_early_from_template(
+            constant_inputs,
             chain_target,
-            chain_data,
             chain_step,
-            dummy_proof,
             tx_proof,
         )?;
         let mut pending = PendingPartitionWitness::start(
@@ -138,17 +141,26 @@ fn generate_tx_witness<'a>(
         old_jump,
         txs,
     };
-    let partial_witness =
-        BlockTxCircuit::generate_witness(&block_tx, tx_target).unwrap_or_else(|error| {
-            panic!("{path:?} block transaction chunk #{chunk_index} witness failed: {error:?}")
-        });
-    let partition_witness =
-        generate_partial_witness::<F, C, D>(partial_witness, &tx_data.prover_only, &tx_data.common)
-            .unwrap_or_else(|error| {
-                panic!(
-                    "{path:?} block transaction chunk #{chunk_index} generators failed: {error:?}"
-                )
-            });
+    // Write witness values directly into the partition's representative
+    // slots (array-indexed), bypassing the PartialWitness hash map and its
+    // per-target hashing for the ~10^5 inputs of every transaction chunk.
+    let mut seeded = PartitionWitness::new(
+        tx_data.common.config.num_wires,
+        tx_data.common.degree(),
+        &tx_data.prover_only.representative_map,
+    );
+    BlockTxCircuit::generate_witness_into(&block_tx, tx_target, &mut seeded).unwrap_or_else(
+        |error| panic!("{path:?} block transaction chunk #{chunk_index} witness failed: {error:?}"),
+    );
+    let partition_witness = PendingPartitionWitness::start_from_partition(
+        seeded,
+        &tx_data.prover_only,
+        &tx_data.common,
+    )
+    .and_then(plonky2::iop::generator::PendingPartitionWitness::finish)
+    .unwrap_or_else(|error| {
+        panic!("{path:?} block transaction chunk #{chunk_index} generators failed: {error:?}")
+    });
     let new_jump = jump_from_witness(&partition_witness, &tx_target.new_jump);
     (partition_witness, new_jump)
 }
@@ -231,8 +243,16 @@ fn prove_path(
     );
     jump = next_jump;
 
+    let chain_constant_inputs = BlockTxChainCircuit::witness_inputs_constant(
+        chain_target,
+        chain_data,
+        dummy_proof,
+    )
+    .expect("chain constant witness inputs failed");
+
     std::thread::scope(|scope| {
         let base = &base_proof;
+        let chain_constant = &chain_constant_inputs;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
@@ -254,7 +274,7 @@ fn prove_path(
                             chain_step,
                             previous,
                             base,
-                            dummy_proof,
+                            chain_constant,
                             &tx_proof,
                         )
                     })
@@ -326,7 +346,7 @@ fn prove_path(
                         chain_step,
                         previous,
                         base,
-                        dummy_proof,
+                        chain_constant,
                         &tx_proof,
                     )
                 })
@@ -350,7 +370,7 @@ fn prove_path(
                 chain_step,
                 previous,
                 base,
-                dummy_proof,
+                chain_constant,
                 &tx_proof,
             )));
         }
