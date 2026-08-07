@@ -34,9 +34,9 @@ pub struct RangeCheckQuotientGate {
     pub bit_size: usize,
 }
 
-/// Static wire-layout metadata for gates supported by the optional combined
-/// quotient backend. Keeping only layout values here avoids a dependency from
-/// `plonky2` back to downstream circuit crates.
+/// Static wire-layout metadata for the downstream 32-bit arithmetic gates
+/// supported by the optional quotient backend. Keeping only layout values
+/// here avoids a dependency from `plonky2` back to the circuit crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum U32QuotientGate {
     Arithmetic {
@@ -58,24 +58,18 @@ pub enum U32QuotientGate {
         num_carry_limbs: usize,
     },
     /// Byte decomposition: `1 + num_limbs` routed words (sum then bytes)
-    /// plus `4 * num_limbs` base-4 aux limbs per operation,
+    /// plus `4 * num_limbs` base-4 auxiliary limbs per operation, with
     /// `1 + 5 * num_limbs` constraint rows per operation.
-    ByteDecomposition { num_ops: usize, num_limbs: usize },
-    /// Degree-5 extension-field multiplication over the base field: fifteen
-    /// routed words per operation (five limbs each for the two inputs and
-    /// the output), five constraint rows per operation.
-    QuinticMultiplication { num_ops: usize },
-    /// Degree-5 extension-field squaring over the base field: ten routed
-    /// words (input and output limbs) plus ten temporary wires per
-    /// operation, fifteen constraint rows per operation.
-    QuinticSquaring { num_ops: usize },
-    /// Random access with a little-endian binary index, `2^bits` list items
-    /// per copy, and optional routed local constants.
-    RandomAccess {
-        bits: usize,
+    ByteDecomposition {
         num_ops: usize,
-        num_extra_constants: usize,
+        num_limbs: usize,
     },
+    /// Degree-5 extension-field multiplication over the base field: fifteen
+    /// routed words per operation and five constraint rows per operation.
+    QuinticMultiplication { num_ops: usize },
+    /// Degree-5 extension-field squaring: twenty wires and fifteen rows per
+    /// operation (ten routed words plus ten temporary wires).
+    QuinticSquaring { num_ops: usize },
 }
 
 /// A custom gate.
@@ -330,8 +324,8 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         None
     }
 
-    /// Advertises one of the exact promoted gate layouts to optional quotient
-    /// backends. The default leaves unrelated gates on the CPU.
+    /// Advertises one of the exact downstream U32 gate layouts to optional
+    /// quotient backends. The default leaves unrelated gates on the CPU.
     fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
         None
     }

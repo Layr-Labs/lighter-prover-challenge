@@ -87,6 +87,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
         format!("{self:?}")
     }
 
+    fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+        Some(U32QuotientGate::ByteDecomposition {
+            num_ops: self.num_ops,
+            num_limbs: self.num_limbs,
+        })
+    }
+
     fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
         dst.write_usize(self.num_limbs)?;
         dst.write_usize(self.num_ops)
@@ -358,13 +365,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
     fn num_constraints(&self) -> usize {
         (1 + self.num_limbs * 5) * self.num_ops
     }
-
-    fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
-        Some(U32QuotientGate::ByteDecomposition {
-            num_ops: self.num_ops,
-            num_limbs: self.num_limbs,
-        })
-    }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
@@ -487,6 +487,22 @@ mod tests {
     use plonky2::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     use super::*;
+
+    #[test]
+    fn advertises_quotient_layout() {
+        use plonky2::gates::gate::U32QuotientGate;
+
+        let gate = ByteDecompositionGate::new(8, 3);
+        assert_eq!(
+            <ByteDecompositionGate as Gate<GoldilocksField, 2>>::u32_quotient_gate(
+                &gate,
+            ),
+            Some(U32QuotientGate::ByteDecomposition {
+                num_ops: 3,
+                num_limbs: 8,
+            }),
+        );
+    }
 
     #[test]
     fn low_degree() {

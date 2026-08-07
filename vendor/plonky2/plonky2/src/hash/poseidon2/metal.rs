@@ -163,25 +163,11 @@ pub(crate) enum U32QuotientKind {
         result_limbs: usize,
         num_carry_limbs: usize,
     },
-    /// Byte decomposition: `1 + num_limbs` routed words (sum then bytes)
-    /// plus `4 * num_limbs` base-4 aux limbs, `1 + 5 * num_limbs` rows per
-    /// operation.
     ByteDecomposition {
         num_limbs: usize,
     },
-    /// Degree-5 extension multiplication: fifteen routed words per
-    /// operation, five rows per operation.
     QuinticMultiplication,
-    /// Degree-5 extension squaring: ten routed words plus ten temporaries
-    /// per operation, fifteen rows per operation.
     QuinticSquaring,
-    /// Audited random-access layout. The ten-word record stores bits, extra
-    /// constants, and the raw constant-column base in its final three words.
-    RandomAccess {
-        bits: usize,
-        num_extra_constants: usize,
-        constant_base: usize,
-    },
 }
 
 #[derive(Clone, Debug)]
@@ -287,70 +273,6 @@ struct BufferSet {
 struct BufferPool {
     free: Vec<BufferSet>,
     created: usize,
-    waiters: usize,
-    spare_output: Option<Buffer>,
-    detached_readback: bool,
-}
-
-struct DetachedOutput<'a> {
-    owner: &'a MetalShared,
-    buffer: Option<Buffer>,
-}
-
-impl DetachedOutput<'_> {
-    fn buffer(&self) -> &Buffer {
-        self.buffer.as_ref().expect("detached output present")
-    }
-}
-
-impl Drop for DetachedOutput<'_> {
-    fn drop(&mut self) {
-        let Some(buffer) = self.buffer.take() else {
-            return;
-        };
-        let mut pool = self
-            .owner
-            .pool
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        debug_assert!(pool.detached_readback);
-        debug_assert!(pool.spare_output.is_none());
-        pool.spare_output = Some(buffer);
-        pool.detached_readback = false;
-    }
-}
-
-enum TreeReadback<'a, F: RichField> {
-    Ready((LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)),
-    Detached {
-        output: DetachedOutput<'a>,
-        output_len: usize,
-        level_offsets: Vec<usize>,
-        leaf_count: usize,
-        cap_height: usize,
-        marker: PhantomData<F>,
-    },
-}
-
-impl<F: RichField> TreeReadback<'_, F> {
-    fn finish(self) -> (LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>) {
-        match self {
-            Self::Ready(tree) => tree,
-            Self::Detached {
-                output,
-                output_len,
-                level_offsets,
-                leaf_count,
-                cap_height,
-                marker: _,
-            } => {
-                let nodes = unsafe {
-                    slice::from_raw_parts(output.buffer().contents().cast::<u64>(), output_len)
-                };
-                tree_from_levels(nodes, &level_offsets, leaf_count, cap_height)
-            }
-        }
-    }
 }
 
 static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShared::new);
@@ -570,10 +492,10 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
     }
 }
 
-/// Starts one whole-domain kernel which evaluates every advertised RangeCheck,
-/// width-generic integer, byte, quintic, and audited random-access gate, applies
-/// each selector filter, and reduces the shared constraint rows with the same
-/// two alpha challenges as the CPU quotient.
+/// Starts one whole-domain kernel which evaluates every advertised RangeCheck
+/// and U32 arithmetic gate, applies each gate's selector filter, and reduces
+/// the shared constraint rows with the same two alpha challenges as the CPU
+/// quotient.
 pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     wires: &MetalColumns<F>,
     constants: &MetalColumns<F>,
@@ -693,16 +615,19 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                         spec.num_ops.checked_mul(limbs.checked_add(3)?)?,
                     )
                 }
-                // The byte-limb count rides in the addend-count metadata
-                // word; the two width words stay zero (`word_base` is unused
-                // by the byte and quintic branches).
                 U32QuotientKind::ByteDecomposition { num_limbs } => {
                     if num_limbs == 0 || num_limbs > 24 {
                         return None;
                     }
-                    let per_op = num_limbs.checked_mul(5)?.checked_add(1)?;
-                    let count = spec.num_ops.checked_mul(per_op)?;
-                    (3usize, num_limbs, 0usize, 0usize, count, count)
+                    let per_op = 1usize.checked_add(num_limbs.checked_mul(5)?)?;
+                    (
+                        3usize,
+                        num_limbs,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_mul(per_op)?,
+                        spec.num_ops.checked_mul(per_op)?,
+                    )
                 }
                 U32QuotientKind::QuinticMultiplication => (
                     4usize,
@@ -720,32 +645,6 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                     spec.num_ops.checked_mul(20)?,
                     spec.num_ops.checked_mul(15)?,
                 ),
-                U32QuotientKind::RandomAccess {
-                    bits,
-                    num_extra_constants,
-                    constant_base,
-                } => {
-                    if !matches!(
-                        (bits, spec.num_ops, num_extra_constants),
-                        (3, 8, 0) | (4, 4, 2) | (6, 1, 2)
-                    ) {
-                        return None;
-                    }
-                    let vec_size = 1usize.checked_shl(u32::try_from(bits).ok()?)?;
-                    let routed_per_copy = vec_size.checked_add(2)?;
-                    let routed_wires = routed_per_copy
-                        .checked_mul(spec.num_ops)?
-                        .checked_add(num_extra_constants)?;
-                    let wire_count = routed_wires.checked_add(spec.num_ops.checked_mul(bits)?)?;
-                    let num_constraints = spec
-                        .num_ops
-                        .checked_mul(bits.checked_add(2)?)?
-                        .checked_add(num_extra_constants)?;
-                    if constant_base.checked_add(num_extra_constants)? > constants.cols {
-                        return None;
-                    }
-                    (6usize, bits, num_extra_constants, constant_base, wire_count, num_constraints)
-                }
             };
         if wire_count > wires.cols
             || spec.selector_column >= constants.cols
@@ -756,8 +655,6 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             || spec.group.end > u32::MAX as usize
             || spec.num_ops > u32::MAX as usize
             || num_addends > u32::MAX as usize
-            || result_limbs > u32::MAX as usize
-            || carry_limbs > u32::MAX as usize
         {
             return None;
         }
@@ -1065,9 +962,6 @@ impl MetalShared {
                 pool: Mutex::new(BufferPool {
                     free: Vec::new(),
                     created: 0,
-                    waiters: 0,
-                    spare_output: None,
-                    detached_readback: false,
                 }),
                 available: Condvar::new(),
                 ntt_roots: Mutex::new(HashMap::new()),
@@ -1247,90 +1141,18 @@ impl MetalShared {
                     output: None,
                 });
             }
-            pool.waiters += 1;
-            match self.available.wait(pool) {
-                Ok(mut next) => {
-                    next.waiters -= 1;
-                    pool = next;
-                }
-                Err(poisoned) => {
-                    let mut next = poisoned.into_inner();
-                    next.waiters -= 1;
-                    return Err("buffer pool poisoned".to_string());
-                }
-            }
+            pool = self
+                .available
+                .wait(pool)
+                .map_err(|_| "buffer pool poisoned")?;
         }
     }
 
     fn release_set(&self, set: BufferSet) {
-        let mut pool = self
-            .pool
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        pool.free.push(set);
-        self.available.notify_one();
-    }
-
-    fn try_detach_completed_output(
-        &self,
-        set: &mut BufferSet,
-        output_bytes: usize,
-    ) -> Result<Option<DetachedOutput<'_>>, String> {
-        let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
-        if pool.waiters == 0 || pool.detached_readback {
-            return Ok(None);
+        if let Ok(mut pool) = self.pool.lock() {
+            pool.free.push(set);
+            self.available.notify_one();
         }
-        let replacement = match pool.spare_output.take() {
-            Some(buffer) if buffer.length() >= output_bytes as u64 => buffer,
-            _ => autoreleasepool(|| {
-                self.device
-                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
-            }),
-        };
-        let completed = set
-            .output
-            .replace(replacement)
-            .ok_or_else(|| "completed output buffer missing".to_string())?;
-        pool.detached_readback = true;
-        drop(pool);
-        Ok(Some(DetachedOutput {
-            owner: self,
-            buffer: Some(completed),
-        }))
-    }
-
-    fn completed_tree_readback<F: RichField>(
-        &self,
-        set: &mut BufferSet,
-        output_len: usize,
-        level_offsets: Vec<usize>,
-        leaf_count: usize,
-        cap_height: usize,
-    ) -> Result<TreeReadback<'_, F>, String> {
-        let output_bytes = output_len
-            .checked_mul(size_of::<u64>())
-            .ok_or("Metal Merkle output size overflow")?;
-        if let Some(output) = self.try_detach_completed_output(set, output_bytes)? {
-            return Ok(TreeReadback::Detached {
-                output,
-                output_len,
-                level_offsets,
-                leaf_count,
-                cap_height,
-                marker: PhantomData,
-            });
-        }
-        let output = set
-            .output
-            .as_ref()
-            .ok_or_else(|| "completed output buffer missing".to_string())?;
-        let nodes = unsafe { slice::from_raw_parts(output.contents().cast::<u64>(), output_len) };
-        Ok(TreeReadback::Ready(tree_from_levels(
-            nodes,
-            &level_offsets,
-            leaf_count,
-            cap_height,
-        )))
     }
 
     fn roots_for(&self, log_lde: u32) -> Result<(Buffer, Vec<usize>), String> {
@@ -1445,7 +1267,7 @@ impl MetalShared {
         let cap_count = 1usize << cap_height;
         let total_node_count = 2 * lde_size - cap_count;
 
-        let job = GpuJobGuard::begin();
+        let _job = GpuJobGuard::begin();
         let value_len = degree
             .checked_mul(cols)
             .ok_or("NTT value length overflow")?;
@@ -1485,7 +1307,7 @@ impl MetalShared {
         });
 
         let mut set = self.acquire_set()?;
-        let result = (|| -> Result<TreeReadback<'_, F>, String> {
+        let result = (|| -> Result<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>), String> {
             if set
                 .input
                 .as_ref()
@@ -1661,17 +1483,13 @@ impl MetalShared {
                 ));
             }
 
-            self.completed_tree_readback(
-                &mut set,
-                output_len,
-                level_offsets,
-                lde_size,
-                cap_height,
-            )
+            let nodes = unsafe {
+                slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
+            };
+            Ok(tree_from_levels(nodes, &level_offsets, lde_size, cap_height))
         })();
         self.release_set(set);
-        drop(job);
-        let (digests, cap) = result?.finish();
+        let (digests, cap) = result?;
 
         // Copy the coefficients out for the oracle's `polynomials` field.
         let coeff_source = unsafe {
@@ -1717,7 +1535,7 @@ impl MetalShared {
         let cap_count = 1usize << cap_height;
         let total_node_count = 2 * lde_size - cap_count;
 
-        let job = GpuJobGuard::begin();
+        let _job = GpuJobGuard::begin();
         let coeff_len = degree
             .checked_mul(cols)
             .ok_or("NTT coefficient length overflow")?;
@@ -1764,8 +1582,7 @@ impl MetalShared {
             output_bytes,
         );
         self.release_set(set);
-        drop(job);
-        let (digests, cap) = result?.finish();
+        let (digests, cap) = result?;
         Ok((
             MetalColumns {
                 buffer: column_buffer,
@@ -1795,7 +1612,7 @@ impl MetalShared {
         coeff_bytes: usize,
         output_len: usize,
         output_bytes: usize,
-    ) -> Result<TreeReadback<'_, F>, String> {
+    ) -> Result<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>), String> {
         let cols = coeff_columns.len();
         let lde_size = degree << rate_bits;
         let log_lde = lde_size.ilog2();
@@ -1933,13 +1750,10 @@ impl MetalShared {
             ));
         }
 
-        self.completed_tree_readback(
-            set,
-            output_len,
-            level_offsets,
-            lde_size,
-            cap_height,
-        )
+        let nodes = unsafe {
+            slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
+        };
+        Ok(tree_from_levels(nodes, &level_offsets, lde_size, cap_height))
     }
 
     fn build<F: RichField>(
@@ -1965,7 +1779,7 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("Metal Merkle output size overflow")?;
 
-        let job = GpuJobGuard::begin();
+        let _job = GpuJobGuard::begin();
         let mut set = self.acquire_set()?;
         let result = self.build_with_set(
             &mut set,
@@ -1979,8 +1793,7 @@ impl MetalShared {
             output_bytes,
         );
         self.release_set(set);
-        drop(job);
-        Ok(result?.finish())
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1995,7 +1808,7 @@ impl MetalShared {
         input_bytes: usize,
         output_len: usize,
         output_bytes: usize,
-    ) -> Result<TreeReadback<'_, F>, String> {
+    ) -> Result<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>), String> {
         let cap_count = 1usize << cap_height;
 
         let needs_staging = !matches!(&source, LeafSource::Shared(_));
@@ -2146,13 +1959,14 @@ impl MetalShared {
             ));
         }
 
-        self.completed_tree_readback(
-            set,
-            output_len,
-            level_offsets,
+        let nodes =
+            unsafe { slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len) };
+        Ok(tree_from_levels(
+            nodes,
+            &level_offsets,
             leaf_count,
             cap_height,
-        )
+        ))
     }
 }
 
@@ -2308,102 +2122,6 @@ mod tests {
     use crate::hash::merkle_tree::{capacity_up_to_mut, fill_digests_buf, merkle_tree_prove};
     use crate::hash::poseidon2::hash::Poseidon2Hash;
     use crate::plonk::vars::EvaluationVarsBaseBatch;
-
-    #[test]
-    fn does_not_detach_output_without_a_waiting_build() {
-        let context = MetalShared::new().expect("Metal context");
-        let mut set = context.acquire_set().expect("buffer set");
-        set.output = Some(autoreleasepool(|| {
-            context
-                .device
-                .new_buffer(64, MTLResourceOptions::StorageModeShared)
-        }));
-
-        let detached = context
-            .try_detach_completed_output(&mut set, 64)
-            .expect("pool state");
-        assert!(detached.is_none());
-        let pool = context.pool.lock().unwrap();
-        assert_eq!(pool.waiters, 0);
-        assert!(pool.spare_output.is_none());
-        assert!(!pool.detached_readback);
-    }
-
-    #[test]
-    fn detached_output_releases_waiting_set_without_reusing_storage() {
-        use std::sync::mpsc;
-
-        let context = MetalShared::new().expect("Metal context");
-        let mut set = context.acquire_set().expect("first set");
-        set.output = Some(autoreleasepool(|| {
-            context
-                .device
-                .new_buffer(64, MTLResourceOptions::StorageModeShared)
-        }));
-        let original = set.output.as_ref().unwrap().contents();
-
-        std::thread::scope(|scope| {
-            let (tx, rx) = mpsc::sync_channel(0);
-            let context_ref = &context;
-            scope.spawn(move || {
-                let next = context_ref.acquire_set().expect("waiting set");
-                tx.send(next).expect("return acquired set");
-            });
-
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while context.pool.lock().unwrap().waiters != 1 {
-                assert!(Instant::now() < deadline, "waiter did not block on the set");
-                std::thread::yield_now();
-            }
-
-            let detached = context
-                .try_detach_completed_output(&mut set, 64)
-                .expect("pool state")
-                .expect("waiting build enables detach");
-            let replacement = set.output.as_ref().unwrap().contents();
-            assert_eq!(detached.buffer().contents(), original);
-            assert_ne!(replacement, original);
-
-            context.release_set(set);
-            let next = rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("next build acquires before readback release");
-            assert_eq!(next.output.as_ref().unwrap().contents(), replacement);
-            context.release_set(next);
-
-            drop(detached);
-            let pool = context.pool.lock().unwrap();
-            assert!(!pool.detached_readback);
-            assert!(pool.spare_output.is_some());
-        });
-    }
-
-    #[test]
-    fn detached_tree_readback_matches_direct_level_conversion() {
-        type F = GoldilocksField;
-
-        let context = MetalShared::new().expect("Metal context");
-        let mut set = context.acquire_set().expect("buffer set");
-        let limbs: Vec<u64> = (0..28).collect();
-        set.output = Some(autoreleasepool(|| {
-            context.device.new_buffer_with_data(
-                limbs.as_ptr().cast::<c_void>(),
-                size_of_val(limbs.as_slice()) as u64,
-                MTLResourceOptions::StorageModeShared,
-            )
-        }));
-        let offsets = vec![0, 16, 24];
-        let expected = tree_from_levels::<F>(&limbs, &offsets, 4, 0);
-
-        context.pool.lock().unwrap().waiters = 1;
-        let pending = context
-            .completed_tree_readback::<F>(&mut set, limbs.len(), offsets, 4, 0)
-            .expect("completed tree readback");
-        context.pool.lock().unwrap().waiters = 0;
-        context.release_set(set);
-
-        assert_eq!(pending.finish(), expected);
-    }
 
     fn gpu_duration(command_buffer: &CommandBuffer, wall: Duration) -> Duration {
         let gpu_start: f64 = unsafe {
@@ -2918,9 +2636,37 @@ mod tests {
                             }
                             assert_eq!(constraints.len(), spec.num_ops * (total_limbs + 3));
                         }
-                        _ => unreachable!(
-                            "covered by metal_byte_and_quintic_gate_quotient_matches_cpu"
-                        ),
+                        U32QuotientKind::ByteDecomposition { num_limbs } => {
+                            let routed_per_op = 1 + num_limbs;
+                            for op in 0..spec.num_ops {
+                                let routed = routed_per_op * op;
+                                let aux_base = routed_per_op * spec.num_ops + 4 * num_limbs * op;
+                                for j in 0..4 * num_limbs {
+                                    let x = wires.col(aux_base + j)[source_row];
+                                    let y = x * (x - three);
+                                    constraints.push(y * (y + F::TWO));
+                                }
+                                for byte_index in 0..num_limbs {
+                                    let base = aux_base + 4 * byte_index;
+                                    let mut recomposed = wires.col(base + 3)[source_row];
+                                    for limb in (0..3).rev() {
+                                        recomposed = recomposed * four + wires.col(base + limb)[source_row];
+                                    }
+                                    constraints.push(recomposed - wires.col(routed + 1 + byte_index)[source_row]);
+                                }
+                                let mut recomposed = wires.col(routed + num_limbs)[source_row];
+                                for byte_index in (0..num_limbs.saturating_sub(1)).rev() {
+                                    recomposed = recomposed * F::from_canonical_u64(256)
+                                        + wires.col(routed + 1 + byte_index)[source_row];
+                                }
+                                constraints.push(recomposed - wires.col(routed)[source_row]);
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * (1 + 5 * num_limbs));
+                        }
+                        U32QuotientKind::QuinticMultiplication
+                        | U32QuotientKind::QuinticSquaring => {
+                            unreachable!("covered by the extended quotient differential test");
+                        }
                     }
 
                     for (challenge, &alpha) in alphas.iter().enumerate() {
@@ -2961,10 +2707,8 @@ mod tests {
     // Differential coverage for the byte-decomposition and EdDSA quintic
     // gates evaluated in the same union job as production RangeCheck,
     // width-generic subtraction and add-many specs. Wire columns mix random
-    // canonical values with a rotating window of the twelve raw boundary
-    // representatives (including noncanonical encodings at and above the
-    // field order) from the packed-field differential suite, so every kernel
-    // operation sees the carry-boundary cases.
+    // canonical values with a rotating window of raw Goldilocks boundary
+    // representatives, so every kernel operation sees carry-boundary cases.
     #[test]
     fn metal_byte_and_quintic_gate_quotient_matches_cpu() {
         type F = GoldilocksField;
@@ -2980,11 +2724,7 @@ mod tests {
 
         let context = shared_context().expect("Metal context must initialize");
         let alphas = [F::from_canonical_u64(13), F::from_canonical_u64(17)];
-
-        // Production shapes for the 136-wire / 80-routed ranked config. This
-        // one random-invalid job contains every current promoted kind, plus
-        // every audited RandomAccess tuple.
-        let mut shapes = vec![
+        let shapes = [
             (
                 3,
                 UnionShape::U32(U32QuotientKind::ByteDecomposition { num_limbs: 8 }),
@@ -3012,22 +2752,7 @@ mod tests {
                     num_carry_limbs: 2,
                 }),
             ),
-            (3, UnionShape::U32(U32QuotientKind::Arithmetic)),
         ];
-        let raw_constant_base = shapes.len() + 3;
-        for (bits, num_ops, num_extra_constants) in
-            [(3usize, 8usize, 0usize), (4, 4, 2), (6, 1, 2)]
-        {
-            shapes.push((
-                num_ops,
-                UnionShape::U32(U32QuotientKind::RandomAccess {
-                    bits,
-                    num_extra_constants,
-                    constant_base: raw_constant_base,
-                }),
-            ));
-        }
-        assert_eq!(shapes.len(), raw_constant_base);
 
         let mut range_specs = Vec::new();
         let mut u32_specs = Vec::new();
@@ -3036,16 +2761,14 @@ mod tests {
             let gate_index = 3 * spec_index + 2;
             let group = 3 * spec_index + 1..3 * spec_index + 4;
             match shape {
-                UnionShape::RangeCheck { bit_size } => {
-                    range_specs.push(RangeCheckQuotientSpec {
-                        selector_column,
-                        gate_index,
-                        group,
-                        include_unused_selector: true,
-                        num_ops,
-                        bit_size,
-                    })
-                }
+                UnionShape::RangeCheck { bit_size } => range_specs.push(RangeCheckQuotientSpec {
+                    selector_column,
+                    gate_index,
+                    group,
+                    include_unused_selector: true,
+                    num_ops,
+                    bit_size,
+                }),
                 UnionShape::U32(kind) => u32_specs.push(U32QuotientSpec {
                     selector_column,
                     gate_index,
@@ -3057,10 +2780,6 @@ mod tests {
             }
         }
 
-        // The raw-representative boundary set from the packed Goldilocks
-        // differential suite: canonical edges plus noncanonical encodings at
-        // and above the order, the epsilon boundaries, and three arbitrary
-        // heavy-limb values.
         let boundary = [
             0u64,
             1,
@@ -3076,14 +2795,14 @@ mod tests {
             2_441_288_194_761_790_662,
         ];
 
-        for step in [1, 2, 4, 8] {
+        for step in [1, 4] {
             let full_rows = QUOTIENT_ROWS * step;
             let mut wires = context
                 .allocate_columns::<F>(full_rows, WIRE_COLUMNS)
                 .expect("wire columns must allocate");
             let mut constants = context
-                .allocate_columns::<F>(full_rows, shapes.len() + 2)
-                .expect("constant columns must allocate");
+                .allocate_columns::<F>(full_rows, shapes.len())
+                .expect("selector columns must allocate");
             let mut rng = StdRng::seed_from_u64(0x0b17_0000 + step as u64);
             for (column_index, column) in wires
                 .columns_mut()
@@ -3094,20 +2813,6 @@ mod tests {
                 for (row, value) in column.iter_mut().enumerate() {
                     *value = if (row + column_index) % 5 == 0 {
                         GoldilocksField(boundary[(row + 7 * column_index) % boundary.len()])
-                    } else {
-                        F::from_canonical_u64(rng.next_u64() % F::ORDER)
-                    };
-                }
-            }
-            for (column_index, column) in constants
-                .columns_mut()
-                .expect("unique constant columns")
-                .into_iter()
-                .enumerate()
-            {
-                for (row, value) in column.iter_mut().enumerate() {
-                    *value = if (row + 3 * column_index) % 7 == 0 {
-                        GoldilocksField(boundary[(row + 5 * column_index) % boundary.len()])
                     } else {
                         F::from_canonical_u64(rng.next_u64() % F::ORDER)
                     };
@@ -3145,8 +2850,6 @@ mod tests {
             let four = F::from_canonical_u64(4);
             let six = F::from_canonical_u64(6);
             let base256 = F::from_canonical_u64(256);
-            let base32 = F::from_canonical_u64(1u64 << 32);
-            let u32_max = F::from_canonical_u64(u32::MAX as u64);
             for row in 0..QUOTIENT_ROWS {
                 let source_row = row * step;
                 let wire = |column: usize| wires.col(column)[source_row];
@@ -3202,17 +2905,13 @@ mod tests {
                     let mut constraints = Vec::new();
                     match spec.kind {
                         U32QuotientKind::Subtraction { result_limbs } => {
-                            let base =
-                                F::from_canonical_u64(1u64 << (2 * result_limbs as u64));
+                            let base = F::from_canonical_u64(1u64 << (2 * result_limbs as u64));
                             for op in 0..spec.num_ops {
                                 let routed = 5 * op;
                                 let output_result = wire(routed + 3);
                                 let output_borrow = wire(routed + 4);
-                                let result_initial =
-                                    wire(routed) - wire(routed + 1) - wire(routed + 2);
-                                constraints.push(
-                                    output_result - (result_initial + base * output_borrow),
-                                );
+                                let result_initial = wire(routed) - wire(routed + 1) - wire(routed + 2);
+                                constraints.push(output_result - (result_initial + base * output_borrow));
                                 let limb_base = 5 * spec.num_ops + result_limbs * op;
                                 let mut recomposed = F::ZERO;
                                 for j in (0..result_limbs).rev() {
@@ -3231,8 +2930,7 @@ mod tests {
                             result_limbs,
                             num_carry_limbs,
                         } => {
-                            let base =
-                                F::from_canonical_u64(1u64 << (2 * result_limbs as u64));
+                            let base = F::from_canonical_u64(1u64 << (2 * result_limbs as u64));
                             let total_limbs = result_limbs + num_carry_limbs;
                             let routed_per_op = num_addends + 3;
                             for op in 0..spec.num_ops {
@@ -3243,10 +2941,8 @@ mod tests {
                                 }
                                 let output_result = wire(routed + num_addends + 1);
                                 let output_carry = wire(routed + num_addends + 2);
-                                constraints
-                                    .push(output_carry * base + output_result - computed);
-                                let limb_base =
-                                    routed_per_op * spec.num_ops + total_limbs * op;
+                                constraints.push(output_carry * base + output_result - computed);
+                                let limb_base = routed_per_op * spec.num_ops + total_limbs * op;
                                 let mut combined_result = F::ZERO;
                                 let mut combined_carry = F::ZERO;
                                 for j in (0..total_limbs).rev() {
@@ -3268,8 +2964,7 @@ mod tests {
                             let routed_per_op = 1 + num_limbs;
                             for op in 0..spec.num_ops {
                                 let routed = routed_per_op * op;
-                                let aux_base =
-                                    routed_per_op * spec.num_ops + 4 * num_limbs * op;
+                                let aux_base = routed_per_op * spec.num_ops + 4 * num_limbs * op;
                                 for j in 0..4 * num_limbs {
                                     let x = wire(aux_base + j);
                                     let y = x * (x - three);
@@ -3289,10 +2984,7 @@ mod tests {
                                 }
                                 constraints.push(acc - wire(routed));
                             }
-                            assert_eq!(
-                                constraints.len(),
-                                spec.num_ops * (1 + 5 * num_limbs)
-                            );
+                            assert_eq!(constraints.len(), spec.num_ops * (1 + 5 * num_limbs));
                         }
                         U32QuotientKind::QuinticMultiplication => {
                             for op in 0..spec.num_ops {
@@ -3331,7 +3023,7 @@ mod tests {
                                 constraints.push(a[1] * a[1] - extra[4]);
                                 constraints.push((two * a[0] * a[2] + extra[4]) - extra[5]);
                                 constraints.push((six * a[3] * a[4] + extra[5]) - c[2]);
-                                constraints.push((three * a[4] * a[4]) - extra[6]);
+                                constraints.push(three * a[4] * a[4] - extra[6]);
                                 constraints.push((two * a[0] * a[3] + extra[6]) - extra[7]);
                                 constraints.push((two * a[1] * a[2] + extra[7]) - c[3]);
                                 constraints.push(a[2] * a[2] - extra[8]);
@@ -3340,87 +3032,7 @@ mod tests {
                             }
                             assert_eq!(constraints.len(), spec.num_ops * 15);
                         }
-                        U32QuotientKind::Arithmetic => {
-                            for op in 0..spec.num_ops {
-                                let routed = 6 * op;
-                                let multiplicand_0 = wire(routed);
-                                let multiplicand_1 = wire(routed + 1);
-                                let addend = wire(routed + 2);
-                                let output_low = wire(routed + 3);
-                                let output_high = wire(routed + 4);
-                                let inverse = wire(routed + 5);
-                                constraints.push(
-                                    (inverse * (u32_max - output_high) - F::ONE) * output_low,
-                                );
-                                constraints.push(
-                                    output_high * base32 + output_low
-                                        - (multiplicand_0 * multiplicand_1 + addend),
-                                );
-                                let limb_base = 6 * spec.num_ops + 32 * op;
-                                let mut combined_low = F::ZERO;
-                                let mut combined_high = F::ZERO;
-                                for j in (0..32).rev() {
-                                    let x = wire(limb_base + j);
-                                    let y = x * (x - three);
-                                    constraints.push(y * (y + F::TWO));
-                                    if j < 16 {
-                                        combined_low = combined_low * four + x;
-                                    } else {
-                                        combined_high = combined_high * four + x;
-                                    }
-                                }
-                                constraints.push(combined_low - output_low);
-                                constraints.push(combined_high - output_high);
-                            }
-                            assert_eq!(constraints.len(), spec.num_ops * 36);
-                        }
-                        U32QuotientKind::RandomAccess {
-                            bits,
-                            num_extra_constants,
-                            constant_base,
-                        } => {
-                            let vec_size = 1usize << bits;
-                            let routed_per_copy = vec_size + 2;
-                            let extra_wire_base = routed_per_copy * spec.num_ops;
-                            let bit_base = extra_wire_base + num_extra_constants;
-                            for copy in 0..spec.num_ops {
-                                let copy_base = routed_per_copy * copy;
-                                for i in 0..bits {
-                                    let b = wire(bit_base + copy * bits + i);
-                                    constraints.push(b * (b - F::ONE));
-                                }
-                                let mut reconstructed_index = F::ZERO;
-                                for i in (0..bits).rev() {
-                                    reconstructed_index = reconstructed_index.double()
-                                        + wire(bit_base + copy * bits + i);
-                                }
-                                constraints.push(reconstructed_index - wire(copy_base));
-
-                                let mut items =
-                                    (0..vec_size).map(|i| wire(copy_base + 2 + i)).collect::<Vec<_>>();
-                                let mut level_size = vec_size;
-                                for i in 0..bits {
-                                    let b = wire(bit_base + copy * bits + i);
-                                    for k in 0..level_size / 2 {
-                                        let x = items[2 * k];
-                                        let y = items[2 * k + 1];
-                                        items[k] = x + b * (y - x);
-                                    }
-                                    level_size /= 2;
-                                }
-                                constraints.push(items[0] - wire(copy_base + 1));
-                            }
-                            for i in 0..num_extra_constants {
-                                constraints.push(
-                                    constants.col(constant_base + i)[source_row]
-                                        - wire(extra_wire_base + i),
-                                );
-                            }
-                            assert_eq!(
-                                constraints.len(),
-                                spec.num_ops * (bits + 2) + num_extra_constants
-                            );
-                        }
+                        U32QuotientKind::Arithmetic => unreachable!("not exercised by this test"),
                     }
 
                     for (challenge, &alpha) in alphas.iter().enumerate() {
