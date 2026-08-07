@@ -468,10 +468,12 @@ fn divide_chunk_products<F: Field>(
     }
 }
 
-/// Compute the partial products used in the `Z` polynomial.
-/// Returns the polynomials interpolating `partial_products(f / g)`
-/// where `f, g` are the products in the definition of `Z`: `Z(g^i) = f / g`.
-fn wires_permutation_partial_products_and_zs<
+/// Number of subgroup points whose chunk denominators share one Montgomery batch inversion.
+const INV_BATCH: usize = 128;
+
+/// The flat per-point permutation chunk-product buffer consumed by the `Z` chain: point `i`'s
+/// `num_chunks` ratios live at `[i * num_chunks..(i + 1) * num_chunks]`.
+fn permutation_quotient_chunk_products<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
     const D: usize,
@@ -482,7 +484,7 @@ fn wires_permutation_partial_products_and_zs<
     gamma: F,
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
-) -> Vec<PolynomialValues<F>> {
+) -> Vec<F> {
     let degree = common_data.quotient_degree_factor;
     let subgroup = &prover_data.subgroup;
     let num_prods = common_data.num_partial_products;
@@ -494,7 +496,6 @@ fn wires_permutation_partial_products_and_zs<
     // The permutation argument only consumes one numerator/denominator ratio per quotient-degree
     // chunk. Form those products before Montgomery inversion, shrinking each inversion batch by
     // `degree` and reading every witness wire only once.
-    const INV_BATCH: usize = 128;
     let mut all_quotient_chunk_products = vec![F::ZERO; subgroup.len() * num_chunks];
     all_quotient_chunk_products
         .par_chunks_mut(INV_BATCH * num_chunks)
@@ -517,9 +518,18 @@ fn wires_permutation_partial_products_and_zs<
                     for chunk in 0..num_chunks {
                         let start = chunk * degree;
                         let end = min(start + degree, num_routed_wires);
-                        let mut numerator_product = F::ONE;
-                        let mut denominator_product = F::ONE;
-                        for j in start..end {
+                        // Seed both products with the chunk's first factor instead of folding
+                        // from `ONE`. `ONE * a == a` as a value in any field, and bitwise for
+                        // Goldilocks (`reduce128` returns its input unchanged when the high word
+                        // is zero), so this deletes two multiplies per chunk per point — 20 of
+                        // the ~180 field multiplies this phase performs per point at the
+                        // production shape — without changing any representation. The
+                        // column-major vanishing evaluator already seeds its chunk products the
+                        // same way; this makes the witness-side path consistent with it.
+                        let wire_value = witness.get_wire(i, start);
+                        let mut numerator_product = wire_value + beta_k_is[start] * x + gamma;
+                        let mut denominator_product = wire_value + beta * s_sigmas[start] + gamma;
+                        for j in start + 1..end {
                             let wire_value = witness.get_wire(i, j);
                             numerator_product *= wire_value + beta_k_is[j] * x + gamma;
                             denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
@@ -535,6 +545,36 @@ fn wires_permutation_partial_products_and_zs<
                 );
             },
         );
+
+    all_quotient_chunk_products
+}
+
+/// Compute the partial products used in the `Z` polynomial.
+/// Returns the polynomials interpolating `partial_products(f / g)`
+/// where `f, g` are the products in the definition of `Z`: `Z(g^i) = f / g`.
+fn wires_permutation_partial_products_and_zs<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &MatrixWitness<F>,
+    beta: F,
+    beta_k_is: &[F],
+    gamma: F,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+) -> Vec<PolynomialValues<F>> {
+    let num_prods = common_data.num_partial_products;
+    let num_chunks = num_prods + 1;
+    let subgroup = &prover_data.subgroup;
+    let all_quotient_chunk_products = permutation_quotient_chunk_products(
+        witness,
+        beta,
+        beta_k_is,
+        gamma,
+        prover_data,
+        common_data,
+    );
 
     // Accumulate the sequential Z chain directly into the column-major output
     // polynomials, deleting the per-point row Vec, the row-major intermediate,
@@ -1496,6 +1536,474 @@ mod flat_chunk_products_tests {
                     raw(flat_column),
                     raw(legacy_column),
                     "column {k} mismatch for {n_points} points"
+                );
+            }
+        }
+    }
+}
+
+/// Differential oracle for [`permutation_quotient_chunk_products`]: the promoted implementation,
+/// which folds each chunk's numerator and denominator products from `F::ONE` instead of seeding
+/// them with the chunk's first factor. Retained verbatim under `cfg(test)`.
+#[cfg(test)]
+fn permutation_quotient_chunk_products_one_folded<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &MatrixWitness<F>,
+    beta: F,
+    beta_k_is: &[F],
+    gamma: F,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+) -> Vec<F> {
+    let degree = common_data.quotient_degree_factor;
+    let subgroup = &prover_data.subgroup;
+    let num_routed_wires = common_data.config.num_routed_wires;
+    let num_chunks = common_data.num_partial_products + 1;
+    let mut all_quotient_chunk_products = vec![F::ZERO; subgroup.len() * num_chunks];
+    all_quotient_chunk_products
+        .par_chunks_mut(INV_BATCH * num_chunks)
+        .zip(subgroup.par_chunks(INV_BATCH))
+        .enumerate()
+        .for_each_init(
+            || {
+                (
+                    Vec::with_capacity(num_chunks * INV_BATCH),
+                    Vec::with_capacity(num_chunks * INV_BATCH),
+                )
+            },
+            |scratch, (chunk_idx, (quotient_products, xs))| {
+                let base = chunk_idx * INV_BATCH;
+                let (denominator_products, denominator_inverses) = scratch;
+                denominator_products.clear();
+                for (t, &x) in xs.iter().enumerate() {
+                    let i = base + t;
+                    let s_sigmas = &prover_data.sigmas[i];
+                    for chunk in 0..num_chunks {
+                        let start = chunk * degree;
+                        let end = min(start + degree, num_routed_wires);
+                        let mut numerator_product = F::ONE;
+                        let mut denominator_product = F::ONE;
+                        for j in start..end {
+                            let wire_value = witness.get_wire(i, j);
+                            numerator_product *= wire_value + beta_k_is[j] * x + gamma;
+                            denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
+                        }
+                        quotient_products[t * num_chunks + chunk] = numerator_product;
+                        denominator_products.push(denominator_product);
+                    }
+                }
+                divide_chunk_products(
+                    quotient_products,
+                    denominator_products,
+                    denominator_inverses,
+                );
+            },
+        );
+
+    all_quotient_chunk_products
+}
+
+/// Differential coverage for the permutation chunk-ratio path.
+///
+/// Two independent oracles are compared against the shipping code:
+///
+/// * the *pre-chunking* algorithm, which inverts one denominator per routed wire and only then
+///   folds the `num_routed_wires` ratios into `num_chunks` products — this pins the algebraic
+///   identity `prod_C (n_j / d_j) == (prod_C n_j) * (prod_C d_j)^{-1}`;
+/// * the *one-folded* chunk algorithm (the promoted base), which seeds each chunk product with
+///   `F::ONE` rather than with the chunk's first factor.
+///
+/// Both must agree with the shipping code in raw `u64` representation, not merely in field value.
+#[cfg(all(test, feature = "std"))]
+mod permutation_chunk_ratio_tests {
+    use plonky2_field::goldilocks_field::GoldilocksField;
+    use plonky2_field::types::{Field, Field64, PrimeField64};
+
+    use super::{
+        permutation_quotient_chunk_products, permutation_quotient_chunk_products_one_folded,
+        wires_permutation_partial_products_and_zs, INV_BATCH,
+    };
+    use crate::gates::noop::NoopGate;
+    use crate::iop::generator::generate_partial_witness;
+    use crate::iop::witness::{PartialWitness, WitnessWrite};
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::circuit_data::CircuitConfig;
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+    use crate::util::partial_products::quotient_chunk_products_into;
+
+    const D: usize = 2;
+    type C = PoseidonGoldilocksConfig;
+    type F = GoldilocksField;
+
+    fn raw(values: &[F]) -> Vec<u64> {
+        values.iter().map(|x| x.to_noncanonical_u64()).collect()
+    }
+
+    fn canonical(values: &[F]) -> Vec<u64> {
+        values.iter().map(|x| x.to_canonical_u64()).collect()
+    }
+
+    /// Deterministic pseudorandom element; `from_noncanonical_u64` deliberately admits samples
+    /// above the field order so raw comparisons are not vacuous.
+    fn sample(seed: u64) -> F {
+        let mut h = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        F::from_noncanonical_u64(h ^ (h >> 31))
+    }
+
+    /// The Z accumulation exactly as `wires_permutation_partial_products_and_zs` performs it.
+    fn z_chain(flat: &[F], num_chunks: usize) -> Vec<Vec<F>> {
+        let num_prods = num_chunks - 1;
+        let mut columns: Vec<Vec<F>> = vec![Vec::new(); num_chunks];
+        let mut z_x = F::ONE;
+        for chunk_products in flat.chunks_exact(num_chunks) {
+            let mut acc = z_x;
+            for (k, &quotient_chunk_product) in chunk_products.iter().enumerate() {
+                acc *= quotient_chunk_product;
+                if k == num_prods {
+                    columns[k].push(z_x);
+                    z_x = acc;
+                } else {
+                    columns[k].push(acc);
+                }
+            }
+        }
+        columns
+    }
+
+    /// Pre-chunking oracle over explicit per-point numerator/denominator rows: batch-invert every
+    /// wire denominator across an `INV_BATCH` window, multiply the numerators in, then chunk.
+    fn per_wire_inversion_flat(rows: &[(Vec<F>, Vec<F>)], degree: usize) -> Vec<F> {
+        let num_terms = rows[0].0.len();
+        let num_chunks = num_terms.div_ceil(degree);
+        let mut flat = vec![F::ZERO; rows.len() * num_chunks];
+        for (batch, out_chunk) in rows
+            .chunks(INV_BATCH)
+            .zip(flat.chunks_mut(INV_BATCH * num_chunks))
+        {
+            let denoms: Vec<F> = batch.iter().flat_map(|(_, d)| d.iter().copied()).collect();
+            let numers: Vec<F> = batch.iter().flat_map(|(n, _)| n.iter().copied()).collect();
+            let mut quotient_values = F::batch_multiplicative_inverse(&denoms);
+            for t in 0..batch.len() {
+                let point_quotients = &mut quotient_values[t * num_terms..(t + 1) * num_terms];
+                for (quotient_value, &numerator) in point_quotients
+                    .iter_mut()
+                    .zip(&numers[t * num_terms..(t + 1) * num_terms])
+                {
+                    *quotient_value *= numerator;
+                }
+                quotient_chunk_products_into(
+                    point_quotients,
+                    degree,
+                    &mut out_chunk[t * num_chunks..(t + 1) * num_chunks],
+                );
+            }
+        }
+        flat
+    }
+
+    /// Chunk-product algorithm over the same rows. `seed_first` selects the shipping form (seed
+    /// each product with the chunk's first factor) or the promoted form (fold from `ONE`).
+    fn chunk_inversion_flat(rows: &[(Vec<F>, Vec<F>)], degree: usize, seed_first: bool) -> Vec<F> {
+        let num_terms = rows[0].0.len();
+        let num_chunks = num_terms.div_ceil(degree);
+        let mut flat = vec![F::ZERO; rows.len() * num_chunks];
+        for (batch, quotient_products) in rows
+            .chunks(INV_BATCH)
+            .zip(flat.chunks_mut(INV_BATCH * num_chunks))
+        {
+            let mut denominator_products = Vec::with_capacity(batch.len() * num_chunks);
+            for (t, (numerators, denominators)) in batch.iter().enumerate() {
+                for chunk in 0..num_chunks {
+                    let start = chunk * degree;
+                    let end = core::cmp::min(start + degree, num_terms);
+                    let (mut numerator_product, mut denominator_product, first) = if seed_first {
+                        (numerators[start], denominators[start], start + 1)
+                    } else {
+                        (F::ONE, F::ONE, start)
+                    };
+                    for j in first..end {
+                        numerator_product *= numerators[j];
+                        denominator_product *= denominators[j];
+                    }
+                    quotient_products[t * num_chunks + chunk] = numerator_product;
+                    denominator_products.push(denominator_product);
+                }
+            }
+            let inverses = F::batch_multiplicative_inverse(&denominator_products);
+            for (product, &inverse) in quotient_products.iter_mut().zip(inverses.iter()) {
+                *product *= inverse;
+            }
+        }
+        flat
+    }
+
+    fn make_rows(
+        n_points: usize,
+        num_terms: usize,
+        seed: u64,
+        zero_numerators: bool,
+        mirror: usize,
+    ) -> Vec<(Vec<F>, Vec<F>)> {
+        (0..n_points)
+            .map(|i| {
+                let denominators: Vec<F> = (0..num_terms)
+                    .map(|j| {
+                        let d = sample(seed ^ 0xdead ^ ((i as u64) << 24) ^ ((j as u64) << 3));
+                        if d.is_zero() {
+                            F::ONE
+                        } else {
+                            d
+                        }
+                    })
+                    .collect();
+                let numerators: Vec<F> = (0..num_terms)
+                    .map(|j| {
+                        // Mirroring reproduces the dominant production case: an unrouted wire's
+                        // numerator equals its denominator, so the ratio is one — and one's raw
+                        // form after Montgomery inversion is the *noncanonical* `ORDER + 1`.
+                        if mirror > 0 && (i + j) % mirror == 0 {
+                            denominators[j]
+                        } else if zero_numerators && (i + j) % 17 == 0 {
+                            F::ZERO
+                        } else {
+                            sample(seed ^ ((i as u64) << 20) ^ (j as u64))
+                        }
+                    })
+                    .collect();
+                (numerators, denominators)
+            })
+            .collect()
+    }
+
+    /// Odd shapes and inversion-batch boundaries: the shipping chunk algorithm must match both
+    /// the per-wire-inversion oracle and the one-folded chunk oracle, entry for entry, in raw
+    /// representation — for the flat chunk-products buffer and for every `Z` column.
+    #[test]
+    fn chunk_ratios_match_both_oracles_across_shapes_and_boundaries() {
+        let shapes: &[(usize, usize)] = &[
+            (80, 8),
+            (1, 8),
+            (2, 8),
+            (7, 8),
+            (8, 8),
+            (9, 8),
+            (79, 8),
+            (81, 8),
+            (160, 8),
+            (80, 2),
+            (80, 3),
+            (80, 7),
+            (13, 5),
+        ];
+        let mut compared = 0usize;
+        let mut noncanonical = 0usize;
+        for &(num_terms, degree) in shapes {
+            let num_chunks = num_terms.div_ceil(degree);
+            for &n_points in &[1usize, 2, 3, 4, 127, 128, 129, 255, 256, 300] {
+                for &zero_numerators in &[false, true] {
+                    for &mirror in &[0usize, 1, 3] {
+                        let rows = make_rows(
+                            n_points,
+                            num_terms,
+                            (num_terms as u64) << 32 | (degree as u64) << 8 | n_points as u64,
+                            zero_numerators,
+                            mirror,
+                        );
+                        let per_wire = per_wire_inversion_flat(&rows, degree);
+                        let one_folded = chunk_inversion_flat(&rows, degree, false);
+                        let shipping = chunk_inversion_flat(&rows, degree, true);
+                        let label = format!(
+                            "W={num_terms} d={degree} n={n_points} zeros={zero_numerators} mirror={mirror}"
+                        );
+                        assert_eq!(
+                            raw(&shipping),
+                            raw(&per_wire),
+                            "vs per-wire oracle: {label}"
+                        );
+                        assert_eq!(
+                            raw(&shipping),
+                            raw(&one_folded),
+                            "vs one-folded oracle: {label}"
+                        );
+                        for (k, (a, b)) in z_chain(&shipping, num_chunks)
+                            .iter()
+                            .zip(z_chain(&per_wire, num_chunks).iter())
+                            .enumerate()
+                        {
+                            assert_eq!(raw(a), raw(b), "Z column {k}: {label}");
+                        }
+                        compared += shipping.len();
+                        noncanonical += shipping
+                            .iter()
+                            .filter(|v| v.to_noncanonical_u64() >= F::ORDER)
+                            .count();
+                    }
+                }
+            }
+        }
+        assert!(
+            compared > 900_000,
+            "expected broad coverage, got {compared}"
+        );
+        // The mirrored cases must actually produce noncanonical representations, otherwise the
+        // raw comparisons above would be a restatement of value equality.
+        assert!(
+            noncanonical > 100_000,
+            "expected noncanonical raw representations, got {noncanonical}"
+        );
+    }
+
+    /// A chunk denominator product is zero exactly when one of its factors is zero, so the
+    /// chunked path rejects exactly the inputs the per-wire path rejects, with the same panic
+    /// from `Field::inverse`.
+    #[test]
+    fn zero_denominator_failure_class_is_identical() {
+        let num_terms = 80usize;
+        let degree = 8usize;
+        for &n_points in &[1usize, 5, 128, 200] {
+            for &zero_at in &[0usize, 1, 7, 8, 40, 79] {
+                for &zero_point in &[0usize, 1] {
+                    if zero_point >= n_points {
+                        continue;
+                    }
+                    let mut rows = make_rows(n_points, num_terms, 7, false, 0);
+                    rows[zero_point].1[zero_at] = F::ZERO;
+                    assert!(
+                        std::panic::catch_unwind(|| per_wire_inversion_flat(&rows, degree))
+                            .is_err(),
+                        "per-wire oracle must reject a zero denominator (n={n_points}, j={zero_at})"
+                    );
+                    assert!(
+                        std::panic::catch_unwind(|| chunk_inversion_flat(&rows, degree, true))
+                            .is_err(),
+                        "chunked path must reject a zero denominator (n={n_points}, j={zero_at})"
+                    );
+                }
+            }
+        }
+        // Multiple simultaneous zeros: two in one chunk, one in the last chunk of a later batch.
+        let mut rows = make_rows(300, num_terms, 11, false, 0);
+        rows[0].1[0] = F::ZERO;
+        rows[0].1[3] = F::ZERO;
+        rows[129].1[79] = F::ZERO;
+        assert!(std::panic::catch_unwind(|| per_wire_inversion_flat(&rows, degree)).is_err());
+        assert!(std::panic::catch_unwind(|| chunk_inversion_flat(&rows, degree, true)).is_err());
+    }
+
+    /// End-to-end differential on the real prover entry points at the production shape: 80 routed
+    /// wires, quotient degree factor 8 (ten chunks), 2 challenges, degree 2^12 or more.
+    #[test]
+    fn production_shape_circuit_matches_one_folded_oracle() {
+        let config = CircuitConfig::standard_recursion_config();
+        assert_eq!(config.num_routed_wires, 80);
+        assert_eq!(config.num_challenges, 2);
+        assert_eq!(config.max_quotient_degree_factor, 8);
+
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let a = builder.add_virtual_target();
+        let b = builder.add_virtual_target();
+        let mut acc = builder.mul(a, b);
+        for i in 0..64u64 {
+            let c = builder.constant(F::from_canonical_u64(i + 3));
+            acc = builder.mul_add(acc, c, b);
+        }
+        builder.register_public_input(acc);
+        while builder.num_gates() < (1 << 12) - 1 {
+            builder.add_gate(NoopGate, vec![]);
+        }
+        let data = builder.build::<C>();
+        let n_points = 1usize << data.common.degree_bits();
+        assert!(data.common.degree_bits() >= 12);
+        assert_eq!(data.common.quotient_degree_factor, 8);
+        assert_eq!(data.common.num_partial_products + 1, 10);
+
+        let mut pw = PartialWitness::new();
+        pw.set_target(a, F::from_canonical_u64(0x1234_5678_9abc_def0))
+            .unwrap();
+        pw.set_target(b, F::from_canonical_u64(0x0fed_cba9_8765_4321))
+            .unwrap();
+        let partition_witness =
+            generate_partial_witness(pw, &data.prover_only, &data.common).unwrap();
+        let witness = partition_witness.full_witness();
+
+        let num_routed_wires = data.common.config.num_routed_wires;
+        let num_challenges = data.common.config.num_challenges;
+        let num_chunks = data.common.num_partial_products + 1;
+        // Fiat-Shamir challenges are irrelevant to the identity under test; the `beta * k_i`
+        // reassociation matches the prover's.
+        let betas: Vec<F> = (0..num_challenges)
+            .map(|i| sample(0xb17a + i as u64))
+            .collect();
+        let gammas: Vec<F> = (0..num_challenges)
+            .map(|i| sample(0x6a33 + i as u64))
+            .collect();
+        let beta_k_is: Vec<F> = betas
+            .iter()
+            .flat_map(|&beta| data.common.k_is.iter().map(move |&k_i| beta * k_i))
+            .collect();
+
+        for i in 0..num_challenges {
+            let beta_k_is_i = &beta_k_is[i * num_routed_wires..(i + 1) * num_routed_wires];
+            let shipped = permutation_quotient_chunk_products::<F, C, D>(
+                &witness,
+                betas[i],
+                beta_k_is_i,
+                gammas[i],
+                &data.prover_only,
+                &data.common,
+            );
+            let oracle = permutation_quotient_chunk_products_one_folded::<F, C, D>(
+                &witness,
+                betas[i],
+                beta_k_is_i,
+                gammas[i],
+                &data.prover_only,
+                &data.common,
+            );
+            assert_eq!(shipped.len(), n_points * num_chunks);
+            assert_eq!(
+                raw(&shipped),
+                raw(&oracle),
+                "flat chunk products differ for challenge {i}"
+            );
+            assert_eq!(canonical(&shipped), canonical(&oracle));
+
+            // Non-vacuity: Goldilocks multiplication may leave a result in `[ORDER, 2^64)`, so
+            // raw equality above is a real constraint. In this fixture most chunk ratios are the
+            // noncanonical representation of one, because an unrouted wire's numerator and
+            // denominator coincide.
+            let noncanonical = shipped
+                .iter()
+                .filter(|v| v.to_noncanonical_u64() >= F::ORDER)
+                .count();
+            assert!(
+                noncanonical > shipped.len() / 2,
+                "expected noncanonical raw representations, got {noncanonical}"
+            );
+
+            let shipped_columns = wires_permutation_partial_products_and_zs::<F, C, D>(
+                &witness,
+                betas[i],
+                beta_k_is_i,
+                gammas[i],
+                &data.prover_only,
+                &data.common,
+            );
+            let oracle_columns = z_chain(&oracle, num_chunks);
+            assert_eq!(shipped_columns.len(), num_chunks);
+            for (k, (shipped_col, oracle_col)) in
+                shipped_columns.iter().zip(&oracle_columns).enumerate()
+            {
+                assert_eq!(shipped_col.values.len(), n_points);
+                assert_eq!(
+                    raw(&shipped_col.values),
+                    raw(oracle_col),
+                    "Z column {k} differs for challenge {i}"
                 );
             }
         }

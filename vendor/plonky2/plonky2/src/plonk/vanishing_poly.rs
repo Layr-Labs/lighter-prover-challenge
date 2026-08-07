@@ -175,6 +175,14 @@ pub(crate) struct VanishingScratch<F> {
     pub vanishing_all_lookup_terms: Vec<F>,
     pub lookup_selectors: Vec<F>,
     pub constraint_terms_batch: Vec<F>,
+    /// One batch-sized selector-filter buffer, shared by every gate of every batch this worker
+    /// evaluates. `eval_filtered_base_batch` rewrites it in full (`clear()` then either an
+    /// `extend` over the whole selector column or a `resize` to `ONE`), so neither another
+    /// gate's contents nor a longer previous batch's tail can survive into a read.
+    pub gate_filters: Vec<F>,
+    /// Materialized gate-constraint scratch for the gates that have no fused accumulate
+    /// override. `eval_unfiltered_base_batch_into` sizes and fills it before every read.
+    pub gate_constraint_scratch: Vec<F>,
 }
 
 /// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
@@ -273,6 +281,8 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     evaluate_gate_constraints_base_batch_into::<F, D>(
         common_data,
         vars_batch,
+        &mut scratch.gate_filters,
+        &mut scratch.gate_constraint_scratch,
         &mut scratch.constraint_terms_batch,
     );
     let constraint_terms_batch = &scratch.constraint_terms_batch;
@@ -932,19 +942,34 @@ pub fn evaluate_gate_constraints_base_batch<F: RichField + Extendable<D>, const 
     vars_batch: EvaluationVarsBaseBatch<F>,
 ) -> Vec<F> {
     let mut constraints_batch = Vec::new();
-    evaluate_gate_constraints_base_batch_into::<F, D>(common_data, vars_batch, &mut constraints_batch);
+    let mut filters = Vec::new();
+    let mut constraint_scratch = Vec::new();
+    evaluate_gate_constraints_base_batch_into::<F, D>(
+        common_data,
+        vars_batch,
+        &mut filters,
+        &mut constraint_scratch,
+        &mut constraints_batch,
+    );
     constraints_batch
 }
 
-/// Like [`evaluate_gate_constraints_base_batch`], but reuses the caller's buffer.
+/// Like [`evaluate_gate_constraints_base_batch`], but reuses the caller's buffers.
+///
+/// `filters` and `constraint_scratch` are the per-gate scratch buffers. They were allocated fresh
+/// on every batched call; the quotient loop already owns a per-rayon-worker
+/// [`VanishingScratch`], so they now live there and are reused for every gate of every batch a
+/// worker evaluates. Both are fully rewritten by the callee before being read, so their incoming
+/// contents and lengths are irrelevant.
 pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
     vars_batch: EvaluationVarsBaseBatch<F>,
+    filters: &mut Vec<F>,
+    constraint_scratch: &mut Vec<F>,
     constraints_batch: &mut Vec<F>,
 ) {
     constraints_batch.clear();
     constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
-    let mut filters = Vec::with_capacity(vars_batch.len());
     for (i, gate) in common_data.gates.iter().enumerate() {
         let selector_index = common_data.selectors_info.selector_indices[i];
         gate.0.eval_filtered_base_batch(
@@ -954,7 +979,8 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
             common_data.selectors_info.groups[selector_index].clone(),
             common_data.selectors_info.num_selectors(),
             common_data.num_lookup_selectors,
-            &mut filters,
+            filters,
+            constraint_scratch,
             constraints_batch,
         );
     }
@@ -1431,4 +1457,200 @@ pub fn check_lookup_constraints_circuit<F: RichField + Extendable<D>, const D: u
         ));
     }
     constraints
+}
+
+/// Differential coverage for the retained selector-filter scratch.
+///
+/// `eval_filtered_base_batch` writes its filter into a caller-owned `Vec` that now lives in
+/// [`VanishingScratch`] and is shared by every gate of every quotient batch a rayon worker
+/// evaluates. That is only sound because the callee rewrites the buffer in full — `clear()`
+/// followed by either an `extend` over the whole selector column or a `resize` to `ONE` — so
+/// neither another gate's contents nor a longer previous batch's tail can survive into a read.
+/// `Vec::resize` alone would *not* give that guarantee, since it leaves existing elements intact;
+/// these tests pin the behavior against deliberately poisoned, wrong-length incoming buffers.
+#[cfg(all(test, feature = "std"))]
+mod gate_filter_scratch_tests {
+    use plonky2_field::goldilocks_field::GoldilocksField;
+    use plonky2_field::types::{Field, PrimeField64};
+
+    use super::evaluate_gate_constraints_base_batch_into;
+    use crate::gates::noop::NoopGate;
+    use crate::hash::hash_types::HashOut;
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+    use crate::plonk::vars::EvaluationVarsBaseBatch;
+
+    const D: usize = 2;
+    type C = PoseidonGoldilocksConfig;
+    type F = GoldilocksField;
+
+    fn sample(seed: u64) -> F {
+        let mut h = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        F::from_noncanonical_u64(h ^ (h >> 31))
+    }
+
+    fn raw(values: &[F]) -> Vec<u64> {
+        values.iter().map(|x| x.to_noncanonical_u64()).collect()
+    }
+
+    /// A circuit exercising several gate types, so `common_data.gates` holds more than one gate
+    /// and the shared filter buffer is genuinely reused between gates within a single call.
+    fn common_data() -> CommonCircuitData<F, D> {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let a = builder.add_virtual_target();
+        let b = builder.add_virtual_target();
+        let mut acc = builder.mul(a, b);
+        for i in 0..32u64 {
+            let c = builder.constant(F::from_canonical_u64(i + 3));
+            acc = builder.mul_add(acc, c, b);
+            acc = builder.add(acc, c);
+        }
+        let h = builder.add_virtual_targets(8);
+        let hashed = builder
+            .hash_n_to_hash_no_pad::<<C as crate::plonk::config::GenericConfig<D>>::InnerHasher>(h);
+        builder.connect(acc, hashed.elements[0]);
+        builder.register_public_input(acc);
+        for _ in 0..64 {
+            builder.add_gate(NoopGate, vec![]);
+        }
+        builder.build::<C>().common
+    }
+
+    /// Pseudorandom constant and wire columns of the shape the quotient loop gathers.
+    fn batch_inputs(
+        common: &CommonCircuitData<F, D>,
+        batch_size: usize,
+        seed: u64,
+    ) -> (Vec<F>, Vec<F>) {
+        let constants = (0..common.num_constants * batch_size)
+            .map(|i| sample(seed ^ (i as u64) ^ 0x0c07))
+            .collect();
+        let wires = (0..common.config.num_wires * batch_size)
+            .map(|i| sample(seed ^ (i as u64) ^ 0x9142))
+            .collect();
+        (constants, wires)
+    }
+
+    fn evaluate(
+        common: &CommonCircuitData<F, D>,
+        batch_size: usize,
+        constants: &[F],
+        wires: &[F],
+        filters: &mut Vec<F>,
+    ) -> Vec<F> {
+        let public_inputs_hash = HashOut::from_partial(&[F::from_canonical_u64(7)]);
+        let vars = EvaluationVarsBaseBatch::new(batch_size, constants, wires, &public_inputs_hash);
+        let mut out = Vec::new();
+        let mut constraint_scratch = Vec::new();
+        evaluate_gate_constraints_base_batch_into::<F, D>(
+            common,
+            vars,
+            filters,
+            &mut constraint_scratch,
+            &mut out,
+        );
+        out
+    }
+
+    /// One retained filter buffer, carried across a sequence of batches whose sizes grow and
+    /// shrink, must produce exactly the constraints a freshly allocated buffer produces — bit for
+    /// bit. The retained buffer starts poisoned at a length no batch uses, which is the case a
+    /// `resize`-based (rather than `clear`-based) implementation would get wrong.
+    #[test]
+    fn retained_filter_scratch_matches_fresh_allocation() {
+        let common = common_data();
+        assert!(
+            common.gates.len() > 1,
+            "fixture must contain several gates so the buffer is reused within a call"
+        );
+
+        let mut retained: Vec<F> = (0..97).map(|i| sample(0xbadu64 ^ i)).collect();
+        // Batch widths: the production width, then a shrinking tail, then back up.
+        for (round, &batch_size) in [32usize, 32, 17, 7, 1, 32, 3, 32].iter().enumerate() {
+            let (constants, wires) = batch_inputs(&common, batch_size, round as u64);
+            let mut fresh: Vec<F> = Vec::new();
+            let expected = evaluate(&common, batch_size, &constants, &wires, &mut fresh);
+            let actual = evaluate(&common, batch_size, &constants, &wires, &mut retained);
+            assert_eq!(
+                raw(&actual),
+                raw(&expected),
+                "round {round} (batch_size {batch_size}) diverged with a retained filter buffer"
+            );
+            assert_eq!(retained.len(), batch_size);
+            // Poison whatever the callee left behind, so the next round cannot pass by accident.
+            for (i, v) in retained.iter_mut().enumerate() {
+                *v = sample(0xf00d ^ (i as u64) ^ (round as u64) << 8);
+            }
+        }
+    }
+
+    /// A gate group with a single member and no selector polynomials has an empty factor
+    /// sequence, so the filter is the identity. That branch is the one that uses `resize` rather
+    /// than `extend`, and it must overwrite a poisoned buffer completely.
+    #[test]
+    fn empty_factor_sequence_yields_identity_filter() {
+        let common = common_data();
+        let public_inputs_hash = HashOut::from_partial(&[F::from_canonical_u64(7)]);
+        for &batch_size in &[1usize, 3, 32] {
+            let (constants, wires) = batch_inputs(&common, batch_size, 0xe0f7);
+            for (row, gate) in common.gates.iter().enumerate() {
+                let num_constraints = gate.0.num_constraints();
+                if num_constraints == 0 {
+                    continue;
+                }
+
+                let mut poisoned: Vec<F> = (0..batch_size + 11)
+                    .map(|i| sample(0xdead_beef ^ i as u64))
+                    .collect();
+                let mut from_filter = vec![F::ZERO; num_constraints * batch_size];
+                let vars = EvaluationVarsBaseBatch::new(
+                    batch_size,
+                    &constants,
+                    &wires,
+                    &public_inputs_hash,
+                );
+                let mut constraint_scratch = Vec::new();
+                gate.0.eval_filtered_base_batch(
+                    vars,
+                    row,
+                    0,
+                    row..row + 1,
+                    0,
+                    0,
+                    &mut poisoned,
+                    &mut constraint_scratch,
+                    &mut from_filter,
+                );
+                assert_eq!(
+                    poisoned,
+                    vec![F::ONE; batch_size],
+                    "empty factor sequence must leave exactly an identity filter"
+                );
+
+                // Oracle: accumulate the same gate with an explicitly all-ONE filter.
+                let mut from_oracle = vec![F::ZERO; num_constraints * batch_size];
+                let vars = EvaluationVarsBaseBatch::new(
+                    batch_size,
+                    &constants,
+                    &wires,
+                    &public_inputs_hash,
+                );
+                gate.0.eval_unfiltered_base_batch_accumulate(
+                    vars,
+                    &vec![F::ONE; batch_size],
+                    &mut from_oracle,
+                );
+                assert_eq!(
+                    raw(&from_filter),
+                    raw(&from_oracle),
+                    "gate {} (batch_size {batch_size}) diverged under the identity filter",
+                    gate.0.id()
+                );
+            }
+        }
+    }
 }

@@ -151,6 +151,25 @@ pub trait Read {
         Ok(res)
     }
 
+    /// Reads a vector of `u32` values stored in the legacy 8-byte-per-entry `usize` encoding.
+    ///
+    /// The wire format is byte-identical to [`Self::read_usize_vec`]; only the in-memory width
+    /// narrows. A stored value above `u32::MAX` is rejected rather than truncated.
+    #[inline]
+    fn read_usize_encoded_u32_vec(&mut self) -> IoResult<Vec<u32>> {
+        let len = self.read_usize()?;
+        let mut res = Vec::with_capacity(len);
+        for _ in 0..len {
+            let value = self.read_usize()?;
+            if value > u32::MAX as usize {
+                return Err(IoError);
+            }
+            res.push(value as u32);
+        }
+
+        Ok(res)
+    }
+
     /// Reads a element from the field `F` with size less than `2^64` from `self.`
     #[inline]
     fn read_field<F>(&mut self) -> IoResult<F>
@@ -857,6 +876,20 @@ pub trait Read {
             generator_indices_by_watches.insert(k, self.read_usize_vec()?);
         }
 
+        // `generator_watch_counts` is runtime-only and carries no bytes: it is a pure function of
+        // the watcher map just read. Each map entry's watcher list is deduplicated at build time,
+        // so a generator appears once per distinct representative it watches and counting its
+        // occurrences reproduces the builder-derived counts exactly.
+        let mut generator_watch_counts = vec![0usize; generators.len()];
+        for watchers in generator_indices_by_watches.values() {
+            for &generator_idx in watchers {
+                if generator_idx >= generators.len() {
+                    return Err(IoError);
+                }
+                generator_watch_counts[generator_idx] += 1;
+            }
+        }
+
         let constants_sigmas_commitment = self.read_polynomial_batch()?;
         let sigmas_len = self.read_usize()?;
         let mut sigmas = Vec::with_capacity(sigmas_len);
@@ -870,7 +903,7 @@ pub trait Read {
 
         let public_inputs = self.read_target_vec()?;
 
-        let representative_map = self.read_usize_vec()?;
+        let representative_map = self.read_usize_encoded_u32_vec()?;
 
         let is_some = self.read_bool()?;
         let fft_root_table = match is_some {
@@ -907,6 +940,7 @@ pub trait Read {
         Ok(ProverOnlyCircuitData {
             generators,
             generator_indices_by_watches,
+            generator_watch_counts,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
@@ -1257,6 +1291,18 @@ pub trait Write {
         self.write_usize(v.len())?;
         for &elem in v.iter() {
             self.write_usize(elem)?;
+        }
+
+        Ok(())
+    }
+
+    /// Writes a vector of `u32` values in the legacy 8-byte-per-entry `usize` encoding, so the
+    /// serialized bytes are identical to [`Self::write_usize_vec`] on the widened vector.
+    #[inline]
+    fn write_usize_encoded_u32_vec(&mut self, v: &[u32]) -> IoResult<()> {
+        self.write_usize(v.len())?;
+        for &elem in v.iter() {
+            self.write_usize(elem as usize)?;
         }
 
         Ok(())
@@ -1860,6 +1906,9 @@ pub trait Write {
         let ProverOnlyCircuitData {
             generators,
             generator_indices_by_watches,
+            // Runtime-only: reconstructed from `generator_indices_by_watches` on read, so it
+            // contributes no bytes and the serialized format is unchanged.
+            generator_watch_counts: _,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
@@ -1891,7 +1940,7 @@ pub trait Write {
         self.write_usize(subgroup.len())?;
         self.write_field_vec(subgroup)?;
         self.write_target_vec(public_inputs)?;
-        self.write_usize_vec(representative_map)?;
+        self.write_usize_encoded_u32_vec(representative_map)?;
 
         match fft_root_table {
             Some(table) => {
@@ -2245,5 +2294,172 @@ impl Read for Buffer<'_> {
         common_data: &CommonCircuitData<F, D>,
     ) -> IoResult<WitnessGeneratorRef<F, D>> {
         generator_serializer.read_generator(self, common_data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::Field;
+    use crate::gates::noop::NoopGate;
+    use crate::iop::witness::{PartialWitness, WitnessWrite};
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::circuit_data::{CircuitConfig, CircuitData, ProverOnlyCircuitData};
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+    use crate::util::timing::TimingTree;
+
+    const D: usize = 2;
+    type F = GoldilocksField;
+    type C = PoseidonGoldilocksConfig;
+
+    /// The narrowed `u32` codec must produce byte-for-byte the legacy 8-byte-per-entry encoding,
+    /// and must round-trip.
+    #[test]
+    fn usize_encoded_u32_vec_matches_legacy_encoding() {
+        let values: Vec<u32> = vec![0, 1, 2, 7, 255, 256, 65_535, 1 << 20, u32::MAX - 1, u32::MAX];
+        let widened: Vec<usize> = values.iter().map(|&v| v as usize).collect();
+
+        let mut narrow = Vec::new();
+        narrow.write_usize_encoded_u32_vec(&values).unwrap();
+        let mut legacy = Vec::new();
+        legacy.write_usize_vec(&widened).unwrap();
+        assert_eq!(narrow, legacy, "u32 encoding diverges from the legacy bytes");
+        assert_eq!(narrow.len(), 8 * (values.len() + 1));
+        assert_eq!(Buffer::new(&narrow).read_usize_encoded_u32_vec().unwrap(), values);
+
+        // An empty vector still writes its length word.
+        let mut narrow = Vec::new();
+        narrow.write_usize_encoded_u32_vec(&[]).unwrap();
+        let mut legacy = Vec::new();
+        legacy.write_usize_vec(&[]).unwrap();
+        assert_eq!(narrow, legacy);
+        assert_eq!(
+            Buffer::new(&narrow).read_usize_encoded_u32_vec().unwrap(),
+            Vec::<u32>::new()
+        );
+    }
+
+    /// A stored entry above `u32::MAX` is rejected rather than silently truncated.
+    #[test]
+    fn usize_encoded_u32_vec_rejects_out_of_range_entries() {
+        let mut bytes = Vec::new();
+        bytes
+            .write_usize_vec(&[3usize, u32::MAX as usize + 1, 5])
+            .unwrap();
+        assert!(Buffer::new(&bytes).read_usize_encoded_u32_vec().is_err());
+
+        let mut bytes = Vec::new();
+        bytes.write_usize_vec(&[u32::MAX as usize]).unwrap();
+        assert_eq!(
+            Buffer::new(&bytes).read_usize_encoded_u32_vec().unwrap(),
+            vec![u32::MAX]
+        );
+    }
+
+    /// A small circuit with copy constraints, aliased virtual targets, and padding gates.
+    fn small_circuit() -> (CircuitData<F, C, D>, Target, Target) {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let x = builder.add_virtual_target();
+        let y = builder.add_virtual_target();
+        let mut acc = x;
+        for i in 0..200u64 {
+            let c = builder.constant(F::from_canonical_u64(i + 1));
+            acc = builder.mul_add(acc, y, c);
+            if i % 5 == 0 {
+                let aliased = builder.add_virtual_target();
+                builder.connect(aliased, acc);
+                acc = builder.mul(aliased, c);
+            }
+        }
+        for _ in 0..50 {
+            builder.add_gate(NoopGate, vec![]);
+        }
+        builder.register_public_input(acc);
+        (builder.build::<C>(), x, y)
+    }
+
+    /// Prover-only data with a `u32` representative map keeps the legacy serialized format: the
+    /// re-encoding of a decoded buffer is byte-identical, the decoded map matches entry for entry,
+    /// the runtime-only watch counts are reconstructed to exactly the builder-derived vector, and
+    /// the decoded data still proves and verifies.
+    #[test]
+    fn prover_only_data_round_trip_preserves_rep_map_and_watch_counts() -> Result<()> {
+        let (circuit, x, y) = small_circuit();
+        let generator_serializer = DefaultGeneratorSerializer::<C, D>::default();
+
+        let bytes = circuit
+            .prover_only
+            .to_bytes(&generator_serializer, &circuit.common)
+            .unwrap();
+        let decoded = ProverOnlyCircuitData::<F, C, D>::from_bytes(
+            &bytes,
+            &generator_serializer,
+            &circuit.common,
+        )
+        .unwrap();
+        let re_encoded = decoded
+            .to_bytes(&generator_serializer, &circuit.common)
+            .unwrap();
+
+        assert_eq!(bytes, re_encoded, "serialized bytes are not stable");
+        assert_eq!(
+            decoded.representative_map,
+            circuit.prover_only.representative_map
+        );
+        assert_eq!(
+            decoded.generator_watch_counts,
+            circuit.prover_only.generator_watch_counts,
+            "reconstructed watch counts differ from the builder-derived ones"
+        );
+        assert_eq!(
+            decoded.generators.len(),
+            circuit.prover_only.generators.len()
+        );
+        assert_eq!(
+            decoded.generator_indices_by_watches,
+            circuit.prover_only.generator_indices_by_watches
+        );
+        assert_eq!(decoded.sigmas, circuit.prover_only.sigmas);
+        assert_eq!(decoded.subgroup, circuit.prover_only.subgroup);
+        assert_eq!(decoded.public_inputs, circuit.prover_only.public_inputs);
+        assert_eq!(decoded.circuit_digest, circuit.prover_only.circuit_digest);
+        assert_eq!(
+            decoded.constants_sigmas_commitment.merkle_tree.cap,
+            circuit.prover_only.constants_sigmas_commitment.merkle_tree.cap
+        );
+
+        // The representative map occupies exactly 8 bytes per entry on the wire, unchanged from
+        // the `usize` encoding.
+        let mut legacy_map_bytes = Vec::new();
+        legacy_map_bytes
+            .write_usize_vec(
+                &circuit
+                    .prover_only
+                    .representative_map
+                    .iter()
+                    .map(|&r| r as usize)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        assert!(
+            bytes
+                .windows(legacy_map_bytes.len())
+                .any(|w| w == legacy_map_bytes.as_slice()),
+            "the legacy representative-map encoding does not appear in the serialized bytes"
+        );
+
+        let mut inputs = PartialWitness::new();
+        inputs.set_target(x, F::from_canonical_u64(7))?;
+        inputs.set_target(y, F::from_canonical_u64(11))?;
+        let proof = crate::plonk::prover::prove::<F, C, D>(
+            &decoded,
+            &circuit.common,
+            inputs,
+            &mut TimingTree::default(),
+        )?;
+        circuit.verify(proof)
     }
 }
