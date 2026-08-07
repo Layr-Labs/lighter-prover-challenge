@@ -69,16 +69,17 @@ fn chain_step_proof(
     chain_step: u64,
     previous: Option<ChainState<'_>>,
     base_proof: &Proof,
-    constant_inputs: &plonky2::iop::witness::PartialWitness<F>,
+    dummy_proof: &Proof,
     tx_proof: &Proof,
 ) -> Proof {
     let result = (|| {
         // Phase 1: run every generator that does not depend on the previous chain proof while
         // that proof may still be in flight.
-        let early_inputs = BlockTxChainCircuit::witness_inputs_early_from_template(
-            constant_inputs,
+        let early_inputs = BlockTxChainCircuit::witness_inputs_early(
             chain_target,
+            chain_data,
             chain_step,
+            dummy_proof,
             tx_proof,
         )?;
         let mut pending = PendingPartitionWitness::start(
@@ -230,16 +231,8 @@ fn prove_path(
     );
     jump = next_jump;
 
-    let chain_constant_inputs = BlockTxChainCircuit::witness_inputs_constant(
-        chain_target,
-        chain_data,
-        dummy_proof,
-    )
-    .expect("chain constant witness inputs failed");
-
     std::thread::scope(|scope| {
         let base = &base_proof;
-        let chain_constant = &chain_constant_inputs;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
@@ -261,7 +254,7 @@ fn prove_path(
                             chain_step,
                             previous,
                             base,
-                            chain_constant,
+                            dummy_proof,
                             &tx_proof,
                         )
                     })
@@ -333,7 +326,7 @@ fn prove_path(
                         chain_step,
                         previous,
                         base,
-                        chain_constant,
+                        dummy_proof,
                         &tx_proof,
                     )
                 })
@@ -357,7 +350,7 @@ fn prove_path(
                 chain_step,
                 previous,
                 base,
-                chain_constant,
+                dummy_proof,
                 &tx_proof,
             )));
         }
