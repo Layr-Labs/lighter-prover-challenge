@@ -335,6 +335,110 @@ fn fft_classic_simd<P: PackedField>(
     fft_classic_simd_layers(packed_values, s, lg_n, root_table);
 }
 
+/// Goldilocks `x + y` on two lanes, reproducing `impl Add for GoldilocksField`
+/// word for word:
+///     (sum, over)  = x.overflowing_add(y)
+///     (sum, over2) = sum.overflowing_add(over as u64 * EPSILON)
+///     if over2 { sum += EPSILON }
+/// The scalar form branch-hints that second correction as rare; here it is an
+/// unconditional masked add, so the vector form *removes* a branch. Because
+/// `Add` is pure arithmetic -- no assembly, no lookup -- the result is a pure
+/// function of the inputs and these words are identical, not merely congruent.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn gl_add_neon(
+    x: core::arch::aarch64::uint64x2_t,
+    y: core::arch::aarch64::uint64x2_t,
+    eps: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    use core::arch::aarch64::*;
+    let sum = vaddq_u64(x, y);
+    // Unsigned carry: the wrapped sum is below the addend exactly on overflow.
+    let over = vcltq_u64(sum, x);
+    let sum2 = vaddq_u64(sum, vandq_u64(over, eps));
+    let over2 = vcltq_u64(sum2, sum);
+    vaddq_u64(sum2, vandq_u64(over2, eps))
+}
+
+/// Goldilocks `x - y` on two lanes, reproducing `impl Sub for GoldilocksField`.
+/// Borrow is `x < y`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn gl_sub_neon(
+    x: core::arch::aarch64::uint64x2_t,
+    y: core::arch::aarch64::uint64x2_t,
+    eps: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    use core::arch::aarch64::*;
+    let diff = vsubq_u64(x, y);
+    let under = vcltq_u64(x, y);
+    let adj = vandq_u64(under, eps);
+    let diff2 = vsubq_u64(diff, adj);
+    let under2 = vcltq_u64(diff, adj);
+    vsubq_u64(diff2, vandq_u64(under2, eps))
+}
+
+/// One butterfly layer over base-field scalars, with the modular reduction in
+/// vector registers.
+///
+/// Same blocks, same pairing, same twiddles, same order as the generic body:
+/// sub-blocks of `m = 2^(lg_half_m+1)` elements, pairing `j` with `half + j`.
+/// The multiply stays scalar -- aarch64 has no 64x64->128 widening multiply, so
+/// vectorising it would cost more than it saves -- and goes through the same
+/// paired `NeonGoldilocksField` assembly the generic path uses. Only `t`
+/// crosses the register files.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_single_layer_neon(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    lg_half_m: usize,
+    omega_row: &[crate::goldilocks_field::GoldilocksField],
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    let half = 1usize << lg_half_m;
+    let m = half << 1;
+    debug_assert!(omega_row.len() >= half);
+    let base = values.as_mut_ptr().cast::<u64>();
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        let mut k = 0;
+        while k + m <= values.len() {
+            let mut j = 0;
+            while j + 2 <= half {
+                let v = NeonGoldilocksField([
+                    *values.get_unchecked(k + half + j),
+                    *values.get_unchecked(k + half + j + 1),
+                ]);
+                let w = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j),
+                    *omega_row.get_unchecked(j + 1),
+                ]);
+                let t = w * v;
+                // The only register-file crossing in the loop: two fmovs.
+                let tv = vcombine_u64(vcreate_u64(t.0[0].0), vcreate_u64(t.0[1].0));
+                let u = vld1q_u64(base.add(k + j));
+                vst1q_u64(base.add(k + j), gl_add_neon(u, tv, eps));
+                vst1q_u64(base.add(k + half + j), gl_sub_neon(u, tv, eps));
+                j += 2;
+            }
+            // `half` is a power of two and at least 2 whenever this path is
+            // taken, so this tail never runs; kept so the kernel is correct for
+            // any shape rather than only the ones production uses.
+            while j < half {
+                let t = omega_row[j] * values[k + half + j];
+                let u = values[k + j];
+                values[k + j] = u + t;
+                values[k + half + j] = u - t;
+                j += 1;
+            }
+            k += m;
+        }
+    }
+}
+
 #[inline(always)]
 fn fft_classic_simd_single_layer<P: PackedField>(
     packed_values: &mut [P],
@@ -342,6 +446,44 @@ fn fft_classic_simd_single_layer<P: PackedField>(
     lg_packed_width: usize,
     root_table: &FftRootTable<P::Scalar>,
 ) {
+    // Base-field fast path: the reduction runs in vector registers. Guarded on
+    // exact type identity, the same way `fft_zero_padded_cache_blocks` guards
+    // its rate-8 specialisation. Every other instantiation -- scalar
+    // `GoldilocksField`, and `QuadraticExtension` for FRI, both of which are
+    // `WIDTH == 1` -- falls through to the generic body below.
+    #[cfg(target_arch = "aarch64")]
+    if lg_half_m >= lg_packed_width
+        && core::any::TypeId::of::<P>()
+            == core::any::TypeId::of::<
+                crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField,
+            >()
+    {
+        // SAFETY: the `TypeId` compare proves `P` is exactly
+        // `WideGoldilocksField`, hence `P::Scalar` is exactly
+        // `GoldilocksField`. `WideGoldilocksField` is `#[repr(transparent)]`
+        // over `[NeonGoldilocksField; 2]`, itself `#[repr(transparent)]` over
+        // `[GoldilocksField; 2]`, so the packed slice is exactly `4 * len`
+        // contiguous scalars with the same alignment. Only the generic spelling
+        // of the types differs at this point.
+        let scalars = unsafe {
+            core::slice::from_raw_parts_mut(
+                packed_values
+                    .as_mut_ptr()
+                    .cast::<crate::goldilocks_field::GoldilocksField>(),
+                packed_values.len() * P::WIDTH,
+            )
+        };
+        let row = &root_table[lg_half_m];
+        let omega_row = unsafe {
+            core::slice::from_raw_parts(
+                row.as_ptr().cast::<crate::goldilocks_field::GoldilocksField>(),
+                row.len(),
+            )
+        };
+        fft_classic_simd_single_layer_neon(scalars, lg_half_m, omega_row);
+        return;
+    }
+
     let lg_m = lg_half_m + 1;
     let m = 1 << lg_m; // Subarray size (in field elements).
     let packed_m = m >> lg_packed_width; // Subarray size (in vectors).
@@ -349,14 +491,27 @@ fn fft_classic_simd_single_layer<P: PackedField>(
     debug_assert!(half_packed_m != 0);
 
     // Omega values for this iteration, as a slice of vectors.
-    let omega_table = P::pack_slice(&root_table[lg_half_m]);
-    for k in (0..packed_values.len()).step_by(packed_m) {
-        for j in 0..half_packed_m {
-            let omega = omega_table[j];
-            let t = omega * packed_values[k + half_packed_m + j];
-            let u = packed_values[k + j];
-            packed_values[k + j] = u + t;
-            packed_values[k + half_packed_m + j] = u - t;
+    //
+    // Indexing this loop by `k + half_packed_m + j` costs a panic branch per
+    // access -- ten of the eleven branches in the compiled inner loop -- because
+    // the compiler cannot relate those indices to `packed_values.len()`.
+    // Walking the same elements through `chunks_exact_mut` and `split_at_mut`
+    // discharges the bounds by construction: identical accesses in identical
+    // order, so the raw `GoldilocksField.0` words are unchanged, with no
+    // `unsafe` and no per-butterfly branch.
+    //
+    // `omega_table` is truncated first on purpose: `zip` stops at the shortest
+    // iterator, so a short twiddle row would silently perform fewer butterflies
+    // where the indexed form panicked. Slicing keeps that failure loud and pays
+    // one check per layer instead of per butterfly.
+    let omega_table = &P::pack_slice(&root_table[lg_half_m])[..half_packed_m];
+    for block in packed_values.chunks_exact_mut(packed_m) {
+        let (lows, highs) = block.split_at_mut(half_packed_m);
+        for ((u, v), &omega) in lows.iter_mut().zip(highs.iter_mut()).zip(omega_table) {
+            let t = omega * *v;
+            let u_value = *u;
+            *u = u_value + t;
+            *v = u_value - t;
         }
     }
 }
@@ -403,6 +558,19 @@ fn fft_classic_simd_fused_two_layers<P: PackedField>(
     }
 }
 
+/// Run FFT stages `start..end`, one whole-buffer pass each.
+///
+/// A radix-4 traversal fusing stage pairs used to drive these layers, on
+/// the reasoning that it halved whole-array memory passes. Memory passes
+/// are not what this kernel is short of: removing the 2^13 cache blocking
+/// entirely changes the time by under 1% at every thread count from 1 to
+/// 12. What the fused form does cost is registers -- four packed values
+/// plus three twiddle vectors live, against two and one here, while the
+/// Goldilocks multiply is scalar GPR assembly. Measured on both production
+/// LDE shapes (2^19 and 2^17, rate 8) with interleaved arms and per-thread
+/// minimums, single layers are 3-7% faster at every thread count, and
+/// bit-identical: same butterflies, same twiddles, same per-element order,
+/// same raw `GoldilocksField.0` words.
 #[inline(always)]
 fn fft_classic_simd_layers<P: PackedField>(
     packed_values: &mut [P],
@@ -411,20 +579,8 @@ fn fft_classic_simd_layers<P: PackedField>(
     root_table: &FftRootTable<P::Scalar>,
 ) {
     let lg_packed_width = log2_strict(P::WIDTH);
-    let mut lg_half_m = start;
-    // Odd stage count: run the first stage unfused so the remainder pairs up.
-    if (end - start) % 2 == 1 {
+    for lg_half_m in start..end {
         fft_classic_simd_single_layer(packed_values, lg_half_m, lg_packed_width, root_table);
-        lg_half_m += 1;
-    }
-    while lg_half_m < end {
-        fft_classic_simd_fused_two_layers(
-            packed_values,
-            lg_half_m,
-            lg_packed_width,
-            root_table,
-        );
-        lg_half_m += 2;
     }
 }
 
@@ -1698,6 +1854,172 @@ mod tests {
         check::<QuadraticExtension<GoldilocksField>>();
         // Uncached type: exercises the value-identical fallback path.
         check::<QuarticExtension<GoldilocksField>>();
+    }
+
+
+    /// Driving the layers as single stages must be **bit**-identical to the
+    /// radix-4 fused traversal it replaced on the production path, not
+    /// merely congruent: the two perform the same butterflies on the same
+    /// values with the same twiddles in the same per-element order, so the
+    /// raw `GoldilocksField.0` words must match exactly. Every start stage
+    /// at each size is covered, so both stage-count parities are exercised.
+    #[test]
+    fn single_layer_driver_matches_fused_reference_raw_words() {
+        use crate::fft::{
+            fft_classic_simd_fused_two_layers, fft_classic_simd_layers,
+            fft_classic_simd_single_layer,
+        };
+
+        /// The pre-change driver, verbatim, as the oracle.
+        fn drive_fused<P: PackedField>(
+            packed_values: &mut [P],
+            start: usize,
+            end: usize,
+            root_table: &FftRootTable<P::Scalar>,
+        ) {
+            let lg_packed_width = log2_strict(P::WIDTH);
+            let mut lg_half_m = start;
+            if (end - start) % 2 == 1 {
+                fft_classic_simd_single_layer(
+                    packed_values,
+                    lg_half_m,
+                    lg_packed_width,
+                    root_table,
+                );
+                lg_half_m += 1;
+            }
+            while lg_half_m < end {
+                fft_classic_simd_fused_two_layers(
+                    packed_values,
+                    lg_half_m,
+                    lg_packed_width,
+                    root_table,
+                );
+                lg_half_m += 2;
+            }
+        }
+
+        type F = GoldilocksField;
+        type P = <F as Packable>::Packing;
+        for lg_n in [4usize, 5, 8, 11, 13, 16, 17] {
+            let n = 1 << lg_n;
+            let roots = fft_root_table::<F>(n);
+            for start in 2..lg_n {
+                let mut expected = deterministic_values(n);
+                let mut actual = expected.clone();
+                drive_fused::<P>(P::pack_slice_mut(&mut expected), start, lg_n, &roots);
+                fft_classic_simd_layers::<P>(
+                    P::pack_slice_mut(&mut actual),
+                    start,
+                    lg_n,
+                    &roots,
+                );
+                for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                    assert_eq!(
+                        a.0, e.0,
+                        "raw word mismatch at 2^{lg_n} start {start} index {i}"
+                    );
+                }
+            }
+        }
+    }
+
+
+    /// The NEON base-field layer must be **bit**-identical to the generic body
+    /// it specialises: same butterflies, same twiddles, same order, so the raw
+    /// `GoldilocksField.0` words must match exactly rather than merely be
+    /// congruent. Seeded with values above ORDER and within 97 of 2^64 so the
+    /// rare double-overflow and double-underflow corrections actually fire --
+    /// a differential that never exercises its corrections cannot catch them.
+    ///
+    /// The quadratic extension is included deliberately: it is `WIDTH == 1` and
+    /// must take the generic fallback, so the fallback being exercised is as
+    /// much a correctness requirement as the fast path.
+    #[test]
+    fn neon_single_layer_matches_generic_raw_words() {
+        use crate::fft::fft_classic_simd_single_layer;
+        use crate::types::{Field64, PrimeField64};
+
+        /// Verbatim copy of the generic body, as the oracle.
+        fn generic<P: PackedField>(
+            packed_values: &mut [P],
+            lg_half_m: usize,
+            lg_packed_width: usize,
+            root_table: &FftRootTable<P::Scalar>,
+        ) {
+            let lg_m = lg_half_m + 1;
+            let m = 1 << lg_m;
+            let packed_m = m >> lg_packed_width;
+            let half_packed_m = packed_m / 2;
+            let omega_table = &P::pack_slice(&root_table[lg_half_m])[..half_packed_m];
+            for block in packed_values.chunks_exact_mut(packed_m) {
+                let (lows, highs) = block.split_at_mut(half_packed_m);
+                for ((u, v), &omega) in lows.iter_mut().zip(highs.iter_mut()).zip(omega_table) {
+                    let t = omega * *v;
+                    let u_value = *u;
+                    *u = u_value + t;
+                    *v = u_value - t;
+                }
+            }
+        }
+
+        fn adversarial<F: Field + Field64>(n: usize) -> Vec<F> {
+            (0..n)
+                .map(|i| {
+                    F::from_noncanonical_u64(match i % 5 {
+                        0 => (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                        1 => F::ORDER.wrapping_add(i as u64 % 1000),
+                        2 => u64::MAX - (i as u64 % 97),
+                        3 => (i as u64).wrapping_mul(0xdead_beef) | (1 << 63),
+                        _ => i as u64,
+                    })
+                })
+                .collect()
+        }
+
+        type F = GoldilocksField;
+        type P = <F as Packable>::Packing;
+        let lg_packed_width = log2_strict(P::WIDTH);
+        for lg_n in [6usize, 8, 11, 13, 16, 17] {
+            let n = 1usize << lg_n;
+            let roots = fft_root_table::<F>(n);
+            for lg_half_m in lg_packed_width..lg_n {
+                let mut expected = adversarial::<F>(n);
+                let mut actual = expected.clone();
+                generic::<P>(P::pack_slice_mut(&mut expected), lg_half_m, lg_packed_width, &roots);
+                fft_classic_simd_single_layer::<P>(
+                    P::pack_slice_mut(&mut actual),
+                    lg_half_m,
+                    lg_packed_width,
+                    &roots,
+                );
+                for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                    assert_eq!(
+                        a.0, e.0,
+                        "raw word mismatch at 2^{lg_n} layer {lg_half_m} index {i}"
+                    );
+                }
+            }
+        }
+
+        // Fallback instantiations: both are WIDTH == 1 and must be unaffected.
+        type FE = QuadraticExtension<GoldilocksField>;
+        for lg_n in [6usize, 9] {
+            let n = 1usize << lg_n;
+            let roots_ext = fft_root_table::<FE>(n);
+            for lg_half_m in 0..lg_n {
+                let mut expected: Vec<FE> = (0..n)
+                    .map(|i| QuadraticExtension([deterministic_value(i), deterministic_value(i + n)]))
+                    .collect();
+                let mut actual = expected.clone();
+                generic::<FE>(&mut expected, lg_half_m, 0, &roots_ext);
+                fft_classic_simd_single_layer::<FE>(&mut actual, lg_half_m, 0, &roots_ext);
+                for (a, e) in actual.iter().zip(expected.iter()) {
+                    assert_eq!(a.0[0].to_canonical_u64(), e.0[0].to_canonical_u64());
+                    assert_eq!(a.0[1].to_canonical_u64(), e.0[1].to_canonical_u64());
+                }
+            }
+        }
     }
 
     #[test]
