@@ -140,7 +140,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
         let n = vars_base.len();
         let wires = vars_base.local_wires;
         let three = F::from_canonical_usize(3);
-        let four = F::from_canonical_usize(4);
         let base = F::from_canonical_usize(256);
         let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
         let mut chunks = res.chunks_exact_mut(n);
@@ -168,7 +167,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
                 for k in (0..3).rev() {
                     let limb = &wires[(chunk_start + k) * n..][..n];
                     for p in 0..n {
-                        out[p] = out[p] * four + limb[p];
+                        out[p] = out[p].double().double() + limb[p];
                     }
                 }
                 let byte_col = &wires[byte_wire * n..][..n];
@@ -207,7 +206,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
 
         let wires = vars_base.local_wires;
         let three = F::from_canonical_usize(3);
-        let four = F::from_canonical_usize(4);
         let base = F::from_canonical_usize(256);
         // Batches are 32 points in this prover; keep the scratch row on the
         // stack and fall back to the heap only for oversized batches.
@@ -246,7 +244,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
                 for k in (0..3).rev() {
                     let limb = &wires[(chunk_start + k) * n..][..n];
                     for p in 0..n {
-                        scratch[p] = scratch[p] * four + limb[p];
+                        scratch[p] = scratch[p].double().double() + limb[p];
                     }
                 }
                 let byte_col = &wires[byte_wire * n..][..n];
