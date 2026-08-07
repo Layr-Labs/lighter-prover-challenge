@@ -1229,6 +1229,30 @@ mod quotient_layout_tests {
         }
     }
 
+    /// A contiguous PolyMajor gather must produce the same column slices as
+    /// the generic indexed gather. This catches off-by-one source ranges and
+    /// accidental point-major writes in the quotient fast path.
+    #[test]
+    fn contiguous_lde_batch_matches_indexed_gather() {
+        let (data, _) = small_circuit();
+        let commitment = &data.prover_only.constants_sigmas_commitment;
+        let range = data.common.sigmas_range();
+        let indices = [3usize, 4, 5, 6, 7, 8, 9];
+        let mut indexed = Vec::new();
+        let mut contiguous = Vec::new();
+
+        commitment.fill_lde_batch(
+            &indices,
+            1,
+            range.clone(),
+            BatchLayout::PolyMajor,
+            &mut indexed,
+        );
+        commitment.fill_lde_batch_contiguous(indices[0], indices.len(), range, &mut contiguous);
+
+        assert_eq!(contiguous, indexed);
+    }
+
     /// Scratch reuse: `fill_lde_batch` writes every cell of `out` before any
     /// is read, so dropping the zero-fill of an already correctly sized buffer
     /// must be invisible. A poisoned reused buffer has to gather exactly what

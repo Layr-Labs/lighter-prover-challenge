@@ -256,6 +256,19 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         layout: BatchLayout,
         out: &mut Vec<F>,
     ) {
+        if layout == BatchLayout::PolyMajor && step == 1 {
+            if let Some(&index_start) = indices.first() {
+                let contiguous = indices
+                    .iter()
+                    .enumerate()
+                    .all(|(offset, &index)| index_start.checked_add(offset) == Some(index));
+                if contiguous {
+                    self.fill_lde_batch_contiguous(index_start, indices.len(), col_range, out);
+                    return;
+                }
+            }
+        }
+
         let n = indices.len();
         let start = col_range.start;
         let w = col_range.len();
@@ -304,6 +317,43 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                 out[ci * n + k] = value;
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Copies consecutive LDE points into a PolyMajor output buffer.
+    ///
+    /// Column-backed commitments use one contiguous slice copy per column,
+    /// avoiding the indexed element loop in the quotient path. Row-backed
+    /// commitments retain the same logical layout through a narrow fallback.
+    pub(crate) fn fill_lde_batch_contiguous(
+        &self,
+        index_start: usize,
+        n: usize,
+        col_range: core::ops::Range<usize>,
+        out: &mut Vec<F>,
+    ) {
+        let start = col_range.start;
+        let w = col_range.len();
+        out.resize(n * w, F::ZERO);
+
+        match &self.merkle_tree.leaves {
+            MerkleLeaves::Columns { columns, .. } => {
+                let index_end = index_start
+                    .checked_add(n)
+                    .expect("contiguous LDE batch range overflow");
+                for (ci, c) in col_range.enumerate() {
+                    out[ci * n..(ci + 1) * n]
+                        .copy_from_slice(&columns.col(c)[index_start..index_end]);
+                }
+            }
+            MerkleLeaves::Rows { .. } => {
+                for k in 0..n {
+                    let row = &self.get_lde_values(index_start + k, 1)[start..start + w];
+                    for (ci, &value) in row.iter().enumerate() {
+                        out[ci * n + k] = value;
                     }
                 }
             }
