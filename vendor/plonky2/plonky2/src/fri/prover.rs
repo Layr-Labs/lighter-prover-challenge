@@ -6,16 +6,16 @@ use alloc::vec::Vec;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
-use crate::field::extension::{unflatten, Extendable, FieldExtension};
+use crate::field::extension::{Extendable, FieldExtension, unflatten};
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::oracle::coset_fft_zero_tail;
 use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQueryStep};
 use crate::fri::{FriConfig, FriParams};
-use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
+use crate::hash::hash_types::{NUM_HASH_OUT_ELTS, RichField};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
@@ -251,18 +251,57 @@ pub(crate) fn fri_proof_of_work<
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
+    const POW_BATCH_SIZE: u64 = 4;
+    let max_candidate = F::NEG_ONE.to_canonical_u64();
+    let max_batch = max_candidate / POW_BATCH_SIZE;
+    let winning_batch = (0..=max_batch)
         .into_par_iter()
-        .find_any(|&candidate| {
-            let mut duplex_state = duplex_intermediate_state;
-            duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-            duplex_state.permute();
-            let pow_response = duplex_state.squeeze().iter().last().unwrap();
-            let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-            leading_zeros >= min_leading_zeros
+        .find_any(|&batch| {
+            let first_candidate = batch * POW_BATCH_SIZE;
+            let mut duplex_states = [duplex_intermediate_state; POW_BATCH_SIZE as usize];
+            for (offset, state) in duplex_states.iter_mut().enumerate() {
+                state.set_elt(
+                    F::from_canonical_u64(first_candidate + offset as u64),
+                    witness_input_pos,
+                );
+            }
+            <C::Hasher as Hasher<F>>::Permutation::permute_x4(&mut duplex_states);
+            duplex_states.iter().any(|state| {
+                state
+                    .squeeze()
+                    .last()
+                    .unwrap()
+                    .to_canonical_u64()
+                    .leading_zeros()
+                    >= min_leading_zeros
+            })
         })
-        .map(F::from_canonical_u64)
         .expect("Proof of work failed. This is highly unlikely!");
+
+    // Re-evaluate the winning group to recover the exact witness. This costs
+    // one extra four-way permutation per proof, rather than one per candidate.
+    let first_candidate = winning_batch * POW_BATCH_SIZE;
+    let mut duplex_states = [duplex_intermediate_state; POW_BATCH_SIZE as usize];
+    for (offset, state) in duplex_states.iter_mut().enumerate() {
+        state.set_elt(
+            F::from_canonical_u64(first_candidate + offset as u64),
+            witness_input_pos,
+        );
+    }
+    <C::Hasher as Hasher<F>>::Permutation::permute_x4(&mut duplex_states);
+    let winning_offset = duplex_states
+        .iter()
+        .position(|state| {
+            state
+                .squeeze()
+                .last()
+                .unwrap()
+                .to_canonical_u64()
+                .leading_zeros()
+                >= min_leading_zeros
+        })
+        .expect("Winning PoW batch did not contain a valid witness");
+    let pow_witness = F::from_canonical_u64(first_candidate + winning_offset as u64);
 
     // Recompute pow_response using our normal Challenger code, and make sure it matches.
     challenger.observe_element(pow_witness);

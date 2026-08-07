@@ -561,11 +561,23 @@ impl<T> AsRef<[T]> for Poseidon2Permutation<T> {
 
 trait Permuter: Sized {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH];
+
+    #[inline]
+    fn permute_x4(states: [[Self; WIDTH]; 4]) -> [[Self; WIDTH]; 4] {
+        states.map(Self::permute)
+    }
 }
 
 impl<F: Poseidon2> Permuter for F {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH] {
         <F as Poseidon2>::poseidon2(input)
+    }
+
+    #[inline]
+    fn permute_x4(states: [[Self; WIDTH]; 4]) -> [[Self; WIDTH]; 4] {
+        let [a, b, c, d] = states;
+        let (a, b, c, d) = <F as Poseidon2>::poseidon2_x4(a, b, c, d);
+        [a, b, c, d]
     }
 }
 
@@ -607,6 +619,15 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
 
     fn permute(&mut self) {
         self.state = T::permute(self.state);
+    }
+
+    #[inline]
+    fn permute_x4(states: &mut [Self; 4]) {
+        let raw_states = states.map(|state| state.state);
+        let permuted = T::permute_x4(raw_states);
+        for (state, output) in states.iter_mut().zip(permuted) {
+            state.state = output;
+        }
     }
 
     fn squeeze(&self) -> &[T] {
@@ -688,8 +709,7 @@ pub(crate) fn hash_quad_no_pad<F: RichField + Poseidon2>(
         state_b[..chunk_b.len()].copy_from_slice(chunk_b);
         state_c[..chunk_c.len()].copy_from_slice(chunk_c);
         state_d[..chunk_d.len()].copy_from_slice(chunk_d);
-        (state_a, state_b, state_c, state_d) =
-            F::poseidon2_x4(state_a, state_b, state_c, state_d);
+        (state_a, state_b, state_c, state_d) = F::poseidon2_x4(state_a, state_b, state_c, state_d);
     }
 
     let out = |state: &[F; WIDTH]| HashOut {
@@ -1085,8 +1105,16 @@ mod pair_hash_tests {
             let a: Vec<F> = (0..width).map(|_| F::rand()).collect();
             let b: Vec<F> = (0..width).map(|_| F::rand()).collect();
             let (ha, hb) = Poseidon2Hash::hash_or_noop_pair(&a, &b);
-            assert_eq!(ha, <Poseidon2Hash as Hasher<F>>::hash_or_noop(&a), "width {width} a");
-            assert_eq!(hb, <Poseidon2Hash as Hasher<F>>::hash_or_noop(&b), "width {width} b");
+            assert_eq!(
+                ha,
+                <Poseidon2Hash as Hasher<F>>::hash_or_noop(&a),
+                "width {width} a"
+            );
+            assert_eq!(
+                hb,
+                <Poseidon2Hash as Hasher<F>>::hash_or_noop(&b),
+                "width {width} b"
+            );
         }
     }
 
