@@ -1003,6 +1003,31 @@ fn supported_quotient_result_limbs(base_bits: usize) -> Option<usize> {
     }
 }
 
+/// Keep the combined Metal gate job balanced for the small recursive circuits.
+///
+/// Transaction proofs have enough CPU gate work to hide RandomAccess in the
+/// asynchronous GPU union. At degree 2^14, however, the same fixed per-point
+/// fold extends the serialized Metal job on every recursive chain step while
+/// leaving CPU capacity idle. Let the ordinary CPU evaluator retain that gate
+/// for small circuits; larger circuits keep the promoted GPU specialization.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn gpu_u32_quotient_gate_worthwhile(
+    gate: crate::gates::gate::U32QuotientGate,
+    degree_bits: usize,
+) -> bool {
+    // The retained-column differential explicitly exercises every audited
+    // Metal layout on a compact fixture; do not let the production load-
+    // balancing policy turn that test into a CPU-only pass.
+    #[cfg(test)]
+    if COMPARE_GPU_QUOTIENT.load(core::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    !matches!(
+        gate,
+        crate::gates::gate::U32QuotientGate::RandomAccess { .. }
+    ) || degree_bits > 14
+}
+
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn start_gpu_range_check_gate_quotient<
     F: RichField + Extendable<D>,
@@ -1093,6 +1118,16 @@ fn start_gpu_range_check_gate_quotient<
             gate_indices.push(gate_index);
         }
         if let Some(u32_gate) = u32_gate {
+            if !gpu_u32_quotient_gate_worthwhile(u32_gate, common_data.degree_bits()) {
+                if gpu_poseidon_quotient_diagnostics_enabled() {
+                    eprintln!(
+                        "[gpu-range-quotient] retaining gate {gate_index} on CPU at degree 2^{}: \
+                         {u32_gate:?}",
+                        common_data.degree_bits(),
+                    );
+                }
+                continue;
+            }
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
                 U32QuotientGate::Arithmetic { num_ops } => (
                     U32QuotientKind::Arithmetic,
@@ -2537,5 +2572,29 @@ mod l_0_table_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "std", target_arch = "aarch64", target_os = "macos"))]
+mod gpu_gate_balance_tests {
+    use super::gpu_u32_quotient_gate_worthwhile;
+    use crate::gates::gate::U32QuotientGate;
+
+    #[test]
+    fn random_access_offload_is_disabled_only_for_small_circuits() {
+        let random_access = U32QuotientGate::RandomAccess {
+            bits: 4,
+            num_ops: 4,
+            num_extra_constants: 2,
+        };
+        let arithmetic = U32QuotientGate::Arithmetic { num_ops: 2 };
+
+        assert!(!gpu_u32_quotient_gate_worthwhile(random_access, 13));
+        assert!(!gpu_u32_quotient_gate_worthwhile(random_access, 14));
+        assert!(gpu_u32_quotient_gate_worthwhile(random_access, 15));
+        assert!(gpu_u32_quotient_gate_worthwhile(random_access, 16));
+
+        assert!(gpu_u32_quotient_gate_worthwhile(arithmetic, 13));
+        assert!(gpu_u32_quotient_gate_worthwhile(arithmetic, 14));
     }
 }
