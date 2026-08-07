@@ -408,7 +408,109 @@ fn prove_path(
     })
 }
 
-pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
+pub fn prove_block(block: Block<F>, circuits: &Circuits) -> Proof {
+    prove_block_marked(block, circuits, std::time::Instant::now())
+}
+
+/// Builds all circuits and proves the block with the startup phases overlapped:
+/// the pre-execution circuit build and its proof run on their own lane while
+/// the heavy and light tx/chain circuits build on two more lanes.
+///
+/// The serial layout pays `max(lane builds) + pre proof`; the overlapped layout
+/// pays `max(tx lanes, pre build + pre proof)`. The tx lanes are the longest
+/// builds and the pre lane is shorter than they are, so the pre proof leaves
+/// the startup critical path entirely. Values are unaffected: the same five
+/// circuits are built by the same code, and the pre proof consumes only its own
+/// circuit and the fixture block, which are both ready on its lane.
+///
+/// The pre proof intentionally does NOT set the exclusive-GPU routing hint
+/// here: that hint widens GPU routing on the assumption that nothing else is
+/// running, which is false during the overlap. The promoted occupancy-
+/// conditional router already sends narrow trees to the CPU while the stream
+/// is busy with the tx builds' commitment trees, which is the correct behavior
+/// for this phase.
+pub fn prove_block_overlapped(block: Block<F>, t0: std::time::Instant) -> Proof {
+    let mark = |label: &str| {
+        if std::env::var_os("LIGHTER_PHASE_LOG").is_some() {
+            eprintln!("PHASE {:>10.3}s {label}", t0.elapsed().as_secs_f64());
+        }
+    };
+    let ((pre_target, pre_data, pre_proof), heavy, light) = std::thread::scope(|scope| {
+        let block_ref = &block;
+        let pre_handle = std::thread::Builder::new()
+            .name("pre-lane".into())
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, move || {
+                let pre = circuit::block_pre_execution_constraints::BlockPreExecutionCircuit::define(
+                    circuit::types::config::CIRCUIT_CONFIG,
+                );
+                let pre_target = pre.target;
+                let pre_data = pre.builder.build::<C>();
+                let pre_proof = BlockPreExecutionCircuit::prove(
+                    &pre_data,
+                    &BlockPreExec::from_block(block_ref),
+                    &pre_target,
+                )
+                .expect("block pre-execution proof failed");
+                (pre_target, pre_data, pre_proof)
+            })
+            .expect("pre lane thread must start");
+        let heavy_handle = std::thread::Builder::new()
+            .name("heavy-circuits-build".into())
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, || {
+                crate::api::PathCircuits::new(
+                    crate::api::HEAVY_TX_PER_PROOF,
+                    crate::api::HEAVY_TX_MODE,
+                )
+            })
+            .expect("heavy circuits build thread must start");
+        let light = crate::api::PathCircuits::new(
+            crate::api::LIGHT_TX_PER_PROOF,
+            crate::api::LIGHT_TX_MODE,
+        );
+        (
+            pre_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            heavy_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            light,
+        )
+    });
+    mark("overlapped startup done (builds + pre proof)");
+    let circuits = Circuits {
+        heavy_tx_target: heavy.tx_target,
+        heavy_tx_data: heavy.tx_data,
+        light_tx_target: light.tx_target,
+        light_tx_data: light.tx_data,
+        pre_target,
+        pre_data,
+        heavy_chain_target: heavy.chain_target,
+        heavy_chain_data: heavy.chain_data,
+        light_chain_target: light.chain_target,
+        light_chain_data: light.chain_data,
+        dummy_heavy_proof: heavy.dummy_proof,
+        dummy_light_proof: light.dummy_proof,
+    };
+    prove_block_after_pre(block, &circuits, pre_proof, t0)
+}
+
+/// `prove_block` with an externally supplied epoch for the measurement-only
+/// phase marks (see `phase_mark` in the `prove` binary). Behavior is identical
+/// when `LIGHTER_PHASE_LOG` is unset, which the trusted verifier's cleared
+/// environment guarantees for ranked runs.
+pub fn prove_block_marked(
+    block: Block<F>,
+    circuits: &Circuits,
+    t0: std::time::Instant,
+) -> Proof {
+    let mark = |label: &str| {
+        if std::env::var_os("LIGHTER_PHASE_LOG").is_some() {
+            eprintln!("PHASE {:>10.3}s {label}", t0.elapsed().as_secs_f64());
+        }
+    };
     // The pre-execution proof runs strictly before any other proving work, so
     // the serialized GPU stream is otherwise idle: route its mid-size column
     // trees to the GPU for just this phase.
@@ -420,6 +522,24 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     )
     .expect("block pre-execution proof failed");
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+    mark("pre-execution proof done");
+    prove_block_after_pre(block, circuits, pre_proof, t0)
+}
+
+/// Everything after the pre-execution proof: the tx/chain pipeline, the block
+/// circuit build overlap, and the final block proof. Shared verbatim by the
+/// serial and overlapped startup layouts.
+fn prove_block_after_pre(
+    mut block: Block<F>,
+    circuits: &Circuits,
+    pre_proof: Proof,
+    t0: std::time::Instant,
+) -> Proof {
+    let mark = |label: &str| {
+        if std::env::var_os("LIGHTER_PHASE_LOG").is_some() {
+            eprintln!("PHASE {:>10.3}s {label}", t0.elapsed().as_secs_f64());
+        }
+    };
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
@@ -486,6 +606,7 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
             )
         });
 
+    mark("tx/chain pipeline done (both paths + block circuit build)");
     let (light_chain_input, heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
     // The final block witness runs on the serial tail with nothing else proving, so it alone
@@ -506,6 +627,7 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     )
     .expect("final block proof failed");
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+    mark("final block proof done");
     final_proof
 }
 

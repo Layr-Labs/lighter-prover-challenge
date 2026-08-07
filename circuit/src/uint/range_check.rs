@@ -484,6 +484,122 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
     }
 }
 
+/// Candidate replacement for `eval_unfiltered_base_batch_accumulate`, kept out of
+/// the gate impl until it is measured. Two changes versus the shipped path, both
+/// of which the release disassembly of the shipped path shows are unclaimed:
+///
+/// 1. No `scratch` heap buffer. The shipped path calls `__rjem_malloc` on every
+///    invocation for `vec![F::ZERO; n]`, writes every term into it, and then has
+///    `batch_multiply_add_inplace` read it straight back. Fusing the term
+///    computation into the accumulate deletes the allocation and one full
+///    write+read of `n` field words per constraint.
+/// 2. Packed term computation. The shipped loops are `for p in 0..n` over
+///    independent lanes, and the disassembly shows a max run of 2 consecutive
+///    multiply-class instructions, i.e. LLVM did not interleave them. Goldilocks
+///    multiplication is `mul`+`umulh` with multi-cycle latency, and
+///    `NeonGoldilocksField`/`WideGoldilocksField` exist precisely to hide it.
+///
+/// Raw-word identity requirement: the shipped path's accumulate is
+/// `batch_multiply_add_inplace`, which splits at the maximal `P::WIDTH` prefix,
+/// uses `P::multiply_accumulate` there, and plain scalar `+= a * b` on the ragged
+/// tail. This function reproduces that split and those operations exactly, so
+/// every accumulator word must match bit for bit, not merely as a field value.
+#[cfg(test)]
+fn accumulate_fused_packed<F: RichField + Extendable<D>, const D: usize>(
+    gate: &RangeCheckGate<F, D>,
+    vars_base: EvaluationVarsBaseBatch<F>,
+    filters: &[F],
+    combined_gate_constraints: &mut [F],
+) {
+    use plonky2::field::packable::Packable;
+
+    type Packed<F> = <F as Packable>::Packing;
+
+    let n = vars_base.len();
+    assert_eq!(filters.len(), n);
+    assert!(combined_gate_constraints.len() >= gate.num_constraints() * n);
+
+    let wires = vars_base.local_wires;
+    let num_aux = gate.aux_limbs_per_input();
+    let base = F::from_canonical_usize(RangeCheckGate::<F, D>::BASE);
+    let three = F::from_canonical_usize(3);
+    let width = <Packed<F> as PackedField>::WIDTH;
+    let split = n - n % width;
+    let mut constraint_index = 0;
+
+    for i in 0..gate.num_ops {
+        let input_off = gate.wire_ith_input(i) * n;
+        let top_off = gate.wire_ith_input_jth_aux_limb(i, num_aux - 1) * n;
+
+        // Constraint 0: Horner-recombined limbs minus the declared input.
+        {
+            let out = &mut combined_gate_constraints[constraint_index * n..][..n];
+            let (out_head, out_tail) = out.split_at_mut(split);
+            let out_packed = <Packed<F> as PackedField>::pack_slice_mut(out_head);
+            for (k, slot) in out_packed.iter_mut().enumerate() {
+                let at = |off: usize| {
+                    *<Packed<F> as PackedField>::from_slice(&wires[off + k * width..][..width])
+                };
+                let mut acc = at(top_off);
+                for j in (0..num_aux - 1).rev() {
+                    acc = acc * base + at(gate.wire_ith_input_jth_aux_limb(i, j) * n);
+                }
+                acc -= at(input_off);
+                let f = *<Packed<F> as PackedField>::from_slice(&filters[k * width..][..width]);
+                *slot = slot.multiply_accumulate(acc, f);
+            }
+            for (t, slot) in out_tail.iter_mut().enumerate() {
+                let p = split + t;
+                let mut acc = wires[top_off + p];
+                for j in (0..num_aux - 1).rev() {
+                    acc = acc * base + wires[gate.wire_ith_input_jth_aux_limb(i, j) * n + p];
+                }
+                acc -= wires[input_off + p];
+                *slot += acc * filters[p];
+            }
+            constraint_index += 1;
+        }
+
+        // One range constraint per aux limb. BASE == 4, so the degree-4 product
+        // l(l-1)(l-2)(l-3) factors exactly as u(u+2) with u = l^2 - 3l; the odd
+        // top limb is the degree-2 boolean check l(l-1). Both factorings are the
+        // shipped path's, reproduced unchanged.
+        for j in 0..num_aux {
+            let limb_off = gate.wire_ith_input_jth_aux_limb(i, j) * n;
+            let boolean_only = j == num_aux - 1 && gate.bit_size % 2 == 1;
+            let out = &mut combined_gate_constraints[constraint_index * n..][..n];
+            let (out_head, out_tail) = out.split_at_mut(split);
+            let out_packed = <Packed<F> as PackedField>::pack_slice_mut(out_head);
+            for (k, slot) in out_packed.iter_mut().enumerate() {
+                let x =
+                    *<Packed<F> as PackedField>::from_slice(&wires[limb_off + k * width..][..width]);
+                let term = if boolean_only {
+                    x * (x - F::ONE)
+                } else {
+                    let y = x * (x - three);
+                    y * (y + F::TWO)
+                };
+                let f = *<Packed<F> as PackedField>::from_slice(&filters[k * width..][..width]);
+                *slot = slot.multiply_accumulate(term, f);
+            }
+            for (t, slot) in out_tail.iter_mut().enumerate() {
+                let p = split + t;
+                let x = wires[limb_off + p];
+                let term = if boolean_only {
+                    x * (x - F::ONE)
+                } else {
+                    let y = x * (x - three);
+                    y * (y + F::TWO)
+                };
+                *slot += term * filters[p];
+            }
+            constraint_index += 1;
+        }
+    }
+
+    debug_assert_eq!(constraint_index, gate.num_constraints());
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
     for RangeCheckGate<F, D>
 {
@@ -741,4 +857,465 @@ mod tests {
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
         26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48
     );
+}
+
+/// Differential oracle and microbenchmark for `accumulate_fused_packed`.
+///
+/// Run with:
+/// `cargo test --release -p circuit --lib -- --ignored --nocapture range_check_accumulate`
+#[cfg(test)]
+mod accumulate_probe {
+    use std::time::Instant;
+
+    use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::field::types::{Field64, PrimeField64};
+    use plonky2::hash::hash_types::HashOut;
+
+    use super::*;
+
+    type F = GoldilocksField;
+    const D: usize = 2;
+
+    /// Deterministic xorshift so failures are reproducible without a rand dep.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        /// Deliberately includes noncanonical words: raw values in
+        /// `[ORDER, 2^64)` and raw `ORDER` itself (a noncanonical zero).
+        fn field_maybe_noncanonical(&mut self) -> F {
+            match self.next() % 8 {
+                0 => F::from_canonical_u64(0),
+                1 => F::from_noncanonical_u64(F::ORDER),
+                2 => F::from_noncanonical_u64(F::ORDER + (self.next() % 1024)),
+                3 => F::from_canonical_u64(self.next() % 4),
+                _ => F::from_canonical_u64(self.next() % F::ORDER),
+            }
+        }
+    }
+
+    fn gate_for(bit_size: usize) -> RangeCheckGate<F, D> {
+        RangeCheckGate::<F, D>::new_from_config(&crate::types::config::CIRCUIT_CONFIG, bit_size)
+    }
+
+    fn make_inputs(
+        gate: &RangeCheckGate<F, D>,
+        n: usize,
+        seed: u64,
+        zero_filters: bool,
+    ) -> (Vec<F>, Vec<F>, Vec<F>, Vec<F>) {
+        let mut rng = Rng(seed | 1);
+        let wires: Vec<F> = (0..gate.num_wires() * n)
+            .map(|_| rng.field_maybe_noncanonical())
+            .collect();
+        let constants: Vec<F> = (0..gate.num_constants() * n)
+            .map(|_| rng.field_maybe_noncanonical())
+            .collect();
+        let filters: Vec<F> = (0..n)
+            .map(|_| {
+                if zero_filters {
+                    F::ZERO
+                } else {
+                    rng.field_maybe_noncanonical()
+                }
+            })
+            .collect();
+        // Pre-seeded, nonzero accumulator: the production caller folds many
+        // gates into the same buffer, so starting from zero would hide carry
+        // differences.
+        let acc: Vec<F> = (0..gate.num_constraints() * n)
+            .map(|_| rng.field_maybe_noncanonical())
+            .collect();
+        (wires, constants, filters, acc)
+    }
+
+    #[test]
+    fn range_check_accumulate_is_raw_word_identical() {
+        let hash = HashOut::<F>::ZERO;
+        let mut checked = 0usize;
+        for bit_size in [16usize, 32, 48, 17, 33, 47] {
+            let gate = gate_for(bit_size);
+            for n in 1..=40usize {
+                for (seed, zero_filters) in [(0xa5a5_1234u64, false), (0x7777_beefu64, true)] {
+                    let (wires, constants, filters, acc0) =
+                        make_inputs(&gate, n, seed ^ (n as u64) ^ (bit_size as u64), zero_filters);
+                    let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+
+                    let mut shipped = acc0.clone();
+                    gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut shipped);
+
+                    let mut candidate = acc0.clone();
+                    accumulate_fused_packed(&gate, vars, &filters, &mut candidate);
+
+                    for (idx, (a, b)) in shipped.iter().zip(candidate.iter()).enumerate() {
+                        assert_eq!(
+                            a.to_canonical_u64(),
+                            b.to_canonical_u64(),
+                            "value mismatch: bit_size={bit_size} n={n} idx={idx}"
+                        );
+                        // Raw representation, not just field value: the Merkle
+                        // commitment hashes these words directly.
+                        assert_eq!(
+                            a.to_noncanonical_u64(),
+                            b.to_noncanonical_u64(),
+                            "raw-word mismatch: bit_size={bit_size} n={n} idx={idx}"
+                        );
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        println!("range_check accumulate oracle: {checked} configurations raw-word identical");
+    }
+
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn range_check_accumulate_bench() {
+        const ITERS: usize = 200_000;
+        const REPS: usize = 5;
+        let hash = HashOut::<F>::ZERO;
+        let n = 32; // production quotient batch width
+
+        println!(
+            "{:<9} {:>7} {:>7} {:>12} {:>12} {:>8} {:>9}",
+            "bit_size", "ops", "constr", "shipped_ns", "packed_ns", "speedup", "spread%"
+        );
+        for bit_size in [16usize, 32, 48] {
+            let gate = gate_for(bit_size);
+            let (wires, constants, filters, acc0) = make_inputs(&gate, n, 0xdead_beef, false);
+            let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+
+            let mut shipped_times = Vec::new();
+            let mut packed_times = Vec::new();
+            for _ in 0..REPS {
+                // Interleaved within each rep so drift hits both arms equally.
+                let mut acc = acc0.clone();
+                let t = Instant::now();
+                for _ in 0..ITERS {
+                    gate.eval_unfiltered_base_batch_accumulate(
+                        std::hint::black_box(vars),
+                        std::hint::black_box(&filters),
+                        std::hint::black_box(&mut acc),
+                    );
+                }
+                shipped_times.push(t.elapsed().as_secs_f64() / ITERS as f64 * 1e9);
+                std::hint::black_box(&acc);
+
+                let mut acc = acc0.clone();
+                let t = Instant::now();
+                for _ in 0..ITERS {
+                    accumulate_fused_packed(
+                        std::hint::black_box(&gate),
+                        std::hint::black_box(vars),
+                        std::hint::black_box(&filters),
+                        std::hint::black_box(&mut acc),
+                    );
+                }
+                packed_times.push(t.elapsed().as_secs_f64() / ITERS as f64 * 1e9);
+                std::hint::black_box(&acc);
+            }
+
+            let med = |v: &mut Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let spread = |v: &[f64]| {
+                let mn = v.iter().cloned().fold(f64::INFINITY, f64::min);
+                let mx = v.iter().cloned().fold(0.0, f64::max);
+                (mx - mn) / mn * 100.0
+            };
+            let sp = spread(&shipped_times).max(spread(&packed_times));
+            let s = med(&mut shipped_times);
+            let p = med(&mut packed_times);
+            println!(
+                "{:<9} {:>7} {:>7} {:>12.1} {:>12.1} {:>8.3} {:>9.2}",
+                bit_size,
+                gate.num_ops,
+                gate.num_constraints(),
+                s,
+                p,
+                s / p,
+                sp
+            );
+        }
+    }
+}
+
+/// Differential oracle for the fused LDE coset-scale pass.
+///
+/// `fri/oracle.rs::fill_lde_column_store` previously reached its coset-scaled
+/// state in two passes over `degree` words per column: `copy_from_slice`
+/// followed by `batch_multiply_inplace`. The intermediate unscaled image is
+/// never observed — only the FFT reads the buffer — so the copy is a deletable
+/// materialization. `batch_multiply_into` fuses the two.
+///
+/// The Merkle commitment hashes these words directly, so equality must hold at
+/// the raw-word level, not merely as field values. Lives in the `circuit` crate
+/// because the vendored plonky2 workspace cannot resolve its own dev-deps
+/// offline; it exercises the same public API.
+#[cfg(test)]
+mod lde_fuse_oracle {
+    use plonky2::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
+    use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::field::types::{Field, Field64, PrimeField64};
+
+    type F = GoldilocksField;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn field(&mut self) -> F {
+            match self.next() % 6 {
+                0 => F::ZERO,
+                1 => F::ONE,
+                2 => F::from_noncanonical_u64(F::ORDER),
+                3 => F::from_noncanonical_u64(F::ORDER + (self.next() % 512)),
+                _ => F::from_canonical_u64(self.next() % F::ORDER),
+            }
+        }
+    }
+
+    #[test]
+    fn fused_lde_scale_matches_copy_then_multiply() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        // 0..=200 covers every packing remainder many times over; production
+        // lengths are powers of two (2^14, 2^16) which are also covered by
+        // construction since the packed prefix is maximal.
+        for n in (0..=200usize).chain([1 << 10, (1 << 10) + 3]) {
+            let a: Vec<F> = (0..n).map(|_| rng.field()).collect();
+            let b: Vec<F> = (0..n).map(|_| rng.field()).collect();
+
+            let mut reference = vec![F::ZERO; n];
+            reference.copy_from_slice(&a);
+            batch_multiply_inplace(&mut reference, &b);
+
+            let mut fused = vec![F::ZERO; n];
+            batch_multiply_into(&mut fused, &a, &b);
+
+            for (i, (r, f)) in reference.iter().zip(fused.iter()).enumerate() {
+                assert_eq!(
+                    r.to_canonical_u64(),
+                    f.to_canonical_u64(),
+                    "value mismatch at n={n} i={i}"
+                );
+                assert_eq!(
+                    r.to_noncanonical_u64(),
+                    f.to_noncanonical_u64(),
+                    "raw-word mismatch at n={n} i={i}"
+                );
+            }
+        }
+    }
+}
+
+/// Microbenchmark for the fused LDE coset-scale pass (H8).
+///
+/// End-to-end wall-clock A/B on this host has a paired stdev of ~5.9%, so it
+/// cannot resolve a sub-1% mechanism (it would need ~7000 pairs). Isolating the
+/// mechanism instead makes it measurable in seconds, exactly as the gate
+/// accumulate probe does.
+///
+/// Arm A is the shipped two-pass form (`copy_from_slice` then
+/// `batch_multiply_inplace`); arm B is the fused `batch_multiply_into`. Sizes are
+/// the production degrees: 2^16 for tx circuits, 2^14 for chain/pre.
+///
+/// Run:
+/// `cargo test --release -p circuit --lib -- --ignored --nocapture lde_fuse_bench`
+#[cfg(test)]
+mod lde_fuse_bench {
+    use std::time::Instant;
+
+    use plonky2::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
+    use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::field::types::Field;
+
+    type F = GoldilocksField;
+
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn lde_fuse_bench() {
+        const REPS: usize = 7;
+        println!(
+            "{:<10} {:>6} {:>13} {:>13} {:>9} {:>9}",
+            "degree", "iters", "two_pass_us", "fused_us", "speedup", "spread%"
+        );
+        for (log_degree, iters) in [(14usize, 400usize), (16, 120)] {
+            let degree = 1usize << log_degree;
+            let coeffs: Vec<F> = (0..degree)
+                .map(|i| F::from_canonical_u64((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+                .collect();
+            let powers: Vec<F> = (0..degree)
+                .map(|i| F::from_canonical_u64((i as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9) | 1))
+                .collect();
+            // Fresh destination per arm, sized like one LDE column.
+            let mut dest = vec![F::ZERO; degree];
+
+            let mut two_pass = Vec::new();
+            let mut fused = Vec::new();
+            for _ in 0..REPS {
+                let t = Instant::now();
+                for _ in 0..iters {
+                    let d = std::hint::black_box(&mut dest);
+                    d.copy_from_slice(std::hint::black_box(&coeffs));
+                    batch_multiply_inplace(d, std::hint::black_box(&powers));
+                }
+                two_pass.push(t.elapsed().as_secs_f64() / iters as f64 * 1e6);
+                std::hint::black_box(&dest);
+
+                let t = Instant::now();
+                for _ in 0..iters {
+                    batch_multiply_into(
+                        std::hint::black_box(&mut dest),
+                        std::hint::black_box(&coeffs),
+                        std::hint::black_box(&powers),
+                    );
+                }
+                fused.push(t.elapsed().as_secs_f64() / iters as f64 * 1e6);
+                std::hint::black_box(&dest);
+            }
+
+            let med = |v: &mut Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let spread = |v: &[f64]| {
+                let mn = v.iter().cloned().fold(f64::INFINITY, f64::min);
+                let mx = v.iter().cloned().fold(0.0, f64::max);
+                (mx - mn) / mn * 100.0
+            };
+            let sp = spread(&two_pass).max(spread(&fused));
+            let a = med(&mut two_pass);
+            let b = med(&mut fused);
+            println!(
+                "2^{:<8} {:>6} {:>13.2} {:>13.2} {:>9.3} {:>9.2}",
+                log_degree, iters, a, b, a / b, sp
+            );
+        }
+    }
+}
+
+/// Settling probe for H9: is `fill_lde_batch`'s gather copy pure overhead, or is
+/// it also compacting scattered columns into cache for the consumer?
+///
+/// Arm A models the shipped path: memcpy `n` points from each of `cols` widely
+/// separated LDE columns into one flat buffer, then consume the flat buffer.
+/// Arm B models the borrow: consume the same values directly from the scattered
+/// columns via a slice-of-slices, with no copy.
+///
+/// If B does not win, H9's refactor is not worth its blast radius.
+/// Run: `cargo test --release -p circuit --lib -- --ignored --nocapture h9_gather_probe`
+#[cfg(test)]
+mod h9_gather_probe {
+    use std::time::Instant;
+
+    use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::field::types::Field;
+
+    type F = GoldilocksField;
+
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn h9_gather_probe() {
+        // Production shape: 32-point quotient batches; ~316 columns gathered per
+        // batch across constants/sigmas + wires + zs/partial. Each column is an
+        // LDE of 2^19 elements, so consecutive columns are 4 MiB apart.
+        const N: usize = 32;
+        const COLS: usize = 316;
+        const LDE: usize = 1 << 19;
+
+        let columns: Vec<Vec<F>> = (0..COLS)
+            .map(|c| {
+                (0..LDE)
+                    .map(|i| F::from_canonical_u64(((c * LDE + i) as u64) | 1))
+                    .collect()
+            })
+            .collect();
+
+        let mut flat = vec![F::ZERO; COLS * N];
+        const REPS: usize = 5;
+        const BATCHES: usize = 2000;
+
+        let mut copy_then_read = Vec::new();
+        let mut borrow_read = Vec::new();
+        for _ in 0..REPS {
+            // Arm A: gather (memcpy per column) then consume the flat buffer.
+            let t = Instant::now();
+            let mut acc_a = F::ZERO;
+            for b in 0..BATCHES {
+                let start = (b * N) % (LDE - N);
+                for (ci, col) in columns.iter().enumerate() {
+                    flat[ci * N..(ci + 1) * N].copy_from_slice(&col[start..start + N]);
+                }
+                let f = std::hint::black_box(&flat);
+                for ci in 0..COLS {
+                    let s = &f[ci * N..(ci + 1) * N];
+                    for v in s {
+                        acc_a += *v;
+                    }
+                }
+            }
+            copy_then_read.push(t.elapsed().as_secs_f64() / BATCHES as f64 * 1e6);
+            std::hint::black_box(acc_a);
+
+            // Arm B: build a slice-of-slices and consume in place, no copy.
+            let t = Instant::now();
+            let mut acc_b = F::ZERO;
+            let mut view: Vec<&[F]> = Vec::with_capacity(COLS);
+            for b in 0..BATCHES {
+                let start = (b * N) % (LDE - N);
+                view.clear();
+                for col in columns.iter() {
+                    view.push(&col[start..start + N]);
+                }
+                let v = std::hint::black_box(&view);
+                for s in v.iter() {
+                    for x in s.iter() {
+                        acc_b += *x;
+                    }
+                }
+            }
+            borrow_read.push(t.elapsed().as_secs_f64() / BATCHES as f64 * 1e6);
+            std::hint::black_box(acc_b);
+        }
+
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let spread = |v: &[f64]| {
+            let mn = v.iter().cloned().fold(f64::INFINITY, f64::min);
+            let mx = v.iter().cloned().fold(0.0, f64::max);
+            (mx - mn) / mn * 100.0
+        };
+        let sp = spread(&copy_then_read).max(spread(&borrow_read));
+        let a = med(&mut copy_then_read);
+        let b = med(&mut borrow_read);
+        println!("\nH9 gather probe: {COLS} cols x {N} pts, columns {LDE} apart");
+        println!("  A copy-then-read : {a:>9.3} us/batch");
+        println!("  B borrow-read    : {b:>9.3} us/batch");
+        println!("  speedup (A/B)    : {:>9.3}x   spread {sp:.2}%", a / b);
+        println!(
+            "  verdict: {}",
+            if a / b > 1.15 {
+                "BORROW WINS -- H9 refactor is justified"
+            } else if a / b < 0.95 {
+                "COPY WINS -- gather is doing useful cache compaction; H9 DEAD"
+            } else {
+                "WASH -- not worth the blast radius"
+            }
+        );
+    }
 }

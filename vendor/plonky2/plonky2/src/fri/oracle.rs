@@ -5,7 +5,7 @@ use itertools::Itertools;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
-use crate::field::batch_util::batch_multiply_inplace;
+use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
 use crate::field::extension::Extendable;
 use crate::field::fft::{fft_in_place_with_options, FftRootTable};
 use crate::field::packed::PackedField;
@@ -284,14 +284,26 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .zip(polynomials.par_iter())
             .for_each(|(destination, polynomial)| {
                 assert_eq!(polynomial.len(), degree, "Polynomial degrees inconsistent");
-                destination[..degree].copy_from_slice(&polynomial.coeffs);
+                // Fused copy-and-scale: the unscaled coefficient image that
+                // `copy_from_slice` used to materialize here is never observed —
+                // the FFT reads only the coset-scaled values — so writing the
+                // product directly deletes one full read+write pass over
+                // `degree` words per column, per commitment, per proof. Word
+                // values are unchanged: `batch_multiply_into` uses the same
+                // packed-prefix/scalar-tail schedule as the
+                // `batch_multiply_inplace` it replaces, and it never reads the
+                // (possibly uninitialized) destination.
+                batch_multiply_into(
+                    &mut destination[..degree],
+                    &polynomial.coeffs,
+                    &coset_powers,
+                );
                 if rate_bits == 0 || degree < 2 {
                     destination[degree..].fill(F::ZERO);
                 }
                 // For a nontrivial zero-padded FFT, the expansion path writes
                 // every tail element before reading it. This is the same
                 // invariant used by `lde_values` to avoid a dead tail memset.
-                batch_multiply_inplace(&mut destination[..degree], &coset_powers);
                 fft_in_place_with_options(destination, Some(rate_bits), fft_root_table);
             });
         true
