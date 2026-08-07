@@ -338,13 +338,16 @@ pub struct PartitionWitness<'a, F: Field> {
     /// Bitmap with one bit per slot of `values`; bit `i` of word `i / 64` is set iff slot `i` has
     /// been assigned a value.
     pub set_bitmap: Vec<u64>,
-    pub representative_map: &'a [usize],
+    /// Compact (4-byte) representative indices; zero-extended to `usize` only at
+    /// the point of indexing. Halves the map-read traffic of every witness
+    /// write and of the `full_witness` drain.
+    pub representative_map: &'a [u32],
     pub num_wires: usize,
     pub degree: usize,
 }
 
 impl<'a, F: Field> PartitionWitness<'a, F> {
-    pub fn new(num_wires: usize, degree: usize, representative_map: &'a [usize]) -> Self {
+    pub fn new(num_wires: usize, degree: usize, representative_map: &'a [u32]) -> Self {
         let len = representative_map.len();
         Self {
             values: vec![F::ZERO; len],
@@ -369,7 +372,7 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     /// Set a `Target`. On success, returns the representative index of the newly-set target. If the
     /// target was already set, returns `None`.
     pub fn set_target_returning_rep(&mut self, target: Target, value: F) -> Result<Option<usize>> {
-        let rep_index = self.representative_map[self.target_index(target)];
+        let rep_index = self.representative_map[self.target_index(target)] as usize;
         if self.is_set_by_rep_index(rep_index) {
             let old_value = self.values[rep_index];
             if value != old_value {
@@ -410,7 +413,7 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
             for column in wire_values.iter_mut() {
                 // Unset slots hold `F::ZERO` in the dense `values` vector, so this is exactly
                 // the old `values[rep].unwrap_or(F::ZERO)` without touching the bitmap.
-                column.push(self.values[self.representative_map[wire_index]]);
+                column.push(self.values[self.representative_map[wire_index] as usize]);
                 wire_index += 1;
             }
         }
@@ -427,11 +430,122 @@ impl<F: Field> WitnessWrite<F> for PartitionWitness<'_, F> {
 
 impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
     fn try_get_target(&self, target: Target) -> Option<F> {
-        let rep_index = self.representative_map[self.target_index(target)];
+        let rep_index = self.representative_map[self.target_index(target)] as usize;
         if self.is_set_by_rep_index(rep_index) {
             Some(self.values[rep_index])
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::hint::black_box;
+
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    type F = GoldilocksField;
+
+    /// `full_witness` must agree cell-for-cell with per-target reads through
+    /// the compact `u32` representative map (unset cells read as zero).
+    #[test]
+    fn full_witness_matches_per_target_reads() {
+        let num_wires = 7usize;
+        let degree = 16usize;
+        let len = num_wires * degree;
+        // A valid compressed forest: every representative points at itself or
+        // an earlier index.
+        let rep_map: Vec<u32> = (0..len as u32).map(|i| i - (i % 3)).collect();
+
+        let mut pw = PartitionWitness::<F>::new(num_wires, degree, &rep_map);
+        for row in 0..degree {
+            for column in 0..num_wires {
+                if (row + column) % 4 == 0 {
+                    let target = Target::Wire(Wire { row, column });
+                    // Values assigned via the shared representative, exactly as
+                    // production writes do.
+                    let value = F::from_canonical_u64(
+                        (rep_map[pw.target_index(target)] as u64) * 7 + 1,
+                    );
+                    pw.set_target(target, value).unwrap();
+                }
+            }
+        }
+
+        let expected: Vec<Vec<F>> = (0..num_wires)
+            .map(|column| {
+                (0..degree)
+                    .map(|row| {
+                        pw.try_get_target(Target::Wire(Wire { row, column }))
+                            .unwrap_or(F::ZERO)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let full = pw.full_witness();
+        assert_eq!(full.wire_values, expected);
+    }
+
+    /// Microbench for the u32 representative map: one sequential gather pass
+    /// (`values[map[i]]`) over a transaction-proof-scale map, u32 vs usize
+    /// entries. Run explicitly:
+    /// `cargo test --release -- --ignored --nocapture microbench_rep_map`
+    #[test]
+    #[ignore = "microbench; run with --ignored --nocapture"]
+    fn microbench_rep_map_gather_u32_vs_usize() {
+        // 136 wires x 2^16 rows: the ranked transaction-proof wire-target scale.
+        let len: usize = 136 << 16;
+        let rep_u32: Vec<u32> = (0..len)
+            .map(|i| ((i as u64).wrapping_mul(2654435761) % len as u64) as u32)
+            .collect();
+        let rep_usize: Vec<usize> = rep_u32.iter().map(|&x| x as usize).collect();
+        let values: Vec<F> = (0..len as u64).map(F::from_canonical_u64).collect();
+
+        let passes = 20;
+        let cases: [(&str, Box<dyn Fn() -> F>); 2] = [
+            (
+                "u32 ",
+                Box::new(|| {
+                    let mut acc = F::ZERO;
+                    for &r in &rep_u32 {
+                        acc += values[r as usize];
+                    }
+                    acc
+                }),
+            ),
+            (
+                "usize",
+                Box::new(|| {
+                    let mut acc = F::ZERO;
+                    for &r in &rep_usize {
+                        acc += values[r];
+                    }
+                    acc
+                }),
+            ),
+        ];
+        let mut timings = Vec::new();
+        for (name, gather) in &cases {
+            let mut best = f64::MAX;
+            for _ in 0..passes {
+                let start = std::time::Instant::now();
+                let acc = gather();
+                let elapsed = start.elapsed().as_secs_f64();
+                black_box(acc);
+                best = best.min(elapsed);
+            }
+            timings.push(best);
+            eprintln!(
+                "rep-map gather {name}: best {:.3} ms over {passes} passes",
+                best * 1e3
+            );
+        }
+        eprintln!(
+            "rep-map gather ratio usize/u32: {:.3}x",
+            timings[1] / timings[0]
+        );
     }
 }

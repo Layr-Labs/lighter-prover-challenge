@@ -6,19 +6,16 @@ use plonky2_maybe_rayon::*;
 use crate::field::polynomial::PolynomialValues;
 use crate::field::types::Field;
 use crate::iop::target::Target;
-use crate::iop::wire::Wire;
-
-/// When `true`, `get_sigma_polys` parallelizes across whole sigma columns with a single
-/// `par_chunks` traversal instead of entering and joining a fresh inner Rayon traversal
-/// sequentially for every column. `par_chunks` is an indexed parallel iterator, so the collected
-/// column order and the sequential element order within every column are unchanged; only task
-/// placement moves. Flip to `false` to restore the previous sequential-outer schedule exactly.
-const OUTER_PARALLEL_SIGMA_COLUMNS: bool = false;
 
 /// Disjoint Set Forest data-structure following <https://en.wikipedia.org/wiki/Disjoint-set_data_structure>.
 pub struct Forest {
-    /// A map of parent pointers, stored as indices.
-    pub(crate) parents: Vec<usize>,
+    /// A map of parent pointers, stored as indices. Indices are stored as `u32`
+    /// (half the bytes of `usize` on the 64-bit prover host): every target
+    /// index in the supported circuits is far below `u32::MAX`, insertion is
+    /// checked, and the persistent representative map derived from this vector
+    /// is read on every witness write, so halving its width halves that read
+    /// traffic.
+    pub(crate) parents: Vec<u32>,
 
     num_wires: usize,
     num_routed_wires: usize,
@@ -49,6 +46,10 @@ impl Forest {
     pub fn add(&mut self, t: Target) {
         let index = self.parents.len();
         debug_assert_eq!(self.target_index(t), index);
+        // Checked: a circuit with more than `u32::MAX` targets must fail loudly
+        // rather than truncate. Every value stored in `parents` afterwards is an
+        // existing in-bounds index, so it is representable by construction.
+        let index = u32::try_from(index).expect("Forest index exceeds u32::MAX");
         self.parents.push(index);
     }
 
@@ -58,14 +59,20 @@ impl Forest {
 
         // First, find the representative of the set containing `x_index`.
         let mut representative = x_index;
-        while self.parents[representative] != representative {
-            representative = self.parents[representative];
+        while self.parents[representative] as usize != representative {
+            representative = self.parents[representative] as usize;
         }
 
+        // `representative` is an in-bounds index of `parents` (either `x_index`
+        // itself or a value read from `parents`), and every in-bounds index fits
+        // in `u32` because insertion is checked.
+        debug_assert!(u32::try_from(representative).is_ok());
+        let representative_u32 = representative as u32;
+
         // Then, update each node in this chain to point directly to the representative.
-        while self.parents[x_index] != x_index {
-            let old_parent = self.parents[x_index];
-            self.parents[x_index] = representative;
+        while self.parents[x_index] as usize != x_index {
+            let old_parent = self.parents[x_index] as usize;
+            self.parents[x_index] = representative_u32;
             x_index = old_parent;
         }
 
@@ -81,65 +88,63 @@ impl Forest {
             return;
         }
 
-        self.parents[y_index] = x_index;
+        // `x_index` is an existing in-bounds index returned by `find`.
+        debug_assert!(u32::try_from(x_index).is_ok());
+        self.parents[y_index] = x_index as u32;
     }
 
     /// Compress all paths. After calling this, every `parent` value will point to the node's
     /// representative.
-    ///
-    /// This dedicated full pass visits every index once and gives it its own direct-root write,
-    /// so the general `find`'s second chain walk (which rewrites intermediate nodes) is
-    /// unnecessary: each intermediate node receives its direct-root assignment when the outer
-    /// loop reaches it. Roots are stable during this pass, so the final `parents` vector is
-    /// identical to calling `find(i)` for every `i`.
     pub(crate) fn compress_paths(&mut self) {
         for i in 0..self.parents.len() {
-            let parent = self.parents[i];
-            if parent == i {
-                continue;
-            }
-            let mut root = parent;
-            while self.parents[root] != root {
-                root = self.parents[root];
-            }
-            self.parents[i] = root;
+            self.find(i);
         }
     }
 
     /// Assumes `compress_paths` has already been called.
-    ///
-    /// Each copy class is maintained as a closed cycle at every insertion: the first element of
-    /// a class starts as a self-loop, and every later element is spliced in between the current
-    /// tail and the head. A scan sequence `a, b, c` therefore evolves as `a->a`, then
-    /// `a->b->a`, then `a->b->c->a`, which is exactly the open successor chain built by the
-    /// previous implementation plus its closing sweep. This deletes the whole-forest `first`
-    /// array and the final serial sweep over every forest entry.
     pub fn wire_partition(&mut self) -> WirePartition {
-        let mut sigma = vec![0u32; self.degree * self.num_routed_wires];
-        let mut last = vec![u32::MAX; self.parents.len()];
+        // Thread every routed wire onto its copy class's circular successor chain in one dense
+        // row-major pass, using two flat per-representative cursors instead of a map of class
+        // vectors plus a neighbor map. `parents` is fully compressed, so each routed wire's entry
+        // is its class representative. A closing sweep links each class's last wire back to its
+        // first, which also maps singleton classes to themselves. The successor of a wire is the
+        // next routed wire of its class in scan order, circularly — exactly the neighbor the
+        // map-based construction produced, so the resulting sigma polynomials are bit-identical.
+        const UNSET: u32 = u32::MAX;
+        let num_slots = self.degree * self.num_routed_wires;
+        let mut first = vec![UNSET; self.parents.len()];
+        let mut last = vec![UNSET; self.parents.len()];
+        let mut next = vec![0u32; num_slots];
 
+        let mut scan_index = 0u32;
         for row in 0..self.degree {
+            let row_base = row * self.num_wires;
             for column in 0..self.num_routed_wires {
-                let t = Target::Wire(Wire { row, column });
-                let parent = self.parents[self.target_index(t)];
-                let index = (column * self.degree + row) as u32;
-                let old_tail = last[parent];
-                if old_tail == u32::MAX {
-                    sigma[index as usize] = index;
+                let rep = self.parents[row_base + column] as usize;
+                if first[rep] == UNSET {
+                    first[rep] = scan_index;
                 } else {
-                    sigma[index as usize] = sigma[old_tail as usize];
-                    sigma[old_tail as usize] = index;
+                    next[last[rep] as usize] = scan_index;
                 }
-                last[parent] = index;
+                last[rep] = scan_index;
+                scan_index += 1;
+            }
+        }
+        for rep in 0..first.len() {
+            if first[rep] != UNSET {
+                next[last[rep] as usize] = first[rep];
             }
         }
 
-        WirePartition { sigma }
+        WirePartition { next }
     }
 }
 
 pub struct WirePartition {
-    sigma: Vec<u32>,
+    /// For each routed wire, indexed in row-major scan order (`row * num_routed_wires + column`),
+    /// the scan index of the next wire in its copy class (circular; singletons point to
+    /// themselves).
+    next: Vec<u32>,
 }
 
 impl WirePartition {
@@ -150,369 +155,138 @@ impl WirePartition {
         subgroup: &[F],
     ) -> Vec<PolynomialValues<F>> {
         let degree = 1 << degree_log;
-        // `degree` is always a power of two here, so `x / degree == x >> degree_log` and
-        // `x % degree == x & (degree - 1)` hold exactly.
-        let mask = degree - 1;
+        let sigma = self.get_sigma_map(degree, k_is.len());
 
-        if OUTER_PARALLEL_SIGMA_COLUMNS {
-            self.sigma
-                .par_chunks(degree)
-                .map(|chunk| {
-                    let values = chunk
-                        .iter()
-                        .map(|&x| k_is[x as usize >> degree_log] * subgroup[x as usize & mask])
-                        .collect::<Vec<_>>();
-                    PolynomialValues::new(values)
-                })
-                .collect()
-        } else {
-            self.sigma
-                .chunks(degree)
-                .map(|chunk| {
-                    let values = chunk
-                        .par_iter()
-                        .map(|&x| k_is[x as usize >> degree_log] * subgroup[x as usize & mask])
-                        .collect::<Vec<_>>();
-                    PolynomialValues::new(values)
-                })
-                .collect()
+        sigma
+            .chunks(degree)
+            .map(|chunk| {
+                let values = chunk
+                    .par_iter()
+                    .map(|&x| k_is[x / degree] * subgroup[x % degree])
+                    .collect::<Vec<_>>();
+                PolynomialValues::new(values)
+            })
+            .collect()
+    }
+
+    /// Generates sigma in the context of Plonk, which is a map from `[kn]` to `[kn]`, where `k` is
+    /// the number of routed wires and `n` is the number of gates.
+    fn get_sigma_map(&self, degree: usize, num_routed_wires: usize) -> Vec<usize> {
+        // A wire's "neighbor" in the context of Plonk's "extended copy constraints" check is the
+        // next wire in the given wire's partition, looping around at the end; a wire with a
+        // partition all to itself is its own neighbor. The successor chain holds exactly these
+        // neighbors, keyed by row-major scan index.
+        let mut sigma = Vec::with_capacity(num_routed_wires * degree);
+        for column in 0..num_routed_wires {
+            for row in 0..degree {
+                let neighbor = self.next[row * num_routed_wires + column] as usize;
+                let neighbor_row = neighbor / num_routed_wires;
+                let neighbor_column = neighbor % num_routed_wires;
+                sigma.push(neighbor_column * degree + neighbor_row);
+            }
         }
+        sigma
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use hashbrown::HashMap;
+
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::hash::poseidon::PoseidonHash;
+    use crate::iop::wire::Wire;
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::circuit_data::CircuitConfig;
+    use crate::plonk::config::PoseidonGoldilocksConfig;
 
-    /// Deterministic pseudo-random stream (no `rand` dependency) for building forests.
-    struct Lcg(u64);
+    const D: usize = 2;
+    type C = PoseidonGoldilocksConfig;
+    type F = GoldilocksField;
 
-    impl Lcg {
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            self.0 >> 11
-        }
-
-        fn below(&mut self, n: usize) -> usize {
-            (self.next_u64() % n as u64) as usize
-        }
-    }
-
-    /// Populates a forest exactly the way `CircuitBuilder::sigma_vecs` does: all wire targets
-    /// in row-major index order, then all virtual targets, then the copy-constraint merges.
-    fn build_forest(
+    /// The previous map-of-classes plus neighbor-map sigma construction, kept verbatim as the
+    /// reference the flat successor-chain construction must match bit for bit.
+    fn reference_sigma_map(
+        parents: &[u32],
+        degree: usize,
         num_wires: usize,
         num_routed_wires: usize,
-        degree: usize,
-        num_virtual_targets: usize,
-        merges: &[(Target, Target)],
-    ) -> Forest {
-        let mut forest = Forest::new(num_wires, num_routed_wires, degree, num_virtual_targets);
-        for row in 0..degree {
-            for column in 0..num_wires {
-                forest.add(Target::Wire(Wire { row, column }));
-            }
-        }
-        for index in 0..num_virtual_targets {
-            forest.add(Target::VirtualTarget { index });
-        }
-        for &(a, b) in merges {
-            forest.merge(a, b);
-        }
-        forest
-    }
-
-    fn random_target(
-        rng: &mut Lcg,
-        num_wires: usize,
-        degree: usize,
-        num_virtual_targets: usize,
-    ) -> Target {
-        if num_virtual_targets > 0 && rng.below(8) == 0 {
-            Target::VirtualTarget {
-                index: rng.below(num_virtual_targets),
-            }
-        } else {
-            Target::Wire(Wire {
-                row: rng.below(degree),
-                column: rng.below(num_wires),
-            })
-        }
-    }
-
-    fn random_merges(
-        rng: &mut Lcg,
-        num_wires: usize,
-        degree: usize,
-        num_virtual_targets: usize,
-        count: usize,
-    ) -> Vec<(Target, Target)> {
-        (0..count)
-            .map(|_| {
-                (
-                    random_target(rng, num_wires, degree, num_virtual_targets),
-                    random_target(rng, num_wires, degree, num_virtual_targets),
-                )
-            })
-            .collect()
-    }
-
-    /// The promoted tree's `compress_paths`: the general two-walk `find` applied to every index.
-    fn reference_compress_paths(parents: &mut [usize]) {
-        for i in 0..parents.len() {
-            let mut representative = i;
-            while parents[representative] != representative {
-                representative = parents[representative];
-            }
-            let mut x_index = i;
-            while parents[x_index] != x_index {
-                let old_parent = parents[x_index];
-                parents[x_index] = representative;
-                x_index = old_parent;
-            }
-        }
-    }
-
-    /// The promoted tree's `wire_partition`: open successor chains through `first`/`last`
-    /// followed by a closing sweep over the whole forest.
-    fn reference_wire_partition(
-        parents: &[usize],
-        num_wires: usize,
-        num_routed_wires: usize,
-        degree: usize,
-    ) -> Vec<u32> {
-        let mut sigma = vec![0u32; degree * num_routed_wires];
-        let mut first = vec![u32::MAX; parents.len()];
-        let mut last = vec![u32::MAX; parents.len()];
-
+    ) -> Vec<usize> {
+        let mut partition = HashMap::<usize, Vec<Wire>>::new();
         for row in 0..degree {
             for column in 0..num_routed_wires {
-                let t = Target::Wire(Wire { row, column });
-                let parent = parents[t.index(num_wires, degree)];
-                let index = (column * degree + row) as u32;
-                if first[parent] == u32::MAX {
-                    first[parent] = index;
-                } else {
-                    sigma[last[parent] as usize] = index;
-                }
-                last[parent] = index;
+                let w = Wire { row, column };
+                let t = Target::Wire(w);
+                partition
+                    .entry(parents[t.index(num_wires, degree)] as usize)
+                    .or_default()
+                    .push(w);
+            }
+        }
+        let partition: Vec<Vec<Wire>> = partition.into_values().collect();
+
+        let mut neighbors = HashMap::with_capacity(partition.len());
+        for subset in &partition {
+            for n in 0..subset.len() {
+                neighbors.insert(subset[n], subset[(n + 1) % subset.len()]);
             }
         }
 
-        for cell in 0..parents.len() {
-            if first[cell] != u32::MAX {
-                sigma[last[cell] as usize] = first[cell];
-            }
-        }
-
-        sigma
-    }
-
-    /// Independent class-cycle reference: group the routed cells of each representative in scan
-    /// order and map `class[i]` to `class[(i + 1) % len]`.
-    fn class_cycle_sigma(
-        compressed_parents: &[usize],
-        num_wires: usize,
-        num_routed_wires: usize,
-        degree: usize,
-    ) -> Vec<u32> {
-        let mut classes: Vec<Vec<u32>> = vec![Vec::new(); compressed_parents.len()];
-        for row in 0..degree {
-            for column in 0..num_routed_wires {
-                let t = Target::Wire(Wire { row, column });
-                let root = compressed_parents[t.index(num_wires, degree)];
-                classes[root].push((column * degree + row) as u32);
-            }
-        }
-
-        let mut sigma = vec![0u32; degree * num_routed_wires];
-        for class in &classes {
-            for (i, &cell) in class.iter().enumerate() {
-                sigma[cell as usize] = class[(i + 1) % class.len()];
+        let mut sigma = Vec::with_capacity(num_routed_wires * degree);
+        for column in 0..num_routed_wires {
+            for row in 0..degree {
+                let wire = Wire { row, column };
+                let neighbor = neighbors[&wire];
+                sigma.push(neighbor.column * degree + neighbor.row);
             }
         }
         sigma
     }
 
-    /// Differential test of circular insertion and one-write compression against a class-cycle
-    /// reference, over singleton and multi-element classes with interleaved row/column order.
     #[test]
-    fn flat_sigma_insertion_matches_circular_partition_reference() {
-        let num_wires = 5;
-        let num_routed_wires = 4;
-        let num_virtual_targets = 3;
+    fn flat_sigma_map_matches_reference_on_recursive_circuit() {
+        // Real production-shaped circuits: a hash chain with public inputs, and a recursive
+        // verifier of its proof shape — copy classes of many sizes including singletons.
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config.clone());
+        let x = builder.add_virtual_target();
+        let mut state = builder.hash_n_to_hash_no_pad::<PoseidonHash>(vec![x]);
+        for _ in 0..4 {
+            state = builder.hash_n_to_hash_no_pad::<PoseidonHash>(state.elements.to_vec());
+        }
+        builder.register_public_inputs(&state.elements);
+        let inner = builder.build::<C>();
 
-        for degree in [1usize, 2, 7, 16] {
-            let mut rng = Lcg(0x5eed_0000 + degree as u64);
-            let mut merges = Vec::new();
-            if degree >= 2 {
-                // Interleaved multi-element classes, a non-routed column, and a virtual target
-                // pulled into a routed class, plus a redundant merge.
-                merges.push((
-                    Target::Wire(Wire { row: 0, column: 1 }),
-                    Target::Wire(Wire {
-                        row: degree - 1,
-                        column: 3,
-                    }),
-                ));
-                merges.push((
-                    Target::Wire(Wire {
-                        row: degree - 1,
-                        column: 0,
-                    }),
-                    Target::Wire(Wire { row: 0, column: 2 }),
-                ));
-                merges.push((
-                    Target::Wire(Wire { row: 1, column: 4 }),
-                    Target::Wire(Wire { row: 0, column: 0 }),
-                ));
-                merges.push((
-                    Target::VirtualTarget { index: 0 },
-                    Target::Wire(Wire { row: 1, column: 2 }),
-                ));
-                merges.push((
-                    Target::Wire(Wire { row: 0, column: 1 }),
-                    Target::Wire(Wire {
-                        row: degree - 1,
-                        column: 3,
-                    }),
-                ));
-            } else {
-                merges.push((
-                    Target::Wire(Wire { row: 0, column: 0 }),
-                    Target::Wire(Wire { row: 0, column: 3 }),
-                ));
-                merges.push((
-                    Target::VirtualTarget { index: 1 },
-                    Target::Wire(Wire { row: 0, column: 2 }),
-                ));
-            }
-            merges.extend(random_merges(
-                &mut rng,
-                num_wires,
-                degree,
-                num_virtual_targets,
-                2 * degree + 3,
-            ));
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let proof = builder.add_virtual_proof_with_pis(&inner.common);
+        let verifier_data = builder.constant_verifier_data(&inner.verifier_only);
+        builder.verify_proof::<C>(&proof, &verifier_data, &inner.common);
+        builder.register_public_inputs(&proof.public_inputs);
+        let outer = builder.build::<C>();
 
-            let mut forest = build_forest(
+        for circuit in [&inner, &outer] {
+            let num_wires = circuit.common.config.num_wires;
+            let num_routed_wires = circuit.common.config.num_routed_wires;
+            let degree = circuit.common.degree();
+
+            // `representative_map` is the fully compressed forest the build used.
+            let mut forest = Forest {
+                parents: circuit.prover_only.representative_map.clone(),
                 num_wires,
                 num_routed_wires,
                 degree,
-                num_virtual_targets,
-                &merges,
-            );
-            let original_parents = forest.parents.clone();
-
-            forest.compress_paths();
-
-            // Independently follow the original parent chains from every index and compare the
-            // entire compressed-parent vector.
-            for i in 0..original_parents.len() {
-                let mut root = i;
-                while original_parents[root] != root {
-                    root = original_parents[root];
-                }
-                assert_eq!(
-                    forest.parents[i], root,
-                    "compressed parent mismatch at index {i} (degree {degree})"
-                );
-            }
-
-            let expected = class_cycle_sigma(&forest.parents, num_wires, num_routed_wires, degree);
-            let sigma = forest.wire_partition().sigma;
-            assert_eq!(sigma, expected, "sigma mismatch at degree {degree}");
-        }
-    }
-
-    /// Full-pipeline equivalence against the promoted tree's implementation (two-walk
-    /// compression, `first`/`last` chains, closing sweep) on a production-shaped config
-    /// (80 routed wires x 2^12 rows) and an odd-sized config.
-    #[test]
-    fn sigma_matches_promoted_reference_on_production_shapes() {
-        // (num_wires, num_routed_wires, degree, num_virtual_targets, merges)
-        let configs = [
-            (135usize, 80usize, 1usize << 12, 1500usize, 135 * (1 << 12)),
-            (7, 5, 999, 41, 5000),
-        ];
-
-        for (num_wires, num_routed_wires, degree, num_virtual_targets, num_merges) in configs {
-            let mut rng = Lcg(0xfeed_f00d ^ ((degree as u64) << 32) ^ num_wires as u64);
-            let merges =
-                random_merges(&mut rng, num_wires, degree, num_virtual_targets, num_merges);
-
-            let mut forest = build_forest(
+            };
+            let flat = forest
+                .wire_partition()
+                .get_sigma_map(degree, num_routed_wires);
+            let reference = reference_sigma_map(
+                &circuit.prover_only.representative_map,
+                degree,
                 num_wires,
                 num_routed_wires,
-                degree,
-                num_virtual_targets,
-                &merges,
             );
-            let mut reference_parents = forest.parents.clone();
-
-            reference_compress_paths(&mut reference_parents);
-            let expected_sigma =
-                reference_wire_partition(&reference_parents, num_wires, num_routed_wires, degree);
-
-            forest.compress_paths();
-            assert_eq!(
-                forest.parents, reference_parents,
-                "compressed parents diverge for degree {degree}"
-            );
-
-            let sigma = forest.wire_partition().sigma;
-            assert_eq!(sigma, expected_sigma, "sigma diverges for degree {degree}");
+            assert_eq!(flat, reference);
         }
-    }
-
-    /// `get_sigma_polys` (shift/mask decode, outer-parallel columns) against the promoted
-    /// tree's sequential division/remainder arithmetic.
-    #[test]
-    fn sigma_polys_match_division_reference() {
-        type F = GoldilocksField;
-
-        let num_wires = 135;
-        let num_routed_wires = 80;
-        let degree_log = 12;
-        let degree = 1 << degree_log;
-        let num_virtual_targets = 700;
-
-        let mut rng = Lcg(0xabcd_ef01);
-        let merges = random_merges(&mut rng, num_wires, degree, num_virtual_targets, 3 * degree);
-        let mut forest = build_forest(
-            num_wires,
-            num_routed_wires,
-            degree,
-            num_virtual_targets,
-            &merges,
-        );
-        forest.compress_paths();
-        let partition = forest.wire_partition();
-
-        let k_is: Vec<F> = (0..num_routed_wires)
-            .map(|_| F::from_canonical_u64(rng.next_u64()))
-            .collect();
-        let subgroup: Vec<F> = (0..degree)
-            .map(|_| F::from_canonical_u64(rng.next_u64()))
-            .collect();
-
-        let expected: Vec<PolynomialValues<F>> = partition
-            .sigma
-            .chunks(degree)
-            .map(|chunk| {
-                let values = chunk
-                    .iter()
-                    .map(|&x| k_is[x as usize / degree] * subgroup[x as usize % degree])
-                    .collect::<Vec<_>>();
-                PolynomialValues::new(values)
-            })
-            .collect();
-
-        let actual = partition.get_sigma_polys(degree_log, &k_is, &subgroup);
-        assert_eq!(actual, expected);
     }
 }

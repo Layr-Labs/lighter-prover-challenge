@@ -4,7 +4,7 @@ use static_assertions::const_assert;
 
 use crate::extension::quadratic::QuadraticExtension;
 use crate::extension::quartic::QuarticExtension;
-use crate::extension::quintic::{QuinticExtension, QuinticFirstCoeff};
+use crate::extension::quintic::QuinticExtension;
 use crate::extension::{Extendable, Frobenius};
 use crate::goldilocks_field::{reduce160, GoldilocksField};
 use crate::types::Field;
@@ -143,18 +143,6 @@ impl Frobenius<5> for QuinticExtension<GoldilocksField> {
         let z = &FROB_COEFFS[count - 1];
         let Self([a0, a1, a2, a3, a4]) = *self;
         Self([a0, a1 * z[0], a2 * z[1], a3 * z[2], a4 * z[3]])
-    }
-}
-
-impl QuinticFirstCoeff<GoldilocksField> for QuinticExtension<GoldilocksField> {
-    #[inline]
-    fn mul_first_coeff(&self, rhs: &Self) -> GoldilocksField {
-        let Self([a0, a1, a2, a3, a4]) = *self;
-        let Self([b0, b1, b2, b3, b4]) = *rhs;
-        ext5_add_prods0(
-            &[a0.0, a1.0, a2.0, a3.0, a4.0],
-            &[b0.0, b1.0, b2.0, b3.0, b4.0],
-        )
     }
 }
 
@@ -550,8 +538,8 @@ pub(crate) fn ext5_mul(a: [u64; 5], b: [u64; 5]) -> [GoldilocksField; 5] {
 
 #[cfg(test)]
 mod tests {
-    use crate::extension::quintic::{QuinticExtension, QuinticFirstCoeff};
-    use crate::extension::{Extendable, FieldExtension, Frobenius, OEF};
+    use crate::extension::quintic::QuinticExtension;
+    use crate::extension::{Extendable, Frobenius};
     use crate::goldilocks_field::GoldilocksField;
     use crate::types::{Field, Field64, PrimeField64};
 
@@ -641,67 +629,5 @@ mod tests {
             let limbs = core::array::from_fn(|_| GoldilocksField(next()));
             check(QuinticExtension(limbs));
         }
-    }
-
-    /// The generic `QuinticFirstCoeff` default implementation (the `c0` row of the generic
-    /// `Mul`), reconstructed as the reference oracle for the widening specialization above.
-    fn generic_mul_first_coeff(a: QE, b: QE) -> GF {
-        let QuinticExtension([a0, a1, a2, a3, a4]) = a;
-        let QuinticExtension([b0, b1, b2, b3, b4]) = b;
-        a0 * b0
-            + <QE as OEF<5>>::W * (a1 * b4 + a2 * b3 + a3 * b2 + a4 * b1)
-    }
-
-    /// The specialized (delayed-reduction) first-coefficient helper must agree with the
-    /// generic expression as a field value on edge cases and random non-canonical inputs,
-    /// and `try_inverse` (its only consumer) must still return exact inverses.
-    #[test]
-    fn quintic_first_coeff_specialization_matches_generic() {
-        let canon =
-            |x: GF| x.to_canonical_u64();
-        let check_pair = |a: QE, b: QE| {
-            assert_eq!(
-                canon(a.mul_first_coeff(&b)),
-                canon(generic_mul_first_coeff(a, b)),
-                "first coeff mismatch for a={a:?}, b={b:?}"
-            );
-            // The first coefficient of a full product must also match Mul's c0.
-            assert_eq!(canon(a.mul_first_coeff(&b)), canon((a * b).0[0]));
-        };
-
-        let p = GF::ORDER;
-        let specials = [0u64, 1, 2, p - 1, p, u64::MAX];
-        for &u in &specials {
-            for &v in &specials {
-                let a = QuinticExtension([GoldilocksField(u); 5]);
-                let b = QuinticExtension([GoldilocksField(v); 5]);
-                check_pair(a, b);
-            }
-        }
-
-        let mut state = 0x9E37_79B9_7F4A_7C15u64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        for _ in 0..2000 {
-            let a = QuinticExtension(core::array::from_fn(|_| GoldilocksField(next())));
-            let b = QuinticExtension(core::array::from_fn(|_| GoldilocksField(next())));
-            check_pair(a, b);
-
-            // try_inverse consumes the helper: x * x^-1 == 1 exactly.
-            if !a.is_zero() {
-                let inv = a.try_inverse().expect("nonzero element must have an inverse");
-                let prod = a * inv;
-                let limbs = FieldExtension::<5>::to_basefield_array(&prod);
-                assert_eq!(canon(limbs[0]), 1, "a * a^-1 != 1 for a={a:?}");
-                for limb in &limbs[1..] {
-                    assert_eq!(canon(*limb), 0, "a * a^-1 != 1 for a={a:?}");
-                }
-            }
-        }
-        assert!(QE::ZERO.try_inverse().is_none());
     }
 }

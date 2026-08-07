@@ -331,3 +331,6 @@ where
         }
     }
 }
+
+// Redraw ticket 1 of 2 for the five-mechanism consolidation (pre-registered in the submission note). No-op delta: Yukon dedupes identical archives.
+// Retry of failed validation bda2c470 (no score was produced; ticket 1 not consumed). Disclosed in the note.
