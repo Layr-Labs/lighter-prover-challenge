@@ -136,6 +136,48 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         }
     }
 
+    /// Whether this gate honours the `store_from` argument of
+    /// [`Self::eval_unfiltered_base_batch_accumulate_store`].
+    ///
+    /// Gates opt in one at a time; the caller zero-fills the constraint rows
+    /// first written by any gate that has not, so correctness never depends on
+    /// how many gates have been converted.
+    fn supports_store_from(&self) -> bool {
+        false
+    }
+
+    /// Like [`Self::eval_unfiltered_base_batch_accumulate`], but the caller
+    /// guarantees that constraint rows `store_from..num_constraints()` of
+    /// `combined_gate_constraints` are *raw* `F::ZERO` — this gate is the first
+    /// to write them for this batch — so those rows may be **stored** rather
+    /// than accumulated into.
+    ///
+    /// Storing is bit-identical to accumulating into a raw zero, not merely
+    /// field-value identical, which is what lets the caller drop the zero-fill
+    /// entirely once every first-writing gate has opted in. Both
+    /// `batch_multiply_into` and `batch_multiply_add_inplace` use the same
+    /// packed/leftover split, and on each half:
+    ///   - packed: `x_out.multiply_accumulate(a, b)` is, per lane,
+    ///     `reduce128((0 as u128) + a * b)`, and the store is `a * b`, i.e.
+    ///     `reduce128(a * b)` — the same bits;
+    ///   - leftover: the accumulate is `F(0) + a * b`, and `Add` with a zero
+    ///     left operand takes neither overflow branch and returns its right
+    ///     operand unchanged.
+    /// This is the same argument `reduce_gate_constraints_base_batch` already
+    /// uses for its `res_out_is_zero_seed` fast path.
+    ///
+    /// The default implementation ignores `store_from` and accumulates, which
+    /// is always correct: it just requires the caller to have zeroed the rows.
+    fn eval_unfiltered_base_batch_accumulate_store(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+        _store_from: usize,
+    ) {
+        self.eval_unfiltered_base_batch_accumulate(vars_base, filters, combined_gate_constraints)
+    }
+
     /// Defines the recursive constraints that enforce the statement represented by this custom gate.
     /// This is necessary to recursively verify proofs generated from a circuit containing such gates.
     ///
@@ -184,6 +226,7 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         num_lookup_selectors: usize,
         filters: &mut Vec<F>,
         combined_gate_constraints: &mut [F],
+        store_from: usize,
     ) {
         let batch_size = vars_batch.len();
         debug_assert!(self.num_constraints() * batch_size <= combined_gate_constraints.len());
@@ -209,7 +252,12 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
             }
         }
         vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
-        self.eval_unfiltered_base_batch_accumulate(vars_batch, filters, combined_gate_constraints);
+        self.eval_unfiltered_base_batch_accumulate_store(
+            vars_batch,
+            filters,
+            combined_gate_constraints,
+            store_from,
+        );
     }
 
     /// Adds this gate's filtered constraints into the `combined_gate_constraints` buffer.
@@ -340,6 +388,19 @@ impl<F: RichField + Extendable<D>, const D: usize> Serialize for GateRef<F, D> {
 #[derive(Clone, Debug, Default)]
 pub struct CurrentSlot<F: RichField + Extendable<D>, const D: usize> {
     pub current_slot: HashMap<Vec<F>, (usize, usize)>,
+    /// Memoized [`Gate::num_ops`] for the gate this entry is keyed by.
+    ///
+    /// The default `Gate::num_ops` *materializes* the gate's generator list and returns its
+    /// length, so every call allocates one `WitnessGeneratorRef` (an `Arc`) per operation plus
+    /// the `Vec` holding them, and drops all of it immediately. `find_slot` calls it once per
+    /// packed operation, which is where the overwhelming majority of the circuit's operations
+    /// are placed. Caching it here evaluates it once per distinct gate value instead.
+    ///
+    /// Keying on the entry is exact: `CurrentSlot` entries are keyed by `GateRef`, whose `Eq`
+    /// is `Gate::id()` equality, and every gate's `id()` is a `Debug` rendering of its complete
+    /// configuration. Gates that compare equal therefore have identical fields, and `num_ops`
+    /// is a pure function of those fields.
+    pub num_ops: Option<usize>,
 }
 
 /// A gate along with any constants used to configure it.

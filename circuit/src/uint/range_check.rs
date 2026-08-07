@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 use log::warn;
-use plonky2::field::batch_util::batch_multiply_add_inplace;
+use plonky2::field::batch_util::{batch_multiply_add_inplace, batch_multiply_into};
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
@@ -346,6 +346,26 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
         filters: &[F],
         combined_gate_constraints: &mut [F],
     ) {
+        // `store_from == num_constraints()` stores nothing: pure accumulation.
+        self.eval_unfiltered_base_batch_accumulate_store(
+            vars_base,
+            filters,
+            combined_gate_constraints,
+            self.num_constraints(),
+        );
+    }
+
+    fn supports_store_from(&self) -> bool {
+        true
+    }
+
+    fn eval_unfiltered_base_batch_accumulate_store(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+        store_from: usize,
+    ) {
         let n = vars_base.len();
         assert_eq!(filters.len(), n);
         assert!(combined_gate_constraints.len() >= self.num_constraints() * n);
@@ -399,7 +419,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
             }
             let combined =
                 &mut combined_gate_constraints[constraint_index * n..(constraint_index + 1) * n];
-            batch_multiply_add_inplace(combined, &scratch, filters);
+            // Rows at or past `store_from` are raw zero on entry, so the
+            // store is bit-identical to the accumulate.
+            if constraint_index >= store_from {
+                batch_multiply_into(combined, &scratch, filters);
+            } else {
+                batch_multiply_add_inplace(combined, &scratch, filters);
+            }
             constraint_index += 1;
 
             for j in 0..num_aux {
@@ -418,7 +444,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
                 }
                 let combined = &mut combined_gate_constraints
                     [constraint_index * n..(constraint_index + 1) * n];
-                batch_multiply_add_inplace(combined, &scratch, filters);
+                // Rows at or past `store_from` are raw zero on entry, so the
+                // store is bit-identical to the accumulate.
+                if constraint_index >= store_from {
+                    batch_multiply_into(combined, &scratch, filters);
+                } else {
+                    batch_multiply_add_inplace(combined, &scratch, filters);
+                }
                 constraint_index += 1;
             }
         }

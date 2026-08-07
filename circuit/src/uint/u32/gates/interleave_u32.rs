@@ -285,6 +285,25 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32InterleaveG
         debug_assert_eq!(constraint_index, num_constraints);
     }
 
+    fn supports_store_from(&self) -> bool {
+        true
+    }
+
+    fn eval_unfiltered_base_batch_accumulate_store(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+        store_from: usize,
+    ) {
+        self.eval_unfiltered_base_batch_accumulate_packed_store(
+            vars_base,
+            filters,
+            combined_gate_constraints,
+            store_from,
+        );
+    }
+
     fn generators(&self, row: usize, _local_constants: &[F]) -> Vec<WitnessGeneratorRef<F, D>> {
         (0..self.num_ops)
             .map(|i| {

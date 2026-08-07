@@ -111,6 +111,25 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for Multiplication
         );
     }
 
+    fn supports_store_from(&self) -> bool {
+        true
+    }
+
+    fn eval_unfiltered_base_batch_accumulate_store(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+        store_from: usize,
+    ) {
+        self.eval_unfiltered_base_batch_accumulate_packed_store(
+            vars_base,
+            filters,
+            combined_gate_constraints,
+            store_from,
+        );
+    }
+
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,
