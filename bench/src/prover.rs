@@ -104,39 +104,31 @@ fn chain_step_proof(
     chain_step: u64,
     previous: Option<ChainState<'_>>,
     base_proof: &Proof,
-    dummy_proof: &Proof,
+    constant_inputs: &plonky2::iop::witness::PartialWitness<F>,
     tx_proof: &Proof,
 ) -> Proof {
     mark_spine_thread_latency_critical();
     let result = (|| {
         // Phase 1: run every generator that does not depend on the previous chain proof while
-        // that proof may still be in flight. Inputs are written directly into
-        // the partition's representative slots — no PartialWitness map, no
-        // per-path template clone, no replay pass.
-        let mut pending = PendingPartitionWitness::start_seeded(
+        // that proof may still be in flight.
+        let early_inputs = BlockTxChainCircuit::witness_inputs_early_from_template(
+            constant_inputs,
+            chain_target,
+            chain_step,
+            tx_proof,
+        )?;
+        let mut pending = PendingPartitionWitness::start(
+            early_inputs,
             &chain_data.prover_only,
             &chain_data.common,
-            |seeder| {
-                BlockTxChainCircuit::witness_inputs_early_into(
-                    chain_target,
-                    chain_data,
-                    chain_step,
-                    dummy_proof,
-                    tx_proof,
-                    seeder,
-                )
-            },
         )?;
 
-        // Phase 2: wait for the previous chain proof, feed it directly, and prove.
+        // Phase 2: wait for the previous chain proof, feed it, and prove.
         let previous_proof = previous.map(ChainState::wait);
-        pending.feed_seeded(|feeder| {
-            BlockTxChainCircuit::witness_inputs_cyclic_into(
-                chain_target,
-                previous_proof.as_ref().unwrap_or(base_proof),
-                feeder,
-            )
-        })?;
+        pending.feed(BlockTxChainCircuit::witness_inputs_cyclic(
+            chain_target,
+            previous_proof.as_ref().unwrap_or(base_proof),
+        )?)?;
         BlockTxChainCircuit::prove_prepared(pending, chain_data)
     })();
     result.unwrap_or_else(|error| {
@@ -276,9 +268,16 @@ fn prove_path(
     );
     jump = next_jump;
 
+    let chain_constant_inputs = BlockTxChainCircuit::witness_inputs_constant(
+        chain_target,
+        chain_data,
+        dummy_proof,
+    )
+    .expect("chain constant witness inputs failed");
 
     std::thread::scope(|scope| {
         let base = &base_proof;
+        let chain_constant = &chain_constant_inputs;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
@@ -300,7 +299,7 @@ fn prove_path(
                             chain_step,
                             previous,
                             base,
-                            dummy_proof,
+                            chain_constant,
                             &tx_proof,
                         )
                     })
@@ -372,7 +371,7 @@ fn prove_path(
                         chain_step,
                         previous,
                         base,
-                        dummy_proof,
+                        chain_constant,
                         &tx_proof,
                     )
                 })
@@ -396,7 +395,7 @@ fn prove_path(
                 chain_step,
                 previous,
                 base,
-                dummy_proof,
+                chain_constant,
                 &tx_proof,
             )));
         }
