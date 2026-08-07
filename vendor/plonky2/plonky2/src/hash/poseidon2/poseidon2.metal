@@ -974,6 +974,164 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
+        } else if (kind == 7u) {
+            // BaseSumGate: one routed sum then `num_ops` routed limbs. The
+            // recomposition row comes first, then one range product per limb
+            // in wire order. `num_addends` carries the base.
+            uint base = num_addends;
+            ulong acc = wires[(ulong)num_ops * lde_rows + source_row];
+            for (uint i = num_ops; i > 1u; --i) {
+                ulong limb = wires[(ulong)(i - 1u) * lde_rows + source_row];
+                acc = gl_add(gl_mul(acc, (ulong)base), limb);
+            }
+            range_check_gate_emit(
+                gl_sub(acc, wires[source_row]),
+                alpha_powers, alpha_stride, gate_accumulators,
+                constraint_index++);
+            for (uint i = 0; i < num_ops; ++i) {
+                ulong limb = wires[(ulong)(i + 1u) * lde_rows + source_row];
+                ulong product = limb;
+                for (uint k = 1; k < base; ++k) {
+                    product = gl_mul(product, gl_sub(limb, (ulong)k));
+                }
+                range_check_gate_emit(
+                    product,
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 8u) {
+            // ExponentiationGate: the base, `num_ops` power bits in
+            // little-endian order and the output are routed, then the running
+            // values. Each row checks one square-and-multiply step, consuming
+            // the bits from the most significant end, and the last row ties
+            // the final running value to the output.
+            ulong base_value = wires[source_row];
+            ulong previous = 1;
+            for (uint i = 0; i < num_ops; ++i) {
+                ulong bit = wires[(ulong)(num_ops - i) * lde_rows + source_row];
+                ulong running =
+                    wires[((ulong)num_ops + 2u + i) * lde_rows + source_row];
+                ulong selected = gl_add(gl_mul(bit, base_value), gl_sub(1, bit));
+                range_check_gate_emit(
+                    gl_sub(gl_mul(previous, selected), running),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                previous = gl_mul(running, running);
+            }
+            range_check_gate_emit(
+                gl_sub(wires[((ulong)num_ops + 1u) * lde_rows + source_row],
+                       wires[((ulong)num_ops * 2u + 1u) * lde_rows + source_row]),
+                alpha_powers, alpha_stride, gate_accumulators,
+                constraint_index++);
+        } else if (kind == 9u) {
+            // AdditionGate: three routed wires per operation, the two
+            // coefficients read from the gate's own constants.
+            ulong c0 = constants[(ulong)num_carry_limbs * lde_rows + source_row];
+            ulong c1 = constants[((ulong)num_carry_limbs + 1u) * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong routed = (ulong)op * 3u;
+                ulong addend_0 = wires[routed * lde_rows + source_row];
+                ulong addend_1 = wires[(routed + 1u) * lde_rows + source_row];
+                ulong output = wires[(routed + 2u) * lde_rows + source_row];
+                ulong computed =
+                    gl_add(gl_mul(addend_0, c0), gl_mul(addend_1, c1));
+                range_check_gate_emit(
+                    gl_sub(output, computed),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 10u) {
+            // ArithmeticGate: four routed wires per operation, the two
+            // coefficients read from the gate's own constants.
+            ulong c0 = constants[(ulong)num_carry_limbs * lde_rows + source_row];
+            ulong c1 = constants[((ulong)num_carry_limbs + 1u) * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong routed = (ulong)op * 4u;
+                ulong m0 = wires[routed * lde_rows + source_row];
+                ulong m1 = wires[(routed + 1u) * lde_rows + source_row];
+                ulong addend = wires[(routed + 2u) * lde_rows + source_row];
+                ulong output = wires[(routed + 3u) * lde_rows + source_row];
+                ulong computed = gl_add(gl_mul(gl_mul(m0, m1), c0), gl_mul(addend, c1));
+                range_check_gate_emit(
+                    gl_sub(output, computed),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 11u) {
+            // SelectionGate: four routed wires per operation followed by one
+            // temporary per operation after every routed wire.
+            ulong temp_base = (ulong)num_ops * 4u;
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong routed = (ulong)op * 4u;
+                ulong b = wires[routed * lde_rows + source_row];
+                ulong x = wires[(routed + 1u) * lde_rows + source_row];
+                ulong y = wires[(routed + 2u) * lde_rows + source_row];
+                ulong result = wires[(routed + 3u) * lde_rows + source_row];
+                ulong temp = wires[(temp_base + op) * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(gl_sub(gl_mul(b, y), y), temp),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_sub(gl_mul(b, x), temp), result),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 12u) {
+            // EqualityGate: three routed wires per operation followed by three
+            // temporaries per operation; the "one" value is a gate constant.
+            ulong one_value = constants[(ulong)num_carry_limbs * lde_rows + source_row];
+            ulong temp_base = (ulong)num_ops * 3u;
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong routed = (ulong)op * 3u;
+                ulong x = wires[routed * lde_rows + source_row];
+                ulong y = wires[(routed + 1u) * lde_rows + source_row];
+                ulong equal = wires[(routed + 2u) * lde_rows + source_row];
+                ulong temp = temp_base + (ulong)op * 3u;
+                ulong diff = wires[temp * lde_rows + source_row];
+                ulong invdiff = wires[(temp + 1u) * lde_rows + source_row];
+                ulong prod = wires[(temp + 2u) * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(gl_sub(x, y), diff),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_mul(diff, invdiff), prod),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_mul(prod, diff), diff),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_sub(one_value, prod), equal),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 13u) {
+            // MulExtensionGate over the quadratic extension `x^2 = 7`: six
+            // routed wires per operation and one row per output limb.
+            ulong scale = constants[(ulong)num_carry_limbs * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong routed = (ulong)op * 6u;
+                ulong a0 = wires[routed * lde_rows + source_row];
+                ulong a1 = wires[(routed + 1u) * lde_rows + source_row];
+                ulong b0 = wires[(routed + 2u) * lde_rows + source_row];
+                ulong b1 = wires[(routed + 3u) * lde_rows + source_row];
+                ulong out0 = wires[(routed + 4u) * lde_rows + source_row];
+                ulong out1 = wires[(routed + 5u) * lde_rows + source_row];
+                ulong product_0 =
+                    gl_add(gl_mul(a0, b0), gl_mul(7, gl_mul(a1, b1)));
+                ulong product_1 = gl_add(gl_mul(a0, b1), gl_mul(a1, b0));
+                range_check_gate_emit(
+                    gl_sub(out0, gl_mul(product_0, scale)),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(out1, gl_mul(product_1, scale)),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
         } else {
             // The Rust encoder rejects unknown discriminants; if a malformed
             // record reaches the shader, make its selected row unsatisfiable.
