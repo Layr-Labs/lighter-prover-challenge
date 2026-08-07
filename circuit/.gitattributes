@@ -1,0 +1,4 @@
+# Never convert line endings: two tree-wide CRLF clobbers have reached the
+# ranked frontier, each silently reverting promoted mechanisms and breaking the
+# pinned fixture bytes.
+* -text
