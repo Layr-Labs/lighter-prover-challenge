@@ -34,9 +34,9 @@ pub struct RangeCheckQuotientGate {
     pub bit_size: usize,
 }
 
-/// Static wire-layout metadata for gates supported by the optional combined
-/// quotient backend. Keeping only layout values here avoids a dependency from
-/// `plonky2` back to downstream circuit crates.
+/// Static wire-layout metadata for the downstream 32-bit arithmetic gates
+/// supported by the optional quotient backend. Keeping only layout values
+/// here avoids a dependency from `plonky2` back to the circuit crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum U32QuotientGate {
     Arithmetic {
@@ -69,11 +69,15 @@ pub enum U32QuotientGate {
     /// words (input and output limbs) plus ten temporary wires per
     /// operation, fifteen constraint rows per operation.
     QuinticSquaring { num_ops: usize },
-    /// Random access with a little-endian binary index, `2^bits` list items
-    /// per copy, and optional routed local constants.
+    /// Indexed lookup over a `1 << bits` element list. Per copy: the access
+    /// index, the claimed element and the list items are routed, the index
+    /// bits follow all routed wires, and the rows are `bits` booleanity
+    /// checks, the index recomposition, then the tree-folded selection.
+    /// After every copy come `num_extra_constants` rows comparing the gate's
+    /// own constants against routed wires.
     RandomAccess {
         bits: usize,
-        num_ops: usize,
+        num_copies: usize,
         num_extra_constants: usize,
     },
 }
@@ -330,8 +334,8 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         None
     }
 
-    /// Advertises one of the exact promoted gate layouts to optional quotient
-    /// backends. The default leaves unrelated gates on the CPU.
+    /// Advertises one of the exact downstream U32 gate layouts to optional
+    /// quotient backends. The default leaves unrelated gates on the CPU.
     fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
         None
     }

@@ -386,11 +386,12 @@ inline void range_check_gate_emit(
 //   selector column, gate index, group start/end, include UNUSED selector,
 //   operation count, base-4 limbs per operation, final-limb range (2 or 4),
 //   then two unused words that keep both record kinds the same stride.
-// It is followed by promoted-family records with the same five selector words,
-// then kind (arithmetic=0, subtraction=1, add-many=2, byte-decomposition=3,
-// quintic-multiplication=4, quintic-squaring=5, random-access=6), operation or
-// copy count, and three explicit kind words. Random access uses the final words
-// for index bits, extra constants, and the raw constant-column base.
+// It is followed by U32-family records with the same five selector words, then:
+//   kind (arithmetic=0, subtraction=1, add-many=2, byte-decomposition=3,
+//   quintic-multiplication=4, quintic-squaring=5), operation count,
+//   addend count (byte-limb count for byte decomposition, zero except for
+//   add-many), base-4 result limbs, and carry limbs (zero except for
+//   add-many).
 // The result-limb count is what makes the subtraction and add-many branches
 // width-generic: a `2 * result_limbs`-bit word recomposes from that many
 // base-4 limbs and its overflow weight is `1 << (2 * result_limbs)`, which
@@ -398,35 +399,6 @@ inline void range_check_gate_emit(
 // Every gate starts again at constraint row zero. This matches the CPU's
 // shared row accumulator: reducing each filtered gate locally with the same
 // alpha powers and then adding the results is linear in those row values.
-
-// Select within one contiguous eight-item block using the low three index bits.
-// Keeping only this block and the at-most-eight block results private avoids a
-// 64-word private array for the audited six-bit gate.
-inline ulong random_access_select_8(
-    const device ulong* wires,
-    uint lde_rows,
-    uint source_row,
-    ulong list_base,
-    ulong bit_base,
-    uint block) {
-    ulong items[8];
-    for (uint i = 0; i < 8u; ++i) {
-        ulong column = list_base + (ulong)block * 8u + i;
-        items[i] = wires[column * lde_rows + source_row];
-    }
-    uint level_size = 8u;
-    for (uint level = 0; level < 3u; ++level) {
-        ulong b = wires[(bit_base + level) * lde_rows + source_row];
-        for (uint k = 0; k < level_size / 2u; ++k) {
-            ulong x = items[2u * k];
-            ulong y = items[2u * k + 1u];
-            items[k] = gl_add(x, gl_mul(b, gl_sub(y, x)));
-        }
-        level_size /= 2u;
-    }
-    return items[0];
-}
-
 kernel void range_check_gate_quotient(
     const device ulong* wires [[buffer(0)]],
     const device ulong* constants [[buffer(1)]],
@@ -889,97 +861,93 @@ kernel void range_check_gate_quotient(
                     alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 6u) {
+        } else {
+            // RandomAccessGate. For this family the generic record slots
+            // carry `bits`, the extra-constant count and the absolute
+            // constants column those constants begin at; `num_ops` is the
+            // copy count. Per copy the routed block is the access index, the
+            // claimed element and `1 << bits` list items; the index bits sit
+            // after every routed wire.
             uint bits = num_addends;
             uint num_extra_constants = result_limbs;
-            uint constant_base = num_carry_limbs;
-            uint num_copies = num_ops;
-            ulong vec_size = 1UL << bits;
-            ulong routed_per_copy = vec_size + 2u;
-            ulong extra_wire_base = routed_per_copy * num_copies;
-            ulong bit_base = extra_wire_base + num_extra_constants;
+            uint constants_base = num_carry_limbs;
+            uint vec_size = 1u << bits;
+            uint routed_per_copy = vec_size + 2u;
+            ulong bit_base = (ulong)routed_per_copy * num_ops + num_extra_constants;
+            for (uint copy = 0; copy < num_ops; ++copy) {
+                ulong routed_base = (ulong)routed_per_copy * copy;
+                ulong access_index = wires[routed_base * lde_rows + source_row];
+                ulong claimed_element = wires[(routed_base + 1u) * lde_rows + source_row];
 
-            for (uint copy = 0; copy < num_copies; ++copy) {
-                ulong copy_base = routed_per_copy * copy;
-
-                // RandomAccessGate emits boolean constraints for b_0 upward.
+                ulong bit_values[6];
                 for (uint i = 0; i < bits; ++i) {
-                    ulong b = wires[(bit_base + (ulong)copy * bits + i)
-                        * lde_rows + source_row];
+                    bit_values[i] =
+                        wires[(bit_base + (ulong)copy * bits + i) * lde_rows + source_row];
+                }
+
+                // Booleanity of every index bit, in wire order.
+                for (uint i = 0; i < bits; ++i) {
+                    ulong b = bit_values[i];
                     range_check_gate_emit(
                         gl_mul(b, gl_sub(b, 1)),
-                        alpha_powers,
-                        alpha_stride,
-                        gate_accumulators,
+                        alpha_powers, alpha_stride, gate_accumulators,
                         constraint_index++);
                 }
 
-                // Reconstruct the little-endian index in the CPU's exact
-                // reverse-bit `acc.double() + b` order.
-                ulong reconstructed_index = 0;
+                // The CPU folds the bits reversed with `acc = 2 * acc + b`,
+                // so the recomposition is little-endian in wire order.
+                ulong reconstructed = 0;
                 for (uint remaining = bits; remaining > 0u; --remaining) {
-                    uint i = remaining - 1u;
-                    ulong b = wires[(bit_base + (ulong)copy * bits + i)
-                        * lde_rows + source_row];
-                    reconstructed_index = gl_add(
-                        gl_add(reconstructed_index, reconstructed_index), b);
+                    ulong b = bit_values[remaining - 1u];
+                    reconstructed = gl_add(gl_add(reconstructed, reconstructed), b);
                 }
-                ulong access_index = wires[copy_base * lde_rows + source_row];
                 range_check_gate_emit(
-                    gl_sub(reconstructed_index, access_index),
-                    alpha_powers,
-                    alpha_stride,
-                    gate_accumulators,
+                    gl_sub(reconstructed, access_index),
+                    alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
 
-                // Fold each eight-item block in ascending pair order, then fold
-                // block results with the remaining bits in the same order.
-                ulong block_results[8];
-                uint block_count = (uint)(vec_size / 8u);
-                ulong list_base = copy_base + 2u;
-                ulong copy_bit_base = bit_base + (ulong)copy * bits;
-                for (uint block = 0; block < block_count; ++block) {
-                    block_results[block] = random_access_select_8(
-                        wires, lde_rows, source_row, list_base, copy_bit_base, block);
-                }
-                uint level_size = block_count;
-                for (uint i = 3u; i < bits; ++i) {
-                    ulong b = wires[(copy_bit_base + i) * lde_rows + source_row];
-                    for (uint k = 0; k < level_size / 2u; ++k) {
-                        ulong x = block_results[2u * k];
-                        ulong y = block_results[2u * k + 1u];
-                        block_results[k] = gl_add(x, gl_mul(b, gl_sub(y, x)));
+                // Fold the list pairwise, bit `i` selecting at level `i`. The
+                // first level reads the list items straight from the wire
+                // columns, so the working array only ever holds half of them.
+                ulong items[32];
+                uint level_size = vec_size >> 1u;
+                {
+                    ulong b = bit_values[0];
+                    for (uint k = 0; k < level_size; ++k) {
+                        ulong x =
+                            wires[(routed_base + 2u + 2u * k) * lde_rows + source_row];
+                        ulong y =
+                            wires[(routed_base + 3u + 2u * k) * lde_rows + source_row];
+                        items[k] = gl_add(x, gl_mul(b, gl_sub(y, x)));
                     }
-                    level_size /= 2u;
                 }
-                ulong claimed_element = wires[(copy_base + 1u) * lde_rows + source_row];
+                for (uint i = 1; i < bits; ++i) {
+                    ulong b = bit_values[i];
+                    level_size >>= 1u;
+                    for (uint k = 0; k < level_size; ++k) {
+                        ulong x = items[2u * k];
+                        ulong y = items[2u * k + 1u];
+                        items[k] = gl_add(x, gl_mul(b, gl_sub(y, x)));
+                    }
+                }
                 range_check_gate_emit(
-                    gl_sub(block_results[0], claimed_element),
-                    alpha_powers,
-                    alpha_stride,
-                    gate_accumulators,
+                    gl_sub(items[0], claimed_element),
+                    alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
 
-            // Raw local constants follow all gate and lookup selectors.
+            // The gate's own constants, compared against routed wires after
+            // every copy's rows.
+            ulong extra_base = (ulong)routed_per_copy * num_ops;
             for (uint i = 0; i < num_extra_constants; ++i) {
-                ulong local_constant = constants[
-                    ((ulong)constant_base + i) * lde_rows + source_row];
-                ulong extra_wire = wires[
-                    (extra_wire_base + i) * lde_rows + source_row];
+                ulong constant_value =
+                    constants[((ulong)constants_base + i) * lde_rows + source_row];
+                ulong wire_value = wires[(extra_base + i) * lde_rows + source_row];
                 range_check_gate_emit(
-                    gl_sub(local_constant, extra_wire),
-                    alpha_powers,
-                    alpha_stride,
-                    gate_accumulators,
+                    gl_sub(constant_value, wire_value),
+                    alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
-        } else {
-            // The Rust encoder rejects unknown discriminants; if a malformed
-            // record reaches the shader, make its selected row unsatisfiable.
-            range_check_gate_emit(
-                1, alpha_powers, alpha_stride, gate_accumulators,
-                constraint_index++);
         }
 
         total[0] = gl_add(total[0], gl_mul(filter, gate_accumulators[0]));
