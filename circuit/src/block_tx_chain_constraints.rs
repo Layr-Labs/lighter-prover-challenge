@@ -12,7 +12,7 @@ use plonky2::gates::select_base::SelectionGate;
 use plonky2::hash::hash_types::{HashOut, RichField};
 use plonky2::iop::generator::PendingPartitionWitness;
 use plonky2::iop::target::{BoolTarget, Target};
-use plonky2::iop::witness::{PartialWitness, WitnessWrite};
+use plonky2::iop::witness::{PartialWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_data::{
     CircuitConfig, CircuitData, CommonCircuitData, VerifierCircuitTarget,
 };
@@ -210,16 +210,22 @@ impl BlockTxChainCircuit {
         dummy_proof_cyclic: &ProofWithPublicInputs<F, C, D>,
     ) -> Result<PartialWitness<F>> {
         let mut pw = PartialWitness::new();
+        Self::write_inputs_constant(target, circuit_data, dummy_proof_cyclic, &mut pw)?;
+        Ok(pw)
+    }
 
+    /// Writes the verifier data and dummy proof shared by every chain step.
+    pub fn write_inputs_constant<W: Witness<F>>(
+        target: &BlockTxChainTarget,
+        circuit_data: &CircuitData<F, C, D>,
+        dummy_proof_cyclic: &ProofWithPublicInputs<F, C, D>,
+        pw: &mut W,
+    ) -> Result<()> {
         pw.set_verifier_data_target(&target.self_verifier_data, &circuit_data.verifier_only)?;
-
-        // This will take place of `DummyProofGenerator`
         pw.set_proof_with_pis_target(
             &target.dummy_proof_with_pis_target_cyclic,
             dummy_proof_cyclic,
-        )?;
-
-        Ok(pw)
+        )
     }
 
     /// The per-step early inputs, layered onto a clone of
@@ -249,13 +255,30 @@ impl BlockTxChainCircuit {
         dummy_proof_cyclic: &ProofWithPublicInputs<F, C, D>,
         current_block_tx_proof: &ProofWithPublicInputs<F, C, D>,
     ) -> Result<PartialWitness<F>> {
-        let template = Self::witness_inputs_constant(target, circuit_data, dummy_proof_cyclic)?;
-        Self::witness_inputs_early_from_template(
-            &template,
+        let mut pw = PartialWitness::new();
+        Self::write_inputs_early(
             target,
+            circuit_data,
             recursion_step,
+            dummy_proof_cyclic,
             current_block_tx_proof,
-        )
+            &mut pw,
+        )?;
+        Ok(pw)
+    }
+
+    /// Writes all chain-step inputs available before the cyclic predecessor.
+    pub fn write_inputs_early<W: Witness<F>>(
+        target: &BlockTxChainTarget,
+        circuit_data: &CircuitData<F, C, D>,
+        recursion_step: u64,
+        dummy_proof_cyclic: &ProofWithPublicInputs<F, C, D>,
+        current_block_tx_proof: &ProofWithPublicInputs<F, C, D>,
+        pw: &mut W,
+    ) -> Result<()> {
+        Self::write_inputs_constant(target, circuit_data, dummy_proof_cyclic, pw)?;
+        pw.set_proof_with_pis_target(&target.tx_proof, current_block_tx_proof)?;
+        pw.set_target(target.recursion_step, F::from_canonical_u64(recursion_step))
     }
 
     /// The cyclic-proof witness inputs, fed once the previous chain step's proof is available.
@@ -264,8 +287,18 @@ impl BlockTxChainCircuit {
         cyclic_proof: &ProofWithPublicInputs<F, C, D>,
     ) -> Result<PartialWitness<F>> {
         let mut pw = PartialWitness::new();
-        pw.set_proof_with_pis_target(&target.cyclic_proof, cyclic_proof)?;
+        Self::write_inputs_cyclic(target, cyclic_proof, &mut pw)?;
         Ok(pw)
+    }
+
+    /// Writes the predecessor proof supplied after the early chain generators
+    /// have run to quiescence.
+    pub fn write_inputs_cyclic<W: Witness<F>>(
+        target: &BlockTxChainTarget,
+        cyclic_proof: &ProofWithPublicInputs<F, C, D>,
+        pw: &mut W,
+    ) -> Result<()> {
+        pw.set_proof_with_pis_target(&target.cyclic_proof, cyclic_proof)
     }
 
     /// Proves a chain step whose witness inputs were supplied through a
