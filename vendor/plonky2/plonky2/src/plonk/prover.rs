@@ -28,7 +28,8 @@ use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{
-    eval_vanishing_poly_base_batch, get_lut_poly, PermutationBatch, VanishingScratch,
+    eval_vanishing_poly_base_batch, get_lut_poly, LdeColumnBatch, PermutationBatch,
+    VanishingScratch,
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
@@ -915,13 +916,6 @@ fn compute_quotient_polys<
                     (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
                 };
 
-                prover_data.constants_sigmas_commitment.fill_lde_batch(
-                    &scratch.indices,
-                    step,
-                    common_data.sigmas_range(),
-                    batch_layout,
-                    &mut scratch.s_sigmas_flat,
-                );
                 wires_commitment.fill_lde_batch(
                     &scratch.indices,
                     step,
@@ -929,20 +923,62 @@ fn compute_quotient_polys<
                     BatchLayout::PolyMajor,
                     &mut scratch.local_wires,
                 );
-                zs_partial_products_and_lookup_commitment.fill_lde_batch(
-                    &scratch.indices,
-                    step,
-                    zs_local_range,
-                    batch_layout,
-                    &mut scratch.zs_local_flat,
-                );
-                zs_partial_products_and_lookup_commitment.fill_lde_batch(
-                    &scratch.indices_next,
-                    step,
-                    zs_next_range,
-                    batch_layout,
-                    &mut scratch.zs_next_flat,
-                );
+
+                // The ranked no-lookup path stores these commitments as
+                // columns and walks consecutive quotient points. Borrow those
+                // slices directly instead of copying three PolyMajor batches
+                // into thread-local scratch. Strided, wrapped, row-backed and
+                // lookup batches retain the existing gather fallback.
+                let borrowed_perm = if col_major_perm {
+                    match (
+                        zs_partial_products_and_lookup_commitment.contiguous_lde_columns(
+                            &scratch.indices,
+                            step,
+                            zs_local_range.clone(),
+                        ),
+                        zs_partial_products_and_lookup_commitment.contiguous_lde_columns(
+                            &scratch.indices_next,
+                            step,
+                            zs_next_range.clone(),
+                        ),
+                        prover_data.constants_sigmas_commitment.contiguous_lde_columns(
+                            &scratch.indices,
+                            step,
+                            common_data.sigmas_range(),
+                        ),
+                    ) {
+                        (Some(zs_local), Some(zs_next), Some(sigmas)) => {
+                            Some((zs_local, zs_next, sigmas))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                if borrowed_perm.is_none() {
+                    prover_data.constants_sigmas_commitment.fill_lde_batch(
+                        &scratch.indices,
+                        step,
+                        common_data.sigmas_range(),
+                        batch_layout,
+                        &mut scratch.s_sigmas_flat,
+                    );
+                    zs_partial_products_and_lookup_commitment.fill_lde_batch(
+                        &scratch.indices,
+                        step,
+                        zs_local_range,
+                        batch_layout,
+                        &mut scratch.zs_local_flat,
+                    );
+                    zs_partial_products_and_lookup_commitment.fill_lde_batch(
+                        &scratch.indices_next,
+                        step,
+                        zs_next_range,
+                        batch_layout,
+                        &mut scratch.zs_next_flat,
+                    );
+                }
 
                 let indices_batch = &scratch.indices;
                 // Per-point row views over the PointMajor gathers, built only
@@ -1002,10 +1038,21 @@ fn compute_quotient_polys<
                 };
 
                 let perm = if col_major_perm {
-                    PermutationBatch::Cols {
-                        zs_partial_products_cols: &scratch.zs_local_flat,
-                        zs_next_cols: &scratch.zs_next_flat,
-                        s_sigmas_cols: &scratch.s_sigmas_flat,
+                    if let Some((zs_local, zs_next, sigmas)) = borrowed_perm {
+                        PermutationBatch::Cols {
+                            zs_partial_products_cols: LdeColumnBatch::Borrowed(zs_local),
+                            zs_next_cols: LdeColumnBatch::Borrowed(zs_next),
+                            s_sigmas_cols: LdeColumnBatch::Borrowed(sigmas),
+                        }
+                    } else {
+                        PermutationBatch::Cols {
+                            zs_partial_products_cols: LdeColumnBatch::flat(
+                                &scratch.zs_local_flat,
+                                n,
+                            ),
+                            zs_next_cols: LdeColumnBatch::flat(&scratch.zs_next_flat, n),
+                            s_sigmas_cols: LdeColumnBatch::flat(&scratch.s_sigmas_flat, n),
+                        }
                     }
                 } else {
                     PermutationBatch::Rows {
@@ -1261,6 +1308,42 @@ mod quotient_layout_tests {
         commitment.fill_lde_batch_contiguous(indices[0], indices.len(), range, &mut contiguous);
 
         assert_eq!(contiguous, indexed);
+    }
+
+    #[test]
+    fn borrowed_lde_columns_match_contiguous_gather() {
+        let (data, _) = small_circuit();
+        let commitment = &data.prover_only.constants_sigmas_commitment;
+        let range = data.common.sigmas_range();
+        let indices = [3usize, 4, 5, 6, 7, 8, 9];
+        let mut gathered = Vec::new();
+
+        commitment.fill_lde_batch(
+            &indices,
+            1,
+            range.clone(),
+            BatchLayout::PolyMajor,
+            &mut gathered,
+        );
+        let borrowed = commitment
+            .contiguous_lde_columns(&indices, 1, range.clone())
+            .expect("column-backed contiguous batch must be borrowable");
+
+        assert_eq!(borrowed.num_columns(), range.len());
+        assert_eq!(borrowed.num_points(), indices.len());
+        for column in 0..range.len() {
+            assert_eq!(
+                borrowed.column(column),
+                &gathered[column * indices.len()..(column + 1) * indices.len()]
+            );
+        }
+
+        assert!(
+            commitment
+                .contiguous_lde_columns(&indices, 2, range)
+                .is_none(),
+            "strided batches must retain the gather fallback"
+        );
     }
 
     /// Scratch reuse: `fill_lde_batch` writes every cell of `out` before any

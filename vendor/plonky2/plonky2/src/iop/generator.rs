@@ -343,6 +343,45 @@ impl<F: Field> Witness<F> for PartitionSeeder<'_, '_, F> {
     }
 }
 
+/// Writes late inputs directly into a pending partition witness and records
+/// exactly the unfinished generators made ready by those inputs.
+pub struct PartitionFeeder<'a, 'b, F: Field> {
+    witness: &'b mut PartitionWitness<'a, F>,
+    unresolved_watches: &'b mut [usize],
+    generator_is_expired: &'b [bool],
+    generator_indices_by_watches: &'b BTreeMap<usize, Vec<usize>>,
+    pending_generator_indices: &'b mut Vec<usize>,
+}
+
+impl<F: Field> Debug for PartitionFeeder<'_, '_, F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PartitionFeeder").finish_non_exhaustive()
+    }
+}
+
+impl<F: Field> WitnessWrite<F> for PartitionFeeder<'_, '_, F> {
+    fn set_target(&mut self, target: Target, value: F) -> Result<()> {
+        if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
+            if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
+                for &generator_idx in watchers {
+                    if !self.generator_is_expired[generator_idx] {
+                        debug_assert_ne!(self.unresolved_watches[generator_idx], 0);
+                        self.unresolved_watches[generator_idx] -= 1;
+                        self.pending_generator_indices.push(generator_idx);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<F: Field> Witness<F> for PartitionFeeder<'_, '_, F> {
+    fn try_get_target(&self, target: Target) -> Option<F> {
+        self.witness.try_get_target(target)
+    }
+}
+
 /// Resumable witness generation: [`Self::start`] seeds an initial set of inputs and runs every
 /// generator that can already make progress, each [`Self::feed`] sets newly available inputs and
 /// resumes only the generators watching them, and [`Self::finish`] performs the same completeness
@@ -491,22 +530,28 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
     /// newly populated representatives are queued; every other unfinished generator was already
     /// run to quiescence and cannot make progress without new values.
     pub fn feed(&mut self, inputs: PartialWitness<F>) -> Result<()> {
-        let generator_indices_by_watches = &self.prover_data.generator_indices_by_watches;
-
-        let mut pending_generator_indices = Vec::new();
-        for (t, v) in inputs.target_values.into_iter() {
-            if let Some(watch) = self.witness.set_target_returning_rep(t, v)? {
-                if let Some(watchers) = generator_indices_by_watches.get(&watch) {
-                    for &watching_generator_idx in watchers {
-                        if !self.generator_is_expired[watching_generator_idx] {
-                            debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
-                            self.unresolved_watches[watching_generator_idx] -= 1;
-                            pending_generator_indices.push(watching_generator_idx);
-                        }
-                    }
-                }
+        self.feed_seeded(|feeder| {
+            for (target, value) in inputs.target_values.into_iter() {
+                feeder.set_target(target, value)?;
             }
-        }
+            Ok(())
+        })
+    }
+
+    /// Writes late inputs directly into this partition and resumes generators
+    /// watching representatives populated by the write.
+    pub fn feed_seeded(
+        &mut self,
+        seed: impl FnOnce(&mut PartitionFeeder<'a, '_, F>) -> Result<()>,
+    ) -> Result<()> {
+        let mut pending_generator_indices = Vec::new();
+        seed(&mut PartitionFeeder {
+            witness: &mut self.witness,
+            unresolved_watches: &mut self.unresolved_watches,
+            generator_is_expired: &self.generator_is_expired,
+            generator_indices_by_watches: &self.prover_data.generator_indices_by_watches,
+            pending_generator_indices: &mut pending_generator_indices,
+        })?;
 
         run_generator_worklist(
             &mut self.witness,
@@ -1348,6 +1393,50 @@ mod tests {
         )?;
         outer.verify(single_shot_proof)?;
         outer.verify(two_phase_proof)
+    }
+
+    #[test]
+    fn pending_partition_witness_direct_feed_matches_map_feed() -> Result<()> {
+        let (outer, early_inputs, late_inputs) = two_inner_proof_fixture()?;
+        let single_shot_inputs = merged_inputs(&early_inputs, &late_inputs)?;
+        let single_shot = generate_partial_witness(
+            single_shot_inputs.clone(),
+            &outer.prover_only,
+            &outer.common,
+        )?;
+        let single_shot_repeat =
+            generate_partial_witness(single_shot_inputs, &outer.prover_only, &outer.common)?;
+
+        let mut pending = PendingPartitionWitness::start_seeded(
+            &outer.prover_only,
+            &outer.common,
+            |seeder| {
+                for (&target, &value) in &early_inputs.target_values {
+                    seeder.set_target(target, value)?;
+                }
+                Ok(())
+            },
+        )?;
+        pending.feed_seeded(|feeder| {
+            for (&target, &value) in &late_inputs.target_values {
+                feeder.set_target(target, value)?;
+            }
+            Ok(())
+        })?;
+        let direct_split = pending.finish()?;
+
+        for ((single_value, repeat_value), split_value) in single_shot
+            .values
+            .iter()
+            .zip(&single_shot_repeat.values)
+            .zip(&direct_split.values)
+        {
+            if single_value == repeat_value {
+                assert_eq!(single_value, split_value);
+            }
+        }
+
+        Ok(())
     }
 
     #[test]

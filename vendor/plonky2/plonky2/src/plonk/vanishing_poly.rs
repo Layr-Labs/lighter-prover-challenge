@@ -9,6 +9,7 @@ use super::vars::EvaluationVarsBase;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
+use crate::fri::oracle::ContiguousLdeColumns;
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
 use crate::gates::selectors::LookupSelectors;
@@ -184,12 +185,11 @@ pub(crate) struct VanishingScratch<F> {
 /// of point-major gather buffers; it is required whenever the circuit has
 /// lookups, whose constraint evaluator consumes per-point rows.
 ///
-/// `Cols` carries flat column-major buffers straight from `fill_lde_batch`'s
-/// `PolyMajor` layout — column `c`'s batch values occupy `[c * n..(c + 1) * n]`
-/// — which the no-lookup column evaluator reads directly, with no transpose in
-/// between.
+/// `Cols` carries column-major views, either over a flat `fill_lde_batch`
+/// fallback or directly over column-backed LDE storage. The no-lookup column
+/// evaluator consumes both representations through the same read-only view.
 #[derive(Clone, Copy)]
-pub(crate) enum PermutationBatch<'a, F> {
+pub(crate) enum PermutationBatch<'a, F: RichField> {
     Rows {
         local_zs_batch: &'a [&'a [F]],
         next_zs_batch: &'a [&'a [F]],
@@ -200,12 +200,56 @@ pub(crate) enum PermutationBatch<'a, F> {
         /// Z and partial-product columns `0..(num_partial_products + 1) * num_challenges`
         /// of the zs/partial-products commitment, i.e. `zs_range` followed by
         /// `partial_products_range`.
-        zs_partial_products_cols: &'a [F],
+        zs_partial_products_cols: LdeColumnBatch<'a, F>,
         /// Z columns only (`zs_range`), gathered at the "next" indices.
-        zs_next_cols: &'a [F],
+        zs_next_cols: LdeColumnBatch<'a, F>,
         /// Sigma columns (`sigmas_range` of the constants-sigmas commitment).
-        s_sigmas_cols: &'a [F],
+        s_sigmas_cols: LdeColumnBatch<'a, F>,
     },
+}
+
+/// Read-only column-major inputs for the batched permutation evaluator.
+#[derive(Clone, Copy)]
+pub(crate) enum LdeColumnBatch<'a, F: RichField> {
+    Flat {
+        values: &'a [F],
+        num_points: usize,
+    },
+    Borrowed(ContiguousLdeColumns<'a, F>),
+}
+
+impl<'a, F: RichField> LdeColumnBatch<'a, F> {
+    pub(crate) const fn flat(values: &'a [F], num_points: usize) -> Self {
+        Self::Flat { values, num_points }
+    }
+
+    fn num_columns(&self) -> usize {
+        match self {
+            Self::Flat { values, num_points } => {
+                assert!(*num_points != 0);
+                assert_eq!(values.len() % num_points, 0);
+                values.len() / num_points
+            }
+            Self::Borrowed(columns) => columns.num_columns(),
+        }
+    }
+
+    fn num_points(&self) -> usize {
+        match self {
+            Self::Flat { num_points, .. } => *num_points,
+            Self::Borrowed(columns) => columns.num_points(),
+        }
+    }
+
+    fn column(&self, column: usize) -> &[F] {
+        match self {
+            Self::Flat { values, num_points } => {
+                assert!(column < self.num_columns());
+                &values[column * num_points..(column + 1) * num_points]
+            }
+            Self::Borrowed(columns) => columns.column(column),
+        }
+    }
 }
 
 fn reduce_gate_constraints_base_batch<F: Field>(
@@ -320,12 +364,15 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             !has_lookup,
             "lookup circuits need per-point permutation rows"
         );
+        assert_eq!(zs_partial_products_cols.num_points(), n);
+        assert_eq!(zs_next_cols.num_points(), n);
+        assert_eq!(s_sigmas_cols.num_points(), n);
         assert_eq!(
-            zs_partial_products_cols.len(),
-            (num_prods + 1) * num_challenges * n
+            zs_partial_products_cols.num_columns(),
+            (num_prods + 1) * num_challenges
         );
-        assert_eq!(zs_next_cols.len(), num_challenges * n);
-        assert_eq!(s_sigmas_cols.len(), num_routed_wires * n);
+        assert_eq!(zs_next_cols.num_columns(), num_challenges);
+        assert_eq!(s_sigmas_cols.num_columns(), num_routed_wires);
 
         let wires = vars_batch.local_wires;
         let chunk_size = max_degree;
@@ -362,11 +409,11 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         // `acc_cols[i * acc_stride + c * n..][..n]`.
         let acc_col = |i: usize, c: usize| -> &[F] {
             if c == 0 {
-                &zs_partial_products_cols[i * n..][..n]
+                zs_partial_products_cols.column(i)
             } else if c <= num_prods {
-                &zs_partial_products_cols[(num_challenges + i * num_prods + (c - 1)) * n..][..n]
+                zs_partial_products_cols.column(num_challenges + i * num_prods + (c - 1))
             } else {
-                &zs_next_cols[i * n..][..n]
+                zs_next_cols.column(i)
             }
         };
 
@@ -392,7 +439,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 den_prod.clear();
                 {
                     let wire_col = &wires[j_start * n..][..n];
-                    let sigma_col = &s_sigmas_cols[j_start * n..][..n];
+                    let sigma_col = s_sigmas_cols.column(j_start);
                     let beta_k_i = beta_k_is[i * num_routed_wires + j_start];
                     for k in 0..n {
                         num_prod.push(wire_col[k] + beta_k_i * xs_batch[k] + gamma);
@@ -401,7 +448,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 }
                 for j in j_start + 1..j_end {
                     let wire_col = &wires[j * n..][..n];
-                    let sigma_col = &s_sigmas_cols[j * n..][..n];
+                    let sigma_col = s_sigmas_cols.column(j);
                     let beta_k_i = beta_k_is[i * num_routed_wires + j];
                     for k in 0..n {
                         num_prod[k] *= wire_col[k] + beta_k_i * xs_batch[k] + gamma;
