@@ -208,6 +208,7 @@ pub(crate) enum PermutationBatch<'a, F> {
     },
 }
 
+#[cfg(test)]
 fn reduce_gate_constraints_base_batch<F: Field>(
     constraint_terms_batch: &[F],
     batch_size: usize,
@@ -228,13 +229,60 @@ fn reduce_gate_constraints_base_batch<F: Field>(
     }
 }
 
+/// Reduces the gate-constraint rows into fresh output storage.
+///
+/// The first row performs the same multiply-accumulate as the zero-initialized
+/// path, but writes its result directly into each slot. This preserves the
+/// field representation produced by `multiply_accumulate` while avoiding a
+/// separate full-buffer zero fill before the Horner reduction.
+fn reduce_gate_constraints_base_batch_from_zero<'a, F: Field>(
+    constraint_terms_batch: &[F],
+    batch_size: usize,
+    alphas: &[F],
+    res_out: &'a mut [core::mem::MaybeUninit<F>],
+) -> &'a mut [F] {
+    debug_assert!(batch_size > 0);
+    debug_assert_eq!(constraint_terms_batch.len() % batch_size, 0);
+    debug_assert_eq!(res_out.len(), batch_size * alphas.len());
+
+    let mut constraint_rows = constraint_terms_batch.chunks_exact(batch_size).rev();
+    if let Some(first_row) = constraint_rows.next() {
+        for (point, &term) in first_row.iter().enumerate() {
+            let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
+            for (value, &alpha) in result.iter_mut().zip(alphas) {
+                value.write(term.multiply_accumulate(F::ZERO, alpha));
+            }
+        }
+    } else {
+        // Degenerate circuits with no gate constraints still retain the old
+        // zero-initialized result.
+        for value in res_out.iter_mut() {
+            value.write(F::ZERO);
+        }
+    }
+
+    // SAFETY: the first row above initializes every point/challenge slot, or
+    // the empty-row fallback initializes the whole slice explicitly.
+    let res_out =
+        unsafe { core::slice::from_raw_parts_mut(res_out.as_mut_ptr().cast::<F>(), res_out.len()) };
+    for constraint_row in constraint_rows {
+        for (point, &term) in constraint_row.iter().enumerate() {
+            let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
+            for (value, &alpha) in result.iter_mut().zip(alphas) {
+                *value = term.multiply_accumulate(*value, alpha);
+            }
+        }
+    }
+    res_out
+}
+
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
 ///
 /// Results are stored point-major: the challenges for point `k` occupy
-/// `res_out[k * num_challenges..(k + 1) * num_challenges]`. `res_out` must be
-/// zero-initialized by the caller.
+/// `res_out[k * num_challenges..(k + 1) * num_challenges]`. Every output slot
+/// is initialized before this function returns.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const D: usize>(
+pub(crate) fn eval_vanishing_poly_base_batch<'a, F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
     indices_batch: &[usize],
     xs_batch: &[F],
@@ -250,8 +298,8 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
     scratch: &mut VanishingScratch<F>,
-    res_out: &mut [F],
-) {
+    res_out: &'a mut [core::mem::MaybeUninit<F>],
+) -> &'a mut [F] {
     let has_lookup = common_data.num_lookup_polys != 0;
 
     let n = indices_batch.len();
@@ -283,7 +331,8 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(betas.len(), num_challenges);
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
-    reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out);
+    let res_out =
+        reduce_gate_constraints_base_batch_from_zero(constraint_terms_batch, n, alphas, res_out);
 
     let numerator_values = &mut scratch.numerator_values;
     let denominator_values = &mut scratch.denominator_values;
@@ -435,7 +484,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         l_0_xs.clear();
         num_prod.clear();
         den_prod.clear();
-        return;
+        return res_out;
     }
 
     let PermutationBatch::Rows {
@@ -555,6 +604,8 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         vanishing_partial_products_terms.clear();
         vanishing_all_lookup_terms.clear();
     }
+
+    res_out
 }
 
 /// Evaluates all lookup constraints, based on the logarithmic derivatives paper (<https://eprint.iacr.org/2022/1530.pdf>),
@@ -1168,6 +1219,8 @@ pub(crate) fn eval_vanishing_poly_circuit<F: RichField + Extendable<D>, const D:
 
 #[cfg(test)]
 mod tests {
+    use core::mem::MaybeUninit;
+
     use plonky2_field::goldilocks_field::GoldilocksField;
 
     use super::*;
@@ -1218,6 +1271,34 @@ mod tests {
             let mut actual = initial;
             reduce_gate_constraints_base_batch(&terms, batch_size, &alphas, &mut actual);
             assert_eq!(actual, expected, "batch size {batch_size}");
+        }
+    }
+
+    #[test]
+    fn zero_initialized_constraint_reduction_matches_legacy_buffer() {
+        type F = GoldilocksField;
+
+        let alphas = [F::from_canonical_u64(3), F::from_canonical_u64(5)];
+        for batch_size in [1, 11, 31, 32] {
+            for num_constraints in [0, 1, 7] {
+                let terms = (0..batch_size * num_constraints)
+                    .map(|i| F::from_canonical_usize(i * 17 + 3))
+                    .collect::<Vec<_>>();
+                let mut expected = vec![F::ZERO; batch_size * alphas.len()];
+                reduce_gate_constraints_base_batch(&terms, batch_size, &alphas, &mut expected);
+
+                let mut storage = vec![MaybeUninit::uninit(); batch_size * alphas.len()];
+                let actual = reduce_gate_constraints_base_batch_from_zero(
+                    &terms,
+                    batch_size,
+                    &alphas,
+                    &mut storage,
+                );
+                assert_eq!(
+                    actual, expected,
+                    "batch {batch_size}, rows {num_constraints}"
+                );
+            }
         }
     }
 }

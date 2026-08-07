@@ -879,12 +879,18 @@ fn compute_quotient_polys<
     let zs_row_width = zs_partial_products_and_lookup_commitment.lde_row_width();
     let num_routed_wires = common_data.config.num_routed_wires;
 
-    let mut quotient_values = vec![F::ZERO; points.len() * num_challenges];
-    quotient_values
-        .par_chunks_mut(BATCH_SIZE * num_challenges)
-        .zip(points_batches)
-        .enumerate()
-        .for_each_init(
+    let quotient_value_count = points.len() * num_challenges;
+    let mut quotient_values = Vec::with_capacity(quotient_value_count);
+    {
+        let quotient_value_slots = crate::hash::merkle_tree::capacity_up_to_mut(
+            &mut quotient_values,
+            quotient_value_count,
+        );
+        quotient_value_slots
+            .par_chunks_mut(BATCH_SIZE * num_challenges)
+            .zip(points_batches)
+            .enumerate()
+            .for_each_init(
             || QuotientScratch::<F> {
                 indices: Vec::with_capacity(BATCH_SIZE),
                 indices_next: Vec::with_capacity(BATCH_SIZE),
@@ -1048,7 +1054,7 @@ fn compute_quotient_polys<
                 );
 
                 let quotient_values_batch = &mut quotient_values_batch[..n * num_challenges];
-                eval_vanishing_poly_base_batch::<F, D>(
+                let quotient_values_batch = eval_vanishing_poly_base_batch::<F, D>(
                     common_data,
                     indices_batch,
                     &scratch.shifted_xs,
@@ -1078,6 +1084,11 @@ fn compute_quotient_polys<
                 }
             },
         );
+    }
+
+    // SAFETY: every parallel batch initializes its complete point/challenge
+    // sub-slice in `eval_vanishing_poly_base_batch` before returning.
+    unsafe { quotient_values.set_len(quotient_value_count) };
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
     // One streaming pass splits the interleaved point-major buffer into the
