@@ -102,6 +102,88 @@ pub enum MerkleLeaves<F> {
     },
 }
 
+/// Merkle tree digests stored in level order, exactly as the fused GPU
+/// pipeline writes them: `nodes[level_offsets[l] + i]` is node `i` of level
+/// `l`, where level 0 holds the leaf digests and node `i` of level `l` is the
+/// digest of the subtree covering leaves `i << l..(i + 1) << l`. The final
+/// level (the last `level_offsets` entry) is the cap, so
+/// `level_offsets.len() - 1` is the number of hashing layers below the cap.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LevelOrderDigests<T> {
+    /// All tree nodes as one contiguous level-order array, cap level included.
+    pub nodes: Vec<T>,
+    /// Element offset of each level's first node within `nodes`.
+    pub level_offsets: Vec<usize>,
+}
+
+impl<T: Copy> LevelOrderDigests<T> {
+    /// Node `index` of level `level`.
+    pub fn node(&self, level: usize, index: usize) -> T {
+        self.nodes[self.level_offsets[level] + index]
+    }
+
+    /// Merkle path siblings for `leaf_index`: the sibling hashed in at layer
+    /// `l` (layer 0 first) is node `(leaf_index >> l) ^ 1` of level `l`.
+    pub(crate) fn prove_siblings(&self, leaf_index: usize) -> Vec<T> {
+        (0..self.level_offsets.len() - 1)
+            .map(|level| self.node(level, (leaf_index >> level) ^ 1))
+            .collect()
+    }
+
+    /// Materializes the interleaved recursive-subtree layout documented on
+    /// [`MerkleTree::digests`]. Cold path; only serialization needs it.
+    pub fn to_interleaved(&self) -> Vec<T> {
+        let num_layers = self.level_offsets.len() - 1;
+        if num_layers == 0 {
+            return Vec::new();
+        }
+        let num_leaves = self.level_offsets[1] - self.level_offsets[0];
+        let cap_count = num_leaves >> num_layers;
+        let subtree_leaf_count = num_leaves / cap_count;
+        let num_digests = 2 * (num_leaves - cap_count);
+        let mut digests = Vec::with_capacity(num_digests);
+        let digests_buf = capacity_up_to_mut(&mut digests, num_digests);
+        digests_buf
+            .chunks_exact_mut(2 * (subtree_leaf_count - 1))
+            .enumerate()
+            .for_each(|(cap_index, subtree)| {
+                self.fill_interleaved_subtree(
+                    subtree,
+                    cap_index * subtree_leaf_count,
+                    subtree_leaf_count,
+                );
+            });
+        unsafe {
+            // SAFETY: `fill_interleaved_subtree` wrote every slot of each
+            // subtree chunk, and the chunks cover the whole buffer.
+            digests.set_len(num_digests);
+        }
+        digests
+    }
+
+    /// Writes the subtree over `leaf_count` leaves starting at `start_leaf`
+    /// in the interleaved layout and returns the subtree root, mirroring
+    /// [`fill_subtree`]'s recursion but reading precomputed level-order nodes.
+    fn fill_interleaved_subtree(
+        &self,
+        digests: &mut [MaybeUninit<T>],
+        start_leaf: usize,
+        leaf_count: usize,
+    ) -> T {
+        if leaf_count == 1 {
+            return self.node(0, start_leaf);
+        }
+        let (left_half, right_half) = digests.split_at_mut(digests.len() / 2);
+        let (left_root, left_digests) = left_half.split_last_mut().unwrap();
+        let (right_root, right_digests) = right_half.split_first_mut().unwrap();
+        let half = leaf_count / 2;
+        left_root.write(self.fill_interleaved_subtree(left_digests, start_leaf, half));
+        right_root.write(self.fill_interleaved_subtree(right_digests, start_leaf + half, half));
+        let level = leaf_count.ilog2() as usize;
+        self.node(level, start_leaf / leaf_count)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MerkleTree<F: RichField, H: Hasher<F>> {
     /// The data in the leaves of the Merkle tree.
@@ -120,6 +202,12 @@ pub struct MerkleTree<F: RichField, H: Hasher<F>> {
     /// Consequently, the digests of the roots are not stored here (they can be found in `cap`).
     pub digests: Vec<H::Hash>,
 
+    /// Alternative level-order digest storage, used when a builder backend
+    /// (the GPU pipeline) already produced the nodes in that layout. When
+    /// this is `Some`, `digests` is empty: `prove` reads the levels directly
+    /// and serialization materializes the interleaved layout on demand.
+    pub level_digests: Option<LevelOrderDigests<H::Hash>>,
+
     /// The Merkle cap.
     pub cap: MerkleCap<F, H>,
 }
@@ -133,6 +221,7 @@ impl<F: RichField, H: Hasher<F>> Default for MerkleTree<F, H> {
             },
             num_leaves: 0,
             digests: Vec::new(),
+            level_digests: None,
             cap: MerkleCap::default(),
         }
     }
@@ -495,13 +584,16 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             "cap_height={cap_height} should be at most log2(leaves.len())={log_rows}"
         );
 
-        if let Some((digests, cap)) = H::try_build_merkle_tree_column_store(&columns, cap_height) {
-            debug_assert_eq!(digests.len(), 2 * (num_leaves - (1 << cap_height)));
+        if let Some((level_digests, cap)) =
+            H::try_build_merkle_tree_column_store(&columns, cap_height)
+        {
+            debug_assert_eq!(level_digests.nodes.len(), 2 * num_leaves - (1 << cap_height));
             debug_assert_eq!(cap.len(), 1 << cap_height);
             return Self {
                 leaves: MerkleLeaves::Columns { columns, log_rows },
                 num_leaves,
-                digests,
+                digests: Vec::new(),
+                level_digests: Some(level_digests),
                 cap: MerkleCap(cap),
             };
         }
@@ -529,6 +621,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             leaves: MerkleLeaves::Columns { columns, log_rows },
             num_leaves,
             digests,
+            level_digests: None,
             cap: MerkleCap(cap),
         }
     }
@@ -537,16 +630,17 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     /// Merkle pipeline) into a tree.
     pub fn from_prebuilt_columns(
         columns: ColumnStore<F>,
-        digests: Vec<H::Hash>,
+        level_digests: LevelOrderDigests<H::Hash>,
         cap: Vec<H::Hash>,
     ) -> Self {
         let num_leaves = columns.num_rows();
         let log_rows = log2_strict(num_leaves);
-        debug_assert_eq!(digests.len(), 2 * (num_leaves - cap.len()));
+        debug_assert_eq!(level_digests.nodes.len(), 2 * num_leaves - cap.len());
         Self {
             leaves: MerkleLeaves::Columns { columns, log_rows },
             num_leaves,
-            digests,
+            digests: Vec::new(),
+            level_digests: Some(level_digests),
             cap: MerkleCap(cap),
         }
     }
@@ -597,10 +691,10 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             log2_leaves_len
         );
 
-        if let Some((digests, cap)) =
+        if let Some((level_digests, cap)) =
             H::try_build_merkle_tree(&leaves, leaf_width, num_leaves, cap_height)
         {
-            debug_assert_eq!(digests.len(), 2 * (num_leaves - (1 << cap_height)));
+            debug_assert_eq!(level_digests.nodes.len(), 2 * num_leaves - (1 << cap_height));
             debug_assert_eq!(cap.len(), 1 << cap_height);
             return Self {
                 leaves: MerkleLeaves::Rows {
@@ -608,7 +702,8 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
                     width: leaf_width,
                 },
                 num_leaves,
-                digests,
+                digests: Vec::new(),
+                level_digests: Some(level_digests),
                 cap: MerkleCap(cap),
             };
         }
@@ -621,6 +716,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             },
             num_leaves,
             digests,
+            level_digests: None,
             cap: MerkleCap(cap),
         }
     }
@@ -659,8 +755,18 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     /// Create a Merkle proof from a leaf index.
     pub fn prove(&self, leaf_index: usize) -> MerkleProof<F, H> {
         let cap_height = log2_strict(self.cap.len());
-        let siblings =
-            merkle_tree_prove::<F, H>(leaf_index, self.num_leaves, cap_height, &self.digests);
+        let siblings = match &self.level_digests {
+            Some(levels) => {
+                debug_assert_eq!(
+                    levels.level_offsets.len() - 1,
+                    log2_strict(self.num_leaves) - cap_height
+                );
+                levels.prove_siblings(leaf_index)
+            }
+            None => {
+                merkle_tree_prove::<F, H>(leaf_index, self.num_leaves, cap_height, &self.digests)
+            }
+        };
 
         MerkleProof { siblings }
     }
@@ -735,6 +841,93 @@ pub(crate) mod tests {
         let leaves = random_data::<F>(n, 7);
 
         verify_all_leaves::<F, C, D>(leaves, 1)?;
+
+        Ok(())
+    }
+
+    /// Builds the level-order digest representation directly from the leaves,
+    /// bottom-up, matching the GPU buffer convention: level 0 holds the leaf
+    /// digests, each level's parents follow, the last level is the cap.
+    fn cpu_level_order<F: RichField, H: Hasher<F>>(
+        leaves: &[Vec<F>],
+        cap_height: usize,
+    ) -> (LevelOrderDigests<H::Hash>, Vec<H::Hash>) {
+        let num_layers = log2_strict(leaves.len()) - cap_height;
+        let mut nodes: Vec<H::Hash> = leaves.iter().map(|leaf| H::hash_or_noop(leaf)).collect();
+        let mut level_offsets = vec![0];
+        let mut level_start = 0;
+        for _ in 0..num_layers {
+            let next_start = nodes.len();
+            for pair in 0..(next_start - level_start) / 2 {
+                let left = nodes[level_start + 2 * pair];
+                let right = nodes[level_start + 2 * pair + 1];
+                nodes.push(H::two_to_one(left, right));
+            }
+            level_offsets.push(next_start);
+            level_start = next_start;
+        }
+        let cap = nodes[level_start..].to_vec();
+        (
+            LevelOrderDigests {
+                nodes,
+                level_offsets,
+            },
+            cap,
+        )
+    }
+
+    /// Differential test: a tree backed by level-order digests must produce
+    /// exactly the same cap, the same proof for every leaf, and the same
+    /// materialized interleaved digest array as the CPU-built interleaved
+    /// tree over the same leaves.
+    #[test]
+    fn test_level_order_digests_match_interleaved() -> Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        for &(n, cap_height) in &[(32usize, 0usize), (256, 3), (1024, 10)] {
+            // 7 is a non-power width; 4 exercises the hash_or_noop leaves.
+            for &width in &[4usize, 7, 12] {
+                let leaves = random_data::<F>(n, width);
+                let interleaved = MerkleTree::<F, H>::new(leaves.clone(), cap_height);
+                assert!(
+                    interleaved.level_digests.is_none(),
+                    "reference tree must use the interleaved CPU layout"
+                );
+                let (levels, cap) = cpu_level_order::<F, H>(&leaves, cap_height);
+
+                assert_eq!(
+                    cap, interleaved.cap.0,
+                    "cap: n={n} cap_height={cap_height} width={width}"
+                );
+                assert_eq!(
+                    levels.to_interleaved(),
+                    interleaved.digests,
+                    "materialized digests: n={n} cap_height={cap_height} width={width}"
+                );
+
+                let level_tree = MerkleTree::<F, H> {
+                    leaves: interleaved.leaves.clone(),
+                    num_leaves: n,
+                    digests: Vec::new(),
+                    level_digests: Some(levels),
+                    cap: MerkleCap(cap),
+                };
+
+                for (i, leaf) in leaves.iter().enumerate() {
+                    let expected = interleaved.prove(i);
+                    let actual = level_tree.prove(i);
+                    assert_eq!(
+                        expected.siblings, actual.siblings,
+                        "proof: leaf {i}, n={n} cap_height={cap_height} width={width}"
+                    );
+                    verify_merkle_proof_to_cap(leaf.clone(), i, &interleaved.cap, &expected)?;
+                    verify_merkle_proof_to_cap(leaf.clone(), i, &level_tree.cap, &actual)?;
+                }
+            }
+        }
 
         Ok(())
     }
