@@ -594,6 +594,35 @@ fn wires_permutation_partial_products_and_zs<
     columns.into_iter().map(PolynomialValues::new).collect()
 }
 
+/// Reusable per-row buffers for lookup polynomial construction.
+struct LookupScratch<F: Field> {
+    minus_looked_combos: Vec<F>,
+    looked_combo_inverses: Vec<F>,
+    lookup_combos: Vec<F>,
+    minus_looking_combos: Vec<F>,
+    looking_combo_inverses: Vec<F>,
+}
+
+impl<F: Field> LookupScratch<F> {
+    fn new(num_lut_slots: usize, num_lu_slots: usize) -> Self {
+        Self {
+            minus_looked_combos: Vec::with_capacity(num_lut_slots),
+            looked_combo_inverses: Vec::with_capacity(num_lut_slots),
+            lookup_combos: Vec::with_capacity(num_lut_slots),
+            minus_looking_combos: Vec::with_capacity(num_lu_slots),
+            looking_combo_inverses: Vec::with_capacity(num_lu_slots),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.minus_looked_combos.clear();
+        self.looked_combo_inverses.clear();
+        self.lookup_combos.clear();
+        self.minus_looking_combos.clear();
+        self.looking_combo_inverses.clear();
+    }
+}
+
 /// Computes lookup polynomials for a given challenge.
 /// The polynomials hold the value of RE, Sum and Ldc of the Tip5 paper (<https://eprint.iacr.org/2023/107.pdf>). To reduce their
 /// numbers, we batch multiple slots in a single polynomial. Since RE only involves degree one constraints, we can batch
@@ -610,6 +639,7 @@ fn compute_lookup_polys<
     deltas: &[F; 4],
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
+    scratch: &mut LookupScratch<F>,
 ) -> Vec<PolynomialValues<F>> {
     let degree = common_data.degree();
     let num_lu_slots = LookupGate::num_slots(&common_data.config);
@@ -624,45 +654,42 @@ fn compute_lookup_polys<
         final_poly_vecs.push(PolynomialValues::<F>::new(vec![F::ZERO; degree]));
     }
 
-    for LookupWire {
+    let challenge_a = deltas[LookupChallenges::ChallengeA as usize];
+    let challenge_alpha = deltas[LookupChallenges::ChallengeAlpha as usize];
+    let challenge_b = deltas[LookupChallenges::ChallengeB as usize];
+    let challenge_delta = deltas[LookupChallenges::ChallengeDelta as usize];
+
+    for &LookupWire {
         last_lu_gate: last_lu_row,
         last_lut_gate: last_lut_row,
         first_lut_gate: first_lut_row,
-    } in prover_data.lookup_rows.clone()
+    } in &prover_data.lookup_rows
     {
         // Set values for partial Sums and RE.
         for row in (last_lut_row..(first_lut_row + 1)).rev() {
-            // Get combos for Sum.
-            let looked_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| {
-                    let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
-                    let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
-
-                    looked_inp + deltas[LookupChallenges::ChallengeA as usize] * looked_out
-                })
-                .collect();
-            // Get (alpha - combo).
-            let minus_looked_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| deltas[LookupChallenges::ChallengeAlpha as usize] - looked_combos[s])
-                .collect();
-            // Get 1/(alpha - combo).
-            let looked_combo_inverses = F::batch_multiplicative_inverse(&minus_looked_combos);
-
-            // Get lookup combos, used to check the well formation of the LUT.
-            let lookup_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| {
-                    let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
-                    let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
-
-                    looked_inp + deltas[LookupChallenges::ChallengeB as usize] * looked_out
-                })
-                .collect();
+            scratch.clear();
+            // Build both combo families from one read of each LUT wire pair.
+            for s in 0..num_lut_slots {
+                let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
+                let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
+                let looked_combo = looked_inp + challenge_a * looked_out;
+                scratch
+                    .minus_looked_combos
+                    .push(challenge_alpha - looked_combo);
+                scratch
+                    .lookup_combos
+                    .push(looked_inp + challenge_b * looked_out);
+            }
+            F::batch_multiplicative_inverse_into(
+                &scratch.minus_looked_combos,
+                &mut scratch.looked_combo_inverses,
+            );
 
             // Compute next row's first value of RE.
             // If `row == first_lut_row`, then `final_poly_vecs[0].values[row + 1] == 0`.
             let mut new_re = final_poly_vecs[0].values[row + 1];
-            for elt in &lookup_combos {
-                new_re = new_re * deltas[LookupChallenges::ChallengeDelta as usize] + *elt
+            for elt in &scratch.lookup_combos {
+                new_re = new_re * challenge_delta + *elt
             }
             final_poly_vecs[0].values[row] = new_re;
 
@@ -677,7 +704,7 @@ fn compute_lookup_polys<
                     ..min((slot + 1) * max_lookup_table_degree, num_lut_slots))
                     .fold(prev, |acc, s| {
                         acc + witness.get_wire(row, LookupTableGate::wire_ith_multiplicity(s))
-                            * looked_combo_inverses[s]
+                            * scratch.looked_combo_inverses[s]
                     });
                 final_poly_vecs[slot + 1].values[row] = sum;
             }
@@ -685,21 +712,19 @@ fn compute_lookup_polys<
 
         // Set values for partial LDCs.
         for row in (last_lu_row..last_lut_row).rev() {
-            // Get looking combos.
-            let looking_combos: Vec<F> = (0..num_lu_slots)
-                .map(|s| {
-                    let looking_in = witness.get_wire(row, LookupGate::wire_ith_looking_inp(s));
-                    let looking_out = witness.get_wire(row, LookupGate::wire_ith_looking_out(s));
-
-                    looking_in + deltas[LookupChallenges::ChallengeA as usize] * looking_out
-                })
-                .collect();
-            // Get (alpha - combo).
-            let minus_looking_combos: Vec<F> = (0..num_lu_slots)
-                .map(|s| deltas[LookupChallenges::ChallengeAlpha as usize] - looking_combos[s])
-                .collect();
-            // Get 1 / (alpha - combo).
-            let looking_combo_inverses = F::batch_multiplicative_inverse(&minus_looking_combos);
+            scratch.clear();
+            for s in 0..num_lu_slots {
+                let looking_in = witness.get_wire(row, LookupGate::wire_ith_looking_inp(s));
+                let looking_out = witness.get_wire(row, LookupGate::wire_ith_looking_out(s));
+                let looking_combo = looking_in + challenge_a * looking_out;
+                scratch
+                    .minus_looking_combos
+                    .push(challenge_alpha - looking_combo);
+            }
+            F::batch_multiplicative_inverse_into(
+                &scratch.minus_looking_combos,
+                &mut scratch.looking_combo_inverses,
+            );
 
             for slot in 0..num_partial_lookups {
                 let prev = if slot == 0 {
@@ -710,13 +735,26 @@ fn compute_lookup_polys<
                 };
                 let sum = (slot * max_lookup_degree
                     ..min((slot + 1) * max_lookup_degree, num_lu_slots))
-                    .fold(F::ZERO, |acc, s| acc + looking_combo_inverses[s]);
+                    .fold(F::ZERO, |acc, s| acc + scratch.looking_combo_inverses[s]);
                 final_poly_vecs[slot + 1].values[row] = prev - sum;
             }
         }
     }
 
     final_poly_vecs
+}
+
+/// Runs independent lookup challenges in parallel while retaining the
+/// challenge-major output order expected by the commitment layout.
+fn collect_lookup_challenges<T: Send>(
+    num_challenges: usize,
+    compute: impl Fn(usize) -> Vec<T> + Sync + Send,
+) -> Vec<T> {
+    let by_challenge: Vec<Vec<T>> = (0..num_challenges)
+        .into_par_iter()
+        .map(compute)
+        .collect();
+    by_challenge.into_iter().flatten().collect()
 }
 
 /// Computes lookup polynomials for all challenges.
@@ -732,19 +770,20 @@ fn compute_all_lookup_polys<
     lookup: bool,
 ) -> Vec<PolynomialValues<F>> {
     if lookup {
-        let polys: Vec<Vec<PolynomialValues<F>>> = (0..common_data.config.num_challenges)
-            .map(|c| {
-                compute_lookup_polys(
-                    witness,
-                    &deltas[c * NUM_COINS_LOOKUP..(c + 1) * NUM_COINS_LOOKUP]
-                        .try_into()
-                        .unwrap(),
-                    prover_data,
-                    common_data,
-                )
-            })
-            .collect();
-        polys.into_iter().flatten().collect()
+        let num_lut_slots = LookupTableGate::num_slots(&common_data.config);
+        let num_lu_slots = LookupGate::num_slots(&common_data.config);
+        collect_lookup_challenges(common_data.config.num_challenges, |c| {
+            let mut scratch = LookupScratch::new(num_lut_slots, num_lu_slots);
+            compute_lookup_polys(
+                witness,
+                &deltas[c * NUM_COINS_LOOKUP..(c + 1) * NUM_COINS_LOOKUP]
+                    .try_into()
+                    .unwrap(),
+                prover_data,
+                common_data,
+                &mut scratch,
+            )
+        })
     } else {
         vec![]
     }
@@ -1431,9 +1470,74 @@ mod flat_chunk_products_tests {
 
     use crate::util::partial_products::quotient_chunk_products_into;
 
-    use super::divide_chunk_products;
+    use super::{collect_lookup_challenges, divide_chunk_products, LookupScratch};
 
     type F = GoldilocksField;
+
+    #[test]
+    fn parallel_lookup_challenges_keep_challenge_major_order() {
+        let actual = collect_lookup_challenges(4, |challenge| {
+            vec![challenge * 10, challenge * 10 + 1]
+        });
+        assert_eq!(actual, vec![0, 1, 10, 11, 20, 21, 30, 31]);
+    }
+
+    #[test]
+    fn lookup_scratch_reuses_row_buffers() {
+        let mut scratch = LookupScratch::<F>::new(8, 4);
+        scratch
+            .minus_looked_combos
+            .extend((0..8).map(|i| F::from_canonical_usize(i + 1)));
+        scratch
+            .lookup_combos
+            .extend((0..8).map(|i| F::from_canonical_usize(i + 1)));
+        scratch
+            .minus_looking_combos
+            .extend((0..4).map(|i| F::from_canonical_usize(i + 1)));
+        F::batch_multiplicative_inverse_into(
+            &scratch.minus_looked_combos,
+            &mut scratch.looked_combo_inverses,
+        );
+        F::batch_multiplicative_inverse_into(
+            &scratch.minus_looking_combos,
+            &mut scratch.looking_combo_inverses,
+        );
+        let before = [
+            scratch.minus_looked_combos.as_ptr(),
+            scratch.looked_combo_inverses.as_ptr(),
+            scratch.lookup_combos.as_ptr(),
+            scratch.minus_looking_combos.as_ptr(),
+            scratch.looking_combo_inverses.as_ptr(),
+        ];
+
+        scratch.clear();
+        scratch
+            .minus_looked_combos
+            .extend((0..8).map(|i| F::from_canonical_usize(i + 1)));
+        scratch
+            .lookup_combos
+            .extend((0..8).map(|i| F::from_canonical_usize(i + 1)));
+        scratch
+            .minus_looking_combos
+            .extend((0..4).map(|i| F::from_canonical_usize(i + 1)));
+        F::batch_multiplicative_inverse_into(
+            &scratch.minus_looked_combos,
+            &mut scratch.looked_combo_inverses,
+        );
+        F::batch_multiplicative_inverse_into(
+            &scratch.minus_looking_combos,
+            &mut scratch.looking_combo_inverses,
+        );
+        let after = [
+            scratch.minus_looked_combos.as_ptr(),
+            scratch.looked_combo_inverses.as_ptr(),
+            scratch.lookup_combos.as_ptr(),
+            scratch.minus_looking_combos.as_ptr(),
+            scratch.looking_combo_inverses.as_ptr(),
+        ];
+
+        assert_eq!(after, before);
+    }
 
     #[test]
     fn chunk_before_inversion_matches_individual_ratios() {
