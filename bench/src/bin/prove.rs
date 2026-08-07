@@ -44,9 +44,10 @@ static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
-    env_logger::init();
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
+        // Drain older, phase-ordered jobs before newly spawned recursive work.
+        .breadth_first()
         .build_global()
         .expect("cannot configure prover thread pool");
 
