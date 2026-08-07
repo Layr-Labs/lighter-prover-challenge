@@ -108,17 +108,11 @@ impl Forest {
     /// Compress all paths. After calling this, every `parent` value will point to the node's
     /// representative.
     ///
-    /// The final `parents` vector is identical to calling `find(i)` for every `i`: a node is only
-    /// ever written when it is a non-root (the `continue` guard), and the value written is always
-    /// a root, so roots are stable for the whole pass and every index ends at `root(i)`.
-    ///
-    /// The writeback loop is load-bearing for performance, not just for `i`. A copy-constraint
-    /// class built by repeated `connect` is a *chain*, and the outer loop visits it in the
-    /// direction that walks it from the far end: writing the root into `parents[i]` alone leaves
-    /// every intermediate node still pointing along the chain, so the next index re-walks almost
-    /// the whole thing — quadratic in the class length, over a `parents` array of tens of
-    /// millions of entries. Writing the root into every node on the path as we go makes each
-    /// later node terminate in one hop.
+    /// This dedicated full pass visits every index once and gives it its own direct-root write,
+    /// so the general `find`'s second chain walk (which rewrites intermediate nodes) is
+    /// unnecessary: each intermediate node receives its direct-root assignment when the outer
+    /// loop reaches it. Roots are stable during this pass, so the final `parents` vector is
+    /// identical to calling `find(i)` for every `i`.
     pub(crate) fn compress_paths(&mut self) {
         for i in 0..self.parents.len() {
             let parent = self.parents[i];
@@ -129,13 +123,7 @@ impl Forest {
             while self.parents[root as usize] != root {
                 root = self.parents[root as usize];
             }
-            // Point every node on `i`'s path directly at the root, not just `i`.
-            let mut x = i;
-            while self.parents[x] != root {
-                let next = self.parents[x] as usize;
-                self.parents[x] = root;
-                x = next;
-            }
+            self.parents[i] = root;
         }
     }
 

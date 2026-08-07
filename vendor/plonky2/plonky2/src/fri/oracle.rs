@@ -595,18 +595,7 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
             .zip(&coeffs.coeffs[..live])
             .map(|(r, &c)| r * c),
     );
-    match zero_factor {
-        // SAFETY: capacity is exactly `len`. When `live` equals the
-        // zero-padded FFT's live prefix `len >> r` (with `r > 0` and at least
-        // two live coefficients), the FFT reads only the first `len >> r`
-        // coefficients — all just written above — and writes every tail
-        // element before reading it (all expansion paths fill back-to-front),
-        // so the tail never needs the zero fill. This is the same invariant
-        // the `lde_values` fast path relies on. Any other shape keeps the
-        // zero-filling resize.
-        Some(r) if r > 0 && live >= 2 && live == len >> r => unsafe { scaled.set_len(len) },
-        _ => scaled.resize(len, F::ZERO),
-    }
+    scaled.resize(len, F::ZERO);
     PolynomialCoeffs::new(scaled).fft_with_options(zero_factor, root_table)
 }
 
