@@ -360,6 +360,87 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     }
 }
 
+/// Generator indices grouped by the representative target they watch.
+///
+/// Representatives are dense target indices, so a CSR offset table turns the prover's frequent
+/// watcher lookup into two adjacent loads and one contiguous slice. The previous `BTreeMap`
+/// required a pointer-chasing tree walk for every newly populated representative.
+#[derive(Eq, PartialEq, Debug)]
+pub struct GeneratorWatchIndex {
+    offsets: Vec<u32>,
+    watchers: Vec<usize>,
+    entries: usize,
+}
+
+impl GeneratorWatchIndex {
+    pub fn from_map(map: BTreeMap<usize, Vec<usize>>) -> Self {
+        let entries = map.values().filter(|watchers| !watchers.is_empty()).count();
+        let Some((&max_representative, _)) = map.last_key_value() else {
+            return Self {
+                offsets: vec![0],
+                watchers: Vec::new(),
+                entries: 0,
+            };
+        };
+
+        let offsets_len = max_representative
+            .checked_add(2)
+            .expect("generator watch representative index overflow");
+        let total_watchers = map.values().map(Vec::len).sum::<usize>();
+        assert!(
+            u32::try_from(total_watchers).is_ok(),
+            "generator watch index exceeds u32 offsets"
+        );
+
+        let mut offsets = vec![0u32; offsets_len];
+        let mut watchers = Vec::with_capacity(total_watchers);
+        let mut entries_iter = map.into_iter().peekable();
+        for representative in 0..=max_representative {
+            offsets[representative] = watchers.len() as u32;
+            if entries_iter
+                .peek()
+                .is_some_and(|(key, _)| *key == representative)
+            {
+                let (_, representative_watchers) = entries_iter.next().unwrap();
+                watchers.extend(representative_watchers);
+            }
+        }
+        offsets[max_representative + 1] = watchers.len() as u32;
+        debug_assert!(entries_iter.next().is_none());
+
+        Self {
+            offsets,
+            watchers,
+            entries,
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, representative: &usize) -> Option<&[usize]> {
+        let end_index = representative.checked_add(1)?;
+        let (&start, &end) = (
+            self.offsets.get(*representative)?,
+            self.offsets.get(end_index)?,
+        );
+        (start != end).then(|| &self.watchers[start as usize..end as usize])
+    }
+
+    pub const fn len(&self) -> usize {
+        self.entries
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &[usize])> {
+        self.offsets
+            .windows(2)
+            .enumerate()
+            .filter_map(|(representative, bounds)| {
+                let start = bounds[0] as usize;
+                let end = bounds[1] as usize;
+                (start != end).then(|| (representative, &self.watchers[start..end]))
+            })
+    }
+}
+
 /// Circuit data required by the prover, but not the verifier.
 #[derive(Eq, PartialEq, Debug)]
 pub struct ProverOnlyCircuitData<
@@ -370,7 +451,7 @@ pub struct ProverOnlyCircuitData<
     pub generators: Vec<WitnessGeneratorRef<F, D>>,
     /// Generator indices (within the `Vec` above), indexed by the representative of each target
     /// they watch.
-    pub generator_indices_by_watches: BTreeMap<usize, Vec<usize>>,
+    pub generator_indices_by_watches: GeneratorWatchIndex,
     /// For each generator (indexed as in `generators`), the number of *distinct* representatives
     /// it watches — equivalently, the number of entries of `generator_indices_by_watches` whose
     /// watcher list contains that generator.
@@ -715,4 +796,30 @@ pub struct VerifierCircuitTarget {
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to
     /// seed Fiat-Shamir.
     pub circuit_digest: HashOutTarget,
+}
+
+#[cfg(test)]
+mod generator_watch_index_tests {
+    use super::GeneratorWatchIndex;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn sparse_watch_index_preserves_lists_and_empty_representatives() {
+        let map = BTreeMap::from([(1usize, vec![2usize, 5]), (4, vec![3])]);
+        let index = GeneratorWatchIndex::from_map(map);
+
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.get(&0), None);
+        assert_eq!(index.get(&1), Some([2usize, 5].as_slice()));
+        assert_eq!(index.get(&2), None);
+        assert_eq!(index.get(&3), None);
+        assert_eq!(index.get(&4), Some([3usize].as_slice()));
+        assert_eq!(index.get(&5), None);
+
+        let entries = index
+            .iter()
+            .map(|(representative, watchers)| (representative, watchers.to_vec()))
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![(1, vec![2, 5]), (4, vec![3])]);
+    }
 }
