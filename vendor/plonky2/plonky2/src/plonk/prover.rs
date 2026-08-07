@@ -879,6 +879,7 @@ fn compute_quotient_polys<
         s_sigmas_flat: Vec<F>,
         zs_local_flat: Vec<F>,
         zs_next_flat: Vec<F>,
+        quotient_row: Vec<F>,
         vanishing: VanishingScratch<F>,
     }
 
@@ -899,15 +900,35 @@ fn compute_quotient_polys<
     // real serial store loop, not `alloc_zeroed`: 8 MiB per d16 tx proof,
     // 2 MiB per chain-step proof, on the per-proof spine between the Zs
     // commitment and the quotient commitment.
-    let quotient_len = points.len() * num_challenges;
-    let mut quotient_values: Vec<F> = Vec::with_capacity(quotient_len);
-    // SAFETY: capacity is exactly `quotient_len`, and the parallel pass below
-    // writes every element before any is read (see above). Same idiom as the
-    // promoted zero-tail fast path in `fri/oracle.rs`.
-    unsafe { quotient_values.set_len(quotient_len) };
-    quotient_values
-        .par_chunks_mut(BATCH_SIZE * num_challenges)
-        .zip(points_batches)
+    // Each batch scatters its finished quotient values straight into the
+    // per-challenge output columns at its own disjoint point range: batch `b`
+    // owns points [BATCH_SIZE*b, BATCH_SIZE*b + n), which is exactly
+    // `column[c][BATCH_SIZE*b..][..n]` for every challenge column. This
+    // deletes both the former point-major intermediate buffer (8 MiB per d16
+    // proof, 32 MiB for the final block proof) and the single-threaded
+    // whole-buffer split pass that re-traversed it after the parallel
+    // evaluation while every other core sat idle. Values and final positions
+    // are identical; only which pass stores them changes.
+    struct ColPtr<T>(*mut T);
+    unsafe impl<T> Send for ColPtr<T> {}
+    unsafe impl<T> Sync for ColPtr<T> {}
+    let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
+        .map(|_| {
+            let mut column = Vec::with_capacity(points.len());
+            // SAFETY: the per-batch scatter below writes every element exactly
+            // once (batches partition the point range) before any read; `F` is
+            // plain data. Same idiom as the promoted zero-tail fast path in
+            // `fri/oracle.rs`.
+            unsafe { column.set_len(points.len()) };
+            column
+        })
+        .collect();
+    let column_ptrs: Vec<ColPtr<F>> = challenge_columns
+        .iter_mut()
+        .map(|column| ColPtr(column.as_mut_ptr()))
+        .collect();
+    let column_ptrs = &column_ptrs;
+    points_batches
         .enumerate()
         .for_each_init(
             || QuotientScratch::<F> {
@@ -918,9 +939,10 @@ fn compute_quotient_polys<
                 s_sigmas_flat: Vec::new(),
                 zs_local_flat: Vec::new(),
                 zs_next_flat: Vec::new(),
+                quotient_row: Vec::new(),
                 vanishing: VanishingScratch::default(),
             },
-            |scratch, (batch_i, (quotient_values_batch, xs_batch))| {
+            |scratch, (batch_i, xs_batch)| {
                 // Each batch must be the same size, except the last one, which may be smaller.
                 debug_assert!(
                     xs_batch.len() == BATCH_SIZE
@@ -1074,7 +1096,11 @@ fn compute_quotient_polys<
                     public_inputs_hash,
                 );
 
-                let quotient_values_batch = &mut quotient_values_batch[..n * num_challenges];
+                // Zero the reused scratch row each batch: value-safe under
+                // both evaluator conventions (assign-first or accumulate).
+                scratch.quotient_row.clear();
+                scratch.quotient_row.resize(n * num_challenges, F::ZERO);
+                let quotient_values_batch = &mut scratch.quotient_row[..n * num_challenges];
                 eval_vanishing_poly_base_batch::<F, D>(
                     common_data,
                     indices_batch,
@@ -1103,22 +1129,23 @@ fn compute_quotient_polys<
                         .iter_mut()
                         .for_each(|v| *v *= denominator_inv);
                 }
+
+                // Scatter this batch's point-major rows into the disjoint
+                // per-challenge column segments (see the column setup above).
+                let base = BATCH_SIZE * batch_i;
+                for (k, point_values) in quotient_values_batch
+                    .chunks_exact(num_challenges)
+                    .enumerate()
+                {
+                    for (column, &value) in column_ptrs.iter().zip(point_values) {
+                        // SAFETY: `base + k` is inside this batch's disjoint
+                        // range; every column has `points.len()` capacity.
+                        unsafe { *column.0.add(base + k) = value };
+                    }
+                }
             },
         );
 
-    debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
-    // One streaming pass splits the interleaved point-major buffer into the
-    // per-challenge columns, instead of `num_challenges` parallel passes each
-    // stride-reading the whole buffer. Same values in the same order; only
-    // which pass writes them changes.
-    let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
-        .map(|_| Vec::with_capacity(points.len()))
-        .collect();
-    for point_values in quotient_values.chunks_exact(num_challenges) {
-        for (column, &value) in challenge_columns.iter_mut().zip(point_values) {
-            column.push(value);
-        }
-    }
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
