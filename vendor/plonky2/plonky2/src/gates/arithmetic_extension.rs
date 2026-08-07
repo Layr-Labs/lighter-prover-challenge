@@ -138,7 +138,17 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticExte
             F::Extension::from_basefield_array(arr)
         };
 
-        let mut scratch = vec![F::ZERO; D * n];
+        // Batches are 32 points in this prover; keep the scratch row on the
+        // stack and fall back to the heap only for oversized batches. The
+        // extension gates dominate the chain circuits' CPU quotient pass.
+        let mut scratch_stack = [F::ZERO; 2 * 64];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if D * n <= 2 * 64 {
+            &mut scratch_stack[..D * n]
+        } else {
+            scratch_heap = vec![F::ZERO; D * n];
+            &mut scratch_heap
+        };
         for i in 0..self.num_ops {
             let m0_start = Self::wires_ith_multiplicand_0(i).start;
             let m1_start = Self::wires_ith_multiplicand_1(i).start;
