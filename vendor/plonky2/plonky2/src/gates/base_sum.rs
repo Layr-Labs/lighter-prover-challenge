@@ -141,6 +141,13 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> Gate<F, D> fo
     }
 
     // 1 for the sum then `num_limbs` for the limbs.
+    fn base_sum_quotient_gate(&self) -> Option<crate::gates::gate::BaseSumQuotientGate> {
+        Some(crate::gates::gate::BaseSumQuotientGate {
+            num_limbs: self.num_limbs,
+            base: B,
+        })
+    }
+
     fn num_wires(&self) -> usize {
         1 + self.num_limbs
     }

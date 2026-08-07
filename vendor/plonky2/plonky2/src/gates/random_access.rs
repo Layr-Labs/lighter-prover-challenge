@@ -508,6 +508,16 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
             .collect()
     }
 
+    fn random_access_quotient_gate(
+        &self,
+    ) -> Option<crate::gates::gate::RandomAccessQuotientGate> {
+        Some(crate::gates::gate::RandomAccessQuotientGate {
+            num_copies: self.num_copies,
+            bits: self.bits,
+            num_extra_constants: self.num_extra_constants,
+        })
+    }
+
     fn num_wires(&self) -> usize {
         self.num_routed_wires() + self.num_copies * self.bits
     }
