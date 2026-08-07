@@ -4,7 +4,9 @@
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
-use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
+use circuit::block_pre_execution_constraints::{
+    BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
+};
 use circuit::block_tx::{BlockTx, JumpState, JumpStateTarget};
 use circuit::block_tx_chain_constraints::{
     BlockTxChainCircuit, BlockTxChainTarget, cyclic_base_witness,
@@ -408,18 +410,42 @@ fn prove_path(
     })
 }
 
-pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
+/// Proves the block pre-execution circuit under the exclusive GPU phase.
+/// Split out so the startup path can run it concurrently with the remaining
+/// circuit loads.
+pub(crate) fn prove_pre_execution(
+    pre_data: &CircuitData<F, C, D>,
+    pre_target: &BlockPreExecutionTarget,
+    pre_exec: &BlockPreExec<F>,
+) -> Proof {
     // The pre-execution proof runs strictly before any other proving work, so
     // the serialized GPU stream is otherwise idle: route its mid-size column
     // trees to the GPU for just this phase.
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
     let pre_proof = BlockPreExecutionCircuit::prove(
-        &circuits.pre_data,
-        &BlockPreExec::from_block(&block),
-        &circuits.pre_target,
+        pre_data,
+        pre_exec,
+        pre_target,
     )
     .expect("block pre-execution proof failed");
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+    pre_proof
+}
+
+pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
+    let pre_proof =
+        prove_pre_execution(&circuits.pre_data, &circuits.pre_target, &BlockPreExec::from_block(&block));
+    prove_block_after_pre(block, circuits, pre_proof)
+}
+
+/// The pipeline after the pre-execution proof: transaction/chain proving plus
+/// the final block proof. The startup path calls this once the pre-execution
+/// proof and the remaining circuit loads have both completed.
+pub(crate) fn prove_block_after_pre(
+    mut block: Block<F>,
+    mut circuits: Circuits,
+    pre_proof: Proof,
+) -> Proof {
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 

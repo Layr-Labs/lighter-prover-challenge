@@ -9,7 +9,7 @@ use anyhow::Result;
 
 use crate::field::extension::Extendable;
 use crate::field::packed::PackedField;
-use crate::gates::gate::Gate;
+use crate::gates::gate::{Gate, U32QuotientGate};
 use crate::gates::packed_util::PackedEvaluableBase;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -63,6 +63,12 @@ impl ArithmeticGate {
 impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticGate {
     fn id(&self) -> String {
         format!("{self:?}")
+    }
+
+    fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+        Some(U32QuotientGate::MulAdd {
+            num_ops: self.num_ops,
+        })
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {

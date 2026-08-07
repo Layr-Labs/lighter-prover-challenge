@@ -18,8 +18,10 @@ use api::{
     Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
     PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
 };
+use circuit::block_pre_execution::BlockPreExec;
+use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
 use circuit::block::Block;
-use circuit::types::config::F;
+use circuit::types::config::{C, CIRCUIT_CONFIG, F};
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -67,7 +69,32 @@ fn main() {
     // Embedded circuits (deserialized from compile-time blobs) by default;
     // falls back to building from scratch if they are unavailable, and
     // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B measurement.
-    let proof = prover::prove_block(block, Circuits::load());
+    // Startup overlap: the pre-execution proof (small circuit, mostly GPU)
+    // runs on its own thread while the remaining four circuit loads (LDE
+    // FFTs, commitment, transpose) fill the otherwise-idle cores. Both must
+    // finish before the transaction pipeline can start; hiding the pre-exec
+    // proof behind the loads removes it from the serial startup tail.
+    let pre_exec = BlockPreExec::from_block(&block);
+    let pre_handle = std::thread::Builder::new()
+        .name("pre-exec-startup".into())
+        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .spawn(move || {
+            let (pre_target, pre_data) = match Circuits::load_pre() {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    log::warn!("embedded pre circuit unavailable ({error:#}); building from scratch");
+                    let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
+                    (pre.target, pre.builder.build::<C>())
+                }
+            };
+            let pre_proof = prover::prove_pre_execution(&pre_data, &pre_target, &pre_exec);
+            pre_proof
+        })
+        .expect("pre-execution startup thread must start");
+
+    let circuits = Circuits::load();
+    let pre_proof = pre_handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let proof = prover::prove_block_after_pre(block, circuits, pre_proof);
     let mut writer = BufWriter::with_capacity(
         PROOF_OUTPUT_BUFFER_BYTES,
         File::create(output).expect("cannot create proof output"),

@@ -8,7 +8,7 @@ use anyhow::Result;
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::Extendable;
 use crate::field::packed::PackedField;
-use crate::gates::gate::Gate;
+use crate::gates::gate::{Gate, U32QuotientGate};
 use crate::gates::packed_util::PackedEvaluableBase;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -75,6 +75,12 @@ impl EqualityGate {
 impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EqualityGate {
     fn id(&self) -> String {
         format!("{self:?}")
+    }
+
+    fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+        Some(U32QuotientGate::Equality {
+            num_ops: self.num_ops,
+        })
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
