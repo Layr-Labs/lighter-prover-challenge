@@ -360,10 +360,8 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ByteDecomposit
     }
 
     fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
-        Some(U32QuotientGate::ByteDecomposition {
-            num_ops: self.num_ops,
-            num_limbs: self.num_limbs,
-        })
+        // EXPERIMENT: keep this family on the CPU to free GPU capacity.
+        None
     }
 }
 
