@@ -739,6 +739,28 @@ const BATCH_SIZE: usize = 32;
 pub(crate) static COMPARE_QUOTIENT_LAYOUTS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+#[inline]
+fn scale_and_scatter_quotient_batch<F: Field>(
+    point_major: &[F],
+    denominator_inverses: &[F],
+    challenge_columns: &mut [&mut [F]],
+) {
+    let num_points = denominator_inverses.len();
+    let num_challenges = challenge_columns.len();
+    debug_assert_eq!(point_major.len(), num_points * num_challenges);
+    debug_assert!(challenge_columns.iter().all(|column| column.len() == num_points));
+
+    for (point, (&denominator_inverse, values)) in denominator_inverses
+        .iter()
+        .zip(point_major.chunks_exact(num_challenges))
+        .enumerate()
+    {
+        for (column, &value) in challenge_columns.iter_mut().zip(values) {
+            column[point] = value * denominator_inverse;
+        }
+    }
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -848,6 +870,8 @@ fn compute_quotient_polys<
         s_sigmas_flat: Vec<F>,
         zs_local_flat: Vec<F>,
         zs_next_flat: Vec<F>,
+        quotient_batch: Vec<F>,
+        denominator_inverses: Vec<F>,
         vanishing: VanishingScratch<F>,
     }
 
@@ -855,9 +879,25 @@ fn compute_quotient_polys<
     let zs_row_width = zs_partial_products_and_lookup_commitment.lde_row_width();
     let num_routed_wires = common_data.config.num_routed_wires;
 
-    let mut quotient_values = vec![F::ZERO; points.len() * num_challenges];
-    quotient_values
-        .par_chunks_mut(BATCH_SIZE * num_challenges)
+    let mut challenge_columns = vec![vec![F::ZERO; points.len()]; num_challenges];
+    let mut column_chunks = challenge_columns
+        .iter_mut()
+        .flat_map(|column| column.chunks_mut(BATCH_SIZE).map(Some))
+        .collect::<Vec<_>>();
+    let mut batch_destinations = Vec::with_capacity(num_batches * num_challenges);
+    for batch in 0..num_batches {
+        for challenge in 0..num_challenges {
+            batch_destinations.push(
+                column_chunks[challenge * num_batches + batch]
+                    .take()
+                    .unwrap(),
+            );
+        }
+    }
+    drop(column_chunks);
+
+    batch_destinations
+        .par_chunks_mut(num_challenges)
         .zip(points_batches)
         .enumerate()
         .for_each_init(
@@ -870,9 +910,11 @@ fn compute_quotient_polys<
                 s_sigmas_flat: Vec::new(),
                 zs_local_flat: Vec::new(),
                 zs_next_flat: Vec::new(),
+                quotient_batch: Vec::with_capacity(BATCH_SIZE * num_challenges),
+                denominator_inverses: Vec::with_capacity(BATCH_SIZE),
                 vanishing: VanishingScratch::default(),
             },
-            |scratch, (batch_i, (quotient_values_batch, xs_batch))| {
+            |scratch, (batch_i, (challenge_chunks, xs_batch))| {
                 // Each batch must be the same size, except the last one, which may be smaller.
                 debug_assert!(
                     xs_batch.len() == BATCH_SIZE
@@ -1023,7 +1065,8 @@ fn compute_quotient_polys<
                     public_inputs_hash,
                 );
 
-                let quotient_values_batch = &mut quotient_values_batch[..n * num_challenges];
+                scratch.quotient_batch.resize(n * num_challenges, F::ZERO);
+                scratch.quotient_batch.fill(F::ZERO);
                 eval_vanishing_poly_base_batch::<F, D>(
                     common_data,
                     indices_batch,
@@ -1040,34 +1083,22 @@ fn compute_quotient_polys<
                     &z_h_on_coset,
                     &lut_re_poly_evals_refs,
                     &mut scratch.vanishing,
-                    quotient_values_batch,
+                    &mut scratch.quotient_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
-                }
+                scratch.denominator_inverses.clear();
+                scratch
+                    .denominator_inverses
+                    .extend(indices_batch.iter().map(|&i| z_h_on_coset.eval_inverse(i)));
+                scale_and_scatter_quotient_batch(
+                    &scratch.quotient_batch,
+                    &scratch.denominator_inverses,
+                    challenge_chunks,
+                );
             },
         );
+    drop(batch_destinations);
 
-    debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
-    // One streaming pass splits the interleaved point-major buffer into the
-    // per-challenge columns, instead of `num_challenges` parallel passes each
-    // stride-reading the whole buffer. Same values in the same order; only
-    // which pass writes them changes.
-    let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
-        .map(|_| Vec::with_capacity(points.len()))
-        .collect();
-    for point_values in quotient_values.chunks_exact(num_challenges) {
-        for (column, &value) in challenge_columns.iter_mut().zip(point_values) {
-            column.push(value);
-        }
-    }
     challenge_columns
         .into_par_iter()
         .map(|column| PolynomialValues::new(column).coset_ifft(F::coset_shift()))
@@ -1162,7 +1193,9 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{
+        precomputed, scale_and_scatter_quotient_batch, BatchLayout, COMPARE_QUOTIENT_LAYOUTS,
+    };
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field, Field64};
     use crate::iop::witness::{PartialWitness, WitnessWrite};
@@ -1290,6 +1323,44 @@ mod quotient_layout_tests {
                 // Poison every cell so the next iteration starts from a dirty
                 // buffer of the right length (the reuse case being deleted).
                 scratch.fill(poison);
+            }
+        }
+    }
+
+    #[test]
+    fn scale_and_scatter_quotient_batch_matches_reference() {
+        let num_points = 5;
+        let num_challenges = 3;
+        let point_major = (0..num_points * num_challenges)
+            .map(|i| {
+                F::from_noncanonical_u64(
+                    u64::MAX.wrapping_sub((i as u64 + 1) * 0x1234_5678),
+                )
+            })
+            .collect::<Vec<_>>();
+        let denominator_inverses = (0..num_points)
+            .map(|i| F::from_canonical_usize(17 * i + 3))
+            .collect::<Vec<_>>();
+        let poison = F::from_canonical_u64(0xdead_beef);
+        let mut columns = (0..num_challenges)
+            .map(|_| vec![poison; num_points])
+            .collect::<Vec<_>>();
+        let mut column_slices = columns
+            .iter_mut()
+            .map(Vec::as_mut_slice)
+            .collect::<Vec<_>>();
+
+        scale_and_scatter_quotient_batch(
+            &point_major,
+            &denominator_inverses,
+            &mut column_slices,
+        );
+
+        for challenge in 0..num_challenges {
+            for point in 0..num_points {
+                let expected = point_major[point * num_challenges + challenge]
+                    * denominator_inverses[point];
+                assert_eq!(columns[challenge][point].0, expected.0);
             }
         }
     }
