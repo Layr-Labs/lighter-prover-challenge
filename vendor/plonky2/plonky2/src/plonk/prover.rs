@@ -879,7 +879,25 @@ fn compute_quotient_polys<
     let zs_row_width = zs_partial_products_and_lookup_commitment.lde_row_width();
     let num_routed_wires = common_data.config.num_routed_wires;
 
-    let mut quotient_values = vec![F::ZERO; points.len() * num_challenges];
+    // The zero-fill this used to do existed only to seed the Horner chain in
+    // `reduce_gate_constraints_base_batch`, which is the first thing every
+    // batch does. That chain now *assigns* its first reversed row instead of
+    // accumulating into zeros (a raw-limb-identical change: the old first pass
+    // computed `reduce128(term as u128)`, which returns `term` unchanged), so
+    // every slot of this buffer is stored before it is read and the memset is
+    // dead. `par_chunks_mut` partitions the whole buffer and each batch writes
+    // all of its own slice, including a short final batch.
+    //
+    // `F` has no `IsZero` specialization, so the old `vec![F::ZERO; n]` was a
+    // real serial store loop, not `alloc_zeroed`: 8 MiB per d16 tx proof,
+    // 2 MiB per chain-step proof, on the per-proof spine between the Zs
+    // commitment and the quotient commitment.
+    let quotient_len = points.len() * num_challenges;
+    let mut quotient_values: Vec<F> = Vec::with_capacity(quotient_len);
+    // SAFETY: capacity is exactly `quotient_len`, and the parallel pass below
+    // writes every element before any is read (see above). Same idiom as the
+    // promoted zero-tail fast path in `fri/oracle.rs`.
+    unsafe { quotient_values.set_len(quotient_len) };
     quotient_values
         .par_chunks_mut(BATCH_SIZE * num_challenges)
         .zip(points_batches)
