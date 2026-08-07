@@ -785,7 +785,11 @@ fn compute_quotient_polys<
     // instead of once per proof.
     let points =
         precomputed::two_adic_subgroup::<F>(common_data.degree_bits() + quotient_degree_bits);
+    let shifted_points = precomputed::shifted_two_adic_subgroup::<F>(
+        common_data.degree_bits() + quotient_degree_bits,
+    );
     let lde_size = points.len();
+    debug_assert_eq!(shifted_points.len(), lde_size);
 
     let z_h_on_coset = ZeroPolyOnCoset::new(common_data.degree_bits(), quotient_degree_bits);
     // The `L_0` denominator inverses consumed by `eval_l_0` depend only on
@@ -842,7 +846,6 @@ fn compute_quotient_polys<
     struct QuotientScratch<F: RichField> {
         indices: Vec<usize>,
         indices_next: Vec<usize>,
-        shifted_xs: Vec<F>,
         local_constants: Vec<F>,
         local_wires: Vec<F>,
         s_sigmas_flat: Vec<F>,
@@ -864,7 +867,6 @@ fn compute_quotient_polys<
             || QuotientScratch::<F> {
                 indices: Vec::with_capacity(BATCH_SIZE),
                 indices_next: Vec::with_capacity(BATCH_SIZE),
-                shifted_xs: Vec::with_capacity(BATCH_SIZE),
                 local_constants: Vec::new(),
                 local_wires: Vec::new(),
                 s_sigmas_flat: Vec::new(),
@@ -889,10 +891,13 @@ fn compute_quotient_polys<
                     .indices_next
                     .extend(scratch.indices.iter().map(|&i| (i + next_step) % lde_size));
 
-                scratch.shifted_xs.clear();
-                scratch
-                    .shifted_xs
-                    .extend(xs_batch.iter().map(|&x| F::coset_shift() * x));
+                let shifted_xs_batch = &shifted_points[BATCH_SIZE * batch_i..][..n];
+                debug_assert!(
+                    shifted_xs_batch
+                        .iter()
+                        .zip(xs_batch)
+                        .all(|(&sx, &x)| sx == F::coset_shift() * x)
+                );
 
                 prover_data.constants_sigmas_commitment.fill_lde_batch(
                     &scratch.indices,
@@ -1027,7 +1032,7 @@ fn compute_quotient_polys<
                 eval_vanishing_poly_base_batch::<F, D>(
                     common_data,
                     indices_batch,
-                    &scratch.shifted_xs,
+                    shifted_xs_batch,
                     vars_batch,
                     perm,
                     &local_lookup_batch,
@@ -1095,6 +1100,7 @@ pub(crate) mod precomputed {
 
         static SUBGROUPS: OnceLock<Map> = OnceLock::new();
         static COSET_POWERS: OnceLock<Map> = OnceLock::new();
+        static SHIFTED_SUBGROUPS: OnceLock<Map> = OnceLock::new();
 
         fn get_or_compute<F: Field>(
             cache: &'static OnceLock<Map>,
@@ -1133,6 +1139,17 @@ pub(crate) mod precomputed {
                 F::coset_shift().powers().take(degree).collect()
             })
         }
+
+        /// Cached `x * F::coset_shift()` over the whole two-adic subgroup of
+        /// size `1 << n_log`: the quotient evaluator needs the shifted point
+        /// for every domain element of every proof, and the domain depends
+        /// only on its size.
+        pub(crate) fn shifted_two_adic_subgroup<F: Field>(n_log: usize) -> Arc<Vec<F>> {
+            get_or_compute(&SHIFTED_SUBGROUPS, n_log, || {
+                let shift = F::coset_shift();
+                two_adic_subgroup::<F>(n_log).iter().map(|&x| shift * x).collect()
+            })
+        }
     }
 
     /// Without `std` there is no process-global synchronization; fall back to
@@ -1151,9 +1168,14 @@ pub(crate) mod precomputed {
         pub(crate) fn coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
             Arc::new(F::coset_shift().powers().take(degree).collect::<Vec<F>>())
         }
+
+        pub(crate) fn shifted_two_adic_subgroup<F: Field>(n_log: usize) -> Arc<Vec<F>> {
+            let shift = F::coset_shift();
+            Arc::new(F::two_adic_subgroup(n_log).into_iter().map(|x| shift * x).collect::<Vec<F>>())
+        }
     }
 
-    pub(crate) use imp::{coset_shift_powers, two_adic_subgroup};
+    pub(crate) use imp::{coset_shift_powers, shifted_two_adic_subgroup, two_adic_subgroup};
 }
 
 #[cfg(test)]
