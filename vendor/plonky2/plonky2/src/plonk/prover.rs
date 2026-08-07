@@ -501,8 +501,19 @@ fn wires_permutation_partial_products_and_zs<
     // chunk. Form those products before Montgomery inversion, shrinking each inversion batch by
     // `degree` and reading every witness wire only once.
     const INV_BATCH: usize = 128;
-    let mut all_quotient_chunk_products = vec![F::ZERO; subgroup.len() * num_chunks];
-    all_quotient_chunk_products
+    // Every slot of this buffer is assigned below before anything reads it —
+    // the inner loop writes `quotient_products[t * num_chunks + chunk]` for
+    // every `t` in the batch and every `chunk`, which covers each sub-slice
+    // exactly, and `divide_chunk_products` only multiplies those cells in
+    // place afterwards. So zero-filling it first is dead work: at
+    // `num_chunks = 10` and a 2^16 subgroup that is 5.2 MiB of serial stores
+    // per challenge, ~10.5 MiB per proof, on the per-proof spine between
+    // witness generation and the Zs/partial-products commitment.
+    let product_count = subgroup.len() * num_chunks;
+    let mut all_quotient_chunk_products: Vec<F> = Vec::with_capacity(product_count);
+    let product_slots =
+        crate::hash::merkle_tree::capacity_up_to_mut(&mut all_quotient_chunk_products, product_count);
+    product_slots
         .par_chunks_mut(INV_BATCH * num_chunks)
         .zip(subgroup.par_chunks(INV_BATCH))
         .enumerate()
@@ -530,10 +541,18 @@ fn wires_permutation_partial_products_and_zs<
                             numerator_product *= wire_value + beta_k_is[j] * x + gamma;
                             denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
                         }
-                        quotient_products[t * num_chunks + chunk] = numerator_product;
+                        quotient_products[t * num_chunks + chunk].write(numerator_product);
                         denominator_products.push(denominator_product);
                     }
                 }
+                // SAFETY: the loop above wrote every slot of this sub-slice —
+                // `t` covers `0..xs.len()` and `chunk` covers `0..num_chunks`,
+                // and the sub-slice length is exactly `xs.len() * num_chunks`
+                // (the `zip` pairs each chunk with its own `xs`, so a short
+                // final chunk is still covered exactly).
+                let quotient_products = unsafe {
+                    &mut *(quotient_products as *mut [core::mem::MaybeUninit<F>] as *mut [F])
+                };
                 divide_chunk_products(
                     quotient_products,
                     denominator_products,
@@ -541,6 +560,11 @@ fn wires_permutation_partial_products_and_zs<
                 );
             },
         );
+
+    // SAFETY: the parallel pass above wrote and then divided every one of the
+    // `product_count` slots; `par_chunks_mut` partitions the buffer exactly, so
+    // none is left uninitialized.
+    unsafe { all_quotient_chunk_products.set_len(product_count) };
 
     // Accumulate the sequential Z chain directly into the column-major output
     // polynomials, deleting the per-point row Vec, the row-major intermediate,
@@ -855,7 +879,25 @@ fn compute_quotient_polys<
     let zs_row_width = zs_partial_products_and_lookup_commitment.lde_row_width();
     let num_routed_wires = common_data.config.num_routed_wires;
 
-    let mut quotient_values = vec![F::ZERO; points.len() * num_challenges];
+    // The zero-fill this used to do existed only to seed the Horner chain in
+    // `reduce_gate_constraints_base_batch`, which is the first thing every
+    // batch does. That chain now *assigns* its first reversed row instead of
+    // accumulating into zeros (a raw-limb-identical change: the old first pass
+    // computed `reduce128(term as u128)`, which returns `term` unchanged), so
+    // every slot of this buffer is stored before it is read and the memset is
+    // dead. `par_chunks_mut` partitions the whole buffer and each batch writes
+    // all of its own slice, including a short final batch.
+    //
+    // `F` has no `IsZero` specialization, so the old `vec![F::ZERO; n]` was a
+    // real serial store loop, not `alloc_zeroed`: 8 MiB per d16 tx proof,
+    // 2 MiB per chain-step proof, on the per-proof spine between the Zs
+    // commitment and the quotient commitment.
+    let quotient_len = points.len() * num_challenges;
+    let mut quotient_values: Vec<F> = Vec::with_capacity(quotient_len);
+    // SAFETY: capacity is exactly `quotient_len`, and the parallel pass below
+    // writes every element before any is read (see above). Same idiom as the
+    // promoted zero-tail fast path in `fri/oracle.rs`.
+    unsafe { quotient_values.set_len(quotient_len) };
     quotient_values
         .par_chunks_mut(BATCH_SIZE * num_challenges)
         .zip(points_batches)
