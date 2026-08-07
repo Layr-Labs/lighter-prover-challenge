@@ -92,18 +92,24 @@ impl Forest {
     /// unnecessary: each intermediate node receives its direct-root assignment when the outer
     /// loop reaches it. Roots are stable during this pass, so the final `parents` vector is
     /// identical to calling `find(i)` for every `i`.
+    /// Parallel refinement: roots are fixed by the merge history and invariant under
+    /// compression order, so per-element root resolution is a pure function of the
+    /// immutable pre-pass array. Resolving every root against a read-only borrow and
+    /// installing the result wholesale produces the identical final vector while
+    /// spreading the tens-of-millions-entry walk across cores.
     pub(crate) fn compress_paths(&mut self) {
-        for i in 0..self.parents.len() {
-            let parent = self.parents[i];
-            if parent == i {
-                continue;
-            }
-            let mut root = parent;
-            while self.parents[root] != root {
-                root = self.parents[root];
-            }
-            self.parents[i] = root;
-        }
+        let parents = &self.parents;
+        let roots: Vec<usize> = (0..parents.len())
+            .into_par_iter()
+            .map(|i| {
+                let mut root = i;
+                while parents[root] != root {
+                    root = parents[root];
+                }
+                root
+            })
+            .collect();
+        self.parents = roots;
     }
 
     /// Assumes `compress_paths` has already been called.
