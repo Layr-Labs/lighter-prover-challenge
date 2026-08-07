@@ -5,7 +5,7 @@ use itertools::Itertools;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
-use crate::field::batch_util::batch_multiply_inplace;
+use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
 use crate::field::extension::Extendable;
 use crate::field::fft::{fft_in_place_with_options, FftRootTable};
 use crate::field::packed::PackedField;
@@ -284,14 +284,26 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .zip(polynomials.par_iter())
             .for_each(|(destination, polynomial)| {
                 assert_eq!(polynomial.len(), degree, "Polynomial degrees inconsistent");
-                destination[..degree].copy_from_slice(&polynomial.coeffs);
+                // Fused copy-and-scale: the unscaled coefficient image that
+                // `copy_from_slice` used to materialize here is never observed —
+                // the FFT reads only the coset-scaled values — so writing the
+                // product directly deletes one full read+write pass over
+                // `degree` words per column, per commitment, per proof. Word
+                // values are unchanged: `batch_multiply_into` uses the same
+                // packed-prefix/scalar-tail schedule as the
+                // `batch_multiply_inplace` it replaces, and it never reads the
+                // (possibly uninitialized) destination.
+                batch_multiply_into(
+                    &mut destination[..degree],
+                    &polynomial.coeffs,
+                    &coset_powers,
+                );
                 if rate_bits == 0 || degree < 2 {
                     destination[degree..].fill(F::ZERO);
                 }
                 // For a nontrivial zero-padded FFT, the expansion path writes
                 // every tail element before reading it. This is the same
                 // invariant used by `lde_values` to avoid a dead tail memset.
-                batch_multiply_inplace(&mut destination[..degree], &coset_powers);
                 fft_in_place_with_options(destination, Some(rate_bits), fft_root_table);
             });
         true
@@ -589,9 +601,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 
 /// `coeffs.coset_fft_with_options(shift, zero_factor, root_table)` for a
 /// coefficient vector whose entries from index `live` on are *known to be
-/// zero* — the caller must have written those zeros itself (or otherwise hold a
-/// proof of them), since the result is only equal to the classic path under
-/// that precondition.
+/// zero*. For the exact zero-padded FFT shape selected by `zero_factor`, the
+/// FFT overwrites that entire tail before reading it, so those entries may be
+/// left uninitialized instead.
 ///
 /// The classic path materializes `shift^i * c_i` for all `coeffs.len()`
 /// coefficients. Where `c_i` is zero the product is zero, so this scales only
@@ -608,7 +620,9 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
 ) -> PolynomialValues<F> {
     let len = coeffs.len();
     debug_assert!(live <= len);
-    debug_assert!(coeffs.coeffs[live..].iter().all(F::is_zero));
+    let zero_tail_is_unread =
+        matches!(zero_factor, Some(r) if r > 0 && live >= 2 && live == len >> r);
+    debug_assert!(zero_tail_is_unread || coeffs.coeffs[live..].iter().all(F::is_zero));
     let mut scaled = Vec::with_capacity(len);
     scaled.extend(
         shift
@@ -616,17 +630,14 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
             .zip(&coeffs.coeffs[..live])
             .map(|(r, &c)| r * c),
     );
-    match zero_factor {
-        // SAFETY: capacity is exactly `len`. When `live` equals the
-        // zero-padded FFT's live prefix `len >> r` (with `r > 0` and at least
-        // two live coefficients), the FFT reads only the first `len >> r`
-        // coefficients — all just written above — and writes every tail
-        // element before reading it (all expansion paths fill back-to-front),
-        // so the tail never needs the zero fill. This is the same invariant
-        // the `lde_values` fast path relies on. Any other shape keeps the
-        // zero-filling resize.
-        Some(r) if r > 0 && live >= 2 && live == len >> r => unsafe { scaled.set_len(len) },
-        _ => scaled.resize(len, F::ZERO),
+    if zero_tail_is_unread {
+        // SAFETY: capacity is exactly `len`. The zero-padded FFT reads only
+        // the live prefix written above, then writes every tail element before
+        // reading it (all expansion paths fill back-to-front). This is the same
+        // invariant the `lde_values` fast path relies on.
+        unsafe { scaled.set_len(len) };
+    } else {
+        scaled.resize(len, F::ZERO);
     }
     PolynomialCoeffs::new(scaled).fft_with_options(zero_factor, root_table)
 }

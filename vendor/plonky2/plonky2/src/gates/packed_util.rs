@@ -55,6 +55,36 @@ pub trait PackedEvaluableBase<F: RichField + Extendable<D>, const D: usize>: Gat
         filters: &[F],
         combined_gate_constraints: &mut [F],
     ) {
+        // `store_from == num_constraints()` stores nothing: pure accumulation.
+        self.eval_unfiltered_base_batch_accumulate_packed_store(
+            vars_batch,
+            filters,
+            combined_gate_constraints,
+            self.num_constraints(),
+        );
+    }
+
+    /// [`Self::eval_unfiltered_base_batch_accumulate_packed`], except that
+    /// constraint rows `store_from..num_constraints()` are **stored** rather
+    /// than accumulated into, because the caller guarantees those rows of
+    /// `combined_gate_constraints` are raw `F::ZERO` (this gate is their first
+    /// writer for this batch).
+    ///
+    /// Bit-identical to accumulating into a raw zero on both halves of the
+    /// packed/leftover split: the packed half replaces
+    /// `ZEROS.multiply_accumulate(row, filter)`, which is per lane
+    /// `reduce128(0 + row * filter)`, with `row * filter`, which is per lane
+    /// `reduce128(row * filter)`; the leftover half replaces
+    /// `F::ZERO + scratch * filter` with `scratch * filter`, and `Add` with a
+    /// zero left operand takes neither overflow branch and returns its right
+    /// operand unchanged. Storing additionally drops the load of `combined`.
+    fn eval_unfiltered_base_batch_accumulate_packed_store(
+        &self,
+        vars_batch: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+        store_from: usize,
+    ) {
         let n = vars_batch.len();
         assert_eq!(filters.len(), n);
         let num_constraints = self.num_constraints();
@@ -87,12 +117,16 @@ pub trait PackedEvaluableBase<F: RichField + Extendable<D>, const D: usize>: Gat
                 .copy_from_slice(&filters[offset..offset + width]);
             for j in 0..num_constraints {
                 let combined = &mut combined_gate_constraints[j * n + offset..][..width];
-                let mut acc = <F as Packable>::Packing::ZEROS;
-                acc.as_slice_mut().copy_from_slice(combined);
                 let mut row = <F as Packable>::Packing::ZEROS;
                 row.as_slice_mut()
                     .copy_from_slice(&scratch[j * width..(j + 1) * width]);
-                combined.copy_from_slice(acc.multiply_accumulate(row, filter).as_slice());
+                if j >= store_from {
+                    combined.copy_from_slice((row * filter).as_slice());
+                } else {
+                    let mut acc = <F as Packable>::Packing::ZEROS;
+                    acc.as_slice_mut().copy_from_slice(combined);
+                    combined.copy_from_slice(acc.multiply_accumulate(row, filter).as_slice());
+                }
             }
         }
         for (i, vars_leftovers) in vars_leftovers_iter.enumerate() {
@@ -102,7 +136,12 @@ pub trait PackedEvaluableBase<F: RichField + Extendable<D>, const D: usize>: Gat
                 StridedConstraintConsumer::new(&mut scratch[..num_constraints], 1, 0),
             );
             for j in 0..num_constraints {
-                combined_gate_constraints[j * n + point] += scratch[j] * filters[point];
+                let product = scratch[j] * filters[point];
+                if j >= store_from {
+                    combined_gate_constraints[j * n + point] = product;
+                } else {
+                    combined_gate_constraints[j * n + point] += product;
+                }
             }
         }
     }

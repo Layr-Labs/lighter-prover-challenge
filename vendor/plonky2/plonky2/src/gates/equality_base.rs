@@ -5,7 +5,7 @@ use alloc::string::ToString;
 
 use anyhow::Result;
 
-use crate::field::batch_util::batch_multiply_add_inplace;
+use crate::field::batch_util::{batch_multiply_add_inplace, batch_multiply_into};
 use crate::field::extension::Extendable;
 use crate::field::packed::PackedField;
 use crate::gates::gate::Gate;
@@ -124,6 +124,26 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EqualityGate {
         filters: &[F],
         combined_gate_constraints: &mut [F],
     ) {
+        // `store_from == num_constraints()` stores nothing: pure accumulation.
+        self.eval_unfiltered_base_batch_accumulate_store(
+            vars_base,
+            filters,
+            combined_gate_constraints,
+            <Self as Gate<F, D>>::num_constraints(self),
+        );
+    }
+
+    fn supports_store_from(&self) -> bool {
+        true
+    }
+
+    fn eval_unfiltered_base_batch_accumulate_store(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+        store_from: usize,
+    ) {
         let n = vars_base.len();
         assert_eq!(filters.len(), n);
         assert!(combined_gate_constraints.len() >= self.num_ops * 4 * n);
@@ -150,7 +170,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EqualityGate {
             () => {{
                 let combined = &mut combined_gate_constraints
                     [constraint_index * n..(constraint_index + 1) * n];
-                batch_multiply_add_inplace(combined, &scratch, filters);
+                // Rows at or past `store_from` are raw zero on entry, so the
+                // store is bit-identical to the accumulate (see
+                // `Gate::eval_unfiltered_base_batch_accumulate_store`).
+                if constraint_index >= store_from {
+                    batch_multiply_into(combined, &scratch, filters);
+                } else {
+                    batch_multiply_add_inplace(combined, &scratch, filters);
+                }
                 constraint_index += 1;
             }};
         }
