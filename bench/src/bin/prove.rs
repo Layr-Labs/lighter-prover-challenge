@@ -62,7 +62,8 @@ fn main() {
         PUBLIC_LIGHT_TX_COUNT,
     )
     .expect("invalid prover fixture");
-    let proof = prover::prove_block(block, &Circuits::new());
+    let (circuits, pre_proof) = Circuits::new_with_pre_proof(&block);
+    let proof = prover::prove_block_after_pre(block, &circuits, pre_proof);
     bincode::serialize_into(
         BufWriter::with_capacity(
             PROOF_OUTPUT_BUFFER_BYTES,

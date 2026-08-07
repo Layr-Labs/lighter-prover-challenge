@@ -1,7 +1,9 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
+use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, BlockTarget, Circuit as _};
+use circuit::block_pre_execution::BlockPreExec;
 use circuit::block_pre_execution_constraints::{
     BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
 };
@@ -77,6 +79,7 @@ impl PathCircuits {
 }
 
 impl Circuits {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         let ((pre_target, pre_data), (heavy, light)) = rayon::join(
             || {
@@ -104,6 +107,57 @@ impl Circuits {
             dummy_heavy_proof: heavy.dummy_proof,
             dummy_light_proof: light.dummy_proof,
         }
+    }
+
+    /// Build the independent transaction paths while the pre-execution circuit
+    /// is built and proved. The previous startup barrier waited for both path
+    /// circuits before starting this proof even when the pre circuit was ready.
+    pub fn new_with_pre_proof(block: &Block<F>) -> (Self, Proof) {
+        let ((pre_target, pre_data, pre_proof), (heavy, light)) = rayon::join(
+            || {
+                let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
+                let pre_target = pre.target;
+                let pre_data = pre.builder.build::<C>();
+
+                // Circuit construction is CPU-only, so the pre proof remains
+                // the sole owner of the serialized GPU stream while the two
+                // transaction paths continue building on Rayon workers.
+                plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
+                let pre_proof = BlockPreExecutionCircuit::prove(
+                    &pre_data,
+                    &BlockPreExec::from_block(block),
+                    &pre_target,
+                )
+                .expect("block pre-execution proof failed");
+                plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+
+                (pre_target, pre_data, pre_proof)
+            },
+            || {
+                rayon::join(
+                    || PathCircuits::new(HEAVY_TX_PER_PROOF, HEAVY_TX_MODE),
+                    || PathCircuits::new(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE),
+                )
+            },
+        );
+
+        (
+            Self {
+                heavy_tx_target: heavy.tx_target,
+                heavy_tx_data: heavy.tx_data,
+                light_tx_target: light.tx_target,
+                light_tx_data: light.tx_data,
+                pre_target,
+                pre_data,
+                heavy_chain_target: heavy.chain_target,
+                heavy_chain_data: heavy.chain_data,
+                light_chain_target: light.chain_target,
+                light_chain_data: light.chain_data,
+                dummy_heavy_proof: heavy.dummy_proof,
+                dummy_light_proof: light.dummy_proof,
+            },
+            pre_proof,
+        )
     }
 
     /// Builds the final block circuit, which depends on the pre-execution and

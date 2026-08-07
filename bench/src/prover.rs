@@ -362,7 +362,7 @@ fn prove_path(
     })
 }
 
-pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
+pub fn prove_block(block: Block<F>, circuits: &Circuits) -> Proof {
     // The pre-execution proof runs strictly before any other proving work, so
     // the serialized GPU stream is otherwise idle: route its mid-size column
     // trees to the GPU for just this phase.
@@ -374,6 +374,12 @@ pub fn prove_block(mut block: Block<F>, circuits: &Circuits) -> Proof {
     )
     .expect("block pre-execution proof failed");
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+    prove_block_after_pre(block, circuits, pre_proof)
+}
+
+/// Continue the block pipeline from a pre-execution proof produced while the
+/// transaction-path circuits were still being constructed.
+pub fn prove_block_after_pre(mut block: Block<F>, circuits: &Circuits, pre_proof: Proof) -> Proof {
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
