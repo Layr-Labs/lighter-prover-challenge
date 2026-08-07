@@ -48,7 +48,7 @@ const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
 /// 3-set experiment measured 13-18% faster locally but scored -21.6% on the
 /// official ranked host (submission 41467098), so concurrent GPU submission is
 /// intentionally disabled.
-const MAX_BUFFER_SETS: usize = 1;
+const MAX_BUFFER_SETS: usize = 2;
 /// Parallel staging copy granularity in u64 elements (4 MiB chunks).
 const STAGING_CHUNK: usize = 1 << 19;
 
@@ -333,9 +333,13 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     // wait and measurably starves the fold's pure-CPU phases.
     let serial_critical_shape = leaf_count == 1 << 17 && leaf_width > 4;
     if serial_critical_shape {
+        // With `MAX_BUFFER_SETS` concurrent builds allowed, a submission only
+        // waits when every set is busy; one build in flight still leaves a
+        // free slot, so the head-of-line wait that motivated the CPU fallback
+        // has not begun yet.
         return exclusive
             || leaf_width > 64
-            || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
+            || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) < MAX_BUFFER_SETS;
     }
     leaf_permutations + parent_permutations >= min_permutations
 }
