@@ -91,7 +91,7 @@ pub(crate) struct PoseidonGateQuotientJob<F> {
     command_buffer: CommandBuffer,
     output: Buffer,
     len: usize,
-    _job: GpuJobGuard,
+    // Quotient uses private buffers; do not hold GpuJobGuard across vanishing.
     _phantom: PhantomData<F>,
 }
 
@@ -102,7 +102,6 @@ pub(crate) struct RangeCheckGateQuotientJob<F> {
     command_buffer: CommandBuffer,
     output: Buffer,
     len: usize,
-    _job: GpuJobGuard,
     _phantom: PhantomData<F>,
 }
 impl<F: RichField> PoseidonGateQuotientJob<F> {
@@ -1128,7 +1127,6 @@ impl MetalShared {
             self.device
                 .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
         });
-        let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
@@ -1159,7 +1157,6 @@ impl MetalShared {
             command_buffer,
             output,
             len,
-            _job: job_guard,
             _phantom: PhantomData,
         })
     }
@@ -1196,7 +1193,6 @@ impl MetalShared {
             self.device
                 .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
         });
-        let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
@@ -1229,7 +1225,6 @@ impl MetalShared {
             command_buffer,
             output,
             len,
-            _job: job_guard,
             _phantom: PhantomData,
         })
     }
@@ -1277,7 +1272,9 @@ impl MetalShared {
         output_bytes: usize,
     ) -> Result<Option<DetachedOutput<'_>>, String> {
         let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
-        if pool.waiters == 0 || pool.detached_readback {
+        // Always detach after GPU completion so CPU digest conversion does not
+        // hold the exclusive BufferSet. Bounded by one detached lease.
+        if pool.detached_readback {
             return Ok(None);
         }
         let replacement = match pool.spare_output.take() {
@@ -2164,17 +2161,21 @@ fn set_u32(encoder: &metal::ComputeCommandEncoderRef, index: u64, value: u32) {
     );
 }
 
+/// Largest multiple of threadExecutionWidth within max threadgroup size.
+/// Kernels only use thread_position_in_grid — pure occupancy scheduling.
+fn dispatch_group_width(pipeline: &ComputePipelineState) -> NSUInteger {
+    let execution_width = pipeline.thread_execution_width();
+    let max_group = pipeline.max_total_threads_per_threadgroup();
+    ((max_group / execution_width) * execution_width).max(execution_width)
+}
+
 fn dispatch2d(
     encoder: &metal::ComputeCommandEncoderRef,
     pipeline: &ComputePipelineState,
     width: usize,
     height: usize,
 ) {
-    let execution_width = pipeline.thread_execution_width();
-    let group_width = pipeline
-        .max_total_threads_per_threadgroup()
-        .min(64)
-        .max(execution_width);
+    let group_width = dispatch_group_width(pipeline);
     encoder.dispatch_threads(
         MTLSize {
             width: width as NSUInteger,
@@ -2194,11 +2195,7 @@ fn dispatch(
     pipeline: &ComputePipelineState,
     thread_count: usize,
 ) {
-    let execution_width = pipeline.thread_execution_width();
-    let group_width = pipeline
-        .max_total_threads_per_threadgroup()
-        .min(64)
-        .max(execution_width);
+    let group_width = dispatch_group_width(pipeline);
     encoder.dispatch_threads(
         MTLSize {
             width: thread_count as NSUInteger,

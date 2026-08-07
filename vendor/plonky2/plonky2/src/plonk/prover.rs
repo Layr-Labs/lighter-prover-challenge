@@ -1506,12 +1506,17 @@ fn compute_quotient_polys<
     // remaining gates, while the permutation argument always needs the routed
     // prefix. Do not gather dead high columns for offloaded Poseidon/Range
     // gates into every 32-point CPU scratch batch.
-    let cpu_num_wires = common_data
-        .gates
+    //
+    // Materialize the ascending survivor list once: the Metal offload decision
+    // is fixed for the whole proof, so re-scanning `excluded_gate_indices`
+    // inside every 32-point batch (~1.1M times on the public fixture) is pure
+    // dead control work. The same slice drives wire-width and gate evaluation.
+    let cpu_gate_indices = (0..common_data.gates.len())
+        .filter(|gate_index| !excluded_gate_indices.contains(gate_index))
+        .collect::<Vec<_>>();
+    let cpu_num_wires = cpu_gate_indices
         .iter()
-        .enumerate()
-        .filter(|(gate_index, _)| !excluded_gate_indices.contains(gate_index))
-        .map(|(_, gate)| gate.0.num_wires())
+        .map(|&i| common_data.gates[i].0.num_wires())
         .max()
         .unwrap_or(0)
         .max(num_routed_wires);
@@ -1769,7 +1774,7 @@ fn compute_quotient_polys<
                     beta_k_is,
                     deltas,
                     alphas,
-                    &excluded_gate_indices,
+                    &cpu_gate_indices,
                     &z_h_on_coset,
                     &lut_re_poly_evals_refs,
                     &mut scratch.vanishing,
