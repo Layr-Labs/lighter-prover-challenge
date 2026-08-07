@@ -2,8 +2,6 @@
 use alloc::{vec, vec::Vec};
 use core::borrow::Borrow;
 
-use plonky2_maybe_rayon::*;
-
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::packed::PackedField;
 use crate::field::polynomial::PolynomialCoeffs;
@@ -84,56 +82,26 @@ impl<F: Field> ReducingFactor<F> {
 
     pub fn reduce_polys_base<BF: Extendable<D, Extension = F>, const D: usize>(
         &mut self,
-        polys: impl IntoIterator<Item = impl Borrow<PolynomialCoeffs<BF>> + Sync>,
+        polys: impl IntoIterator<Item = impl Borrow<PolynomialCoeffs<BF>>>,
     ) -> PolynomialCoeffs<F>
     where
         F: FieldExtension<D, BaseField = BF>,
     {
-        // Fused multiply-accumulate: each base coefficient is read exactly
-        // once and multiplied by its polynomial's power of the reducing base.
-        // For the large opening batches this runs on the serial per-proof
-        // spine, so split the polynomials into chunks reduced in parallel and
-        // then sum the per-chunk partial vectors. Coefficient `i` of the
-        // result is `sum_j base^j * c_{j,i}` either way — field addition is
-        // exact, commutative and associative, so regrouping the sum by chunk
-        // produces the identical field element for every coefficient.
-        let polys: Vec<_> = polys.into_iter().collect();
-        let num_polys = polys.len();
-        let max_len = polys
-            .iter()
-            .map(|p| p.borrow().coeffs.len())
-            .max()
-            .unwrap_or(0);
-        let base_powers: Vec<F> = self.base.powers().take(num_polys).collect();
-        self.count += num_polys as u64;
-
-        let accumulate_chunk = |ps: &[_], powers: &[F]| -> Vec<F> {
-            let mut acc: Vec<F> = vec![F::ZERO; max_len];
-            for (base_power, poly) in powers.iter().zip(ps) {
-                let coeffs: &PolynomialCoeffs<BF> = Borrow::borrow(poly);
-                for (a, &c) in acc.iter_mut().zip(coeffs.coeffs.iter()) {
-                    *a += <F as FieldExtension<D>>::scalar_mul(base_power, c);
-                }
+        // Fused multiply-accumulate: one extension accumulator, each base
+        // coefficient read exactly once. Equivalent to the old
+        // `map(mul_extension).sum()` (field arithmetic is exact and the
+        // per-power scalar products are accumulated in the same order), but
+        // without one degree-sized temporary allocation + two clone passes per
+        // polynomial.
+        let mut acc: Vec<F> = Vec::new();
+        for (base_power, poly) in self.base.powers().zip(polys) {
+            self.count += 1;
+            let coeffs = &poly.borrow().coeffs;
+            if coeffs.len() > acc.len() {
+                acc.resize(coeffs.len(), F::ZERO);
             }
-            acc
-        };
-
-        // Small batches (the `g * zeta` batch has two polynomials) are not
-        // worth the parallel dispatch or the partial-vector merge.
-        const PARALLEL_CHUNK: usize = 16;
-        if num_polys <= PARALLEL_CHUNK {
-            return PolynomialCoeffs::new(accumulate_chunk(&polys, &base_powers));
-        }
-
-        let partials: Vec<Vec<F>> = polys
-            .par_chunks(PARALLEL_CHUNK)
-            .zip(base_powers.par_chunks(PARALLEL_CHUNK))
-            .map(|(ps, powers)| accumulate_chunk(ps, powers))
-            .collect();
-        let mut acc = vec![F::ZERO; max_len];
-        for partial in partials {
-            for (a, p) in acc.iter_mut().zip(partial) {
-                *a += p;
+            for (a, &c) in acc.iter_mut().zip(coeffs.iter()) {
+                *a += <F as FieldExtension<D>>::scalar_mul(&base_power, c);
             }
         }
         PolynomialCoeffs::new(acc)

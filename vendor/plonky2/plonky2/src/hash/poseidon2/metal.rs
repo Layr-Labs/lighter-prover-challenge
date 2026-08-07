@@ -14,7 +14,10 @@ use plonky2_maybe_rayon::*;
 
 use crate::field::types::{Field, PrimeField64};
 use crate::hash::hash_types::{HashOut, RichField};
+use crate::hash::merkle_tree::MerkleDigestStore;
 use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
+
+type MerkleBuild<F> = (MerkleDigestStore<HashOut<F>>, Vec<HashOut<F>>);
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
@@ -211,7 +214,7 @@ pub(crate) fn build_merkle_tree<F: RichField>(
     leaf_width: usize,
     leaf_count: usize,
     cap_height: usize,
-) -> Option<(Vec<HashOut<F>>, Vec<HashOut<F>>)> {
+) -> Option<MerkleBuild<F>> {
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || leaves.len() != leaf_count * leaf_width
@@ -235,7 +238,7 @@ pub(crate) fn build_merkle_tree<F: RichField>(
 pub(crate) fn build_merkle_tree_columns<F: RichField>(
     columns: &[Vec<F>],
     cap_height: usize,
-) -> Option<(Vec<HashOut<F>>, Vec<HashOut<F>>)> {
+) -> Option<MerkleBuild<F>> {
     let leaf_width = columns.len();
     let leaf_count = columns.first().map_or(0, Vec::len);
     if F::ORDER != 0xffff_ffff_0000_0001
@@ -273,7 +276,7 @@ pub(crate) fn build_commitment_from_coeffs<F: RichField>(
     coeff_columns: &[&[F]],
     rate_bits: usize,
     cap_height: usize,
-) -> Option<(MetalColumns<F>, Vec<HashOut<F>>, Vec<HashOut<F>>)> {
+) -> Option<(MetalColumns<F>, MerkleDigestStore<HashOut<F>>, Vec<HashOut<F>>)> {
     let cols = coeff_columns.len();
     let degree = coeff_columns.first().map_or(0, |column| column.len());
     if F::ORDER != 0xffff_ffff_0000_0001
@@ -314,7 +317,7 @@ pub(crate) fn build_commitment_from_values<F: RichField>(
     cap_height: usize,
 ) -> Option<(
     MetalColumns<F>,
-    Vec<HashOut<F>>,
+    MerkleDigestStore<HashOut<F>>,
     Vec<HashOut<F>>,
     Vec<Vec<F>>,
 )> {
@@ -562,7 +565,7 @@ impl MetalShared {
     ) -> Result<
         (
             MetalColumns<F>,
-            Vec<HashOut<F>>,
+            MerkleDigestStore<HashOut<F>>,
             Vec<HashOut<F>>,
             Vec<Vec<F>>,
         ),
@@ -613,7 +616,7 @@ impl MetalShared {
         });
 
         let mut set = self.acquire_set()?;
-        let result = (|| -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
+        let result = (|| -> Result<MerkleBuild<F>, String> {
             if set
                 .input
                 .as_ref()
@@ -825,7 +828,7 @@ impl MetalShared {
         degree: usize,
         rate_bits: usize,
         cap_height: usize,
-    ) -> Result<(MetalColumns<F>, Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
+    ) -> Result<(MetalColumns<F>, MerkleDigestStore<HashOut<F>>, Vec<HashOut<F>>), String> {
         let cols = coeff_columns.len();
         let lde_size = degree << rate_bits;
         let log_lde = lde_size.ilog2();
@@ -907,7 +910,7 @@ impl MetalShared {
         coeff_bytes: usize,
         output_len: usize,
         output_bytes: usize,
-    ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
+    ) -> Result<MerkleBuild<F>, String> {
         let cols = coeff_columns.len();
         let lde_size = degree << rate_bits;
         let log_lde = lde_size.ilog2();
@@ -1057,7 +1060,7 @@ impl MetalShared {
         leaf_width: usize,
         leaf_count: usize,
         cap_height: usize,
-    ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
+    ) -> Result<MerkleBuild<F>, String> {
         let cap_count = 1usize << cap_height;
         let total_node_count = 2 * leaf_count - cap_count;
 
@@ -1102,7 +1105,7 @@ impl MetalShared {
         input_bytes: usize,
         output_len: usize,
         output_bytes: usize,
-    ) -> Result<(Vec<HashOut<F>>, Vec<HashOut<F>>), String> {
+    ) -> Result<MerkleBuild<F>, String> {
         let cap_count = 1usize << cap_height;
 
         if set
@@ -1320,64 +1323,28 @@ fn tree_from_levels<F: RichField>(
     level_offsets: &[usize],
     leaf_count: usize,
     cap_height: usize,
-) -> (Vec<HashOut<F>>, Vec<HashOut<F>>) {
+) -> MerkleBuild<F> {
     let cap_count = 1usize << cap_height;
-    let subtree_leaf_count = leaf_count / cap_count;
-    let subtree_digest_count = 2 * (subtree_leaf_count - 1);
-    let mut digests = vec![HashOut::ZERO; 2 * (leaf_count - cap_count)];
-    let mut cap = vec![HashOut::ZERO; cap_count];
-
-    if subtree_digest_count == 0 {
-        cap.par_iter_mut()
-            .enumerate()
-            .for_each(|(cap_index, root)| {
-                *root = read_node(nodes, level_offsets[0], cap_index);
-            });
-    } else {
-        digests
-            .par_chunks_exact_mut(subtree_digest_count)
-            .zip(cap.par_iter_mut())
-            .enumerate()
-            .for_each(|(cap_index, (subtree_digests, root))| {
-                *root = fill_subtree_layout(
-                    subtree_digests,
-                    nodes,
-                    level_offsets,
-                    cap_index * subtree_leaf_count,
-                    subtree_leaf_count,
-                );
-            });
-    }
-    (digests, cap)
-}
-
-fn fill_subtree_layout<F: RichField>(
-    digests: &mut [HashOut<F>],
-    nodes: &[u64],
-    level_offsets: &[usize],
-    start_leaf: usize,
-    leaf_count: usize,
-) -> HashOut<F> {
-    if leaf_count == 1 {
-        return read_node(nodes, level_offsets[0], start_leaf);
-    }
-
-    let (left_half, right_half) = digests.split_at_mut(digests.len() / 2);
-    let (left_root, left_digests) = left_half.split_last_mut().unwrap();
-    let (right_root, right_digests) = right_half.split_first_mut().unwrap();
-    let half = leaf_count / 2;
-    *left_root = fill_subtree_layout(left_digests, nodes, level_offsets, start_leaf, half);
-    *right_root = fill_subtree_layout(right_digests, nodes, level_offsets, start_leaf + half, half);
-
-    let level = leaf_count.ilog2() as usize;
-    read_node(nodes, level_offsets[level], start_leaf / leaf_count)
-}
-
-fn read_node<F: RichField>(nodes: &[u64], level_offset: usize, index: usize) -> HashOut<F> {
-    let offset = level_offset + index * 4;
-    HashOut {
-        elements: core::array::from_fn(|i| F::from_canonical_u64(nodes[offset + i])),
-    }
+    let hashes = nodes
+        .par_chunks_exact(4)
+        .map(|node| HashOut {
+            elements: core::array::from_fn(|i| F::from_canonical_u64(node[i])),
+        })
+        .collect::<Vec<_>>();
+    let level_offsets = level_offsets
+        .iter()
+        .map(|offset| offset / 4)
+        .collect::<Vec<_>>();
+    let cap_start = *level_offsets.last().unwrap();
+    let cap = hashes[cap_start..cap_start + cap_count].to_vec();
+    debug_assert_eq!(hashes.len(), 2 * leaf_count - cap_count);
+    (
+        MerkleDigestStore::Levels {
+            nodes: hashes,
+            level_offsets,
+        },
+        cap,
+    )
 }
 
 #[cfg(test)]
@@ -2239,15 +2206,17 @@ kernel void goldilocks_mul_bench_native(
     }
 
     fn assert_tree_eq(
-        actual: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
+        actual: &MerkleBuild<GoldilocksField>,
         expected: &(Vec<HashOut<GoldilocksField>>, Vec<HashOut<GoldilocksField>>),
         width: usize,
         cap_height: usize,
     ) {
-        assert_eq!(actual.0.len(), expected.0.len());
+        let cap_count = 1 << cap_height;
+        let leaf_count = expected.0.len() / 2 + cap_count;
+        let actual_digests = actual.0.recursive_digests(leaf_count, cap_height);
+        assert_eq!(actual_digests.len(), expected.0.len());
         assert_eq!(actual.1.len(), expected.1.len());
-        for (index, (actual, expected)) in actual
-            .0
+        for (index, (actual, expected)) in actual_digests
             .iter()
             .chain(&actual.1)
             .zip(expected.0.iter().chain(&expected.1))

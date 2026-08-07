@@ -35,7 +35,7 @@ use crate::gates::lookup::Lookup;
 use crate::gates::selectors::SelectorsInfo;
 use crate::hash::hash_types::{HashOutTarget, MerkleCapTarget, RichField};
 use crate::hash::merkle_proofs::{MerkleProof, MerkleProofTarget};
-use crate::hash::merkle_tree::{MerkleCap, MerkleLeaves, MerkleTree};
+use crate::hash::merkle_tree::{MerkleCap, MerkleDigestStore, MerkleLeaves, MerkleTree};
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::generator::WitnessGeneratorRef;
 use crate::iop::target::{BoolTarget, Target};
@@ -344,7 +344,7 @@ pub trait Read {
                 width: leaf_width,
             },
             num_leaves,
-            digests,
+            digests: MerkleDigestStore::Recursive(digests),
             cap,
         })
     }
@@ -1438,7 +1438,10 @@ pub trait Write {
             self.write_usize(leaf.len())?;
             self.write_field_vec(&leaf)?;
         }
-        self.write_hash_vec::<F, H>(&tree.digests)?;
+        let digests = tree
+            .digests
+            .recursive_digests(tree.num_leaves, tree.cap.height());
+        self.write_hash_vec::<F, H>(&digests)?;
         self.write_usize(tree.cap.height())?;
         self.write_merkle_cap(&tree.cap)?;
 

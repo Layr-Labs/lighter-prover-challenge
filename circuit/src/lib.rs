@@ -72,7 +72,4 @@ pub mod uint;
 pub mod utils;
 
 #[cfg(test)]
-mod inverse_exploration;
-
-#[cfg(test)]
 pub mod gate_batch_testing;
