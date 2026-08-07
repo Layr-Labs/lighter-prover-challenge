@@ -256,19 +256,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         layout: BatchLayout,
         out: &mut Vec<F>,
     ) {
-        if layout == BatchLayout::PolyMajor && step == 1 {
-            if let Some(&index_start) = indices.first() {
-                let contiguous = indices
-                    .iter()
-                    .enumerate()
-                    .all(|(offset, &index)| index_start.checked_add(offset) == Some(index));
-                if contiguous {
-                    self.fill_lde_batch_contiguous(index_start, indices.len(), col_range, out);
-                    return;
-                }
-            }
-        }
-
         let n = indices.len();
         let start = col_range.start;
         let w = col_range.len();
@@ -317,43 +304,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                 out[ci * n + k] = value;
                             }
                         }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Copies consecutive LDE points into a PolyMajor output buffer.
-    ///
-    /// Column-backed commitments use one contiguous slice copy per column,
-    /// avoiding the indexed element loop in the quotient path. Row-backed
-    /// commitments retain the same logical layout through a narrow fallback.
-    pub(crate) fn fill_lde_batch_contiguous(
-        &self,
-        index_start: usize,
-        n: usize,
-        col_range: core::ops::Range<usize>,
-        out: &mut Vec<F>,
-    ) {
-        let start = col_range.start;
-        let w = col_range.len();
-        out.resize(n * w, F::ZERO);
-
-        match &self.merkle_tree.leaves {
-            MerkleLeaves::Columns { columns, .. } => {
-                let index_end = index_start
-                    .checked_add(n)
-                    .expect("contiguous LDE batch range overflow");
-                for (ci, c) in col_range.enumerate() {
-                    out[ci * n..(ci + 1) * n]
-                        .copy_from_slice(&columns.col(c)[index_start..index_end]);
-                }
-            }
-            MerkleLeaves::Rows { .. } => {
-                for k in 0..n {
-                    let row = &self.get_lde_values(index_start + k, 1)[start..start + w];
-                    for (ci, &value) in row.iter().enumerate() {
-                        out[ci * n + k] = value;
                     }
                 }
             }
@@ -517,7 +467,18 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
             .zip(&coeffs.coeffs[..live])
             .map(|(r, &c)| r * c),
     );
-    scaled.resize(len, F::ZERO);
+    match zero_factor {
+        // SAFETY: capacity is exactly `len`. When `live` equals the
+        // zero-padded FFT's live prefix `len >> r` (with `r > 0` and at least
+        // two live coefficients), the FFT reads only the first `len >> r`
+        // coefficients — all just written above — and writes every tail
+        // element before reading it (all expansion paths fill back-to-front),
+        // so the tail never needs the zero fill. This is the same invariant
+        // the `lde_values` fast path relies on. Any other shape keeps the
+        // zero-filling resize.
+        Some(r) if r > 0 && live >= 2 && live == len >> r => unsafe { scaled.set_len(len) },
+        _ => scaled.resize(len, F::ZERO),
+    }
     PolynomialCoeffs::new(scaled).fft_with_options(zero_factor, root_table)
 }
 

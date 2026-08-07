@@ -264,6 +264,12 @@ where
     let lookup_polys =
         compute_all_lookup_polys(&witness, &deltas, prover_data, common_data, has_lookup);
 
+    // The permutation argument and lookup polys were the last readers of the
+    // witness matrix (non-routed columns were already moved out into
+    // `wires_values`). Free the ~80 routed columns now, before the ZS
+    // commitment, quotient evaluation, and FRI phases raise memory pressure.
+    drop(witness);
+
     if has_lookup {
         zs_partial_products.extend(lookup_polys);
     }
@@ -1050,17 +1056,21 @@ fn compute_quotient_polys<
         );
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
-    (0..num_challenges)
+    // One streaming pass splits the interleaved point-major buffer into the
+    // per-challenge columns, instead of `num_challenges` parallel passes each
+    // stride-reading the whole buffer. Same values in the same order; only
+    // which pass writes them changes.
+    let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
+        .map(|_| Vec::with_capacity(points.len()))
+        .collect();
+    for point_values in quotient_values.chunks_exact(num_challenges) {
+        for (column, &value) in challenge_columns.iter_mut().zip(point_values) {
+            column.push(value);
+        }
+    }
+    challenge_columns
         .into_par_iter()
-        .map(|challenge| {
-            PolynomialValues::new(
-                quotient_values
-                    .chunks_exact(num_challenges)
-                    .map(|point_values| point_values[challenge])
-                    .collect(),
-            )
-        })
-        .map(|values| values.coset_ifft(F::coset_shift()))
+        .map(|column| PolynomialValues::new(column).coset_ifft(F::coset_shift()))
         .collect()
 }
 
@@ -1227,30 +1237,6 @@ mod quotient_layout_tests {
                 assert_eq!(point_major[k * w + c].0, poly_major[c * n + k].0);
             }
         }
-    }
-
-    /// A contiguous PolyMajor gather must produce the same column slices as
-    /// the generic indexed gather. This catches off-by-one source ranges and
-    /// accidental point-major writes in the quotient fast path.
-    #[test]
-    fn contiguous_lde_batch_matches_indexed_gather() {
-        let (data, _) = small_circuit();
-        let commitment = &data.prover_only.constants_sigmas_commitment;
-        let range = data.common.sigmas_range();
-        let indices = [3usize, 4, 5, 6, 7, 8, 9];
-        let mut indexed = Vec::new();
-        let mut contiguous = Vec::new();
-
-        commitment.fill_lde_batch(
-            &indices,
-            1,
-            range.clone(),
-            BatchLayout::PolyMajor,
-            &mut indexed,
-        );
-        commitment.fill_lde_batch_contiguous(indices[0], indices.len(), range, &mut contiguous);
-
-        assert_eq!(contiguous, indexed);
     }
 
     /// Scratch reuse: `fill_lde_batch` writes every cell of `out` before any
