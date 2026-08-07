@@ -11,6 +11,7 @@ use anyhow::Result;
 
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::types::Field;
 use crate::gates::gate::Gate;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -154,12 +155,40 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ReducingExtens
             F::Extension::from_basefield_array(arr)
         };
 
-        let alphas: Vec<F::Extension> = (0..n).map(|p| ext(Self::wires_alpha().start, p)).collect();
-        let mut accs: Vec<F::Extension> = (0..n)
-            .map(|p| ext(Self::wires_old_acc().start, p))
-            .collect();
+        // Batches are 32 points in this prover (and D is a small constant), so
+        // the per-point alpha/accumulator columns and the D-row scratch all
+        // fit on the stack; fall back to the heap only for oversized batches.
+        let mut alphas_stack = [F::Extension::ZERO; 64];
+        let mut alphas_heap;
+        let alphas: &mut [F::Extension] = if n <= 64 {
+            &mut alphas_stack[..n]
+        } else {
+            alphas_heap = vec![F::Extension::ZERO; n];
+            &mut alphas_heap
+        };
+        for (p, alpha) in alphas.iter_mut().enumerate() {
+            *alpha = ext(Self::wires_alpha().start, p);
+        }
+        let mut accs_stack = [F::Extension::ZERO; 64];
+        let mut accs_heap;
+        let accs: &mut [F::Extension] = if n <= 64 {
+            &mut accs_stack[..n]
+        } else {
+            accs_heap = vec![F::Extension::ZERO; n];
+            &mut accs_heap
+        };
+        for (p, acc) in accs.iter_mut().enumerate() {
+            *acc = ext(Self::wires_old_acc().start, p);
+        }
 
-        let mut scratch = vec![F::ZERO; D * n];
+        let mut scratch_stack = [F::ZERO; 128];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if D * n <= 128 {
+            &mut scratch_stack[..D * n]
+        } else {
+            scratch_heap = vec![F::ZERO; D * n];
+            &mut scratch_heap
+        };
         for i in 0..self.num_coeffs {
             let coeff_start = Self::wires_coeff(i).start;
             let acc_start = self.wires_accs(i).start;

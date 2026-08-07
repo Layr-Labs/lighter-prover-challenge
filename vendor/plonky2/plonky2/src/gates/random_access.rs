@@ -288,11 +288,30 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
         let col = |w: usize| &wires[w * n..][..n];
         let vec_size = self.vec_size();
         let mut row = 0;
-        let mut scratch = vec![F::ZERO; n];
+        // Batches are 32 points in this prover; keep the scratch row on the
+        // stack and fall back to the heap only for oversized batches.
+        let mut scratch_stack = [F::ZERO; 64];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if n <= 64 {
+            &mut scratch_stack[..n]
+        } else {
+            scratch_heap = vec![F::ZERO; n];
+            &mut scratch_heap
+        };
         // `items` holds vec_size columns of n points, folded in place; the
         // write index k always trails the read indices 2k, 2k+1, which were
-        // consumed at an earlier k of the same level.
-        let mut items = vec![F::ZERO; vec_size * n];
+        // consumed at an earlier k of the same level. vec_size = 1 << bits is
+        // at most 64 for the shapes these circuits use (bits <= 6), so the
+        // whole buffer (<= 16 KiB for 32-point batches) also fits on the
+        // stack, again with a heap fallback for oversized gates or batches.
+        let mut items_stack = [F::ZERO; 2048];
+        let mut items_heap;
+        let items: &mut [F] = if vec_size * n <= 2048 {
+            &mut items_stack[..vec_size * n]
+        } else {
+            items_heap = vec![F::ZERO; vec_size * n];
+            &mut items_heap
+        };
 
         let mut emit = |row: &mut usize, scratch: &[F]| {
             batch_multiply_add_inplace(

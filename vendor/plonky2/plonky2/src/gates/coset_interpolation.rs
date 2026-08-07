@@ -319,7 +319,19 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
 
         let domain = F::two_adic_subgroup(self.subgroup_bits);
         let weights = &self.barycentric_weights;
-        let mut values = vec![F::Extension::ZERO; self.num_points()];
+        // num_points = 1 << subgroup_bits is a small constant for the shapes
+        // these circuits use, so the per-point values buffer lives on the
+        // stack, with a heap fallback for oversized gates. The full
+        // num_constraints * n scratch matrix stays on the heap: its size is
+        // not bounded by a small constant.
+        let mut values_stack = [F::Extension::ZERO; 64];
+        let mut values_heap;
+        let values: &mut [F::Extension] = if self.num_points() <= 64 {
+            &mut values_stack[..self.num_points()]
+        } else {
+            values_heap = vec![F::Extension::ZERO; self.num_points()];
+            &mut values_heap
+        };
         let mut scratch = vec![F::ZERO; num_constraints * n];
 
         for (p, vars) in vars_base.iter().enumerate() {

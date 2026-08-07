@@ -348,7 +348,16 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
             }};
         }
 
-        let mut states = vec![[F::ZERO; WIDTH]; n];
+        // Per-point permutation states likewise live on the stack for the
+        // 32-point batches used by this prover, with a heap fallback.
+        let mut states_stack = [[F::ZERO; WIDTH]; 64];
+        let mut states_heap;
+        let states: &mut [[F; WIDTH]] = if n <= 64 {
+            &mut states_stack[..n]
+        } else {
+            states_heap = vec![[F::ZERO; WIDTH]; n];
+            &mut states_heap
+        };
 
         // Assert that `swap` is binary.
         let swap = col(Self::WIRE_SWAP);

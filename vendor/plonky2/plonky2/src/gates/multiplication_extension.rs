@@ -127,7 +127,17 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for MulExtensionGa
             F::Extension::from_basefield_array(arr)
         };
 
-        let mut scratch = vec![F::ZERO; D * n];
+        // Batches are 32 points in this prover (and D is a small constant), so
+        // the D-row scratch fits on the stack; fall back to the heap only for
+        // oversized batches.
+        let mut scratch_stack = [F::ZERO; 128];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if D * n <= 128 {
+            &mut scratch_stack[..D * n]
+        } else {
+            scratch_heap = vec![F::ZERO; D * n];
+            &mut scratch_heap
+        };
         for i in 0..self.num_ops {
             let m0_start = Self::wires_ith_multiplicand_0(i).start;
             let m1_start = Self::wires_ith_multiplicand_1(i).start;
