@@ -182,6 +182,19 @@ pub(crate) enum U32QuotientKind {
         num_extra_constants: usize,
         constant_base: usize,
     },
+    /// `ExponentiationGate`: `num_ops` carries the power-bit count.
+    Exponentiation,
+    /// `EqualityGate`: `constant_column` is the index, inside the
+    /// constants/sigmas commitment, of the gate's first constant (its "one").
+    Equality {
+        constant_column: usize,
+    },
+    /// `ReducingGate` / `ReducingExtensionGate` at `D == 2`: `num_ops` carries
+    /// the coefficient count and `extension_coeffs` selects whether each
+    /// coefficient occupies one base wire or a full two-wire extension value.
+    Reducing {
+        extension_coeffs: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -745,6 +758,46 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                         return None;
                     }
                     (6usize, bits, num_extra_constants, constant_base, wire_count, num_constraints)
+                }
+                U32QuotientKind::Exponentiation => (
+                    7usize,
+                    0usize,
+                    0usize,
+                    0usize,
+                    spec.num_ops.checked_mul(2)?.checked_add(2)?,
+                    spec.num_ops.checked_add(1)?,
+                ),
+                // Three routed words per operation (x, y, equal) followed by
+                // three unrouted temporaries (diff, invdiff, prod). The
+                // constants column travels in the addend-count slot.
+                U32QuotientKind::Equality { constant_column } => {
+                    if constant_column >= constants.cols {
+                        return None;
+                    }
+                    (
+                        8usize,
+                        constant_column,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_mul(6)?,
+                        spec.num_ops.checked_mul(4)?,
+                    )
+                }
+                // Output, alpha and old accumulator take two wires each, then
+                // one or two wires per coefficient, then one accumulator per
+                // step except the last (which aliases the output wires).
+                U32QuotientKind::Reducing { extension_coeffs } => {
+                    let coeff_wires = if extension_coeffs { 2usize } else { 1usize };
+                    (
+                        9usize,
+                        extension_coeffs as usize,
+                        0usize,
+                        0usize,
+                        spec.num_ops
+                            .checked_mul(coeff_wires.checked_add(2)?)?
+                            .checked_add(4)?,
+                        spec.num_ops.checked_mul(2)?,
+                    )
                 }
             };
         if wire_count > wires.cols
@@ -3013,6 +3066,31 @@ mod tests {
                 }),
             ),
             (3, UnionShape::U32(U32QuotientKind::Arithmetic)),
+            // Production shapes for the gates matched by type in the prover:
+            // 67 power bits, 22 equality operations, and the two reducing
+            // flavours at the coefficient counts that fill 136 wires. The
+            // equality constant column reuses an existing selector column as
+            // test data — both sides read the same values.
+            (
+                (WIRE_COLUMNS - 2) / 2,
+                UnionShape::U32(U32QuotientKind::Exponentiation),
+            ),
+            (
+                WIRE_COLUMNS / 6,
+                UnionShape::U32(U32QuotientKind::Equality { constant_column: 0 }),
+            ),
+            (
+                (WIRE_COLUMNS - 4) / 3,
+                UnionShape::U32(U32QuotientKind::Reducing {
+                    extension_coeffs: false,
+                }),
+            ),
+            (
+                (WIRE_COLUMNS - 4) / 4,
+                UnionShape::U32(U32QuotientKind::Reducing {
+                    extension_coeffs: true,
+                }),
+            ),
         ];
         let raw_constant_base = shapes.len() + 3;
         for (bits, num_ops, num_extra_constants) in
@@ -3339,6 +3417,83 @@ mod tests {
                                 constraints.push((two * a[1] * a[3] + extra[9]) - c[4]);
                             }
                             assert_eq!(constraints.len(), spec.num_ops * 15);
+                        }
+                        U32QuotientKind::Exponentiation => {
+                            let num_power_bits = spec.num_ops;
+                            let exponent_base = wire(0);
+                            for i in 0..num_power_bits {
+                                let previous = if i == 0 {
+                                    F::ONE
+                                } else {
+                                    let last = wire(2 + num_power_bits + i - 1);
+                                    last * last
+                                };
+                                let current_bit = wire(1 + (num_power_bits - i - 1));
+                                constraints.push(
+                                    previous
+                                        * (current_bit * exponent_base
+                                            + (F::ONE - current_bit))
+                                        - wire(2 + num_power_bits + i),
+                                );
+                            }
+                            constraints.push(
+                                wire(1 + num_power_bits) - wire(1 + 2 * num_power_bits),
+                            );
+                            assert_eq!(constraints.len(), num_power_bits + 1);
+                        }
+                        U32QuotientKind::Equality { constant_column } => {
+                            let const_0 = constants.col(constant_column)[source_row];
+                            for op in 0..spec.num_ops {
+                                let temporary = 3 * spec.num_ops + 3 * op;
+                                let difference = wire(temporary);
+                                let product = wire(temporary + 2);
+                                constraints.push((wire(3 * op) - wire(3 * op + 1)) - difference);
+                                constraints
+                                    .push(difference * wire(temporary + 1) - product);
+                                constraints.push(product * difference - difference);
+                                constraints.push((const_0 - product) - wire(3 * op + 2));
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * 4);
+                        }
+                        U32QuotientKind::Reducing { extension_coeffs } => {
+                            // Quadratic Goldilocks extension: x^2 = 7.
+                            assert_eq!(
+                                <F as crate::field::extension::Extendable<2>>::W,
+                                F::from_canonical_u64(7),
+                                "the kernel hard-codes the quadratic extension modulus"
+                            );
+                            let w = F::from_canonical_u64(7);
+                            let coeff_wires = if extension_coeffs { 2 } else { 1 };
+                            let coeff_start = 6;
+                            let acc_start = coeff_start + spec.num_ops * coeff_wires;
+                            let alpha_0 = wire(2);
+                            let alpha_1 = wire(3);
+                            let mut acc_0 = wire(4);
+                            let mut acc_1 = wire(5);
+                            for i in 0..spec.num_ops {
+                                let next_start = if i + 1 == spec.num_ops {
+                                    0
+                                } else {
+                                    acc_start + 2 * i
+                                };
+                                let next_0 = wire(next_start);
+                                let next_1 = wire(next_start + 1);
+                                let coeff_wire = coeff_start + i * coeff_wires;
+                                let coeff_0 = wire(coeff_wire);
+                                let coeff_1 = if extension_coeffs {
+                                    wire(coeff_wire + 1)
+                                } else {
+                                    F::ZERO
+                                };
+                                constraints.push(
+                                    acc_0 * alpha_0 + w * acc_1 * alpha_1 + coeff_0 - next_0,
+                                );
+                                constraints
+                                    .push(acc_0 * alpha_1 + acc_1 * alpha_0 + coeff_1 - next_1);
+                                acc_0 = next_0;
+                                acc_1 = next_1;
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * 2);
                         }
                         U32QuotientKind::Arithmetic => {
                             for op in 0..spec.num_ops {

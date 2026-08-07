@@ -388,9 +388,13 @@ inline void range_check_gate_emit(
 //   then two unused words that keep both record kinds the same stride.
 // It is followed by promoted-family records with the same five selector words,
 // then kind (arithmetic=0, subtraction=1, add-many=2, byte-decomposition=3,
-// quintic-multiplication=4, quintic-squaring=5, random-access=6), operation or
-// copy count, and three explicit kind words. Random access uses the final words
-// for index bits, extra constants, and the raw constant-column base.
+// quintic-multiplication=4, quintic-squaring=5, random-access=6,
+// exponentiation=7, equality=8, reducing=9), operation or copy count, and
+// three explicit kind words. Random access uses the final words for index
+// bits, extra constants, and the raw constant-column base; exponentiation
+// carries the power-bit count in the operation slot; equality carries its
+// constants column in the addend slot; reducing carries the
+// extension-coefficient flag in the addend slot.
 // The result-limb count is what makes the subtraction and add-many branches
 // width-generic: a `2 * result_limbs`-bit word recomposes from that many
 // base-4 limbs and its overflow weight is `1 << (2 * result_limbs)`, which
@@ -973,6 +977,122 @@ kernel void range_check_gate_quotient(
                     alpha_stride,
                     gate_accumulators,
                     constraint_index++);
+            }
+        } else if (kind == 7u) {
+            // ExponentiationGate: wire 0 is the base, wires 1..=n the power
+            // bits in little-endian order, wire 1+n the output and wires
+            // 2+n..2+2n the running intermediate values; `num_ops` carries n.
+            // The accumulation walks the bits big-endian and seeds the chain
+            // with ONE rather than a square, exactly as the CPU evaluator.
+            uint num_power_bits = num_ops;
+            ulong exponent_base = wires[(ulong)0 * lde_rows + source_row];
+            for (uint i = 0; i < num_power_bits; ++i) {
+                ulong previous;
+                if (i == 0u) {
+                    previous = 1;
+                } else {
+                    ulong last = wires[((ulong)2u + num_power_bits + i - 1u) * lde_rows
+                                       + source_row];
+                    previous = gl_mul(last, last);
+                }
+                ulong current_bit =
+                    wires[((ulong)1u + (num_power_bits - i - 1u)) * lde_rows + source_row];
+                ulong multiplier =
+                    gl_add(gl_mul(current_bit, exponent_base), gl_sub(1, current_bit));
+                ulong intermediate =
+                    wires[((ulong)2u + num_power_bits + i) * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(gl_mul(previous, multiplier), intermediate),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+            ulong output_value = wires[((ulong)1u + num_power_bits) * lde_rows + source_row];
+            ulong final_intermediate =
+                wires[((ulong)1u + 2u * num_power_bits) * lde_rows + source_row];
+            range_check_gate_emit(
+                gl_sub(output_value, final_intermediate),
+                alpha_powers, alpha_stride, gate_accumulators,
+                constraint_index++);
+        } else if (kind == 8u) {
+            // EqualityGate: three routed words per operation (x, y, equal)
+            // followed by three unrouted temporaries (diff, invdiff, prod).
+            // The addend slot carries the constants column holding the gate's
+            // first constant, its "one" value.
+            uint constant_column = num_addends;
+            ulong const_0 = constants[(ulong)constant_column * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong routed_base = (ulong)op * 3u;
+                ulong x = wires[(routed_base + 0u) * lde_rows + source_row];
+                ulong y = wires[(routed_base + 1u) * lde_rows + source_row];
+                ulong equal = wires[(routed_base + 2u) * lde_rows + source_row];
+                ulong temporary_base = (ulong)num_ops * 3u + (ulong)op * 3u;
+                ulong difference = wires[(temporary_base + 0u) * lde_rows + source_row];
+                ulong inverse = wires[(temporary_base + 1u) * lde_rows + source_row];
+                ulong product = wires[(temporary_base + 2u) * lde_rows + source_row];
+
+                range_check_gate_emit(
+                    gl_sub(gl_sub(x, y), difference),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_mul(difference, inverse), product),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_mul(product, difference), difference),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_sub(const_0, product), equal),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 9u) {
+            // ReducingGate / ReducingExtensionGate at D == 2. Wires 0..2 are
+            // the output, 2..4 alpha, 4..6 the incoming accumulator, then one
+            // (base) or two (extension) wires per coefficient, then one
+            // two-wire accumulator per step except the last, which aliases the
+            // output. Each step emits the two components of
+            // `acc * alpha + coeff - next_acc` in that order.
+            //
+            // The quadratic extension is F[x]/(x^2 - 7) for Goldilocks:
+            //   (a0 + a1 x)(b0 + b1 x) = (a0 b0 + 7 a1 b1) + (a0 b1 + a1 b0) x.
+            uint extension_coeffs = num_addends;
+            uint coeff_wires = extension_coeffs != 0u ? 2u : 1u;
+            uint coeff_start = 6u;
+            uint acc_start = coeff_start + num_ops * coeff_wires;
+            ulong alpha_0 = wires[(ulong)2u * lde_rows + source_row];
+            ulong alpha_1 = wires[(ulong)3u * lde_rows + source_row];
+            ulong acc_0 = wires[(ulong)4u * lde_rows + source_row];
+            ulong acc_1 = wires[(ulong)5u * lde_rows + source_row];
+            for (uint i = 0; i < num_ops; ++i) {
+                uint next_start = (i + 1u == num_ops) ? 0u : acc_start + 2u * i;
+                ulong next_0 = wires[(ulong)next_start * lde_rows + source_row];
+                ulong next_1 = wires[((ulong)next_start + 1u) * lde_rows + source_row];
+
+                uint coeff_wire = coeff_start + i * coeff_wires;
+                ulong coeff_0 = wires[(ulong)coeff_wire * lde_rows + source_row];
+                ulong coeff_1 = extension_coeffs != 0u
+                    ? wires[((ulong)coeff_wire + 1u) * lde_rows + source_row]
+                    : 0;
+
+                ulong product_0 = gl_add(
+                    gl_mul(acc_0, alpha_0),
+                    gl_mul(7, gl_mul(acc_1, alpha_1)));
+                ulong product_1 = gl_add(
+                    gl_mul(acc_0, alpha_1),
+                    gl_mul(acc_1, alpha_0));
+                range_check_gate_emit(
+                    gl_sub(gl_add(product_0, coeff_0), next_0),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_add(product_1, coeff_1), next_1),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+
+                acc_0 = next_0;
+                acc_1 = next_1;
             }
         } else {
             // The Rust encoder rejects unknown discriminants; if a malformed
