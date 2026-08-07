@@ -53,7 +53,7 @@ use crate::timed;
 use crate::util::context_tree::ContextTree;
 use crate::util::partial_products::num_partial_products;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil, log2_strict, transpose, transpose_poly_values};
+use crate::util::{log2_ceil, log2_strict, transpose_poly_values};
 
 /// Number of random coins needed for lookups (for each challenge).
 /// A coin is a randomly sampled extension field element from the verifier,
@@ -979,20 +979,19 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .map(|g| g.0.num_constants())
             .max()
             .unwrap();
-        transpose(
-            &self
-                .gate_instances
-                .iter()
-                .map(|g| {
-                    let mut consts = g.constants.clone();
-                    consts.resize(max_constants, F::ZERO);
-                    consts
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_iter()
-        .map(PolynomialValues::new)
-        .collect()
+        // Write each constant column directly: column `c` at row `j` is instance `j`'s
+        // `constants[c]`, zero-padded — identical to transposing the padded row-major
+        // matrix without materializing it. Serial deliberately: builds overlap proving.
+        (0..max_constants)
+            .map(|c| {
+                let values = self
+                    .gate_instances
+                    .iter()
+                    .map(|g| g.constants.get(c).copied().unwrap_or(F::ZERO))
+                    .collect();
+                PolynomialValues::new(values)
+            })
+            .collect()
     }
 
     fn sigma_vecs(&self, k_is: &[F], subgroup: &[F]) -> (Vec<PolynomialValues<F>>, Forest) {
@@ -1391,5 +1390,60 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // TODO: Can skip parts of this.
         let circuit_data = self.build::<C>();
         circuit_data.verifier_data()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::polynomial::PolynomialValues;
+    use crate::field::types::Field;
+    use crate::gates::arithmetic_base::ArithmeticGate;
+    use crate::gates::constant::ConstantGate;
+    use crate::gates::noop::NoopGate;
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::circuit_data::CircuitConfig;
+    use crate::util::transpose;
+
+    type F = GoldilocksField;
+    const D: usize = 2;
+
+    #[test]
+    fn constant_polys_match_transpose_reference() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config.clone());
+        // Gates with differing num_constants so zero-padding paths are exercised.
+        builder.add_gate(NoopGate, vec![]);
+        builder.add_gate(
+            ConstantGate::new(config.num_constants),
+            (0..config.num_constants as u64).map(F::from_canonical_u64).collect(),
+        );
+        builder.add_gate(ArithmeticGate { num_ops: 2 }, vec![F::ONE, F::TWO]);
+        builder.add_gate(NoopGate, vec![]);
+        builder.add_gate(ArithmeticGate { num_ops: 2 }, vec![F::NEG_ONE, F::ZERO]);
+
+        // The stock implementation, kept verbatim as the differential reference.
+        let max_constants = builder
+            .gates
+            .iter()
+            .map(|g| g.0.num_constants())
+            .max()
+            .unwrap();
+        let reference: Vec<PolynomialValues<F>> = transpose(
+            &builder
+                .gate_instances
+                .iter()
+                .map(|g| {
+                    let mut consts = g.constants.clone();
+                    consts.resize(max_constants, F::ZERO);
+                    consts
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(PolynomialValues::new)
+        .collect();
+
+        assert_eq!(builder.constant_polys(), reference);
     }
 }
