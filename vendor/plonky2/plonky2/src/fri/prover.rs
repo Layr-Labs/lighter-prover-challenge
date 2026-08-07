@@ -251,9 +251,18 @@ pub(crate) fn fri_proof_of_work<
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
+    // `find_first` instead of `find_any`: the search stays parallel, but the
+    // returned nonce is the smallest satisfying candidate instead of whichever
+    // rayon worker happened to win the race. `find_any` made the PoW witness —
+    // and therefore the FRI query indices and every downstream proof byte —
+    // nondeterministic across runs on identical witnesses. At these
+    // proof-of-work sizes the expected extra confirmation work over `find_any`
+    // is a few thousand permutations, microseconds against a proof; in
+    // exchange the whole prover becomes bit-reproducible, which is what lets
+    // the orchestration differential oracles compare full proof bytes.
     let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
         .into_par_iter()
-        .find_any(|&candidate| {
+        .find_first(|&candidate| {
             let mut duplex_state = duplex_intermediate_state;
             duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
             duplex_state.permute();

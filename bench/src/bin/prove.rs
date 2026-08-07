@@ -13,8 +13,8 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 
 use api::{
-    Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
-    PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
+    HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES, PUBLIC_HEAVY_TX_COUNT,
+    PUBLIC_LIGHT_TX_COUNT,
 };
 use circuit::block::Block;
 use circuit::types::config::F;
@@ -62,7 +62,12 @@ fn main() {
         PUBLIC_LIGHT_TX_COUNT,
     )
     .expect("invalid prover fixture");
-    let proof = prover::prove_block(block, &Circuits::new());
+    // Pipelined orchestration: the pre-execution circuit builds, generates its
+    // witness, and proves on a dedicated thread concurrently with the path
+    // circuit builds and the early transaction pipeline; the final block
+    // witness is likewise assembled while the light chain is still folding.
+    // Proof bytes are identical to `prove_block` — see `prove_block_pipelined`.
+    let proof = prover::prove_block_pipelined(block);
     let mut writer = BufWriter::with_capacity(
         PROOF_OUTPUT_BUFFER_BYTES,
         File::create(output).expect("cannot create proof output"),

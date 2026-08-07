@@ -8,7 +8,7 @@ use plonky2::field::extension::Extendable;
 use plonky2::field::types::{Field, Field64};
 use plonky2::hash::hash_types::{HashOutTarget, RichField};
 use plonky2::iop::target::{BoolTarget, Target};
-use plonky2::iop::witness::{PartialWitness, WitnessWrite};
+use plonky2::iop::witness::PartialWitness;
 use plonky2::plonk::circuit_data::{CircuitConfig, CircuitData};
 use plonky2::plonk::config::GenericConfig;
 use plonky2::plonk::proof::ProofWithPublicInputs;
@@ -172,7 +172,26 @@ impl Circuit<C, F, D> for BlockPreExecutionCircuit {
         target: &BlockPreExecutionTarget,
     ) -> Result<PartialWitness<F>> {
         let mut pw = PartialWitness::new();
+        BlockPreExecutionCircuit::generate_witness_into(block, target, &mut pw)?;
+        Ok(pw)
+    }
+}
 
+impl BlockPreExecutionCircuit {
+    /// Writes the pre-execution witness into any writable witness — in
+    /// particular directly into a `PartitionWitness`-backed seeder, whose
+    /// representative slots are array-indexed, bypassing the `PartialWitness`
+    /// hash map (and its per-target hashing) entirely. The set of
+    /// (target, value) pairs written is identical to
+    /// [`Circuit::generate_witness`]'s.
+    pub fn generate_witness_into<W>(
+        block: &BlockPreExec<F>,
+        target: &BlockPreExecutionTarget,
+        pw: &mut W,
+    ) -> Result<()>
+    where
+        W: plonky2::iop::witness::Witness<F>,
+    {
         pw.set_target(target.created_at, F::from_canonical_i64(block.created_at))?;
         pw.set_target(
             target.block_number,
@@ -224,11 +243,9 @@ impl Circuit<C, F, D> for BlockPreExecutionCircuit {
 
         pw.set_hash_target(target.old_state_root, block.old_state_root)?;
 
-        Ok(pw)
+        Ok(())
     }
-}
 
-impl BlockPreExecutionCircuit {
     /// Initializes a new block virtual targets for the given number of transactions.
     pub fn new(config: CircuitConfig) -> Self {
         let mut builder = Builder::new(config);
