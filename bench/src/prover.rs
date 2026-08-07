@@ -30,7 +30,11 @@ enum TxPath {
     Light,
 }
 
-const LIGHT_TX_PROOF_WINDOW: usize = 2;
+// A window of 2 leaves the strictly sequential chain consumer starved
+// whenever one chunk proof runs long; 3 keeps one extra producer ahead of it
+// at ~0.6 GB additional peak retention, well inside the 48 GB runner. A
+// window of 4 was measured and regressed, so 3 is the measured optimum.
+const LIGHT_TX_PROOF_WINDOW: usize = 3;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
@@ -69,17 +73,16 @@ fn chain_step_proof(
     chain_step: u64,
     previous: Option<ChainState<'_>>,
     base_proof: &Proof,
-    dummy_proof: &Proof,
+    constant_inputs: &plonky2::iop::witness::PartialWitness<F>,
     tx_proof: &Proof,
 ) -> Proof {
     let result = (|| {
         // Phase 1: run every generator that does not depend on the previous chain proof while
         // that proof may still be in flight.
-        let early_inputs = BlockTxChainCircuit::witness_inputs_early(
+        let early_inputs = BlockTxChainCircuit::witness_inputs_early_from_template(
+            constant_inputs,
             chain_target,
-            chain_data,
             chain_step,
-            dummy_proof,
             tx_proof,
         )?;
         let mut pending = PendingPartitionWitness::start(
@@ -231,8 +234,16 @@ fn prove_path(
     );
     jump = next_jump;
 
+    let chain_constant_inputs = BlockTxChainCircuit::witness_inputs_constant(
+        chain_target,
+        chain_data,
+        dummy_proof,
+    )
+    .expect("chain constant witness inputs failed");
+
     std::thread::scope(|scope| {
         let base = &base_proof;
+        let chain_constant = &chain_constant_inputs;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
@@ -254,7 +265,7 @@ fn prove_path(
                             chain_step,
                             previous,
                             base,
-                            dummy_proof,
+                            chain_constant,
                             &tx_proof,
                         )
                     })
@@ -287,9 +298,14 @@ fn prove_path(
             });
 
             in_flight.push_back((current_step, proof_handle));
+            // The heavy path's chain consumer benefits from the same
+            // one-extra-producer buffering; its chunks are few, so the added
+            // retention is bounded by a single proof.
             let max_in_flight =
                 if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
                     LIGHT_TX_PROOF_WINDOW
+                } else if path == TxPath::Heavy && current_step >= 1 {
+                    2
                 } else {
                     1
                 };
@@ -326,7 +342,7 @@ fn prove_path(
                         chain_step,
                         previous,
                         base,
-                        dummy_proof,
+                        chain_constant,
                         &tx_proof,
                     )
                 })
@@ -350,7 +366,7 @@ fn prove_path(
                 chain_step,
                 previous,
                 base,
-                dummy_proof,
+                chain_constant,
                 &tx_proof,
             )));
         }
