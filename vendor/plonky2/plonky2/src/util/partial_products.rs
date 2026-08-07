@@ -14,13 +14,34 @@ pub(crate) fn quotient_chunk_products<F: Field>(
     quotient_values: &[F],
     max_degree: usize,
 ) -> Vec<F> {
+    // One product per chunk: the historical exact capacity of the `collect()` this wrapper
+    // replaces.
+    let num_chunks = quotient_values.len().div_ceil(max_degree);
+    let mut res = Vec::with_capacity(num_chunks);
+    res.resize(num_chunks, F::ZERO);
+    quotient_chunk_products_into(quotient_values, max_degree, &mut res);
+    res
+}
+
+/// Allocation-free form of [`quotient_chunk_products`]: writes one product per
+/// `max_degree`-sized chunk of `quotient_values` into `out`, which must hold exactly
+/// `quotient_values.len().div_ceil(max_degree)` elements. The prover's Z-polynomial pass calls
+/// this once per subgroup point with a slice of its flat chunk-products buffer, instead of
+/// collecting a fresh Vec per point. Products and their order are identical to the allocating
+/// form: each output is the same left-to-right `product()` over the same chunk.
+pub(crate) fn quotient_chunk_products_into<F: Field>(
+    quotient_values: &[F],
+    max_degree: usize,
+    out: &mut [F],
+) {
     debug_assert!(max_degree > 1);
     assert!(!quotient_values.is_empty());
     let chunk_size = max_degree;
-    quotient_values
-        .chunks(chunk_size)
-        .map(|chunk| chunk.iter().copied().product())
-        .collect()
+    let chunks = quotient_values.chunks(chunk_size);
+    assert_eq!(out.len(), chunks.len());
+    for (out_product, chunk) in out.iter_mut().zip(chunks) {
+        *out_product = chunk.iter().copied().product();
+    }
 }
 
 /// Compute partial products of the original vector `v` such that all products consist of `max_degree`
@@ -227,6 +248,55 @@ mod tests {
 
     fn raw(values: &[GoldilocksField]) -> Vec<u64> {
         values.iter().map(|x| x.to_noncanonical_u64()).collect()
+    }
+
+    /// Independent copy of the pre-`_into` `quotient_chunk_products` implementation, retained
+    /// only as a differential-test oracle (the shipping function now delegates to `_into`).
+    fn quotient_chunk_products_legacy<F: Field>(
+        quotient_values: &[F],
+        max_degree: usize,
+    ) -> Vec<F> {
+        debug_assert!(max_degree > 1);
+        assert!(!quotient_values.is_empty());
+        let chunk_size = max_degree;
+        quotient_values
+            .chunks(chunk_size)
+            .map(|chunk| chunk.iter().copied().product())
+            .collect()
+    }
+
+    /// `quotient_chunk_products_into` (and the wrapper that now delegates to it) must produce
+    /// exactly the legacy per-point Vec's contents, raw representation equality, for both a
+    /// full final chunk and a partial final chunk. Written into an offset slice of a larger
+    /// flat buffer, exactly as the prover's per-point loop does.
+    #[test]
+    fn test_quotient_chunk_products_into_matches_legacy() {
+        type F = GoldilocksField;
+        // (len, max_degree): 8/2 and 80/8 have all-full chunks, 7/3 has a partial final chunk.
+        for &(len, max_degree) in &[(8usize, 2usize), (80, 8), (7, 3)] {
+            let quotient_values = noncanonical_vec(len, 5);
+            let expected = quotient_chunk_products_legacy(&quotient_values, max_degree);
+            let num_chunks = len.div_ceil(max_degree);
+            assert_eq!(expected.len(), num_chunks);
+
+            let wrapped = quotient_chunk_products(&quotient_values, max_degree);
+            assert_eq!(raw(&wrapped), raw(&expected));
+            assert_eq!(wrapped.capacity(), num_chunks);
+
+            // Flat-buffer form: write point products at an interior offset, as the prover does.
+            let mut flat = vec![F::ZERO; 3 * num_chunks];
+            quotient_chunk_products_into(
+                &quotient_values,
+                max_degree,
+                &mut flat[num_chunks..2 * num_chunks],
+            );
+            assert_eq!(raw(&flat[num_chunks..2 * num_chunks]), raw(&expected));
+            // Neighboring points' slots untouched.
+            assert!(flat[..num_chunks]
+                .iter()
+                .chain(&flat[2 * num_chunks..])
+                .all(|x| x.to_noncanonical_u64() == 0));
+        }
     }
 
     /// `_into` must append exactly the legacy terms (raw representation equality),

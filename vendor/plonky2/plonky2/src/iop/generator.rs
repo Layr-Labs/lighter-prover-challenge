@@ -237,23 +237,22 @@ fn run_generator_worklist<
                 *remaining_generators -= 1;
             }
 
-            // Merge any generated values into our witness, and get a list of newly-populated
-            // targets' representatives.
-            let mut new_target_reps = Vec::with_capacity(buffer.target_values.len());
+            // Merge any generated values into our witness and, for each newly populated
+            // target's representative, immediately enqueue the unfinished generators watching
+            // it. The witness merge (`witness`) and the watcher bookkeeping
+            // (`generator_indices_by_watches`, `generator_is_expired`, `unresolved_watches`)
+            // touch disjoint state, so fusing the two passes deletes the per-run intermediate
+            // rep Vec while preserving both the `set_target_returning_rep` call order and the
+            // pending-queue push order exactly.
             for (t, v) in buffer.target_values.drain(..) {
-                let reps = witness.set_target_returning_rep(t, v)?;
-                new_target_reps.extend(reps);
-            }
-
-            // Enqueue unfinished generators that were watching one of the newly populated targets.
-            for watch in new_target_reps {
-                let opt_watchers = generator_indices_by_watches.get(&watch);
-                if let Some(watchers) = opt_watchers {
-                    for &watching_generator_idx in watchers {
-                        if !generator_is_expired[watching_generator_idx] {
-                            debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                            unresolved_watches[watching_generator_idx] -= 1;
-                            next_pending_generator_indices.push(watching_generator_idx);
+                if let Some(watch) = witness.set_target_returning_rep(t, v)? {
+                    if let Some(watchers) = generator_indices_by_watches.get(&watch) {
+                        for &watching_generator_idx in watchers {
+                            if !generator_is_expired[watching_generator_idx] {
+                                debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
+                                unresolved_watches[watching_generator_idx] -= 1;
+                                next_pending_generator_indices.push(watching_generator_idx);
+                            }
                         }
                     }
                 }

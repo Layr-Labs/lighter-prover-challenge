@@ -1028,10 +1028,14 @@ impl<F: RichField + Extendable<5> + Extendable<D>, const D: usize> SimpleGenerat
             .map(|t| witness.get_target(t));
         let denominator = QuinticExtension::<F>::from_basefield_array(denominator_limbs);
 
-        let quotient = if denominator == QuinticExtension::<F>::ZERO {
-            QuinticExtension::<F>::ZERO
-        } else {
-            numerator / denominator
+        // `try_inverse` returns `None` exactly when `denominator == ZERO` (`is_zero` is
+        // `== ZERO`), so this preserves the historical write of `ZERO` for a zero
+        // denominator while deleting the separate pre-division zero check (five
+        // canonicalizing limb compares per run). The nonzero case is `numerator * inv`
+        // with the same operand order the `Div` impl (`self * rhs.inverse()`) used.
+        let quotient = match denominator.try_inverse() {
+            None => QuinticExtension::<F>::ZERO,
+            Some(inv) => numerator * inv,
         };
         for (lhs, rhs) in self.quotient.to_target_array().into_iter().zip(
             <QuinticExtension<F> as FieldExtension<5>>::to_basefield_array(&quotient).into_iter(),
