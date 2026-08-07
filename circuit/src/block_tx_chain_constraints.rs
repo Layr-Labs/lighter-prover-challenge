@@ -242,6 +242,34 @@ impl BlockTxChainCircuit {
         Ok(pw)
     }
 
+    /// Writes the same early inputs as
+    /// [`Self::witness_inputs_early_from_template`], but directly into the
+    /// partition's representative slots through a seeder instead of building
+    /// and cloning a `PartialWitness` hash map. The dummy cyclic proof and
+    /// the circuit's own verifier data are tens of thousands of targets, so
+    /// per chain step this replaces a full hash-map clone plus a re-insert
+    /// pass with array-indexed writes. The same targets receive the same
+    /// values, and the seeder maintains the unresolved-watch counters exactly
+    /// as the hash-map path does.
+    pub fn seed_witness_inputs_early(
+        seeder: &mut impl WitnessWrite<F>,
+        target: &BlockTxChainTarget,
+        circuit_data: &CircuitData<F, C, D>,
+        recursion_step: u64,
+        dummy_proof_cyclic: &ProofWithPublicInputs<F, C, D>,
+        current_block_tx_proof: &ProofWithPublicInputs<F, C, D>,
+    ) -> Result<()> {
+        seeder.set_verifier_data_target(&target.self_verifier_data, &circuit_data.verifier_only)?;
+        seeder.set_proof_with_pis_target(&target.tx_proof, current_block_tx_proof)?;
+        seeder.set_target(target.recursion_step, F::from_canonical_u64(recursion_step))?;
+        // This will take place of `DummyProofGenerator`
+        seeder.set_proof_with_pis_target(
+            &target.dummy_proof_with_pis_target_cyclic,
+            dummy_proof_cyclic,
+        )?;
+        Ok(())
+    }
+
     pub fn witness_inputs_early(
         target: &BlockTxChainTarget,
         circuit_data: &CircuitData<F, C, D>,
