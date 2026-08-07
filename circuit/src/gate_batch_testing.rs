@@ -6,6 +6,7 @@
 //! `test_eval_fns` only exercises a batch of one point, which cannot catch
 //! column-indexing mistakes in hand-written batched evaluations.
 
+use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::{Extendable, FieldExtension};
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::types::{Field, Field64};
@@ -276,6 +277,43 @@ where
             );
         }
     }
+}
+
+/// Checks a gate's `eval_unfiltered_base_batch_accumulate` override against
+/// the default path (materialize the full unfiltered constraint matrix, then
+/// `batch_multiply_add_inplace` row by row) across a multi-point batch with
+/// deterministic pseudo-random wires, constants, and filters. Constraint order
+/// and values must be bit-identical.
+pub fn assert_direct_accumulation_matches_materialized_batch<G>(gate: &G)
+where
+    G: Gate<GoldilocksField, 2>,
+{
+    type F = GoldilocksField;
+    const N: usize = 11;
+
+    let wires = (0..gate.num_wires() * N)
+        .map(|i| F::from_canonical_usize(3 * i + 5))
+        .collect::<Vec<_>>();
+    let constants = (0..gate.num_constants() * N)
+        .map(|i| F::from_canonical_usize(7 * i + 11))
+        .collect::<Vec<_>>();
+    let hash = HashOut::ZERO;
+    let vars = EvaluationVarsBaseBatch::new(N, &constants, &wires, &hash);
+    let filters = (0..N)
+        .map(|i| F::from_canonical_usize(2 * i + 1))
+        .collect::<Vec<_>>();
+
+    let mut expected = vec![F::ZERO; gate.num_constraints() * N];
+    let materialized = gate.eval_unfiltered_base_batch(vars);
+    for (acc, constraints) in expected
+        .chunks_exact_mut(N)
+        .zip(materialized.chunks_exact(N))
+    {
+        batch_multiply_add_inplace(acc, constraints, &filters);
+    }
+    let mut actual = vec![F::ZERO; expected.len()];
+    gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+    assert_eq!(actual, expected, "gate {}", gate.id());
 }
 
 pub fn assert_base_batch_matches_eval_unfiltered<G>(gate: &G)
