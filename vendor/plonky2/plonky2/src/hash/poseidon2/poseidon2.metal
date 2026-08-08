@@ -1167,6 +1167,108 @@ kernel void range_check_gate_quotient(
     output[(ulong)gid * 2 + 1] = gl_canonicalize(total[1]);
 }
 
+// Evaluates the permutation-argument rows of the vanishing polynomial at one
+// quotient-domain point and reduces them with both alpha challenges, exactly
+// mirroring the CPU `PermutationBatch::Cols` path in `vanishing_poly.rs`.
+//
+// Row layout (identical to the CPU term_rows order, with num_chunks =
+// ceil(num_routed_wires / chunk_size) and R = 2 * (1 + num_chunks)):
+//   row i (i in 0..2):                    L_0(x) * (Z_i(x) - 1)
+//   row 2 + i * num_chunks + c:           prev_acc * num_prod - next_acc * den_prod
+// where num_prod / den_prod are the chunk-c products of
+//   wire_j + beta_k_is[i * num_routed_wires + j] * x + gamma_i     and
+//   wire_j + beta_i * sigma_j + gamma_i
+// and the accumulator chain for challenge i is
+//   [Z_i(x), partial products (columns 2 + i * num_prods ..), Z_i(g x)],
+// the "next" Z read at quotient row (gid + next_step) % quotient_rows.
+//
+// The output is point-major with two challenge words per point, canonical, so
+// the prover merges it exactly like the gate quotient jobs. alpha_powers holds
+// alpha_i^r for r in 0..R at [i * R + r] (R = 2 * (num_prods + 2)).
+// betas_gammas holds [beta_0, beta_1, gamma_0, gamma_1].
+kernel void permutation_quotient(
+    const device ulong* wires [[buffer(0)]],
+    const device ulong* constants [[buffer(1)]],
+    const device ulong* zs_partial_products [[buffer(2)]],
+    const device ulong* xs [[buffer(3)]],
+    const device ulong* l0s [[buffer(4)]],
+    device ulong* output [[buffer(5)]],
+    constant ulong* alpha_powers [[buffer(6)]],
+    constant ulong* betas_gammas [[buffer(7)]],
+    constant ulong* beta_k_is [[buffer(8)]],
+    constant uint& lde_rows [[buffer(9)]],
+    constant uint& quotient_rows [[buffer(10)]],
+    constant uint& step [[buffer(11)]],
+    constant uint& next_step [[buffer(12)]],
+    constant uint& sigma_base [[buffer(13)]],
+    constant uint& num_routed_wires [[buffer(14)]],
+    constant uint& chunk_size [[buffer(15)]],
+    constant uint& num_prods [[buffer(16)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= quotient_rows) {
+        return;
+    }
+
+    uint source_row = gid * step;
+    uint next_row = ((gid + next_step) % quotient_rows) * step;
+    ulong x = xs[gid];
+    ulong l0 = l0s[gid];
+    uint num_chunks = num_prods + 1u;
+    uint num_rows = 2u * (num_chunks + 1u);
+
+    ulong acc[2] = { 0, 0 };
+    for (uint i = 0; i < 2u; ++i) {
+        ulong z = zs_partial_products[(ulong)i * lde_rows + source_row];
+        ulong row = gl_mul(l0, gl_sub(z, 1UL));
+        acc[0] = gl_add(acc[0], gl_mul(row, alpha_powers[i]));
+        acc[1] = gl_add(acc[1], gl_mul(row, alpha_powers[num_rows + i]));
+    }
+
+    for (uint i = 0; i < 2u; ++i) {
+        ulong beta = betas_gammas[i];
+        ulong gamma = betas_gammas[2u + i];
+        // Accumulator chain column 0 is Z_i(x) itself.
+        ulong prev = zs_partial_products[(ulong)i * lde_rows + source_row];
+        for (uint c = 0; c < num_chunks; ++c) {
+            uint j_start = c * chunk_size;
+            uint j_end = min(j_start + chunk_size, num_routed_wires);
+            ulong wire = wires[(ulong)j_start * lde_rows + source_row];
+            ulong sigma =
+                constants[(ulong)(sigma_base + j_start) * lde_rows + source_row];
+            ulong beta_k = beta_k_is[i * num_routed_wires + j_start];
+            ulong num_prod = gl_add(gl_add(wire, gl_mul(beta_k, x)), gamma);
+            ulong den_prod = gl_add(gl_add(wire, gl_mul(beta, sigma)), gamma);
+            for (uint j = j_start + 1u; j < j_end; ++j) {
+                wire = wires[(ulong)j * lde_rows + source_row];
+                sigma = constants[(ulong)(sigma_base + j) * lde_rows + source_row];
+                beta_k = beta_k_is[i * num_routed_wires + j];
+                num_prod = gl_mul(
+                    num_prod, gl_add(gl_add(wire, gl_mul(beta_k, x)), gamma));
+                den_prod = gl_mul(
+                    den_prod, gl_add(gl_add(wire, gl_mul(beta, sigma)), gamma));
+            }
+            ulong next;
+            if (c + 1u <= num_prods) {
+                // Accumulator columns 1..=num_prods are the partial products,
+                // stored at commitment columns 2 + i * num_prods + (c + 1 - 1).
+                next = zs_partial_products
+                    [(ulong)(2u + i * num_prods + c) * lde_rows + source_row];
+            } else {
+                // The final accumulator is Z_i at the rotated "next" point.
+                next = zs_partial_products[(ulong)i * lde_rows + next_row];
+            }
+            ulong row = gl_sub(gl_mul(prev, num_prod), gl_mul(next, den_prod));
+            uint r = 2u + i * num_chunks + c;
+            acc[0] = gl_add(acc[0], gl_mul(row, alpha_powers[r]));
+            acc[1] = gl_add(acc[1], gl_mul(row, alpha_powers[num_rows + r]));
+            prev = next;
+        }
+    }
+
+    output[(ulong)gid * 2] = gl_canonicalize(acc[0]);
+    output[(ulong)gid * 2 + 1] = gl_canonicalize(acc[1]);
+}
+
 kernel void poseidon2_hash_leaves(
     const device ulong* leaves [[buffer(0)]],
     device ulong* hashes [[buffer(1)]],
@@ -1347,53 +1449,5 @@ kernel void poseidon2_hash_parents(
     device ulong* output = parents + (ulong)gid * 4;
     for (uint i = 0; i < 4; ++i) {
         output[i] = gl_canonicalize(state[i]);
-    }
-}
-
-// One sponge absorption pass over a group of at most eight natural-order
-// columns, with the running 12-lane state parked in `state` between passes
-// (column-major: lane i of row gid at state[i * leaf_count + gid]). The
-// final pass writes the four-lane digests to `hashes` at the bit-reversed
-// row, exactly like poseidon2_hash_leaves_colmajor. Splitting the sponge by
-// column group lets the CPU compute group g+1's LDE columns while the GPU
-// absorbs group g; the arithmetic per pass is identical to the fused
-// kernel's corresponding loop iteration.
-kernel void poseidon2_absorb_pass(
-    const device ulong* leaves [[buffer(0)]],
-    device ulong* state [[buffer(1)]],
-    device ulong* hashes [[buffer(2)]],
-    constant ulong* parameters [[buffer(3)]],
-    constant uint& leaf_count [[buffer(4)]],
-    constant uint& log_leaf_count [[buffer(5)]],
-    constant uint& col_start [[buffer(6)]],
-    constant uint& chunk_size [[buffer(7)]],
-    constant uint& first_pass [[buffer(8)]],
-    constant uint& final_pass [[buffer(9)]],
-    uint gid [[thread_position_in_grid]]) {
-    if (gid >= leaf_count) {
-        return;
-    }
-    ulong st[12] = { 0 };
-    if (first_pass == 0u) {
-        for (uint i = 0; i < 12; ++i) {
-            st[i] = state[(ulong)i * leaf_count + gid];
-        }
-    }
-    for (uint i = 0; i < chunk_size; ++i) {
-        st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
-    }
-    poseidon2(st, parameters);
-    if (final_pass != 0u) {
-        uint out_row = log_leaf_count == 0
-            ? gid
-            : (reverse_bits(gid) >> (32 - log_leaf_count));
-        device ulong* output = hashes + (ulong)out_row * 4;
-        for (uint i = 0; i < 4; ++i) {
-            output[i] = gl_canonicalize(st[i]);
-        }
-    } else {
-        for (uint i = 0; i < 12; ++i) {
-            state[(ulong)i * leaf_count + gid] = st[i];
-        }
     }
 }

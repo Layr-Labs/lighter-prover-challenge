@@ -167,61 +167,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             if let Some(mut columns) =
                 C::Hasher::try_allocate_merkle_tree_columns(polynomials.len(), lde_len, cap_height)
             {
-                // Streamed exclusive-phase path: the backend absorbs each
-                // group of eight LDE columns while the CPU computes the next
-                // group, collapsing the serial FFT-then-hash commitment into
-                // max(FFT, hash). Falls through to the classic fill + build
-                // whenever the backend declines (the group fill below is the
-                // same computation `fill_lde_column_store` performs, so a
-                // partial fill is simply refilled).
-                let streamed = {
-                    let coset_powers =
-                        crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
-                    let polys = &polynomials;
-                    C::Hasher::try_build_merkle_tree_column_store_streamed(
-                        &columns,
-                        cap_height,
-                        &|group, destinations: &mut [&mut [F]]| {
-                            destinations.par_iter_mut().enumerate().for_each(
-                                |(k, destination)| {
-                                    let polynomial = &polys[group * 8 + k];
-                                    assert_eq!(
-                                        polynomial.len(),
-                                        degree,
-                                        "Polynomial degrees inconsistent"
-                                    );
-                                    batch_multiply_into(
-                                        &mut destination[..degree],
-                                        &polynomial.coeffs,
-                                        &coset_powers,
-                                    );
-                                    if rate_bits == 0 || degree < 2 {
-                                        destination[degree..].fill(F::ZERO);
-                                    }
-                                    fft_in_place_with_options(
-                                        destination,
-                                        Some(rate_bits),
-                                        fft_root_table,
-                                    );
-                                },
-                            );
-                        },
-                    )
-                };
-                if let Some((level_digests, cap)) = streamed {
-                    let merkle_tree = timed!(
-                        timing,
-                        "build Merkle tree",
-                        MerkleTree::from_prebuilt_columns(columns, level_digests, cap)
-                    );
-                    return Self {
-                        polynomials,
-                        merkle_tree,
-                        degree_log: log2_strict(degree),
-                        rate_bits,
-                        blinding,
-                    };
-                }
                 let initialized = timed!(
                     timing,
                     "FFT + blinding",
