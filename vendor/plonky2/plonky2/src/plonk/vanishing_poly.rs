@@ -2,6 +2,8 @@
 use alloc::{format, vec, vec::Vec};
 use core::cmp::min;
 
+use plonky2_field::packable::Packable;
+use plonky2_field::packed::PackedField;
 use plonky2_field::polynomial::PolynomialCoeffs;
 
 use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
@@ -208,6 +210,132 @@ pub(crate) enum PermutationBatch<'a, F> {
         /// Sigma columns (`sigmas_range` of the constants-sigmas commitment).
         s_sigmas_cols: &'a [F],
     },
+}
+
+/// Initializes one permutation-argument numerator/denominator chunk across a
+/// contiguous quotient batch. The packing is across points, so one pack/unpack
+/// setup is amortized over the full (normally 32-point) column rather than paid
+/// once per tiny constraint row.
+#[inline]
+fn init_perm_chunk_packed<F: Field + Packable>(
+    numerator: &mut Vec<F>,
+    denominator: &mut Vec<F>,
+    wire_col: &[F],
+    sigma_col: &[F],
+    xs: &[F],
+    beta_k_i: F,
+    beta: F,
+    gamma: F,
+) {
+    let n = wire_col.len();
+    debug_assert_eq!(sigma_col.len(), n);
+    debug_assert_eq!(xs.len(), n);
+    numerator.resize(n, F::ZERO);
+    denominator.resize(n, F::ZERO);
+
+    type Packing<T> = <T as Packable>::Packing;
+    let packed_n = n / Packing::<F>::WIDTH * Packing::<F>::WIDTH;
+    let num_packed = Packing::<F>::pack_slice_mut(&mut numerator[..packed_n]);
+    let den_packed = Packing::<F>::pack_slice_mut(&mut denominator[..packed_n]);
+    let wire_packed = Packing::<F>::pack_slice(&wire_col[..packed_n]);
+    let sigma_packed = Packing::<F>::pack_slice(&sigma_col[..packed_n]);
+    let xs_packed = Packing::<F>::pack_slice(&xs[..packed_n]);
+    for ((((num, den), &wire), &sigma), &x) in num_packed
+        .iter_mut()
+        .zip(den_packed)
+        .zip(wire_packed)
+        .zip(sigma_packed)
+        .zip(xs_packed)
+    {
+        *num = wire + x * beta_k_i + gamma;
+        *den = wire + sigma * beta + gamma;
+    }
+
+    for k in packed_n..n {
+        numerator[k] = wire_col[k] + beta_k_i * xs[k] + gamma;
+        denominator[k] = wire_col[k] + beta * sigma_col[k] + gamma;
+    }
+}
+
+/// Multiplies a later routed-wire factor into a permutation chunk. This is the
+/// same lane-local operation order as the scalar loop, expressed through the
+/// field's preferred packing over the long point dimension.
+#[inline]
+fn accumulate_perm_chunk_packed<F: Field + Packable>(
+    numerator: &mut [F],
+    denominator: &mut [F],
+    wire_col: &[F],
+    sigma_col: &[F],
+    xs: &[F],
+    beta_k_i: F,
+    beta: F,
+    gamma: F,
+) {
+    let n = wire_col.len();
+    debug_assert_eq!(numerator.len(), n);
+    debug_assert_eq!(denominator.len(), n);
+    debug_assert_eq!(sigma_col.len(), n);
+    debug_assert_eq!(xs.len(), n);
+
+    type Packing<T> = <T as Packable>::Packing;
+    let packed_n = n / Packing::<F>::WIDTH * Packing::<F>::WIDTH;
+    let num_packed = Packing::<F>::pack_slice_mut(&mut numerator[..packed_n]);
+    let den_packed = Packing::<F>::pack_slice_mut(&mut denominator[..packed_n]);
+    let wire_packed = Packing::<F>::pack_slice(&wire_col[..packed_n]);
+    let sigma_packed = Packing::<F>::pack_slice(&sigma_col[..packed_n]);
+    let xs_packed = Packing::<F>::pack_slice(&xs[..packed_n]);
+    for ((((num, den), &wire), &sigma), &x) in num_packed
+        .iter_mut()
+        .zip(den_packed)
+        .zip(wire_packed)
+        .zip(sigma_packed)
+        .zip(xs_packed)
+    {
+        *num *= wire + x * beta_k_i + gamma;
+        *den *= wire + sigma * beta + gamma;
+    }
+
+    for k in packed_n..n {
+        numerator[k] *= wire_col[k] + beta_k_i * xs[k] + gamma;
+        denominator[k] *= wire_col[k] + beta * sigma_col[k] + gamma;
+    }
+}
+
+/// Writes one permutation chunk-check row across a contiguous quotient batch.
+#[inline]
+fn write_perm_check_row_packed<F: Field + Packable>(
+    row: &mut [F],
+    previous: &[F],
+    numerator: &[F],
+    next: &[F],
+    denominator: &[F],
+) {
+    let n = row.len();
+    debug_assert_eq!(previous.len(), n);
+    debug_assert_eq!(numerator.len(), n);
+    debug_assert_eq!(next.len(), n);
+    debug_assert_eq!(denominator.len(), n);
+
+    type Packing<T> = <T as Packable>::Packing;
+    let packed_n = n / Packing::<F>::WIDTH * Packing::<F>::WIDTH;
+    let row_packed = Packing::<F>::pack_slice_mut(&mut row[..packed_n]);
+    let previous_packed = Packing::<F>::pack_slice(&previous[..packed_n]);
+    let numerator_packed = Packing::<F>::pack_slice(&numerator[..packed_n]);
+    let next_packed = Packing::<F>::pack_slice(&next[..packed_n]);
+    let denominator_packed = Packing::<F>::pack_slice(&denominator[..packed_n]);
+    for ((((out, &prev), &num), &next), &den) in row_packed
+        .iter_mut()
+        .zip(previous_packed)
+        .zip(numerator_packed)
+        .zip(next_packed)
+        .zip(denominator_packed)
+    {
+        *out = prev * num - next * den;
+    }
+
+    for k in packed_n..n {
+        row[k] = previous[k] * numerator[k] - next[k] * denominator[k];
+    }
 }
 
 fn reduce_gate_constraints_base_batch<F: Field>(
@@ -426,25 +554,33 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 // `ONE * a == a` bitwise for Goldilocks (`reduce128` is the
                 // identity on inputs `< 2^64`), so skipping that multiply —
                 // and the resize-to-ONE memset — changes no value.
-                num_prod.clear();
-                den_prod.clear();
-                {
-                    let wire_col = &wires[j_start * n..][..n];
-                    let sigma_col = &s_sigmas_cols[j_start * n..][..n];
-                    let beta_k_i = beta_k_is[i * num_routed_wires + j_start];
-                    for k in 0..n {
-                        num_prod.push(wire_col[k] + beta_k_i * xs_batch[k] + gamma);
-                        den_prod.push(wire_col[k] + beta * sigma_col[k] + gamma);
-                    }
-                }
+                let wire_col = &wires[j_start * n..][..n];
+                let sigma_col = &s_sigmas_cols[j_start * n..][..n];
+                let beta_k_i = beta_k_is[i * num_routed_wires + j_start];
+                init_perm_chunk_packed(
+                    num_prod,
+                    den_prod,
+                    wire_col,
+                    sigma_col,
+                    xs_batch,
+                    beta_k_i,
+                    beta,
+                    gamma,
+                );
                 for j in j_start + 1..j_end {
                     let wire_col = &wires[j * n..][..n];
                     let sigma_col = &s_sigmas_cols[j * n..][..n];
                     let beta_k_i = beta_k_is[i * num_routed_wires + j];
-                    for k in 0..n {
-                        num_prod[k] *= wire_col[k] + beta_k_i * xs_batch[k] + gamma;
-                        den_prod[k] *= wire_col[k] + beta * sigma_col[k] + gamma;
-                    }
+                    accumulate_perm_chunk_packed(
+                        num_prod,
+                        den_prod,
+                        wire_col,
+                        sigma_col,
+                        xs_batch,
+                        beta_k_i,
+                        beta,
+                        gamma,
+                    );
                 }
 
                 let row =
@@ -453,9 +589,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 // as next.
                 let prev_col = acc_col(i, c);
                 let next_col = acc_col(i, c + 1);
-                for k in 0..n {
-                    row[k] = prev_col[k] * num_prod[k] - next_col[k] * den_prod[k];
-                }
+                write_perm_check_row_packed(row, prev_col, num_prod, next_col, den_prod);
             }
         }
 
@@ -1315,8 +1449,229 @@ pub(crate) fn eval_vanishing_poly_circuit<F: RichField + Extendable<D>, const D:
 #[cfg(test)]
 mod tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
-
     use super::*;
+
+    #[test]
+    fn packed_permutation_columns_match_scalar_raw_words_with_tail() {
+        type F = GoldilocksField;
+
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut values = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            F::from_noncanonical_u64(seed)
+        };
+        // 35 exercises eight full width-four packs and a three-point tail on
+        // AArch64; it also remains a valid width-one differential elsewhere.
+        let n = 35;
+        let wire0 = (0..n).map(|_| values()).collect::<Vec<_>>();
+        let sigma0 = (0..n).map(|_| values()).collect::<Vec<_>>();
+        let xs = (0..n).map(|_| values()).collect::<Vec<_>>();
+        let beta_k0 = values();
+        let beta = values();
+        let gamma = values();
+
+        let expected_num0 = (0..n)
+            .map(|k| wire0[k] + beta_k0 * xs[k] + gamma)
+            .collect::<Vec<_>>();
+        let expected_den0 = (0..n)
+            .map(|k| wire0[k] + beta * sigma0[k] + gamma)
+            .collect::<Vec<_>>();
+        let mut actual_num = Vec::new();
+        let mut actual_den = Vec::new();
+        init_perm_chunk_packed(
+            &mut actual_num,
+            &mut actual_den,
+            &wire0,
+            &sigma0,
+            &xs,
+            beta_k0,
+            beta,
+            gamma,
+        );
+        assert_eq!(
+            actual_num.iter().map(|x| x.0).collect::<Vec<_>>(),
+            expected_num0.iter().map(|x| x.0).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            actual_den.iter().map(|x| x.0).collect::<Vec<_>>(),
+            expected_den0.iter().map(|x| x.0).collect::<Vec<_>>()
+        );
+
+        let wire1 = (0..n).map(|_| values()).collect::<Vec<_>>();
+        let sigma1 = (0..n).map(|_| values()).collect::<Vec<_>>();
+        let beta_k1 = values();
+        let mut expected_num = expected_num0;
+        let mut expected_den = expected_den0;
+        for k in 0..n {
+            expected_num[k] *= wire1[k] + beta_k1 * xs[k] + gamma;
+            expected_den[k] *= wire1[k] + beta * sigma1[k] + gamma;
+        }
+        accumulate_perm_chunk_packed(
+            &mut actual_num,
+            &mut actual_den,
+            &wire1,
+            &sigma1,
+            &xs,
+            beta_k1,
+            beta,
+            gamma,
+        );
+        assert_eq!(
+            actual_num.iter().map(|x| x.0).collect::<Vec<_>>(),
+            expected_num.iter().map(|x| x.0).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            actual_den.iter().map(|x| x.0).collect::<Vec<_>>(),
+            expected_den.iter().map(|x| x.0).collect::<Vec<_>>()
+        );
+
+        let previous = (0..n).map(|_| values()).collect::<Vec<_>>();
+        let next = (0..n).map(|_| values()).collect::<Vec<_>>();
+        let expected_row = (0..n)
+            .map(|k| previous[k] * expected_num[k] - next[k] * expected_den[k])
+            .collect::<Vec<_>>();
+        let mut actual_row = vec![values(); n];
+        write_perm_check_row_packed(
+            &mut actual_row,
+            &previous,
+            &actual_num,
+            &next,
+            &actual_den,
+        );
+        assert_eq!(
+            actual_row.iter().map(|x| x.0).collect::<Vec<_>>(),
+            expected_row.iter().map(|x| x.0).collect::<Vec<_>>()
+        );
+    }
+
+    /// Reproducible owner benchmark for the production quotient shape. Kept
+    /// ignored so it never adds time to the normal test suite.
+    #[test]
+    #[ignore]
+    fn benchmark_packed_permutation_columns_production_shape() {
+        use core::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        type F = GoldilocksField;
+        const N: usize = 32;
+        const WIRES: usize = 80;
+        const CHUNK: usize = 8;
+        const CHUNKS: usize = WIRES / CHUNK;
+        const CHALLENGES: usize = 2;
+        const ITERS: usize = 2_000;
+
+        let mut seed = 0x243f_6a88_85a3_08d3u64;
+        let mut values = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            F::from_noncanonical_u64(seed)
+        };
+        let wires = (0..WIRES * N).map(|_| values()).collect::<Vec<_>>();
+        let sigmas = (0..WIRES * N).map(|_| values()).collect::<Vec<_>>();
+        let xs = (0..N).map(|_| values()).collect::<Vec<_>>();
+        let beta_ks = (0..CHALLENGES * WIRES)
+            .map(|_| values())
+            .collect::<Vec<_>>();
+        let previous = (0..CHALLENGES * CHUNKS * N)
+            .map(|_| values())
+            .collect::<Vec<_>>();
+        let next = (0..CHALLENGES * CHUNKS * N)
+            .map(|_| values())
+            .collect::<Vec<_>>();
+        let beta = values();
+        let gamma = values();
+
+        let run = |packed: bool| -> Duration {
+            let mut numerator = Vec::with_capacity(N);
+            let mut denominator = Vec::with_capacity(N);
+            let mut row = vec![F::ZERO; N];
+            let start = Instant::now();
+            for _ in 0..ITERS {
+                let wires = black_box(&wires);
+                let sigmas = black_box(&sigmas);
+                for challenge in 0..CHALLENGES {
+                    for chunk in 0..CHUNKS {
+                        let j_start = chunk * CHUNK;
+                        let j_end = j_start + CHUNK;
+                        let wire0 = &wires[j_start * N..][..N];
+                        let sigma0 = &sigmas[j_start * N..][..N];
+                        let beta_k0 = beta_ks[challenge * WIRES + j_start];
+                        if packed {
+                            init_perm_chunk_packed(
+                                &mut numerator,
+                                &mut denominator,
+                                wire0,
+                                sigma0,
+                                &xs,
+                                beta_k0,
+                                beta,
+                                gamma,
+                            );
+                        } else {
+                            numerator.clear();
+                            denominator.clear();
+                            for k in 0..N {
+                                numerator.push(wire0[k] + beta_k0 * xs[k] + gamma);
+                                denominator.push(wire0[k] + beta * sigma0[k] + gamma);
+                            }
+                        }
+                        for j in j_start + 1..j_end {
+                            let wire = &wires[j * N..][..N];
+                            let sigma = &sigmas[j * N..][..N];
+                            let beta_k = beta_ks[challenge * WIRES + j];
+                            if packed {
+                                accumulate_perm_chunk_packed(
+                                    &mut numerator,
+                                    &mut denominator,
+                                    wire,
+                                    sigma,
+                                    &xs,
+                                    beta_k,
+                                    beta,
+                                    gamma,
+                                );
+                            } else {
+                                for k in 0..N {
+                                    numerator[k] *= wire[k] + beta_k * xs[k] + gamma;
+                                    denominator[k] *= wire[k] + beta * sigma[k] + gamma;
+                                }
+                            }
+                        }
+                        let offset = (challenge * CHUNKS + chunk) * N;
+                        let prev = &previous[offset..][..N];
+                        let next = &next[offset..][..N];
+                        if packed {
+                            write_perm_check_row_packed(
+                                &mut row,
+                                prev,
+                                &numerator,
+                                next,
+                                &denominator,
+                            );
+                        } else {
+                            for k in 0..N {
+                                row[k] = prev[k] * numerator[k] - next[k] * denominator[k];
+                            }
+                        }
+                        black_box(&mut row);
+                    }
+                }
+            }
+            start.elapsed()
+        };
+
+        // C-A-A-C reduces first-run and monotonic thermal bias.
+        let control_1 = run(false);
+        let packed_1 = run(true);
+        let packed_2 = run(true);
+        let control_2 = run(false);
+        println!(
+            "permutation owner benchmark: C={control_1:?},{control_2:?} P={packed_1:?},{packed_2:?} iters={ITERS}"
+        );
+    }
 
     #[test]
     fn constraint_major_reduction_preserves_pointwise_horner_order() {
@@ -1356,7 +1711,7 @@ mod tests {
                 for constraint_row in terms.chunks_exact(batch_size).rev() {
                     let term = constraint_row[point];
                     for (result, &alpha) in point_result.iter_mut().zip(&alphas) {
-                        *result = term.multiply_accumulate(*result, alpha);
+                        *result = Field::multiply_accumulate(&term, *result, alpha);
                     }
                 }
             }

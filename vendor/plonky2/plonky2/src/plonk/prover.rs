@@ -795,7 +795,7 @@ fn compute_all_lookup_polys<
     }
 }
 
-const BATCH_SIZE: usize = 32;
+const BATCH_SIZE: usize = 64;
 
 /// Process-wide counters for the narrow Metal Poseidon2 quotient path. A
 /// successful `started` count proves all of the production guards held: no
