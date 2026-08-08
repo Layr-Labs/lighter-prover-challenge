@@ -547,6 +547,21 @@ impl GpuJobGuard {
         GPU_JOBS_IN_FLIGHT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         GpuJobGuard
     }
+
+    /// Claims the serialized stream only if no earlier Metal work is live.
+    /// This is a performance admission check, not a correctness lock: later
+    /// jobs may still enqueue behind this one on the same FIFO queue.
+    fn try_begin_idle() -> Option<Self> {
+        GPU_JOBS_IN_FLIGHT
+            .compare_exchange(
+                0,
+                1,
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .ok()
+            .map(|_| GpuJobGuard)
+    }
 }
 
 impl Drop for GpuJobGuard {
@@ -1051,10 +1066,44 @@ pub(crate) fn allocate_columns<F: RichField>(
 /// staging buffer.
 /// Retained buffers for the streamed sponge build: the inter-pass state
 /// (12 u64 lanes per leaf, column-major) and the level-order digest output.
-/// One streamed build runs at a time (exclusive proving phases only), so a
-/// single grow-on-demand pair suffices; holding the lock for the whole build
-/// serializes any unexpected second caller onto the classic path.
+/// One streamed build runs at a time. The established exclusive phase and the
+/// idle-only Light wire path therefore share one grow-on-demand pair; holding
+/// the lock for the whole build sends any unexpected second caller back to the
+/// classic path.
 static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
+
+/// The exclusive final-block path is the established streamed-sponge case.
+/// The ranked Light transaction worker has one additional safe opportunity:
+/// its degree-2^16 wire commitment (2^19 leaves, at least 128 columns), but
+/// only when the serialized Metal stream is actually idle. Narrow commitments
+/// and all Heavy/chain work keep the classic path, avoiding another queue or
+/// any fixed delay.
+fn streamed_sponge_scope(
+    exclusive: bool,
+    light_tx_thread: bool,
+    gpu_jobs: usize,
+    leaf_width: usize,
+    leaf_count: usize,
+) -> Option<bool> {
+    if exclusive && leaf_width >= 16 && leaf_count >= 1 << 20 {
+        return Some(false);
+    }
+    if !exclusive
+        && light_tx_thread
+        && gpu_jobs == 0
+        && leaf_width >= 128
+        && leaf_count == 1 << 19
+    {
+        return Some(true);
+    }
+    None
+}
+
+fn is_light_tx_proof_thread() -> bool {
+    std::thread::current()
+        .name()
+        .is_some_and(|name| name.starts_with("Light-tx-proof-"))
+}
 
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
@@ -1079,15 +1128,20 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
+    let exclusive = EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed);
+    let idle_light = streamed_sponge_scope(
+        exclusive,
+        is_light_tx_proof_thread(),
+        GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed),
+        leaf_width,
+        leaf_count,
+    )?;
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
-        || leaf_width < 16
-        || leaf_count < 1 << 20
         || !leaf_count.is_power_of_two()
         || leaf_count > u32::MAX as usize
         || leaf_width > u32::MAX as usize
         || cap_height > leaf_count.ilog2() as usize
-        || !EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
     {
         return None;
     }
@@ -1101,7 +1155,14 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let output_bytes = output_len.checked_mul(size_of::<u64>())?;
     let state_bytes = leaf_count.checked_mul(12)?.checked_mul(size_of::<u64>())?;
 
-    let job = GpuJobGuard::begin();
+    let job = if idle_light {
+        // Close the observation-to-claim race between the policy check and
+        // admission. If another job arrived first, refill through the classic
+        // path rather than extending an already occupied queue.
+        GpuJobGuard::try_begin_idle()?
+    } else {
+        GpuJobGuard::begin()
+    };
     let mut buffers = STREAMED_BUFFERS.lock().ok()?;
     let needs_new = buffers.as_ref().map_or(true, |(state, output)| {
         state.length() < state_bytes as u64 || output.length() < output_bytes as u64
@@ -2768,6 +2829,22 @@ mod tests {
     use crate::field::types::{Field64, PrimeField64};
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
+
+    #[test]
+    fn streamed_sponge_admission_is_narrow_and_idle_only() {
+        // Preserve the established exclusive final-block route.
+        assert_eq!(streamed_sponge_scope(true, false, 7, 16, 1 << 20), Some(false));
+
+        // Add exactly the ranked Light wire commitment while Metal is idle.
+        assert_eq!(streamed_sponge_scope(false, true, 0, 128, 1 << 19), Some(true));
+
+        // Do not lengthen an occupied queue or admit Heavy/narrow/other-size trees.
+        assert_eq!(streamed_sponge_scope(false, true, 1, 128, 1 << 19), None);
+        assert_eq!(streamed_sponge_scope(false, false, 0, 128, 1 << 19), None);
+        assert_eq!(streamed_sponge_scope(false, true, 0, 127, 1 << 19), None);
+        assert_eq!(streamed_sponge_scope(false, true, 0, 128, 1 << 17), None);
+        assert_eq!(streamed_sponge_scope(false, true, 0, 128, 1 << 20), None);
+    }
 
     /// The prebuilt AIR library is only sound while it is the compiled form of
     /// the MSL we ship. Nothing in the type system ties the two together, so
