@@ -100,7 +100,22 @@ impl<F: Field + Frobenius<1> + FieldExtension<1, BaseField = F>> Extendable<1> f
 pub trait FieldExtension<const D: usize>: Field {
     type BaseField: Field;
 
+    /// Whether [`Self::into_basefield_vec`] can return the input allocation
+    /// reinterpreted as base-field elements instead of allocating a copy.
+    const REUSES_BASEFIELD_VEC_ALLOCATION: bool = false;
+
     fn to_basefield_array(&self) -> [Self::BaseField; D];
+
+    /// Consumes extension elements and lays their base-field limbs out
+    /// consecutively. Implementations whose representation is already the
+    /// canonical limb array may override this to reuse the input allocation.
+    fn into_basefield_vec(values: Vec<Self>) -> Vec<Self::BaseField> {
+        let mut flattened = Vec::with_capacity(values.len() * D);
+        for value in values {
+            flattened.extend_from_slice(&value.to_basefield_array());
+        }
+        flattened
+    }
 
     fn from_basefield_array(arr: [Self::BaseField; D]) -> Self;
 

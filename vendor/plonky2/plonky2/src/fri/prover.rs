@@ -18,8 +18,11 @@ use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
+use crate::util::parallel_reverse_index_bits_in_place;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_strict, reverse_bits};
+#[cfg(test)]
+use crate::util::reverse_index_bits_in_place;
 
 /// Builds a FRI proof.
 pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
@@ -122,6 +125,34 @@ fn bitrev_flatten<F: RichField + Extendable<D>, const D: usize>(values: &[F::Ext
     flat
 }
 
+/// Reorders an owned extension-field codeword and reinterprets its canonical
+/// limbs as the flat base-field leaf buffer. The production quadratic
+/// extension reuses the input allocation, avoiding the previous full-size
+/// gather allocation and copy.
+fn bitrev_flatten_owned<F: RichField + Extendable<D>, const D: usize>(
+    mut values: Vec<F::Extension>,
+) -> Vec<F> {
+    parallel_reverse_index_bits_in_place(&mut values);
+    <F::Extension as FieldExtension<D>>::into_basefield_vec(values)
+}
+
+/// Uses allocation reuse only where it also wins the measured permutation
+/// tradeoff. Smaller codewords retain the promoted parallel gather, while
+/// production-sized quadratic codewords avoid its allocation and full copy.
+fn bitrev_flatten_for_commit<F: RichField + Extendable<D>, const D: usize>(
+    values: &mut Vec<F::Extension>,
+) -> Vec<F> {
+    const PARALLEL_REUSE_THRESHOLD: usize = 1 << 18;
+
+    if F::Extension::REUSES_BASEFIELD_VEC_ALLOCATION
+        && values.len() >= PARALLEL_REUSE_THRESHOLD
+    {
+        bitrev_flatten_owned::<F, D>(core::mem::take(values))
+    } else {
+        bitrev_flatten::<F, D>(values)
+    }
+}
+
 fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     mut coeffs: PolynomialCoeffs<F::Extension>,
     mut values: PolynomialValues<F::Extension>,
@@ -137,12 +168,10 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     for (round, arity_bits) in fri_params.reduction_arity_bits.iter().enumerate() {
         let arity = 1 << arity_bits;
 
-        // Fused bit-reversal + flatten: one gather pass writes the flat leaf
-        // buffer directly (leaf `i` is the `arity`-chunk of the bit-reversed
-        // codeword starting at `i * arity`), instead of a random-access
-        // in-place permutation followed by a separate flattening pass with a
-        // heap allocation per element.
-        let flat_values = bitrev_flatten::<F, D>(&values.values);
+        // Large quadratic codewords reuse their allocation after a parallel
+        // in-place permutation. Smaller rounds retain the promoted gather,
+        // which wins below the measured crossover.
+        let flat_values = bitrev_flatten_for_commit::<F, D>(&mut values.values);
         let tree = MerkleTree::<F, C::Hasher>::new_flat(
             flat_values,
             arity * D,
@@ -364,7 +393,7 @@ mod tests {
 
         // Sizes on both sides of the `FLATTEN_BLOCK = 1 << 10` grain: below it
         // (a single partial chunk), exactly on it, and several blocks past it.
-        for log_n in [0usize, 1, 5, 10, 11, 13] {
+        for log_n in [0usize, 1, 5, 10, 11, 13, 18] {
             let n = 1usize << log_n;
             let values: Vec<FE> = (0..n).map(|_| FE::rand()).collect();
 
@@ -380,6 +409,56 @@ mod tests {
             for (k, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
                 assert_eq!(a.0, e.0, "limb {k} of {n}");
             }
+        }
+    }
+
+    #[test]
+    fn owned_bitrev_flatten_matches_serial_gather() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type FE = <F as Extendable<D>>::Extension;
+
+        for log_n in [0usize, 1, 5, 10, 11, 13] {
+            let n = 1usize << log_n;
+            let values: Vec<FE> = (0..n).map(|_| FE::rand()).collect();
+            let expected = bitrev_flatten::<F, D>(&values);
+            let actual = bitrev_flatten_owned::<F, D>(values);
+
+            assert_eq!(actual.len(), expected.len(), "length for n = {n}");
+            for (k, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(a.0, e.0, "limb {k} of {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_bitrev_matches_cache_blocked_reference() {
+        for log_n in 0usize..=18 {
+            let n = 1usize << log_n;
+            let mut expected = (0..n as u64).collect::<Vec<_>>();
+            let mut actual = expected.clone();
+
+            reverse_index_bits_in_place(&mut expected);
+            parallel_reverse_index_bits_in_place(&mut actual);
+
+            assert_eq!(actual, expected, "log_n = {log_n}");
+        }
+    }
+
+    #[test]
+    fn commit_flatten_uses_owned_path_only_at_parallel_threshold() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type FE = <F as Extendable<D>>::Extension;
+
+        for log_n in [17usize, 18] {
+            let n = 1usize << log_n;
+            let mut values: Vec<FE> = (0..n).map(|_| FE::rand()).collect();
+            let expected = bitrev_flatten::<F, D>(&values);
+            let actual = bitrev_flatten_for_commit::<F, D>(&mut values);
+
+            assert_eq!(actual, expected, "log_n = {log_n}");
+            assert_eq!(values.is_empty(), log_n >= 18, "log_n = {log_n}");
         }
     }
 }
