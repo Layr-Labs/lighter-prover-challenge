@@ -519,6 +519,133 @@ fn divide_chunk_products<F: Field>(
     }
 }
 
+fn accumulate_z_columns_serial<F: Field>(
+    all_quotient_chunk_products: &[F],
+    num_chunks: usize,
+) -> Vec<Vec<F>> {
+    debug_assert!(num_chunks > 0);
+    debug_assert_eq!(all_quotient_chunk_products.len() % num_chunks, 0);
+    let num_prods = num_chunks - 1;
+    let n_points = all_quotient_chunk_products.len() / num_chunks;
+    let mut columns: Vec<Vec<F>> = (0..num_chunks)
+        .map(|_| Vec::with_capacity(n_points))
+        .collect();
+    let mut z_x = F::ONE;
+    for quotient_chunk_products in all_quotient_chunk_products.chunks_exact(num_chunks) {
+        let mut acc = z_x;
+        for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
+            acc *= quotient_chunk_product;
+            if k == num_prods {
+                // The last term is Z(gx), but we store Z(x) in its place,
+                // otherwise Z would end up shifted.
+                columns[k].push(z_x);
+                z_x = acc;
+            } else {
+                columns[k].push(acc);
+            }
+        }
+    }
+    columns
+}
+
+/// Split the inter-row Z dependency into independent blocks. Each worker first
+/// scans from a local Z=1; a short block-product prefix gives its true base Z,
+/// after which the local columns are scaled and concatenated in point order.
+fn accumulate_z_columns_block_parallel<F: Field>(
+    all_quotient_chunk_products: &[F],
+    num_chunks: usize,
+    block_points: usize,
+) -> Vec<Vec<F>> {
+    debug_assert!(num_chunks > 0);
+    debug_assert!(block_points > 0);
+    debug_assert_eq!(all_quotient_chunk_products.len() % num_chunks, 0);
+
+    let products_per_block = block_points * num_chunks;
+    let mut blocks: Vec<(Vec<Vec<F>>, F)> = all_quotient_chunk_products
+        .par_chunks(products_per_block)
+        .map(|block_products| {
+            let rows = block_products.len() / num_chunks;
+            let mut columns: Vec<Vec<F>> = (0..num_chunks)
+                .map(|_| Vec::with_capacity(rows))
+                .collect();
+            let mut z_x = F::ONE;
+            for quotient_chunk_products in block_products.chunks_exact(num_chunks) {
+                let mut acc = z_x;
+                for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
+                    acc *= quotient_chunk_product;
+                    if k + 1 == num_chunks {
+                        columns[k].push(z_x);
+                        z_x = acc;
+                    } else {
+                        columns[k].push(acc);
+                    }
+                }
+            }
+            (columns, z_x)
+        })
+        .collect();
+
+    let mut block_bases = Vec::with_capacity(blocks.len());
+    let mut z_x = F::ONE;
+    for (_, block_product) in &blocks {
+        block_bases.push(z_x);
+        z_x *= *block_product;
+    }
+
+    blocks
+        .par_iter_mut()
+        .zip(block_bases.par_iter())
+        .enumerate()
+        .for_each(|(block_index, ((columns, _), &base))| {
+            if block_index == 0 {
+                return;
+            }
+            for column in columns {
+                for value in column {
+                    *value *= base;
+                }
+            }
+        });
+
+    let n_points = all_quotient_chunk_products.len() / num_chunks;
+    let mut columns: Vec<Vec<F>> = (0..num_chunks)
+        .map(|_| Vec::with_capacity(n_points))
+        .collect();
+    for (block_columns, _) in blocks {
+        for (column, block_column) in columns.iter_mut().zip(block_columns) {
+            column.extend(block_column);
+        }
+    }
+    columns
+}
+
+#[inline]
+fn accumulate_z_columns<F: Field>(
+    all_quotient_chunk_products: &[F],
+    num_chunks: usize,
+) -> Vec<Vec<F>> {
+    #[cfg(feature = "parallel")]
+    {
+        const PARALLEL_MIN_POINTS: usize = 1 << 14;
+        const BLOCK_POINTS: usize = 2048;
+        const PRODUCTION_NUM_CHUNKS: usize = 10;
+
+        let n_points = all_quotient_chunk_products.len() / num_chunks;
+        if num_chunks == PRODUCTION_NUM_CHUNKS
+            && n_points >= PARALLEL_MIN_POINTS
+            && plonky2_maybe_rayon::rayon::current_num_threads() > 1
+        {
+            return accumulate_z_columns_block_parallel(
+                all_quotient_chunk_products,
+                num_chunks,
+                BLOCK_POINTS,
+            );
+        }
+    }
+
+    accumulate_z_columns_serial(all_quotient_chunk_products, num_chunks)
+}
+
 /// Compute the partial products used in the `Z` polynomial.
 /// Returns the polynomials interpolating `partial_products(f / g)`
 /// where `f, g` are the products in the definition of `Z`: `Z(g^i) = f / g`.
@@ -611,30 +738,9 @@ fn wires_permutation_partial_products_and_zs<
     // none is left uninitialized.
     unsafe { all_quotient_chunk_products.set_len(product_count) };
 
-    // Accumulate the sequential Z chain directly into the column-major output
-    // polynomials, deleting the per-point row Vec, the row-major intermediate,
-    // and the whole-phase transpose. Values and their order are identical: for
-    // each point, column k receives the k-th running product, and the last
-    // column receives the previous Z(x) exactly as the swap-based version did.
-    let n_points = subgroup.len();
-    let mut columns: Vec<Vec<F>> = (0..num_prods + 1)
-        .map(|_| Vec::with_capacity(n_points))
-        .collect();
-    let mut z_x = F::ONE;
-    for quotient_chunk_products in all_quotient_chunk_products.chunks_exact(num_chunks) {
-        let mut acc = z_x;
-        for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
-            acc *= quotient_chunk_product;
-            if k == num_prods {
-                // The last term is Z(gx), but we store Z(x) in its place,
-                // otherwise Z would end up shifted.
-                columns[k].push(z_x);
-                z_x = acc;
-            } else {
-                columns[k].push(acc);
-            }
-        }
-    }
+    // Production-sized instances use a block prefix; small and generic shapes
+    // retain the exact serial scan.
+    let columns = accumulate_z_columns(&all_quotient_chunk_products, num_chunks);
 
     columns.into_iter().map(PolynomialValues::new).collect()
 }
@@ -2526,7 +2632,10 @@ mod flat_chunk_products_tests {
 
     use crate::util::partial_products::quotient_chunk_products_into;
 
-    use super::divide_chunk_products;
+    use super::{
+        accumulate_z_columns, accumulate_z_columns_block_parallel,
+        accumulate_z_columns_serial, divide_chunk_products,
+    };
 
     type F = GoldilocksField;
 
@@ -2668,6 +2777,75 @@ mod flat_chunk_products_tests {
                     raw(legacy_column),
                     "column {k} mismatch for {n_points} points"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn block_parallel_z_columns_match_serial_canonically() {
+        const NUM_CHUNKS: usize = 10;
+        const BLOCK_POINTS: usize = 2048;
+
+        for &n_points in &[1usize, 2048, 2049, 1 << 14] {
+            let products = noncanonical_vec(n_points * NUM_CHUNKS, n_points as u64 + 53);
+            let expected = accumulate_z_columns_serial(&products, NUM_CHUNKS);
+            let actual =
+                accumulate_z_columns_block_parallel(&products, NUM_CHUNKS, BLOCK_POINTS);
+
+            assert_eq!(actual.len(), NUM_CHUNKS);
+            for (column_index, (actual_column, expected_column)) in
+                actual.iter().zip(&expected).enumerate()
+            {
+                let first_block_len = n_points.min(BLOCK_POINTS);
+                assert_eq!(
+                    raw(&actual_column[..first_block_len]),
+                    raw(&expected_column[..first_block_len]),
+                    "first block raw mismatch at column {column_index}, n={n_points}"
+                );
+                for (row, (&actual_value, &expected_value)) in
+                    actual_column.iter().zip(expected_column).enumerate()
+                {
+                    assert_eq!(
+                        actual_value.to_canonical_u64(),
+                        expected_value.to_canonical_u64(),
+                        "canonical mismatch at column {column_index}, row {row}, n={n_points}"
+                    );
+                }
+            }
+
+            let last_row = &products[(n_points - 1) * NUM_CHUNKS..];
+            let output_final_z = actual[NUM_CHUNKS - 1][n_points - 1]
+                * last_row.iter().copied().product::<F>();
+            let expected_final_z = products.iter().copied().product::<F>();
+            assert_eq!(
+                output_final_z.to_canonical_u64(),
+                expected_final_z.to_canonical_u64(),
+                "final Z chain mismatch for n={n_points}"
+            );
+
+            let selected = accumulate_z_columns(&products, NUM_CHUNKS);
+            for (selected_column, expected_column) in selected.iter().zip(&expected) {
+                if n_points < (1 << 14) {
+                    assert_eq!(raw(selected_column), raw(expected_column));
+                }
+                for (&selected_value, &expected_value) in
+                    selected_column.iter().zip(expected_column)
+                {
+                    assert_eq!(
+                        selected_value.to_canonical_u64(),
+                        expected_value.to_canonical_u64()
+                    );
+                }
+            }
+        }
+
+        for num_chunks in [1usize, 3, 11] {
+            let n_points = 1 << 14;
+            let products = noncanonical_vec(n_points * num_chunks, num_chunks as u64 + 97);
+            let expected = accumulate_z_columns_serial(&products, num_chunks);
+            let selected = accumulate_z_columns(&products, num_chunks);
+            for (selected_column, expected_column) in selected.iter().zip(&expected) {
+                assert_eq!(raw(selected_column), raw(expected_column));
             }
         }
     }
