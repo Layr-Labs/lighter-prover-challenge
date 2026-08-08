@@ -33,7 +33,7 @@
 //! building circuits from scratch.
 
 use anyhow::{Context, Result, bail, ensure};
-use plonky2::field::fft::{cached_fft_root_table, cached_two_adic_subgroup};
+use plonky2::field::fft::fft_root_table;
 use plonky2::field::polynomial::PolynomialValues;
 use plonky2::field::types::Field;
 use plonky2::fri::oracle::PolynomialBatch;
@@ -43,7 +43,7 @@ use plonky2::plonk::circuit_data::{
 use plonky2::plonk::permutation_argument::Forest;
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
-use plonky2::util::{log2_ceil, transpose_poly_values_ref};
+use plonky2::util::log2_ceil;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -277,7 +277,7 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
 ///
 /// The returned `CircuitData` is value-identical to the freshly built one:
 /// deserialized components are byte round trips, and every recomputed
-/// component (subgroup, FFT root table, sigma values/transpose, watch counts,
+/// component (subgroup, FFT root table, column-major sigma values, watch counts,
 /// constants/sigmas commitment) is derived by the same code paths the builder
 /// itself runs, from the same inputs. The recomputed commitment cap is checked
 /// against the embedded verifier data before returning.
@@ -443,18 +443,12 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let num_wires = common.config.num_wires;
     let num_routed = common.config.num_routed_wires;
 
-    // The embedded loads run concurrently and several circuits share a degree
-    // or FFT-domain size, so route these deterministic derivations through the
-    // process-wide caches instead of recomputing the primitive-root power
-    // chains per load. The cached values are value-identical to a fresh
-    // computation (the cache stores exactly what `two_adic_subgroup` /
-    // `fft_root_table` produce), so this is startup-only deduplication.
-    let subgroup = cached_two_adic_subgroup::<F>(degree_bits).as_ref().clone();
+    let subgroup = F::two_adic_subgroup(degree_bits);
 
     // Same table size expression as `try_build_with_options`.
     let max_fft_points =
         1usize << (degree_bits + rate_bits.max(log2_ceil(common.quotient_degree_factor)));
-    let root_table = cached_fft_root_table::<F>(max_fft_points);
+    let root_table = fft_root_table::<F>(max_fft_points);
 
     // Sigma values from the representative map, through the builder's own
     // forest partition code (`sigma_vecs` post-`compress_paths` state).
@@ -463,13 +457,13 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let sigma_vecs = wire_partition.get_sigma_polys(degree_bits, &common.k_is, &subgroup);
     let representative_map = forest.into_parents();
 
-    // `prover_only.sigmas` is the transpose of the sigma *values*, and the
-    // commitment below consumes those same values. Transposing first reads the
-    // columns in place, so they can then be moved into the commitment instead
-    // of cloned; the clone was one extra full copy of the sigma columns
-    // (`num_routed_wires * degree` field elements) per circuit. Only the order
-    // of two independent reads changes — no quantity is computed differently.
-    let sigmas = transpose_poly_values_ref(&sigma_vecs);
+    // Retain sigma values in the same column-major layout as `MatrixWitness`;
+    // the packed permutation kernel streams both by wire. The commitment takes
+    // the originals by move, leaving this as the sole retained copy.
+    let sigmas: Vec<Vec<F>> = sigma_vecs
+        .iter()
+        .map(|sigma| sigma.values.clone())
+        .collect();
 
     // The builder's commitment path: values in, IFFT inside, LDE + Merkle.
     // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).

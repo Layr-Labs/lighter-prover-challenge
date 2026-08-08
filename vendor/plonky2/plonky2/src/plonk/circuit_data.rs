@@ -502,7 +502,7 @@ pub struct ProverOnlyCircuitData<
     pub generator_watch_counts: Vec<usize>,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
-    /// The transpose of the list of sigma polynomials.
+    /// Sigma polynomial values in column-major order: `sigmas[wire][row]`.
     pub sigmas: Vec<Vec<F>>,
     /// Subgroup of order `degree`.
     pub subgroup: Vec<F>,

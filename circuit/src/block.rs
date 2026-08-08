@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
 
 use num::BigInt;
 use plonky2::field::extension::Extendable;
@@ -129,10 +128,8 @@ where
 
     #[serde(rename = "txs")]
     txs: Vec<Tx<F>>,
-    /// Chunk slots share immutable padding transactions instead of cloning the
-    /// full transaction state and Merkle paths for every padded position.
     #[serde(skip)]
-    pub tx_chunks: Vec<Vec<Arc<Tx<F>>>>,
+    pub tx_chunks: Vec<Vec<Tx<F>>>,
 }
 
 impl<F> Block<F>
@@ -185,68 +182,38 @@ where
                 last_heavy_index = next_index;
             }
         }
-        let empty_template =
-            empty_template.expect("block witness must end with an empty padding tx");
-        block.tx_chunks = if txs.is_empty() {
-            Self::empty_tx_chunks(
-                empty_template,
-                heavy_empty_tx_count,
-                light_empty_tx_count,
-                last_heavy_index,
-                last_light_index,
-                tx_per_proof,
-                light_tx_per_proof,
-            )
-        } else {
-            Self::chunk_txs(
-                txs,
-                empty_template,
-                last_heavy_index,
-                last_light_index,
-                tx_per_proof,
-                light_tx_per_proof,
-            )
-        };
+        if txs.is_empty() {
+            for (count, circuit_type, last_index) in [
+                (heavy_empty_tx_count, TX_HEAVY, last_heavy_index),
+                (light_empty_tx_count, TX_LIGHT, last_light_index),
+            ] {
+                let mut pad = empty_template
+                    .clone()
+                    .expect("block witness must end with an empty padding tx");
+                pad.tx_circuit_type = circuit_type;
+                pad.tx_index = last_index;
+                txs.extend(std::iter::repeat_n(pad, count));
+            }
+        }
+        block.tx_chunks = Self::chunk_txs(
+            txs,
+            empty_template,
+            last_heavy_index,
+            last_light_index,
+            tx_per_proof,
+            light_tx_per_proof,
+        );
         Ok(block)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn empty_tx_chunks(
-        empty_template: Tx<F>,
-        heavy_count: usize,
-        light_count: usize,
-        last_heavy_index: u64,
-        last_light_index: u64,
-        tx_per_proof: usize,
-        light_tx_per_proof: usize,
-    ) -> Vec<Vec<Arc<Tx<F>>>> {
-        let mut heavy_pad = empty_template.clone();
-        heavy_pad.tx_circuit_type = TX_HEAVY;
-        heavy_pad.tx_index = last_heavy_index;
-        let mut light_pad = empty_template;
-        light_pad.tx_circuit_type = TX_LIGHT;
-        light_pad.tx_index = last_light_index;
-
-        [
-            (heavy_count, tx_per_proof, Arc::new(heavy_pad)),
-            (light_count, light_tx_per_proof, Arc::new(light_pad)),
-        ]
-        .into_iter()
-        .flat_map(|(count, per_proof, pad)| {
-            let chunk_count = count.div_ceil(per_proof).max(1);
-            (0..chunk_count).map(move |_| vec![Arc::clone(&pad); per_proof])
-        })
-        .collect()
     }
 
     fn chunk_txs(
         txs: Vec<Tx<F>>,
-        empty_template: Tx<F>,
+        empty_template: Option<Tx<F>>,
         last_heavy_index: u64,
         last_light_index: u64,
         tx_per_proof: usize,
         light_tx_per_proof: usize,
-    ) -> Vec<Vec<Arc<Tx<F>>>> {
+    ) -> Vec<Vec<Tx<F>>> {
         let per_proof = |circuit_type: u8| {
             if circuit_type == TX_LIGHT {
                 light_tx_per_proof
@@ -256,9 +223,9 @@ where
         };
         // Txs of each circuit type are grouped together across type jumps, keeping their
         // relative execution order. A group is emitted as soon as it is full.
-        let mut chunks: Vec<Vec<Arc<Tx<F>>>> = Vec::new();
-        let mut heavy_buf: Vec<Arc<Tx<F>>> = Vec::new();
-        let mut light_buf: Vec<Arc<Tx<F>>> = Vec::new();
+        let mut chunks: Vec<Vec<Tx<F>>> = Vec::new();
+        let mut heavy_buf: Vec<Tx<F>> = Vec::new();
+        let mut light_buf: Vec<Tx<F>> = Vec::new();
         let mut has_heavy = false;
         let mut has_light = false;
         for t in txs {
@@ -270,7 +237,7 @@ where
                 &mut heavy_buf
             };
             let size = per_proof(t.tx_circuit_type);
-            buf.push(Arc::new(t));
+            buf.push(t);
             if buf.len() == size {
                 chunks.push(std::mem::take(buf));
             }
@@ -285,13 +252,13 @@ where
             if buf.is_empty() && has_txs {
                 continue;
             }
-            let mut pad = empty_template.clone();
+            let mut pad = empty_template
+                .clone()
+                .expect("block witness must end with an empty padding tx");
             pad.tx_circuit_type = circuit_type;
             pad.tx_index = last_index;
-            let pad = Arc::new(pad);
-            let size = per_proof(circuit_type);
-            while buf.len() < size {
-                buf.push(Arc::clone(&pad));
+            while buf.len() < per_proof(circuit_type) {
+                buf.push(pad.clone());
             }
             chunks.push(std::mem::take(buf));
         }

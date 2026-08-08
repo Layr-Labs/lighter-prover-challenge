@@ -12,6 +12,9 @@ use super::circuit_builder::{LookupChallenges, LookupWire};
 use crate::field::extension::Extendable;
 use crate::field::fft::ifft_borrowed;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
+use crate::field::batch_util::batch_multiply_inplace;
+use crate::field::packable::Packable;
+use crate::field::packed::PackedField;
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::fri::oracle::{BatchLayout, PolynomialBatch};
@@ -543,9 +546,7 @@ fn divide_chunk_products<F: Field>(
 ) {
     debug_assert_eq!(numerator_products.len(), denominator_products.len());
     F::batch_multiplicative_inverse_into(denominator_products, inverse_scratch);
-    for (product, &inverse) in numerator_products.iter_mut().zip(inverse_scratch.iter()) {
-        *product *= inverse;
-    }
+    batch_multiply_inplace(numerator_products, inverse_scratch);
 }
 
 /// Accumulate the sequential Z chain directly into the column-major output
@@ -582,21 +583,13 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
     columns.into_iter().map(PolynomialValues::new).collect()
 }
 
-/// Compute both production permutation challenges in one pass over the witness
-/// and sigma rows.
+/// Compute both production permutation challenges in one column-major pass.
 ///
-/// `MatrixWitness` is column-major (`wire_values[wire][row]`), so one
-/// per-challenge pass touches a separate allocation for each of the routed
-/// wires of every row — 80 columns at the production shape — and keeps nothing
-/// warm for the next challenge, which then re-streams the identical bytes.
-/// Fusing collapses two full traversals of the witness and sigma matrices, and
-/// two Rayon fork/joins over the subgroup, into one.
-///
-/// Value-exactness: each challenge keeps its own accumulators, its own
-/// numerator/denominator multiplication order (`for j in start..end`), its own
-/// inversion batch in the same push order, and its own Z chain. Only the
-/// memory traversal and the Rayon scheduling are shared, so every output limb
-/// is bit-identical to running the per-challenge path twice.
+/// `MatrixWitness` and `prover_data.sigmas` are both stored by wire. Each
+/// inversion batch therefore streams consecutive rows from both tables and
+/// evaluates four rows through the field's native packing. Challenge-local
+/// accumulators preserve the original multiplication order within every row;
+/// only independent rows execute in SIMD lanes.
 fn two_challenge_wires_permutation_partial_products_and_zs<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -618,16 +611,13 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     let num_chunks = num_prods + 1;
     debug_assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
     debug_assert_eq!(beta_k_is.len(), 2 * num_routed_wires);
+    debug_assert_eq!(prover_data.sigmas.len(), num_routed_wires);
     let (beta_k_is_0, beta_k_is_1) = beta_k_is.split_at(num_routed_wires);
     let (beta_0, beta_1) = (betas[0], betas[1]);
     let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
 
     const INV_BATCH: usize = 128;
     let product_count = subgroup.len() * num_chunks;
-    // Same uninitialised-capacity handling as the per-challenge path: every
-    // slot is written below before anything reads it, so zero-filling first is
-    // dead work (5.2 MiB of serial stores per challenge at the production
-    // shape).
     let mut quotient_products_0: Vec<F> = Vec::with_capacity(product_count);
     let mut quotient_products_1: Vec<F> = Vec::with_capacity(product_count);
     {
@@ -650,59 +640,129 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                         Vec::with_capacity(num_chunks * INV_BATCH),
                         Vec::with_capacity(num_chunks * INV_BATCH),
                         Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(num_chunks * INV_BATCH),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
                     let base = chunk_idx * INV_BATCH;
-                    let (denominators_0, denominators_1, denominator_inverses) = scratch;
-                    denominators_0.clear();
-                    denominators_1.clear();
-                    for (t, &x) in xs.iter().enumerate() {
-                        let i = base + t;
-                        let s_sigmas = &prover_data.sigmas[i];
-                        for chunk in 0..num_chunks {
-                            let start = chunk * degree;
-                            let end = min(start + degree, num_routed_wires);
-                            let mut numerator_0 = F::ONE;
-                            let mut numerator_1 = F::ONE;
-                            let mut denominator_0 = F::ONE;
-                            let mut denominator_1 = F::ONE;
-                            for j in start..end {
-                                let wire_value = witness.get_wire(i, j);
-                                let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                    let rows = xs.len();
+                    let work_len = rows * num_chunks;
+                    let (
+                        numerators_0,
+                        numerators_1,
+                        denominators_0,
+                        denominators_1,
+                        denominator_inverses,
+                    ) = scratch;
+                    numerators_0.resize(work_len, F::ZERO);
+                    numerators_1.resize(work_len, F::ZERO);
+                    denominators_0.resize(work_len, F::ZERO);
+                    denominators_1.resize(work_len, F::ZERO);
+
+                    let packed_rows =
+                        rows / <F as Packable>::Packing::WIDTH
+                            * <F as Packable>::Packing::WIDTH;
+                    let xs_packed =
+                        <F as Packable>::Packing::pack_slice(&xs[..packed_rows]);
+                    for chunk in 0..num_chunks {
+                        let start = chunk * degree;
+                        let end = min(start + degree, num_routed_wires);
+                        let range = chunk * rows..(chunk + 1) * rows;
+                        let numerator_0 = &mut numerators_0[range.clone()];
+                        let numerator_1 = &mut numerators_1[range.clone()];
+                        let denominator_0 = &mut denominators_0[range.clone()];
+                        let denominator_1 = &mut denominators_1[range];
+
+                        for j in start..end {
+                            let wires = &witness.wire_values[j][base..base + rows];
+                            let sigmas = &prover_data.sigmas[j][base..base + rows];
+                            let wires_packed =
+                                <F as Packable>::Packing::pack_slice(&wires[..packed_rows]);
+                            let sigmas_packed =
+                                <F as Packable>::Packing::pack_slice(&sigmas[..packed_rows]);
+                            let numerator_0_packed =
+                                <F as Packable>::Packing::pack_slice_mut(
+                                    &mut numerator_0[..packed_rows],
+                                );
+                            let numerator_1_packed =
+                                <F as Packable>::Packing::pack_slice_mut(
+                                    &mut numerator_1[..packed_rows],
+                                );
+                            let denominator_0_packed =
+                                <F as Packable>::Packing::pack_slice_mut(
+                                    &mut denominator_0[..packed_rows],
+                                );
+                            let denominator_1_packed =
+                                <F as Packable>::Packing::pack_slice_mut(
+                                    &mut denominator_1[..packed_rows],
+                                );
+
+                            for k in 0..xs_packed.len() {
+                                let wire = wires_packed[k];
+                                let x = xs_packed[k];
+                                let sigma = sigmas_packed[k];
+                                let n0 = wire + x * beta_k_is_0[j] + gamma_0;
+                                let n1 = wire + x * beta_k_is_1[j] + gamma_1;
+                                let d0 = wire + sigma * beta_0 + gamma_0;
+                                let d1 = wire + sigma * beta_1 + gamma_1;
+                                if j == start {
+                                    numerator_0_packed[k] = n0;
+                                    numerator_1_packed[k] = n1;
+                                    denominator_0_packed[k] = d0;
+                                    denominator_1_packed[k] = d1;
+                                } else {
+                                    numerator_0_packed[k] *= n0;
+                                    numerator_1_packed[k] *= n1;
+                                    denominator_0_packed[k] *= d0;
+                                    denominator_1_packed[k] *= d1;
+                                }
                             }
-                            let output = t * num_chunks + chunk;
-                            products_0[output].write(numerator_0);
-                            products_1[output].write(numerator_1);
-                            denominators_0.push(denominator_0);
-                            denominators_1.push(denominator_1);
+                            for t in packed_rows..rows {
+                                let wire = wires[t];
+                                let x = xs[t];
+                                let sigma = sigmas[t];
+                                let n0 = wire + beta_k_is_0[j] * x + gamma_0;
+                                let n1 = wire + beta_k_is_1[j] * x + gamma_1;
+                                let d0 = wire + beta_0 * sigma + gamma_0;
+                                let d1 = wire + beta_1 * sigma + gamma_1;
+                                if j == start {
+                                    numerator_0[t] = n0;
+                                    numerator_1[t] = n1;
+                                    denominator_0[t] = d0;
+                                    denominator_1[t] = d1;
+                                } else {
+                                    numerator_0[t] *= n0;
+                                    numerator_1[t] *= n1;
+                                    denominator_0[t] *= d0;
+                                    denominator_1[t] *= d1;
+                                }
+                            }
                         }
                     }
-                    // SAFETY: the loop above wrote every slot of both
-                    // sub-slices — `t` covers `0..xs.len()` and `chunk` covers
-                    // `0..num_chunks`, and each sub-slice length is exactly
-                    // `xs.len() * num_chunks` (the `zip`s pair each pair of
-                    // chunks with its own `xs`, so a short final chunk is still
-                    // covered exactly).
-                    let products_0 = unsafe {
-                        &mut *(products_0 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
-                    };
-                    let products_1 = unsafe {
-                        &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
-                    };
-                    divide_chunk_products(products_0, denominators_0, denominator_inverses);
-                    divide_chunk_products(products_1, denominators_1, denominator_inverses);
+
+                    divide_chunk_products(
+                        numerators_0,
+                        denominators_0,
+                        denominator_inverses,
+                    );
+                    divide_chunk_products(
+                        numerators_1,
+                        denominators_1,
+                        denominator_inverses,
+                    );
+                    for t in 0..rows {
+                        for chunk in 0..num_chunks {
+                            let source = chunk * rows + t;
+                            let output = t * num_chunks + chunk;
+                            products_0[output].write(numerators_0[source]);
+                            products_1[output].write(numerators_1[source]);
+                        }
+                    }
                 },
             );
     }
 
-    // SAFETY: the parallel pass above wrote and then divided every one of the
-    // `product_count` slots of both buffers; `par_chunks_mut` partitions each
-    // buffer exactly, so none is left uninitialized.
     unsafe {
         quotient_products_0.set_len(product_count);
         quotient_products_1.set_len(product_count);
@@ -770,7 +830,6 @@ fn wires_permutation_partial_products_and_zs<
                 denominator_products.clear();
                 for (t, &x) in xs.iter().enumerate() {
                     let i = base + t;
-                    let s_sigmas = &prover_data.sigmas[i];
                     for chunk in 0..num_chunks {
                         let start = chunk * degree;
                         let end = min(start + degree, num_routed_wires);
@@ -779,7 +838,8 @@ fn wires_permutation_partial_products_and_zs<
                         for j in start..end {
                             let wire_value = witness.get_wire(i, j);
                             numerator_product *= wire_value + beta_k_is[j] * x + gamma;
-                            denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
+                            denominator_product *=
+                                wire_value + beta * prover_data.sigmas[j][i] + gamma;
                         }
                         quotient_products[t * num_chunks + chunk].write(numerator_product);
                         denominator_products.push(denominator_product);
@@ -1935,6 +1995,7 @@ fn compute_quotient_polys<
                         .all(|(&sx, &x)| sx == F::coset_shift() * x)
                 );
 
+
                 // The constants and sigma columns are circuit-fixed, so their
                 // quotient-domain values were extracted once at circuit build
                 // time; copy them per batch instead of re-walking the strided
@@ -2006,6 +2067,7 @@ fn compute_quotient_polys<
                 } else {
                     (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
                 };
+
                 wires_commitment.fill_lde_batch(
                     &scratch.indices,
                     step,
@@ -2606,6 +2668,7 @@ mod quotient_layout_tests {
         assert_eq!(contiguous, indexed);
     }
 
+
     /// Scratch reuse: `fill_lde_batch` writes every cell of `out` before any
     /// is read, so dropping the zero-fill of an already correctly sized buffer
     /// must be invisible. A poisoned reused buffer has to gather exactly what
@@ -3080,7 +3143,7 @@ mod permutation_pairing_tests {
                 for j in start..end {
                     let wire_value = witness.get_wire(i, j);
                     let numerator = wire_value + beta_k_is[j] * x + gamma;
-                    let denominator = wire_value + beta * sigmas[i][j] + gamma;
+                    let denominator = wire_value + beta * sigmas[j][i] + gamma;
                     ratio *= numerator * denominator.inverse();
                 }
                 acc *= ratio;
@@ -3116,8 +3179,8 @@ mod permutation_pairing_tests {
             let mut rng = Rng::new(0x9e37_79b9_7f4a_7c15 ^ ((n_points as u64) << 8));
 
             let subgroup: Vec<F> = (0..n_points).map(|_| rng.next_field()).collect();
-            let sigmas: Vec<Vec<F>> = (0..n_points)
-                .map(|_| (0..num_routed_wires).map(|_| rng.next_field()).collect())
+            let sigmas: Vec<Vec<F>> = (0..num_routed_wires)
+                .map(|_| (0..n_points).map(|_| rng.next_field()).collect())
                 .collect();
             let witness = MatrixWitness {
                 wire_values: (0..num_routed_wires)
