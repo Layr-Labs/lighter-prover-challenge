@@ -368,29 +368,6 @@ impl<F: RichField> TreeReadback<'_, F> {
 
 static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShared::new);
 
-/// Starts building the Metal context on a detached background thread.
-///
-/// [`CONTEXT`] is otherwise forced by whichever proving step first wants the
-/// GPU, which puts the shader compile and pipeline lowering (see
-/// [`MetalShared::new`]) squarely on the critical path of a scored worker
-/// process. Kicking it off from the process entry point instead lets it run
-/// against the startup work that precedes the first GPU use — argument
-/// handling, thread-pool construction, fixture parsing.
-///
-/// Idempotent and safe to call from anywhere: `LazyLock` initializes exactly
-/// once, and a thread that reaches [`shared_context`] while this one is still
-/// compiling blocks until it finishes and then observes the same context.
-/// Callers that never touch the GPU pay only the thread spawn. Nothing here
-/// is observable in a proof — the context holds compiled kernels, not values.
-pub fn prewarm() {
-    std::thread::Builder::new()
-        .name("poseidon2-metal-prewarm".to_owned())
-        .spawn(|| {
-            let _ = &*CONTEXT;
-        })
-        .ok();
-}
-
 /// True while the prover is inside an exclusive serial phase (pre-execution
 /// or final block proof) where no concurrent proof can contend for the
 /// serialized GPU stream. Process-global on purpose: the phases it brackets
@@ -1064,109 +1041,58 @@ impl MetalShared {
             let library = device
                 .new_library_with_source(SHADER_SOURCE, &options)
                 .map_err(|error| format!("shader compilation failed: {error}"))?;
-            // Build the eight compute pipelines concurrently, one thread each.
-            //
-            // Every `newComputePipelineStateWithFunction:` lowers that kernel's
-            // AIR to a GPU binary through MTLCompilerService, and the three
-            // Poseidon2 permutation kernels plus the two gate-quotient kernels
-            // are large enough that each takes hundreds of milliseconds when the
-            // result is not already in the OS shader cache. The benchmark
-            // sandbox denies writes to that cache, which disables it outright —
-            // reads miss too — so *every* scored worker process pays the full
-            // cold lowering, serialized at ~2.36 s. The compiler service handles
-            // the requests in parallel, so issuing all eight at once collapses
-            // that to the cost of the single slowest kernel (~0.67 s).
-            //
-            // This is a scheduling change only: the pipelines, and therefore
-            // every value the GPU later computes, are identical. `Device`,
-            // `Library` and `ComputePipelineState` are all `Send + Sync`, and
-            // each worker thread gets its own autorelease pool so the temporary
-            // `NSError`s the Metal API autoreleases are drained on the thread
-            // that created them rather than leaking.
-            let device_ref = &device;
-            let library_ref = &library;
-            let required = |name: &'static str, kind: &'static str| {
-                move || -> Result<ComputePipelineState, String> {
-                    autoreleasepool(|| {
-                        let function = library_ref
-                            .get_function(name, None)
-                            .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
-                        device_ref
-                            .new_compute_pipeline_state_with_function(&function)
-                            .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
-                    })
-                }
-            };
-            let optional = |name: &'static str| {
-                move || -> Option<ComputePipelineState> {
-                    autoreleasepool(|| {
-                        library_ref
-                            .get_function(name, None)
-                            .ok()
-                            .and_then(|function| {
-                                device_ref
-                                    .new_compute_pipeline_state_with_function(&function)
-                                    .ok()
-                            })
-                    })
-                }
-            };
-            let (
-                leaf_pipeline,
-                leaf_colmajor_pipeline,
-                parent_pipeline,
-                ntt_prepare_pipeline,
-                ntt_stage_pipeline,
-                ifft_finalize_pipeline,
-                poseidon_gate_quotient_pipeline,
-                range_check_gate_quotient_pipeline,
-            ) = std::thread::scope(|scope| {
-                let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
-                let leaf_colmajor =
-                    scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
-                let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
-                let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
-                let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
-                let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
-                let poseidon_gate = scope.spawn(optional("poseidon2_gate_quotient"));
-                let range_check_gate = scope.spawn(optional("range_check_gate_quotient"));
-                // A panic inside a pipeline build is a bug, not a runtime
-                // condition; propagate it rather than papering over it.
-                (
-                    leaf.join().expect("leaf pipeline thread panicked"),
-                    leaf_colmajor
-                        .join()
-                        .expect("col-major leaf pipeline thread panicked"),
-                    parent.join().expect("parent pipeline thread panicked"),
-                    ntt_prepare
-                        .join()
-                        .expect("ntt prepare pipeline thread panicked"),
-                    ntt_stage
-                        .join()
-                        .expect("ntt stage pipeline thread panicked"),
-                    ifft_finalize
-                        .join()
-                        .expect("ifft finalize pipeline thread panicked"),
-                    poseidon_gate
-                        .join()
-                        .expect("poseidon2 gate quotient pipeline thread panicked"),
-                    range_check_gate
-                        .join()
-                        .expect("range check gate quotient pipeline thread panicked"),
-                )
-            });
-            // Surfaced in kernel order, so a single missing or unbuildable
-            // kernel yields the same error string the sequential construction
-            // produced. Only the tie-break between two simultaneous failures
-            // can differ, and every one of these kernels is present in
-            // `SHADER_SOURCE`; a failure here means the whole library is bad,
-            // which `new_library_with_source` above has already rejected.
-            let leaf_pipeline = leaf_pipeline?;
-            let leaf_colmajor_pipeline = leaf_colmajor_pipeline?;
-            let parent_pipeline = parent_pipeline?;
-            let ntt_prepare_pipeline = ntt_prepare_pipeline?;
-            let ntt_stage_pipeline = ntt_stage_pipeline?;
-            let ifft_finalize_pipeline = ifft_finalize_pipeline?;
+            let leaf_function = library
+                .get_function("poseidon2_hash_leaves", None)
+                .map_err(|error| format!("leaf kernel unavailable: {error}"))?;
+            let leaf_colmajor_function = library
+                .get_function("poseidon2_hash_leaves_colmajor", None)
+                .map_err(|error| format!("col-major leaf kernel unavailable: {error}"))?;
+            let parent_function = library
+                .get_function("poseidon2_hash_parents", None)
+                .map_err(|error| format!("parent kernel unavailable: {error}"))?;
+            let ntt_prepare_function = library
+                .get_function("ntt_prepare", None)
+                .map_err(|error| format!("ntt prepare kernel unavailable: {error}"))?;
+            let ntt_stage_function = library
+                .get_function("ntt_stage", None)
+                .map_err(|error| format!("ntt stage kernel unavailable: {error}"))?;
+            let leaf_pipeline = device
+                .new_compute_pipeline_state_with_function(&leaf_function)
+                .map_err(|error| format!("leaf pipeline creation failed: {error}"))?;
+            let leaf_colmajor_pipeline = device
+                .new_compute_pipeline_state_with_function(&leaf_colmajor_function)
+                .map_err(|error| format!("col-major leaf pipeline creation failed: {error}"))?;
+            let parent_pipeline = device
+                .new_compute_pipeline_state_with_function(&parent_function)
+                .map_err(|error| format!("parent pipeline creation failed: {error}"))?;
+            let ntt_prepare_pipeline = device
+                .new_compute_pipeline_state_with_function(&ntt_prepare_function)
+                .map_err(|error| format!("ntt prepare pipeline creation failed: {error}"))?;
+            let ntt_stage_pipeline = device
+                .new_compute_pipeline_state_with_function(&ntt_stage_function)
+                .map_err(|error| format!("ntt stage pipeline creation failed: {error}"))?;
+            let ifft_finalize_function = library
+                .get_function("ifft_finalize", None)
+                .map_err(|error| format!("ifft finalize kernel unavailable: {error}"))?;
+            let ifft_finalize_pipeline = device
+                .new_compute_pipeline_state_with_function(&ifft_finalize_function)
+                .map_err(|error| format!("ifft finalize pipeline creation failed: {error}"))?;
+            let poseidon_gate_quotient_pipeline = library
+                .get_function("poseidon2_gate_quotient", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
+            let range_check_gate_quotient_pipeline = library
+                .get_function("range_check_gate_quotient", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
