@@ -27,17 +27,18 @@ use plonky2::fri::oracle::PolynomialBatch;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// Return freed pages to the OS as soon as they are unused instead of retaining
-// them for the process lifetime.
+// Keep freed dirty pages for jemalloc's normal ten-second decay window so the
+// repeated witness, coefficient, and digest shapes can reuse physical pages
+// instead of forcing an immediate purge/re-fault cycle.
 //
-// The benchmark runs five of these workers concurrently and the score is the
-// sum of their lifetimes, so every resident page one worker holds is a page the
-// other four contend for. With decay disabled the allocator never madvises a
-// freed extent away, so this process's resident set is the *high-water mark* of
-// its heap rather than its live set: the transaction/chain pipeline allocates
-// and frees the same shapes of multi-hundred-megabyte witness, coefficient and
-// digest buffers 50+ times, and the retained slack accumulates monotonically.
-// Setting both decay periods to zero makes residency track the live set.
+// The trusted harness runs the five fixtures sequentially in fresh worker
+// processes and sums their lifetimes; there are no sibling worker resident
+// sets to protect. The final-block boundary still releases the large retained
+// circuit buffers before allocating its extensions, and `_exit` reclaims the
+// whole address space after the proof. Retaining pages indefinitely raised
+// peak RSS and regressed local wall time, while jemalloc's bounded default
+// dirty decay reduced page reclaims without turning RSS into the process
+// high-water mark. Muzzy decay remains disabled, matching jemalloc's default.
 //
 // This changes no computed value: `malloc_conf` only tunes when the allocator
 // hands unused pages back to the kernel. Every allocation still returns
@@ -46,14 +47,14 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 //
 // ABI note: jemalloc reads `const char *malloc_conf` (prefixed `_rjem_` in
 // tikv-jemalloc-sys), i.e. a pointer-sized slot holding the address of a
-// NUL-terminated string. `&[u8; 34]` is a thin pointer to the NUL-terminated
+// NUL-terminated string. `&[u8; 38]` is a thin pointer to the NUL-terminated
 // bytes, which matches that ABI exactly. Exporting the bare byte array itself
 // (no indirection) or omitting the trailing NUL would make jemalloc read the
 // string bytes as a pointer and crash. This is a default: the environment and
 // /etc/malloc.conf can still override it.
 #[cfg(not(target_env = "msvc"))]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-static MALLOC_CONF: &[u8; 34] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
+static MALLOC_CONF: &[u8; 38] = b"dirty_decay_ms:10000,muzzy_decay_ms:0\0";
 
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
