@@ -532,6 +532,16 @@ pub fn set_exclusive_gpu_phase(enabled: bool) {
     EXCLUSIVE_GPU_PHASE.store(enabled, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether the process is currently inside an exclusive serial proving phase.
+///
+/// The commitment path consults this to route whole commitments (NTT +
+/// hashing) through the GPU backend only while the serialized Metal stream
+/// is contention-free by contract. Same benign-race caveat as the routing
+/// cutoff: either answer hashes identical trees.
+pub fn exclusive_gpu_phase_active() -> bool {
+    EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Number of Merkle builds currently occupying the serialized GPU stream
 /// (from buffer acquisition through `wait_until_completed`). Routing reads
 /// this to decide whether a small serial-path tree would enqueue behind
