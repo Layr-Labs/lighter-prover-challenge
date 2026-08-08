@@ -1,3 +1,4 @@
+use core::cell::Cell;
 use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::mem::{size_of, size_of_val};
@@ -18,6 +19,27 @@ use crate::hash::merkle_tree::LevelOrderDigests;
 use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
+
+/// Source for the four sponge/Merkle-path kernels, carrying the
+/// round-constant-folded permutation core. Compiled with the MSL front end
+/// at context construction (which the prewarm thread keeps off the scored
+/// critical path) rather than shipped in the prebuilt metallib: the
+/// committed `poseidon2.metallib` pins `poseidon2.metal` byte-for-byte, and
+/// a host without an offline Metal toolchain cannot regenerate the AIR, so
+/// hash-kernel changes live in their own source-compiled library while
+/// every other kernel keeps loading from the metallib.
+const SHADER_HASH_V2_SOURCE: &str = include_str!("poseidon2_hash_v2.metal");
+
+/// Every kernel `poseidon2_hash_v2.metal` defines. The compile test asserts
+/// they all resolve, and `MetalShared::new` fails loudly if any is missing,
+/// so a broken v2 source can never silently strand the hash kernels on an
+/// older implementation.
+const HASH_V2_KERNELS: [&str; 4] = [
+    "poseidon2_hash_leaves",
+    "poseidon2_hash_leaves_colmajor",
+    "poseidon2_hash_parents",
+    "poseidon2_absorb_pass",
+];
 
 /// `poseidon2.metal` precompiled to AIR, so a worker that cannot use the Metal
 /// shader cache does not pay the MSL front end. Regenerate whenever
@@ -449,16 +471,25 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
 /// CPU for the sum of their lowerings instead of the larger of the two.
 ///
 /// Scheduling only. The pipelines are the same objects the blocking build
-/// produced, lowered from the same library, so nothing they later compute can
-/// differ; only the instant at which they become available does.
-fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
-    for (name, slot) in [
-        ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
+/// produced, lowered from the same libraries, so nothing they later compute
+/// can differ; only the instant at which they become available does.
+fn spawn_optional_pipelines(
+    device: &Device,
+    library: &metal::Library,
+    hash_library: &metal::Library,
+) {
+    for (name, library, slot) in [
+        (
+            "poseidon2_gate_quotient",
+            library,
+            &POSEIDON_GATE_QUOTIENT_PIPELINE,
+        ),
         (
             "range_check_gate_quotient",
+            library,
             &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
         ),
-        ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
+        ("poseidon2_absorb_pass", hash_library, &ABSORB_PASS_PIPELINE),
     ] {
         let device = device.clone();
         let library = library.clone();
@@ -532,6 +563,94 @@ pub fn set_exclusive_gpu_phase(enabled: bool) {
     EXCLUSIVE_GPU_PHASE.store(enabled, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Which recursive chain lane owns the current synchronous proving call.
+///
+/// The routing decision itself executes on the chain-step thread even though
+/// the CPU fallback may subsequently fan out through Rayon, so thread-local
+/// ownership distinguishes the three-step heavy lane from the 49-step light
+/// spine without changing any generic proving API.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChainGpuLane {
+    Other,
+    HeavyAlone,
+    HeavyWithPeer,
+    LightAlone,
+    LightWithPeer,
+}
+
+thread_local! {
+    static CHAIN_GPU_LANE: Cell<ChainGpuLane> = const { Cell::new(ChainGpuLane::Other) };
+}
+
+/// Number of light-chain proofs currently inside the actual proving phase.
+/// This is a scheduling hint only; stale observations can change CPU/GPU
+/// routing but cannot change a Merkle digest or proof byte.
+static LIGHT_CHAIN_PROOFS_ACTIVE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+struct ChainGpuAdmissionGuard {
+    previous: ChainGpuLane,
+    light: bool,
+}
+
+impl Drop for ChainGpuAdmissionGuard {
+    fn drop(&mut self) {
+        if self.light {
+            LIGHT_CHAIN_PROOFS_ACTIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        CHAIN_GPU_LANE.set(self.previous);
+    }
+}
+
+/// Runs one recursive-chain proof under a path-aware Metal admission hint.
+///
+/// The hint does not prioritize a queue, add a command buffer, or wait for the
+/// device. It only lets a narrow heavy-chain tree decline an otherwise-idle
+/// GPU slot while deadline-critical light proving is already active.
+pub fn with_chain_gpu_admission<T>(
+    is_light: bool,
+    peer_path_active: bool,
+    f: impl FnOnce() -> T,
+) -> T {
+    let lane = match (is_light, peer_path_active) {
+        (false, false) => ChainGpuLane::HeavyAlone,
+        (false, true) => ChainGpuLane::HeavyWithPeer,
+        (true, false) => ChainGpuLane::LightAlone,
+        (true, true) => ChainGpuLane::LightWithPeer,
+    };
+    let previous = CHAIN_GPU_LANE.replace(lane);
+    if is_light {
+        LIGHT_CHAIN_PROOFS_ACTIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    let _guard = ChainGpuAdmissionGuard {
+        previous,
+        light: is_light,
+    };
+    f()
+}
+
+/// The first and most conservative path-aware admission rule.
+///
+/// Only the width-16, 2^17 heavy quotient tree changes route, only while both
+/// paths are alive and a light proof is already running, and never in a
+/// genuinely exclusive phase. The heavy Z/partial-products and wide wires
+/// trees remain unchanged in this first low-intervention rung; Light,
+/// pre-execution, final-block, and all transaction trees also retain the
+/// promoted routing policy.
+fn heavy_quotient_tree_yields_to_light(
+    lane: ChainGpuLane,
+    light_ready: bool,
+    exclusive: bool,
+    leaf_width: usize,
+    leaf_count: usize,
+) -> bool {
+    !exclusive
+        && lane == ChainGpuLane::HeavyWithPeer
+        && light_ready
+        && leaf_count == 1 << 17
+        && leaf_width == 16
+}
+
 /// Number of Merkle builds currently occupying the serialized GPU stream
 /// (from buffer acquisition through `wait_until_completed`). Routing reads
 /// this to decide whether a small serial-path tree would enqueue behind
@@ -563,6 +682,12 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     };
     let parent_permutations = leaf_count - (1usize << cap_height);
     let exclusive = EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed);
+    let lane = CHAIN_GPU_LANE.get();
+    let light_ready =
+        LIGHT_CHAIN_PROOFS_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) != 0;
+    if heavy_quotient_tree_yields_to_light(lane, light_ready, exclusive, leaf_width, leaf_count) {
+        return false;
+    }
     let min_permutations = if exclusive {
         EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS
     } else {
@@ -1367,6 +1492,26 @@ impl MetalShared {
     fn new() -> Result<Self, String> {
         autoreleasepool(|| {
             let device = Device::system_default().ok_or("no Metal device")?;
+            // The sponge/Merkle kernels compile from their own source (see
+            // `SHADER_HASH_V2_SOURCE`); run that MSL front end on its own
+            // thread so it overlaps the metallib load and the ntt pipeline
+            // lowerings below.
+            let hash_library_thread = {
+                let device = device.clone();
+                std::thread::Builder::new()
+                    .name("poseidon2-metal-hash-v2-compile".to_owned())
+                    .spawn(move || {
+                        autoreleasepool(|| {
+                            let options = CompileOptions::new();
+                            device
+                                .new_library_with_source(SHADER_HASH_V2_SOURCE, &options)
+                                .map_err(|error| {
+                                    format!("hash kernel shader compilation failed: {error}")
+                                })
+                        })
+                    })
+                    .map_err(|error| format!("hash kernel compile thread failed: {error}"))?
+            };
             let options = CompileOptions::new();
             // Prefer the prebuilt AIR library over compiling the MSL source.
             //
@@ -1427,14 +1572,15 @@ impl MetalShared {
             // `NSError`s the Metal API autoreleases are drained on the thread
             // that created them rather than leaking.
             let device_ref = &device;
-            let library_ref = &library;
-            let required = |name: &'static str, kind: &'static str| {
+            let required = |library: &metal::Library, name: &'static str, kind: &'static str| {
+                let library = library.clone();
+                let device = device_ref.clone();
                 move || -> Result<ComputePipelineState, String> {
                     autoreleasepool(|| {
-                        let function = library_ref
+                        let function = library
                             .get_function(name, None)
                             .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
-                        device_ref
+                        device
                             .new_compute_pipeline_state_with_function(&function)
                             .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
                     })
@@ -1462,23 +1608,40 @@ impl MetalShared {
             // simply move their MTLCompilerService contention onto the path they
             // are being taken off.
             let (
+                hash_library,
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
                 parent_pipeline,
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
-            ) = std::thread::scope(|scope| {
-                let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
-                let leaf_colmajor =
-                    scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
-                let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
-                let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
-                let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
-                let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
+            ) = std::thread::scope(|scope| -> Result<_, String> {
+                let ntt_prepare = scope.spawn(required(&library, "ntt_prepare", "ntt prepare"));
+                let ntt_stage = scope.spawn(required(&library, "ntt_stage", "ntt stage"));
+                let ifft_finalize =
+                    scope.spawn(required(&library, "ifft_finalize", "ifft finalize"));
+                // The hash kernels are required: a context without them could
+                // only hash on the CPU, which is exactly the fallback the
+                // caller already takes when the whole context is unavailable,
+                // so a v2 compile failure fails the context loudly instead of
+                // silently stranding the hash kernels on an older
+                // implementation.
+                let hash_library = hash_library_thread
+                    .join()
+                    .map_err(|_| "hash kernel compile thread panicked".to_owned())??;
+                let leaf =
+                    scope.spawn(required(&hash_library, "poseidon2_hash_leaves", "leaf"));
+                let leaf_colmajor = scope.spawn(required(
+                    &hash_library,
+                    "poseidon2_hash_leaves_colmajor",
+                    "col-major leaf",
+                ));
+                let parent =
+                    scope.spawn(required(&hash_library, "poseidon2_hash_parents", "parent"));
                 // A panic inside a pipeline build is a bug, not a runtime
                 // condition; propagate it rather than papering over it.
-                (
+                Ok((
+                    hash_library,
                     leaf.join().expect("leaf pipeline thread panicked"),
                     leaf_colmajor
                         .join()
@@ -1493,14 +1656,14 @@ impl MetalShared {
                     ifft_finalize
                         .join()
                         .expect("ifft finalize pipeline thread panicked"),
-                )
-            });
+                ))
+            })?;
             // Surfaced in kernel order, so a single missing or unbuildable
             // kernel yields the same error string the sequential construction
             // produced. Only the tie-break between two simultaneous failures
-            // can differ, and every one of these kernels is present in
-            // `SHADER_SOURCE`; a failure here means the whole library is bad,
-            // which `new_library_with_source` above has already rejected.
+            // can differ, and every one of these kernels is present in its
+            // library's source; a failure here means that whole library is
+            // bad, which its `new_library_with_source` has already rejected.
             let leaf_pipeline = leaf_pipeline?;
             let leaf_colmajor_pipeline = leaf_colmajor_pipeline?;
             let parent_pipeline = parent_pipeline?;
@@ -1508,7 +1671,7 @@ impl MetalShared {
             let ntt_stage_pipeline = ntt_stage_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
-            spawn_optional_pipelines(&device, &library);
+            spawn_optional_pipelines(&device, &library, &hash_library);
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -2768,6 +2931,68 @@ mod tests {
     use crate::field::types::{Field64, PrimeField64};
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
+
+    #[test]
+    fn heavy_quotient_admission_yields_only_to_ready_light_work() {
+        let narrow_width = 16;
+        let chain_leaves = 1 << 17;
+
+        assert!(heavy_quotient_tree_yields_to_light(
+            ChainGpuLane::HeavyWithPeer,
+            true,
+            false,
+            narrow_width,
+            chain_leaves,
+        ));
+
+        for (lane, light_ready, exclusive, width, leaves) in [
+            (
+                ChainGpuLane::HeavyWithPeer,
+                false,
+                false,
+                narrow_width,
+                chain_leaves,
+            ),
+            (
+                ChainGpuLane::HeavyAlone,
+                true,
+                false,
+                narrow_width,
+                chain_leaves,
+            ),
+            (
+                ChainGpuLane::LightWithPeer,
+                true,
+                false,
+                narrow_width,
+                chain_leaves,
+            ),
+            (
+                ChainGpuLane::HeavyWithPeer,
+                true,
+                true,
+                narrow_width,
+                chain_leaves,
+            ),
+            (ChainGpuLane::HeavyWithPeer, true, false, 24, chain_leaves),
+            (ChainGpuLane::HeavyWithPeer, true, false, 135, chain_leaves),
+            (
+                ChainGpuLane::HeavyWithPeer,
+                true,
+                false,
+                narrow_width,
+                1 << 19,
+            ),
+        ] {
+            assert!(!heavy_quotient_tree_yields_to_light(
+                lane,
+                light_ready,
+                exclusive,
+                width,
+                leaves,
+            ));
+        }
+    }
 
     /// The prebuilt AIR library is only sound while it is the compiled form of
     /// the MSL we ship. Nothing in the type system ties the two together, so
@@ -4548,6 +4773,271 @@ kernel void goldilocks_mul_bench_native(
         let native =
             unsafe { slice::from_raw_parts(native_output.contents().cast::<u64>(), count * 4) };
         assert_eq!(limb, native);
+    }
+
+    #[test]
+    fn hash_v2_shader_compiles_and_exposes_hash_kernels() {
+        autoreleasepool(|| {
+            let device = Device::system_default().expect("no Metal device");
+            let options = CompileOptions::new();
+            let library = device
+                .new_library_with_source(SHADER_HASH_V2_SOURCE, &options)
+                .unwrap_or_else(|error| panic!("hash v2 shader failed to compile: {error}"));
+            for name in HASH_V2_KERNELS {
+                library
+                    .get_function(name, None)
+                    .unwrap_or_else(|error| panic!("hash v2 kernel {name} missing: {error}"));
+            }
+        });
+    }
+
+    /// The v2 hash kernels (round constants folded into the producing linear
+    /// layers, small-addend materializes) against both the poseidon2.metal
+    /// kernels and the strict-arithmetic reference build of that file:
+    /// identical adversarial inputs -- non-canonical lanes, values at and
+    /// above ORDER, u64::MAX -- and bit-equal outputs, for every kernel the
+    /// v2 library defines. Bit-equality across different internal
+    /// representative choices is exactly what gl_canonicalize at the kernel
+    /// output boundary guarantees; the parked absorb state is compared after
+    /// canonicalization because it is deliberately left as a raw
+    /// representative between passes.
+    #[test]
+    fn metal_poseidon2_hash_v2_matches_v1_and_native() {
+        autoreleasepool(|| {
+            let device = Device::system_default().expect("no Metal device");
+            let queue = device.new_command_queue();
+            let options = CompileOptions::new();
+            let native_source =
+                ["#define POSEIDON2_NATIVE_ARITHMETIC_REFERENCE 1\n", SHADER_SOURCE].concat();
+            let libraries: Vec<(&str, metal::Library)> = [
+                ("v2", SHADER_HASH_V2_SOURCE.to_owned()),
+                ("v1", SHADER_SOURCE.to_owned()),
+                ("native", native_source),
+            ]
+            .into_iter()
+            .map(|(tag, source)| {
+                let library = device
+                    .new_library_with_source(&source, &options)
+                    .unwrap_or_else(|error| panic!("{tag} shader failed: {error}"));
+                (tag, library)
+            })
+            .collect();
+            let build_pipeline = |tag: &str, library: &metal::Library, name: &str| {
+                let function = library
+                    .get_function(name, None)
+                    .unwrap_or_else(|error| panic!("{tag} kernel {name} unavailable: {error}"));
+                device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .unwrap_or_else(|error| panic!("{tag} pipeline {name} failed: {error}"))
+            };
+
+            let mut parameter_values = Vec::with_capacity(130);
+            parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
+            parameter_values.extend(INTERNAL_CONSTANTS);
+            parameter_values.extend(MATRIX_DIAG_12_U64);
+            let parameters = device.new_buffer_with_data(
+                parameter_values.as_ptr().cast::<c_void>(),
+                size_of_val(parameter_values.as_slice()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            let boundaries = [
+                0,
+                1,
+                (1u64 << 32) - 1,
+                1u64 << 32,
+                GoldilocksField::ORDER - 1,
+                GoldilocksField::ORDER,
+                GoldilocksField::ORDER + 1,
+                u64::MAX,
+            ];
+            let mut rng = StdRng::seed_from_u64(0x5632_4841_5348_4b52);
+            let mut adversarial = |len: usize| -> Vec<u64> {
+                (0..len)
+                    .map(|i| {
+                        if i & 3 == 0 {
+                            boundaries[(i / 4) % boundaries.len()]
+                        } else {
+                            rng.next_u64()
+                        }
+                    })
+                    .collect()
+            };
+            let buffer_with = |values: &[u64]| {
+                device.new_buffer_with_data(
+                    values.as_ptr().cast::<c_void>(),
+                    size_of_val(values) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            };
+            let output_buffer = |len: usize| {
+                device.new_buffer(
+                    (len * size_of::<u64>()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            };
+            let read = |buffer: &Buffer, len: usize| -> Vec<u64> {
+                unsafe { slice::from_raw_parts(buffer.contents().cast::<u64>(), len) }.to_vec()
+            };
+            let run = |pipeline: &ComputePipelineState,
+                       buffers: &[&Buffer],
+                       constants: &[(u64, u32)],
+                       threads: usize| {
+                let command_buffer = autoreleasepool(|| {
+                    let command_buffer = queue.new_command_buffer();
+                    let encoder = command_buffer.new_compute_command_encoder();
+                    encoder.set_compute_pipeline_state(pipeline);
+                    for (index, buffer) in buffers.iter().enumerate() {
+                        encoder.set_buffer(index as u64, Some(*buffer), 0);
+                    }
+                    for &(index, value) in constants {
+                        set_u32(encoder, index, value);
+                    }
+                    dispatch(encoder, pipeline, threads);
+                    encoder.end_encoding();
+                    command_buffer.commit();
+                    command_buffer.to_owned()
+                });
+                command_buffer.wait_until_completed();
+                assert_eq!(
+                    command_buffer.status(),
+                    MTLCommandBufferStatus::Completed,
+                    "kernel dispatch failed"
+                );
+            };
+            let canonical = |values: &[u64]| -> Vec<u64> {
+                values
+                    .iter()
+                    .map(|&x| {
+                        if x >= GoldilocksField::ORDER {
+                            x - GoldilocksField::ORDER
+                        } else {
+                            x
+                        }
+                    })
+                    .collect()
+            };
+
+            // Parents: one permutation over a fully adversarial 8-lane input.
+            let parent_count = 1usize << 12;
+            let parent_input = buffer_with(&adversarial(parent_count * 8));
+            let parent_outputs: Vec<Vec<u64>> = libraries
+                .iter()
+                .map(|(tag, library)| {
+                    let pipeline = build_pipeline(tag, library, "poseidon2_hash_parents");
+                    let output = output_buffer(parent_count * 4);
+                    run(
+                        &pipeline,
+                        &[&parent_input, &output, &parameters],
+                        &[(3, parent_count as u32)],
+                        parent_count,
+                    );
+                    read(&output, parent_count * 4)
+                })
+                .collect();
+            assert_eq!(parent_outputs[0], parent_outputs[1], "v2 parents != v1");
+            assert_eq!(parent_outputs[0], parent_outputs[2], "v2 parents != native");
+
+            // Row-major leaves: a multi-chunk width with a 3-lane tail and the
+            // production 136-column width (17 chunks, tail of 0).
+            for (leaf_width, leaf_count) in [(11usize, 1usize << 12), (136, 1 << 10)] {
+                let input = buffer_with(&adversarial(leaf_count * leaf_width));
+                let outputs: Vec<Vec<u64>> = libraries
+                    .iter()
+                    .map(|(tag, library)| {
+                        let pipeline = build_pipeline(tag, library, "poseidon2_hash_leaves");
+                        let output = output_buffer(leaf_count * 4);
+                        run(
+                            &pipeline,
+                            &[&input, &output, &parameters],
+                            &[(3, leaf_width as u32), (4, leaf_count as u32)],
+                            leaf_count,
+                        );
+                        read(&output, leaf_count * 4)
+                    })
+                    .collect();
+                assert_eq!(outputs[0], outputs[1], "v2 leaves != v1 at width {leaf_width}");
+                assert_eq!(
+                    outputs[0], outputs[2],
+                    "v2 leaves != native at width {leaf_width}"
+                );
+            }
+
+            // Column-major leaves, bit-reversed output scatter included.
+            let (leaf_width, leaf_count, log_leaf_count) = (24usize, 1usize << 10, 10u32);
+            let colmajor_input = buffer_with(&adversarial(leaf_count * leaf_width));
+            let colmajor_outputs: Vec<Vec<u64>> = libraries
+                .iter()
+                .map(|(tag, library)| {
+                    let pipeline = build_pipeline(tag, library, "poseidon2_hash_leaves_colmajor");
+                    let output = output_buffer(leaf_count * 4);
+                    run(
+                        &pipeline,
+                        &[&colmajor_input, &output, &parameters],
+                        &[
+                            (3, leaf_width as u32),
+                            (4, leaf_count as u32),
+                            (5, log_leaf_count),
+                        ],
+                        leaf_count,
+                    );
+                    read(&output, leaf_count * 4)
+                })
+                .collect();
+            assert_eq!(colmajor_outputs[0], colmajor_outputs[1], "v2 colmajor != v1");
+            assert_eq!(colmajor_outputs[0], colmajor_outputs[2], "v2 colmajor != native");
+
+            // Streamed absorb: first / middle / final passes over a width-20
+            // sponge (chunks of 8, 8 and a 4-lane tail), comparing the parked
+            // raw state canonically after every non-final pass and the digests
+            // bit-exactly after the final one.
+            let (absorb_width, absorb_count, absorb_log) = (20usize, 1usize << 10, 10u32);
+            let absorb_input = buffer_with(&adversarial(absorb_count * absorb_width));
+            let passes = [(0u32, 8u32, 1u32, 0u32), (8, 8, 0, 0), (16, 4, 0, 1)];
+            let mut states: Vec<Buffer> = Vec::new();
+            let mut digests: Vec<Buffer> = Vec::new();
+            let mut absorb_pipelines = Vec::new();
+            for (tag, library) in &libraries {
+                absorb_pipelines.push(build_pipeline(tag, library, "poseidon2_absorb_pass"));
+                states.push(output_buffer(absorb_count * 12));
+                digests.push(output_buffer(absorb_count * 4));
+            }
+            for &(col_start, chunk_size, first_pass, final_pass) in &passes {
+                for (index, pipeline) in absorb_pipelines.iter().enumerate() {
+                    run(
+                        pipeline,
+                        &[&absorb_input, &states[index], &digests[index], &parameters],
+                        &[
+                            (4, absorb_count as u32),
+                            (5, absorb_log),
+                            (6, col_start),
+                            (7, chunk_size),
+                            (8, first_pass),
+                            (9, final_pass),
+                        ],
+                        absorb_count,
+                    );
+                }
+                if final_pass == 0 {
+                    let base = canonical(&read(&states[0], absorb_count * 12));
+                    for other in 1..3 {
+                        assert_eq!(
+                            base,
+                            canonical(&read(&states[other], absorb_count * 12)),
+                            "v2 absorb state != {} after col_start {col_start}",
+                            libraries[other].0,
+                        );
+                    }
+                }
+            }
+            let base = read(&digests[0], absorb_count * 4);
+            assert_eq!(base, read(&digests[1], absorb_count * 4), "v2 absorb != v1");
+            assert_eq!(
+                base,
+                read(&digests[2], absorb_count * 4),
+                "v2 absorb != native"
+            );
+        });
     }
 
     #[test]

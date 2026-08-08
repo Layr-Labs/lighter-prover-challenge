@@ -53,6 +53,12 @@ incremental = false
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+# Drop the symbol table from the scored worker: the benchmark sandbox makes
+# every worker a fresh inode whose ad-hoc code signature is re-validated at
+# ~7.5 ms/MB, so a smaller binary is a direct startup win. Release builds do
+# not need runtime symbolization (the worker exits via `_exit(2)` and is never
+# debugged), and `panic = "abort"` keeps backtraces off the path anyway.
+strip = true
 
 # bench/build.rs constructs and serializes the five startup circuits at
 # compile time. Build scripts default to opt-level 0, which would turn that
