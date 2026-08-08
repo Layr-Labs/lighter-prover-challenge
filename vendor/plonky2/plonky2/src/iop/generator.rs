@@ -7,6 +7,11 @@ use alloc::{
 };
 use core::fmt::Debug;
 use core::marker::PhantomData;
+use core::ops::{Deref, DerefMut};
+#[cfg(feature = "std")]
+use std::collections::HashMap;
+#[cfg(feature = "std")]
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Result, anyhow};
 use plonky2_maybe_rayon::*;
@@ -282,11 +287,9 @@ fn run_generator_worklist<
 fn seed_inputs_and_unresolved_watches<F: Field>(
     witness: &mut PartitionWitness<F>,
     inputs: PartialWitness<F>,
-    generator_watch_counts: &[usize],
+    unresolved_watches: &mut [usize],
     generator_indices_by_watches: &GeneratorWatchIndex,
-) -> Result<Vec<usize>> {
-    let mut unresolved_watches = generator_watch_counts.to_vec();
-
+) -> Result<()> {
     for (t, v) in inputs.target_values.into_iter() {
         if let Some(watch) = witness.set_target_returning_rep(t, v)? {
             if let Some(watchers) = generator_indices_by_watches.get(&watch) {
@@ -298,7 +301,7 @@ fn seed_inputs_and_unresolved_watches<F: Field>(
         }
     }
 
-    Ok(unresolved_watches)
+    Ok(())
 }
 
 /// Direct-seeding adapter: writes values straight into the partition's
@@ -382,6 +385,86 @@ impl<F: Field> Witness<F> for PartitionFeeder<'_, '_, F> {
     }
 }
 
+#[derive(Default)]
+struct GeneratorStateStorage {
+    unresolved_watches: Vec<usize>,
+    generator_is_expired: Vec<bool>,
+}
+
+/// Owns scheduler-state arrays whose backing allocations can be reused by a later proof of the
+/// same generator count. Every value is reinitialized from authoritative prover data before use;
+/// the pool retains capacity only. A small per-shape bound avoids retaining an unbounded number
+/// of arrays after a temporary burst of concurrent proofs.
+struct GeneratorStateBuffers {
+    generator_count: usize,
+    storage: Option<GeneratorStateStorage>,
+}
+
+#[cfg(feature = "std")]
+fn generator_state_pool() -> &'static Mutex<HashMap<usize, Vec<GeneratorStateStorage>>> {
+    static POOL: OnceLock<Mutex<HashMap<usize, Vec<GeneratorStateStorage>>>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+impl GeneratorStateBuffers {
+    fn acquire(generator_watch_counts: &[usize]) -> Self {
+        let generator_count = generator_watch_counts.len();
+
+        #[cfg(feature = "std")]
+        let mut storage = generator_state_pool()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(&generator_count)
+            .and_then(Vec::pop)
+            .unwrap_or_default();
+        #[cfg(not(feature = "std"))]
+        let mut storage = GeneratorStateStorage::default();
+
+        storage.unresolved_watches.clear();
+        storage
+            .unresolved_watches
+            .extend_from_slice(generator_watch_counts);
+        storage.generator_is_expired.clear();
+        storage.generator_is_expired.resize(generator_count, false);
+
+        Self {
+            generator_count,
+            storage: Some(storage),
+        }
+    }
+}
+
+impl Deref for GeneratorStateBuffers {
+    type Target = GeneratorStateStorage;
+
+    fn deref(&self) -> &Self::Target {
+        self.storage.as_ref().expect("generator state is present")
+    }
+}
+
+impl DerefMut for GeneratorStateBuffers {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.storage.as_mut().expect("generator state is present")
+    }
+}
+
+impl Drop for GeneratorStateBuffers {
+    fn drop(&mut self) {
+        #[cfg(feature = "std")]
+        if let Some(mut storage) = self.storage.take() {
+            storage.unresolved_watches.clear();
+            storage.generator_is_expired.clear();
+            let mut pool = generator_state_pool()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let same_shape = pool.entry(self.generator_count).or_default();
+            if same_shape.len() < 8 {
+                same_shape.push(storage);
+            }
+        }
+    }
+}
+
 /// Resumable witness generation: [`Self::start`] seeds an initial set of inputs and runs every
 /// generator that can already make progress, each [`Self::feed`] sets newly available inputs and
 /// resumes only the generators watching them, and [`Self::finish`] performs the same completeness
@@ -396,8 +479,7 @@ pub struct PendingPartitionWitness<
     const D: usize,
 > {
     witness: PartitionWitness<'a, F>,
-    unresolved_watches: Vec<usize>,
-    generator_is_expired: Vec<bool>,
+    generator_state: GeneratorStateBuffers,
     remaining_generators: usize,
     prover_data: &'a ProverOnlyCircuitData<F, C, D>,
     parallel_threshold: usize,
@@ -446,22 +528,27 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &prover_data.representative_map,
         );
 
-        let mut unresolved_watches = seed_inputs_and_unresolved_watches(
+        let mut generator_state =
+            GeneratorStateBuffers::acquire(&prover_data.generator_watch_counts);
+        seed_inputs_and_unresolved_watches(
             &mut witness,
             inputs,
-            &prover_data.generator_watch_counts,
+            &mut generator_state.unresolved_watches,
             &prover_data.generator_indices_by_watches,
         )?;
 
-        let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
 
         // Initially, all generators are queued.
+        let state = generator_state
+            .storage
+            .as_mut()
+            .expect("generator state is present");
         run_generator_worklist(
             &mut witness,
             prover_data,
-            &mut unresolved_watches,
-            &mut generator_is_expired,
+            &mut state.unresolved_watches,
+            &mut state.generator_is_expired,
             &mut remaining_generators,
             (0..generators.len()).collect(),
             parallel_threshold,
@@ -469,8 +556,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
 
         Ok(Self {
             witness,
-            unresolved_watches,
-            generator_is_expired,
+            generator_state,
             remaining_generators,
             prover_data,
             parallel_threshold,
@@ -495,22 +581,26 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &prover_data.representative_map,
         );
 
-        let mut unresolved_watches = prover_data.generator_watch_counts.to_vec();
+        let mut generator_state =
+            GeneratorStateBuffers::acquire(&prover_data.generator_watch_counts);
         seed(&mut PartitionSeeder {
             witness: &mut witness,
-            unresolved_watches: &mut unresolved_watches,
+            unresolved_watches: &mut generator_state.unresolved_watches,
             generator_indices_by_watches: &prover_data.generator_indices_by_watches,
         })?;
 
-        let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
 
         // Initially, all generators are queued.
+        let state = generator_state
+            .storage
+            .as_mut()
+            .expect("generator state is present");
         run_generator_worklist(
             &mut witness,
             prover_data,
-            &mut unresolved_watches,
-            &mut generator_is_expired,
+            &mut state.unresolved_watches,
+            &mut state.generator_is_expired,
             &mut remaining_generators,
             (0..generators.len()).collect(),
             PARALLEL_WORKLIST_THRESHOLD,
@@ -518,8 +608,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
 
         Ok(Self {
             witness,
-            unresolved_watches,
-            generator_is_expired,
+            generator_state,
             remaining_generators,
             prover_data,
             parallel_threshold: PARALLEL_WORKLIST_THRESHOLD,
@@ -531,15 +620,20 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
     /// run to quiescence and cannot make progress without new values.
     pub fn feed(&mut self, inputs: PartialWitness<F>) -> Result<()> {
         let generator_indices_by_watches = &self.prover_data.generator_indices_by_watches;
+        let state = self
+            .generator_state
+            .storage
+            .as_mut()
+            .expect("generator state is present");
 
         let mut pending_generator_indices = Vec::new();
         for (t, v) in inputs.target_values.into_iter() {
             if let Some(watch) = self.witness.set_target_returning_rep(t, v)? {
                 if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                     for &watching_generator_idx in watchers {
-                        if !self.generator_is_expired[watching_generator_idx] {
-                            debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
-                            self.unresolved_watches[watching_generator_idx] -= 1;
+                        if !state.generator_is_expired[watching_generator_idx] {
+                            debug_assert_ne!(state.unresolved_watches[watching_generator_idx], 0);
+                            state.unresolved_watches[watching_generator_idx] -= 1;
                             pending_generator_indices.push(watching_generator_idx);
                         }
                     }
@@ -550,8 +644,8 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         run_generator_worklist(
             &mut self.witness,
             self.prover_data,
-            &mut self.unresolved_watches,
-            &mut self.generator_is_expired,
+            &mut state.unresolved_watches,
+            &mut state.generator_is_expired,
             &mut self.remaining_generators,
             pending_generator_indices,
             self.parallel_threshold,
@@ -568,10 +662,15 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         seed: impl FnOnce(&mut PartitionFeeder<'a, '_, F>) -> Result<()>,
     ) -> Result<()> {
         let mut pending_generator_indices = Vec::new();
+        let state = self
+            .generator_state
+            .storage
+            .as_mut()
+            .expect("generator state is present");
         seed(&mut PartitionFeeder {
             witness: &mut self.witness,
-            unresolved_watches: &mut self.unresolved_watches,
-            generator_is_expired: &self.generator_is_expired,
+            unresolved_watches: &mut state.unresolved_watches,
+            generator_is_expired: &state.generator_is_expired,
             pending_generator_indices: &mut pending_generator_indices,
             generator_indices_by_watches: &self.prover_data.generator_indices_by_watches,
         })?;
@@ -579,8 +678,8 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         run_generator_worklist(
             &mut self.witness,
             self.prover_data,
-            &mut self.unresolved_watches,
-            &mut self.generator_is_expired,
+            &mut state.unresolved_watches,
+            &mut state.generator_is_expired,
             &mut self.remaining_generators,
             pending_generator_indices,
             self.parallel_threshold,
@@ -988,6 +1087,23 @@ mod tests {
     type F = GoldilocksField;
     type C = PoseidonGoldilocksConfig;
 
+    #[test]
+    fn generator_state_pool_reuses_capacity_and_reinitializes_values() {
+        let counts = [3usize, 1, 0, 2, 5, 4, 1];
+        let first_ptr = {
+            let mut state = GeneratorStateBuffers::acquire(&counts);
+            let ptr = state.unresolved_watches.as_ptr();
+            state.unresolved_watches.fill(usize::MAX);
+            state.generator_is_expired.fill(true);
+            ptr
+        };
+
+        let state = GeneratorStateBuffers::acquire(&counts);
+        assert_eq!(state.unresolved_watches.as_ptr(), first_ptr);
+        assert_eq!(state.unresolved_watches, counts);
+        assert!(state.generator_is_expired.iter().all(|expired| !expired));
+    }
+
     #[derive(Debug)]
     struct CountingSimpleGenerator {
         dependencies: Vec<Target>,
@@ -1178,10 +1294,7 @@ mod tests {
     /// The initialization that `seed_inputs_and_unresolved_watches` replaced: seed every input,
     /// then walk the entire representative-keyed watcher map counting, per generator, the
     /// still-unpopulated representatives it watches. Kept as an in-test oracle.
-    fn legacy_seed_inputs_and_unresolved_watches<
-        C: GenericConfig<D, F = F>,
-        const D: usize,
-    >(
+    fn legacy_seed_inputs_and_unresolved_watches<C: GenericConfig<D, F = F>, const D: usize>(
         witness: &mut PartitionWitness<F>,
         inputs: PartialWitness<F>,
         prover_data: &ProverOnlyCircuitData<F, C, D>,
@@ -1244,10 +1357,11 @@ mod tests {
                 outer.common.degree(),
                 &prover_data.representative_map,
             );
-            let new_counts = seed_inputs_and_unresolved_watches(
+            let mut new_counts = prover_data.generator_watch_counts.clone();
+            seed_inputs_and_unresolved_watches(
                 &mut new_witness,
                 inputs.clone(),
-                &prover_data.generator_watch_counts,
+                &mut new_counts,
                 &prover_data.generator_indices_by_watches,
             )?;
 
@@ -1431,29 +1545,32 @@ mod tests {
     fn direct_seeded_pending_witness_matches_map_seeded_recursive_circuit() -> Result<()> {
         let (outer, early_inputs, late_inputs) = two_inner_proof_fixture()?;
 
-        let mut map_seeded =
-            PendingPartitionWitness::start(early_inputs.clone(), &outer.prover_only, &outer.common)?;
+        let mut map_seeded = PendingPartitionWitness::start(
+            early_inputs.clone(),
+            &outer.prover_only,
+            &outer.common,
+        )?;
         map_seeded.feed(late_inputs.clone())?;
         let map_seeded = map_seeded.finish()?;
 
         // RandomValueGenerator outputs are expected to differ between the two
         // executions, but all remaining witness slots must match.
-        let mut map_seeded_repeat =
-            PendingPartitionWitness::start(early_inputs.clone(), &outer.prover_only, &outer.common)?;
+        let mut map_seeded_repeat = PendingPartitionWitness::start(
+            early_inputs.clone(),
+            &outer.prover_only,
+            &outer.common,
+        )?;
         map_seeded_repeat.feed(late_inputs.clone())?;
         let map_seeded_repeat = map_seeded_repeat.finish()?;
         let num_random_generators = count_random_generators(&outer.prover_only);
 
-        let mut direct_seeded = PendingPartitionWitness::start_seeded(
-            &outer.prover_only,
-            &outer.common,
-            |seeder| {
+        let mut direct_seeded =
+            PendingPartitionWitness::start_seeded(&outer.prover_only, &outer.common, |seeder| {
                 for (&target, &value) in &early_inputs.target_values {
                     seeder.set_target(target, value)?;
                 }
                 Ok(())
-            },
-        )?;
+            })?;
         direct_seeded.feed_seeded(|feeder| {
             for (&target, &value) in &late_inputs.target_values {
                 feeder.set_target(target, value)?;
