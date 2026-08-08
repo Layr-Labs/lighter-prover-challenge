@@ -1050,6 +1050,93 @@ fn fft_classic_simd_layers_parallel<P, M>(
 {
     let lg_packed_width = log2_strict(P::WIDTH);
     let scalar_len = packed_values.len() * P::WIDTH;
+
+    // The tip's pair-column fusion lived only in the serial layer driver.
+    // Exclusive-GPU phases call this parallel sibling for the same ≥2^19
+    // base-field ranges; without this arm those transforms stayed on two
+    // single-layer passes per fused pair. Same kernel, same 4q blocks, same
+    // FUSED_PAIR_MIN_SCALARS gate — only the block walk is distributed.
+    #[cfg(target_arch = "aarch64")]
+    if start + 2 <= end
+        && scalar_len >= FUSED_PAIR_MIN_SCALARS
+        && core::any::TypeId::of::<P>()
+            == core::any::TypeId::of::<
+                crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField,
+            >()
+    {
+        let mut lg_half_m = start;
+        while lg_half_m + 2 <= end {
+            // twolayers_neon walks 4q-scalar blocks (q = 2^lg_half_m).
+            let packed_m = 1usize << (lg_half_m + 2 - lg_packed_width);
+            let block_count = packed_values.len() / packed_m;
+            let w1_row = unsafe {
+                let row = &root_table[lg_half_m];
+                core::slice::from_raw_parts(
+                    row.as_ptr()
+                        .cast::<crate::goldilocks_field::GoldilocksField>(),
+                    row.len(),
+                )
+            };
+            let w2_row = unsafe {
+                let row = &root_table[lg_half_m + 1];
+                core::slice::from_raw_parts(
+                    row.as_ptr()
+                        .cast::<crate::goldilocks_field::GoldilocksField>(),
+                    row.len(),
+                )
+            };
+            if scalar_len >= PARALLEL_FFT_MIN_SCALARS && block_count >= 2 {
+                MaybeParChunksMut::par_chunks_mut(packed_values, packed_m).for_each(|block| {
+                    // SAFETY: same TypeId / repr(transparent) argument as the
+                    // serial fused arm; each chunk is an exact multiple of
+                    // P::WIDTH scalars.
+                    let scalars = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            block
+                                .as_mut_ptr()
+                                .cast::<crate::goldilocks_field::GoldilocksField>(),
+                            block.len() * P::WIDTH,
+                        )
+                    };
+                    fft_classic_simd_two_layers_neon(scalars, lg_half_m, w1_row, w2_row);
+                });
+            } else {
+                let scalars = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        packed_values
+                            .as_mut_ptr()
+                            .cast::<crate::goldilocks_field::GoldilocksField>(),
+                        packed_values.len() * P::WIDTH,
+                    )
+                };
+                fft_classic_simd_two_layers_neon(scalars, lg_half_m, w1_row, w2_row);
+            }
+            lg_half_m += 2;
+        }
+        if lg_half_m < end {
+            let packed_m = 1usize << (lg_half_m + 1 - lg_packed_width);
+            let block_count = packed_values.len() / packed_m;
+            if scalar_len >= PARALLEL_FFT_MIN_SCALARS && block_count >= 2 {
+                MaybeParChunksMut::par_chunks_mut(packed_values, packed_m).for_each(|block| {
+                    fft_classic_simd_single_layer_with::<P, M>(
+                        block,
+                        lg_half_m,
+                        lg_packed_width,
+                        root_table,
+                    );
+                });
+            } else {
+                fft_classic_simd_single_layer_with::<P, M>(
+                    packed_values,
+                    lg_half_m,
+                    lg_packed_width,
+                    root_table,
+                );
+            }
+        }
+        return;
+    }
+
     for lg_half_m in start..end {
         let packed_m = 1usize << (lg_half_m + 1 - lg_packed_width);
         let block_count = packed_values.len() / packed_m;
