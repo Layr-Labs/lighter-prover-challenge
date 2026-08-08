@@ -43,6 +43,57 @@ static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
+/// Number of performance (P) cores on this Apple Silicon part, via
+/// `hw.perflevel0.logicalcpu`. macOS has no hard affinity, but QoS class
+/// steers scheduling: a rayon worker parked on an E-core runs 3-4x slower
+/// than a P-core, and a `par_iter` barrier completes at the speed of its
+/// slowest chunk, so one E-core straggler stretches every parallel phase.
+/// Sizing the pool to P-cores keeps every barrier chunk on a fast core.
+/// `PROVE_THREADS` overrides the count (for A/B on the ranked host), and
+/// the P-core count is floored at half the total CPU count so parts with a
+/// small P-core share (e.g. 4P+6E base M4) cannot collapse the pool.
+/// Falls back to all CPUs on non-macOS or if the sysctl is unavailable.
+fn p_core_count() -> usize {
+    if let Ok(v) = std::env::var("PROVE_THREADS") {
+        if let Ok(n) = v.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    let all = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn sysctlbyname(
+                name: *const i8,
+                oldp: *mut core::ffi::c_void,
+                oldlenp: *mut usize,
+                newp: *const core::ffi::c_void,
+                newlen: usize,
+            ) -> i32;
+        }
+        let mut count: u32 = 0;
+        let mut len = core::mem::size_of::<u32>();
+        let name = b"hw.perflevel0.logicalcpu\0".as_ptr().cast::<i8>();
+        let ok = unsafe {
+            sysctlbyname(
+                name,
+                (&mut count as *mut u32).cast(),
+                &mut len,
+                core::ptr::null(),
+                0,
+            )
+        };
+        if ok == 0 && count > 0 {
+            return (count as usize).max(all / 2);
+        }
+    }
+    all
+}
+
 fn main() {
     // First statement in the process: the Metal shader compile and pipeline
     // lowering behind the GPU hash path cost the better part of a second on a
@@ -53,8 +104,24 @@ fn main() {
     // the compiled kernels are identical either way.
     plonky2::hash::poseidon2::prewarm_gpu();
     env_logger::init();
+    // Size the pool to P-cores and mark every worker latency-critical. The
+    // default `num_cpus` count includes E-cores, and default-QoS threads are
+    // what macOS parks on them; a barrier then waits on the slowest chunk.
+    // Scheduling-only: no work is added or reordered, proof bytes are untouched.
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
+        .num_threads(p_core_count())
+        .start_handler(|_| {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                #[allow(non_camel_case_types)]
+                type qos_class_t = u32;
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
+                }
+                let _ = pthread_set_qos_class_self_np(0x21, 0);
+            }
+        })
         .build_global()
         .expect("cannot configure prover thread pool");
 
@@ -63,19 +130,24 @@ fn main() {
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
-    let json = fs::read(fixture).expect("cannot read prover fixture");
-    let block = Block::<F>::from_json_with_empty_txs(
-        &json,
-        HEAVY_TX_PER_PROOF,
-        LIGHT_TX_PER_PROOF,
-        PUBLIC_HEAVY_TX_COUNT,
-        PUBLIC_LIGHT_TX_COUNT,
-    )
-    .expect("invalid prover fixture");
-    // Embedded circuits (deserialized from compile-time blobs) by default;
-    // falls back to building from scratch if they are unavailable, and
-    // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B measurement.
-    let proof = prover::prove_block(block, Circuits::load());
+    // Overlap fixture parse with embedded circuit load: independent work that
+    // previously ran fully serial on the scored critical path, beside the Metal
+    // pipeline prewarm already started above.
+    let (block, circuits) = rayon::join(
+        || {
+            let json = fs::read(&fixture).expect("cannot read prover fixture");
+            Block::<F>::from_json_with_empty_txs(
+                &json,
+                HEAVY_TX_PER_PROOF,
+                LIGHT_TX_PER_PROOF,
+                PUBLIC_HEAVY_TX_COUNT,
+                PUBLIC_LIGHT_TX_COUNT,
+            )
+            .expect("invalid prover fixture")
+        },
+        Circuits::load,
+    );
+    let proof = prover::prove_block(block, circuits);
     let mut writer = BufWriter::with_capacity(
         PROOF_OUTPUT_BUFFER_BYTES,
         File::create(output).expect("cannot create proof output"),
