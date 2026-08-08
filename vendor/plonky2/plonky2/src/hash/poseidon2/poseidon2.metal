@@ -324,6 +324,94 @@ inline void internal_linear_layer(thread ulong state[12], constant ulong* diagon
     }
 }
 
+// Cooperative width-12 representation: four adjacent lanes own the three
+// words at indices lane, lane + 4, lane + 8. Eight independent permutations
+// therefore fit in one 32-wide Apple SIMD-group. The Poseidon2 external MDS is
+// three 4x4 blocks followed by a sum at equal positions, which makes this
+// layout exact rather than an approximation.
+inline lazy_t simd4_word_at(ulong value, ushort lane) {
+    uint2 limbs = simd_shuffle(uint2((uint)value, (uint)(value >> 32)), lane);
+    return { (ulong)limbs.x, (ulong)limbs.y };
+}
+
+inline void external_linear_layer_simd4(
+    thread ulong state[3],
+    ushort lane4,
+    ushort simd_base) {
+    lazy_t block[3];
+    ushort next_lane = simd_base + ((lane4 + 1) & 3);
+    for (uint block_index = 0; block_index < 3; ++block_index) {
+        ulong value = state[block_index];
+        lazy_t total = simd4_word_at(value, simd_base);
+        total = lazy_add(total, simd4_word_at(value, simd_base + 1));
+        total = lazy_add(total, simd4_word_at(value, simd_base + 2));
+        total = lazy_add(total, simd4_word_at(value, simd_base + 3));
+        lazy_t own = lazy_of(value);
+        lazy_t next = simd4_word_at(value, next_lane);
+        block[block_index] = lazy_add(lazy_add(total, own), lazy_add(next, next));
+    }
+
+    lazy_t column_sum = lazy_add(lazy_add(block[0], block[1]), block[2]);
+    for (uint block_index = 0; block_index < 3; ++block_index) {
+        state[block_index] = lazy_materialize(lazy_add(block[block_index], column_sum));
+    }
+}
+
+inline ulong sum_state_simd4(
+    thread const ulong state[3],
+    ushort simd_base) {
+    lazy_t local = lazy_add(lazy_add(lazy_of(state[0]), lazy_of(state[1])), lazy_of(state[2]));
+    ulong local_word = lazy_materialize(local);
+    lazy_t total = simd4_word_at(local_word, simd_base);
+    total = lazy_add(total, simd4_word_at(local_word, simd_base + 1));
+    total = lazy_add(total, simd4_word_at(local_word, simd_base + 2));
+    total = lazy_add(total, simd4_word_at(local_word, simd_base + 3));
+    return lazy_materialize(total);
+}
+
+inline void poseidon2_simd4(
+    thread ulong state[3],
+    constant ulong* parameters,
+    ushort lane4,
+    ushort simd_base) {
+    constant ulong* external_constants = parameters;
+    constant ulong* internal_constants = parameters + 96;
+    constant ulong* diagonal = parameters + 118;
+
+    external_linear_layer_simd4(state, lane4, simd_base);
+
+    for (uint round = 0; round < 4; ++round) {
+        for (uint block_index = 0; block_index < 3; ++block_index) {
+            uint state_index = block_index * 4 + lane4;
+            state[block_index] = pow7(gl_add(
+                state[block_index],
+                external_constants[round * 12 + state_index]));
+        }
+        external_linear_layer_simd4(state, lane4, simd_base);
+    }
+
+    for (uint round = 0; round < 22; ++round) {
+        if (lane4 == 0) {
+            state[0] = pow7(gl_add(state[0], internal_constants[round]));
+        }
+        ulong sum = sum_state_simd4(state, simd_base);
+        for (uint block_index = 0; block_index < 3; ++block_index) {
+            uint state_index = block_index * 4 + lane4;
+            state[block_index] = gl_mul_add(state[block_index], diagonal[state_index], sum);
+        }
+    }
+
+    for (uint round = 4; round < 8; ++round) {
+        for (uint block_index = 0; block_index < 3; ++block_index) {
+            uint state_index = block_index * 4 + lane4;
+            state[block_index] = pow7(gl_add(
+                state[block_index],
+                external_constants[round * 12 + state_index]));
+        }
+        external_linear_layer_simd4(state, lane4, simd_base);
+    }
+}
+
 // Parameter layout: 8 x 12 external constants, 22 internal constants,
 // then the 12-element internal diagonal.
 inline void poseidon2(thread ulong state[12], constant ulong* parameters) {
@@ -1434,6 +1522,30 @@ kernel void poseidon2_hash_parents(
     }
 }
 
+kernel void poseidon2_hash_parents_simd4(
+    const device ulong* children [[buffer(0)]],
+    device ulong* parents [[buffer(1)]],
+    constant ulong* parameters [[buffer(2)]],
+    constant uint& parent_count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]]) {
+    uint parent = gid >> 2;
+    if (parent >= parent_count) {
+        return;
+    }
+    ushort lane4 = simd_lane & 3;
+    ushort simd_base = simd_lane & ~3;
+
+    const device ulong* input = children + (ulong)parent * 8;
+    ulong state[3] = {
+        input[lane4],
+        input[4 + lane4],
+        0,
+    };
+    poseidon2_simd4(state, parameters, lane4, simd_base);
+    parents[(ulong)parent * 4 + lane4] = gl_canonicalize(state[0]);
+}
+
 // One sponge absorption pass over a group of at most eight natural-order
 // columns, with the running 12-lane state parked in `state` between passes
 // (column-major: lane i of row gid at state[i * leaf_count + gid]). The
@@ -1478,6 +1590,57 @@ kernel void poseidon2_absorb_pass(
     } else {
         for (uint i = 0; i < 12; ++i) {
             state[(ulong)i * leaf_count + gid] = st[i];
+        }
+    }
+}
+
+kernel void poseidon2_absorb_pass_simd4(
+    const device ulong* leaves [[buffer(0)]],
+    device ulong* state [[buffer(1)]],
+    device ulong* hashes [[buffer(2)]],
+    constant ulong* parameters [[buffer(3)]],
+    constant uint& leaf_count [[buffer(4)]],
+    constant uint& log_leaf_count [[buffer(5)]],
+    constant uint& col_start [[buffer(6)]],
+    constant uint& chunk_size [[buffer(7)]],
+    constant uint& first_pass [[buffer(8)]],
+    constant uint& final_pass [[buffer(9)]],
+    uint gid [[thread_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]]) {
+    uint row = gid >> 2;
+    if (row >= leaf_count) {
+        return;
+    }
+    ushort lane4 = simd_lane & 3;
+    ushort simd_base = simd_lane & ~3;
+
+    ulong st[3] = { 0 };
+    if (first_pass == 0u) {
+        for (uint block_index = 0; block_index < 3; ++block_index) {
+            uint state_index = block_index * 4 + lane4;
+            st[block_index] = state[(ulong)state_index * leaf_count + row];
+        }
+    }
+    if (lane4 < chunk_size) {
+        st[0] = gl_canonicalize(
+            leaves[(ulong)(col_start + lane4) * leaf_count + row]);
+    }
+    uint upper_index = 4 + lane4;
+    if (upper_index < chunk_size) {
+        st[1] = gl_canonicalize(
+            leaves[(ulong)(col_start + upper_index) * leaf_count + row]);
+    }
+
+    poseidon2_simd4(st, parameters, lane4, simd_base);
+    if (final_pass != 0u) {
+        uint out_row = log_leaf_count == 0
+            ? row
+            : (reverse_bits(row) >> (32 - log_leaf_count));
+        hashes[(ulong)out_row * 4 + lane4] = gl_canonicalize(st[0]);
+    } else {
+        for (uint block_index = 0; block_index < 3; ++block_index) {
+            uint state_index = block_index * 4 + lane4;
+            state[(ulong)state_index * leaf_count + row] = st[block_index];
         }
     }
 }
