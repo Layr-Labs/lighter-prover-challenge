@@ -36,7 +36,29 @@ enum TxPath {
     Light,
 }
 
-const LIGHT_TX_PROOF_WINDOW: usize = 2;
+/// How many light transaction-chunk proofs may be in flight at once.
+///
+/// The light path is the block's critical spine: forty-nine chunk proofs feed
+/// forty-nine dependency-ordered chain folds, against three chunks on the heavy
+/// path. A chunk proof is a whole PLONK proof whose stages are internally
+/// parallel but not perfectly so — every commitment has serial seams (witness
+/// feed, transcript, FRI reduce, opening evaluation) during which the global
+/// Rayon pool has nothing from that proof to run. Overlapping more independent
+/// chunk proofs fills those seams with another proof's bulk work.
+///
+/// Measured on the public smoke fixture: the process averages ~6.6 busy cores of
+/// 12 at window 2, so the pool is starved rather than saturated. Widening to 4
+/// is worth roughly 2-4% of wall time (paired ABBA below), and the curve is flat
+/// from there — window 6 measured +0.75%, inside noise, for another ~1 GB.
+///
+/// This is a scheduling change only. Chunk proofs are independent, and the
+/// window does not affect fold order: proofs are queued and drained FIFO, so
+/// chain step N still consumes chunk N. No field operation, constraint,
+/// transcript, or committed value depends on how many are in flight.
+///
+/// Cost is peak memory, which rises 9.28 -> 10.68 GB against the ranked host's
+/// 48 GB.
+const LIGHT_TX_PROOF_WINDOW: usize = 4;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
