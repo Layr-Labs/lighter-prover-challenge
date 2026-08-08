@@ -5,11 +5,32 @@ use core::iter::{Product, Sum};
 use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
 use itertools::Itertools;
-use num::bigint::BigUint;
-use num::{Integer, One};
+use num::bigint::{BigInt, BigUint, Sign};
+use num::{Integer, One, Signed, Zero};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{Field, PrimeField, Sample};
+
+
+fn modinv_euclid(a: BigUint, m: BigUint) -> BigUint {
+    let mut t = BigInt::zero();
+    let mut new_t = BigInt::one();
+    let mut r = BigInt::from_biguint(Sign::Plus, m.clone());
+    let mut new_r = BigInt::from_biguint(Sign::Plus, a);
+    while !new_r.is_zero() {
+        let q = &r / &new_r;
+        let (nt, t_) = (&t - &q * &new_t, new_t);
+        t = t_;
+        new_t = nt;
+        let (nr, r_) = (&r - &q * &new_r, new_r);
+        r = r_;
+        new_r = nr;
+    }
+    if t.sign() == Sign::Minus {
+        t += BigInt::from_biguint(Sign::Plus, m);
+    }
+    t.to_biguint().expect("modinv non-negative")
+}
 
 /// The base field of the secp256k1 elliptic curve.
 ///
@@ -113,8 +134,12 @@ impl Field for Secp256K1Base {
             return None;
         }
 
-        // Fermat's Little Theorem
-        Some(self.exp_biguint(&(Self::order() - BigUint::one() - BigUint::one())))
+        // Extended Euclidean algorithm — unique inverse, same canonical limbs
+        // as Fermat exp(order-2), fewer nonnative multiplies (emrektemel).
+        Some(Self::from_noncanonical_biguint(modinv_euclid(
+            self.to_canonical_biguint(),
+            Self::order(),
+        )))
     }
 
     fn from_noncanonical_biguint(val: BigUint) -> Self {

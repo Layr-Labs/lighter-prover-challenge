@@ -368,6 +368,11 @@ impl<F: RichField> TreeReadback<'_, F> {
 
 static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShared::new);
 
+pub fn warm_up_gpu_context() {
+    let _ = &*CONTEXT;
+}
+
+
 /// True while the prover is inside an exclusive serial phase (pre-execution
 /// or final block proof) where no concurrent proof can contend for the
 /// serialized GPU stream. Process-global on purpose: the phases it brackets

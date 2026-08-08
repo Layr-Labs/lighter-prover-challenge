@@ -50,7 +50,10 @@ impl Circuits {
         // Same parallel layout as `Circuits::new`; the five loads are
         // independent (unlike builds, the chain loads do not wait on the
         // transaction circuits).
-        let (pre, (heavy, light)) = rayon::join(
+        // Dummy-proof bincode decodes are independent of the five circuit
+        // blobs; fold them into the same join tree so they do not serialize
+        // after the blob loads (emrektemel micro-stack).
+        let (pre, (heavy, (light_pair, dummies))) = rayon::join(
             || load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB),
             || {
                 rayon::join(
@@ -62,25 +65,44 @@ impl Circuits {
                     },
                     || {
                         rayon::join(
-                            || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
-                            || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
+                            || {
+                                rayon::join(
+                                    || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
+                                    || {
+                                        load_blob::<BlockTxChainTarget>(
+                                            "light_chain",
+                                            LIGHT_CHAIN_BLOB,
+                                        )
+                                    },
+                                )
+                            },
+                            || {
+                                rayon::join(
+                                    || {
+                                        bincode::deserialize::<Proof>(include_bytes!(
+                                            "../dummy-heavy-chain-proof.bin"
+                                        ))
+                                        .expect("embedded heavy chain dummy proof is invalid")
+                                    },
+                                    || {
+                                        bincode::deserialize::<Proof>(include_bytes!(
+                                            "../dummy-light-chain-proof.bin"
+                                        ))
+                                        .expect("embedded light chain dummy proof is invalid")
+                                    },
+                                )
+                            },
                         )
                     },
                 )
             },
         );
         let (pre_target, pre_data) = pre?;
-        let ((heavy_tx, heavy_chain), (light_tx, light_chain)) = (
-            (heavy.0?, heavy.1?),
-            (light.0?, light.1?),
-        );
-
-        let dummy_heavy_proof: Proof =
-            bincode::deserialize(include_bytes!("../dummy-heavy-chain-proof.bin"))
-                .expect("embedded heavy chain dummy proof is invalid");
-        let dummy_light_proof: Proof =
-            bincode::deserialize(include_bytes!("../dummy-light-chain-proof.bin"))
-                .expect("embedded light chain dummy proof is invalid");
+        let heavy_tx = heavy.0?;
+        let heavy_chain = heavy.1?;
+        let light_tx = light_pair.0?;
+        let light_chain = light_pair.1?;
+        let (dummy_heavy_proof, dummy_light_proof) = dummies;
 
         Ok(Self {
             heavy_tx_target: heavy_tx.0,

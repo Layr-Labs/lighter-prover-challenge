@@ -598,8 +598,14 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         out_buffer.set_wire(output_low_wire, output_low)?;
 
         let diff = u32::MAX as u64 - output_high_u64;
+        // On the common no-overflow path, output_high is 0 so diff == u32::MAX.
+        // For Goldilocks, inv(2^32-1) is the closed form p - 2^32 (emrektemel).
         let inverse = if diff == 0 {
             F::ZERO
+        } else if diff == u32::MAX as u64 && F::ORDER == 0xFFFF_FFFF_0000_0001 {
+            let inv = F::from_canonical_u64(0xFFFF_FFFE_0000_0001);
+            debug_assert_eq!(inv, F::from_canonical_u64(diff).inverse());
+            inv
         } else {
             F::from_canonical_u64(diff).inverse()
         };
