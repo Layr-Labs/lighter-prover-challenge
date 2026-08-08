@@ -1,6 +1,7 @@
+use core::any::TypeId;
 use core::ffi::c_void;
 use core::marker::PhantomData;
-use core::mem::{size_of, size_of_val};
+use core::mem::{align_of, size_of, size_of_val};
 use core::slice;
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
@@ -77,6 +78,10 @@ const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
 const MAX_BUFFER_SETS: usize = 1;
 /// Parallel staging copy granularity in u64 elements (4 MiB chunks).
 const STAGING_CHUNK: usize = 1 << 19;
+/// The recurrent chain-tree shape whose level-order readback spans exactly two
+/// large Rayon chunks. A direct bulk copy avoids scheduling and joining a
+/// second worker while the caller is on the serial proof spine.
+const BULK_DIGEST_COPY_LEAF_COUNT: usize = 1 << 17;
 
 struct MetalShared {
     device: Device,
@@ -2793,26 +2798,36 @@ fn dispatch(
     );
 }
 
-/// Copies the GPU's level-order node array (leaf digests first, cap level
-/// last; 4 u64 limbs per digest) into CPU-owned [`LevelOrderDigests`] storage
-/// with one bulk streaming pass, and reads the cap off the top level. The
-/// interleaved [`crate::hash::merkle_tree::MerkleTree::digests`] layout is
-/// deliberately not rebuilt here: `prove` indexes the levels directly, and
-/// the rare consumers that need the interleaved array (serialization)
-/// materialize it on demand via [`LevelOrderDigests::to_interleaved`].
-fn tree_from_levels<F: RichField>(
+fn bulk_copy_canonical_goldilocks_digests<F: RichField>(
     nodes: &[u64],
-    level_offsets: &[usize],
-    leaf_count: usize,
-    cap_height: usize,
-) -> (LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>) {
-    let cap_count = 1usize << cap_height;
-    let node_count = 2 * leaf_count - cap_count;
-    // Hard (not `debug_`) assert: the `set_len` below is sound only because the
-    // limb slice covers every digest slot, and all three call sites size the
-    // GPU output buffer with exactly this expression.
-    assert_eq!(nodes.len(), node_count * 4);
-    debug_assert_eq!(level_offsets[0], 0);
+) -> Option<Vec<HashOut<F>>> {
+    if TypeId::of::<F>()
+        != TypeId::of::<crate::field::goldilocks_field::GoldilocksField>()
+    {
+        return None;
+    }
+
+    assert_eq!(nodes.len() % 4, 0);
+    assert_eq!(size_of::<HashOut<F>>(), 4 * size_of::<u64>());
+    assert_eq!(align_of::<HashOut<F>>(), align_of::<u64>());
+
+    // SAFETY: the exact `TypeId` check above proves that `F` is
+    // `GoldilocksField`, which is `repr(transparent)` over `u64` and accepts
+    // every u64 bit pattern. `HashOut` is `repr(transparent)` over `[F; 4]`;
+    // the hard size/alignment checks pin the remaining layout assumptions.
+    // The completed GPU buffer is immutably borrowed for this call, and every
+    // shader output is canonicalized before readback. `to_vec` performs the
+    // single owned copy required before that buffer can be recycled.
+    let digests = unsafe {
+        slice::from_raw_parts(nodes.as_ptr().cast::<HashOut<F>>(), nodes.len() / 4)
+    }
+    .to_vec();
+    Some(digests)
+}
+
+fn copy_canonical_digests_parallel<F: RichField>(nodes: &[u64]) -> Vec<HashOut<F>> {
+    assert_eq!(nodes.len() % 4, 0);
+    let node_count = nodes.len() / 4;
 
     // Chunked parallel bulk copy out of the CPU-visible shared buffer; every
     // worker walks its chunk sequentially, so the whole read stays a
@@ -2837,22 +2852,43 @@ fn tree_from_levels<F: RichField>(
             }
         });
     // SAFETY: every one of the `node_count` slots was written exactly once
-    // above. `nodes.len() == node_count * 4` is asserted, and `STAGING_CHUNK`
-    // is a multiple of 4, so `par_chunks_mut(STAGING_CHUNK / 4)` and
-    // `par_chunks(STAGING_CHUNK)` yield the same chunk count and rayon's
-    // indexed `zip` pairs chunk `i` with chunk `i` without truncating either
-    // side. Digest chunk `i` of length `m` is paired with a limb chunk of
-    // length exactly `4 * m`, whose `chunks_exact(4)` yields exactly `m` items
-    // with no remainder — including the short final chunk — so the inner `zip`
-    // visits every digest of every chunk. `elements` is `HashOut`'s only
-    // field, so each `write` initializes a whole slot. `set_len` runs only
-    // after the copy returns; an unwind out of it drops a length-0 `Vec`,
-    // leaving nothing uninitialized to drop. This is the same argument that
-    // already licenses `capacity_up_to_mut` in `MerkleTree::cpu_digests` and
-    // `LevelOrderDigests::to_interleaved`.
+    // above. `nodes.len() == node_count * 4`, and `STAGING_CHUNK` is a multiple
+    // of 4, so the paired Rayon chunks cover the same digest range, including
+    // the short final chunk. `set_len` runs only after the copy returns; an
+    // unwind leaves a length-0 Vec and nothing uninitialized to drop.
     unsafe {
         digests.set_len(node_count);
     }
+    digests
+}
+
+/// Copies the GPU's level-order node array (leaf digests first, cap level
+/// last; 4 u64 limbs per digest) into CPU-owned [`LevelOrderDigests`] storage
+/// with one bulk streaming pass, and reads the cap off the top level. The
+/// interleaved [`crate::hash::merkle_tree::MerkleTree::digests`] layout is
+/// deliberately not rebuilt here: `prove` indexes the levels directly, and
+/// the rare consumers that need the interleaved array (serialization)
+/// materialize it on demand via [`LevelOrderDigests::to_interleaved`].
+fn tree_from_levels<F: RichField>(
+    nodes: &[u64],
+    level_offsets: &[usize],
+    leaf_count: usize,
+    cap_height: usize,
+) -> (LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>) {
+    let cap_count = 1usize << cap_height;
+    let node_count = 2 * leaf_count - cap_count;
+    // Hard (not `debug_`) assert: both conversion paths require exactly four
+    // limbs for every digest, and all three call sites size the GPU output
+    // buffer with exactly this expression.
+    assert_eq!(nodes.len(), node_count * 4);
+    debug_assert_eq!(level_offsets[0], 0);
+
+    let digests = if leaf_count == BULK_DIGEST_COPY_LEAF_COUNT {
+        bulk_copy_canonical_goldilocks_digests(nodes)
+            .unwrap_or_else(|| copy_canonical_digests_parallel(nodes))
+    } else {
+        copy_canonical_digests_parallel(nodes)
+    };
 
     // The GPU offsets are in u64 limbs; the CPU representation indexes whole
     // digests.
@@ -5140,12 +5176,68 @@ kernel void goldilocks_mul_bench_native(
         }
     }
 
-    /// The staging copy in [`tree_from_levels`] pairs `STAGING_CHUNK / 4`-sized
-    /// digest chunks with `STAGING_CHUNK`-sized limb chunks, and its `set_len`
-    /// is sound only if that pairing covers every slot including a short final
-    /// chunk. Every other differential builds a tree that fits in one chunk;
-    /// this one spans two (node count `2 * (1 << 17) - 16 = 262128`, i.e. one
-    /// full 131072-digest chunk plus a 131056-digest remainder).
+    /// Pins the exact `2^17` production-shape bulk-copy layout, including every
+    /// raw Goldilocks word, level offset, and cap digest.
+    #[test]
+    fn bulk_goldilocks_digest_copy_preserves_production_layout() {
+        let leaf_count = BULK_DIGEST_COPY_LEAF_COUNT;
+        let cap_height = 4;
+        let cap_count = 1usize << cap_height;
+        let node_count = 2 * leaf_count - cap_count;
+        let mut nodes: Vec<u64> = (0..node_count * 4).map(|i| i as u64).collect();
+        nodes[..8].copy_from_slice(&[
+            0,
+            1,
+            GoldilocksField::ORDER - 1,
+            0x1234_5678_9abc_def0,
+            0x8000_0000_0000_0000,
+            (1 << 32) - 1,
+            1 << 32,
+            GoldilocksField::ORDER - 2,
+        ]);
+
+        let mut level_offsets = vec![0];
+        let mut level_offset = 0;
+        let mut child_count = leaf_count;
+        while child_count > cap_count {
+            level_offset += child_count * 4;
+            level_offsets.push(level_offset);
+            child_count /= 2;
+        }
+
+        let (tree, cap) = tree_from_levels::<GoldilocksField>(
+            &nodes,
+            &level_offsets,
+            leaf_count,
+            cap_height,
+        );
+        assert_eq!(tree.nodes.len(), node_count);
+        assert_eq!(
+            tree.level_offsets,
+            level_offsets
+                .iter()
+                .map(|offset| offset / 4)
+                .collect::<Vec<_>>()
+        );
+        for (digest, limbs) in tree.nodes.iter().zip(nodes.chunks_exact(4)) {
+            for (element, limb) in digest.elements.iter().zip(limbs) {
+                assert_eq!(element.0, *limb);
+            }
+        }
+        let cap_offset = *tree.level_offsets.last().unwrap();
+        assert_eq!(cap, tree.nodes[cap_offset..cap_offset + cap_count]);
+        assert_eq!(
+            size_of::<HashOut<GoldilocksField>>(),
+            4 * size_of::<u64>()
+        );
+        assert_eq!(
+            align_of::<HashOut<GoldilocksField>>(),
+            align_of::<u64>()
+        );
+    }
+
+    /// Exercises the same `2^17` fast path from a completed real Metal buffer
+    /// and compares the complete level-order tree with the CPU implementation.
     #[test]
     fn metal_merkle_matches_cpu_across_staging_chunks() {
         const WIDTH: usize = 4;
