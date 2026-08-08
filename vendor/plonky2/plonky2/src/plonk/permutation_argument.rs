@@ -84,6 +84,16 @@ impl Forest {
         target.index(self.num_wires, self.degree)
     }
 
+    /// Representative index of `target` in the (path-compressed) parent map —
+    /// the key space of the generator watch index. The builder constructs that
+    /// index after `sigma_vecs`' path compression, when every parent pointer
+    /// already names its representative; a loader reconstructing the watch
+    /// index from serialized generators and the stored parent map needs
+    /// exactly this mapping.
+    pub fn watch_rep_index(&self, target: Target) -> usize {
+        self.parents[self.target_index(target)] as usize
+    }
+
     /// Add a new partition with a single member.
     ///
     /// The `u32` narrowing is guarded by [`Forest::new`], which asserts that the announced
