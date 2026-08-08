@@ -582,6 +582,162 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
     columns.into_iter().map(PolynomialValues::new).collect()
 }
 
+const DUAL_Z_BLOCK_ROWS: usize = 512;
+
+/// Raw writers into disjoint row ranges of preallocated column vectors. The
+/// vectors keep length zero during the first pass, so a panic cannot drop
+/// uninitialised field elements. Each parallel task owns a distinct block of
+/// row indices across every column.
+struct ParallelZColumns<'a, F: Field> {
+    addresses: Vec<usize>,
+    n_points: usize,
+    _borrow: core::marker::PhantomData<&'a mut F>,
+}
+
+impl<'a, F: Field> ParallelZColumns<'a, F> {
+    fn new(columns: &'a mut [Vec<F>], n_points: usize) -> Self {
+        let addresses = columns
+            .iter_mut()
+            .map(|column| {
+                debug_assert!(column.capacity() >= n_points);
+                column.as_mut_ptr() as usize
+            })
+            .collect();
+        Self {
+            addresses,
+            n_points,
+            _borrow: core::marker::PhantomData,
+        }
+    }
+
+    #[inline]
+    fn write(&self, column: usize, row: usize, value: F) {
+        debug_assert!(row < self.n_points);
+        // SAFETY: callers partition rows into non-overlapping Rayon blocks;
+        // each (column, row) cell is written exactly once before lengths are
+        // exposed, and the backing vectors cannot move while `self` borrows
+        // them.
+        unsafe { (self.addresses[column] as *mut F).add(row).write(value) };
+    }
+
+    #[inline]
+    fn rescale(&self, column: usize, row: usize, scale: F) {
+        debug_assert!(row < self.n_points);
+        // SAFETY: the first pass initialized every cell. Rescale tasks use the
+        // same disjoint row-block partition as the write pass.
+        unsafe {
+            let cell = (self.addresses[column] as *mut F).add(row);
+            cell.write(cell.read() * scale);
+        }
+    }
+}
+
+/// Scan both production Z recurrences in the same Rayon block traversal.
+/// Each block first computes columns relative to Z=1 and returns both block
+/// products. A tiny serial prefix computes each block's incoming Z, then one
+/// parallel pass rescales the already-column-major outputs.
+fn dual_z_polynomials_from_quotient_chunk_products<F: Field>(
+    quotient_products_0: Vec<F>,
+    quotient_products_1: Vec<F>,
+    num_prods: usize,
+) -> (Vec<PolynomialValues<F>>, Vec<PolynomialValues<F>>) {
+    let num_chunks = num_prods + 1;
+    debug_assert_eq!(quotient_products_0.len(), quotient_products_1.len());
+    debug_assert_eq!(quotient_products_0.len() % num_chunks, 0);
+    let n_points = quotient_products_0.len() / num_chunks;
+    let mut columns_0: Vec<Vec<F>> = (0..num_chunks)
+        .map(|_| Vec::with_capacity(n_points))
+        .collect();
+    let mut columns_1: Vec<Vec<F>> = (0..num_chunks)
+        .map(|_| Vec::with_capacity(n_points))
+        .collect();
+
+    let writers_0 = ParallelZColumns::new(&mut columns_0, n_points);
+    let writers_1 = ParallelZColumns::new(&mut columns_1, n_points);
+    let block_elements = DUAL_Z_BLOCK_ROWS * num_chunks;
+    let mut block_totals: Vec<(F, F)> = quotient_products_0
+        .par_chunks(block_elements)
+        .zip(quotient_products_1.par_chunks(block_elements))
+        .enumerate()
+        .map(|(block, (products_0, products_1))| {
+            debug_assert_eq!(products_0.len(), products_1.len());
+            debug_assert_eq!(products_0.len() % num_chunks, 0);
+            let first_row = block * DUAL_Z_BLOCK_ROWS;
+            let mut z_0 = F::ONE;
+            let mut z_1 = F::ONE;
+            for (row_in_block, (row_0, row_1)) in products_0
+                .chunks_exact(num_chunks)
+                .zip(products_1.chunks_exact(num_chunks))
+                .enumerate()
+            {
+                let row = first_row + row_in_block;
+                let previous_z_0 = z_0;
+                let previous_z_1 = z_1;
+                for column in 0..num_chunks {
+                    z_0 *= row_0[column];
+                    z_1 *= row_1[column];
+                    if column == num_prods {
+                        // The final product is Z(gx), but this column stores
+                        // the previous Z(x), preserving the legacy shift.
+                        writers_0.write(column, row, previous_z_0);
+                        writers_1.write(column, row, previous_z_1);
+                    } else {
+                        writers_0.write(column, row, z_0);
+                        writers_1.write(column, row, z_1);
+                    }
+                }
+            }
+            (z_0, z_1)
+        })
+        .collect();
+    drop(writers_0);
+    drop(writers_1);
+
+    let mut incoming_0 = F::ONE;
+    let mut incoming_1 = F::ONE;
+    for totals in &mut block_totals {
+        let (total_0, total_1) = *totals;
+        *totals = (incoming_0, incoming_1);
+        incoming_0 *= total_0;
+        incoming_1 *= total_1;
+    }
+
+    // SAFETY: the block traversal writes every row in every column exactly
+    // once. Empty inputs have zero lengths and no cells to initialize.
+    unsafe {
+        for column in &mut columns_0 {
+            column.set_len(n_points);
+        }
+        for column in &mut columns_1 {
+            column.set_len(n_points);
+        }
+    }
+
+    let writers_0 = ParallelZColumns::new(&mut columns_0, n_points);
+    let writers_1 = ParallelZColumns::new(&mut columns_1, n_points);
+    block_totals
+        .par_iter()
+        .enumerate()
+        .skip(1)
+        .for_each(|(block, &(scale_0, scale_1))| {
+            let first_row = block * DUAL_Z_BLOCK_ROWS;
+            let end_row = min(first_row + DUAL_Z_BLOCK_ROWS, n_points);
+            for column in 0..num_chunks {
+                for row in first_row..end_row {
+                    writers_0.rescale(column, row, scale_0);
+                    writers_1.rescale(column, row, scale_1);
+                }
+            }
+        });
+    drop(writers_0);
+    drop(writers_1);
+
+    (
+        columns_0.into_iter().map(PolynomialValues::new).collect(),
+        columns_1.into_iter().map(PolynomialValues::new).collect(),
+    )
+}
+
 /// Compute both production permutation challenges in one pass over the witness
 /// and sigma rows.
 ///
@@ -592,11 +748,11 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
 /// Fusing collapses two full traversals of the witness and sigma matrices, and
 /// two Rayon fork/joins over the subgroup, into one.
 ///
-/// Value-exactness: each challenge keeps its own accumulators, its own
-/// numerator/denominator multiplication order (`for j in start..end`), its own
-/// inversion batch in the same push order, and its own Z chain. Only the
-/// memory traversal and the Rayon scheduling are shared, so every output limb
-/// is bit-identical to running the per-challenge path twice.
+/// Each challenge keeps its own numerator/denominator multiplication order
+/// (`for j in start..end`). The two denominator lists share one Montgomery
+/// inversion and the two Z chains share one block-prefix scan, so the output is
+/// field-value identical to two general passes (raw noncanonical limbs may be
+/// reassociated).
 fn two_challenge_wires_permutation_partial_products_and_zs<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -647,16 +803,16 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
             .for_each_init(
                 || {
                     (
-                        Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
                     let base = chunk_idx * INV_BATCH;
-                    let (denominators_0, denominators_1, denominator_inverses) = scratch;
-                    denominators_0.clear();
-                    denominators_1.clear();
+                    let (denominators, denominator_inverses) = scratch;
+                    let ratios_in_batch = xs.len() * num_chunks;
+                    denominators.clear();
+                    denominators.resize(2 * ratios_in_batch, F::ONE);
                     for (t, &x) in xs.iter().enumerate() {
                         let i = base + t;
                         let s_sigmas = &prover_data.sigmas[i];
@@ -678,8 +834,8 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
                             products_1[output].write(numerator_1);
-                            denominators_0.push(denominator_0);
-                            denominators_1.push(denominator_1);
+                            denominators[output] = denominator_0;
+                            denominators[ratios_in_batch + output] = denominator_1;
                         }
                     }
                     // SAFETY: the loop above wrote every slot of both
@@ -694,8 +850,14 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     let products_1 = unsafe {
                         &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
                     };
-                    divide_chunk_products(products_0, denominators_0, denominator_inverses);
-                    divide_chunk_products(products_1, denominators_1, denominator_inverses);
+                    F::batch_multiplicative_inverse_into(denominators, denominator_inverses);
+                    let (inverses_0, inverses_1) = denominator_inverses.split_at(ratios_in_batch);
+                    for (product, &inverse) in products_0.iter_mut().zip(inverses_0) {
+                        *product *= inverse;
+                    }
+                    for (product, &inverse) in products_1.iter_mut().zip(inverses_1) {
+                        *product *= inverse;
+                    }
                 },
             );
     }
@@ -708,10 +870,12 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
         quotient_products_1.set_len(product_count);
     }
 
-    vec![
-        z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
-        z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
-    ]
+    let (z_polynomials_0, z_polynomials_1) = dual_z_polynomials_from_quotient_chunk_products(
+        quotient_products_0,
+        quotient_products_1,
+        num_prods,
+    );
+    vec![z_polynomials_0, z_polynomials_1]
 }
 
 /// Compute the partial products used in the `Z` polynomial.
@@ -2940,15 +3104,13 @@ mod l_0_table_tests {
     }
 }
 
-/// Value-exactness gate for the fused two-challenge permutation path.
+/// Field-value exactness gate for the fused two-challenge permutation path.
 ///
-/// `two_challenge_wires_permutation_partial_products_and_zs` must be a pure
-/// traversal/scheduling change: for the same witness, sigmas, subgroup and
-/// challenges it has to reproduce, **limb for limb**, what two independent
-/// `wires_permutation_partial_products_and_zs` calls produce. Goldilocks
-/// canonicalises inside `PartialEq`, so field equality would hide a path that
-/// returned a different representative of the same residue; the primary
-/// comparisons here are on the raw `to_noncanonical_u64` limbs instead.
+/// Combining the two inversion batches and reassociating the Z recurrence at
+/// block boundaries can change a Goldilocks value's noncanonical limb while
+/// preserving its field value. The oracle therefore compares canonical field
+/// values, and the independent per-element-inverse reference below remains the
+/// algebraic correctness check.
 #[cfg(all(test, feature = "std"))]
 mod permutation_pairing_tests {
     use crate::field::polynomial::PolynomialValues;
@@ -2959,9 +3121,9 @@ mod permutation_pairing_tests {
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     use super::{
-        all_wires_permutation_partial_products, paired_permutation_batch_count,
-        two_challenge_wires_permutation_partial_products_and_zs,
-        wires_permutation_partial_products_and_zs,
+        all_wires_permutation_partial_products, dual_z_polynomials_from_quotient_chunk_products,
+        paired_permutation_batch_count, two_challenge_wires_permutation_partial_products_and_zs,
+        wires_permutation_partial_products_and_zs, z_polynomials_from_quotient_chunk_products,
     };
 
     const D: usize = 2;
@@ -3028,9 +3190,9 @@ mod permutation_pairing_tests {
         builder.build::<C>()
     }
 
-    /// Flatten a `Vec<Vec<PolynomialValues>>` to raw limbs, with the shape
-    /// recorded so a structural difference cannot be flattened away.
-    fn raw_limbs(polys: &[Vec<PolynomialValues<F>>]) -> Vec<(usize, usize, Vec<u64>)> {
+    /// Flatten to canonical residues, with the shape recorded so a structural
+    /// difference cannot be flattened away.
+    fn canonical_values(polys: &[Vec<PolynomialValues<F>>]) -> Vec<(usize, usize, Vec<u64>)> {
         polys
             .iter()
             .enumerate()
@@ -3041,12 +3203,39 @@ mod permutation_pairing_tests {
                         column,
                         poly.values
                             .iter()
-                            .map(|v| v.to_noncanonical_u64())
+                            .map(|v| v.to_canonical_u64())
                             .collect::<Vec<u64>>(),
                     )
                 })
             })
             .collect()
+    }
+
+    #[test]
+    fn dual_z_block_scan_matches_sequential_value_oracle() {
+        let num_prods = 9usize;
+        let num_chunks = num_prods + 1;
+        for &n_points in &[1usize, 4, 256, 512, 1024, 2048] {
+            let mut rng = Rng::new(0xd1b5_4a32_d192_ed03 ^ n_points as u64);
+            let products_0: Vec<F> = (0..n_points * num_chunks)
+                .map(|_| rng.next_field())
+                .collect();
+            let products_1: Vec<F> = (0..n_points * num_chunks)
+                .map(|_| rng.next_field())
+                .collect();
+            let expected = vec![
+                z_polynomials_from_quotient_chunk_products(products_0.clone(), num_prods),
+                z_polynomials_from_quotient_chunk_products(products_1.clone(), num_prods),
+            ];
+            let (actual_0, actual_1) =
+                dual_z_polynomials_from_quotient_chunk_products(products_0, products_1, num_prods);
+            let actual = vec![actual_0, actual_1];
+            assert_eq!(
+                canonical_values(&actual),
+                canonical_values(&expected),
+                "dual block scan diverged at {n_points} points"
+            );
+        }
     }
 
     /// Independent, deliberately naive reference: per-point chunk ratios with a
@@ -3096,7 +3285,7 @@ mod permutation_pairing_tests {
     }
 
     #[test]
-    fn paired_two_challenge_path_is_limb_identical_to_general_loop() {
+    fn paired_two_challenge_path_matches_general_loop_by_field_value() {
         let mut data = build_circuit();
         let num_routed_wires = data.common.config.num_routed_wires;
         let degree = data.common.quotient_degree_factor;
@@ -3109,10 +3298,10 @@ mod permutation_pairing_tests {
         assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
         assert_eq!(data.common.k_is.len(), num_routed_wires);
 
-        // Point counts spanning: a single point, a short first batch, the
-        // inversion batch boundary (INV_BATCH = 128) exactly, one past it, and
-        // several batches with a short tail.
-        for &n_points in &[1usize, 5, 127, 128, 129, 300] {
+        // Power-of-two point counts spanning a short first batch, the inversion
+        // batch boundary (INV_BATCH = 128), and several batches. PolynomialValues
+        // requires a two-adic domain in debug builds.
+        for &n_points in &[1usize, 4, 64, 128, 256, 512] {
             let mut rng = Rng::new(0x9e37_79b9_7f4a_7c15 ^ ((n_points as u64) << 8));
 
             let subgroup: Vec<F> = (0..n_points).map(|_| rng.next_field()).collect();
@@ -3180,8 +3369,8 @@ mod permutation_pairing_tests {
                 }
             }
             assert_eq!(
-                raw_limbs(&paired),
-                raw_limbs(&general),
+                canonical_values(&paired),
+                canonical_values(&general),
                 "fused path diverged from the general loop at {n_points} points"
             );
 
@@ -3204,8 +3393,8 @@ mod permutation_pairing_tests {
                 "dispatcher did not take the fused path at num_challenges = 2"
             );
             assert_eq!(
-                raw_limbs(&dispatched),
-                raw_limbs(&paired),
+                canonical_values(&dispatched),
+                canonical_values(&paired),
                 "dispatcher output differs from the fused path"
             );
 
@@ -3245,8 +3434,8 @@ mod permutation_pairing_tests {
             // The first two challenges of the 3-challenge general run use the
             // same betas/gammas, so they must still match the fused output.
             assert_eq!(
-                raw_limbs(&general3[..2]),
-                raw_limbs(&paired),
+                canonical_values(&general3[..2]),
+                canonical_values(&paired),
                 "general 3-challenge loop disagrees with the fused pair"
             );
 
