@@ -1,6 +1,11 @@
 use alloc::vec::Vec;
 use core::cmp::{max, min};
 
+use plonky2_maybe_rayon::MaybeParChunksMut;
+#[cfg(all(feature = "parallel", target_arch = "aarch64"))]
+use plonky2_maybe_rayon::{IndexedParallelIterator, MaybeParChunks};
+#[cfg(feature = "parallel")]
+use plonky2_maybe_rayon::ParallelIterator;
 use plonky2_util::{log2_strict, reverse_index_bits_in_place};
 use unroll::unroll_for_loops;
 
@@ -181,6 +186,24 @@ fn fft_dispatch<F: Field>(
     fft_classic(input, zero_factor.unwrap_or(0), &computed_root_table);
 }
 
+#[inline]
+fn fft_dispatch_parallel<F: Field>(
+    input: &mut [F],
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+) {
+    if let Some(table) = root_table {
+        fft_classic_parallel(input, zero_factor.unwrap_or(0), table);
+        return;
+    }
+    #[cfg(feature = "std")]
+    let computed_root_table = root_table_cache::get::<F>(log2_strict(input.len()));
+    #[cfg(not(feature = "std"))]
+    let computed_root_table = fft_root_table::<F>(input.len());
+
+    fft_classic_parallel(input, zero_factor.unwrap_or(0), &computed_root_table);
+}
+
 /// Computes an FFT in the caller-provided buffer.
 ///
 /// This is equivalent to [`fft_with_options`], but permits buffers backed by
@@ -192,6 +215,19 @@ pub fn fft_in_place_with_options<F: Field>(
     root_table: Option<&FftRootTable<F>>,
 ) {
     fft_dispatch(buffer, zero_factor, root_table);
+}
+
+/// Computes an FFT in place, distributing independent blocks of the large
+/// outer stages across the feature-gated worker pool. Callers should use this
+/// only when the transform is not already nested in a wider parallel phase.
+#[doc(hidden)]
+#[inline]
+pub fn fft_in_place_with_options_parallel<F: Field>(
+    buffer: &mut [F],
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+) {
+    fft_dispatch_parallel(buffer, zero_factor, root_table);
 }
 
 #[inline]
@@ -361,6 +397,45 @@ fn fft_classic_simd_with<P, M>(
     fft_classic_simd_layers::<P, M>(packed_values, s, lg_n, root_table);
 }
 
+/// Parallel sibling of `fft_classic_simd_with`. The packed-width prefix is
+/// tiny and remains serial; only the independent blocks in later stages are
+/// distributed.
+#[unroll_for_loops]
+fn fft_classic_simd_with_parallel<P, M>(
+    values: &mut [P::Scalar],
+    r: usize,
+    lg_n: usize,
+    root_table: &FftRootTable<P::Scalar>,
+) where
+    P: PackedField,
+    M: FftTwiddleMul<P>,
+{
+    let lg_packed_width = log2_strict(P::WIDTH);
+    let packed_values = P::pack_slice_mut(values);
+    let packed_n = packed_values.len();
+    debug_assert!(packed_n == 1 << (lg_n - lg_packed_width));
+
+    assert!(lg_packed_width <= 4);
+    for lg_half_m in 0..4 {
+        if (r..min(lg_n, lg_packed_width)).contains(&lg_half_m) {
+            let half_m = 1 << lg_half_m;
+            let mut omega = P::default();
+            for (j, omega_j) in omega.as_slice_mut().iter_mut().enumerate() {
+                *omega_j = root_table[lg_half_m][j % half_m];
+            }
+
+            for k in (0..packed_n).step_by(2) {
+                let (u, v) = packed_values[k].interleave(packed_values[k + 1], half_m);
+                let t = M::mul(omega, v);
+                (packed_values[k], packed_values[k + 1]) = (u + t).interleave(u - t, half_m);
+            }
+        }
+    }
+
+    let s = max(r, lg_packed_width);
+    fft_classic_simd_layers_parallel::<P, M>(packed_values, s, lg_n, root_table);
+}
+
 #[inline(always)]
 fn fft_classic_simd<P: PackedField>(
     values: &mut [P::Scalar],
@@ -496,6 +571,69 @@ fn fft_classic_simd_single_layer_neon(
 /// GoldilocksField` word for word. Same blocks, same pairing, same twiddles,
 /// same order as the generic body.
 #[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fft_classic_simd_neon_ext_butterflies(
+    lows: &mut [crate::extension::quadratic::QuadraticExtension<
+        crate::goldilocks_field::GoldilocksField,
+    >],
+    highs: &mut [crate::extension::quadratic::QuadraticExtension<
+        crate::goldilocks_field::GoldilocksField,
+    >],
+    omegas: &[crate::extension::quadratic::QuadraticExtension<
+        crate::goldilocks_field::GoldilocksField,
+    >],
+    base_subfield: bool,
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+    use crate::extension::quadratic::QuadraticExtension;
+    use crate::goldilocks_field::GoldilocksField;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    const W: u64 = 7;
+    debug_assert_eq!(lows.len(), highs.len());
+    debug_assert!(omegas.len() >= lows.len());
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        let mut j = 0;
+        while j < lows.len() {
+            let v = *highs.get_unchecked(j);
+            let w = *omegas.get_unchecked(j);
+            let (c0, c1) = if base_subfield {
+                // [w0, 0] * [v0, v1] = [w0*v0, w0*v1]: one paired mul.
+                let p = NeonGoldilocksField([w.0[0], w.0[0]])
+                    * NeonGoldilocksField([v.0[0], v.0[1]]);
+                (p.0[0].0, p.0[1].0)
+            } else {
+                // General extension product with the W = 7 conjugation.
+                let p = NeonGoldilocksField([w.0[0], w.0[1]])
+                    * NeonGoldilocksField([v.0[0], v.0[1]]);
+                let q = NeonGoldilocksField([w.0[0], w.0[1]])
+                    * NeonGoldilocksField([v.0[1], v.0[0]]);
+                let c0 = (p.0[0] + GoldilocksField(W) * p.0[1]).0;
+                let c1 = (q.0[0] + q.0[1]).0;
+                (c0, c1)
+            };
+            let tv = vcombine_u64(vcreate_u64(c0), vcreate_u64(c1));
+
+            let u = *lows.get_unchecked(j);
+            let uv = vcombine_u64(vcreate_u64(u.0[0].0), vcreate_u64(u.0[1].0));
+            let sum = gl_add_neon(uv, tv, eps);
+            let diff = gl_sub_neon(uv, tv, eps);
+            *lows.get_unchecked_mut(j) = QuadraticExtension([
+                GoldilocksField(vgetq_lane_u64(sum, 0)),
+                GoldilocksField(vgetq_lane_u64(sum, 1)),
+            ]);
+            *highs.get_unchecked_mut(j) = QuadraticExtension([
+                GoldilocksField(vgetq_lane_u64(diff, 0)),
+                GoldilocksField(vgetq_lane_u64(diff, 1)),
+            ]);
+            j += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn fft_classic_simd_single_layer_neon_ext(
     values: &mut [crate::extension::quadratic::QuadraticExtension<
@@ -506,60 +644,18 @@ fn fft_classic_simd_single_layer_neon_ext(
         crate::goldilocks_field::GoldilocksField,
     >],
 ) {
-    use core::arch::aarch64::*;
-    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
-    use crate::extension::quadratic::QuadraticExtension;
-    use crate::goldilocks_field::GoldilocksField;
-
-    const EPSILON: u64 = (1 << 32) - 1;
-    const W: u64 = 7;
     let half = 1usize << lg_half_m;
     let m = half << 1;
     debug_assert!(omega_row.len() >= half);
-    let base_subfield = omega_row[..half]
-        .iter()
-        .all(|w| w.0[1].0 == 0);
-    unsafe {
-        let eps = vdupq_n_u64(EPSILON);
-        let mut k = 0;
-        while k + m <= values.len() {
-            let mut j = 0;
-            while j + 1 <= half {
-                let v = *values.get_unchecked(k + half + j);
-                let w = *omega_row.get_unchecked(j);
-                let (c0, c1) = if base_subfield {
-                    // [w0, 0] * [v0, v1] = [w0*v0, w0*v1]: one paired mul.
-                    let p = NeonGoldilocksField([w.0[0], w.0[0]])
-                        * NeonGoldilocksField([v.0[0], v.0[1]]);
-                    (p.0[0].0, p.0[1].0)
-                } else {
-                    // General extension product with the W = 7 conjugation.
-                    let p = NeonGoldilocksField([w.0[0], w.0[1]])
-                        * NeonGoldilocksField([v.0[0], v.0[1]]);
-                    let q = NeonGoldilocksField([w.0[0], w.0[1]])
-                        * NeonGoldilocksField([v.0[1], v.0[0]]);
-                    let c0 = (p.0[0] + GoldilocksField(W) * p.0[1]).0;
-                    let c1 = (q.0[0] + q.0[1]).0;
-                    (c0, c1)
-                };
-                let tv = vcombine_u64(vcreate_u64(c0), vcreate_u64(c1));
-
-                let u = *values.get_unchecked(k + j);
-                let uv = vcombine_u64(vcreate_u64(u.0[0].0), vcreate_u64(u.0[1].0));
-                let sum = gl_add_neon(uv, tv, eps);
-                let diff = gl_sub_neon(uv, tv, eps);
-                *values.get_unchecked_mut(k + j) = QuadraticExtension([
-                    GoldilocksField(vgetq_lane_u64(sum, 0)),
-                    GoldilocksField(vgetq_lane_u64(sum, 1)),
-                ]);
-                *values.get_unchecked_mut(k + half + j) = QuadraticExtension([
-                    GoldilocksField(vgetq_lane_u64(diff, 0)),
-                    GoldilocksField(vgetq_lane_u64(diff, 1)),
-                ]);
-                j += 1;
-            }
-            k += m;
-        }
+    let base_subfield = omega_row[..half].iter().all(|w| w.0[1].0 == 0);
+    for block in values.chunks_exact_mut(m) {
+        let (lows, highs) = block.split_at_mut(half);
+        fft_classic_simd_neon_ext_butterflies(
+            lows,
+            highs,
+            &omega_row[..half],
+            base_subfield,
+        );
     }
 }
 
@@ -772,6 +868,114 @@ fn fft_classic_simd_layers<P, M>(
             lg_packed_width,
             root_table,
         );
+    }
+}
+
+/// Small transforms do not amortize worker-pool scheduling. Production FRI
+/// first wins consistently at 2^18 elements; 2^17 is left on the serial path.
+const PARALLEL_FFT_MIN_SCALARS: usize = 1 << 18;
+
+/// Once only a few full FFT blocks remain, block-level parallelism leaves
+/// most workers idle. Split the independent butterflies inside those last
+/// blocks, but only for the exact production extension-field NEON kernel and
+/// only on transforms large enough to amortize the nested Rayon dispatch.
+#[cfg(all(feature = "parallel", target_arch = "aarch64"))]
+const PARALLEL_FFT_INNER_MIN_SCALARS: usize = 1 << 20;
+#[cfg(all(feature = "parallel", target_arch = "aarch64"))]
+const PARALLEL_FFT_INNER_MAX_BLOCKS: usize = 4;
+#[cfg(all(feature = "parallel", target_arch = "aarch64"))]
+const PARALLEL_FFT_INNER_GRAIN: usize = 1 << 15;
+
+#[inline(always)]
+fn fft_classic_simd_layers_parallel<P, M>(
+    packed_values: &mut [P],
+    start: usize,
+    end: usize,
+    root_table: &FftRootTable<P::Scalar>,
+) where
+    P: PackedField,
+    M: FftTwiddleMul<P>,
+{
+    let lg_packed_width = log2_strict(P::WIDTH);
+    let scalar_len = packed_values.len() * P::WIDTH;
+    for lg_half_m in start..end {
+        let packed_m = 1usize << (lg_half_m + 1 - lg_packed_width);
+        let block_count = packed_values.len() / packed_m;
+
+        #[cfg(all(feature = "parallel", target_arch = "aarch64"))]
+        if scalar_len >= PARALLEL_FFT_INNER_MIN_SCALARS
+            && block_count <= PARALLEL_FFT_INNER_MAX_BLOCKS
+            && core::any::TypeId::of::<P>()
+                == core::any::TypeId::of::<
+                    crate::extension::quadratic::QuadraticExtension<
+                        crate::goldilocks_field::GoldilocksField,
+                    >,
+                >()
+        {
+            type FE = crate::extension::quadratic::QuadraticExtension<
+                crate::goldilocks_field::GoldilocksField,
+            >;
+
+            // SAFETY: the exact `TypeId` check proves `P == FE`; that type has
+            // packed width one and is represented by one `[GoldilocksField; 2]`
+            // without padding. The root-table scalar type is the same `FE`.
+            let ext_values = unsafe {
+                core::slice::from_raw_parts_mut(
+                    packed_values.as_mut_ptr().cast::<FE>(),
+                    packed_values.len() * P::WIDTH,
+                )
+            };
+            let omega_row = unsafe {
+                let row = &root_table[lg_half_m];
+                core::slice::from_raw_parts(row.as_ptr().cast::<FE>(), row.len())
+            };
+            let half = 1usize << lg_half_m;
+            let m = half << 1;
+            debug_assert_eq!(P::WIDTH, 1);
+            debug_assert_eq!(m, packed_m);
+            debug_assert!(omega_row.len() >= half);
+            let base_subfield = omega_row[..half].iter().all(|w| w.0[1].0 == 0);
+
+            MaybeParChunksMut::par_chunks_mut(ext_values, m).for_each(|block| {
+                let (lows, highs) = block.split_at_mut(half);
+                MaybeParChunksMut::par_chunks_mut(lows, PARALLEL_FFT_INNER_GRAIN)
+                    .zip(MaybeParChunksMut::par_chunks_mut(
+                        highs,
+                        PARALLEL_FFT_INNER_GRAIN,
+                    ))
+                    .zip(MaybeParChunks::par_chunks(
+                        &omega_row[..half],
+                        PARALLEL_FFT_INNER_GRAIN,
+                    ))
+                    .for_each(|((lows, highs), omegas)| {
+                        fft_classic_simd_neon_ext_butterflies(
+                            lows,
+                            highs,
+                            omegas,
+                            base_subfield,
+                        );
+                    });
+            });
+            continue;
+        }
+
+        if scalar_len >= PARALLEL_FFT_MIN_SCALARS && block_count >= 2 {
+            MaybeParChunksMut::par_chunks_mut(packed_values, packed_m).for_each(|block| {
+                fft_classic_simd_single_layer_with::<P, M>(
+                    block,
+                    lg_half_m,
+                    lg_packed_width,
+                    root_table,
+                );
+            });
+        } else {
+            fft_classic_simd_single_layer_with::<P, M>(
+                packed_values,
+                lg_half_m,
+                lg_packed_width,
+                root_table,
+            );
+        }
     }
 }
 
@@ -1011,6 +1215,34 @@ where
     }
 }
 
+#[inline(always)]
+fn fft_classic_with_parallel<F, M>(values: &mut [F], r: usize, root_table: &FftRootTable<F>)
+where
+    F: Field,
+    M: FftTwiddleMul<F> + FftTwiddleMul<<F as Packable>::Packing>,
+{
+    let n = values.len();
+    let lg_n = log2_strict(n);
+    let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
+    let first_layer = if r == 0 {
+        reverse_index_bits_in_place(values);
+        0
+    } else {
+        prepare_zero_padded_fft::<F, M>(values, r, lg_n, lg_packed_width, root_table)
+    };
+
+    if lg_n <= lg_packed_width {
+        fft_classic_simd_with_parallel::<F, M>(values, first_layer, lg_n, root_table);
+    } else {
+        fft_classic_simd_with_parallel::<<F as Packable>::Packing, M>(
+            values,
+            first_layer,
+            lg_n,
+            root_table,
+        );
+    }
+}
+
 pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &FftRootTable<F>) {
     let lg_n = log2_strict(values.len());
     if root_table.len() != lg_n {
@@ -1028,6 +1260,27 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
         fft_classic_with::<F, GeneralTwiddle>(values, r, root_table);
     } else {
         fft_classic_with::<F, BaseSubfieldTwiddle>(values, r, root_table);
+    }
+}
+
+pub(crate) fn fft_classic_parallel<F: Field>(
+    values: &mut [F],
+    r: usize,
+    root_table: &FftRootTable<F>,
+) {
+    let lg_n = log2_strict(values.len());
+    if root_table.len() != lg_n {
+        panic!(
+            "Expected root table of length {}, but it was {}.",
+            lg_n,
+            root_table.len()
+        );
+    }
+
+    if lg_n == F::TWO_ADICITY {
+        fft_classic_with_parallel::<F, GeneralTwiddle>(values, r, root_table);
+    } else {
+        fft_classic_with_parallel::<F, BaseSubfieldTwiddle>(values, r, root_table);
     }
 }
 
@@ -2075,7 +2328,10 @@ mod tests {
 
     use super::{BaseSubfieldTwiddle, FftTwiddleMul, GeneralTwiddle};
     use crate::extension::quadratic::QuadraticExtension;
-    use crate::fft::{FftRootTable, fft, fft_classic, fft_root_table, fft_with_options, ifft};
+    use crate::fft::{
+        FftRootTable, fft, fft_classic, fft_classic_parallel, fft_in_place_with_options,
+        fft_in_place_with_options_parallel, fft_root_table, fft_with_options, ifft,
+    };
     use crate::goldilocks_field::GoldilocksField;
 
     /// Portable copy of the general extension-butterfly product used by the
@@ -2735,6 +2991,51 @@ mod tests {
                 "extension FFT mismatch at 2^{lg_n}, r={r}"
             );
         }
+    }
+
+    #[test]
+    fn parallel_zero_padded_extension_fft_matches_serial_raw_words() {
+        type F = GoldilocksField;
+        type FE = QuadraticExtension<F>;
+
+        for r in [1usize, 2, 3] {
+            for lg_n in [9usize, 12, 16, 17, 18, 20, 21] {
+                let n = 1 << lg_n;
+                let nonzero_len = n >> r;
+                let roots = fft_root_table(n);
+                let raw_value = |i: usize, salt: u64| {
+                    let mut x = (i as u64).wrapping_add(salt);
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    GoldilocksField(x)
+                };
+                let mut serial = (0..nonzero_len)
+                    .map(|i| {
+                        QuadraticExtension([
+                            raw_value(i, 0x9E37_79B9_7F4A_7C15),
+                            raw_value(i, 0xD1B5_4A32_D192_ED03),
+                        ])
+                    })
+                    .chain(core::iter::repeat_n(FE::ZERO, n - nonzero_len))
+                    .collect::<Vec<_>>();
+                let mut parallel = serial.clone();
+
+                fft_classic(&mut serial, r, &roots);
+                fft_classic_parallel(&mut parallel, r, &roots);
+                assert_eq!(parallel, serial, "parallel FFT mismatch at 2^{lg_n}, r={r}");
+            }
+        }
+
+        let n = 1 << 18;
+        let mut serial = (0..n >> 3)
+            .map(|i| GoldilocksField((i as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)))
+            .chain(core::iter::repeat_n(F::ZERO, n - (n >> 3)))
+            .collect::<Vec<_>>();
+        let mut parallel = serial.clone();
+        fft_in_place_with_options(&mut serial, Some(3), None);
+        fft_in_place_with_options_parallel(&mut parallel, Some(3), None);
+        assert_eq!(parallel, serial, "packed base-field public entry diverged");
     }
 
 }
