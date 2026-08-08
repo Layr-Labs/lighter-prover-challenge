@@ -515,11 +515,13 @@ pub(crate) fn prove_block_after_pre(
         std::thread::scope(|scope| {
             // The final block circuit depends only on already-built circuit data
             // and is not needed until the final proof, so it builds concurrently
-            // with the entire transaction/chain proving pipeline.
+            // with the transaction/chain proving pipeline — specifically in the
+            // idle window this lane already has after the heavy path retires
+            // (see the build call below for why it waits for that join).
             // Two-phase final-block witness (H13): this lane also runs the
-            // EARLY witness phase (block data + pre-proof generators) after the
-            // build, then joins the heavy path — which finishes ~30 s before
-            // the light path — and feeds its verify subtree here, mid-pipeline.
+            // EARLY witness phase (block data + pre-proof generators), then
+            // feeds the heavy path's verify subtree here, mid-pipeline — the
+            // heavy path finishes ~30 s before the light path.
             // Measured feed split: light 0.018 s vs heavy 0.575 s; the heavy
             // verify subtree (ECDSA/keccak) owns the late witness cost, and
             // moving it here deletes it from the serial tail. Both phases run
@@ -554,6 +556,36 @@ pub(crate) fn prove_block_after_pre(
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
+                    // The block circuit build is deferred behind the heavy
+                    // path's join instead of starting with the pipeline.
+                    //
+                    // The build is 3.4 s of fully parallel CPU (define 0.8 s +
+                    // `build` 2.6 s: sigma derivation, the 2^21-row
+                    // constants/sigmas LDE and its Merkle tree). Started at
+                    // pipeline entry it lands in the single most contended
+                    // window of the worker: both transaction paths are ramping
+                    // and the serialized GPU stream is saturated by their chunk
+                    // trees. Measured on the public fixture, the light path's
+                    // first two chain folds cost 1.84 s and 1.74 s against a
+                    // 0.58 s median for the same fixed-size fold — ~2.4 s of
+                    // excess concentrated exactly under this build.
+                    //
+                    // Nothing needs the block circuit until the final proof,
+                    // which cannot start before the light chain proof exists.
+                    // The heavy path has 3 chunks against the light path's 49,
+                    // so it retires early under any fixture; on the public
+                    // fixture the lane then sits idle for 21.6 s before the
+                    // light path finishes. Building after that join moves the
+                    // work into that idle window, where the light spine is the
+                    // only other proving work, and still leaves the build
+                    // finishing ~20 s before it is first read.
+                    //
+                    // Pure scheduling: the circuit built is bit-identical, and
+                    // the early-witness phase that follows it is unchanged, so
+                    // no proof byte depends on where this runs.
+                    let heavy_chain_proof = heavy_handle_outer
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                     let (block_target, block_data) = circuits.build_block_circuit();
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
@@ -569,9 +601,6 @@ pub(crate) fn prove_block_after_pre(
                         &block_data.common,
                     )
                     .expect("final block early witness phase failed");
-                    let heavy_chain_proof = heavy_handle_outer
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                     pending
                         .feed(
                             BlockCircuit::witness_inputs_heavy_chain(
