@@ -89,19 +89,29 @@ fn main() {
         },
     );
     let pre_exec = circuit::block_pre_execution::BlockPreExec::from_block(&block);
+    // The pre-execution circuit loaded above is handed back out of this thread
+    // and moved into `Circuits` below: `Circuits::load()` used to deserialize
+    // `pre.embed` a *second* time, rebuilding a 2^17 x 86 constants/sigmas
+    // extension and its 1.57 M-permutation GPU Merkle tree that no proof ever
+    // reads. Same value, loaded once.
     let pre_handle = std::thread::Builder::new()
         .name("pre-exec-startup".into())
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .spawn(move || {
             let (pre_target, pre_data) = pre_circuits;
-            prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec)
+            let proof = prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec);
+            (pre_target, pre_data, proof)
         })
         .expect("pre-execution startup thread must start");
-    // Embedded circuits (deserialized from compile-time blobs) by default;
-    // falls back to building from scratch if they are unavailable, and
-    // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B measurement.
-    let circuits = Circuits::load();
-    let pre_proof = pre_handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    // The four remaining embedded circuits (deserialized from compile-time
+    // blobs) by default; falls back to building from scratch if they are
+    // unavailable, and `LIGHTER_BUILD_CIRCUITS=1` forces the build path for
+    // A/B measurement. This runs concurrently with the pre-execution proof
+    // above, exactly as the five-blob load did.
+    let rest = Circuits::load_rest_or_build();
+    let (pre_target, pre_data, pre_proof) =
+        pre_handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let circuits = rest.finish(pre_target, pre_data);
     let proof = prover::prove_block_after_pre(block, circuits, pre_proof);
     let mut writer = BufWriter::with_capacity(
         PROOF_OUTPUT_BUFFER_BYTES,
