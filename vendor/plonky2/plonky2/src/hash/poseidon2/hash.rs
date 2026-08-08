@@ -467,6 +467,16 @@ fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
 }
 
 impl Poseidon2 for F {
+    /// aarch64 NEON: vectorised Goldilocks add/reduce external MDS.
+    /// Non-NEON keeps the trait default (u128 widen then reduce).
+    #[inline]
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    fn external_linear_layer(state: &mut [Self; WIDTH]) {
+        unsafe {
+            crate::hash::arch::aarch64::poseidon_goldilocks_neon::external_linear_layer(state);
+        }
+    }
+
     #[inline]
     fn internal_linear_layer(state: &mut [Self; WIDTH]) {
         type Packing = <F as Packable>::Packing;
@@ -1126,5 +1136,133 @@ mod pair_hash_tests {
             new_time,
             old_time.as_secs_f64() / new_time.as_secs_f64()
         );
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64", target_feature = "neon"))]
+mod external_linear_layer_neon_tests {
+    use plonky2_field::types::{Field, Field64, PrimeField64, Sample};
+
+    use super::*;
+    use crate::hash::arch::aarch64::poseidon_goldilocks_neon::{
+        external_linear_layer as external_neon,
+        external_linear_layer_scalar_add as external_scalar_add,
+    };
+
+    fn apply_u128(state: &mut [F; WIDTH]) {
+        let mut state_u128: [u128; WIDTH] = [0u128; WIDTH];
+        for i in 0..WIDTH {
+            state_u128[i] = state[i].to_noncanonical_u64() as u128;
+        }
+        external_linear_layer_u128(&mut state_u128);
+        for i in 0..WIDTH {
+            state[i] = F::from_noncanonical_u128_with_96_bits(state_u128[i]);
+        }
+    }
+
+    fn adversarial_states() -> Vec<[F; WIDTH]> {
+        let mut out = Vec::new();
+        out.push([F::ZERO; WIDTH]);
+        out.push([F::ONE; WIDTH]);
+        let near = F::from_canonical_u64(F::ORDER - 1);
+        out.push([near; WIDTH]);
+        // Non-canonical representatives (raw limb >= ORDER).
+        let nc = F::from_noncanonical_u64(F::ORDER + 5);
+        out.push([nc; WIDTH]);
+        let mut mixed = [F::ZERO; WIDTH];
+        for i in 0..WIDTH {
+            let raw = match i % 4 {
+                0 => F::ORDER.wrapping_add(i as u64),
+                1 => u64::MAX.wrapping_sub(i as u64),
+                2 => (i as u64).wrapping_mul(0x9e3779b97f4a7c15),
+                _ => F::ORDER.wrapping_sub(1).wrapping_sub(i as u64),
+            };
+            mixed[i] = F::from_noncanonical_u64(raw);
+        }
+        out.push(mixed);
+        for _ in 0..64 {
+            out.push(core::array::from_fn(|_| F::rand()));
+        }
+        for _ in 0..64 {
+            out.push(core::array::from_fn(|_| {
+                F::from_noncanonical_u64(F::rand().0.wrapping_mul(3))
+            }));
+        }
+        out
+    }
+
+    #[test]
+    fn neon_matches_scalar_add_raw_limbs() {
+        for (case, state0) in adversarial_states().into_iter().enumerate() {
+            let mut a = state0;
+            let mut b = state0;
+            unsafe {
+                external_neon(&mut a);
+            }
+            external_scalar_add(&mut b);
+            for i in 0..WIDTH {
+                assert_eq!(
+                    a[i].0, b[i].0,
+                    "raw limb mismatch case={case} i={i}: neon={:#x} scalar={:#x}",
+                    a[i].0,
+                    b[i].0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn neon_field_equals_u128_path() {
+        for (case, state0) in adversarial_states().into_iter().enumerate() {
+            let mut neon = state0;
+            let mut u128p = state0;
+            unsafe {
+                external_neon(&mut neon);
+            }
+            apply_u128(&mut u128p);
+            for i in 0..WIDTH {
+                assert_eq!(
+                    neon[i].to_canonical_u64(),
+                    u128p[i].to_canonical_u64(),
+                    "canonical mismatch case={case} i={i}: neon_raw={:#x} u128_raw={:#x}",
+                    neon[i].0,
+                    u128p[i].0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn production_external_is_neon_raw_identical_to_helper() {
+        // F::external_linear_layer must dispatch to the NEON kernel on this cfg.
+        for (case, state0) in adversarial_states().into_iter().enumerate() {
+            let mut prod = state0;
+            let mut neon = state0;
+            F::external_linear_layer(&mut prod);
+            unsafe {
+                external_neon(&mut neon);
+            }
+            for i in 0..WIDTH {
+                assert_eq!(
+                    prod[i].0, neon[i].0,
+                    "production dispatch mismatch case={case} i={i}",
+                );
+            }
+        }
+    }
+
+    /// Mutation check: corrupting a limb must be visible to the raw-limb compare.
+    #[test]
+    fn mutation_is_detected() {
+        let state0: [F; WIDTH] = core::array::from_fn(|_| F::rand());
+        let mut neon = state0;
+        let mut scalar = state0;
+        unsafe {
+            external_neon(&mut neon);
+        }
+        external_scalar_add(&mut scalar);
+        assert_eq!(neon[0].0, scalar[0].0);
+        neon[0] = F::from_noncanonical_u64(neon[0].0 ^ 1);
+        assert_ne!(neon[0].0, scalar[0].0, "mutation must change a limb");
     }
 }
