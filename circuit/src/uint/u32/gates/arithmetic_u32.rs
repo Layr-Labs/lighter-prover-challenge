@@ -598,8 +598,15 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         out_buffer.set_wire(output_low_wire, output_low)?;
 
         let diff = u32::MAX as u64 - output_high_u64;
+        // Every no-overflow op hits diff == u32::MAX, whose Goldilocks inverse
+        // is the fixed constant p - 2^32 (from 2^32 * (2^32 - 1) = -1 mod p);
+        // returning it directly skips a full inversion chain per op.
         let inverse = if diff == 0 {
             F::ZERO
+        } else if diff == u32::MAX as u64 && F::ORDER == 0xffff_ffff_0000_0001 {
+            let inv = F::from_canonical_u64(0xffff_fffe_0000_0001);
+            debug_assert_eq!(inv, F::from_canonical_u64(diff).inverse());
+            inv
         } else {
             F::from_canonical_u64(diff).inverse()
         };
