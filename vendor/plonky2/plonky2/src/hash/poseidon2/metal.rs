@@ -230,16 +230,46 @@ pub(crate) struct U32QuotientSpec {
 /// Written once during the fused NTT + Merkle build, immutable afterwards.
 pub struct MetalColumns<F> {
     buffer: Buffer,
+    /// `buffer.contents()`, captured once at construction and held as an address.
+    ///
+    /// `Buffer::contents` is an Objective-C message send — `objc_msgSend` through
+    /// the dispatch cache, opaque to the optimizer — and for a
+    /// `StorageModeShared` buffer it returns the same address for the buffer's
+    /// whole lifetime, which is why the streamed column fill already hoists it
+    /// out of its inner loop. Every accessor below used to re-send it: `col` is
+    /// called once per gathered column per 32-point quotient batch, on the order
+    /// of 10^6 times for a degree-2^16 transaction proof and 10^7 for the final
+    /// block proof, so the send was re-deriving a value fixed at allocation
+    /// time. Kept as a `usize` rather than a raw pointer so the struct's auto
+    /// traits are exactly what they were.
+    base: usize,
     rows: usize,
     cols: usize,
     uniqueness: Arc<()>,
     _phantom: PhantomData<F>,
 }
 
+impl<F> MetalColumns<F> {
+    /// Wraps a freshly allocated shared buffer, capturing its contents pointer.
+    fn with_buffer(buffer: Buffer, rows: usize, cols: usize) -> Self {
+        let base = buffer.contents() as usize;
+        Self {
+            buffer,
+            base,
+            rows,
+            cols,
+            uniqueness: Arc::new(()),
+            _phantom: PhantomData,
+        }
+    }
+}
+
 impl<F> Clone for MetalColumns<F> {
     fn clone(&self) -> Self {
         Self {
             buffer: self.buffer.clone(),
+            // Same buffer, therefore the same contents address.
+            base: self.base,
             rows: self.rows,
             cols: self.cols,
             uniqueness: self.uniqueness.clone(),
@@ -263,10 +293,7 @@ impl<F: RichField> MetalColumns<F> {
         // any-bit-pattern-valid via `F`'s u64 wrapper) written before this
         // handle was returned and never mutated afterwards.
         unsafe {
-            slice::from_raw_parts(
-                self.buffer.contents().cast::<F>().add(j * self.rows),
-                self.rows,
-            )
+            slice::from_raw_parts((self.base as *const F).add(j * self.rows), self.rows)
         }
     }
 
@@ -279,7 +306,7 @@ impl<F: RichField> MetalColumns<F> {
         // exclusive access to the handle guarantee that no cloned handle, CPU
         // reader, or GPU reader can observe the buffer during initialization.
         let values = unsafe {
-            slice::from_raw_parts_mut(self.buffer.contents().cast::<F>(), self.rows * self.cols)
+            slice::from_raw_parts_mut(self.base as *mut F, self.rows * self.cols)
         };
         Some(values.chunks_exact_mut(self.rows).collect())
     }
@@ -297,9 +324,7 @@ impl<F> core::fmt::Debug for MetalColumns<F> {
 impl<F> MetalColumns<F> {
     fn raw(&self) -> &[u64] {
         // SAFETY: the buffer holds `rows * cols` initialized u64 values.
-        unsafe {
-            slice::from_raw_parts(self.buffer.contents().cast::<u64>(), self.rows * self.cols)
-        }
+        unsafe { slice::from_raw_parts(self.base as *const u64, self.rows * self.cols) }
     }
 }
 
@@ -1561,13 +1586,7 @@ impl MetalShared {
             self.device
                 .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
         });
-        Ok(MetalColumns {
-            buffer,
-            rows,
-            cols,
-            uniqueness: Arc::new(()),
-            _phantom: PhantomData,
-        })
+        Ok(MetalColumns::with_buffer(buffer, rows, cols))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2148,13 +2167,7 @@ impl MetalShared {
             .collect();
 
         Ok((
-            MetalColumns {
-                buffer: column_buffer,
-                rows: lde_size,
-                cols,
-                uniqueness: Arc::new(()),
-                _phantom: PhantomData,
-            },
+            MetalColumns::with_buffer(column_buffer, lde_size, cols),
             digests,
             cap,
             coeff_columns,
@@ -2232,13 +2245,7 @@ impl MetalShared {
         drop(job);
         let (digests, cap) = result?.finish();
         Ok((
-            MetalColumns {
-                buffer: column_buffer,
-                rows: lde_size,
-                cols,
-                uniqueness: Arc::new(()),
-                _phantom: PhantomData,
-            },
+            MetalColumns::with_buffer(column_buffer, lde_size, cols),
             digests,
             cap,
         ))
