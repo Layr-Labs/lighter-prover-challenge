@@ -50,6 +50,30 @@ inline ulong gl_add(ulong a, ulong b) {
 #endif
 }
 
+// Adds a canonical field element `b < p` to an arbitrary u64 representative.
+// If the raw sum wraps then r = a + b - 2^64 < b < p, hence
+// r + EPSILON <= p - 2 + EPSILON = 2^64 - 2.  The carry fold therefore
+// cannot wrap a second time.  This is the shader analogue of
+// GoldilocksField::add_canonical_u64 on the CPU.
+inline ulong gl_add_canonical_rhs(ulong a, ulong b) {
+    uint a0 = (uint)a;
+    uint a1 = (uint)(a >> 32);
+    uint b0 = (uint)b;
+    uint b1 = (uint)(b >> 32);
+    uint r0 = a0 + b0;
+    uint carry0 = (uint)(r0 < a0);
+    uint r1 = a1 + b1;
+    uint carry1 = (uint)(r1 < a1);
+    uint next = r1 + carry0;
+    carry1 += (uint)(next < r1);
+    r1 = next;
+
+    uint old0 = r0;
+    r0 -= carry1;
+    r1 += carry1 & (uint)(old0 != 0);
+    return ((ulong)r1 << 32) | (ulong)r0;
+}
+
 inline ulong gl_sub(ulong a, ulong b) {
 #if defined(POSEIDON2_NATIVE_ARITHMETIC_REFERENCE)
     ulong diff = a - b;
@@ -214,6 +238,41 @@ inline ulong gl_mul_add(ulong a, ulong b, ulong addend) {
     return reduce_top(r0, r1, (int)carry - (int)under);
 }
 
+// r = a * b + addend0 + addend1 (mod p), requiring canonical b < p.
+// The product's high word is then at most p - 2, so absorbing both carries
+// cannot overflow it.  This lets a following round constant join the same
+// reduction as the internal linear layer's multiply and state sum.
+inline ulong gl_mul_add2(
+    ulong a,
+    ulong b,
+    ulong addend0,
+    ulong addend1) {
+    ulong low = a * b;
+    ulong high = metal::mulhi(a, b);
+    ulong low2 = low + addend0;
+    high += (ulong)(low2 < low);
+    ulong low3 = low2 + addend1;
+    high += (ulong)(low3 < low2);
+    uint l0 = (uint)low3;
+    uint l1 = (uint)(low3 >> 32);
+    uint h0 = (uint)high;
+    uint h1 = (uint)(high >> 32);
+
+    uint r0 = l0 - h0;
+    uint borrow = (uint)(r0 > l0);
+    uint next = r0 - h1;
+    borrow += (uint)(next > r0);
+    r0 = next;
+
+    uint r1 = l1 + h0;
+    uint carry = (uint)(r1 < l1);
+    next = r1 - borrow;
+    uint under = (uint)(next > r1);
+    r1 = next;
+
+    return reduce_top(r0, r1, (int)carry - (int)under);
+}
+
 inline ulong pow7(ulong value) {
     ulong value2 = gl_mul(value, value);
     ulong value4 = gl_mul(value2, value2);
@@ -272,6 +331,52 @@ inline void internal_linear_layer(thread ulong state[12], constant ulong* diagon
     }
 }
 
+// Materializes the external layer while folding in the constants consumed by
+// the next round.  `mat4` contributes at most 27 wraps per lane; one more raw
+// constant addition keeps the count below 29, within fold_carries' proven
+// single-correction range.
+inline void external_linear_layer_rc(
+    thread ulong state[12],
+    constant ulong* rc,
+    uint rc_lanes) {
+    lazy_t lazy[12];
+    for (uint i = 0; i < 12; ++i) {
+        lazy[i] = lazy_of(state[i]);
+    }
+    mat4(lazy);
+    mat4(lazy + 4);
+    mat4(lazy + 8);
+
+    lazy_t sums[4];
+    for (uint i = 0; i < 4; ++i) {
+        sums[i] = lazy_add(lazy_add(lazy[i], lazy[i + 4]), lazy[i + 8]);
+    }
+    for (uint i = 0; i < 12; ++i) {
+        lazy_t value = lazy_add(lazy[i], sums[i & 3]);
+        if (i < rc_lanes) {
+            ulong next = value.v + rc[i];
+            value.c += (uint)(next < value.v);
+            value.v = next;
+        }
+        state[i] = fold_carries(value.v, value.c);
+    }
+}
+
+// The internal layer similarly folds the next round's canonical constants
+// into its already fused multiply-plus-sum reduction.
+inline void internal_linear_layer_rc(
+    thread ulong state[12],
+    constant ulong* diagonal,
+    constant ulong* rc,
+    uint rc_lanes) {
+    ulong sum = sum_state(state);
+    for (uint i = 0; i < 12; ++i) {
+        state[i] = i < rc_lanes
+            ? gl_mul_add2(state[i], diagonal[i], sum, rc[i])
+            : gl_mul_add(state[i], diagonal[i], sum);
+    }
+}
+
 // Parameter layout: 8 x 12 external constants, 22 internal constants,
 // then the 12-element internal diagonal.
 inline void poseidon2(thread ulong state[12], constant ulong* parameters) {
@@ -279,25 +384,41 @@ inline void poseidon2(thread ulong state[12], constant ulong* parameters) {
     constant ulong* internal_constants = parameters + 96;
     constant ulong* diagonal = parameters + 118;
 
-    external_linear_layer(state);
+    external_linear_layer_rc(state, external_constants, 12u);
 
     for (uint round = 0; round < 4; ++round) {
         for (uint i = 0; i < 12; ++i) {
-            state[i] = pow7(gl_add(state[i], external_constants[round * 12 + i]));
+            state[i] = pow7(state[i]);
         }
-        external_linear_layer(state);
+        if (round < 3) {
+            external_linear_layer_rc(
+                state, external_constants + (round + 1) * 12, 12u);
+        } else {
+            external_linear_layer_rc(state, internal_constants, 1u);
+        }
     }
 
     for (uint round = 0; round < 22; ++round) {
-        state[0] = pow7(gl_add(state[0], internal_constants[round]));
-        internal_linear_layer(state, diagonal);
+        state[0] = pow7(state[0]);
+        if (round < 21) {
+            internal_linear_layer_rc(
+                state, diagonal, internal_constants + round + 1, 1u);
+        } else {
+            internal_linear_layer_rc(
+                state, diagonal, external_constants + 4 * 12, 12u);
+        }
     }
 
     for (uint round = 4; round < 8; ++round) {
         for (uint i = 0; i < 12; ++i) {
-            state[i] = pow7(gl_add(state[i], external_constants[round * 12 + i]));
+            state[i] = pow7(state[i]);
         }
-        external_linear_layer(state);
+        if (round < 7) {
+            external_linear_layer_rc(
+                state, external_constants + (round + 1) * 12, 12u);
+        } else {
+            external_linear_layer_rc(state, external_constants, 0u);
+        }
     }
 }
 
@@ -391,7 +512,8 @@ kernel void poseidon2_gate_quotient(
 
     for (uint round = 0; round < 4; ++round) {
         for (uint i = 0; i < 12; ++i) {
-            state[i] = gl_add(state[i], external_constants[round * 12 + i]);
+            state[i] =
+                gl_add_canonical_rhs(state[i], external_constants[round * 12 + i]);
         }
         if (round != 0) {
             uint saved_start = 29 + (round - 1) * 12;
@@ -418,7 +540,7 @@ kernel void poseidon2_gate_quotient(
     for (uint round = 0; round < 22; ++round) {
         ulong saved = poseidon2_gate_wire(wires, 65 + round, lde_rows, source_row);
         poseidon2_gate_emit(
-            gl_sub(gl_add(state[0], internal_constants[round]), saved),
+            gl_sub(gl_add_canonical_rhs(state[0], internal_constants[round]), saved),
             alpha_powers,
             accumulators,
             constraint_index);
@@ -428,7 +550,8 @@ kernel void poseidon2_gate_quotient(
 
     for (uint round = 4; round < 8; ++round) {
         for (uint i = 0; i < 12; ++i) {
-            state[i] = gl_add(state[i], external_constants[round * 12 + i]);
+            state[i] =
+                gl_add_canonical_rhs(state[i], external_constants[round * 12 + i]);
         }
         uint saved_start = 87 + (round - 4) * 12;
         for (uint i = 0; i < 12; ++i) {
