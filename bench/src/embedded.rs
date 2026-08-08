@@ -9,19 +9,24 @@
 //! exact `Circuits` value `Circuits::new` builds, several times faster than
 //! rebuilding, moving that work out of the scored worker lifetime.
 //!
-//! [`Circuits::load`] is the production entry point: embedded first, build
-//! fallback on any error, `LIGHTER_BUILD_CIRCUITS=1` to force the build path
-//! (measurement A/B). The `embedded_matches_rebuilt` ignored test is the
-//! value-equality oracle between the two paths.
+//! [`Circuits::load_pre`] and [`Circuits::load_remaining`] are the production
+//! entry points: embedded first, build fallback on any error,
+//! `LIGHTER_BUILD_CIRCUITS=1` to force the build path (measurement A/B). The
+//! `embedded_matches_rebuilt` ignored test is the value-equality oracle.
 
-use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
+use anyhow::Context as _;
+use circuit::block_pre_execution_constraints::{
+    BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
+};
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
 use circuit::embed::deserialize_embedded;
-use circuit::types::config::{C, D, F};
+use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
 use plonky2::plonk::circuit_data::CircuitData;
 
-use crate::api::{Circuits, Proof};
+use crate::api::{
+    Circuits, HEAVY_TX_MODE, HEAVY_TX_PER_PROOF, LIGHT_TX_MODE, LIGHT_TX_PER_PROOF, PathCircuits,
+};
 
 static PRE_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pre.embed"));
 static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx.embed"));
@@ -41,12 +46,150 @@ fn load_blob<T: serde::de::DeserializeOwned>(
         .map_err(|error| error.context(format!("loading embedded circuit {name}")))
 }
 
+pub(crate) struct RemainingCircuits {
+    heavy: PathCircuits,
+    light: PathCircuits,
+}
+
+fn load_embedded_path(
+    tx_name: &'static str,
+    tx_blob: &'static [u8],
+    chain_name: &'static str,
+    chain_blob: &'static [u8],
+    dummy_proof: &'static [u8],
+) -> anyhow::Result<PathCircuits> {
+    let (tx, chain) = rayon::join(
+        || load_blob::<BlockTxTarget>(tx_name, tx_blob),
+        || load_blob::<BlockTxChainTarget>(chain_name, chain_blob),
+    );
+    let (tx_target, tx_data) = tx?;
+    let (chain_target, chain_data) = chain?;
+    let dummy_proof =
+        bincode::deserialize(dummy_proof).context("embedded chain dummy proof is invalid")?;
+    Ok(PathCircuits {
+        tx_target,
+        tx_data,
+        chain_target,
+        chain_data,
+        dummy_proof,
+    })
+}
+
+impl RemainingCircuits {
+    fn from_embedded() -> anyhow::Result<Self> {
+        let (heavy, light) = rayon::join(
+            || {
+                load_embedded_path(
+                    "heavy_tx",
+                    HEAVY_TX_BLOB,
+                    "heavy_chain",
+                    HEAVY_CHAIN_BLOB,
+                    include_bytes!("../dummy-heavy-chain-proof.bin"),
+                )
+            },
+            || {
+                load_embedded_path(
+                    "light_tx",
+                    LIGHT_TX_BLOB,
+                    "light_chain",
+                    LIGHT_CHAIN_BLOB,
+                    include_bytes!("../dummy-light-chain-proof.bin"),
+                )
+            },
+        );
+        Ok(Self {
+            heavy: heavy?,
+            light: light?,
+        })
+    }
+
+    fn build() -> Self {
+        let (heavy, light) = rayon::join(
+            || PathCircuits::new(HEAVY_TX_PER_PROOF, HEAVY_TX_MODE),
+            || PathCircuits::new(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE),
+        );
+        Self { heavy, light }
+    }
+
+    pub(crate) fn with_pre(
+        self,
+        (pre_target, pre_data): (BlockPreExecutionTarget, CircuitData<F, C, D>),
+    ) -> Circuits {
+        Circuits {
+            heavy_tx_target: self.heavy.tx_target,
+            heavy_tx_data: self.heavy.tx_data,
+            light_tx_target: self.light.tx_target,
+            light_tx_data: self.light.tx_data,
+            pre_target,
+            pre_data,
+            heavy_chain_target: self.heavy.chain_target,
+            heavy_chain_data: self.heavy.chain_data,
+            light_chain_target: self.light.chain_target,
+            light_chain_data: self.light.chain_data,
+            dummy_heavy_proof: self.heavy.dummy_proof,
+            dummy_light_proof: self.light.dummy_proof,
+        }
+    }
+}
+
+fn force_circuit_build() -> bool {
+    std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|value| value == "1")
+}
+
+fn build_pre() -> (BlockPreExecutionTarget, CircuitData<F, C, D>) {
+    let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
+    (pre.target, pre.builder.build::<C>())
+}
+
+fn load_or_build_circuits<T>(
+    force_build: bool,
+    load: impl FnOnce() -> anyhow::Result<T>,
+    build: impl FnOnce() -> T,
+    on_load_error: impl FnOnce(anyhow::Error),
+) -> T {
+    if force_build {
+        return build();
+    }
+    match load() {
+        Ok(circuits) => circuits,
+        Err(error) => {
+            on_load_error(error);
+            build()
+        }
+    }
+}
+
 impl Circuits {
-    /// Loads only the pre-execution circuit blob. This is the fast path used
-    /// by the startup overlap: the pre-execution proof can start (and hide)
-    /// behind the remaining circuit loads.
-    pub fn load_pre() -> anyhow::Result<(BlockPreExecutionTarget, CircuitData<F, C, D>)> {
-        load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB)
+    /// Loads only the pre-execution circuit. The startup-overlap path proves it
+    /// while the other four circuits load, then reunites both owned parts.
+    pub(crate) fn load_pre() -> (BlockPreExecutionTarget, CircuitData<F, C, D>) {
+        load_or_build_circuits(
+            force_circuit_build(),
+            || load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB),
+            build_pre,
+            |error| {
+                log::warn!("embedded pre circuit unavailable ({error:#}); building from scratch");
+            },
+        )
+    }
+
+    /// Loads the four transaction and chain circuits without touching the pre
+    /// blob. This removes the duplicate pre deserialization from startup.
+    pub(crate) fn load_remaining() -> RemainingCircuits {
+        let force_build = force_circuit_build();
+        if force_build {
+            log::info!("LIGHTER_BUILD_CIRCUITS=1: building startup circuits from scratch");
+        }
+        load_or_build_circuits(
+            force_build,
+            RemainingCircuits::from_embedded,
+            RemainingCircuits::build,
+            |error| {
+                log::warn!(
+                    "remaining embedded circuits unavailable ({error:#}); building from scratch"
+                );
+            },
+        )
     }
 
     /// Reconstructs all five startup circuits from the blobs embedded at
@@ -57,79 +200,59 @@ impl Circuits {
         // Same parallel layout as `Circuits::new`; the five loads are
         // independent (unlike builds, the chain loads do not wait on the
         // transaction circuits).
-        let (pre, (heavy, light)) = rayon::join(
+        let (pre, remaining) = rayon::join(
             || load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB),
-            || {
-                rayon::join(
-                    || {
-                        rayon::join(
-                            || load_blob::<BlockTxTarget>("heavy_tx", HEAVY_TX_BLOB),
-                            || load_blob::<BlockTxChainTarget>("heavy_chain", HEAVY_CHAIN_BLOB),
-                        )
-                    },
-                    || {
-                        rayon::join(
-                            || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
-                            || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
-                        )
-                    },
-                )
-            },
+            RemainingCircuits::from_embedded,
         );
-        let (pre_target, pre_data) = pre?;
-        let ((heavy_tx, heavy_chain), (light_tx, light_chain)) = (
-            (heavy.0?, heavy.1?),
-            (light.0?, light.1?),
-        );
-
-        let dummy_heavy_proof: Proof =
-            bincode::deserialize(include_bytes!("../dummy-heavy-chain-proof.bin"))
-                .expect("embedded heavy chain dummy proof is invalid");
-        let dummy_light_proof: Proof =
-            bincode::deserialize(include_bytes!("../dummy-light-chain-proof.bin"))
-                .expect("embedded light chain dummy proof is invalid");
-
-        Ok(Self {
-            heavy_tx_target: heavy_tx.0,
-            heavy_tx_data: heavy_tx.1,
-            light_tx_target: light_tx.0,
-            light_tx_data: light_tx.1,
-            pre_target,
-            pre_data,
-            heavy_chain_target: heavy_chain.0,
-            heavy_chain_data: heavy_chain.1,
-            light_chain_target: light_chain.0,
-            light_chain_data: light_chain.1,
-            dummy_heavy_proof,
-            dummy_light_proof,
-        })
-    }
-
-    /// Production loader: embedded circuits when available, otherwise a fresh
-    /// build. `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B runs.
-    pub fn load() -> Self {
-        if std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1") {
-            log::info!("LIGHTER_BUILD_CIRCUITS=1: building startup circuits from scratch");
-            return Self::new();
-        }
-        match Self::from_embedded() {
-            Ok(circuits) => circuits,
-            Err(error) => {
-                log::warn!("embedded circuits unavailable ({error:#}); building from scratch");
-                Self::new()
-            }
-        }
+        Ok(remaining?.with_pre(pre?))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use circuit::circuit_serializer::BlockGateSerializer;
     use circuit::embed::EmbedGeneratorSerializer;
     use plonky2::util::serialization::Write as _;
 
     use super::*;
     use crate::api::PROVER_THREAD_STACK_BYTES;
+
+    #[test]
+    fn circuit_load_policy_prefers_embedded_data() {
+        let value = load_or_build_circuits(
+            false,
+            || Ok(7),
+            || panic!("successful embedded load must not build"),
+            |_| panic!("successful embedded load must not report an error"),
+        );
+        assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn circuit_load_policy_honors_forced_build() {
+        let value = load_or_build_circuits(
+            true,
+            || panic!("forced build must not read embedded data"),
+            || 11,
+            |_| panic!("forced build must not report an embedded error"),
+        );
+        assert_eq!(value, 11);
+    }
+
+    #[test]
+    fn circuit_load_policy_builds_after_embedded_failure() {
+        let error_reported = Cell::new(false);
+        let value = load_or_build_circuits(
+            false,
+            || anyhow::bail!("corrupt embedded data"),
+            || 13,
+            |_| error_reported.set(true),
+        );
+        assert_eq!(value, 13);
+        assert!(error_reported.get());
+    }
 
     fn on_big_stack(f: impl FnOnce() + Send + 'static) {
         // Mirror the prove binary's startup: circuit construction recurses
@@ -238,6 +361,34 @@ mod tests {
         );
     }
 
+    fn assert_circuits_identical(expected: &Circuits, actual: &Circuits) {
+        assert_circuit_pair_identical(
+            "pre",
+            (&expected.pre_target, &expected.pre_data),
+            (&actual.pre_target, &actual.pre_data),
+        );
+        assert_circuit_pair_identical(
+            "heavy_tx",
+            (&expected.heavy_tx_target, &expected.heavy_tx_data),
+            (&actual.heavy_tx_target, &actual.heavy_tx_data),
+        );
+        assert_circuit_pair_identical(
+            "heavy_chain",
+            (&expected.heavy_chain_target, &expected.heavy_chain_data),
+            (&actual.heavy_chain_target, &actual.heavy_chain_data),
+        );
+        assert_circuit_pair_identical(
+            "light_tx",
+            (&expected.light_tx_target, &expected.light_tx_data),
+            (&actual.light_tx_target, &actual.light_tx_data),
+        );
+        assert_circuit_pair_identical(
+            "light_chain",
+            (&expected.light_chain_target, &expected.light_chain_data),
+            (&actual.light_chain_target, &actual.light_chain_data),
+        );
+    }
+
     /// Determinism oracle for the embed mechanism: builds all five circuits
     /// from scratch AND loads the embedded set, then asserts value identity.
     /// This is the gate for `Circuits::from_embedded` — if it fails, the
@@ -251,31 +402,7 @@ mod tests {
             let embedded = Circuits::from_embedded()
                 .expect("embedded circuits must load when blobs are compiled in");
 
-            assert_circuit_pair_identical(
-                "pre",
-                (&rebuilt.pre_target, &rebuilt.pre_data),
-                (&embedded.pre_target, &embedded.pre_data),
-            );
-            assert_circuit_pair_identical(
-                "heavy_tx",
-                (&rebuilt.heavy_tx_target, &rebuilt.heavy_tx_data),
-                (&embedded.heavy_tx_target, &embedded.heavy_tx_data),
-            );
-            assert_circuit_pair_identical(
-                "heavy_chain",
-                (&rebuilt.heavy_chain_target, &rebuilt.heavy_chain_data),
-                (&embedded.heavy_chain_target, &embedded.heavy_chain_data),
-            );
-            assert_circuit_pair_identical(
-                "light_tx",
-                (&rebuilt.light_tx_target, &rebuilt.light_tx_data),
-                (&embedded.light_tx_target, &embedded.light_tx_data),
-            );
-            assert_circuit_pair_identical(
-                "light_chain",
-                (&rebuilt.light_chain_target, &rebuilt.light_chain_data),
-                (&embedded.light_chain_target, &embedded.light_chain_data),
-            );
+            assert_circuits_identical(&rebuilt, &embedded);
 
             // The gate serializer round trip below also pins the common data
             // encoding used by the blobs.
@@ -286,6 +413,21 @@ mod tests {
             assert!(!bytes.is_empty());
 
             println!("embedded_matches_rebuilt: all five circuits are value-identical");
+        });
+    }
+
+    #[test]
+    fn split_embedded_load_matches_full_embedded_load() {
+        on_big_stack(|| {
+            let full = Circuits::from_embedded()
+                .expect("embedded circuits must load when blobs are compiled in");
+            let pre = load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB)
+                .expect("embedded pre circuit must load");
+            let split = RemainingCircuits::from_embedded()
+                .expect("remaining embedded circuits must load")
+                .with_pre(pre);
+
+            assert_circuits_identical(&full, &split);
         });
     }
 

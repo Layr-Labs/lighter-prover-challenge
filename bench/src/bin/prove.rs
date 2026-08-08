@@ -18,9 +18,8 @@ use api::{
     Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
     PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
 };
-use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
 use circuit::block::Block;
-use circuit::types::config::{C, CIRCUIT_CONFIG, F};
+use circuit::types::config::F;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -77,16 +76,7 @@ fn main() {
             )
             .expect("invalid prover fixture")
         },
-        || match Circuits::load_pre() {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                log::warn!("embedded pre circuit unavailable ({error:#}); building from scratch");
-                let pre = circuit::block_pre_execution_constraints::BlockPreExecutionCircuit::define(
-                    circuit::types::config::CIRCUIT_CONFIG,
-                );
-                (pre.target, pre.builder.build::<C>())
-            }
-        },
+        Circuits::load_pre,
     );
     let pre_exec = circuit::block_pre_execution::BlockPreExec::from_block(&block);
     let pre_handle = std::thread::Builder::new()
@@ -94,14 +84,18 @@ fn main() {
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .spawn(move || {
             let (pre_target, pre_data) = pre_circuits;
-            prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec)
+            let proof = prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec);
+            ((pre_target, pre_data), proof)
         })
         .expect("pre-execution startup thread must start");
-    // Embedded circuits (deserialized from compile-time blobs) by default;
-    // falls back to building from scratch if they are unavailable, and
-    // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B measurement.
-    let circuits = Circuits::load();
-    let pre_proof = pre_handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    // Load only the other four circuits while the pre-execution proof runs.
+    // The proof thread returns ownership of the pre circuit so startup never
+    // deserializes or builds that circuit a second time.
+    let remaining_circuits = Circuits::load_remaining();
+    let (pre_circuits, pre_proof) = pre_handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let circuits = remaining_circuits.with_pre(pre_circuits);
     let proof = prover::prove_block_after_pre(block, circuits, pre_proof);
     let mut writer = BufWriter::with_capacity(
         PROOF_OUTPUT_BUFFER_BYTES,
