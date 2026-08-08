@@ -9,6 +9,7 @@ use super::vars::EvaluationVarsBase;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
+use crate::gates::gate::SelectorFilterPrefix;
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
 use crate::gates::selectors::LookupSelectors;
@@ -182,6 +183,8 @@ pub(crate) struct VanishingScratch<F> {
     pub constraint_terms_batch: Vec<F>,
     /// Reused selector-filter buffer across batches (survivor-list package).
     pub gate_filters: Vec<F>,
+    /// Left-to-right selector factors shared by later gates in one group.
+    pub gate_filter_prefix: SelectorFilterPrefix<F>,
 }
 
 /// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
@@ -312,6 +315,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         &mut scratch.constraint_terms_batch,
         cpu_gate_indices,
         &mut scratch.gate_filters,
+        &mut scratch.gate_filter_prefix,
         cpu_num_gate_constraints,
     );
     let constraint_terms_batch = &scratch.constraint_terms_batch;
@@ -450,10 +454,12 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                         let wire = wire_col[k];
                         let sigma = sigma_col[k];
                         let x = xs_batch[k];
-                        num_prod.push(wire + beta_k_0 * x + gamma_0);
-                        den_prod.push(wire + beta_0 * sigma + gamma_0);
-                        num_prod_second.push(wire + beta_k_1 * x + gamma_1);
-                        den_prod_second.push(wire + beta_1 * sigma + gamma_1);
+                        let scaled_0 = F::mul_pair([beta_k_0, beta_0], [x, sigma]);
+                        let scaled_1 = F::mul_pair([beta_k_1, beta_1], [x, sigma]);
+                        num_prod.push(wire + scaled_0[0] + gamma_0);
+                        den_prod.push(wire + scaled_0[1] + gamma_0);
+                        num_prod_second.push(wire + scaled_1[0] + gamma_1);
+                        den_prod_second.push(wire + scaled_1[1] + gamma_1);
                     }
                 }
                 for j in j_start + 1..j_end {
@@ -465,10 +471,20 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                         let wire = wire_col[k];
                         let sigma = sigma_col[k];
                         let x = xs_batch[k];
-                        num_prod[k] *= wire + beta_k_0 * x + gamma_0;
-                        den_prod[k] *= wire + beta_0 * sigma + gamma_0;
-                        num_prod_second[k] *= wire + beta_k_1 * x + gamma_1;
-                        den_prod_second[k] *= wire + beta_1 * sigma + gamma_1;
+                        let scaled_0 = F::mul_pair([beta_k_0, beta_0], [x, sigma]);
+                        let scaled_1 = F::mul_pair([beta_k_1, beta_1], [x, sigma]);
+                        let products_0 = F::mul_pair(
+                            [num_prod[k], den_prod[k]],
+                            [wire + scaled_0[0] + gamma_0, wire + scaled_0[1] + gamma_0],
+                        );
+                        let products_1 = F::mul_pair(
+                            [num_prod_second[k], den_prod_second[k]],
+                            [wire + scaled_1[0] + gamma_1, wire + scaled_1[1] + gamma_1],
+                        );
+                        num_prod[k] = products_0[0];
+                        den_prod[k] = products_0[1];
+                        num_prod_second[k] = products_1[0];
+                        den_prod_second[k] = products_1[1];
                     }
                 }
 
@@ -482,9 +498,14 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 let prev_1 = acc_col(1, c);
                 let next_1 = acc_col(1, c + 1);
                 for k in 0..n {
-                    row_0[k] = prev_0[k] * num_prod[k] - next_0[k] * den_prod[k];
-                    row_1[k] = prev_1[k] * num_prod_second[k]
-                        - next_1[k] * den_prod_second[k];
+                    let products_0 =
+                        F::mul_pair([prev_0[k], next_0[k]], [num_prod[k], den_prod[k]]);
+                    let products_1 = F::mul_pair(
+                        [prev_1[k], next_1[k]],
+                        [num_prod_second[k], den_prod_second[k]],
+                    );
+                    row_0[k] = products_0[0] - products_0[1];
+                    row_1[k] = products_1[0] - products_1[1];
                 }
             }
         } else {
@@ -505,8 +526,9 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                         let sigma_col = &s_sigmas_cols[j_start * n..][..n];
                         let beta_k_i = beta_k_is[i * num_routed_wires + j_start];
                         for k in 0..n {
-                            num_prod.push(wire_col[k] + beta_k_i * xs_batch[k] + gamma);
-                            den_prod.push(wire_col[k] + beta * sigma_col[k] + gamma);
+                            let scaled = F::mul_pair([beta_k_i, beta], [xs_batch[k], sigma_col[k]]);
+                            num_prod.push(wire_col[k] + scaled[0] + gamma);
+                            den_prod.push(wire_col[k] + scaled[1] + gamma);
                         }
                     }
                     for j in j_start + 1..j_end {
@@ -514,8 +536,16 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                         let sigma_col = &s_sigmas_cols[j * n..][..n];
                         let beta_k_i = beta_k_is[i * num_routed_wires + j];
                         for k in 0..n {
-                            num_prod[k] *= wire_col[k] + beta_k_i * xs_batch[k] + gamma;
-                            den_prod[k] *= wire_col[k] + beta * sigma_col[k] + gamma;
+                            let scaled = F::mul_pair([beta_k_i, beta], [xs_batch[k], sigma_col[k]]);
+                            let products = F::mul_pair(
+                                [num_prod[k], den_prod[k]],
+                                [
+                                    wire_col[k] + scaled[0] + gamma,
+                                    wire_col[k] + scaled[1] + gamma,
+                                ],
+                            );
+                            num_prod[k] = products[0];
+                            den_prod[k] = products[1];
                         }
                     }
 
@@ -524,7 +554,9 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     let prev_col = acc_col(i, c);
                     let next_col = acc_col(i, c + 1);
                     for k in 0..n {
-                        row[k] = prev_col[k] * num_prod[k] - next_col[k] * den_prod[k];
+                        let products =
+                            F::mul_pair([prev_col[k], next_col[k]], [num_prod[k], den_prod[k]]);
+                        row[k] = products[0] - products[1];
                     }
                 }
             }
@@ -1139,12 +1171,14 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
         .filter(|i| !excluded_gate_indices.contains(i))
         .collect::<Vec<_>>();
     let mut filters = Vec::with_capacity(vars_batch.len());
+    let mut filter_prefix = SelectorFilterPrefix::default();
     evaluate_gate_constraints_base_batch_into_cpu_gates(
         common_data,
         vars_batch,
         constraints_batch,
         &cpu_gate_indices,
         &mut filters,
+        &mut filter_prefix,
         num_constraint_rows,
     );
 }
@@ -1158,21 +1192,29 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
     constraints_batch: &mut Vec<F>,
     cpu_gate_indices: &[usize],
     filters: &mut Vec<F>,
+    filter_prefix: &mut SelectorFilterPrefix<F>,
     num_constraint_rows: usize,
 ) {
     debug_assert!(num_constraint_rows <= common_data.num_gate_constraints);
     constraints_batch.clear();
     constraints_batch.resize(num_constraint_rows * vars_batch.len(), F::ZERO);
+    filter_prefix.reset();
     for &i in cpu_gate_indices {
         let gate = &common_data.gates[i];
         let selector_index = common_data.selectors_info.selector_indices[i];
-        gate.0.eval_filtered_base_batch(
+        let group = common_data.selectors_info.groups[selector_index].clone();
+        debug_assert!(group.contains(&i));
+        let batch_size = vars_batch.len();
+        let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
+        let filter_prefix = filter_prefix.prepare(selector_index, group.clone(), i, selector_col);
+        gate.0.eval_filtered_base_batch_with_prefix(
             vars_batch,
             i,
             selector_index,
-            common_data.selectors_info.groups[selector_index].clone(),
+            group,
             common_data.selectors_info.num_selectors(),
             common_data.num_lookup_selectors,
+            filter_prefix,
             filters,
             constraints_batch,
         );
