@@ -63,3 +63,7 @@ tynm = { version = "0.1.6", default-features = false }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
+
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.build-dependencies]
+metal = "0.33.0"
+
