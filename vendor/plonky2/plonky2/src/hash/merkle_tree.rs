@@ -444,8 +444,8 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
             return H::two_to_one(left_digest, right_digest);
         }
 
-        // Rayon task creation dominates the tiny subtrees near the leaves. Keep
-        // enough parallelism at the upper levels, then recurse synchronously.
+        // Four-way interleaved base cases make the work below 64 leaves cheaper
+        // than the Rayon scheduling and work-stealing overhead.
         let (left_digest, right_digest) = if num_leaves > 64 {
             plonky2_maybe_rayon::join(
                 || fill_subtree_flat::<F, H>(left_digests_buf, left_leaves, leaf_width, half),
