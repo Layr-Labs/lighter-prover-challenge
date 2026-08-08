@@ -711,6 +711,11 @@ pub(crate) fn prove_block_after_pre(
     // before the final block proof — the process's peak-RSS moment — stacks its
     // own extensions on top of them.
     circuits.release_finished_circuit_extensions();
+    // The transaction/chain phase is the last consumer of the small retained-
+    // column cache. Final-block replacements all exceed its cap, so keeping
+    // idle entries would add up to 160 MiB to peak RSS without a possible hit.
+    // This purge is opportunistic and never waits.
+    plonky2::hash::poseidon2::purge_cached_columns();
 
     let (light_chain_input, heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);

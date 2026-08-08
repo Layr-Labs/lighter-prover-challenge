@@ -3,6 +3,7 @@ use core::marker::PhantomData;
 use core::mem::{size_of, size_of_val};
 use core::slice;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use metal::{
@@ -82,6 +83,12 @@ const STAGING_CHUNK: usize = 1 << 19;
 /// peak unified-memory pressure.
 const MAX_CACHED_QUOTIENT_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
+/// Production transaction proofs repeatedly allocate 80 MiB Z/partial-product
+/// columns and 64 MiB quotient columns; chain/pre-execution uses 20/16 MiB.
+/// Two slots cover the pair retained together without becoming a general heap
+/// or retaining 136/544 MiB wire and 256+ MiB final-block columns.
+const MAX_CACHED_COLUMN_BYTES: u64 = 80 * 1024 * 1024;
+const MAX_CACHED_COLUMNS: usize = 2;
 
 struct MetalShared {
     device: Device,
@@ -98,6 +105,9 @@ struct MetalShared {
     /// Kept separate from the tree pool so quotient allocation never delays
     /// Merkle admission or contends on its condition variable.
     quotient_output_pool: Arc<Mutex<QuotientOutputPool>>,
+    /// Completed retained-column allocations, isolated from both the blocking
+    /// Merkle pool and quotient-output cache. Access is always opportunistic.
+    column_pool: Arc<Mutex<ColumnBufferPool>>,
     available: Condvar,
     /// Per-`log2(lde_size)` concatenated FFT twiddle rows (canonical u64), with
     /// `offsets[lg_half_m]` giving each stage row's element offset.
@@ -119,6 +129,8 @@ pub(crate) struct PoseidonGateQuotientJob<F> {
     command_buffer: CommandBuffer,
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
+    /// Keeps bound inputs logically alive until Metal stops reading them.
+    column_readers: [MetalColumns<F>; 2],
     len: usize,
     _job: GpuJobGuard,
     _phantom: PhantomData<F>,
@@ -131,6 +143,7 @@ pub(crate) struct RangeCheckGateQuotientJob<F> {
     command_buffer: CommandBuffer,
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
+    column_readers: [MetalColumns<F>; 2],
     len: usize,
     _job: GpuJobGuard,
     _phantom: PhantomData<F>,
@@ -190,6 +203,11 @@ fn recycle_completed_quotient_output(
 
 impl<F> Drop for PoseidonGateQuotientJob<F> {
     fn drop(&mut self) {
+        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
+            for columns in &self.column_readers {
+                columns.poison_recycling();
+            }
+        }
         recycle_completed_quotient_output(
             &self.command_buffer,
             &mut self.output,
@@ -200,6 +218,11 @@ impl<F> Drop for PoseidonGateQuotientJob<F> {
 
 impl<F> Drop for RangeCheckGateQuotientJob<F> {
     fn drop(&mut self) {
+        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
+            for columns in &self.column_readers {
+                columns.poison_recycling();
+            }
+        }
         recycle_completed_quotient_output(
             &self.command_buffer,
             &mut self.output,
@@ -300,7 +323,21 @@ pub struct MetalColumns<F> {
     rows: usize,
     cols: usize,
     uniqueness: Arc<()>,
+    /// Only the narrowly pooled `allocate_columns` path carries this token.
+    recycle: Option<Arc<ColumnRecycle>>,
     _phantom: PhantomData<F>,
+}
+
+const COLUMN_RECYCLE_PENDING: u8 = 0;
+const COLUMN_RECYCLE_READY: u8 = 1;
+const COLUMN_RECYCLE_POISONED: u8 = 2;
+
+/// Shared by every logical clone of one allocation. Readiness is monotonic:
+/// the initial Merkle read may make it ready, while any incomplete later GPU
+/// reader terminally poisons it; a retry can never undo that poison.
+struct ColumnRecycle {
+    pool: Arc<Mutex<ColumnBufferPool>>,
+    state: AtomicU8,
 }
 
 impl<F> MetalColumns<F> {
@@ -313,7 +350,50 @@ impl<F> MetalColumns<F> {
             rows,
             cols,
             uniqueness: Arc::new(()),
+            recycle: None,
             _phantom: PhantomData,
+        }
+    }
+
+    fn with_recyclable_buffer(
+        buffer: Buffer,
+        rows: usize,
+        cols: usize,
+        pool: Arc<Mutex<ColumnBufferPool>>,
+    ) -> Self {
+        let base = buffer.contents() as usize;
+        Self {
+            buffer,
+            base,
+            rows,
+            cols,
+            uniqueness: Arc::new(()),
+            recycle: Some(Arc::new(ColumnRecycle {
+                pool,
+                state: AtomicU8::new(COLUMN_RECYCLE_PENDING),
+            })),
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Records that the initializing Merkle command completed successfully.
+    fn mark_recycling_ready(&self) {
+        if let Some(recycle) = &self.recycle {
+            let _ = recycle.state.compare_exchange(
+                COLUMN_RECYCLE_PENDING,
+                COLUMN_RECYCLE_READY,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Permanently prevents this allocation from entering the cache.
+    fn poison_recycling(&self) {
+        if let Some(recycle) = &self.recycle {
+            recycle
+                .state
+                .store(COLUMN_RECYCLE_POISONED, Ordering::Release);
         }
     }
 }
@@ -327,7 +407,29 @@ impl<F> Clone for MetalColumns<F> {
             rows: self.rows,
             cols: self.cols,
             uniqueness: self.uniqueness.clone(),
+            recycle: self.recycle.clone(),
             _phantom: PhantomData,
+        }
+    }
+}
+
+impl<F> Drop for MetalColumns<F> {
+    fn drop(&mut self) {
+        // Count=1 proves that no retained tree, CPU accessor, or job-owned GPU
+        // reader clone remains. The buffer cannot alias a live logical owner.
+        if Arc::strong_count(&self.uniqueness) != 1 {
+            return;
+        }
+        let Some(recycle) = &self.recycle else {
+            return;
+        };
+        if recycle.state.load(Ordering::Acquire) != COLUMN_RECYCLE_READY {
+            return;
+        }
+        // Pooling is not correctness-critical: contention or poisoning falls
+        // back to ordinary Objective-C release rather than delaying Drop.
+        if let Ok(mut pool) = recycle.pool.try_lock() {
+            pool.recycle(self.buffer.clone());
         }
     }
 }
@@ -443,6 +545,51 @@ impl QuotientOutputPool {
         if length > smallest_length {
             self.free[smallest_index] = buffer;
         }
+    }
+}
+
+/// A deliberately tiny cache, not a general Metal heap: at most two completed
+/// retained-column buffers no larger than the recurring 80 MiB shape survive.
+#[derive(Default)]
+struct ColumnBufferPool {
+    free: Vec<Buffer>,
+}
+
+impl ColumnBufferPool {
+    fn take_best_fit(&mut self, bytes: u64) -> Option<Buffer> {
+        let index = self
+            .free
+            .iter()
+            .enumerate()
+            .filter(|(_, buffer)| buffer.length() >= bytes)
+            .min_by_key(|(_, buffer)| buffer.length())
+            .map(|(index, _)| index)?;
+        Some(self.free.swap_remove(index))
+    }
+
+    fn recycle(&mut self, buffer: Buffer) {
+        let length = buffer.length();
+        if length > MAX_CACHED_COLUMN_BYTES {
+            return;
+        }
+        if self.free.len() < MAX_CACHED_COLUMNS {
+            self.free.push(buffer);
+            return;
+        }
+        let (smallest_index, smallest_length) = self
+            .free
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, cached)| cached.length())
+            .map(|(index, cached)| (index, cached.length()))
+            .expect("full retained-column pool is nonempty");
+        if length > smallest_length {
+            self.free[smallest_index] = buffer;
+        }
+    }
+
+    fn purge(&mut self) {
+        self.free.clear();
     }
 }
 
@@ -698,6 +845,20 @@ pub fn prewarm() {
             let _ = force_context();
         })
         .ok();
+}
+
+/// Releases idle cached columns before the one-off final block raises peak
+/// memory. It never initializes Metal and never waits for the pool mutex.
+pub fn purge_cached_columns() {
+    if !context_ready() {
+        return;
+    }
+    let Ok(context) = &*CONTEXT else {
+        return;
+    };
+    if let Ok(mut pool) = context.column_pool.try_lock() {
+        pool.purge();
+    }
 }
 
 /// True while the prover is inside an exclusive serial phase (pre-execution
@@ -1452,6 +1613,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         });
     drop(job);
     if !all_ok {
+        columns.poison_recycling();
         log::warn!("streamed Metal sponge build failed; falling back to the classic path");
         return None;
     }
@@ -1459,12 +1621,14 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let nodes = unsafe {
         slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
     };
-    Some(tree_from_levels::<F>(
+    let tree = tree_from_levels::<F>(
         nodes,
         &level_offsets,
         leaf_count,
         cap_height,
-    ))
+    );
+    columns.mark_recycling_ready();
+    Some(tree)
 }
 
 pub(crate) fn build_merkle_tree_shared<F: RichField>(
@@ -1493,8 +1657,12 @@ pub(crate) fn build_merkle_tree_shared<F: RichField>(
         leaf_count,
         cap_height,
     ) {
-        Ok(tree) => Some(tree),
+        Ok(tree) => {
+            columns.mark_recycling_ready();
+            Some(tree)
+        }
         Err(error) => {
+            columns.poison_recycling();
             log::warn!("Metal shared-column hashing failed; using CPU Merkle hashing: {error}");
             None
         }
@@ -1776,6 +1944,7 @@ impl MetalShared {
                     detached_readback: false,
                 }),
                 quotient_output_pool: Arc::new(Mutex::new(QuotientOutputPool::default())),
+                column_pool: Arc::new(Mutex::new(ColumnBufferPool::default())),
                 available: Condvar::new(),
                 ntt_roots: Mutex::new(HashMap::new()),
                 ntt_shifts: Mutex::new(HashMap::new()),
@@ -1795,11 +1964,31 @@ impl MetalShared {
         let bytes = len
             .checked_mul(size_of::<u64>())
             .ok_or("Metal column size overflow")?;
-        let buffer = autoreleasepool(|| {
-            self.device
-                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+        let bytes = bytes as u64;
+        let cached = if bytes <= MAX_CACHED_COLUMN_BYTES {
+            self.column_pool
+                .try_lock()
+                .ok()
+                .and_then(|mut pool| pool.take_best_fit(bytes))
+        } else {
+            None
+        };
+        let buffer = cached.unwrap_or_else(|| {
+            autoreleasepool(|| {
+                self.device
+                    .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+            })
         });
-        Ok(MetalColumns::with_buffer(buffer, rows, cols))
+        if bytes <= MAX_CACHED_COLUMN_BYTES {
+            Ok(MetalColumns::with_recyclable_buffer(
+                buffer,
+                rows,
+                cols,
+                Arc::clone(&self.column_pool),
+            ))
+        } else {
+            Ok(MetalColumns::with_buffer(buffer, rows, cols))
+        }
     }
 
     fn acquire_quotient_output(&self, bytes: u64) -> Buffer {
@@ -1869,6 +2058,7 @@ impl MetalShared {
             command_buffer,
             output: Some(output),
             output_pool: Arc::clone(&self.quotient_output_pool),
+            column_readers: [wires.clone(), constants.clone()],
             len,
             _job: job_guard,
             _phantom: PhantomData,
@@ -1935,6 +2125,7 @@ impl MetalShared {
             command_buffer,
             output: Some(output),
             output_pool: Arc::clone(&self.quotient_output_pool),
+            column_readers: [wires.clone(), constants.clone()],
             len,
             _job: job_guard,
             _phantom: PhantomData,
@@ -3080,6 +3271,135 @@ mod tests {
     }
 
     #[test]
+    fn retained_column_pool_is_bounded_and_best_fit() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let buffer = |bytes| {
+            autoreleasepool(|| {
+                device.new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+            })
+        };
+        let mib = 1024 * 1024;
+        let mut pool = ColumnBufferPool::default();
+
+        pool.recycle(buffer(16 * mib));
+        pool.recycle(buffer(80 * mib));
+        pool.recycle(buffer(64 * mib));
+        assert_eq!(pool.free.len(), MAX_CACHED_COLUMNS);
+        let mut lengths = pool
+            .free
+            .iter()
+            .map(|cached| cached.length())
+            .collect::<Vec<_>>();
+        lengths.sort_unstable();
+        assert_eq!(lengths, vec![64 * mib, 80 * mib]);
+
+        let sixty_four = pool.take_best_fit(20 * mib).expect("64 MiB best fit");
+        assert_eq!(sixty_four.length(), 64 * mib);
+        let eighty = pool.take_best_fit(1).expect("remaining 80 MiB buffer");
+        assert_eq!(eighty.length(), 80 * mib);
+        assert!(pool.take_best_fit(1).is_none());
+
+        pool.recycle(buffer(MAX_CACHED_COLUMN_BYTES + 1));
+        assert!(pool.free.is_empty(), "oversized columns must not be cached");
+    }
+
+    #[test]
+    fn retained_columns_recycle_only_when_completed_unique_and_unpoisoned() {
+        type F = GoldilocksField;
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let buffer = || {
+            autoreleasepool(|| {
+                device.new_buffer(128, MTLResourceOptions::StorageModeShared)
+            })
+        };
+        let pool = Arc::new(Mutex::new(ColumnBufferPool::default()));
+
+        // Allocation alone does not prove initialization/Merkle completion.
+        drop(MetalColumns::<F>::with_recyclable_buffer(
+            buffer(),
+            2,
+            8,
+            Arc::clone(&pool),
+        ));
+        assert!(pool.lock().unwrap().free.is_empty());
+
+        let completed_buffer = buffer();
+        let completed_ptr = completed_buffer.contents();
+        let completed = MetalColumns::<F>::with_recyclable_buffer(
+            completed_buffer,
+            2,
+            8,
+            Arc::clone(&pool),
+        );
+        completed.mark_recycling_ready();
+        let retained_tree = completed.clone();
+        drop(completed);
+        assert!(pool.lock().unwrap().free.is_empty());
+        drop(retained_tree);
+        let reused = pool
+            .lock()
+            .unwrap()
+            .take_best_fit(128)
+            .expect("final completed clone must recycle");
+        assert_eq!(reused.contents(), completed_ptr);
+        drop(reused);
+
+        let poisoned = MetalColumns::<F>::with_recyclable_buffer(
+            buffer(),
+            2,
+            8,
+            Arc::clone(&pool),
+        );
+        poisoned.mark_recycling_ready();
+        let in_flight_reader = poisoned.clone();
+        in_flight_reader.poison_recycling();
+        drop(poisoned);
+        drop(in_flight_reader);
+        assert!(pool.lock().unwrap().free.is_empty());
+    }
+
+    #[test]
+    fn completed_metal_merkle_build_reuses_its_retained_columns() {
+        type F = GoldilocksField;
+        if Device::system_default().is_none() {
+            return;
+        }
+        struct ExclusivePhaseReset;
+        impl Drop for ExclusivePhaseReset {
+            fn drop(&mut self) {
+                set_exclusive_gpu_phase(false);
+                purge_cached_columns();
+            }
+        }
+
+        let context = shared_context().expect("Metal context must initialize");
+        purge_cached_columns();
+        set_exclusive_gpu_phase(true);
+        let _reset = ExclusivePhaseReset;
+        let rows = 1 << 16;
+        let cols = 8;
+        let cap_height = 4;
+        let mut columns = context
+            .allocate_columns::<F>(rows, cols)
+            .expect("retained Metal columns");
+        for column in columns.columns_mut().expect("unique initialization") {
+            column.fill(F::ZERO);
+        }
+        let original_ptr = columns.buffer.contents();
+        build_merkle_tree_shared(&columns, cap_height).expect("completed Metal Merkle build");
+        drop(columns);
+
+        let reused = context
+            .allocate_columns::<F>(rows, cols)
+            .expect("reused retained Metal columns");
+        assert_eq!(reused.buffer.contents(), original_ptr);
+    }
+
+    #[test]
     fn quotient_output_recycles_only_after_completion() {
         type F = GoldilocksField;
         let Some(device) = Device::system_default() else {
@@ -3096,6 +3416,10 @@ mod tests {
             command_buffer: not_enqueued,
             output: Some(output()),
             output_pool: Arc::clone(&pool),
+            column_readers: [
+                MetalColumns::with_buffer(output(), 1, 8),
+                MetalColumns::with_buffer(output(), 1, 8),
+            ],
             len: 8,
             _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
@@ -3115,6 +3439,10 @@ mod tests {
             command_buffer: completed,
             output: Some(completed_output),
             output_pool: Arc::clone(&pool),
+            column_readers: [
+                MetalColumns::with_buffer(output(), 1, 8),
+                MetalColumns::with_buffer(output(), 1, 8),
+            ],
             len: 8,
             _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
@@ -3126,6 +3454,84 @@ mod tests {
             .expect("completed output must be reusable");
         assert_eq!(reused.contents(), completed_output_ptr);
         assert!(pool.lock().unwrap().free.is_empty());
+    }
+
+    #[test]
+    fn quotient_job_retains_and_poisons_incomplete_column_readers() {
+        type F = GoldilocksField;
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let queue = device.new_command_queue();
+        let output_pool = Arc::new(Mutex::new(QuotientOutputPool::default()));
+        let column_pool = Arc::new(Mutex::new(ColumnBufferPool::default()));
+        let buffer = |bytes| {
+            autoreleasepool(|| {
+                device.new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+            })
+        };
+
+        let incomplete_reader = MetalColumns::<F>::with_recyclable_buffer(
+            buffer(128),
+            2,
+            8,
+            Arc::clone(&column_pool),
+        );
+        incomplete_reader.mark_recycling_ready();
+        drop(PoseidonGateQuotientJob::<F> {
+            command_buffer: queue.new_command_buffer().to_owned(),
+            output: Some(buffer(64)),
+            output_pool: Arc::clone(&output_pool),
+            column_readers: [
+                incomplete_reader.clone(),
+                MetalColumns::with_buffer(buffer(128), 2, 8),
+            ],
+            len: 8,
+            _job: GpuJobGuard::begin(),
+            _phantom: PhantomData,
+        });
+        drop(incomplete_reader);
+        assert!(
+            column_pool.lock().unwrap().free.is_empty(),
+            "an incomplete Metal reader must permanently poison reuse"
+        );
+
+        let completed_reader_buffer = buffer(128);
+        let completed_reader_ptr = completed_reader_buffer.contents();
+        let completed_reader = MetalColumns::<F>::with_recyclable_buffer(
+            completed_reader_buffer,
+            2,
+            8,
+            Arc::clone(&column_pool),
+        );
+        completed_reader.mark_recycling_ready();
+        let completed = autoreleasepool(|| {
+            let command_buffer = queue.new_command_buffer();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+            command_buffer.to_owned()
+        });
+        drop(PoseidonGateQuotientJob::<F> {
+            command_buffer: completed,
+            output: Some(buffer(64)),
+            output_pool,
+            column_readers: [
+                completed_reader.clone(),
+                MetalColumns::with_buffer(buffer(128), 2, 8),
+            ],
+            len: 8,
+            _job: GpuJobGuard::begin(),
+            _phantom: PhantomData,
+        });
+        assert!(column_pool.lock().unwrap().free.is_empty());
+        drop(completed_reader);
+        let reused = column_pool
+            .lock()
+            .unwrap()
+            .take_best_fit(128)
+            .expect("the final completed reader must recycle");
+        assert_eq!(reused.contents(), completed_reader_ptr);
     }
     use crate::gates::selectors::UNUSED_SELECTOR;
     use crate::hash::hash_types::HashOut;
