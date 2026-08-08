@@ -36,24 +36,28 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // (no indirection) or omitting the trailing NUL would make jemalloc read the
 // string bytes as a pointer and crash. This is a default: the environment and
 // /etc/malloc.conf can still override it.
+// Use a moderate per-bin cache depth to reduce allocator arena traffic while
+// bounding retained memory under the three-wide proof pipeline.
 #[cfg(not(target_env = "msvc"))]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
+static MALLOC_CONF: &[u8; 64] =
+    b"dirty_decay_ms:-1,muzzy_decay_ms:-1,tcache_nslots_small_max:256\0";
 
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
-    // First statement in the process: the Metal shader compile and pipeline
-    // lowering behind the GPU hash path cost the better part of a second on a
-    // cold OS shader cache, and the benchmark sandbox denies writes to that
-    // cache, which disables it entirely — so every scored worker pays the full
-    // price. Starting it here overlaps it with the startup work below instead
-    // of stalling the first proving step that wants the GPU. Pure scheduling:
-    // the compiled kernels are identical either way.
-    plonky2::hash::poseidon2::prewarm_gpu();
     env_logger::init();
+    // Rayon otherwise occupies every logical CPU while the sequential chain spine and
+    // final-block lanes run as scoped threads outside the pool. Reserve one CPU so those
+    // latency-critical lanes can advance without displacing a hashing worker each time.
+    let rayon_threads = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .max(1);
     rayon::ThreadPoolBuilder::new()
+        .num_threads(rayon_threads)
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
         .expect("cannot configure prover thread pool");
@@ -99,11 +103,7 @@ fn main() {
     // every allocation one by one, and none of it is observable — the kernel
     // reclaims the address space wholesale at exit. Every Metal command buffer
     // in the hash path is `commit()`ed and then `wait_until_completed()`ed
-    // before its results are read. The one detached thread this binary spawns
-    // is the GPU pre-warm above, which only populates a cache of compiled
-    // kernels and produces nothing anyone reads back, so there is no in-flight
-    // background work left to lose here.
+    // before its results are read, and nothing in this binary spawns a detached
+    // thread, so there is no in-flight background work left to lose here.
     std::process::exit(0);
 }
-
-// p90-fire-174-1786149031
