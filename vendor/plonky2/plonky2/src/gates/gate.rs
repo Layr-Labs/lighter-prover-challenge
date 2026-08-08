@@ -240,27 +240,62 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
     ) {
         let batch_size = vars_batch.len();
         debug_assert!(self.num_constraints() * batch_size <= combined_gate_constraints.len());
-        // Contiguous-column filter computation: read the selector constant
-        // column once and accumulate the same product terms, in the same
-        // order, as the per-point `compute_filter` — identical field values
-        // without the per-point strided views.
         let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
         let mut factors = group_range
             .filter(|&i| i != row)
             .chain((num_selectors > 1).then_some(UNUSED_SELECTOR));
         filters.clear();
         if let Some(i) = factors.next() {
-            let k = F::from_canonical_usize(i);
-            filters.extend(selector_col.iter().map(|&s| k - s));
+            let factor = F::from_canonical_usize(i);
+            filters.extend(selector_col.iter().map(|&s| factor - s));
         } else {
             filters.resize(batch_size, F::ONE);
         }
         for i in factors {
-            let k = F::from_canonical_usize(i);
+            let factor = F::from_canonical_usize(i);
             for (filter, &s) in filters.iter_mut().zip(selector_col) {
-                *filter *= k - s;
+                *filter *= factor - s;
             }
         }
+        vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
+        self.eval_unfiltered_base_batch_accumulate(vars_batch, filters, combined_gate_constraints);
+    }
+
+    /// Internal batch-filter entry point with a shared left prefix.
+    ///
+    /// `filter_prefix` is empty for the first gate in a selector group. For a
+    /// later gate at row `r`, it contains exactly the left-to-right product of
+    /// `(k - selector)` for every group row `k < r`, with one value per batch
+    /// point. The default implementation appends rows after `r` and the
+    /// optional unused-selector factor in the scalar filter's original order.
+    #[doc(hidden)]
+    fn eval_filtered_base_batch_with_prefix(
+        &self,
+        mut vars_batch: EvaluationVarsBaseBatch<F>,
+        row: usize,
+        selector_index: usize,
+        group_range: Range<usize>,
+        num_selectors: usize,
+        num_lookup_selectors: usize,
+        filter_prefix: &[F],
+        filters: &mut Vec<F>,
+        combined_gate_constraints: &mut [F],
+    ) {
+        let batch_size = vars_batch.len();
+        debug_assert!(self.num_constraints() * batch_size <= combined_gate_constraints.len());
+        // Continue after the caller's shared left prefix, accumulating the
+        // remaining product terms in the same order as `compute_filter`.
+        // This retains identical raw field values while avoiding repeated
+        // prefix work across gates in the same selector group.
+        let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
+        compute_filter_base_batch_from_prefix(
+            row,
+            group_range,
+            selector_col,
+            num_selectors > 1,
+            filter_prefix,
+            filters,
+        );
         vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
         self.eval_unfiltered_base_batch_accumulate(vars_batch, filters, combined_gate_constraints);
     }
@@ -444,6 +479,92 @@ fn compute_filter<K: Field>(row: usize, group_range: Range<usize>, s: K, many_se
         .product()
 }
 
+/// Reusable state for selector-filter prefixes within one base-field batch.
+#[derive(Debug, Default)]
+pub(crate) struct SelectorFilterPrefix<F> {
+    selector_index: Option<usize>,
+    prefix_end: usize,
+    values: Vec<F>,
+}
+
+impl<F: Field> SelectorFilterPrefix<F> {
+    pub(crate) fn reset(&mut self) {
+        self.selector_index = None;
+        self.prefix_end = 0;
+        self.values.clear();
+    }
+
+    pub(crate) fn prepare(
+        &mut self,
+        selector_index: usize,
+        group_range: Range<usize>,
+        row: usize,
+        selector_col: &[F],
+    ) -> &[F] {
+        debug_assert!(group_range.contains(&row));
+        if self.selector_index != Some(selector_index) || row < self.prefix_end {
+            self.values.clear();
+            self.selector_index = Some(selector_index);
+            self.prefix_end = group_range.start;
+        }
+        debug_assert!(
+            (self.prefix_end == group_range.start && self.values.is_empty())
+                || (self.prefix_end > group_range.start && self.values.len() == selector_col.len())
+        );
+        while self.prefix_end < row {
+            extend_filter_prefix(selector_col, self.prefix_end, &mut self.values);
+            self.prefix_end += 1;
+        }
+        &self.values
+    }
+}
+
+/// Extends a batch of selector-filter prefixes by one factor, retaining the
+/// scalar filter's exact left-to-right multiplication order.
+fn extend_filter_prefix<F: Field>(selector_col: &[F], factor_row: usize, prefix: &mut Vec<F>) {
+    let factor = F::from_canonical_usize(factor_row);
+    if prefix.is_empty() {
+        prefix.extend(selector_col.iter().map(|&s| factor - s));
+    } else {
+        debug_assert_eq!(prefix.len(), selector_col.len());
+        for (value, &s) in prefix.iter_mut().zip(selector_col) {
+            *value *= factor - s;
+        }
+    }
+}
+
+fn compute_filter_base_batch_from_prefix<F: Field>(
+    row: usize,
+    group_range: Range<usize>,
+    selector_col: &[F],
+    many_selectors: bool,
+    prefix: &[F],
+    filters: &mut Vec<F>,
+) {
+    debug_assert!(group_range.contains(&row));
+    debug_assert!(prefix.is_empty() || prefix.len() == selector_col.len());
+    filters.clear();
+    if selector_col.is_empty() {
+        return;
+    }
+    filters.extend_from_slice(prefix);
+    let mut factors = (row + 1..group_range.end).chain(many_selectors.then_some(UNUSED_SELECTOR));
+    if filters.is_empty() {
+        if let Some(i) = factors.next() {
+            let factor = F::from_canonical_usize(i);
+            filters.extend(selector_col.iter().map(|&s| factor - s));
+        } else {
+            filters.resize(selector_col.len(), F::ONE);
+        }
+    }
+    for i in factors {
+        let factor = F::from_canonical_usize(i);
+        for (filter, &s) in filters.iter_mut().zip(selector_col) {
+            *filter *= factor - s;
+        }
+    }
+}
+
 fn compute_filter_circuit<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     row: usize,
@@ -461,4 +582,104 @@ fn compute_filter_circuit<F: RichField + Extendable<D>, const D: usize>(
         })
         .collect::<Vec<_>>();
     builder.mul_many_extension(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::Field64;
+
+    type F = GoldilocksField;
+
+    #[test]
+    fn shared_filter_prefix_matches_scalar_raw_words() {
+        let mut selector_col = vec![
+            GoldilocksField(0),
+            GoldilocksField(1),
+            GoldilocksField(F::ORDER - 1),
+            GoldilocksField(F::ORDER),
+            GoldilocksField(F::ORDER + 1),
+            GoldilocksField(u32::MAX as u64),
+            GoldilocksField(1 << 32),
+            GoldilocksField(u64::MAX),
+        ];
+        let mut state = 0x5345_4c45_4354_4f52u64;
+        for _ in 0..128 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            selector_col.push(GoldilocksField(state));
+        }
+
+        for group in [0..1, 2..5, 3..9] {
+            for many_selectors in [false, true] {
+                let mut prefix = Vec::new();
+                let mut filters = Vec::new();
+                let mut prefix_end = group.start;
+                for row in group.clone() {
+                    while prefix_end < row {
+                        extend_filter_prefix(&selector_col, prefix_end, &mut prefix);
+                        prefix_end += 1;
+                    }
+                    compute_filter_base_batch_from_prefix(
+                        row,
+                        group.clone(),
+                        &selector_col,
+                        many_selectors,
+                        &prefix,
+                        &mut filters,
+                    );
+                    let expected = selector_col
+                        .iter()
+                        .map(|&s| compute_filter(row, group.clone(), s, many_selectors).0)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        filters.iter().map(|value| value.0).collect::<Vec<_>>(),
+                        expected,
+                        "group={group:?}, row={row}, many_selectors={many_selectors}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn filter_prefix_state_handles_sparse_groups_and_rewinds() {
+        let selector_col = [
+            GoldilocksField(0),
+            GoldilocksField(1),
+            GoldilocksField(F::ORDER + 1),
+            GoldilocksField(u64::MAX),
+        ];
+        let cases = [
+            (0, 2..7, 2),
+            (0, 2..7, 5),
+            (1, 9..12, 11),
+            (1, 9..12, 9),
+            (0, 2..7, 4),
+        ];
+        let mut state = SelectorFilterPrefix::default();
+        let mut filters = Vec::new();
+        for (selector_index, group, row) in cases {
+            let prefix = state.prepare(selector_index, group.clone(), row, &selector_col);
+            compute_filter_base_batch_from_prefix(
+                row,
+                group.clone(),
+                &selector_col,
+                true,
+                prefix,
+                &mut filters,
+            );
+            let expected = selector_col
+                .iter()
+                .map(|&s| compute_filter(row, group.clone(), s, true).0)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                filters.iter().map(|value| value.0).collect::<Vec<_>>(),
+                expected,
+                "selector_index={selector_index}, group={group:?}, row={row}",
+            );
+        }
+    }
 }
