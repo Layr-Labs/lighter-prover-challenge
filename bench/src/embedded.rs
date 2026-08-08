@@ -53,13 +53,13 @@ impl RemainingEmbeddedCircuits {
         let (light_chain_target, light_chain_data) = self.light_chain;
         Circuits {
             heavy_tx_target,
-            heavy_tx_data: std::sync::RwLock::new(heavy_tx_data),
+            heavy_tx_data,
             light_tx_target,
             light_tx_data,
             pre_target,
             pre_data,
             heavy_chain_target,
-            heavy_chain_data: std::sync::RwLock::new(heavy_chain_data),
+            heavy_chain_data,
             light_chain_target,
             light_chain_data,
             dummy_heavy_proof: self.dummy_heavy_proof,
@@ -291,25 +291,13 @@ mod tests {
             );
             assert_circuit_pair_identical(
                 "heavy_tx",
-                (
-                    &rebuilt.heavy_tx_target,
-                    &rebuilt.heavy_tx_data.read().unwrap(),
-                ),
-                (
-                    &embedded.heavy_tx_target,
-                    &embedded.heavy_tx_data.read().unwrap(),
-                ),
+                (&rebuilt.heavy_tx_target, &rebuilt.heavy_tx_data),
+                (&embedded.heavy_tx_target, &embedded.heavy_tx_data),
             );
             assert_circuit_pair_identical(
                 "heavy_chain",
-                (
-                    &rebuilt.heavy_chain_target,
-                    &rebuilt.heavy_chain_data.read().unwrap(),
-                ),
-                (
-                    &embedded.heavy_chain_target,
-                    &embedded.heavy_chain_data.read().unwrap(),
-                ),
+                (&rebuilt.heavy_chain_target, &rebuilt.heavy_chain_data),
+                (&embedded.heavy_chain_target, &embedded.heavy_chain_data),
             );
             assert_circuit_pair_identical(
                 "light_tx",

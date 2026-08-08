@@ -1,3 +1,4 @@
+// Cycle rebase onto 7aa90dd: borrow + diet (prior draws 22.2893, 22.3352 - both above their base tips, both graft-raced).
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
@@ -266,15 +267,6 @@ fn prove_path(
         !chunks.is_empty(),
         "{path:?} transaction path must contain at least one chunk"
     );
-    // The heavy pair's shared guards are held for exactly as long as this path
-    // may read them — from here to the `return`, which is after its chain proof
-    // exists — so the exclusive acquisition in
-    // `Circuits::release_heavy_circuit_extensions` is a proof that the heavy
-    // path is finished with them. Shared guards never block one another, so
-    // this neither serializes the two paths nor delays the concurrent block
-    // circuit construction, which takes its own shared guard.
-    let heavy_tx_guard;
-    let heavy_chain_guard;
     let (tx_data, tx_target, chain_data, chain_target, dummy_proof) = match path {
         TxPath::Light => (
             &circuits.light_tx_data,
@@ -283,23 +275,13 @@ fn prove_path(
             &circuits.light_chain_target,
             &circuits.dummy_light_proof,
         ),
-        TxPath::Heavy => {
-            heavy_tx_guard = circuits
-                .heavy_tx_data
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            heavy_chain_guard = circuits
-                .heavy_chain_data
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                &*heavy_tx_guard,
-                &circuits.heavy_tx_target,
-                &*heavy_chain_guard,
-                &circuits.heavy_chain_target,
-                &circuits.dummy_heavy_proof,
-            )
-        }
+        TxPath::Heavy => (
+            &circuits.heavy_tx_data,
+            &circuits.heavy_tx_target,
+            &circuits.heavy_chain_data,
+            &circuits.heavy_chain_target,
+            &circuits.dummy_heavy_proof,
+        ),
     };
 
     let base_proof = cyclic_base_witness(
@@ -623,17 +605,6 @@ pub(crate) fn prove_block_after_pre(
                     let heavy_chain_proof = heavy_handle_outer
                         .join()
                         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                    // The heavy path's thread has exited, so its shared guards
-                    // on the heavy transaction and chain circuits are gone, and
-                    // this lane dropped its own guard when `build_block_circuit`
-                    // returned above. Nothing reads those two circuits again:
-                    // the light pipeline uses the light pair, and the final
-                    // block proof uses only `block_data`, the three finished
-                    // proofs and the block. Retire their preprocessed
-                    // extensions here — 438 MiB of Metal shared buffers whose
-                    // release returns the pages to the OS immediately — instead
-                    // of holding them across the whole light phase.
-                    circuits.release_heavy_circuit_extensions();
                     pending
                         .feed(
                             BlockCircuit::witness_inputs_heavy_chain(
