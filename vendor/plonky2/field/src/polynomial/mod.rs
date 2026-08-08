@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::extension::{Extendable, FieldExtension};
 use crate::fft::{
     FftRootTable, fft, fft_with_options, ifft, ifft_with_options_and_postscale,
+    ifft_with_options_and_postscale_chunked,
 };
 use crate::types::Field;
 
@@ -78,6 +79,34 @@ impl<F: Field> PolynomialValues<F> {
     /// already has the inverse powers of that coset's shift.
     pub fn coset_ifft_with_powers(self, inverse_shift_powers: &[F]) -> PolynomialCoeffs<F> {
         ifft_with_options_and_postscale(self, None, None, Some(inverse_shift_powers))
+    }
+
+    /// Like [`PolynomialValues::coset_ifft_with_powers`], but writes the live
+    /// coefficients directly into independently owned chunks and rejects a
+    /// nonzero truncated tail.
+    pub fn coset_ifft_with_powers_chunked(
+        self,
+        inverse_shift_powers: &[F],
+        live_len: usize,
+        chunk_len: usize,
+    ) -> Result<Vec<PolynomialCoeffs<F>>> {
+        let chunks = ifft_with_options_and_postscale_chunked(
+            self,
+            None,
+            None,
+            inverse_shift_powers,
+            live_len,
+            chunk_len,
+        );
+        ensure!(
+            chunks.is_some(),
+            "polynomial has a nonzero coefficient outside the requested chunks"
+        );
+        Ok(chunks
+            .unwrap()
+            .into_iter()
+            .map(PolynomialCoeffs::new)
+            .collect())
     }
 
     pub fn lde_multiple(polys: Vec<Self>, rate_bits: usize) -> Vec<Self> {
@@ -553,6 +582,96 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn test_coset_ifft_with_powers_chunked_matches_trim_and_chunks() {
+        type F = GoldilocksField;
+
+        // Production ratio: eight degree-n chunks, with raw noncanonical
+        // Goldilocks inputs and the IFFT's 0 and n/2 special indices landing
+        // on chunk boundaries. Compare the stored limbs, not just congruence.
+        let n = 64;
+        let chunk_len = n / 8;
+        let evals = PolynomialValues::new(
+            (0..n)
+                .map(|i| {
+                    F::from_noncanonical_u64(
+                        u64::MAX.wrapping_sub((i as u64 + 1) * 0x1234_5678),
+                    )
+                })
+                .collect(),
+        );
+        let inverse_powers = F::coset_shift()
+            .inverse()
+            .powers()
+            .take(n)
+            .collect::<Vec<_>>();
+        let expected = evals
+            .clone()
+            .coset_ifft_with_powers(&inverse_powers)
+            .chunks(chunk_len);
+        let actual = evals
+            .coset_ifft_with_powers_chunked(&inverse_powers, n, chunk_len)
+            .unwrap();
+        assert_eq!(
+            actual
+                .iter()
+                .flat_map(|chunk| chunk.coeffs.iter().map(|value| value.0))
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .flat_map(|chunk| chunk.coeffs.iter().map(|value| value.0))
+                .collect::<Vec<_>>()
+        );
+
+        // Non-power-of-two live length: preserve the legacy zero-tail check
+        // while still writing three independently owned chunks directly.
+        let n = 16;
+        let live_len = 12;
+        let chunk_len = 4;
+        let coefficients = PolynomialCoeffs::new(
+            (0..live_len)
+                .map(|i| F::from_canonical_usize(17 * i + 3))
+                .chain(core::iter::repeat_n(F::ZERO, n - live_len))
+                .collect(),
+        );
+        let evals = coefficients.coset_fft(F::coset_shift());
+        let inverse_powers = F::coset_shift()
+            .inverse()
+            .powers()
+            .take(n)
+            .collect::<Vec<_>>();
+
+        let mut expected = evals.clone().coset_ifft_with_powers(&inverse_powers);
+        expected.trim_to_len(live_len).unwrap();
+        let expected = expected.chunks(chunk_len);
+        let actual = evals
+            .coset_ifft_with_powers_chunked(&inverse_powers, live_len, chunk_len)
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_coset_ifft_with_powers_chunked_rejects_nonzero_tail() {
+        type F = GoldilocksField;
+
+        let n = 16;
+        let mut coefficients = PolynomialCoeffs::zero(n);
+        coefficients.coeffs[n - 1] = F::ONE;
+        let evals = coefficients.coset_fft(F::coset_shift());
+        let inverse_powers = F::coset_shift()
+            .inverse()
+            .powers()
+            .take(n)
+            .collect::<Vec<_>>();
+
+        assert!(
+            evals
+                .coset_ifft_with_powers_chunked(&inverse_powers, 12, 4)
+                .is_err()
+        );
     }
 
     #[test]

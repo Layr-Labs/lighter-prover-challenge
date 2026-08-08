@@ -148,9 +148,6 @@ where
     let has_lookup = !common_data.luts.is_empty();
     let config = &common_data.config;
     let num_challenges = config.num_challenges;
-    let quotient_degree = common_data.quotient_degree();
-    let degree = common_data.degree();
-
     set_lookup_wires(prover_data, common_data, &mut partition_witness)?;
 
     let public_inputs = partition_witness.get_targets(&prover_data.public_inputs);
@@ -295,7 +292,7 @@ where
 
     let alphas = challenger.get_n_challenges(num_challenges);
 
-    let quotient_polys = timed!(
+    let all_quotient_poly_chunks = timed!(
         timing,
         "compute quotient polys",
         compute_quotient_polys::<F, C, D>(
@@ -335,8 +332,12 @@ where
             true,
             false,
         );
-        assert_eq!(quotient_polys.len(), reference.len());
-        for (p, (actual, expected)) in quotient_polys.iter().zip(reference.iter()).enumerate() {
+        assert_eq!(all_quotient_poly_chunks.len(), reference.len());
+        for (p, (actual, expected)) in all_quotient_poly_chunks
+            .iter()
+            .zip(reference.iter())
+            .enumerate()
+        {
             assert_eq!(actual.coeffs.len(), expected.coeffs.len());
             for (i, (actual, expected)) in
                 actual.coeffs.iter().zip(expected.coeffs.iter()).enumerate()
@@ -374,8 +375,12 @@ where
             false,
             false,
         );
-        assert_eq!(quotient_polys.len(), reference.len());
-        for (p, (a, b)) in quotient_polys.iter().zip(reference.iter()).enumerate() {
+        assert_eq!(all_quotient_poly_chunks.len(), reference.len());
+        for (p, (a, b)) in all_quotient_poly_chunks
+            .iter()
+            .zip(reference.iter())
+            .enumerate()
+        {
             assert_eq!(a.coeffs.len(), b.coeffs.len());
             for (i, (x, y)) in a.coeffs.iter().zip(b.coeffs.iter()).enumerate() {
                 assert_eq!(
@@ -386,21 +391,6 @@ where
             }
         }
     }
-
-    let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
-        timing,
-        "split up quotient polys",
-        quotient_polys
-            .into_par_iter()
-            .flat_map(|mut quotient_poly| {
-                quotient_poly.trim_to_len(quotient_degree).expect(
-                    "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
-                );
-                // Split quotient into degree-n chunks.
-                quotient_poly.chunks(degree)
-            })
-            .collect()
-    );
 
     let quotient_polys_commitment = timed!(
         timing,
@@ -2088,14 +2078,23 @@ fn compute_quotient_polys<
             }
         });
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
+    let degree = common_data.degree();
+    let quotient_degree = common_data.quotient_degree_factor * degree;
     challenge_columns
         .into_par_iter()
-        .map(|column| {
-            // Fuse the coset post-scaling into the IFFT instead of walking the
-            // whole coefficient vector again afterwards, reusing a
-            // process-global inverse-shift power chain.
+        .flat_map(|column| {
+            // Fuse the coset post-scaling and the final split into the IFFT's
+            // last writes. The commitment needs independently owned chunks,
+            // so writing them directly deletes the full parent-vector copy.
             PolynomialValues::new(column)
-                .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
+                .coset_ifft_with_powers_chunked(
+                    inverse_coset_shift_powers.as_slice(),
+                    quotient_degree,
+                    degree,
+                )
+                .expect(
+                    "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
+                )
         })
         .collect()
 }

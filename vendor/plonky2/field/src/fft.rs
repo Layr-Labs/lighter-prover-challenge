@@ -272,6 +272,78 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
     PolynomialCoeffs { coeffs: buffer }
 }
 
+/// IFFT with fused post-scaling whose live coefficients are written directly
+/// into independently owned chunks.
+///
+/// This is value-identical to [`ifft_with_options_and_postscale`] followed by
+/// checking that `live_len..n` is zero and copying an exactly divisible
+/// `0..live_len` through `chunks(chunk_len)`. Invalid shapes return `None`.
+/// The difference is that the final reversal,
+/// normalization, and post-scaling writes each live coefficient to its final
+/// chunk allocation, so the full coefficient image is never written and then
+/// copied a second time.
+pub(crate) fn ifft_with_options_and_postscale_chunked<F: Field>(
+    poly: PolynomialValues<F>,
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+    postscale: &[F],
+    live_len: usize,
+    chunk_len: usize,
+) -> Option<Vec<Vec<F>>> {
+    let n = poly.len();
+    if postscale.len() != n
+        || live_len > n
+        || chunk_len == 0
+        || !live_len.is_multiple_of(chunk_len)
+    {
+        return None;
+    }
+
+    let lg_n = log2_strict(n);
+    let n_inv = F::inverse_2exp(lg_n);
+    let PolynomialValues { values: mut buffer } = poly;
+    fft_dispatch(&mut buffer, zero_factor, root_table);
+
+    let mut chunks: Vec<Vec<F>> = (0..live_len / chunk_len)
+        .map(|_| Vec::with_capacity(chunk_len))
+        .collect::<Vec<_>>();
+    for (chunk_index, chunk) in chunks.iter_mut().enumerate() {
+        let base = chunk_index * chunk_len;
+        let destination = chunk.as_mut_ptr();
+        for offset in 0..chunk_len {
+            let index = base + offset;
+            let source = if index == 0 { 0 } else { n - index };
+            let mut coefficient = buffer[source] * n_inv;
+            coefficient *= postscale[index];
+            // SAFETY: `offset < chunk_len <= chunk.capacity()`, and this loop
+            // visits every destination slot exactly once before `set_len`.
+            // `F: Field` is `Copy`, so an unwind while the length is still
+            // zero cannot leak resources requiring destruction.
+            unsafe {
+                destination.add(offset).write(coefficient);
+            }
+        }
+        // SAFETY: every slot in this chunk was initialized by the loop above.
+        unsafe {
+            chunk.set_len(chunk_len);
+        }
+    }
+
+    // The old path normalized and post-scaled the whole power-of-two domain,
+    // then `trim_to_len` rejected any nonzero tail. Keep that exact check, but
+    // do it separately so the production `live_len == n` loop has no per-item
+    // tail branch or chunk division.
+    for index in live_len..n {
+        let source = if index == 0 { 0 } else { n - index };
+        let mut coefficient = buffer[source] * n_inv;
+        coefficient *= postscale[index];
+        if coefficient.is_nonzero() {
+            return None;
+        }
+    }
+    Some(chunks)
+}
+
 /// `ifft` of a borrowed column without the caller-side copy: the initial
 /// bit-reversal permutation is applied as an out-of-place gather from
 /// `values` into the fresh buffer (the same permutation `fft_classic`'s
