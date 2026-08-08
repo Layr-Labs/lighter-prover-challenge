@@ -336,8 +336,11 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         // identical field element and the transcript is unchanged.
         let degree = common_data.degree();
         let table = |z: F::Extension| -> Vec<F::Extension> { z.powers().take(degree).collect() };
-        let zeta_pows = table(zeta);
-        let g_zeta_pows = table(g * zeta);
+        // The two power tables are independent degree-long recurrence chains.
+        // Construct them concurrently so neither chain sits entirely on the
+        // serial opening path. `rayon::join` executes inline when the pool is
+        // busy, so this does not reserve or create a worker thread.
+        let (zeta_pows, g_zeta_pows) = rayon::join(|| table(zeta), || table(g * zeta));
         let eval_polynomials = |pows: &[F::Extension], polynomials: &[PolynomialCoeffs<F>]| {
             polynomials
                 .par_iter()
