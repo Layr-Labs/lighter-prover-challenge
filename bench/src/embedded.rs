@@ -47,11 +47,25 @@ impl Circuits {
     /// `embedded_matches_rebuilt`); errors if the blobs are absent, corrupt,
     /// or fail their internal commitment-cap check.
     pub fn from_embedded() -> anyhow::Result<Self> {
-        // Same parallel layout as `Circuits::new`; the five loads are
-        // independent (unlike builds, the chain loads do not wait on the
-        // transaction circuits).
-        let (pre, (heavy, light)) = rayon::join(
-            || load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB),
+        // Same parallel layout as `Circuits::new`; the five loads and the two
+        // dummy-proof decodes are all independent.
+        let ((pre, dummies), (heavy, light)) = rayon::join(
+            || {
+                rayon::join(
+                    || load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB),
+                    || {
+                        let dummy_heavy_proof: Proof = bincode::deserialize(include_bytes!(
+                            "../dummy-heavy-chain-proof.bin"
+                        ))
+                        .expect("embedded heavy chain dummy proof is invalid");
+                        let dummy_light_proof: Proof = bincode::deserialize(include_bytes!(
+                            "../dummy-light-chain-proof.bin"
+                        ))
+                        .expect("embedded light chain dummy proof is invalid");
+                        (dummy_heavy_proof, dummy_light_proof)
+                    },
+                )
+            },
             || {
                 rayon::join(
                     || {
@@ -74,13 +88,7 @@ impl Circuits {
             (heavy.0?, heavy.1?),
             (light.0?, light.1?),
         );
-
-        let dummy_heavy_proof: Proof =
-            bincode::deserialize(include_bytes!("../dummy-heavy-chain-proof.bin"))
-                .expect("embedded heavy chain dummy proof is invalid");
-        let dummy_light_proof: Proof =
-            bincode::deserialize(include_bytes!("../dummy-light-chain-proof.bin"))
-                .expect("embedded light chain dummy proof is invalid");
+        let (dummy_heavy_proof, dummy_light_proof) = dummies;
 
         Ok(Self {
             heavy_tx_target: heavy_tx.0,
