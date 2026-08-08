@@ -14,20 +14,44 @@
 //! (measurement A/B). The `embedded_matches_rebuilt` ignored test is the
 //! value-equality oracle between the two paths.
 
-use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
+use circuit::block_pre_execution_constraints::{
+    BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
+};
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
 use circuit::embed::deserialize_embedded;
-use circuit::types::config::{C, D, F};
+use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
 use plonky2::plonk::circuit_data::CircuitData;
 
-use crate::api::{Circuits, Proof};
+use crate::api::{
+    Circuits, PathCircuits, Proof, HEAVY_TX_MODE, HEAVY_TX_PER_PROOF, LIGHT_TX_MODE,
+    LIGHT_TX_PER_PROOF,
+};
 
 static PRE_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pre.embed"));
 static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx.embed"));
 static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
 static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+
+fn load_or_build<T>(
+    force_build: bool,
+    name: &'static str,
+    load: impl FnOnce() -> anyhow::Result<T>,
+    build: impl FnOnce() -> T,
+) -> T {
+    if force_build {
+        log::info!("LIGHTER_BUILD_CIRCUITS=1: building {name} from scratch");
+        return build();
+    }
+    match load() {
+        Ok(value) => value,
+        Err(error) => {
+            log::warn!("embedded {name} unavailable ({error:#}); building from scratch");
+            build()
+        }
+    }
+}
 
 fn load_blob<T: serde::de::DeserializeOwned>(
     name: &'static str,
@@ -41,12 +65,119 @@ fn load_blob<T: serde::de::DeserializeOwned>(
         .map_err(|error| error.context(format!("loading embedded circuit {name}")))
 }
 
+/// The four startup circuits that do not participate in the pre-execution
+/// proof. Keeping this separate lets the main thread load them while the exact
+/// pre-execution circuit value is borrowed by the startup proof thread.
+pub(crate) struct RemainingCircuits {
+    heavy: PathCircuits,
+    light: PathCircuits,
+}
+
+impl RemainingCircuits {
+    fn from_embedded() -> anyhow::Result<Self> {
+        let (heavy, light) = rayon::join(
+            || {
+                rayon::join(
+                    || load_blob::<BlockTxTarget>("heavy_tx", HEAVY_TX_BLOB),
+                    || load_blob::<BlockTxChainTarget>("heavy_chain", HEAVY_CHAIN_BLOB),
+                )
+            },
+            || {
+                rayon::join(
+                    || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
+                    || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
+                )
+            },
+        );
+        let (heavy_tx, heavy_chain) = (heavy.0?, heavy.1?);
+        let (light_tx, light_chain) = (light.0?, light.1?);
+
+        let dummy_heavy_proof: Proof =
+            bincode::deserialize(include_bytes!("../dummy-heavy-chain-proof.bin"))
+                .expect("embedded heavy chain dummy proof is invalid");
+        let dummy_light_proof: Proof =
+            bincode::deserialize(include_bytes!("../dummy-light-chain-proof.bin"))
+                .expect("embedded light chain dummy proof is invalid");
+
+        Ok(Self {
+            heavy: PathCircuits {
+                tx_target: heavy_tx.0,
+                tx_data: heavy_tx.1,
+                chain_target: heavy_chain.0,
+                chain_data: heavy_chain.1,
+                dummy_proof: dummy_heavy_proof,
+            },
+            light: PathCircuits {
+                tx_target: light_tx.0,
+                tx_data: light_tx.1,
+                chain_target: light_chain.0,
+                chain_data: light_chain.1,
+                dummy_proof: dummy_light_proof,
+            },
+        })
+    }
+
+    fn build() -> Self {
+        let (heavy, light) = rayon::join(
+            || PathCircuits::new(HEAVY_TX_PER_PROOF, HEAVY_TX_MODE),
+            || PathCircuits::new(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE),
+        );
+        Self { heavy, light }
+    }
+
+    pub(crate) fn with_pre(
+        self,
+        (pre_target, pre_data): (BlockPreExecutionTarget, CircuitData<F, C, D>),
+    ) -> Circuits {
+        Circuits {
+            heavy_tx_target: self.heavy.tx_target,
+            heavy_tx_data: self.heavy.tx_data,
+            light_tx_target: self.light.tx_target,
+            light_tx_data: self.light.tx_data,
+            pre_target,
+            pre_data,
+            heavy_chain_target: self.heavy.chain_target,
+            heavy_chain_data: self.heavy.chain_data,
+            light_chain_target: self.light.chain_target,
+            light_chain_data: self.light.chain_data,
+            dummy_heavy_proof: self.heavy.dummy_proof,
+            dummy_light_proof: self.light.dummy_proof,
+        }
+    }
+}
+
 impl Circuits {
     /// Loads only the pre-execution circuit blob. This is the fast path used
     /// by the startup overlap: the pre-execution proof can start (and hide)
     /// behind the remaining circuit loads.
     pub fn load_pre() -> anyhow::Result<(BlockPreExecutionTarget, CircuitData<F, C, D>)> {
         load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB)
+    }
+
+    pub(crate) fn load_pre_for_startup() -> (BlockPreExecutionTarget, CircuitData<F, C, D>) {
+        let force_build =
+            std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|value| value == "1");
+        load_or_build(force_build, "pre-execution circuit", Self::load_pre, || {
+            let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
+            (pre.target, pre.builder.build::<C>())
+        })
+    }
+
+    pub(crate) fn remaining_from_embedded() -> anyhow::Result<RemainingCircuits> {
+        RemainingCircuits::from_embedded()
+    }
+
+    /// Loads only the four non-pre startup circuits, with the same embedded
+    /// first/build fallback policy as [`Self::load`].
+    pub(crate) fn load_remaining() -> RemainingCircuits {
+        let force_build =
+            std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|value| value == "1");
+        load_or_build(
+            force_build,
+            "remaining startup circuits",
+            Self::remaining_from_embedded,
+            RemainingCircuits::build,
+        )
     }
 
     /// Reconstructs all five startup circuits from the blobs embedded at
@@ -57,52 +188,8 @@ impl Circuits {
         // Same parallel layout as `Circuits::new`; the five loads are
         // independent (unlike builds, the chain loads do not wait on the
         // transaction circuits).
-        let (pre, (heavy, light)) = rayon::join(
-            || load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB),
-            || {
-                rayon::join(
-                    || {
-                        rayon::join(
-                            || load_blob::<BlockTxTarget>("heavy_tx", HEAVY_TX_BLOB),
-                            || load_blob::<BlockTxChainTarget>("heavy_chain", HEAVY_CHAIN_BLOB),
-                        )
-                    },
-                    || {
-                        rayon::join(
-                            || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
-                            || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
-                        )
-                    },
-                )
-            },
-        );
-        let (pre_target, pre_data) = pre?;
-        let ((heavy_tx, heavy_chain), (light_tx, light_chain)) = (
-            (heavy.0?, heavy.1?),
-            (light.0?, light.1?),
-        );
-
-        let dummy_heavy_proof: Proof =
-            bincode::deserialize(include_bytes!("../dummy-heavy-chain-proof.bin"))
-                .expect("embedded heavy chain dummy proof is invalid");
-        let dummy_light_proof: Proof =
-            bincode::deserialize(include_bytes!("../dummy-light-chain-proof.bin"))
-                .expect("embedded light chain dummy proof is invalid");
-
-        Ok(Self {
-            heavy_tx_target: heavy_tx.0,
-            heavy_tx_data: heavy_tx.1,
-            light_tx_target: light_tx.0,
-            light_tx_data: light_tx.1,
-            pre_target,
-            pre_data,
-            heavy_chain_target: heavy_chain.0,
-            heavy_chain_data: heavy_chain.1,
-            light_chain_target: light_chain.0,
-            light_chain_data: light_chain.1,
-            dummy_heavy_proof,
-            dummy_light_proof,
-        })
+        let (pre, remaining) = rayon::join(Self::load_pre, Self::remaining_from_embedded);
+        Ok(remaining?.with_pre(pre?))
     }
 
     /// Production loader: embedded circuits when available, otherwise a fresh
@@ -124,12 +211,36 @@ impl Circuits {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use circuit::circuit_serializer::BlockGateSerializer;
     use circuit::embed::EmbedGeneratorSerializer;
     use plonky2::util::serialization::Write as _;
 
     use super::*;
     use crate::api::PROVER_THREAD_STACK_BYTES;
+
+    #[test]
+    fn forced_load_policy_skips_embedded_source() {
+        let embedded_called = Cell::new(false);
+        let build_called = Cell::new(false);
+        let value = load_or_build(
+            true,
+            "test circuit",
+            || {
+                embedded_called.set(true);
+                Ok(1_u8)
+            },
+            || {
+                build_called.set(true);
+                2_u8
+            },
+        );
+
+        assert_eq!(value, 2);
+        assert!(!embedded_called.get());
+        assert!(build_called.get());
+    }
 
     fn on_big_stack(f: impl FnOnce() + Send + 'static) {
         // Mirror the prove binary's startup: circuit construction recurses
@@ -236,6 +347,45 @@ mod tests {
             rebuilt_data.prover_only == embedded_data.prover_only,
             "{name}: prover-only circuit data diverges"
         );
+    }
+
+    #[test]
+    fn split_embedded_load_recomposes_identically() {
+        on_big_stack(|| {
+            let pre = Circuits::load_pre().expect("embedded pre circuit must load");
+            let split = Circuits::remaining_from_embedded()
+                .expect("remaining embedded circuits must load")
+                .with_pre(pre);
+            let whole = Circuits::from_embedded().expect("all embedded circuits must load");
+
+            assert_circuit_pair_identical(
+                "pre",
+                (&whole.pre_target, &whole.pre_data),
+                (&split.pre_target, &split.pre_data),
+            );
+            assert_circuit_pair_identical(
+                "heavy_tx",
+                (&whole.heavy_tx_target, &whole.heavy_tx_data),
+                (&split.heavy_tx_target, &split.heavy_tx_data),
+            );
+            assert_circuit_pair_identical(
+                "heavy_chain",
+                (&whole.heavy_chain_target, &whole.heavy_chain_data),
+                (&split.heavy_chain_target, &split.heavy_chain_data),
+            );
+            assert_circuit_pair_identical(
+                "light_tx",
+                (&whole.light_tx_target, &whole.light_tx_data),
+                (&split.light_tx_target, &split.light_tx_data),
+            );
+            assert_circuit_pair_identical(
+                "light_chain",
+                (&whole.light_chain_target, &whole.light_chain_data),
+                (&split.light_chain_target, &split.light_chain_data),
+            );
+            assert!(whole.dummy_heavy_proof == split.dummy_heavy_proof);
+            assert!(whole.dummy_light_proof == split.dummy_light_proof);
+        });
     }
 
     /// Determinism oracle for the embed mechanism: builds all five circuits
