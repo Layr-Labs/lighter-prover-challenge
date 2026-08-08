@@ -395,6 +395,7 @@ fn mul_reduce_pair(a0: u64, b0: u64, a1: u64, b1: u64) -> (u64, u64) {
 
     (result0, result1)
 }
+
 #[cfg(test)]
 mod tests {
     use super::NeonGoldilocksField;
