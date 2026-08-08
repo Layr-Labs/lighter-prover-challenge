@@ -162,7 +162,7 @@ fn run_generator_worklist<
                 .par_chunks(PARALLEL_WORKLIST_CHUNK)
                 .map(|chunk| {
                     let mut entries = Vec::with_capacity(chunk.len());
-                    let mut annotated_values = Vec::new();
+                    let mut annotated_values = Vec::with_capacity(chunk.len() * 128);
                     let mut round_buffer = GeneratedValues::empty();
                     for &generator_idx in chunk {
                         if round_generator_is_expired[generator_idx] {
