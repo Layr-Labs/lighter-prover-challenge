@@ -561,11 +561,36 @@ impl<T> AsRef<[T]> for Poseidon2Permutation<T> {
 
 trait Permuter: Sized {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH];
+
+    #[inline]
+    fn permute_x4(
+        input_a: [Self; WIDTH],
+        input_b: [Self; WIDTH],
+        input_c: [Self; WIDTH],
+        input_d: [Self; WIDTH],
+    ) -> ([Self; WIDTH], [Self; WIDTH], [Self; WIDTH], [Self; WIDTH]) {
+        (
+            Self::permute(input_a),
+            Self::permute(input_b),
+            Self::permute(input_c),
+            Self::permute(input_d),
+        )
+    }
 }
 
 impl<F: Poseidon2> Permuter for F {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH] {
         <F as Poseidon2>::poseidon2(input)
+    }
+
+    #[inline]
+    fn permute_x4(
+        input_a: [Self; WIDTH],
+        input_b: [Self; WIDTH],
+        input_c: [Self; WIDTH],
+        input_d: [Self; WIDTH],
+    ) -> ([Self; WIDTH], [Self; WIDTH], [Self; WIDTH], [Self; WIDTH]) {
+        <F as Poseidon2>::poseidon2_x4(input_a, input_b, input_c, input_d)
     }
 }
 
@@ -607,6 +632,20 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
 
     fn permute(&mut self) {
         self.state = T::permute(self.state);
+    }
+
+    #[inline]
+    fn permute_batch4(states: &mut [Self; 4]) {
+        let (a, b, c, d) = T::permute_x4(
+            states[0].state,
+            states[1].state,
+            states[2].state,
+            states[3].state,
+        );
+        states[0].state = a;
+        states[1].state = b;
+        states[2].state = c;
+        states[3].state = d;
     }
 
     fn squeeze(&self) -> &[T] {
@@ -1091,10 +1130,35 @@ mod test {
 
 #[cfg(test)]
 mod pair_hash_tests {
-    use plonky2_field::types::Sample;
+    use plonky2_field::types::{Field64, Sample};
 
     use super::*;
     use crate::plonk::config::Hasher;
+
+    #[test]
+    fn batch4_permutation_matches_scalar_raw_words() {
+        let edge_words = [0, 1, F::ORDER - 1, F::ORDER, F::ORDER + 1, u64::MAX];
+        let mut batched: [Poseidon2Permutation<F>; 4] = core::array::from_fn(|lane| {
+            Poseidon2Permutation::new((0..WIDTH).map(|i| {
+                F::from_noncanonical_u64(edge_words[(lane * WIDTH + i) % edge_words.len()])
+            }))
+        });
+        let mut expected = batched;
+        for state in &mut expected {
+            state.permute();
+        }
+
+        <Poseidon2Permutation<F> as PlonkyPermutation<F>>::permute_batch4(&mut batched);
+        for lane in 0..4 {
+            for i in 0..WIDTH {
+                assert_eq!(
+                    batched[lane].as_ref()[i].0,
+                    expected[lane].as_ref()[i].0,
+                    "raw mismatch at lane {lane}, word {i}",
+                );
+            }
+        }
+    }
 
     #[test]
     fn pair_hash_matches_individual_across_widths() {

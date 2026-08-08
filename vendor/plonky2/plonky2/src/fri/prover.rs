@@ -15,7 +15,7 @@ use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
@@ -239,6 +239,17 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     (trees, coeffs)
 }
 
+const FRI_POW_BATCH_SIZE: usize = 4;
+
+#[inline]
+fn fri_pow_batch_candidates(batch: u64, max_candidate: u64) -> [Option<u64>; FRI_POW_BATCH_SIZE] {
+    let base = batch.checked_mul(FRI_POW_BATCH_SIZE as u64);
+    core::array::from_fn(|lane| {
+        base.and_then(|base| base.checked_add(lane as u64))
+            .filter(|&candidate| candidate <= max_candidate)
+    })
+}
+
 /// Performs the proof-of-work (a.k.a. grinding) step of the FRI protocol. Returns the PoW witness.
 pub(crate) fn fri_proof_of_work<
     F: RichField + Extendable<D>,
@@ -270,18 +281,43 @@ pub(crate) fn fri_proof_of_work<
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
+    let max_candidate = F::NEG_ONE.to_canonical_u64();
+    let evaluate_batch = |batch: u64| -> Option<u64> {
+        let candidates = fri_pow_batch_candidates(batch, max_candidate);
+        let mut duplex_states = [duplex_intermediate_state; FRI_POW_BATCH_SIZE];
+        for (duplex_state, candidate) in duplex_states.iter_mut().zip(candidates) {
+            // Padding lanes in the final partial batch are evaluated as zero but
+            // masked out below; never pass an out-of-domain value to the field.
+            duplex_state.set_elt(
+                F::from_canonical_u64(candidate.unwrap_or_default()),
+                witness_input_pos,
+            );
+        }
+        <<C::Hasher as Hasher<F>>::Permutation as PlonkyPermutation<F>>::permute_batch4(
+            &mut duplex_states,
+        );
+        candidates
+            .into_iter()
+            .zip(duplex_states)
+            .find_map(|(candidate, duplex_state)| {
+                let candidate = candidate?;
+                let pow_response = duplex_state.squeeze().iter().last().unwrap();
+                let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
+                (leading_zeros >= min_leading_zeros).then_some(candidate)
+            })
+    };
+
+    // Keep `find_any` rather than `find_map_any`: plonky2_maybe_rayon's
+    // sequential compatibility trait only exposes the former. Re-evaluating the
+    // single selected batch is negligible relative to the grinding search.
+    let max_batch = max_candidate / FRI_POW_BATCH_SIZE as u64;
+    let batch = (0..=max_batch)
         .into_par_iter()
-        .find_any(|&candidate| {
-            let mut duplex_state = duplex_intermediate_state;
-            duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-            duplex_state.permute();
-            let pow_response = duplex_state.squeeze().iter().last().unwrap();
-            let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-            leading_zeros >= min_leading_zeros
-        })
-        .map(F::from_canonical_u64)
+        .find_any(|&batch| evaluate_batch(batch).is_some())
         .expect("Proof of work failed. This is highly unlikely!");
+    let pow_witness = evaluate_batch(batch)
+        .map(F::from_canonical_u64)
+        .expect("selected PoW batch no longer contains a valid witness");
 
     // Recompute pow_response using our normal Challenger code, and make sure it matches.
     challenger.observe_element(pow_witness);
@@ -349,10 +385,77 @@ fn fri_prover_query_round<
 
 #[cfg(test)]
 mod tests {
-    use plonky2_field::types::Sample;
+    use plonky2_field::types::{PrimeField64, Sample};
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::fri::reduction_strategies::FriReductionStrategy;
+    use crate::plonk::config::{GenericConfig, Poseidon2GoldilocksConfig};
+
+    #[test]
+    fn fri_pow_batch_candidates_cover_domain_inclusively() {
+        for max_candidate in 0..=33u64 {
+            let actual = (0..=max_candidate / FRI_POW_BATCH_SIZE as u64)
+                .flat_map(|batch| fri_pow_batch_candidates(batch, max_candidate))
+                .flatten()
+                .collect::<Vec<_>>();
+            assert_eq!(actual, (0..=max_candidate).collect::<Vec<_>>());
+        }
+
+        let last_batch = u64::MAX / FRI_POW_BATCH_SIZE as u64;
+        assert_eq!(
+            fri_pow_batch_candidates(last_batch, u64::MAX),
+            [
+                Some(u64::MAX - 3),
+                Some(u64::MAX - 2),
+                Some(u64::MAX - 1),
+                Some(u64::MAX),
+            ]
+        );
+        assert_eq!(
+            fri_pow_batch_candidates(last_batch, u64::MAX - 1),
+            [
+                Some(u64::MAX - 3),
+                Some(u64::MAX - 2),
+                Some(u64::MAX - 1),
+                None,
+            ]
+        );
+        assert_eq!(
+            fri_pow_batch_candidates(last_batch + 1, u64::MAX),
+            [None; FRI_POW_BATCH_SIZE]
+        );
+    }
+
+    #[test]
+    fn fri_pow_batch4_witness_matches_verifier_transcript() {
+        const D: usize = 2;
+        type C = Poseidon2GoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        let config = FriConfig {
+            rate_bits: 3,
+            cap_height: 4,
+            proof_of_work_bits: 8,
+            reduction_strategy: FriReductionStrategy::ConstantArityBits(4, 5),
+            num_query_rounds: 28,
+        };
+
+        for buffered_inputs in [0usize, 1, 7] {
+            let transcript = (0..buffered_inputs)
+                .map(|i| F::from_canonical_u64((17 + i) as u64))
+                .collect::<Vec<_>>();
+            let mut prover = Challenger::<F, <C as GenericConfig<D>>::Hasher>::new();
+            prover.observe_elements(&transcript);
+            let mut verifier = prover.clone();
+
+            let witness = fri_proof_of_work::<F, C, D>(&mut prover, &config);
+            verifier.observe_element(witness);
+            let response = verifier.get_challenge();
+            let min_leading_zeros = config.proof_of_work_bits + (64 - F::order().bits()) as u32;
+            assert!(response.to_canonical_u64().leading_zeros() >= min_leading_zeros);
+            assert_eq!(prover.get_challenge(), verifier.get_challenge());
+        }
+    }
 
     /// `bitrev_flatten` must be raw-`u64`-identical to the serial
     /// gather-and-extend loop it replaced, for every leaf and every limb.

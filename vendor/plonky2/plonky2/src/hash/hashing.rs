@@ -89,6 +89,15 @@ pub trait PlonkyPermutation<T: Copy + Default>:
     /// Apply permutation to internal state
     fn permute(&mut self);
 
+    /// Apply the permutation independently to four states. Implementations may
+    /// override this to interleave the four dependency chains.
+    #[inline]
+    fn permute_batch4(states: &mut [Self; 4]) {
+        for state in states {
+            state.permute();
+        }
+    }
+
     /// Return a slice of `RATE` elements
     fn squeeze(&self) -> &[T];
 }
