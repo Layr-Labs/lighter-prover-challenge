@@ -29,6 +29,21 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 const SHADER_SOURCE_SHA256: &str =
     "5a26157063dd5c76cedf06d12681d4f146bacdd236c3613d861ec5bb781597e6";
 
+/// SHA-256 of the selective round-constant-folded tree-kernel source linked
+/// into [`SHADER_METALLIB`] beside the baseline shader.
+const SHADER_RCFOLD_SOURCE_SHA256: &str =
+    "d7c9c1a354c755d6b0950cdce954b3ab15f9cf34dc07f611509939a6be844f5a";
+
+/// The folded leaf/streaming kernels expected in the combined prebuilt AIR.
+/// The parent variant is retained for differential testing, but production
+/// deliberately keeps the baseline parent kernel, where the fold did not win.
+const RCFOLD_METALLIB_KERNELS: [&str; 4] = [
+    "poseidon2_hash_leaves_rcfold",
+    "poseidon2_hash_leaves_colmajor_rcfold",
+    "poseidon2_hash_parents_rcfold",
+    "poseidon2_absorb_pass_rcfold",
+];
+
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
 /// source. This deliberately includes the lazily-built gate-quotient kernels:
@@ -451,14 +466,18 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
 /// Scheduling only. The pipelines are the same objects the blocking build
 /// produced, lowered from the same library, so nothing they later compute can
 /// differ; only the instant at which they become available does.
-fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
+fn spawn_optional_pipelines(
+    device: &Device,
+    library: &metal::Library,
+    absorb_name: &'static str,
+) {
     for (name, slot) in [
         ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
         (
             "range_check_gate_quotient",
             &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
         ),
-        ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
+        (absorb_name, &ABSORB_PASS_PIPELINE),
     ] {
         let device = device.clone();
         let library = library.clone();
@@ -1391,22 +1410,43 @@ impl MetalShared {
             //   xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib
             // and `metallib_matches_shader_source` fails the test run if you
             // forget.
-            let library = device
+            let prebuilt = device
                 .new_library_with_data(SHADER_METALLIB)
                 .ok()
                 .filter(|library| {
                     METALLIB_REQUIRED_KERNELS
                         .iter()
                         .all(|name| library.get_function(name, None).is_ok())
-                })
-                .map_or_else(
-                    || {
-                        device
-                            .new_library_with_source(SHADER_SOURCE, &options)
-                            .map_err(|error| format!("shader compilation failed: {error}"))
-                    },
-                    Ok,
-                )?;
+                });
+            let (library, use_rcfold_tree_kernels) = match prebuilt {
+                Some(library) => {
+                    let has_rcfold = RCFOLD_METALLIB_KERNELS
+                        .iter()
+                        .all(|name| library.get_function(name, None).is_ok());
+                    (library, has_rcfold)
+                }
+                None => (
+                    device
+                        .new_library_with_source(SHADER_SOURCE, &options)
+                        .map_err(|error| format!("shader compilation failed: {error}"))?,
+                    false,
+                ),
+            };
+            let leaf_name = if use_rcfold_tree_kernels {
+                "poseidon2_hash_leaves_rcfold"
+            } else {
+                "poseidon2_hash_leaves"
+            };
+            let leaf_colmajor_name = if use_rcfold_tree_kernels {
+                "poseidon2_hash_leaves_colmajor_rcfold"
+            } else {
+                "poseidon2_hash_leaves_colmajor"
+            };
+            let absorb_name = if use_rcfold_tree_kernels {
+                "poseidon2_absorb_pass_rcfold"
+            } else {
+                "poseidon2_absorb_pass"
+            };
             // Build the compute pipelines concurrently, one thread each.
             //
             // Every `newComputePipelineStateWithFunction:` lowers that kernel's
@@ -1469,9 +1509,8 @@ impl MetalShared {
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
             ) = std::thread::scope(|scope| {
-                let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
-                let leaf_colmajor =
-                    scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
+                let leaf = scope.spawn(required(leaf_name, "leaf"));
+                let leaf_colmajor = scope.spawn(required(leaf_colmajor_name, "col-major leaf"));
                 let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
                 let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
                 let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
@@ -1508,7 +1547,7 @@ impl MetalShared {
             let ntt_stage_pipeline = ntt_stage_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
-            spawn_optional_pipelines(&device, &library);
+            spawn_optional_pipelines(&device, &library, absorb_name);
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -2777,20 +2816,22 @@ mod tests {
     #[test]
     fn metallib_matches_shader_source() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
-        let output = std::process::Command::new("/usr/bin/shasum")
-            .args(["-a", "256", &format!("{dir}/poseidon2.metal")])
-            .output()
-            .expect("shasum must be available to verify the metallib is current");
-        assert!(output.status.success(), "shasum failed");
-        let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
-        let digest = digest.split_whitespace().next().expect("empty shasum output");
-        assert_eq!(
-            digest, SHADER_SOURCE_SHA256,
-            "poseidon2.metal changed but poseidon2.metallib was not regenerated. Run:\n  \
-             xcrun -sdk macosx metal -c poseidon2.metal -o poseidon2.air\n  \
-             xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib\n\
-             then update SHADER_SOURCE_SHA256 to {digest}."
-        );
+        for (source, expected) in [
+            ("poseidon2.metal", SHADER_SOURCE_SHA256),
+            ("poseidon2_hash_v2.metal", SHADER_RCFOLD_SOURCE_SHA256),
+        ] {
+            let output = std::process::Command::new("/usr/bin/shasum")
+                .args(["-a", "256", &format!("{dir}/{source}")])
+                .output()
+                .expect("shasum must be available to verify the metallib is current");
+            assert!(output.status.success(), "shasum failed for {source}");
+            let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
+            let digest = digest.split_whitespace().next().expect("empty shasum output");
+            assert_eq!(
+                digest, expected,
+                "{source} changed but poseidon2.metallib was not regenerated"
+            );
+        }
     }
 
     /// The fallback in `MetalShared::new` hides a broken artifact behind a
@@ -2808,6 +2849,12 @@ mod tests {
             assert!(
                 library.get_function(name, None).is_ok(),
                 "prebuilt metallib is missing kernel {name}"
+            );
+        }
+        for name in RCFOLD_METALLIB_KERNELS {
+            assert!(
+                library.get_function(name, None).is_ok(),
+                "prebuilt metallib is missing folded kernel {name}"
             );
         }
     }
