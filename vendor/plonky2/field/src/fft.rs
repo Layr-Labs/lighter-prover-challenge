@@ -7,7 +7,9 @@ use unroll::unroll_for_loops;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
 #[cfg(target_arch = "aarch64")]
-use crate::goldilocks_field::mul_16th_root_powers;
+use crate::extension::quadratic::QuadraticExtension;
+#[cfg(target_arch = "aarch64")]
+use crate::goldilocks_field::{GoldilocksField, mul_16th_root_powers};
 
 use crate::packable::Packable;
 use crate::packed::PackedField;
@@ -834,6 +836,40 @@ fn fft_zero_padded_rate_8_first_layer_block(
     }
 }
 
+/// The quadratic-extension counterpart of
+/// [`fft_zero_padded_rate_8_first_layer_block`]. Production FRI transforms use
+/// `QuadraticExtension<GoldilocksField>`, and every twiddle in this fixed
+/// stage is an embedded power of the Goldilocks 16th root. Applying the
+/// existing fixed-root kernel independently to the two limbs is therefore
+/// exactly the generic product
+/// `[w, 0] * [v0, v1] = [w * v0, w * v1]`, without sixteen general
+/// Goldilocks multiplications per source pair.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fft_zero_padded_rate_8_first_layer_block_ext(
+    values: &mut [QuadraticExtension<GoldilocksField>],
+    source_start: usize,
+    nonzero_len: usize,
+    destination: usize,
+) {
+    debug_assert!(nonzero_len >= 2);
+
+    for pair in (0..nonzero_len / 2).rev() {
+        let source = source_start + pair * 2;
+        let u = values[source];
+        let v = values[source + 1];
+        let products_0 = mul_16th_root_powers(v.0[0]);
+        let products_1 = mul_16th_root_powers(v.0[1]);
+        let pair_destination = destination + pair * 16;
+
+        for j in 0..8 {
+            let t = QuadraticExtension([products_0[j], products_1[j]]);
+            values[pair_destination + j] = u + t;
+            values[pair_destination + 8 + j] = u - t;
+        }
+    }
+}
+
 /// Expand a bit-reversed nonzero prefix and perform its first nontrivial FFT layer in one pass.
 ///
 /// This is called only when each repeated run contains at least one packed vector.
@@ -848,6 +884,26 @@ fn fft_zero_padded_first_layer<P, M>(
     let repeat = 1 << r;
     let nonzero_len = values.len() >> r;
     debug_assert!(repeat >= P::WIDTH);
+
+    #[cfg(target_arch = "aarch64")]
+    if r == 3
+        && core::any::TypeId::of::<P>()
+            == core::any::TypeId::of::<QuadraticExtension<GoldilocksField>>()
+    {
+        let ext_values = unsafe {
+            // SAFETY: The TypeId check proves `P` is the width-one scalar
+            // `QuadraticExtension<GoldilocksField>`, hence `P::Scalar` is the
+            // same type and `values` has the same layout and element count.
+            core::slice::from_raw_parts_mut(
+                values
+                    .as_mut_ptr()
+                    .cast::<QuadraticExtension<GoldilocksField>>(),
+                values.len(),
+            )
+        };
+        fft_zero_padded_rate_8_first_layer_block_ext(ext_values, 0, nonzero_len, 0);
+        return;
+    }
 
     let packed_repeat = repeat / P::WIDTH;
     let packed_values = P::pack_slice_mut(values);
@@ -898,6 +954,27 @@ fn fft_zero_padded_cache_blocks<P, M>(
             };
             fft_zero_padded_rate_8_first_layer_block(
                 wide_values,
+                source_start,
+                nonzero_per_block,
+                destination,
+            );
+        } else if r == 3
+            && core::any::TypeId::of::<P>()
+                == core::any::TypeId::of::<QuadraticExtension<GoldilocksField>>()
+        {
+            let ext_values = unsafe {
+                // SAFETY: The TypeId check proves `P` is exactly the
+                // width-one quadratic extension, so the packed slice is the
+                // same contiguous element slice under its concrete spelling.
+                core::slice::from_raw_parts_mut(
+                    packed_values
+                        .as_mut_ptr()
+                        .cast::<QuadraticExtension<GoldilocksField>>(),
+                    packed_values.len(),
+                )
+            };
+            fft_zero_padded_rate_8_first_layer_block_ext(
+                ext_values,
                 source_start,
                 nonzero_per_block,
                 destination,
@@ -2698,6 +2775,77 @@ mod tests {
             [actual.0[0].0, actual.0[1].0],
             [expected.0[0].0, expected.0[1].0]
         );
+    }
+
+    /// The fixed 16th-root extension kernel must preserve the exact stored
+    /// Goldilocks words produced by the generic base-subfield-twiddle path.
+    /// Boundary and non-canonical limbs are intentional: field equality alone
+    /// would not catch a different reduction representative reaching the next
+    /// butterfly.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn rate_8_extension_first_layer_matches_generic_raw_limbs() {
+        use crate::fft::{
+            fft_zero_padded_first_layer_block_with,
+            fft_zero_padded_rate_8_first_layer_block_ext,
+        };
+
+        type F = GoldilocksField;
+        type FE = QuadraticExtension<F>;
+
+        const LG_N: usize = 12;
+        const R: usize = 3;
+        const N: usize = 1 << LG_N;
+        const LIVE: usize = N >> R;
+        const SPECIALS: [u64; 12] = [
+            0,
+            1,
+            2,
+            0xFFFF_FFFE_FFFF_FFFE,
+            0xFFFF_FFFE_FFFF_FFFF,
+            0xFFFF_FFFF_0000_0000,
+            0xFFFF_FFFF_0000_0001,
+            0xFFFF_FFFF_0000_0002,
+            0x8000_0000_0000_0000,
+            0xDEAD_BEEF_CAFE_BABE,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+
+        let mut input = vec![FE::ZERO; N];
+        for (i, value) in input[..LIVE].iter_mut().enumerate() {
+            let mixed = (i as u64)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .rotate_left((i & 63) as u32);
+            *value = QuadraticExtension([
+                GoldilocksField(SPECIALS[i % SPECIALS.len()] ^ mixed),
+                GoldilocksField(
+                    SPECIALS[(i * 7 + 3) % SPECIALS.len()] ^ mixed.rotate_left(17),
+                ),
+            ]);
+        }
+
+        let roots = fft_root_table::<FE>(N);
+        let mut expected = input.clone();
+        fft_zero_padded_first_layer_block_with::<FE, BaseSubfieldTwiddle>(
+            &mut expected,
+            0,
+            LIVE,
+            0,
+            1 << R,
+            &roots[R],
+        );
+
+        let mut actual = input;
+        fft_zero_padded_rate_8_first_layer_block_ext(&mut actual, 0, LIVE, 0);
+
+        for (i, (got, want)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                [got.0[0].0, got.0[1].0],
+                [want.0[0].0, want.0[1].0],
+                "raw extension limb mismatch at index {i}"
+            );
+        }
     }
 
     #[test]
