@@ -554,7 +554,7 @@ pub(crate) fn prove_block_after_pre(
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
-                    let (block_target, block_data) = circuits.build_block_circuit();
+                    let (block_target, block_data) = circuits.load_block_circuit();
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
                     let early = BlockCircuit::witness_inputs_early(

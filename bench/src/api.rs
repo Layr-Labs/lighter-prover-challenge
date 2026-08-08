@@ -194,6 +194,95 @@ mod build_timing {
 
     use super::*;
 
+    /// Prints the quotient-cache shape of every production circuit: the
+    /// `constants_sigmas_quotient_cache` in `circuit_builder.rs` is bounded by
+    /// a byte budget, and its payoff depends on the gather `step` it replaces
+    /// (a step of 1 is already contiguous, so the cache buys nothing there).
+    /// Run:
+    /// `cargo test --release -p bench --bin prove -- --ignored quotient_cache_shapes --nocapture`
+    #[test]
+    #[ignore = "manual diagnostic"]
+    fn quotient_cache_shapes() {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .build_global();
+        std::thread::Builder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(|| {
+                let circuits = Circuits::load();
+                let (_, block_data) = circuits.load_block_circuit();
+                let report = |name: &str, data: &CircuitData<F, C, D>| {
+                    let common = &data.common;
+                    let qdb = plonky2::util::log2_ceil(common.quotient_degree_factor);
+                    let step = 1usize << (common.config.fri_config.rate_bits - qdb);
+                    let domain = 1usize << (common.degree_bits() + qdb);
+                    let cols = common.constants_range().len() + common.sigmas_range().len();
+                    println!(
+                        "{name:<12} degree 2^{:<2} qdf {:<2} rate_bits {} step {step} \
+                         domain 2^{} cols {cols} cache {:.2} GiB cached={}",
+                        common.degree_bits(),
+                        common.quotient_degree_factor,
+                        common.config.fri_config.rate_bits,
+                        (common.degree_bits() + qdb),
+                        (cols * domain * 8) as f64 / (1024.0 * 1024.0 * 1024.0),
+                        data.prover_only.constants_sigmas_quotient_cache.is_some(),
+                    );
+                };
+                report("pre", &circuits.pre_data);
+                report("light_tx", &circuits.light_tx_data);
+                report("light_chain", &circuits.light_chain_data);
+                report("heavy_tx", &circuits.heavy_tx_data);
+                report("heavy_chain", &circuits.heavy_chain_data);
+                report("block", &block_data);
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    /// Manual timing harness for the final block circuit, which the pipeline
+    /// builds at runtime on its own lane (`build_block_circuit`) while the
+    /// transaction paths prove. Splits `define` from `build` so the embeddable
+    /// fraction is visible. Run:
+    /// `cargo test --release -p bench --bin prove -- --ignored block_build_timing --nocapture`
+    #[test]
+    #[ignore = "manual timing harness"]
+    fn block_build_timing() {
+        use circuit::block_constraints::{BlockCircuit, Circuit as _};
+
+        let _ = rayon::ThreadPoolBuilder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .build_global();
+        std::thread::Builder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(|| {
+                let t = Instant::now();
+                let circuits = Circuits::load();
+                println!("startup circuits load: {:?}", t.elapsed());
+
+                let t = Instant::now();
+                let block = BlockCircuit::define(
+                    CIRCUIT_CONFIG,
+                    &circuits.pre_data,
+                    &circuits.light_chain_data,
+                    &circuits.heavy_chain_data,
+                    ON_CHAIN_OPERATIONS_LIMIT,
+                );
+                let t_define = t.elapsed();
+                let t = Instant::now();
+                let block_data = block.builder.build::<C>();
+                let t_build = t.elapsed();
+                println!(
+                    "block circuit: define {t_define:?} build {t_build:?} (degree {})",
+                    block_data.common.degree()
+                );
+                println!("gates: {}", block_data.common.gates.len());
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
     /// Manual timing harness for the startup circuit builds, which run once per
     /// worker spawn inside the ranked timed window (five spawns per run). Run:
     /// `cargo test --release -p bench --bin prove -- --ignored build_phase_timing --nocapture`

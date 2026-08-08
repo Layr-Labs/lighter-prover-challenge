@@ -14,6 +14,7 @@
 //! (measurement A/B). The `embedded_matches_rebuilt` ignored test is the
 //! value-equality oracle between the two paths.
 
+use circuit::block_constraints::BlockTarget;
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
@@ -28,6 +29,7 @@ static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx
 static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
 static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+static BLOCK_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block.embed"));
 
 fn load_blob<T: serde::de::DeserializeOwned>(
     name: &'static str,
@@ -47,6 +49,40 @@ impl Circuits {
     /// behind the remaining circuit loads.
     pub fn load_pre() -> anyhow::Result<(BlockPreExecutionTarget, CircuitData<F, C, D>)> {
         load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB)
+    }
+
+    /// Loads the final block circuit from its compile-time blob.
+    ///
+    /// The block circuit is a pure function of the pre-execution and two chain
+    /// circuits, so it embeds exactly like they do. Building it costs `define`
+    /// + `build` in every scored worker process; loading it here replaces that
+    /// with a deserialize plus the same commitment recomputation the other
+    /// blobs already do, and the recomputed cap is checked against the embedded
+    /// verifier data before the circuit is used.
+    pub fn load_block() -> anyhow::Result<(BlockTarget, CircuitData<F, C, D>)> {
+        load_blob::<BlockTarget>("block", BLOCK_BLOB)
+    }
+
+    /// Production loader for the final block circuit: embedded when available,
+    /// otherwise the runtime build. `LIGHTER_BUILD_CIRCUITS=1` forces the build
+    /// path for A/B runs, matching [`Circuits::load`];
+    /// `LIGHTER_BUILD_BLOCK_CIRCUIT=1` forces it for this circuit alone, which
+    /// is the exact two-arm A/B for this mechanism (one binary, one changed
+    /// decision, everything else identical).
+    pub fn load_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
+        if std::env::var_os("LIGHTER_BUILD_BLOCK_CIRCUIT").is_some_and(|v| v == "1")
+            || std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1")
+        {
+            log::info!("LIGHTER_BUILD_CIRCUITS=1: building the final block circuit from scratch");
+            return self.build_block_circuit();
+        }
+        match Self::load_block() {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                log::warn!("embedded block circuit unavailable ({error:#}); building from scratch");
+                self.build_block_circuit()
+            }
+        }
     }
 
     /// Reconstructs all five startup circuits from the blobs embedded at
@@ -289,6 +325,57 @@ mod tests {
         });
     }
 
+    /// Determinism oracle for the final block circuit blob: builds it from the
+    /// freshly loaded startup circuits and asserts value identity with the
+    /// embedded one. Run:
+    /// `cargo test --release -p bench --bin prove -- --ignored embedded_block_matches_rebuilt --nocapture`
+    #[test]
+    #[ignore = "multi-second circuit rebuild; run explicitly"]
+    fn embedded_block_matches_rebuilt() {
+        on_big_stack(|| {
+            let circuits = Circuits::load();
+            let (rebuilt_target, rebuilt_data) = circuits.build_block_circuit();
+            let (embedded_target, embedded_data) =
+                Circuits::load_block().expect("embedded block circuit must load");
+
+            assert_circuit_pair_identical(
+                "block",
+                (&rebuilt_target, &rebuilt_data),
+                (&embedded_target, &embedded_data),
+            );
+            println!("embedded_block_matches_rebuilt: the block circuit is value-identical");
+        });
+    }
+
+    /// Manual timing harness: embedded block load vs runtime build. Run:
+    /// `cargo test --release -p bench --bin prove -- --ignored embedded_block_timing --nocapture`
+    #[test]
+    #[ignore = "manual timing harness"]
+    fn embedded_block_timing() {
+        use std::time::Instant;
+
+        on_big_stack(|| {
+            let circuits = Circuits::load();
+
+            let t = Instant::now();
+            let embedded = Circuits::load_block().expect("embedded block circuit must load");
+            let t_embedded = t.elapsed();
+            drop(embedded);
+
+            let t = Instant::now();
+            let rebuilt = circuits.build_block_circuit();
+            let t_rebuild = t.elapsed();
+            drop(rebuilt);
+
+            println!("block embedded load: {t_embedded:>10.1?}");
+            println!("block runtime build: {t_rebuild:>10.1?}");
+            println!(
+                "net win: {:+.1} ms",
+                (t_rebuild.as_secs_f64() - t_embedded.as_secs_f64()) * 1e3
+            );
+        });
+    }
+
     /// Manual timing harness: embedded load vs fresh build, both under the
     /// production overlapped layout and per circuit sequentially. Run:
     /// `cargo test --release -p bench --bin prove -- --ignored embedded_load_timing --nocapture`
@@ -364,6 +451,7 @@ mod tests {
             ("heavy_chain", HEAVY_CHAIN_BLOB),
             ("light_tx", LIGHT_TX_BLOB),
             ("light_chain", LIGHT_CHAIN_BLOB),
+            ("block", BLOCK_BLOB),
         ] {
             assert!(
                 !blob.is_empty(),
