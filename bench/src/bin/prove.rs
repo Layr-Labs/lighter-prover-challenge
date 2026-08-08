@@ -13,6 +13,7 @@ mod prover;
 use std::env;
 use std::fs::{self, File};
 use std::io::BufWriter;
+use std::path::Path;
 
 use api::{
     Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
@@ -44,24 +45,29 @@ static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
-    // First statement in the process: the Metal shader compile and pipeline
+    let mut args = env::args().skip(1);
+    let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
+    let output = args.next().expect("usage: prove FIXTURE OUTPUT");
+    assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
+
+    // First real work in the process: the Metal shader compile and pipeline
     // lowering behind the GPU hash path cost the better part of a second on a
     // cold OS shader cache, and the benchmark sandbox denies writes to that
     // cache, which disables it entirely — so every scored worker pays the full
     // price. Starting it here overlaps it with the startup work below instead
     // of stalling the first proving step that wants the GPU. Pure scheduling:
     // the compiled kernels are identical either way.
-    plonky2::hash::poseidon2::prewarm_gpu();
+    //
+    // The output file's directory is the process's writable scratch: it is
+    // where the sandbox lets this worker write, so it is where the embedded
+    // pipeline archive can be materialized for Metal to load. Only argument
+    // parsing precedes this, which costs nothing.
+    plonky2::hash::poseidon2::prewarm_gpu(Path::new(&output).parent());
     env_logger::init();
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
         .expect("cannot configure prover thread pool");
-
-    let mut args = env::args().skip(1);
-    let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
-    let output = args.next().expect("usage: prove FIXTURE OUTPUT");
-    assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
     let json = fs::read(fixture).expect("cannot read prover fixture");
     let block = Block::<F>::from_json_with_empty_txs(
@@ -103,7 +109,28 @@ fn main() {
     // is the GPU pre-warm above, which only populates a cache of compiled
     // kernels and produces nothing anyone reads back, so there is no in-flight
     // background work left to lose here.
-    std::process::exit(0);
+    // `std::process::exit` skips Rust destructors but still calls libc `exit(3)`,
+    // which is not the end of the process: it runs every `atexit`/`__cxa_atexit`
+    // handler and `__cxa_finalize`s each loaded image before finally calling
+    // `_exit(2)`. In this binary that image list includes the Objective-C
+    // runtime, Metal and the driver bundle, whose teardown releases GPU objects
+    // the kernel reclaims anyway. That work runs after the last proof byte has
+    // reached its descriptor, so it is dead time by the same argument that
+    // motivates skipping the destructors above.
+    //
+    // `_exit(2)` is the syscall `exit(3)` ends at, entered directly. It is safe
+    // here for the same reason the fast exit already was: the proof was flushed
+    // by `into_inner` and its descriptor closed above, so every byte is with the
+    // kernel. The only thing `_exit` additionally discards is userspace stdio
+    // buffering, and this binary writes nothing to stdout on the scored path;
+    // `env_logger` writes to stderr, which Rust does not buffer. Declared
+    // directly rather than through a `libc` dependency, matching how
+    // `pthread_set_qos_class_self_np` is declared in `prover.rs`, so the
+    // dependency graph and `Cargo.lock` are untouched.
+    unsafe extern "C" {
+        fn _exit(status: i32) -> !;
+    }
+    unsafe { _exit(0) }
 }
 
 // p90-fire-174-1786149031
