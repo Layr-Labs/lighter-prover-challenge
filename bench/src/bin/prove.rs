@@ -18,9 +18,8 @@ use api::{
     Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
     PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
 };
-use circuit::block_pre_execution_constraints::Circuit as _;
 use circuit::block::Block;
-use circuit::types::config::{C, F};
+use circuit::types::config::F;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -64,61 +63,19 @@ fn main() {
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
-    // Fixture parse overlaps the pre-execution circuit load; both are fast.
-    let (block, pre_circuits) = rayon::join(
-        || {
-            let json = fs::read(&fixture).expect("cannot read prover fixture");
-            Block::<F>::from_json_with_empty_txs(
-                &json,
-                HEAVY_TX_PER_PROOF,
-                LIGHT_TX_PER_PROOF,
-                PUBLIC_HEAVY_TX_COUNT,
-                PUBLIC_LIGHT_TX_COUNT,
-            )
-            .expect("invalid prover fixture")
-        },
-        || match Circuits::load_pre() {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                log::warn!("embedded pre circuit unavailable ({error:#}); building from scratch");
-                let pre =
-                    circuit::block_pre_execution_constraints::BlockPreExecutionCircuit::define(
-                        circuit::types::config::CIRCUIT_CONFIG,
-                    );
-                (pre.target, pre.builder.build::<C>())
-            }
-        },
-    );
-    let pre_exec = circuit::block_pre_execution::BlockPreExec::from_block(&block);
-    let pre_handle = std::thread::Builder::new()
-        .name("pre-exec-startup".into())
-        .stack_size(PROVER_THREAD_STACK_BYTES)
-        .spawn(move || {
-            let (pre_target, pre_data) = pre_circuits;
-            let pre_proof = prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec);
-            (pre_target, pre_data, pre_proof)
-        })
-        .expect("pre-execution startup thread must start");
-    // The pre circuit is owned by the startup proof until it completes. Load
-    // only the other four blobs in the meantime: loading all five here would
-    // deserialize the same pre circuit twice on the scored critical path.
-    // Keep the forced-build mode's established behavior unchanged.
-    let remaining = (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1"))
-        .then(Circuits::load_remaining_embedded);
-    let (pre_target, pre_data, pre_proof) = pre_handle
-        .join()
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-    let circuits = match remaining {
-        Some(Ok(remaining)) => remaining.into_circuits((pre_target, pre_data)),
-        Some(Err(error)) => {
-            log::warn!(
-                "embedded remaining circuits unavailable ({error:#}); building from scratch"
-            );
-            Circuits::load()
-        }
-        None => Circuits::load(),
-    };
-    let proof = prover::prove_block_after_pre(block, circuits, pre_proof);
+    let json = fs::read(fixture).expect("cannot read prover fixture");
+    let block = Block::<F>::from_json_with_empty_txs(
+        &json,
+        HEAVY_TX_PER_PROOF,
+        LIGHT_TX_PER_PROOF,
+        PUBLIC_HEAVY_TX_COUNT,
+        PUBLIC_LIGHT_TX_COUNT,
+    )
+    .expect("invalid prover fixture");
+    // Embedded circuits (deserialized from compile-time blobs) by default;
+    // falls back to building from scratch if they are unavailable, and
+    // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B measurement.
+    let proof = prover::prove_block(block, Circuits::load());
     let mut writer = BufWriter::with_capacity(
         PROOF_OUTPUT_BUFFER_BYTES,
         File::create(output).expect("cannot create proof output"),
@@ -146,23 +103,7 @@ fn main() {
     // is the GPU pre-warm above, which only populates a cache of compiled
     // kernels and produces nothing anyone reads back, so there is no in-flight
     // background work left to lose here.
-    // `std::process::exit` skips Rust destructors but still enters libc
-    // `exit(3)`, which runs every registered `atexit`/`__cxa_atexit` handler and
-    // finalises each loaded image — the Objective-C runtime, Metal and the
-    // driver bundle among them — before it reaches `_exit(2)`. That teardown
-    // releases objects the kernel reclaims at process death anyway, and it runs
-    // after the last proof byte has reached its descriptor, so it is dead work
-    // by the same argument that motivates skipping the destructors above.
-    // Entering `_exit(2)` directly is safe for the same reason the fast exit
-    // already was: the proof was flushed by `into_inner` and its descriptor
-    // closed, so every byte is with the kernel; the only thing additionally
-    // discarded is userspace stdio buffering, and nothing is written to stdout
-    // on the scored path. Declared in an `extern "C"` block rather than through
-    // a new dependency, so the dependency graph and `Cargo.lock` are untouched.
-    unsafe extern "C" {
-        fn _exit(status: i32) -> !;
-    }
-    unsafe { _exit(0) }
+    std::process::exit(0);
 }
 
-// p90-fire-174-1786149031
+// p90-fire-322-1786205022
