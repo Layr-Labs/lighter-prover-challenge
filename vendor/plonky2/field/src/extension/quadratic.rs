@@ -82,13 +82,6 @@ impl<F: Extendable<2>> Field for QuadraticExtension<F> {
         F::characteristic()
     }
 
-    #[inline(always)]
-    fn mul_fft_base_twiddle(twiddle: Self, value: Self) -> Self {
-        Self(<F as Extendable<2>>::mul_fft_quadratic_base_twiddle(
-            twiddle.0, value.0,
-        ))
-    }
-
     // Algorithm 11.3.4 in Handbook of Elliptic and Hyperelliptic Curve Cryptography.
     fn try_inverse(&self) -> Option<Self> {
         if self.is_zero() {
