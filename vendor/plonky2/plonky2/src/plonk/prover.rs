@@ -592,11 +592,10 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
 /// Fusing collapses two full traversals of the witness and sigma matrices, and
 /// two Rayon fork/joins over the subgroup, into one.
 ///
-/// Value-exactness: each challenge keeps its own accumulators, its own
-/// numerator/denominator multiplication order (`for j in start..end`), its own
-/// inversion batch in the same push order, and its own Z chain. Only the
-/// memory traversal and the Rayon scheduling are shared, so every output limb
-/// is bit-identical to running the per-challenge path twice.
+/// Each challenge keeps its own accumulators, inversion batch, and Z chain.
+/// When a routed position maps to itself, its numerator and denominator factor
+/// are identical; canceling that common factor preserves the permutation
+/// recurrence while avoiding work that cannot affect either challenge.
 fn two_challenge_wires_permutation_partial_products_and_zs<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -668,12 +667,22 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             let mut denominator_0 = F::ONE;
                             let mut denominator_1 = F::ONE;
                             for j in start..end {
-                                let wire_value = witness.get_wire(i, j);
                                 let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                let numerator_shift_0 = beta_k_is_0[j] * x;
+                                let numerator_shift_1 = beta_k_is_1[j] * x;
+                                let denominator_shift_0 = beta_0 * sigma;
+                                let denominator_shift_1 = beta_1 * sigma;
+                                if numerator_shift_0 == denominator_shift_0
+                                    && numerator_shift_1 == denominator_shift_1
+                                {
+                                    continue;
+                                }
+
+                                let wire_value = witness.get_wire(i, j);
+                                numerator_0 *= wire_value + numerator_shift_0 + gamma_0;
+                                numerator_1 *= wire_value + numerator_shift_1 + gamma_1;
+                                denominator_0 *= wire_value + denominator_shift_0 + gamma_0;
+                                denominator_1 *= wire_value + denominator_shift_1 + gamma_1;
                             }
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
@@ -3274,5 +3283,102 @@ mod permutation_pairing_tests {
                 }
             }
         }
+    }
+
+    /// A fixed permutation position contributes the same factor to the
+    /// numerator and denominator. Exercise a mixture of fixed and non-fixed
+    /// positions, including a noncanonical representation of zero, and compare
+    /// the cancellation path with the uncancelled one-challenge implementation.
+    #[test]
+    fn paired_two_challenge_fixed_factors_match_general_loop() {
+        let mut data = build_circuit();
+        let num_routed_wires = data.common.config.num_routed_wires;
+        let n_points = 17;
+        let mut rng = Rng::new(0xa5a5_5a5a_0123_4567);
+
+        let mut subgroup: Vec<F> = (0..n_points).map(|_| rng.next_field()).collect();
+        subgroup[0] = F::ZERO;
+        let betas: Vec<F> = (0..2).map(|_| rng.next_nonzero_field()).collect();
+        let gammas: Vec<F> = (0..2).map(|_| rng.next_nonzero_field()).collect();
+        let beta_k_is: Vec<F> = betas
+            .iter()
+            .flat_map(|&beta| data.common.k_is.iter().map(move |&k_i| beta * k_i))
+            .collect();
+
+        let mut sigmas: Vec<Vec<F>> = (0..n_points)
+            .map(|_| (0..num_routed_wires).map(|_| rng.next_field()).collect())
+            .collect();
+        let mut forced_fixed = 0;
+        for i in 0..n_points {
+            for j in 0..num_routed_wires {
+                if (i + j) % 3 != 0 {
+                    let fixed_sigma = data.common.k_is[j] * subgroup[i];
+                    // At x = 0, store the other valid Goldilocks limb for zero
+                    // to ensure the equality guard compares field values, not
+                    // raw representatives.
+                    sigmas[i][j] = if i == 0 {
+                        F::from_noncanonical_u64(F::ORDER)
+                    } else {
+                        fixed_sigma
+                    };
+                    forced_fixed += 1;
+                }
+            }
+        }
+
+        let mut witness = MatrixWitness {
+            wire_values: (0..num_routed_wires)
+                .map(|_| (0..n_points).map(|_| rng.next_field()).collect())
+                .collect(),
+        };
+        // The general reference inverts every denominator, so deterministically
+        // avoid its zero-denominator panic without changing which positions are
+        // fixed.
+        for i in 0..n_points {
+            for j in 0..num_routed_wires {
+                while betas.iter().zip(&gammas).any(|(&beta, &gamma)| {
+                    (witness.get_wire(i, j) + beta * sigmas[i][j] + gamma).is_zero()
+                }) {
+                    witness.wire_values[j][i] += F::ONE;
+                }
+            }
+        }
+
+        let cancelable = (0..n_points)
+            .flat_map(|i| (0..num_routed_wires).map(move |j| (i, j)))
+            .filter(|&(i, j)| {
+                beta_k_is[j] * subgroup[i] == betas[0] * sigmas[i][j]
+                    && beta_k_is[num_routed_wires + j] * subgroup[i]
+                        == betas[1] * sigmas[i][j]
+            })
+            .count();
+        assert!(cancelable >= forced_fixed);
+        assert_eq!(sigmas[0][1].to_noncanonical_u64(), F::ORDER);
+
+        data.prover_only.subgroup = subgroup;
+        data.prover_only.sigmas = sigmas;
+        let general: Vec<Vec<PolynomialValues<F>>> = (0..2)
+            .map(|challenge| {
+                wires_permutation_partial_products_and_zs(
+                    &witness,
+                    betas[challenge],
+                    &beta_k_is
+                        [challenge * num_routed_wires..(challenge + 1) * num_routed_wires],
+                    gammas[challenge],
+                    &data.prover_only,
+                    &data.common,
+                )
+            })
+            .collect();
+        let paired = two_challenge_wires_permutation_partial_products_and_zs(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            &data.prover_only,
+            &data.common,
+        );
+
+        assert_eq!(paired, general);
     }
 }
