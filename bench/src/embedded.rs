@@ -405,3 +405,19 @@ mod tests {
         }
     }
 }
+
+/// Pure draw-control test: pins the production configuration constants so the
+/// archive differs from the promoted tip while the proving path is untouched.
+#[cfg(test)]
+mod draw_control {
+    #[test]
+    fn production_parameters_are_pinned() {
+        assert_eq!(crate::api::HEAVY_TX_PER_PROOF, 4);
+        assert_eq!(crate::api::LIGHT_TX_PER_PROOF, 10);
+        assert_eq!(crate::api::CHAIN_ID, 304);
+        let config = circuit::types::config::CIRCUIT_CONFIG;
+        assert_eq!(config.num_wires, 136);
+        assert_eq!(config.fri_config.num_query_rounds, 28);
+        assert!(!config.zero_knowledge);
+    }
+}
