@@ -456,9 +456,19 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let mut out = Vec::with_capacity(w * q_domain);
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
-                for c in col_range {
-                    let column = columns.col(c);
-                    out.extend((0..q_domain).map(|i| column[i * step]));
+                // Production always has `rate_bits == quotient_degree_bits == 3`,
+                // so `step == 1` and the strided gather is a contiguous prefix.
+                // One `copy_from_slice` per column is bit-identical and cheaper.
+                if step == 1 {
+                    for c in col_range {
+                        let column = columns.col(c);
+                        out.extend_from_slice(&column[..q_domain]);
+                    }
+                } else {
+                    for c in col_range {
+                        let column = columns.col(c);
+                        out.extend((0..q_domain).map(|i| column[i * step]));
+                    }
                 }
                 Some(out)
             }

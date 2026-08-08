@@ -63,8 +63,8 @@ fn main() {
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
-    // Overlap fixture parse with embedded circuit load: independent work that
-    // previously ran fully serial on the scored critical path.
+    // Overlap fixture parse with circuit-blob load while Metal prewarm runs on
+    // its detached thread. Pure scheduling: same parse, same circuits, same proof.
     let (block, circuits) = rayon::join(
         || {
             let json = fs::read(&fixture).expect("cannot read prover fixture");
@@ -82,9 +82,6 @@ fn main() {
         // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B measurement.
         Circuits::load,
     );
-    // Embedded circuits (deserialized from compile-time blobs) by default;
-    // falls back to building from scratch if they are unavailable, and
-    // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B measurement.
     let proof = prover::prove_block(block, circuits);
     let mut writer = BufWriter::with_capacity(
         PROOF_OUTPUT_BUFFER_BYTES,
