@@ -27,17 +27,19 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "cfe4ce031860c4804566a5ff00a2e2bb49349305b132f65f300e68621706a282";
+    "8b2173134f69195956184d6a78d2e3f046b28315c67d0c745880273be2a39464";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
 /// source. This deliberately includes the lazily-built gate-quotient kernels:
 /// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 9] = [
+const METALLIB_REQUIRED_KERNELS: [&str; 11] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
     "poseidon2_hash_parents",
+    "poseidon2_hash_parents_simd4",
     "poseidon2_absorb_pass",
+    "poseidon2_absorb_pass_simd4",
     "ntt_prepare",
     "ntt_stage",
     "ifft_finalize",
@@ -483,7 +485,7 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             "range_check_gate_quotient",
             &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
         ),
-        ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
+        ("poseidon2_absorb_pass_simd4", &ABSORB_PASS_PIPELINE),
     ] {
         let device = device.clone();
         let library = library.clone();
@@ -1292,7 +1294,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            dispatch_simd4(encoder, pipeline, leaf_count);
             encoder.end_encoding();
             command_buffer.commit();
             command_buffer.to_owned()
@@ -1329,7 +1331,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             );
             parent_encoder.set_buffer(2, Some(&context.parameters), 0);
             set_u32(parent_encoder, 3, parent_count_u32);
-            dispatch(parent_encoder, &context.parent_pipeline, parent_count);
+            dispatch_simd4(parent_encoder, &context.parent_pipeline, parent_count);
             parent_encoder.end_encoding();
 
             child_count = parent_count;
@@ -1605,7 +1607,7 @@ impl MetalShared {
                 let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
                 let leaf_colmajor =
                     scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
-                let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
+                let parent = scope.spawn(required("poseidon2_hash_parents_simd4", "parent"));
                 let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
                 let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
                 let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
@@ -2235,7 +2237,7 @@ impl MetalShared {
                     );
                     parent_encoder.set_buffer(2, Some(&self.parameters), 0);
                     set_u32(parent_encoder, 3, parent_count_u32);
-                    dispatch(parent_encoder, &self.parent_pipeline, parent_count);
+                    dispatch_simd4(parent_encoder, &self.parent_pipeline, parent_count);
                     parent_encoder.end_encoding();
 
                     child_count = parent_count;
@@ -2495,7 +2497,7 @@ impl MetalShared {
                 );
                 parent_encoder.set_buffer(2, Some(&self.parameters), 0);
                 set_u32(parent_encoder, 3, parent_count_u32);
-                dispatch(parent_encoder, &self.parent_pipeline, parent_count);
+                dispatch_simd4(parent_encoder, &self.parent_pipeline, parent_count);
                 parent_encoder.end_encoding();
 
                 child_count = parent_count;
@@ -2708,7 +2710,7 @@ impl MetalShared {
                     size_of::<u32>() as NSUInteger,
                     (&parent_count_u32 as *const u32).cast::<c_void>(),
                 );
-                dispatch(parent_encoder, &self.parent_pipeline, parent_count);
+                dispatch_simd4(parent_encoder, &self.parent_pipeline, parent_count);
                 parent_encoder.end_encoding();
 
                 child_count = parent_count;
@@ -2791,6 +2793,14 @@ fn dispatch(
             depth: 1,
         },
     );
+}
+
+fn dispatch_simd4(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    item_count: usize,
+) {
+    dispatch(encoder, pipeline, item_count * 4);
 }
 
 /// Copies the GPU's level-order node array (leaf digests first, cap level
@@ -4349,6 +4359,7 @@ kernel void goldilocks_mul_bench_native(
         limb: ComputePipelineState,
         native_leaf: ComputePipelineState,
         native: ComputePipelineState,
+        cooperative: ComputePipelineState,
     }
 
     impl PoseidonBenchmarkHarness {
@@ -4371,12 +4382,13 @@ kernel void goldilocks_mul_bench_native(
                     (
                         pipeline("poseidon2_hash_leaves"),
                         pipeline("poseidon2_hash_parents"),
+                        pipeline("poseidon2_hash_parents_simd4"),
                     )
                 };
                 let native_source =
                     ["#define POSEIDON2_NATIVE_ARITHMETIC_REFERENCE 1\n", SHADER_SOURCE].concat();
-                let (limb_leaf, limb) = pipelines(SHADER_SOURCE);
-                let (native_leaf, native) = pipelines(&native_source);
+                let (limb_leaf, limb, cooperative) = pipelines(SHADER_SOURCE);
+                let (native_leaf, native, _) = pipelines(&native_source);
 
                 let mut parameter_values = Vec::with_capacity(130);
                 parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -4395,6 +4407,7 @@ kernel void goldilocks_mul_bench_native(
                     limb,
                     native_leaf,
                     native,
+                    cooperative,
                 }
             })
         }
@@ -4656,13 +4669,135 @@ kernel void goldilocks_mul_bench_native(
                 MTLResourceOptions::StorageModeShared,
             )
         });
+        let cooperative_output = autoreleasepool(|| {
+            harness.device.new_buffer(
+                output_bytes as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
         harness.run(&harness.limb, &input, &limb_output, count);
         harness.run(&harness.native, &input, &native_output, count);
+        harness.run(
+            &harness.cooperative,
+            &input,
+            &cooperative_output,
+            count * 4,
+        );
         let limb =
             unsafe { slice::from_raw_parts(limb_output.contents().cast::<u64>(), count * 4) };
         let native =
             unsafe { slice::from_raw_parts(native_output.contents().cast::<u64>(), count * 4) };
+        let cooperative = unsafe {
+            slice::from_raw_parts(cooperative_output.contents().cast::<u64>(), count * 4)
+        };
         assert_eq!(limb, native);
+        assert_eq!(cooperative, native);
+    }
+
+    #[test]
+    fn metal_poseidon2_absorb_simd4_matches_scalar() {
+        const LEAF_COUNT: usize = 1 << 10;
+        const LEAF_WIDTH: usize = 17;
+
+        let device = Device::system_default().expect("no Metal device");
+        let library = device
+            .new_library_with_source(SHADER_SOURCE, &CompileOptions::new())
+            .expect("Poseidon2 shader must compile");
+        let pipeline = |name| {
+            let function = library
+                .get_function(name, None)
+                .unwrap_or_else(|error| panic!("{name} unavailable: {error}"));
+            device
+                .new_compute_pipeline_state_with_function(&function)
+                .unwrap_or_else(|error| panic!("{name} pipeline failed: {error}"))
+        };
+        let scalar = pipeline("poseidon2_absorb_pass");
+        let cooperative = pipeline("poseidon2_absorb_pass_simd4");
+
+        let mut rng = StdRng::seed_from_u64(0x5349_4d44_4142_534f);
+        let leaves: Vec<u64> = (0..LEAF_WIDTH * LEAF_COUNT)
+            .map(|index| {
+                if index & 31 == 0 {
+                    GoldilocksField::ORDER + (index as u64 & 0xffff)
+                } else {
+                    rng.next_u64()
+                }
+            })
+            .collect();
+        let input = device.new_buffer_with_data(
+            leaves.as_ptr().cast::<c_void>(),
+            size_of_val(leaves.as_slice()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let state_bytes = (12 * LEAF_COUNT * size_of::<u64>()) as u64;
+        let hash_bytes = (4 * LEAF_COUNT * size_of::<u64>()) as u64;
+        let scalar_state = device.new_buffer(state_bytes, MTLResourceOptions::StorageModeShared);
+        let scalar_hashes = device.new_buffer(hash_bytes, MTLResourceOptions::StorageModeShared);
+        let cooperative_state =
+            device.new_buffer(state_bytes, MTLResourceOptions::StorageModeShared);
+        let cooperative_hashes =
+            device.new_buffer(hash_bytes, MTLResourceOptions::StorageModeShared);
+        let mut parameter_values = Vec::with_capacity(130);
+        parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
+        parameter_values.extend(INTERNAL_CONSTANTS);
+        parameter_values.extend(MATRIX_DIAG_12_U64);
+        let parameters = device.new_buffer_with_data(
+            parameter_values.as_ptr().cast::<c_void>(),
+            size_of_val(parameter_values.as_slice()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let queue = device.new_command_queue();
+
+        let run = |pipeline: &ComputePipelineState,
+                   state: &Buffer,
+                   hashes: &Buffer,
+                   cooperative: bool| {
+            let groups = LEAF_WIDTH.div_ceil(8);
+            for group in 0..groups {
+                let col_start = group * 8;
+                let chunk = (LEAF_WIDTH - col_start).min(8);
+                let command = queue.new_command_buffer();
+                let encoder = command.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(pipeline);
+                encoder.set_buffer(0, Some(&input), 0);
+                encoder.set_buffer(1, Some(state), 0);
+                encoder.set_buffer(2, Some(hashes), 0);
+                encoder.set_buffer(3, Some(&parameters), 0);
+                set_u32(encoder, 4, LEAF_COUNT as u32);
+                set_u32(encoder, 5, LEAF_COUNT.ilog2());
+                set_u32(encoder, 6, col_start as u32);
+                set_u32(encoder, 7, chunk as u32);
+                set_u32(encoder, 8, (group == 0) as u32);
+                set_u32(encoder, 9, (group == groups - 1) as u32);
+                dispatch(
+                    encoder,
+                    pipeline,
+                    LEAF_COUNT * if cooperative { 4 } else { 1 },
+                );
+                encoder.end_encoding();
+                command.commit();
+                command.wait_until_completed();
+                assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+            }
+        };
+        run(&scalar, &scalar_state, &scalar_hashes, false);
+        run(
+            &cooperative,
+            &cooperative_state,
+            &cooperative_hashes,
+            true,
+        );
+
+        let scalar = unsafe {
+            slice::from_raw_parts(scalar_hashes.contents().cast::<u64>(), 4 * LEAF_COUNT)
+        };
+        let cooperative = unsafe {
+            slice::from_raw_parts(
+                cooperative_hashes.contents().cast::<u64>(),
+                4 * LEAF_COUNT,
+            )
+        };
+        assert_eq!(cooperative, scalar);
     }
 
     #[test]
