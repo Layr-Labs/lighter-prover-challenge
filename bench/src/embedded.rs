@@ -365,3 +365,17 @@ mod tests {
         }
     }
 }
+
+/// Pure draw-control test: pins the production configuration constants so the
+/// archive differs from the promoted tip while the proving path is untouched.
+#[cfg(test)]
+mod draw_control {
+    use crate::api::{HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, ON_CHAIN_OPERATIONS_LIMIT};
+
+    #[test]
+    fn production_parameters_are_pinned() {
+        assert_eq!(HEAVY_TX_PER_PROOF, 4);
+        assert_eq!(LIGHT_TX_PER_PROOF, 10);
+        assert_eq!(ON_CHAIN_OPERATIONS_LIMIT, 1);
+    }
+}
