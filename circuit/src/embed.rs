@@ -483,13 +483,16 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // Metal quotient-gate union frontier). It is a pure derivation from the
     // freshly recomputed column-backed commitment — the same extraction the
     // builder performs — and the documented `None` fallback keeps the quotient
-    // path correct if extraction declines.
+    // path correct if extraction declines. The `step > 1` guard mirrors the
+    // builder's: at `step == 1` the quotient loop's contiguous gather already
+    // performs the identical `copy_from_slice` from the identical columns, so
+    // the cache would only duplicate the extension in memory.
     let quotient_degree_bits = plonky2::util::log2_ceil(common.quotient_degree_factor);
     let (constants_sigmas_quotient_cache, constants_sigmas_quotient_step, constants_sigmas_quotient_domain) = {
         let step = 1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
         let domain = 1 << (common.degree_bits() + quotient_degree_bits);
         let cols = common.constants_range().len() + common.sigmas_range().len();
-        if cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
+        if step > 1 && cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
             match (
                 constants_sigmas_commitment.extract_lde_batch_columns(
                     step,
