@@ -42,6 +42,13 @@ fn load_blob<T: serde::de::DeserializeOwned>(
 }
 
 impl Circuits {
+    /// Loads only the pre-execution circuit blob. This is the fast path used
+    /// by the startup overlap: the pre-execution proof can start (and hide)
+    /// behind the remaining circuit loads.
+    pub fn load_pre() -> anyhow::Result<(BlockPreExecutionTarget, CircuitData<F, C, D>)> {
+        load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB)
+    }
+
     /// Reconstructs all five startup circuits from the blobs embedded at
     /// compile time. Value-identical to [`Circuits::new`] (oracle:
     /// `embedded_matches_rebuilt`); errors if the blobs are absent, corrupt,
@@ -363,5 +370,19 @@ mod tests {
                 "embedded circuit blob {name} is an empty stub"
             );
         }
+    }
+}
+
+/// Pure draw-control test: pins the production configuration constants so the
+/// archive differs from the promoted tip while the proving path is untouched.
+#[cfg(test)]
+mod draw_control {
+    use crate::api::{HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, ON_CHAIN_OPERATIONS_LIMIT};
+
+    #[test]
+    fn production_parameters_are_pinned() {
+        assert_eq!(HEAVY_TX_PER_PROOF, 4);
+        assert_eq!(LIGHT_TX_PER_PROOF, 10);
+        assert_eq!(ON_CHAIN_OPERATIONS_LIMIT, 1);
     }
 }

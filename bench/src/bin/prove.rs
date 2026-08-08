@@ -18,8 +18,9 @@ use api::{
     Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
     PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
 };
+use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
 use circuit::block::Block;
-use circuit::types::config::F;
+use circuit::types::config::{C, CIRCUIT_CONFIG, F};
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -63,9 +64,8 @@ fn main() {
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
-    // Overlap fixture parse with embedded circuit load: independent work that
-    // previously ran fully serial on the scored critical path.
-    let (block, circuits) = rayon::join(
+    // Fixture parse overlaps the pre-execution circuit load; both are fast.
+    let (block, pre_circuits) = rayon::join(
         || {
             let json = fs::read(&fixture).expect("cannot read prover fixture");
             Block::<F>::from_json_with_empty_txs(
@@ -77,15 +77,32 @@ fn main() {
             )
             .expect("invalid prover fixture")
         },
-        // Embedded circuits (deserialized from compile-time blobs) by default;
-        // falls back to building from scratch if they are unavailable, and
-        // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B measurement.
-        Circuits::load,
+        || match Circuits::load_pre() {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                log::warn!("embedded pre circuit unavailable ({error:#}); building from scratch");
+                let pre = circuit::block_pre_execution_constraints::BlockPreExecutionCircuit::define(
+                    circuit::types::config::CIRCUIT_CONFIG,
+                );
+                (pre.target, pre.builder.build::<C>())
+            }
+        },
     );
+    let pre_exec = circuit::block_pre_execution::BlockPreExec::from_block(&block);
+    let pre_handle = std::thread::Builder::new()
+        .name("pre-exec-startup".into())
+        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .spawn(move || {
+            let (pre_target, pre_data) = pre_circuits;
+            prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec)
+        })
+        .expect("pre-execution startup thread must start");
     // Embedded circuits (deserialized from compile-time blobs) by default;
     // falls back to building from scratch if they are unavailable, and
     // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B measurement.
-    let proof = prover::prove_block(block, circuits);
+    let circuits = Circuits::load();
+    let pre_proof = pre_handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let proof = prover::prove_block_after_pre(block, circuits, pre_proof);
     let mut writer = BufWriter::with_capacity(
         PROOF_OUTPUT_BUFFER_BYTES,
         File::create(output).expect("cannot create proof output"),
