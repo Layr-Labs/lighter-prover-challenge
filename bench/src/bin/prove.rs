@@ -103,7 +103,28 @@ fn main() {
     // is the GPU pre-warm above, which only populates a cache of compiled
     // kernels and produces nothing anyone reads back, so there is no in-flight
     // background work left to lose here.
-    std::process::exit(0);
+    // `std::process::exit` skips Rust destructors but still calls libc `exit(3)`,
+    // which is not the end of the process: it runs every `atexit`/`__cxa_atexit`
+    // handler and `__cxa_finalize`s each loaded image before finally calling
+    // `_exit(2)`. In this binary that image list includes the Objective-C
+    // runtime, Metal and the driver bundle, whose teardown releases GPU objects
+    // the kernel reclaims anyway. That work runs after the last proof byte has
+    // reached its descriptor, so it is dead time by the same argument that
+    // motivates skipping the destructors above.
+    //
+    // `_exit(2)` is the syscall `exit(3)` ends at, entered directly. It is safe
+    // here for the same reason the fast exit already was: the proof was flushed
+    // by `into_inner` and its descriptor closed above, so every byte is with the
+    // kernel. The only thing `_exit` additionally discards is userspace stdio
+    // buffering, and this binary writes nothing to stdout on the scored path;
+    // `env_logger` writes to stderr, which Rust does not buffer. Declared
+    // directly rather than through a `libc` dependency, matching how
+    // `pthread_set_qos_class_self_np` is declared in `prover.rs`, so the
+    // dependency graph and `Cargo.lock` are untouched.
+    unsafe extern "C" {
+        fn _exit(status: i32) -> !;
+    }
+    unsafe { _exit(0) }
 }
 
 // p90-fire-174-1786149031
