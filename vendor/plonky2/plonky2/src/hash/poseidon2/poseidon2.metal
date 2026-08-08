@@ -1167,6 +1167,7 @@ kernel void range_check_gate_quotient(
     output[(ulong)gid * 2 + 1] = gl_canonicalize(total[1]);
 }
 
+// 2D-split experiment removed; original kernel restored below
 kernel void poseidon2_hash_leaves(
     const device ulong* leaves [[buffer(0)]],
     device ulong* hashes [[buffer(1)]],
@@ -1394,6 +1395,194 @@ kernel void poseidon2_absorb_pass(
     } else {
         for (uint i = 0; i < 12; ++i) {
             state[(ulong)i * leaf_count + gid] = st[i];
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+// 4-way interleaved narrow-leaf hashing.
+//
+// The single-leaf kernels above execute one sponge chain per thread. For
+// narrow leaves (at most one 8-word chunk per leaf) that is one dependent
+// permutation per thread, and the kernel is latency-bound: the GPU cannot
+// hide the permutation dependency chains and memory round trips behind enough
+// independent work, so per-permutation throughput collapses (measured ~30x
+// below the wide-leaf kernels, which amortize 17 sequential permutations per
+// thread). This kernel processes four leaves per thread in lockstep, giving
+// the compiler four independent dependency chains to interleave, exactly like
+// the CPU `poseidon2_x4` path. Every operation is bit-identical to the
+// single-state permutation on each leaf.
+// ---------------------------------------------------------------------------
+
+inline void mat4_x4(thread ulong state[4][12], uint offset) {
+    lazy_t x0[4], x1[4], x2[4], x3[4];
+    #pragma unroll
+    for (uint s = 0; s < 4u; ++s) {
+        x0[s] = lazy_of(state[s][offset + 0u]);
+        x1[s] = lazy_of(state[s][offset + 1u]);
+        x2[s] = lazy_of(state[s][offset + 2u]);
+        x3[s] = lazy_of(state[s][offset + 3u]);
+    }
+    lazy_t t01[4], t23[4], total[4];
+    #pragma unroll
+    for (uint s = 0; s < 4u; ++s) {
+        t01[s] = lazy_add(x0[s], x1[s]);
+        t23[s] = lazy_add(x2[s], x3[s]);
+        total[s] = lazy_add(t01[s], t23[s]);
+
+        state[s][offset + 0u] =
+            lazy_materialize(lazy_add(lazy_add(total[s], t01[s]), x1[s]));
+        state[s][offset + 1u] = lazy_materialize(
+            lazy_add(lazy_add(lazy_add(total[s], x1[s]), x2[s]), x2[s]));
+        state[s][offset + 2u] =
+            lazy_materialize(lazy_add(lazy_add(total[s], t23[s]), x3[s]));
+        state[s][offset + 3u] = lazy_materialize(
+            lazy_add(lazy_add(lazy_add(total[s], x3[s]), x0[s]), x0[s]));
+    }
+}
+
+inline void external_linear_layer_x4(thread ulong state[4][12]) {
+    mat4_x4(state, 0u);
+    mat4_x4(state, 4u);
+    mat4_x4(state, 8u);
+
+    lazy_t sums[4][4];
+    #pragma unroll
+    for (uint i = 0; i < 4u; ++i) {
+        #pragma unroll
+        for (uint s = 0; s < 4u; ++s) {
+            sums[i][s] = lazy_add(
+                lazy_add(lazy_of(state[s][i]), lazy_of(state[s][i + 4u])),
+                lazy_of(state[s][i + 8u]));
+        }
+    }
+    #pragma unroll
+    for (uint i = 0; i < 12u; ++i) {
+        #pragma unroll
+        for (uint s = 0; s < 4u; ++s) {
+            state[s][i] = lazy_materialize(lazy_add(lazy_of(state[s][i]), sums[i & 3u][s]));
+        }
+    }
+}
+
+inline void internal_linear_layer_x4(thread ulong state[4][12], constant ulong* diagonal) {
+    ulong sum[4];
+    #pragma unroll
+    for (uint s = 0; s < 4u; ++s) {
+        ulong acc = 0;
+        uint carries = 0;
+        #pragma unroll
+        for (uint i = 0; i < 12u; ++i) {
+            ulong next = acc + state[s][i];
+            carries += (uint)(next < acc);
+            acc = next;
+        }
+        sum[s] = gl_add(acc, (ulong)carries * GOLDILOCKS_EPSILON);
+    }
+    #pragma unroll
+    for (uint s = 0; s < 4u; ++s) {
+        #pragma unroll
+        for (uint i = 0; i < 12u; ++i) {
+            state[s][i] = gl_mul_add(state[s][i], diagonal[i], sum[s]);
+        }
+    }
+}
+
+inline void poseidon2_x4(thread ulong state[4][12], constant ulong* parameters) {
+    constant ulong* external_constants = parameters;
+    constant ulong* internal_constants = parameters + 96;
+    constant ulong* diagonal = parameters + 118;
+
+    external_linear_layer_x4(state);
+
+    #pragma unroll
+    for (uint round = 0; round < 4u; ++round) {
+        #pragma unroll
+        for (uint i = 0; i < 12u; ++i) {
+            #pragma unroll
+            for (uint s = 0; s < 4u; ++s) {
+                state[s][i] = pow7(gl_add(state[s][i], external_constants[round * 12u + i]));
+            }
+        }
+        external_linear_layer_x4(state);
+    }
+
+    #pragma unroll
+    for (uint round = 0; round < 22u; ++round) {
+        #pragma unroll
+        for (uint s = 0; s < 4u; ++s) {
+            state[s][0] = pow7(gl_add(state[s][0], internal_constants[round]));
+        }
+        internal_linear_layer_x4(state, diagonal);
+    }
+
+    #pragma unroll
+    for (uint round = 4u; round < 8u; ++round) {
+        #pragma unroll
+        for (uint i = 0; i < 12u; ++i) {
+            #pragma unroll
+            for (uint s = 0; s < 4u; ++s) {
+                state[s][i] = pow7(gl_add(state[s][i], external_constants[round * 12u + i]));
+            }
+        }
+        external_linear_layer_x4(state);
+    }
+}
+
+// Four narrow leaves per thread (leaf_width <= 8). The four independent
+// sponge chains interleave so the GPU hides their permutation latencies.
+kernel void poseidon2_hash_leaves_colmajor_x4(
+    const device ulong* leaves [[buffer(0)]],
+    device ulong* hashes [[buffer(1)]],
+    constant ulong* parameters [[buffer(2)]],
+    constant uint& leaf_width [[buffer(3)]],
+    constant uint& leaf_count [[buffer(4)]],
+    constant uint& log_leaf_count [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint base = gid * 4u;
+    if (base >= leaf_count) {
+        return;
+    }
+    uint count = leaf_count - base;
+    if (count > 4u) {
+        count = 4u;
+    }
+
+    ulong state[4][12];
+    #pragma unroll
+    for (uint s = 0; s < 4u; ++s) {
+        #pragma unroll
+        for (uint i = 0; i < 12u; ++i) {
+            state[s][i] = 0;
+        }
+    }
+    #pragma unroll
+    for (uint s = 0; s < 4u; ++s) {
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            if (s < count && i < leaf_width) {
+                state[s][i] = gl_canonicalize(leaves[(ulong)i * leaf_count + base + s]);
+            }
+        }
+    }
+
+    // Widths at or below 4 never permute in the single-leaf kernel: the
+    // canonicalized input words are written straight out, zero-padded. Keep
+    // that exact semantics here.
+    if (leaf_width > 4u) {
+        poseidon2_x4(state, parameters);
+    }
+
+    #pragma unroll
+    for (uint s = 0; s < 4u; ++s) {
+        if (s < count) {
+            uint out_row = log_leaf_count == 0
+                ? (base + s)
+                : (reverse_bits(base + s) >> (32 - log_leaf_count));
+            device ulong* output = hashes + (ulong)out_row * 4;
+            #pragma unroll
+            for (uint i = 0; i < 4u; ++i) {
+                output[i] = gl_canonicalize(state[s][i]);
+            }
         }
     }
 }

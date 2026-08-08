@@ -27,15 +27,16 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "5a26157063dd5c76cedf06d12681d4f146bacdd236c3613d861ec5bb781597e6";
+    "6818ce085b7a47d77c7378c974c0c440f3498f5912ed7c865e87a80bf485ab9d";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
 /// source. This deliberately includes the lazily-built gate-quotient kernels:
 /// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 9] = [
+const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
+    "poseidon2_hash_leaves_colmajor_x4",
     "poseidon2_hash_parents",
     "poseidon2_absorb_pass",
     "ntt_prepare",
@@ -83,6 +84,7 @@ struct MetalShared {
     queue: CommandQueue,
     leaf_pipeline: ComputePipelineState,
     leaf_colmajor_pipeline: ComputePipelineState,
+    leaf_colmajor_x4_pipeline: ComputePipelineState,
     parent_pipeline: ComputePipelineState,
     ntt_prepare_pipeline: ComputePipelineState,
     ntt_stage_pipeline: ComputePipelineState,
@@ -1464,6 +1466,7 @@ impl MetalShared {
             let (
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
+                leaf_colmajor_x4_pipeline,
                 parent_pipeline,
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
@@ -1472,6 +1475,8 @@ impl MetalShared {
                 let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
                 let leaf_colmajor =
                     scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
+                let leaf_colmajor_x4 =
+                    scope.spawn(required("poseidon2_hash_leaves_colmajor_x4", "col-major x4 leaf"));
                 let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
                 let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
                 let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
@@ -1483,6 +1488,9 @@ impl MetalShared {
                     leaf_colmajor
                         .join()
                         .expect("col-major leaf pipeline thread panicked"),
+                    leaf_colmajor_x4
+                        .join()
+                        .expect("col-major x4 leaf pipeline thread panicked"),
                     parent.join().expect("parent pipeline thread panicked"),
                     ntt_prepare
                         .join()
@@ -1503,6 +1511,7 @@ impl MetalShared {
             // which `new_library_with_source` above has already rejected.
             let leaf_pipeline = leaf_pipeline?;
             let leaf_colmajor_pipeline = leaf_colmajor_pipeline?;
+            let leaf_colmajor_x4_pipeline = leaf_colmajor_x4_pipeline?;
             let parent_pipeline = parent_pipeline?;
             let ntt_prepare_pipeline = ntt_prepare_pipeline?;
             let ntt_stage_pipeline = ntt_stage_pipeline?;
@@ -1526,6 +1535,7 @@ impl MetalShared {
                 device,
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
+                leaf_colmajor_x4_pipeline,
                 parent_pipeline,
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
@@ -2537,7 +2547,25 @@ impl MetalShared {
             let log_leaf_count_u32 = leaf_count.ilog2();
             let leaf_pipeline = match &source {
                 LeafSource::Rows(_) => &self.leaf_pipeline,
-                LeafSource::Columns(_) | LeafSource::Shared(_) => &self.leaf_colmajor_pipeline,
+                LeafSource::Columns(_) | LeafSource::Shared(_) => {
+                    // Narrow column-major leaves (at most one 8-word sponge
+                    // chunk per leaf) hash four leaves per thread with
+                    // interleaved permutation chains; wide leaves keep the
+                    // single-leaf kernel, which already amortizes many
+                    // sequential chunks per thread.
+                    if leaf_width <= 8 {
+                        &self.leaf_colmajor_x4_pipeline
+                    } else {
+                        &self.leaf_colmajor_pipeline
+                    }
+                }
+            };
+            let leaf_threads = if leaf_width <= 8
+                && matches!(&source, LeafSource::Columns(_) | LeafSource::Shared(_))
+            {
+                leaf_count.div_ceil(4)
+            } else {
+                leaf_count
             };
             let command_buffer = self.queue.new_command_buffer();
             let leaf_encoder = command_buffer.new_compute_command_encoder();
@@ -2562,7 +2590,7 @@ impl MetalShared {
                     (&log_leaf_count_u32 as *const u32).cast::<c_void>(),
                 );
             }
-            dispatch(leaf_encoder, leaf_pipeline, leaf_count);
+            dispatch(leaf_encoder, leaf_pipeline, leaf_threads);
             leaf_encoder.end_encoding();
 
             let mut level_offset = 0usize;
