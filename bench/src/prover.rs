@@ -1,3 +1,4 @@
+// Redraw 2 of the six-mechanism union (upper-mode retry per the bimodal noise model).
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 

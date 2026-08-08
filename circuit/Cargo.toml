@@ -46,6 +46,7 @@ clap_derive = { workspace = true }
 tiny-keccak =  { workspace = true }
 paste = { workspace = true }
 lz4_flex = { version = "0.14.0", default-features = false, features = ["std"] }
+zstd = "0.13"
 
 [dev-dependencies]
 flate2 = "1.0"
