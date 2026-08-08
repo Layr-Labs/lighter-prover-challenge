@@ -13,6 +13,7 @@ pub struct StridedConstraintConsumer<'a, P: PackedField> {
     start: *mut P::Scalar,
     end: *mut P::Scalar,
     stride: usize,
+    accumulate_filter: Option<P>,
     _phantom: PhantomData<&'a mut [P::Scalar]>,
 }
 
@@ -35,8 +36,24 @@ impl<'a, P: PackedField> StridedConstraintConsumer<'a, P> {
             start,
             end,
             stride,
+            accumulate_filter: None,
             _phantom: PhantomData,
         }
+    }
+
+    /// Creates a consumer which applies the point filter while emitting each
+    /// constraint, accumulating directly into the destination matrix. This
+    /// avoids materializing and rereading a temporary constraint block.
+    pub fn new_accumulating(
+        buffer: &'a mut [P::Scalar],
+        stride: usize,
+        offset: usize,
+        filter: P,
+    ) -> Self {
+        assert!(offset + P::WIDTH <= stride);
+        let mut consumer = Self::new(buffer, stride, offset);
+        consumer.accumulate_filter = Some(filter);
+        consumer
     }
 
     /// Emit one constraint.
@@ -45,7 +62,12 @@ impl<'a, P: PackedField> StridedConstraintConsumer<'a, P> {
             // # Safety
             // The checks in `new` guarantee that this points to valid space.
             unsafe {
-                *self.start.cast() = constraint;
+                let slot = &mut *self.start.cast::<P>();
+                if let Some(filter) = self.accumulate_filter {
+                    *slot = slot.multiply_accumulate(constraint, filter);
+                } else {
+                    *slot = constraint;
+                }
             }
             // See the comment in `new`. `wrapping_add` is needed to avoid UB if we've just
             // exhausted our buffer (and hence we're setting `self.start` to point past the end).
