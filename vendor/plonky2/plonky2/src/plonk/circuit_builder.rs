@@ -55,7 +55,7 @@ use crate::timed;
 use crate::util::context_tree::ContextTree;
 use crate::util::partial_products::num_partial_products;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil, log2_strict, transpose_poly_values};
+use crate::util::{log2_ceil, log2_strict, transpose_poly_values_ref};
 
 /// Number of random coins needed for lookups (for each challenge).
 /// A coin is a randomly sampled extension field element from the verifier,
@@ -1276,9 +1276,17 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let max_fft_points = 1 << (degree_bits + max(rate_bits, log2_ceil(quotient_degree_factor)));
         let fft_root_table = fft_root_table(max_fft_points);
 
+        // `prover_only.sigmas` is the transpose of the sigma *values*, and the
+        // commitment below consumes those same values. Transposing first reads the
+        // columns in place, so they can then be moved into the commitment instead
+        // of cloned; the clone was one extra full copy of the sigma columns
+        // (`num_routed_wires * degree` field elements) per circuit. Only the order
+        // of two independent reads changes — no quantity is computed differently.
+        let sigmas = transpose_poly_values_ref(&sigma_vecs);
+
         let constants_sigmas_commitment = if commit_to_sigma {
             let mut constants_sigmas_vecs = constant_vecs;
-            constants_sigmas_vecs.extend(sigma_vecs.iter().cloned());
+            constants_sigmas_vecs.extend(sigma_vecs);
             PolynomialBatch::<F, C, D>::from_values(
                 constants_sigmas_vecs,
                 rate_bits,
@@ -1405,12 +1413,25 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // gathers read the same values. Extract them once (bounded by 1 GiB so
         // the final block circuit — which is proven once — stays uncached) and
         // let the quotient batch loop copy instead of re-walking the LDE.
+        //
+        // Skipped entirely at `step == 1`, where the cache cannot pay for itself:
+        // it exists to turn a strided gather into a contiguous copy, and at stride
+        // one the gather is *already* contiguous. Concretely,
+        // `extract_lde_batch_columns(1, range, domain)` memcpys
+        // `columns.col(c)[..domain]` per column, while the uncached quotient path
+        // reaches `fill_lde_batch` with `BatchLayout::PolyMajor`, `step == 1` and
+        // consecutive indices — which routes to `fill_lde_batch_contiguous` and
+        // copies `columns.col(c)[start..end]`. Same bytes out of the same buffer,
+        // one `copy_from_slice` per column either way. So the cache is a bit-exact
+        // duplicate of storage the commitment already retains, and building it
+        // costs one extra full-LDE allocation plus copy per circuit and holds that
+        // duplicate resident for the rest of the process.
         let quotient_degree_bits = log2_ceil(common.quotient_degree_factor);
         let (constants_sigmas_quotient_cache, constants_sigmas_quotient_step, constants_sigmas_quotient_domain) = {
             let step = 1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
             let domain = 1 << (common.degree_bits() + quotient_degree_bits);
             let cols = common.constants_range().len() + common.sigmas_range().len();
-            if cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
+            if step != 1 && cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
                 match (
                     constants_sigmas_commitment.extract_lde_batch_columns(
                         step,
@@ -1440,7 +1461,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             generator_indices_by_watches,
             generator_watch_counts,
             constants_sigmas_commitment,
-            sigmas: transpose_poly_values(sigma_vecs),
+            sigmas,
             subgroup,
             public_inputs: self.public_inputs,
             representative_map: forest.parents,
