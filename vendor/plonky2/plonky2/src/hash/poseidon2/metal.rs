@@ -7,7 +7,7 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use metal::{
     Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSUInteger,
+    MTLCommandBufferStatus, MTLResourceOptions, MTLSize, SharedEvent, NSUInteger,
 };
 use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
@@ -16,6 +16,7 @@ use crate::field::types::{Field, PrimeField64};
 use crate::hash::hash_types::{HashOut, RichField};
 use crate::hash::merkle_tree::LevelOrderDigests;
 use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
+use crate::hash::poseidon2::hash::Poseidon2;
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 
@@ -75,6 +76,11 @@ const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
 /// official ranked host (submission 41467098), so concurrent GPU submission is
 /// intentionally disabled.
 const MAX_BUFFER_SETS: usize = 1;
+/// CPU takes one natural-row quarter of each admitted wide commitment. Its x4
+/// permutation kernel is designed to finish before the remaining three GPU
+/// quarters while directly shortening the serialized Metal stream by 25% of
+/// the leaf work.
+const HYBRID_CPU_LEAF_DIVISOR: usize = 4;
 /// Parallel staging copy granularity in u64 elements (4 MiB chunks).
 const STAGING_CHUNK: usize = 1 << 19;
 
@@ -648,6 +654,49 @@ impl Drop for GpuJobGuard {
     }
 }
 
+/// Makes the host half of a hybrid command buffer fail-open. Once Metal has
+/// committed a wait for `value`, every return and unwind path must signal it;
+/// otherwise the single queue would remain blocked for the process lifetime.
+struct HybridHostSignal<'a> {
+    event: &'a SharedEvent,
+    value: u64,
+    armed: bool,
+    command_buffer: Option<CommandBuffer>,
+}
+
+impl<'a> HybridHostSignal<'a> {
+    fn new(event: &'a SharedEvent, value: u64) -> Self {
+        Self {
+            event,
+            value,
+            armed: true,
+            command_buffer: None,
+        }
+    }
+
+    fn attach(&mut self, command_buffer: &metal::CommandBufferRef) {
+        self.command_buffer = Some(command_buffer.to_owned());
+    }
+
+    fn signal(&mut self) {
+        if self.armed {
+            self.event.set_signaled_value(self.value);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for HybridHostSignal<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.signal();
+            if let Some(command_buffer) = &self.command_buffer {
+                command_buffer.wait_until_completed();
+            }
+        }
+    }
+}
+
 fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bool {
     let leaf_permutations = if leaf_width <= 4 {
         0
@@ -743,7 +792,7 @@ fn probe_declines(cols: usize, rows: usize, latch: &core::sync::atomic::AtomicBo
         && !latch.swap(true, core::sync::atomic::Ordering::Relaxed)
 }
 
-pub(crate) fn build_merkle_tree<F: RichField>(
+pub(crate) fn build_merkle_tree<F: RichField + Poseidon2>(
     leaves: &[F],
     leaf_width: usize,
     leaf_count: usize,
@@ -769,7 +818,7 @@ pub(crate) fn build_merkle_tree<F: RichField>(
     }
 }
 
-pub(crate) fn build_merkle_tree_columns<F: RichField>(
+pub(crate) fn build_merkle_tree_columns<F: RichField + Poseidon2>(
     columns: &[Vec<F>],
     cap_height: usize,
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
@@ -1370,7 +1419,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     ))
 }
 
-pub(crate) fn build_merkle_tree_shared<F: RichField>(
+pub(crate) fn build_merkle_tree_shared<F: RichField + Poseidon2>(
     columns: &MetalColumns<F>,
     cap_height: usize,
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
@@ -1501,6 +1550,73 @@ enum LeafSource<'a, F> {
     /// Natural-order poly-major columns already resident in shared Metal
     /// storage. Hash directly without a staging copy.
     Shared(&'a MetalColumns<F>),
+}
+
+/// Returns the CPU prefix size for the production hybrid path. Only the two
+/// wide retained-column shapes on the ranked critical path are admitted; row
+/// storage, staged columns, narrow trees, and every other domain keep the
+/// proven single-device builder.
+fn hybrid_cpu_leaf_count<F>(
+    source: &LeafSource<'_, F>,
+    leaf_width: usize,
+    leaf_count: usize,
+) -> usize {
+    if matches!(source, LeafSource::Shared(_))
+        && leaf_width > 64
+        && (leaf_count == 1 << 17 || leaf_count == 1 << 19)
+    {
+        leaf_count / HYBRID_CPU_LEAF_DIVISOR
+    } else {
+        0
+    }
+}
+
+/// Hashes a contiguous natural-row prefix four leaves at a time. Column-major
+/// storage means each column contributes four adjacent words, while
+/// `poseidon2_x4` overlaps the four permutation dependency chains. The result
+/// remains in natural-row order until the GPU leaf encoder has signalled
+/// completion; only then is it scattered to bit-reversed tree-leaf slots.
+fn hash_shared_colmajor_prefix_x4<F: RichField + Poseidon2>(
+    columns: &MetalColumns<F>,
+    first_row: usize,
+    hashes: &mut [HashOut<F>],
+) {
+    assert_eq!(first_row % 4, 0);
+    assert_eq!(hashes.len() % 4, 0);
+    assert!(first_row + hashes.len() <= columns.rows);
+
+    hashes
+        .par_chunks_exact_mut(4)
+        .enumerate()
+        .for_each(|(quad, output)| {
+            let row = first_row + 4 * quad;
+            let mut state_a = [F::ZERO; 12];
+            let mut state_b = [F::ZERO; 12];
+            let mut state_c = [F::ZERO; 12];
+            let mut state_d = [F::ZERO; 12];
+
+            for column_start in (0..columns.cols).step_by(8) {
+                let chunk = (columns.cols - column_start).min(8);
+                for lane in 0..chunk {
+                    let column = columns.col(column_start + lane);
+                    state_a[lane] = column[row];
+                    state_b[lane] = column[row + 1];
+                    state_c[lane] = column[row + 2];
+                    state_d[lane] = column[row + 3];
+                }
+                (state_a, state_b, state_c, state_d) =
+                    F::poseidon2_x4(state_a, state_b, state_c, state_d);
+            }
+
+            for (destination, state) in output
+                .iter_mut()
+                .zip([state_a, state_b, state_c, state_d])
+            {
+                *destination = HashOut {
+                    elements: state[..4].try_into().unwrap(),
+                };
+            }
+        });
 }
 
 impl MetalShared {
@@ -1660,9 +1776,10 @@ impl MetalShared {
                 size_of_val(parameter_values.as_slice()) as u64,
                 MTLResourceOptions::StorageModeShared,
             );
+            let queue = device.new_command_queue();
 
             Ok(Self {
-                queue: device.new_command_queue(),
+                queue,
                 device,
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
@@ -2529,12 +2646,30 @@ impl MetalShared {
         )
     }
 
-    fn build<F: RichField>(
+    fn build<F: RichField + Poseidon2>(
         &self,
         source: LeafSource<'_, F>,
         leaf_width: usize,
         leaf_count: usize,
         cap_height: usize,
+    ) -> Result<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>), String> {
+        let cpu_leaf_count = hybrid_cpu_leaf_count(&source, leaf_width, leaf_count);
+        self.build_with_cpu_leaf_count(
+            source,
+            leaf_width,
+            leaf_count,
+            cap_height,
+            cpu_leaf_count,
+        )
+    }
+
+    fn build_with_cpu_leaf_count<F: RichField + Poseidon2>(
+        &self,
+        source: LeafSource<'_, F>,
+        leaf_width: usize,
+        leaf_count: usize,
+        cap_height: usize,
+        cpu_leaf_count: usize,
     ) -> Result<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>), String> {
         let cap_count = 1usize << cap_height;
         let total_node_count = 2 * leaf_count - cap_count;
@@ -2554,17 +2689,30 @@ impl MetalShared {
 
         let job = GpuJobGuard::begin();
         let mut set = self.acquire_set()?;
-        let result = self.build_with_set(
-            &mut set,
-            source,
-            leaf_width,
-            leaf_count,
-            cap_height,
-            input_len,
-            input_bytes,
-            output_len,
-            output_bytes,
-        );
+        let result = if cpu_leaf_count == 0 {
+            self.build_with_set(
+                &mut set,
+                source,
+                leaf_width,
+                leaf_count,
+                cap_height,
+                input_len,
+                input_bytes,
+                output_len,
+                output_bytes,
+            )
+        } else {
+            self.build_with_set_hybrid(
+                &mut set,
+                source,
+                leaf_width,
+                leaf_count,
+                cap_height,
+                cpu_leaf_count,
+                output_len,
+                output_bytes,
+            )
+        };
         self.release_set(set);
         drop(job);
         Ok(result?.finish())
@@ -2735,6 +2883,196 @@ impl MetalShared {
         if command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "command buffer ended with status {:?}",
+                command_buffer.status()
+            ));
+        }
+
+        self.completed_tree_readback(
+            set,
+            output_len,
+            level_offsets,
+            leaf_count,
+            cap_height,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_with_set_hybrid<F: RichField + Poseidon2>(
+        &self,
+        set: &mut BufferSet,
+        source: LeafSource<'_, F>,
+        leaf_width: usize,
+        leaf_count: usize,
+        cap_height: usize,
+        cpu_leaf_count: usize,
+        output_len: usize,
+        output_bytes: usize,
+    ) -> Result<TreeReadback<'_, F>, String> {
+        let columns = match source {
+            LeafSource::Shared(columns) => columns,
+            LeafSource::Rows(_) | LeafSource::Columns(_) => {
+                return Err("hybrid Merkle requires retained shared columns".to_string());
+            }
+        };
+        if cpu_leaf_count == 0
+            || cpu_leaf_count % 4 != 0
+            || leaf_count % cpu_leaf_count != 0
+            || !(leaf_count / cpu_leaf_count).is_power_of_two()
+        {
+            return Err("invalid hybrid Merkle CPU leaf partition".to_string());
+        }
+
+        if set
+            .output
+            .as_ref()
+            .map_or(true, |buffer| buffer.length() < output_bytes as u64)
+        {
+            set.output = Some(autoreleasepool(|| {
+                self.device
+                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
+            }));
+        }
+        let output_buffer = set.output.as_ref().unwrap();
+        let cap_count = 1usize << cap_height;
+        let partitions = leaf_count / cpu_leaf_count;
+        let partition_bits = partitions.ilog2() as usize;
+        let log_leaf_count = leaf_count.ilog2() as usize;
+        let hybrid_event = self.device.new_shared_event();
+        let leaf_signal = 1;
+        let cpu_signal = 2;
+        let mut host_signal = HybridHostSignal::new(&hybrid_event, cpu_signal);
+
+        let mut level_offsets = Vec::with_capacity(log_leaf_count + 1);
+        let command_buffer = autoreleasepool(|| -> CommandBuffer {
+            let leaf_count_u32 = leaf_count as u32;
+            let leaf_width_u32 = leaf_width as u32;
+            let log_leaf_count_u32 = log_leaf_count as u32;
+            let command_buffer = self.queue.new_command_buffer();
+
+            // CPU owns natural partition zero. Each remaining natural-row
+            // partition is a separate dispatch in the same encoder. Offsetting
+            // the input by `tile * M` keeps the per-column stride at N, while
+            // offsetting the output by reverse_bits(tile) fills the low bits
+            // omitted by the kernel's full-N reversal of a local `gid < M`.
+            let leaf_encoder = command_buffer.new_compute_command_encoder();
+            leaf_encoder.set_compute_pipeline_state(&self.leaf_colmajor_pipeline);
+            leaf_encoder.set_buffer(2, Some(&self.parameters), 0);
+            set_u32(leaf_encoder, 3, leaf_width_u32);
+            set_u32(leaf_encoder, 4, leaf_count_u32);
+            set_u32(leaf_encoder, 5, log_leaf_count_u32);
+            for tile in 1..partitions {
+                let input_word_offset = tile * cpu_leaf_count;
+                let output_leaf_offset = crate::util::reverse_bits(tile, partition_bits);
+                leaf_encoder.set_buffer(
+                    0,
+                    Some(&columns.buffer),
+                    (input_word_offset * size_of::<u64>()) as NSUInteger,
+                );
+                leaf_encoder.set_buffer(
+                    1,
+                    Some(output_buffer),
+                    (output_leaf_offset * 4 * size_of::<u64>()) as NSUInteger,
+                );
+                dispatch(
+                    leaf_encoder,
+                    &self.leaf_colmajor_pipeline,
+                    cpu_leaf_count,
+                );
+            }
+            leaf_encoder.end_encoding();
+
+            // This host rendezvous makes shared-buffer ownership explicit:
+            // CPU does not touch output until all GPU leaf writes finish, and
+            // parents cannot read it until CPU signals after its scatter.
+            command_buffer.encode_signal_event(&hybrid_event, leaf_signal);
+            command_buffer.encode_wait_for_event(&hybrid_event, cpu_signal);
+
+            let parent_encoder = command_buffer.new_compute_command_encoder();
+            parent_encoder.set_compute_pipeline_state(&self.parent_pipeline);
+            let output_resource: &metal::ResourceRef = output_buffer;
+            let mut level_offset = 0usize;
+            let mut child_count = leaf_count;
+            level_offsets.push(level_offset);
+            while child_count > cap_count {
+                if level_offset != 0 {
+                    parent_encoder.memory_barrier_with_resources(&[output_resource]);
+                }
+                let parent_count = child_count / 2;
+                let child_offset = level_offset;
+                level_offset += child_count * 4;
+                level_offsets.push(level_offset);
+
+                parent_encoder.set_buffer(
+                    0,
+                    Some(output_buffer),
+                    (child_offset * size_of::<u64>()) as NSUInteger,
+                );
+                parent_encoder.set_buffer(
+                    1,
+                    Some(output_buffer),
+                    (level_offset * size_of::<u64>()) as NSUInteger,
+                );
+                parent_encoder.set_buffer(2, Some(&self.parameters), 0);
+                set_u32(parent_encoder, 3, parent_count as u32);
+                dispatch(parent_encoder, &self.parent_pipeline, parent_count);
+                child_count = parent_count;
+            }
+            parent_encoder.end_encoding();
+
+            host_signal.attach(command_buffer);
+            command_buffer.commit();
+            command_buffer.to_owned()
+        });
+
+        // CPU hashes only into private storage while the GPU leaf prefix is in
+        // flight. Four adjacent natural rows share each strided column gather.
+        let mut cpu_hashes = vec![HashOut::ZERO; cpu_leaf_count];
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hash_shared_colmajor_prefix_x4(columns, 0, &mut cpu_hashes);
+        }))
+        .is_err()
+        {
+            host_signal.signal();
+            command_buffer.wait_until_completed();
+            return Err("hybrid CPU leaf hashing panicked".to_string());
+        }
+
+        while hybrid_event.signaled_value() < leaf_signal {
+            if command_buffer.status() == MTLCommandBufferStatus::Error {
+                host_signal.signal();
+                command_buffer.wait_until_completed();
+                return Err("hybrid Metal leaf encoder failed".to_string());
+            }
+            std::thread::yield_now();
+        }
+
+        // GPU is now stopped at the event wait. Scatter the CPU's natural-row
+        // prefix into its bit-reversed level-zero slots, canonicalizing exactly
+        // like `poseidon2_hash_leaves_colmajor` before releasing the parents.
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let output_words = unsafe {
+                slice::from_raw_parts_mut(output_buffer.contents().cast::<u64>(), output_len)
+            };
+            for (natural_row, hash) in cpu_hashes.into_iter().enumerate() {
+                let leaf = crate::util::reverse_bits(natural_row, log_leaf_count);
+                let destination = &mut output_words[leaf * 4..leaf * 4 + 4];
+                for (destination, value) in destination.iter_mut().zip(hash.elements) {
+                    *destination = value.to_canonical_u64();
+                }
+            }
+        }))
+        .is_err()
+        {
+            host_signal.signal();
+            command_buffer.wait_until_completed();
+            return Err("hybrid CPU leaf scatter panicked".to_string());
+        }
+        host_signal.signal();
+
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(format!(
+                "hybrid command buffer ended with status {:?}",
                 command_buffer.status()
             ));
         }
@@ -5187,6 +5525,55 @@ kernel void goldilocks_mul_bench_native(
         assert_eq!(gpu.0.nodes.len(), node_count);
         let cpu = cpu_tree(&leaves, cap_height);
         assert_tree_eq(&gpu, &cpu, WIDTH, cap_height);
+    }
+
+    #[test]
+    fn hybrid_shared_colmajor_tree_matches_full_gpu() {
+        type F = GoldilocksField;
+        // Ranked wire commitments use 135 columns; keep the production sponge
+        // pass count while shrinking only the row domain for a focused test.
+        const WIDTH: usize = 135;
+        const LEAF_COUNT: usize = 1 << 10;
+        const CAP_HEIGHT: usize = 4;
+
+        let context = CONTEXT
+            .as_ref()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut columns = context
+            .allocate_columns::<F>(LEAF_COUNT, WIDTH)
+            .expect("shared columns must allocate");
+        for (column_index, column) in columns
+            .columns_mut()
+            .expect("fresh columns are unique")
+            .into_iter()
+            .enumerate()
+        {
+            for (row, value) in column.iter_mut().enumerate() {
+                *value = F::from_canonical_usize(column_index * LEAF_COUNT + row);
+            }
+        }
+
+        let full_gpu = context
+            .build_with_cpu_leaf_count(
+                LeafSource::Shared(&columns),
+                WIDTH,
+                LEAF_COUNT,
+                CAP_HEIGHT,
+                0,
+            )
+            .expect("full GPU tree");
+        let hybrid = context
+            .build_with_cpu_leaf_count(
+                LeafSource::Shared(&columns),
+                WIDTH,
+                LEAF_COUNT,
+                CAP_HEIGHT,
+                LEAF_COUNT / 4,
+            )
+            .expect("hybrid tree");
+
+        assert_tree_raw_eq(&hybrid, &full_gpu, WIDTH, CAP_HEIGHT);
+        assert_all_paths_raw_eq(&hybrid, &full_gpu, LEAF_COUNT, CAP_HEIGHT);
     }
 
     fn cpu_tree(
