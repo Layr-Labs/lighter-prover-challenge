@@ -1,3 +1,4 @@
+// Night shot 1: four-stack + borrowed permutation columns (S1 diet shelved pending ranked-tax evidence).
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
