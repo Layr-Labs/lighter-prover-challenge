@@ -70,6 +70,43 @@ impl BlockPreExec<F> {
             state_metadata: block.state_metadata.clone(),
         }
     }
+
+    /// Moves the pre-execution-only owned inputs out of a block.
+    ///
+    /// The returned source block retains transaction chunks and every field
+    /// consumed by the transaction paths and final block witness. The moved
+    /// fields are replaced with their defaults and must not be read from the
+    /// source after the pre-execution phase.
+    pub fn take_from_block(block: &mut Block<F>) -> Self {
+        Self {
+            created_at: block.created_at,
+            block_number: block.block_number,
+            old_system_config: block.old_system_config,
+            register_stack_before: block.register_stack_before,
+            all_assets: std::mem::replace(
+                &mut block.all_assets,
+                core::array::from_fn(|_| Asset::default()),
+            ),
+            all_margined_assets: std::mem::take(&mut block.all_margined_assets),
+            all_market_details: std::mem::replace(
+                &mut block.all_market_details,
+                core::array::from_fn(|_| MarketDetails::default()),
+            ),
+            all_market_risk_details: std::mem::replace(
+                &mut block.all_market_risk_details,
+                core::array::from_fn(|_| MarketRiskDetails::default()),
+            ),
+            price_updates: std::mem::take(&mut block.price_updates),
+            calculate_premium: block.calculate_premium,
+            calculate_funding: block.calculate_funding,
+            calculate_oracle_prices: block.calculate_oracle_prices,
+            old_account_tree_root: block.old_account_tree_root,
+            old_account_pub_data_tree_root: block.old_account_pub_data_tree_root,
+            old_market_tree_root: block.old_market_tree_root,
+            old_state_root: block.old_state_root,
+            state_metadata: std::mem::take(&mut block.state_metadata),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
