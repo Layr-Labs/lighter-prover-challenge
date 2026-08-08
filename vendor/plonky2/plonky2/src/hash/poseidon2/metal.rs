@@ -75,6 +75,17 @@ const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
 /// official ranked host (submission 41467098), so concurrent GPU submission is
 /// intentionally disabled.
 const MAX_BUFFER_SETS: usize = 1;
+/// A bulk leaf launch is deliberately short enough that an exact chain-spine
+/// commitment can enter the serialized Metal stream at the next completion
+/// boundary. The buffers stay checked out across tiles, so this is GPU
+/// preemption without restaging or rebuilding any tree state.
+const BULK_LEAF_TILE: usize = 1 << 15;
+/// Split only the expensive top parent levels. The small tail remains one
+/// command buffer to avoid paying a command-buffer round trip per tiny level.
+const BULK_PARENT_LEVEL_QUANTUM: usize = 1 << 15;
+/// Bound a pathological continuous stream of spine requests so bulk work
+/// still progresses. Normal proving has at most a short chain burst.
+const MAX_CONSECUTIVE_SPINE_COMMANDS: usize = 8;
 /// Parallel staging copy granularity in u64 elements (4 MiB chunks).
 const STAGING_CHUNK: usize = 1 << 19;
 
@@ -90,6 +101,9 @@ struct MetalShared {
     parameters: Buffer,
     pool: Mutex<BufferPool>,
     available: Condvar,
+    spine_pool: Mutex<BufferPool>,
+    spine_available: Condvar,
+    command_handoff: Arc<CommandHandoff>,
     /// Per-`log2(lde_size)` concatenated FFT twiddle rows (canonical u64), with
     /// `offsets[lg_half_m]` giving each stage row's element offset.
     ntt_roots: Mutex<HashMap<u32, NttRoots>>,
@@ -341,6 +355,161 @@ struct BufferSet {
     output: Option<Buffer>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TreeClass {
+    Spine,
+    Bulk,
+}
+
+fn classify_tree_class(
+    exclusive: bool,
+    chain_step_thread: bool,
+    leaf_count: usize,
+    leaf_width: usize,
+) -> TreeClass {
+    if !exclusive && chain_step_thread && leaf_count == 1 << 17 && leaf_width > 64 {
+        TreeClass::Spine
+    } else {
+        TreeClass::Bulk
+    }
+}
+
+fn tree_class(leaf_count: usize, leaf_width: usize) -> TreeClass {
+    classify_tree_class(
+        EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed),
+        std::thread::current()
+            .name()
+            .is_some_and(|name| name.contains("-chain-step-")),
+        leaf_count,
+        leaf_width,
+    )
+}
+
+#[derive(Default)]
+struct CommandHandoffState {
+    active_commands: usize,
+    spine_waiters: usize,
+    bulk_waiters: usize,
+    consecutive_spine_commands: usize,
+    max_active_commands: usize,
+}
+
+impl CommandHandoffState {
+    fn waiting_mut(&mut self, class: TreeClass) -> &mut usize {
+        match class {
+            TreeClass::Spine => &mut self.spine_waiters,
+            TreeClass::Bulk => &mut self.bulk_waiters,
+        }
+    }
+
+    fn enqueue(&mut self, class: TreeClass) {
+        *self.waiting_mut(class) += 1;
+    }
+
+    fn abandon(&mut self, class: TreeClass) {
+        let waiting = self.waiting_mut(class);
+        debug_assert!(*waiting > 0);
+        *waiting -= 1;
+    }
+
+    fn selected_class(&self) -> Option<TreeClass> {
+        match (self.spine_waiters > 0, self.bulk_waiters > 0) {
+            (false, false) => None,
+            (true, false) => Some(TreeClass::Spine),
+            (false, true) => Some(TreeClass::Bulk),
+            (true, true)
+                if self.consecutive_spine_commands < MAX_CONSECUTIVE_SPINE_COMMANDS =>
+            {
+                Some(TreeClass::Spine)
+            }
+            (true, true) => Some(TreeClass::Bulk),
+        }
+    }
+
+    fn can_grant(&self, class: TreeClass) -> bool {
+        self.active_commands == 0 && self.selected_class() == Some(class)
+    }
+
+    fn try_grant(&mut self, class: TreeClass) -> bool {
+        if !self.can_grant(class) {
+            return false;
+        }
+        self.abandon(class);
+        self.active_commands = 1;
+        self.max_active_commands = self.max_active_commands.max(self.active_commands);
+        match class {
+            TreeClass::Spine if self.bulk_waiters > 0 => {
+                self.consecutive_spine_commands += 1;
+            }
+            TreeClass::Spine | TreeClass::Bulk => {
+                self.consecutive_spine_commands = 0;
+            }
+        }
+        true
+    }
+
+    fn release(&mut self) {
+        debug_assert_eq!(self.active_commands, 1);
+        self.active_commands = 0;
+    }
+}
+
+#[derive(Default)]
+struct CommandHandoff {
+    state: Mutex<CommandHandoffState>,
+    available: Condvar,
+}
+
+struct GpuCommandPermit {
+    owner: Arc<CommandHandoff>,
+    held: bool,
+}
+
+impl Drop for GpuCommandPermit {
+    fn drop(&mut self) {
+        if !self.held {
+            return;
+        }
+        let mut state = self
+            .owner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.release();
+        self.held = false;
+        drop(state);
+        self.owner.available.notify_all();
+    }
+}
+
+impl CommandHandoff {
+    fn acquire(self: &Arc<Self>, class: TreeClass) -> Result<GpuCommandPermit, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Metal command handoff poisoned")?;
+        state.enqueue(class);
+        loop {
+            if state.try_grant(class) {
+                return Ok(GpuCommandPermit {
+                    owner: self.clone(),
+                    held: true,
+                });
+            }
+            state = match self.available.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => {
+                    let mut state = poisoned.into_inner();
+                    state.abandon(class);
+                    return Err("Metal command handoff poisoned".to_string());
+                }
+            };
+        }
+    }
+
+}
+
+#[derive(Default)]
 struct BufferPool {
     free: Vec<BufferSet>,
     created: usize,
@@ -351,6 +520,7 @@ struct BufferPool {
 
 struct DetachedOutput<'a> {
     owner: &'a MetalShared,
+    class: TreeClass,
     buffer: Option<Buffer>,
 }
 
@@ -365,9 +535,8 @@ impl Drop for DetachedOutput<'_> {
         let Some(buffer) = self.buffer.take() else {
             return;
         };
-        let mut pool = self
-            .owner
-            .pool
+        let (pool, _) = self.owner.pool_lane(self.class);
+        let mut pool = pool
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         debug_assert!(pool.detached_readback);
@@ -1254,6 +1423,13 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         }));
     }
     let (state_buffer, output_buffer) = buffers.as_ref()?;
+    // Exclusive streamed builds intentionally retain the one logical command
+    // permit across their pipelined absorb buffers and parent buffer. Metal
+    // may queue those buffers, but no other producer can enqueue between them.
+    let command_permit = context
+        .command_handoff
+        .acquire(TreeClass::Bulk)
+        .ok()?;
 
     // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
     // absorption of group g: commands on one queue execute in submission
@@ -1347,6 +1523,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             command_buffer.status() == MTLCommandBufferStatus::Completed
         });
     drop(job);
+    drop(command_permit);
     if !all_ok {
         log::warn!("streamed Metal sponge build failed; falling back to the classic path");
         return None;
@@ -1672,6 +1849,15 @@ impl MetalShared {
                     detached_readback: false,
                 }),
                 available: Condvar::new(),
+                spine_pool: Mutex::new(BufferPool {
+                    free: Vec::new(),
+                    created: 0,
+                    waiters: 0,
+                    spare_output: None,
+                    detached_readback: false,
+                }),
+                spine_available: Condvar::new(),
+                command_handoff: Arc::new(CommandHandoff::default()),
                 ntt_roots: Mutex::new(HashMap::new()),
                 ntt_shifts: Mutex::new(HashMap::new()),
                 ntt_ones: Mutex::new(HashMap::new()),
@@ -1826,8 +2012,18 @@ impl MetalShared {
         })
     }
 
-    fn acquire_set(&self) -> Result<BufferSet, String> {
-        let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
+    fn pool_lane(&self, class: TreeClass) -> (&Mutex<BufferPool>, &Condvar) {
+        match class {
+            TreeClass::Spine => (&self.spine_pool, &self.spine_available),
+            TreeClass::Bulk => (&self.pool, &self.available),
+        }
+    }
+
+    fn acquire_set(&self, class: TreeClass) -> Result<BufferSet, String> {
+        let (pool_mutex, available) = self.pool_lane(class);
+        let mut pool = pool_mutex
+            .lock()
+            .map_err(|_| "buffer pool poisoned")?;
         loop {
             if let Some(set) = pool.free.pop() {
                 return Ok(set);
@@ -1840,7 +2036,7 @@ impl MetalShared {
                 });
             }
             pool.waiters += 1;
-            match self.available.wait(pool) {
+            match available.wait(pool) {
                 Ok(mut next) => {
                     next.waiters -= 1;
                     pool = next;
@@ -1854,21 +2050,39 @@ impl MetalShared {
         }
     }
 
-    fn release_set(&self, set: BufferSet) {
-        let mut pool = self
-            .pool
+    fn release_set(&self, class: TreeClass, set: BufferSet) {
+        let (pool, available) = self.pool_lane(class);
+        let mut pool = pool
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.free.push(set);
-        self.available.notify_one();
+        available.notify_one();
+    }
+
+    fn run_serial_command(
+        &self,
+        class: TreeClass,
+        encode_and_commit: impl FnOnce() -> CommandBuffer,
+    ) -> Result<(), String> {
+        let command_permit = self.command_handoff.acquire(class)?;
+        let command_buffer = autoreleasepool(encode_and_commit);
+        command_buffer.wait_until_completed();
+        let status = command_buffer.status();
+        drop(command_permit);
+        if status != MTLCommandBufferStatus::Completed {
+            return Err(format!("command buffer ended with status {status:?}"));
+        }
+        Ok(())
     }
 
     fn try_detach_completed_output(
         &self,
         set: &mut BufferSet,
         output_bytes: usize,
+        class: TreeClass,
     ) -> Result<Option<DetachedOutput<'_>>, String> {
-        let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
+        let (pool, _) = self.pool_lane(class);
+        let mut pool = pool.lock().map_err(|_| "buffer pool poisoned")?;
         if pool.waiters == 0 || pool.detached_readback {
             return Ok(None);
         }
@@ -1887,6 +2101,7 @@ impl MetalShared {
         drop(pool);
         Ok(Some(DetachedOutput {
             owner: self,
+            class,
             buffer: Some(completed),
         }))
     }
@@ -1898,11 +2113,12 @@ impl MetalShared {
         level_offsets: Vec<usize>,
         leaf_count: usize,
         cap_height: usize,
+        class: TreeClass,
     ) -> Result<TreeReadback<'_, F>, String> {
         let output_bytes = output_len
             .checked_mul(size_of::<u64>())
             .ok_or("Metal Merkle output size overflow")?;
-        if let Some(output) = self.try_detach_completed_output(set, output_bytes)? {
+        if let Some(output) = self.try_detach_completed_output(set, output_bytes, class)? {
             return Ok(TreeReadback::Detached {
                 output,
                 output_len,
@@ -2076,7 +2292,8 @@ impl MetalShared {
                 .new_buffer(value_bytes as u64, MTLResourceOptions::StorageModeShared)
         });
 
-        let mut set = self.acquire_set()?;
+        let class = tree_class(lde_size, cols);
+        let mut set = self.acquire_set(class)?;
         let result = (|| -> Result<TreeReadback<'_, F>, String> {
             if set
                 .input
@@ -2117,6 +2334,7 @@ impl MetalShared {
             let output_buffer = set.output.as_ref().unwrap();
 
             let mut level_offsets = Vec::with_capacity(log_lde as usize + 1);
+            let command_permit = self.command_handoff.acquire(class)?;
             let command_buffer = autoreleasepool(|| -> CommandBuffer {
                 let degree_u32 = degree as u32;
                 let lde_size_u32 = lde_size as u32;
@@ -2252,6 +2470,7 @@ impl MetalShared {
                     command_buffer.status()
                 ));
             }
+            drop(command_permit);
 
             self.completed_tree_readback(
                 &mut set,
@@ -2259,9 +2478,10 @@ impl MetalShared {
                 level_offsets,
                 lde_size,
                 cap_height,
+                class,
             )
         })();
-        self.release_set(set);
+        self.release_set(class, set);
         drop(job);
         let (digests, cap) = result?.finish();
 
@@ -2333,7 +2553,8 @@ impl MetalShared {
                 .new_buffer(column_bytes as u64, MTLResourceOptions::StorageModeShared)
         });
 
-        let mut set = self.acquire_set()?;
+        let class = tree_class(lde_size, cols);
+        let mut set = self.acquire_set(class)?;
         let result = self.build_from_coeffs_with_set(
             &mut set,
             coeff_columns,
@@ -2348,8 +2569,9 @@ impl MetalShared {
             coeff_bytes,
             output_len,
             output_bytes,
+            class,
         );
-        self.release_set(set);
+        self.release_set(class, set);
         drop(job);
         let (digests, cap) = result?.finish();
         Ok((
@@ -2375,6 +2597,7 @@ impl MetalShared {
         coeff_bytes: usize,
         output_len: usize,
         output_bytes: usize,
+        class: TreeClass,
     ) -> Result<TreeReadback<'_, F>, String> {
         let cols = coeff_columns.len();
         let lde_size = degree << rate_bits;
@@ -2420,6 +2643,7 @@ impl MetalShared {
         let output_buffer = set.output.as_ref().unwrap();
 
         let mut level_offsets = Vec::with_capacity(log_lde as usize + 1);
+        let command_permit = self.command_handoff.acquire(class)?;
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let degree_u32 = degree as u32;
             let lde_size_u32 = lde_size as u32;
@@ -2512,6 +2736,7 @@ impl MetalShared {
                 command_buffer.status()
             ));
         }
+        drop(command_permit);
 
         self.completed_tree_readback(
             set,
@@ -2519,6 +2744,7 @@ impl MetalShared {
             level_offsets,
             lde_size,
             cap_height,
+            class,
         )
     }
 
@@ -2546,7 +2772,8 @@ impl MetalShared {
             .ok_or("Metal Merkle output size overflow")?;
 
         let job = GpuJobGuard::begin();
-        let mut set = self.acquire_set()?;
+        let class = tree_class(leaf_count, leaf_width);
+        let mut set = self.acquire_set(class)?;
         let result = self.build_with_set(
             &mut set,
             source,
@@ -2557,8 +2784,9 @@ impl MetalShared {
             input_bytes,
             output_len,
             output_bytes,
+            class,
         );
-        self.release_set(set);
+        self.release_set(class, set);
         drop(job);
         Ok(result?.finish())
     }
@@ -2575,6 +2803,7 @@ impl MetalShared {
         input_bytes: usize,
         output_len: usize,
         output_bytes: usize,
+        class: TreeClass,
     ) -> Result<TreeReadback<'_, F>, String> {
         let cap_count = 1usize << cap_height;
 
@@ -2646,84 +2875,150 @@ impl MetalShared {
         let output_buffer = set.output.as_ref().unwrap();
 
         let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let leaf_count_u32 = leaf_count as u32;
-            let leaf_width_u32 = leaf_width as u32;
-            let log_leaf_count_u32 = leaf_count.ilog2();
-            let leaf_pipeline = match &source {
-                LeafSource::Rows(_) => &self.leaf_pipeline,
-                LeafSource::Columns(_) | LeafSource::Shared(_) => &self.leaf_colmajor_pipeline,
-            };
-            let command_buffer = self.queue.new_command_buffer();
-            let leaf_encoder = command_buffer.new_compute_command_encoder();
-            leaf_encoder.set_compute_pipeline_state(leaf_pipeline);
-            leaf_encoder.set_buffer(0, Some(input_buffer), 0);
-            leaf_encoder.set_buffer(1, Some(output_buffer), 0);
-            leaf_encoder.set_buffer(2, Some(&self.parameters), 0);
-            leaf_encoder.set_bytes(
-                3,
-                size_of::<u32>() as NSUInteger,
-                (&leaf_width_u32 as *const u32).cast::<c_void>(),
-            );
-            leaf_encoder.set_bytes(
-                4,
-                size_of::<u32>() as NSUInteger,
-                (&leaf_count_u32 as *const u32).cast::<c_void>(),
-            );
-            if matches!(&source, LeafSource::Columns(_) | LeafSource::Shared(_)) {
-                leaf_encoder.set_bytes(
-                    5,
-                    size_of::<u32>() as NSUInteger,
-                    (&log_leaf_count_u32 as *const u32).cast::<c_void>(),
-                );
-            }
-            dispatch(leaf_encoder, leaf_pipeline, leaf_count);
-            leaf_encoder.end_encoding();
-
-            let mut level_offset = 0usize;
-            let mut child_count = leaf_count;
+        let mut parent_levels = Vec::with_capacity(leaf_count.ilog2() as usize);
+        let mut level_offset = 0usize;
+        let mut child_count = leaf_count;
+        level_offsets.push(level_offset);
+        while child_count > cap_count {
+            let parent_count = child_count / 2;
+            let child_offset = level_offset;
+            level_offset += child_count * 4;
             level_offsets.push(level_offset);
-            while child_count > cap_count {
-                let parent_count = child_count / 2;
-                let child_offset = level_offset;
-                level_offset += child_count * 4;
-                level_offsets.push(level_offset);
+            parent_levels.push((child_offset, level_offset, parent_count));
+            child_count = parent_count;
+        }
 
-                let parent_count_u32 = parent_count as u32;
-                let parent_encoder = command_buffer.new_compute_command_encoder();
-                parent_encoder.set_compute_pipeline_state(&self.parent_pipeline);
-                parent_encoder.set_buffer(
-                    0,
-                    Some(output_buffer),
-                    (child_offset * size_of::<u64>()) as NSUInteger,
-                );
-                parent_encoder.set_buffer(
-                    1,
-                    Some(output_buffer),
-                    (level_offset * size_of::<u64>()) as NSUInteger,
-                );
-                parent_encoder.set_buffer(2, Some(&self.parameters), 0);
-                parent_encoder.set_bytes(
-                    3,
-                    size_of::<u32>() as NSUInteger,
-                    (&parent_count_u32 as *const u32).cast::<c_void>(),
-                );
-                dispatch(parent_encoder, &self.parent_pipeline, parent_count);
-                parent_encoder.end_encoding();
+        let exclusive = EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed);
+        let preemptible_bulk = class == TreeClass::Bulk
+            && !exclusive
+            && leaf_width > 64
+            && leaf_count > BULK_LEAF_TILE;
+        let leaf_count_u32 = leaf_count as u32;
+        let leaf_width_u32 = leaf_width as u32;
+        let log_leaf_count_u32 = leaf_count.ilog2();
+        let leaf_pipeline = match &source {
+            LeafSource::Rows(_) => &self.leaf_pipeline,
+            LeafSource::Columns(_) | LeafSource::Shared(_) => &self.leaf_colmajor_pipeline,
+        };
+        let colmajor = matches!(&source, LeafSource::Columns(_) | LeafSource::Shared(_));
 
-                child_count = parent_count;
+        if !preemptible_bulk {
+            self.run_serial_command(class, || -> CommandBuffer {
+                let command_buffer = self.queue.new_command_buffer();
+                let leaf_encoder = command_buffer.new_compute_command_encoder();
+                leaf_encoder.set_compute_pipeline_state(leaf_pipeline);
+                leaf_encoder.set_buffer(0, Some(input_buffer), 0);
+                leaf_encoder.set_buffer(1, Some(output_buffer), 0);
+                leaf_encoder.set_buffer(2, Some(&self.parameters), 0);
+                set_u32(leaf_encoder, 3, leaf_width_u32);
+                set_u32(leaf_encoder, 4, leaf_count_u32);
+                if colmajor {
+                    set_u32(leaf_encoder, 5, log_leaf_count_u32);
+                }
+                dispatch(leaf_encoder, leaf_pipeline, leaf_count);
+                leaf_encoder.end_encoding();
+
+                for &(child_offset, parent_offset, parent_count) in &parent_levels {
+                    let parent_encoder = command_buffer.new_compute_command_encoder();
+                    parent_encoder.set_compute_pipeline_state(&self.parent_pipeline);
+                    parent_encoder.set_buffer(
+                        0,
+                        Some(output_buffer),
+                        (child_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    parent_encoder.set_buffer(
+                        1,
+                        Some(output_buffer),
+                        (parent_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    parent_encoder.set_buffer(2, Some(&self.parameters), 0);
+                    set_u32(parent_encoder, 3, parent_count as u32);
+                    dispatch(parent_encoder, &self.parent_pipeline, parent_count);
+                    parent_encoder.end_encoding();
+                }
+
+                command_buffer.commit();
+                command_buffer.to_owned()
+            })?;
+        } else {
+            let tile_size = BULK_LEAF_TILE;
+            let tile_bits = tile_size.ilog2() as usize;
+            let log_leaf_count = log_leaf_count_u32 as usize;
+            debug_assert_eq!(leaf_count % tile_size, 0);
+            for tile_start in (0..leaf_count).step_by(tile_size) {
+                let input_elem_offset = if colmajor {
+                    tile_start
+                } else {
+                    tile_start * leaf_width
+                };
+                let output_row_base = if colmajor {
+                    colmajor_tile_output_base(tile_start, tile_bits, log_leaf_count)
+                } else {
+                    tile_start
+                };
+                self.run_serial_command(TreeClass::Bulk, || -> CommandBuffer {
+                    let command_buffer = self.queue.new_command_buffer();
+                    let leaf_encoder = command_buffer.new_compute_command_encoder();
+                    leaf_encoder.set_compute_pipeline_state(leaf_pipeline);
+                    leaf_encoder.set_buffer(
+                        0,
+                        Some(input_buffer),
+                        (input_elem_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    leaf_encoder.set_buffer(
+                        1,
+                        Some(output_buffer),
+                        (output_row_base * 4 * size_of::<u64>()) as NSUInteger,
+                    );
+                    leaf_encoder.set_buffer(2, Some(&self.parameters), 0);
+                    set_u32(leaf_encoder, 3, leaf_width_u32);
+                    set_u32(leaf_encoder, 4, leaf_count_u32);
+                    if colmajor {
+                        set_u32(leaf_encoder, 5, log_leaf_count_u32);
+                    }
+                    dispatch(leaf_encoder, leaf_pipeline, tile_size);
+                    leaf_encoder.end_encoding();
+                    command_buffer.commit();
+                    command_buffer.to_owned()
+                })?;
             }
 
-            command_buffer.commit();
-            command_buffer.to_owned()
-        });
-
-        command_buffer.wait_until_completed();
-        if command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(format!(
-                "command buffer ended with status {:?}",
-                command_buffer.status()
-            ));
+            let mut first_level = 0usize;
+            while first_level < parent_levels.len() {
+                let last_level = if parent_levels[first_level].2
+                    >= BULK_PARENT_LEVEL_QUANTUM
+                {
+                    first_level + 1
+                } else {
+                    parent_levels.len()
+                };
+                self.run_serial_command(TreeClass::Bulk, || -> CommandBuffer {
+                    let command_buffer = self.queue.new_command_buffer();
+                    for &(child_offset, parent_offset, parent_count) in
+                        &parent_levels[first_level..last_level]
+                    {
+                        let parent_encoder = command_buffer.new_compute_command_encoder();
+                        parent_encoder.set_compute_pipeline_state(&self.parent_pipeline);
+                        parent_encoder.set_buffer(
+                            0,
+                            Some(output_buffer),
+                            (child_offset * size_of::<u64>()) as NSUInteger,
+                        );
+                        parent_encoder.set_buffer(
+                            1,
+                            Some(output_buffer),
+                            (parent_offset * size_of::<u64>()) as NSUInteger,
+                        );
+                        parent_encoder.set_buffer(2, Some(&self.parameters), 0);
+                        set_u32(parent_encoder, 3, parent_count as u32);
+                        dispatch(parent_encoder, &self.parent_pipeline, parent_count);
+                        parent_encoder.end_encoding();
+                    }
+                    command_buffer.commit();
+                    command_buffer.to_owned()
+                })?;
+                first_level = last_level;
+            }
         }
 
         self.completed_tree_readback(
@@ -2732,6 +3027,7 @@ impl MetalShared {
             level_offsets,
             leaf_count,
             cap_height,
+            class,
         )
     }
 }
@@ -2742,6 +3038,28 @@ fn set_u32(encoder: &metal::ComputeCommandEncoderRef, index: u64, value: u32) {
         size_of::<u32>() as NSUInteger,
         (&value as *const u32).cast::<c_void>(),
     );
+}
+
+fn reverse_low_bits(value: usize, bits: usize) -> usize {
+    if bits == 0 {
+        0
+    } else {
+        value.reverse_bits() >> (usize::BITS as usize - bits)
+    }
+}
+
+/// With a power-of-two aligned col-major tile, the kernel's local `gid`
+/// contributes the high bits of the globally bit-reversed row. The reversed
+/// tile index is a constant low-bit suffix, so rebasing only the output buffer
+/// reproduces the unsplit kernel exactly without changing the metallib.
+fn colmajor_tile_output_base(
+    tile_start: usize,
+    tile_bits: usize,
+    log_leaf_count: usize,
+) -> usize {
+    debug_assert_eq!(tile_start & ((1usize << tile_bits) - 1), 0);
+    let tile_index = tile_start >> tile_bits;
+    reverse_low_bits(tile_index, log_leaf_count - tile_bits)
 }
 
 fn dispatch2d(
@@ -2933,9 +3251,123 @@ mod tests {
     use crate::plonk::vars::EvaluationVarsBaseBatch;
 
     #[test]
+    fn preemptible_tree_classifier_is_exact() {
+        assert_eq!(
+            classify_tree_class(false, true, 1 << 17, 65),
+            TreeClass::Spine
+        );
+        assert_eq!(
+            classify_tree_class(false, true, 1 << 17, 64),
+            TreeClass::Bulk
+        );
+        assert_eq!(
+            classify_tree_class(false, true, 1 << 16, 65),
+            TreeClass::Bulk
+        );
+        assert_eq!(
+            classify_tree_class(true, true, 1 << 17, 65),
+            TreeClass::Bulk
+        );
+        assert_eq!(
+            classify_tree_class(false, false, 1 << 17, 65),
+            TreeClass::Bulk
+        );
+    }
+
+    #[test]
+    fn completed_bulk_tile_hands_the_single_command_slot_to_spine() {
+        let mut state = CommandHandoffState::default();
+        state.enqueue(TreeClass::Bulk);
+        assert!(state.try_grant(TreeClass::Bulk));
+        assert_eq!(state.active_commands, 1);
+
+        state.enqueue(TreeClass::Bulk);
+        state.enqueue(TreeClass::Spine);
+        assert!(!state.can_grant(TreeClass::Bulk));
+        assert!(!state.can_grant(TreeClass::Spine));
+
+        state.release();
+        assert!(state.can_grant(TreeClass::Spine));
+        assert!(!state.can_grant(TreeClass::Bulk));
+        assert!(state.try_grant(TreeClass::Spine));
+        assert_eq!(state.active_commands, 1);
+        assert_eq!(state.max_active_commands, 1);
+
+        state.release();
+        assert!(state.try_grant(TreeClass::Bulk));
+        assert_eq!(state.max_active_commands, 1);
+    }
+
+    #[test]
+    fn colmajor_tile_offsets_preserve_global_bit_reversal() {
+        for log_leaf_count in 4..=10 {
+            for tile_bits in 1..log_leaf_count {
+                let tile_size = 1usize << tile_bits;
+                let leaf_count = 1usize << log_leaf_count;
+                for tile_start in (0..leaf_count).step_by(tile_size) {
+                    let output_base = colmajor_tile_output_base(
+                        tile_start,
+                        tile_bits,
+                        log_leaf_count,
+                    );
+                    for local_gid in 0..tile_size {
+                        let kernel_row = reverse_low_bits(local_gid, log_leaf_count);
+                        let expected = reverse_low_bits(tile_start + local_gid, log_leaf_count);
+                        assert_eq!(output_base + kernel_row, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preemptible_colmajor_tiles_match_cpu_tree() {
+        const ROWS: usize = 1 << 16;
+        const COLS: usize = 65;
+        const CAP_HEIGHT: usize = 4;
+        assert!(ROWS > BULK_LEAF_TILE);
+        assert_eq!(
+            classify_tree_class(false, false, ROWS, COLS),
+            TreeClass::Bulk
+        );
+
+        let columns: Vec<Vec<GoldilocksField>> = (0..COLS)
+            .map(|column| {
+                (0..ROWS)
+                    .map(|row| {
+                        GoldilocksField::from_canonical_usize(
+                            column.wrapping_mul(0x9e37) ^ row.wrapping_mul(0x85eb),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let log_rows = ROWS.ilog2() as usize;
+        let leaves: Vec<Vec<GoldilocksField>> = (0..ROWS)
+            .map(|leaf| {
+                let natural_row = reverse_low_bits(leaf, log_rows);
+                columns
+                    .iter()
+                    .map(|column| column[natural_row])
+                    .collect()
+            })
+            .collect();
+
+        let Ok(context) = CONTEXT.as_ref() else {
+            return; // Metal is optional on non-Apple test hosts.
+        };
+        let gpu = context
+            .build(LeafSource::Columns(&columns), COLS, ROWS, CAP_HEIGHT)
+            .expect("preemptible Metal tree");
+        let cpu = cpu_tree(&leaves, CAP_HEIGHT);
+        assert_tree_eq(&gpu, &cpu, COLS, CAP_HEIGHT);
+        assert_all_paths_match_cpu(&gpu, &cpu, ROWS, CAP_HEIGHT);
+    }
+
+    #[test]
     fn does_not_detach_output_without_a_waiting_build() {
         let context = MetalShared::new().expect("Metal context");
-        let mut set = context.acquire_set().expect("buffer set");
+        let mut set = context.acquire_set(TreeClass::Bulk).expect("buffer set");
         set.output = Some(autoreleasepool(|| {
             context
                 .device
@@ -2943,7 +3375,7 @@ mod tests {
         }));
 
         let detached = context
-            .try_detach_completed_output(&mut set, 64)
+            .try_detach_completed_output(&mut set, 64, TreeClass::Bulk)
             .expect("pool state");
         assert!(detached.is_none());
         let pool = context.pool.lock().unwrap();
@@ -2957,7 +3389,7 @@ mod tests {
         use std::sync::mpsc;
 
         let context = MetalShared::new().expect("Metal context");
-        let mut set = context.acquire_set().expect("first set");
+        let mut set = context.acquire_set(TreeClass::Bulk).expect("first set");
         set.output = Some(autoreleasepool(|| {
             context
                 .device
@@ -2969,7 +3401,9 @@ mod tests {
             let (tx, rx) = mpsc::sync_channel(0);
             let context_ref = &context;
             scope.spawn(move || {
-                let next = context_ref.acquire_set().expect("waiting set");
+                let next = context_ref
+                    .acquire_set(TreeClass::Bulk)
+                    .expect("waiting set");
                 tx.send(next).expect("return acquired set");
             });
 
@@ -2980,19 +3414,19 @@ mod tests {
             }
 
             let detached = context
-                .try_detach_completed_output(&mut set, 64)
+                .try_detach_completed_output(&mut set, 64, TreeClass::Bulk)
                 .expect("pool state")
                 .expect("waiting build enables detach");
             let replacement = set.output.as_ref().unwrap().contents();
             assert_eq!(detached.buffer().contents(), original);
             assert_ne!(replacement, original);
 
-            context.release_set(set);
+            context.release_set(TreeClass::Bulk, set);
             let next = rx
                 .recv_timeout(Duration::from_secs(2))
                 .expect("next build acquires before readback release");
             assert_eq!(next.output.as_ref().unwrap().contents(), replacement);
-            context.release_set(next);
+            context.release_set(TreeClass::Bulk, next);
 
             drop(detached);
             let pool = context.pool.lock().unwrap();
@@ -3006,7 +3440,7 @@ mod tests {
         type F = GoldilocksField;
 
         let context = MetalShared::new().expect("Metal context");
-        let mut set = context.acquire_set().expect("buffer set");
+        let mut set = context.acquire_set(TreeClass::Bulk).expect("buffer set");
         let limbs: Vec<u64> = (0..28).collect();
         set.output = Some(autoreleasepool(|| {
             context.device.new_buffer_with_data(
@@ -3020,10 +3454,17 @@ mod tests {
 
         context.pool.lock().unwrap().waiters = 1;
         let pending = context
-            .completed_tree_readback::<F>(&mut set, limbs.len(), offsets, 4, 0)
+            .completed_tree_readback::<F>(
+                &mut set,
+                limbs.len(),
+                offsets,
+                4,
+                0,
+                TreeClass::Bulk,
+            )
             .expect("completed tree readback");
         context.pool.lock().unwrap().waiters = 0;
-        context.release_set(set);
+        context.release_set(TreeClass::Bulk, set);
 
         assert_eq!(pending.finish(), expected);
     }
