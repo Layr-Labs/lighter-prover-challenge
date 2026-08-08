@@ -28,7 +28,7 @@ use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::util::timing::TimingTree;
 
-use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
+use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof, promote_thread_qos};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxPath {
@@ -324,6 +324,7 @@ fn prove_path(
                     .name(format!("{path:?}-chain-step-{chain_step}"))
                     .stack_size(PROVER_THREAD_STACK_BYTES)
                     .spawn_scoped(scope, move || {
+                        promote_thread_qos();
                         chain_step_proof(
                             path,
                             chain_target,
@@ -344,6 +345,7 @@ fn prove_path(
                 .name(format!("{path:?}-tx-proof-{current_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
+                    promote_thread_qos();
                     prove_tx_witness(path, current_chunk_index, tx_data, witness)
                 })
                 .expect("transaction proof pipeline thread must start");
@@ -396,6 +398,7 @@ fn prove_path(
                 .name(format!("{path:?}-chain-step-{chain_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
+                    promote_thread_qos();
                     chain_step_proof(
                         path,
                         chain_target,
@@ -535,6 +538,7 @@ pub(crate) fn prove_block_after_pre(
                 .name("heavy-tx-chain".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, || {
+                    promote_thread_qos();
                     prove_path(
                         TxPath::Heavy,
                         heavy_chunks,
@@ -554,6 +558,7 @@ pub(crate) fn prove_block_after_pre(
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
+                    promote_thread_qos();
                     let (block_target, block_data) = circuits.build_block_circuit();
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));

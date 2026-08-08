@@ -26,6 +26,51 @@ pub const PUBLIC_HEAVY_TX_COUNT: usize = 10;
 pub const PUBLIC_LIGHT_TX_COUNT: usize = 490;
 pub const PROVER_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
 
+/// Promote the calling thread to the highest macOS QoS class.
+///
+/// macOS schedules by QoS class, and threads created through plain
+/// `pthread_create` — every `std::thread` and rayon worker in this process —
+/// start at unspecified/legacy QoS rather than inheriting the spawner's
+/// class, so each proving thread must promote itself.
+/// `QOS_CLASS_USER_INTERACTIVE` places the thread in the highest scheduling
+/// band: eligible for P-cores ahead of any default-band work and above other
+/// processes' default-QoS threads on a shared machine. Without it the
+/// scheduler is free to hold prover threads in the default band alongside
+/// arbitrary background load.
+///
+/// Kill-switch: `LIGHTER_NO_QOS=1` restores the untouched default for A/B
+/// measurement. The scored environment sets no variables, so the promoted
+/// path is the ranked default. The env lookup is cached in a relaxed atomic;
+/// after the first call the cost is one load and one branch.
+pub fn promote_thread_qos() {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static MODE: AtomicU8 = AtomicU8::new(0); // 0 = unresolved, 1 = promote, 2 = off
+    let mode = match MODE.load(Ordering::Relaxed) {
+        0 => {
+            let resolved = if std::env::var_os("LIGHTER_NO_QOS").is_some() { 2 } else { 1 };
+            MODE.store(resolved, Ordering::Relaxed);
+            resolved
+        }
+        m => m,
+    };
+    #[cfg(not(target_os = "macos"))]
+    let _ = mode;
+    #[cfg(target_os = "macos")]
+    if mode == 1 {
+        // Value from <pthread/qos.h>; declared directly so the dependency
+        // graph and `Cargo.lock` stay untouched. `qos_class_t` is a C enum
+        // (`unsigned int`); the second argument is a relative priority within
+        // the class (0 = top of band).
+        const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        }
+        unsafe {
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        }
+    }
+}
+
 pub struct Circuits {
     pub heavy_tx_target: BlockTxTarget,
     pub heavy_tx_data: CircuitData<F, C, D>,

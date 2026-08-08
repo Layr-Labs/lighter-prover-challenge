@@ -16,7 +16,7 @@ use std::io::BufWriter;
 
 use api::{
     Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
-    PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
+    PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT, promote_thread_qos,
 };
 use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
 use circuit::block::Block;
@@ -45,6 +45,9 @@ static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
+    // PROBE 2: promote the main thread before any work — it drives fixture
+    // parse, circuit deserialization and the serial pipeline segments below.
+    promote_thread_qos();
     // First statement in the process: the Metal shader compile and pipeline
     // lowering behind the GPU hash path cost the better part of a second on a
     // cold OS shader cache, and the benchmark sandbox denies writes to that
@@ -54,10 +57,21 @@ fn main() {
     // the compiled kernels are identical either way.
     plonky2::hash::poseidon2::prewarm_gpu();
     env_logger::init();
-    rayon::ThreadPoolBuilder::new()
+    // PROBE 2: every rayon worker promotes itself as it starts (QoS is
+    // per-thread on macOS and not inherited across `pthread_create`).
+    let mut pool = rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
-        .build_global()
-        .expect("cannot configure prover thread pool");
+        .start_handler(|_| promote_thread_qos());
+    // A/B experiment only: override the worker count (e.g. P-core count).
+    // The scored environment sets no variables, so the default — one worker
+    // per logical core — is the ranked path.
+    if let Some(n) = env::var("LIGHTER_POOL_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        pool = pool.num_threads(n);
+    }
+    pool.build_global().expect("cannot configure prover thread pool");
 
     let mut args = env::args().skip(1);
     let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
@@ -93,6 +107,7 @@ fn main() {
         .name("pre-exec-startup".into())
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .spawn(move || {
+            promote_thread_qos();
             let (pre_target, pre_data) = pre_circuits;
             prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec)
         })
