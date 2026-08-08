@@ -53,12 +53,12 @@ incremental = false
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-# The score is the sum of worker process lifetimes, and each spawn validates the
-# binary's code signature over its whole mapped size. Debug symbols and the
-# local symbol table are never read by anything on the scored path — nothing
-# unwinds (`panic = "abort"`) and no backtrace is printed — so they are pure
-# per-spawn weight. Stripping them cannot change what any instruction does.
-strip = "symbols"
+# Drop the symbol table from the scored worker: the benchmark sandbox makes
+# every worker a fresh inode whose ad-hoc code signature is re-validated at
+# ~7.5 ms/MB, so a smaller binary is a direct startup win. Release builds do
+# not need runtime symbolization (the worker exits via `_exit(2)` and is never
+# debugged), and `panic = "abort"` keeps backtraces off the path anyway.
+strip = true
 
 # bench/build.rs constructs and serializes the five startup circuits at
 # compile time. Build scripts default to opt-level 0, which would turn that
