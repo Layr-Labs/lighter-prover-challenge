@@ -1056,12 +1056,38 @@ pub(crate) fn allocate_columns<F: RichField>(
 /// serializes any unexpected second caller onto the classic path.
 static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
 
+/// The final block proof's commitment shape: 2^18 rows extended by the rate.
+/// Everything at or above this leaf count is streamed.
+const STREAMED_MIN_LEAF_COUNT: usize = 1 << 20;
+/// The serial-critical commitment shape of the degree-2^14 circuits (the
+/// pre-execution proof and the chain steps), also streamed. Measured per
+/// absorb pass on this shape, the split sponge saturates the GPU exactly as it
+/// does at [`STREAMED_MIN_LEAF_COUNT`] — the eight-column passes run
+/// back-to-back with well under 0.1 ms of accumulated GPU idle across a whole
+/// 17-pass build — so the CPU's coset FFT for each group hides completely
+/// behind the previous group's absorption, just as it does for the final block
+/// proof. This is the same shape [`gpu_worthwhile`] already singles out as
+/// `serial_critical_shape`.
+///
+/// 2^19 (the pipelined chunk circuits) is deliberately NOT streamed. The
+/// exclusive-phase flag is process-global and the chain-tail drain raises it
+/// while chunk proofs may still be in flight, so a chunk tree can observe it;
+/// those trees are not on a serial critical path and keep the single fused
+/// command buffer.
+const STREAMED_SERIAL_LEAF_COUNT: usize = 1 << 17;
+
+/// Leaf counts the streamed sponge accepts.
+fn streamed_leaf_count(leaf_count: usize) -> bool {
+    leaf_count == STREAMED_SERIAL_LEAF_COUNT || leaf_count >= STREAMED_MIN_LEAF_COUNT
+}
+
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
 /// the GPU absorbs each group while the CPU fills the next. Only used inside
 /// exclusive proving phases (nothing else contends for the GPU stream) and
-/// for large wide trees, where the overlap converts the previously serial
-/// CPU-FFT-then-GPU-hash commitment into max(FFT, hash) + one pass.
+/// for the wide serial-path commitment shapes ([`streamed_leaf_count`]), where
+/// the overlap converts the previously serial CPU-FFT-then-GPU-hash commitment
+/// into max(FFT, hash) + one pass.
 ///
 /// Value-exact: the fill closure runs the same `batch_multiply_into` +
 /// zero-padded FFT as `fill_lde_column_store`, and each absorb pass performs
@@ -1082,7 +1108,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || leaf_width < 16
-        || leaf_count < 1 << 20
+        || !streamed_leaf_count(leaf_count)
         || !leaf_count.is_power_of_two()
         || leaf_count > u32::MAX as usize
         || leaf_width > u32::MAX as usize
@@ -4927,6 +4953,132 @@ kernel void goldilocks_mul_bench_native(
                 assert_all_paths_match_cpu(&gpu_cols, &cpu, leaves.len(), cap_height);
             }
         }
+    }
+
+    /// Differential for the streamed sponge build at the serial commitment
+    /// shape [`STREAMED_SERIAL_LEAF_COUNT`]: splitting the sponge into one
+    /// command buffer per eight-column group, with the state parked in memory
+    /// between passes, must reproduce the fused single-command build exactly —
+    /// every level-order node, the cap, and the retained column store the fill
+    /// closure wrote. Widths cover an exact multiple of the rate, a ragged
+    /// final group of one, a ragged final group of four, and the production
+    /// 17-group wires shape. The narrow widths are additionally pinned to the
+    /// CPU Merkle tree, so a fault shared by both GPU kernels cannot pass.
+    ///
+    /// The routing assertions live in this same test because the
+    /// exclusive-phase flag they toggle is process-global: as separate
+    /// `#[test]`s they would run concurrently and clear each other's gate.
+    #[test]
+    fn streamed_sponge_build_matches_the_fused_build() {
+        let context = CONTEXT.as_ref().unwrap_or_else(|error| panic!("{error}"));
+        let leaf_count = STREAMED_SERIAL_LEAF_COUNT;
+        let log_leaf_count = leaf_count.ilog2() as usize;
+        let cap_height = 4usize;
+
+        // The streamed path must decline every shape it is not gated for, so a
+        // tree that could contend for the GPU stream keeps its single fused
+        // command buffer. Declining routes the caller back to the classic
+        // fill-then-build, so this pins routing, not hashes.
+        let declines = |leaf_count: usize, width: usize| {
+            let columns = context
+                .allocate_columns::<GoldilocksField>(leaf_count, width)
+                .unwrap();
+            build_merkle_tree_shared_streamed::<GoldilocksField>(
+                &columns,
+                cap_height,
+                &|_, destinations| {
+                    for destination in destinations.iter_mut() {
+                        destination.fill(GoldilocksField::ZERO);
+                    }
+                },
+            )
+            .is_none()
+        };
+        set_exclusive_gpu_phase(true);
+        assert!(declines(leaf_count, 15), "too narrow");
+        assert!(declines(1 << 16, 16), "below the serial shape");
+        assert!(declines(1 << 18, 16), "between the two admitted shapes");
+        assert!(declines(1 << 19, 16), "pipelined chunk-circuit shape");
+        set_exclusive_gpu_phase(false);
+        assert!(declines(leaf_count, 16), "outside an exclusive phase");
+
+        // The streamed path is gated on the exclusive serial proving phase.
+        set_exclusive_gpu_phase(true);
+        for width in [16usize, 17, 20, 136] {
+            let mut rng = StdRng::seed_from_u64(0x5354_5245_414d ^ width as u64);
+            // Non-canonical representatives on both sides of the modulus, so
+            // the kernel's canonicalization is exercised rather than assumed.
+            let columns: Vec<Vec<GoldilocksField>> = (0..width)
+                .map(|column| {
+                    (0..leaf_count)
+                        .map(|row| {
+                            let raw = match (column * leaf_count + row) & 7 {
+                                0 => 0,
+                                1 => 1,
+                                2 => GoldilocksField::ORDER - 1,
+                                3 => GoldilocksField::ORDER,
+                                4 => GoldilocksField::ORDER + 1,
+                                5 => u64::MAX,
+                                _ => rng.next_u64(),
+                            };
+                            GoldilocksField(raw)
+                        })
+                        .collect()
+                })
+                .collect();
+
+            let mut fused_store = context
+                .allocate_columns::<GoldilocksField>(leaf_count, width)
+                .unwrap();
+            fused_store
+                .columns_mut()
+                .unwrap()
+                .into_iter()
+                .zip(&columns)
+                .for_each(|(destination, source)| destination.copy_from_slice(source));
+            let fused = build_merkle_tree_shared::<GoldilocksField>(&fused_store, cap_height)
+                .expect("the fused shared-column build must accept this shape");
+
+            let streamed_store = context
+                .allocate_columns::<GoldilocksField>(leaf_count, width)
+                .unwrap();
+            let filled = core::sync::atomic::AtomicUsize::new(0);
+            let streamed = build_merkle_tree_shared_streamed::<GoldilocksField>(
+                &streamed_store,
+                cap_height,
+                &|group, destinations| {
+                    filled.fetch_add(destinations.len(), core::sync::atomic::Ordering::Relaxed);
+                    for (index, destination) in destinations.iter_mut().enumerate() {
+                        destination.copy_from_slice(&columns[group * 8 + index]);
+                    }
+                },
+            )
+            .expect("the streamed build must accept the serial commitment shape");
+            assert_eq!(
+                filled.load(core::sync::atomic::Ordering::Relaxed),
+                width,
+                "every column must be filled exactly once, width {width}"
+            );
+
+            assert_eq!(
+                streamed_store, fused_store,
+                "streamed fill left different column words, width {width}"
+            );
+            assert_tree_raw_eq(&streamed, &fused, width, cap_height);
+
+            if width <= 17 {
+                assert_all_paths_raw_eq(&streamed, &fused, leaf_count, cap_height);
+                let leaves: Vec<Vec<GoldilocksField>> = (0..leaf_count)
+                    .map(|leaf| {
+                        let natural = crate::util::reverse_bits(leaf, log_leaf_count);
+                        (0..width).map(|column| columns[column][natural]).collect()
+                    })
+                    .collect();
+                let cpu = cpu_tree(&leaves, cap_height);
+                assert_tree_eq(&streamed, &cpu, width, cap_height);
+            }
+        }
+        set_exclusive_gpu_phase(false);
     }
 
     /// The staging copy in [`tree_from_levels`] pairs `STAGING_CHUNK / 4`-sized
