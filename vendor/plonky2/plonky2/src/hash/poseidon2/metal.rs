@@ -406,6 +406,14 @@ pub fn set_exclusive_gpu_phase(enabled: bool) {
     EXCLUSIVE_GPU_PHASE.store(enabled, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Forces the one-time Metal context initialization (shader compile,
+/// pipeline creation) that is otherwise paid lazily inside the first
+/// GPU-routed tree build. Idempotent; failure falls back to CPU hashing
+/// exactly as on first use.
+pub fn warm_up_gpu_context() {
+    let _ = shared_context();
+}
+
 /// Number of Merkle builds currently occupying the serialized GPU stream
 /// (from buffer acquisition through `wait_until_completed`). Routing reads
 /// this to decide whether a small serial-path tree would enqueue behind
