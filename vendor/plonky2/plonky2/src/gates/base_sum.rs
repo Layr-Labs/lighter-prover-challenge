@@ -170,6 +170,8 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> PackedEvaluab
     ) {
         let sum = vars.local_wires[Self::WIRE_SUM];
         let limbs = vars.local_wires.view(self.limbs());
+        // B=2 folds radix powers by doubling, which is cheaper than the generic
+        // multiply-by-radix Horner fold and value-identical to it.
         let computed_sum = if B == 2 {
             let mut radix_sum = P::ZEROS;
             for &limb in limbs.iter().rev() {
@@ -182,10 +184,18 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> PackedEvaluab
 
         yield_constr.one(computed_sum - sum);
 
+        // B=2's only roots are 0 and 1, so the range-constraint product
+        // `limb * (limb - 1)` is one fewer packed subtraction and one fewer
+        // iterator step than the generic `(0..B)` product, and value-identical
+        // to it.
         let constraints_iter = limbs.iter().map(|&limb| {
-            (0..B)
-                .map(|i| limb - F::from_canonical_usize(i))
-                .product::<P>()
+            if B == 2 {
+                limb * (limb - P::ONES)
+            } else {
+                (0..B)
+                    .map(|i| limb - F::from_canonical_usize(i))
+                    .product::<P>()
+            }
         });
         yield_constr.many(constraints_iter);
     }
@@ -269,6 +279,65 @@ mod tests {
         type C = PoseidonGoldilocksConfig;
         type F = <C as GenericConfig<D>>::F;
         test_eval_fns::<F, C, _, D>(BaseSumGate::<6>::new(11))
+    }
+
+    /// Differential oracle for the packed evaluator: every point of a 32-point
+    /// batch (multiple packed groups plus the scalar leftovers) must produce
+    /// exactly the scalar per-point evaluation. This is the gate that the
+    /// `B = 2` doubling and range-constraint specializations live in, so it is
+    /// exercised for both the specialized base and the generic base.
+    #[test]
+    fn packed_batch_matches_scalar_per_point() {
+        use crate::gates::gate::Gate;
+        use crate::hash::hash_types::HashOut;
+        use crate::plonk::vars::EvaluationVarsBaseBatch;
+        use plonky2_field::types::Field;
+        use plonky2_field::types::Sample;
+
+        fn compare<const B: usize>(num_limbs: usize) {
+            type F = GoldilocksField;
+            let gate = BaseSumGate::<B>::new(num_limbs);
+            let n = 32; // several packed groups; covers leftovers too
+            let wires = F::rand_vec(<BaseSumGate<B> as Gate<F, 2>>::num_wires(&gate) * n);
+            let public_inputs_hash = HashOut::rand();
+            let vars_batch =
+                EvaluationVarsBaseBatch::new(n, &[], &wires, &public_inputs_hash);
+
+            let packed =
+                <BaseSumGate<B> as Gate<F, 2>>::eval_unfiltered_base_batch(&gate, vars_batch);
+
+            // Manual scalar reference for the exact constraint polynomial:
+            // constraint 0 is `reduce_with_powers(limbs, B) - sum`, then one
+            // range constraint per limb. `eval_unfiltered_base_one` panics for
+            // this gate (it only implements the packed path), so this reference
+            // is the oracle for the packed evaluator's B=2 specializations.
+            let mut scalar =
+                vec![F::ZERO; n * <BaseSumGate<B> as Gate<F, 2>>::num_constraints(&gate)];
+            for (i, vars_one) in vars_batch.iter().enumerate() {
+                let sum = vars_one.local_wires[BaseSumGate::<B>::WIRE_SUM];
+                let start = BaseSumGate::<B>::START_LIMBS;
+                let limbs = vars_one.local_wires.view(start..start + num_limbs);
+                let computed_sum = limbs
+                    .iter()
+                    .rev()
+                    .fold(F::ZERO, |acc, &limb| {
+                        acc * F::from_canonical_usize(B) + limb
+                    });
+                scalar[i] = computed_sum - sum;
+                for (j, &limb) in limbs.iter().enumerate() {
+                    scalar[(1 + j) * n + i] = (0..B)
+                        .map(|v| limb - F::from_canonical_usize(v))
+                        .product();
+                }
+            }
+            assert_eq!(
+                packed, scalar,
+                "packed batch eval diverges from scalar per-point eval"
+            );
+        }
+
+        compare::<2>(11);
+        compare::<6>(11);
     }
 
     /// Manual timing harness for the packed accumulate path of the production
