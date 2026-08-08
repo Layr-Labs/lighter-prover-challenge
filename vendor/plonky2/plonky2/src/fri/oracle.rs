@@ -167,61 +167,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             if let Some(mut columns) =
                 C::Hasher::try_allocate_merkle_tree_columns(polynomials.len(), lde_len, cap_height)
             {
-                // Streamed exclusive-phase path: the backend absorbs each
-                // group of eight LDE columns while the CPU computes the next
-                // group, collapsing the serial FFT-then-hash commitment into
-                // max(FFT, hash). Falls through to the classic fill + build
-                // whenever the backend declines (the group fill below is the
-                // same computation `fill_lde_column_store` performs, so a
-                // partial fill is simply refilled).
-                let streamed = {
-                    let coset_powers =
-                        crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
-                    let polys = &polynomials;
-                    C::Hasher::try_build_merkle_tree_column_store_streamed(
-                        &columns,
-                        cap_height,
-                        &|group, destinations: &mut [&mut [F]]| {
-                            destinations.par_iter_mut().enumerate().for_each(
-                                |(k, destination)| {
-                                    let polynomial = &polys[group * 8 + k];
-                                    assert_eq!(
-                                        polynomial.len(),
-                                        degree,
-                                        "Polynomial degrees inconsistent"
-                                    );
-                                    batch_multiply_into(
-                                        &mut destination[..degree],
-                                        &polynomial.coeffs,
-                                        &coset_powers,
-                                    );
-                                    if rate_bits == 0 || degree < 2 {
-                                        destination[degree..].fill(F::ZERO);
-                                    }
-                                    fft_in_place_with_options(
-                                        destination,
-                                        Some(rate_bits),
-                                        fft_root_table,
-                                    );
-                                },
-                            );
-                        },
-                    )
-                };
-                if let Some((level_digests, cap)) = streamed {
-                    let merkle_tree = timed!(
-                        timing,
-                        "build Merkle tree",
-                        MerkleTree::from_prebuilt_columns(columns, level_digests, cap)
-                    );
-                    return Self {
-                        polynomials,
-                        merkle_tree,
-                        degree_log: log2_strict(degree),
-                        rate_bits,
-                        blinding,
-                    };
-                }
                 let initialized = timed!(
                     timing,
                     "FFT + blinding",
@@ -501,11 +446,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     /// circuit-fixed, so the caller caches the result once per circuit and
     /// every subsequent proof's quotient gathers copy from it instead of
     /// re-walking the strided LDE.
-    ///
-    /// When `step == 1` (production: `rate_bits == quotient_degree_bits`) each
-    /// column's contribution is a contiguous LDE prefix, so the strided map
-    /// collapses to a per-column memcpy. Columns are independent and fan
-    /// across the pool; the `step > 1` path is unchanged.
     pub fn extract_lde_batch_columns(
         &self,
         step: usize,
@@ -513,33 +453,14 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         q_domain: usize,
     ) -> Option<Vec<F>> {
         let w = col_range.len();
+        let mut out = Vec::with_capacity(w * q_domain);
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
-                if step == 1 {
-                    // Contiguous: column[i * 1] == column[i] for i in 0..q_domain,
-                    // so memcpy of the prefix is bit-identical to the strided map.
-                    let mut out = Vec::with_capacity(w * q_domain);
-                    // SAFETY: every of the `w * q_domain` slots is overwritten by
-                    // `copy_from_slice` below before any is read. `F` is a plain
-                    // field wrapper (any bit pattern is a valid `F`).
-                    unsafe {
-                        out.set_len(w * q_domain);
-                    }
-                    let col_start = col_range.start;
-                    out.par_chunks_mut(q_domain)
-                        .enumerate()
-                        .for_each(|(ci, dest)| {
-                            dest.copy_from_slice(&columns.col(col_start + ci)[..q_domain]);
-                        });
-                    Some(out)
-                } else {
-                    let mut out = Vec::with_capacity(w * q_domain);
-                    for c in col_range {
-                        let column = columns.col(c);
-                        out.extend((0..q_domain).map(|i| column[i * step]));
-                    }
-                    Some(out)
+                for c in col_range {
+                    let column = columns.col(c);
+                    out.extend((0..q_domain).map(|i| column[i * step]));
                 }
+                Some(out)
             }
             _ => None,
         }
