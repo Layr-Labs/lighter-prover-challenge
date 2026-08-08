@@ -77,11 +77,6 @@ const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
 const MAX_BUFFER_SETS: usize = 1;
 /// Parallel staging copy granularity in u64 elements (4 MiB chunks).
 const STAGING_CHUNK: usize = 1 << 19;
-/// Reuse only the recurring transaction/chain quotient outputs. The final
-/// block's one-off 32 MiB outputs remain uncached so the pool cannot amplify
-/// peak unified-memory pressure.
-const MAX_CACHED_QUOTIENT_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
 
 struct MetalShared {
     device: Device,
@@ -94,10 +89,6 @@ struct MetalShared {
     ifft_finalize_pipeline: ComputePipelineState,
     parameters: Buffer,
     pool: Mutex<BufferPool>,
-    /// Small, nonblocking cache for completed gate-quotient output buffers.
-    /// Kept separate from the tree pool so quotient allocation never delays
-    /// Merkle admission or contends on its condition variable.
-    quotient_output_pool: Arc<Mutex<QuotientOutputPool>>,
     available: Condvar,
     /// Per-`log2(lde_size)` concatenated FFT twiddle rows (canonical u64), with
     /// `offsets[lg_half_m]` giving each stage row's element offset.
@@ -117,8 +108,7 @@ struct NttRoots {
 /// point-major output stays in shared storage for zero-copy CPU combination.
 pub(crate) struct PoseidonGateQuotientJob<F> {
     command_buffer: CommandBuffer,
-    output: Option<Buffer>,
-    output_pool: Arc<Mutex<QuotientOutputPool>>,
+    output: Buffer,
     len: usize,
     _job: GpuJobGuard,
     _phantom: PhantomData<F>,
@@ -129,8 +119,7 @@ pub(crate) struct PoseidonGateQuotientJob<F> {
 /// challenge values per quotient-domain point.
 pub(crate) struct RangeCheckGateQuotientJob<F> {
     command_buffer: CommandBuffer,
-    output: Option<Buffer>,
-    output_pool: Arc<Mutex<QuotientOutputPool>>,
+    output: Buffer,
     len: usize,
     _job: GpuJobGuard,
     _phantom: PhantomData<F>,
@@ -146,8 +135,7 @@ impl<F: RichField> PoseidonGateQuotientJob<F> {
         }
         // SAFETY: construction is restricted to an 8-byte Goldilocks field,
         // and the completed kernel canonicalized every output word.
-        let output = self.output.as_ref().expect("quotient output present");
-        Ok(unsafe { slice::from_raw_parts(output.contents().cast::<F>(), self.len) })
+        Ok(unsafe { slice::from_raw_parts(self.output.contents().cast::<F>(), self.len) })
     }
 }
 
@@ -162,49 +150,7 @@ impl<F: RichField> RangeCheckGateQuotientJob<F> {
         }
         // SAFETY: construction is restricted to an 8-byte Goldilocks field,
         // and the completed kernel canonicalized every output word.
-        let output = self.output.as_ref().expect("quotient output present");
-        Ok(unsafe { slice::from_raw_parts(output.contents().cast::<F>(), self.len) })
-    }
-}
-
-fn recycle_completed_quotient_output(
-    command_buffer: &CommandBuffer,
-    output: &mut Option<Buffer>,
-    pool: &Arc<Mutex<QuotientOutputPool>>,
-) {
-    // Never wait from Drop and never make an in-flight or failed resource
-    // visible to another command. Default retained references keep an early-
-    // dropped output alive for its original command buffer.
-    if command_buffer.status() != MTLCommandBufferStatus::Completed {
-        return;
-    }
-    let Some(buffer) = output.take() else {
-        return;
-    };
-    // Allocation/recycling is an opportunistic micro-optimization. On lock
-    // contention or poisoning, drop normally instead of delaying a proof.
-    if let Ok(mut pool) = pool.try_lock() {
-        pool.recycle(buffer);
-    }
-}
-
-impl<F> Drop for PoseidonGateQuotientJob<F> {
-    fn drop(&mut self) {
-        recycle_completed_quotient_output(
-            &self.command_buffer,
-            &mut self.output,
-            &self.output_pool,
-        );
-    }
-}
-
-impl<F> Drop for RangeCheckGateQuotientJob<F> {
-    fn drop(&mut self) {
-        recycle_completed_quotient_output(
-            &self.command_buffer,
-            &mut self.output,
-            &self.output_pool,
-        );
+        Ok(unsafe { slice::from_raw_parts(self.output.contents().cast::<F>(), self.len) })
     }
 }
 
@@ -401,49 +347,6 @@ struct BufferPool {
     waiters: usize,
     spare_output: Option<Buffer>,
     detached_readback: bool,
-}
-
-#[derive(Default)]
-struct QuotientOutputPool {
-    free: Vec<Buffer>,
-}
-
-impl QuotientOutputPool {
-    /// Takes the smallest cached buffer that covers `bytes`.
-    fn take_best_fit(&mut self, bytes: u64) -> Option<Buffer> {
-        let index = self
-            .free
-            .iter()
-            .enumerate()
-            .filter(|(_, buffer)| buffer.length() >= bytes)
-            .min_by_key(|(_, buffer)| buffer.length())
-            .map(|(index, _)| index)?;
-        Some(self.free.swap_remove(index))
-    }
-
-    /// Retains at most the two largest recurring-size buffers. A larger buffer
-    /// can service every smaller quotient shape, while final-proof outputs are
-    /// rejected by the size cap before they reach the cache.
-    fn recycle(&mut self, buffer: Buffer) {
-        let length = buffer.length();
-        if length > MAX_CACHED_QUOTIENT_OUTPUT_BYTES {
-            return;
-        }
-        if self.free.len() < MAX_CACHED_QUOTIENT_OUTPUTS {
-            self.free.push(buffer);
-            return;
-        }
-        let (smallest_index, smallest_length) = self
-            .free
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, cached)| cached.length())
-            .map(|(index, cached)| (index, cached.length()))
-            .expect("full quotient output pool is nonempty");
-        if length > smallest_length {
-            self.free[smallest_index] = buffer;
-        }
-    }
 }
 
 struct DetachedOutput<'a> {
@@ -1775,7 +1678,6 @@ impl MetalShared {
                     spare_output: None,
                     detached_readback: false,
                 }),
-                quotient_output_pool: Arc::new(Mutex::new(QuotientOutputPool::default())),
                 available: Condvar::new(),
                 ntt_roots: Mutex::new(HashMap::new()),
                 ntt_shifts: Mutex::new(HashMap::new()),
@@ -1802,20 +1704,6 @@ impl MetalShared {
         Ok(MetalColumns::with_buffer(buffer, rows, cols))
     }
 
-    fn acquire_quotient_output(&self, bytes: u64) -> Buffer {
-        if bytes <= MAX_CACHED_QUOTIENT_OUTPUT_BYTES {
-            if let Ok(mut pool) = self.quotient_output_pool.try_lock() {
-                if let Some(buffer) = pool.take_best_fit(bytes) {
-                    return buffer;
-                }
-            }
-        }
-        autoreleasepool(|| {
-            self.device
-                .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
-        })
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn start_poseidon2_gate_quotient<F: RichField>(
         &self,
@@ -1837,7 +1725,10 @@ impl MetalShared {
         let bytes = len
             .checked_mul(size_of::<u64>())
             .ok_or("Poseidon2 gate quotient output size overflow")?;
-        let output = self.acquire_quotient_output(bytes as u64);
+        let output = autoreleasepool(|| {
+            self.device
+                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+        });
         let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
@@ -1867,8 +1758,7 @@ impl MetalShared {
         });
         Ok(PoseidonGateQuotientJob {
             command_buffer,
-            output: Some(output),
-            output_pool: Arc::clone(&self.quotient_output_pool),
+            output,
             len,
             _job: job_guard,
             _phantom: PhantomData,
@@ -1901,7 +1791,10 @@ impl MetalShared {
         let bytes = len
             .checked_mul(size_of::<u64>())
             .ok_or("RangeCheck gate quotient output size overflow")?;
-        let output = self.acquire_quotient_output(bytes as u64);
+        let output = autoreleasepool(|| {
+            self.device
+                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+        });
         let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
@@ -1933,8 +1826,7 @@ impl MetalShared {
         });
         Ok(RangeCheckGateQuotientJob {
             command_buffer,
-            output: Some(output),
-            output_pool: Arc::clone(&self.quotient_output_pool),
+            output,
             len,
             _job: job_guard,
             _phantom: PhantomData,
@@ -3046,86 +2938,6 @@ mod tests {
                 "prebuilt metallib is missing kernel {name}"
             );
         }
-    }
-
-    #[test]
-    fn quotient_output_pool_is_bounded_and_best_fit() {
-        let Some(device) = Device::system_default() else {
-            return;
-        };
-        let buffer = |bytes| {
-            autoreleasepool(|| {
-                device.new_buffer(bytes, MTLResourceOptions::StorageModeShared)
-            })
-        };
-        let mib = 1024 * 1024;
-        let mut pool = QuotientOutputPool::default();
-
-        pool.recycle(buffer(2 * mib));
-        pool.recycle(buffer(8 * mib));
-        pool.recycle(buffer(4 * mib));
-        assert_eq!(pool.free.len(), MAX_CACHED_QUOTIENT_OUTPUTS);
-        let mut lengths = pool.free.iter().map(|buffer| buffer.length()).collect::<Vec<_>>();
-        lengths.sort_unstable();
-        assert_eq!(lengths, vec![4 * mib, 8 * mib]);
-
-        let four = pool.take_best_fit(3 * mib).expect("4 MiB best fit");
-        assert_eq!(four.length(), 4 * mib);
-        let eight = pool.take_best_fit(1).expect("remaining 8 MiB buffer");
-        assert_eq!(eight.length(), 8 * mib);
-        assert!(pool.take_best_fit(1).is_none());
-
-        pool.recycle(buffer(MAX_CACHED_QUOTIENT_OUTPUT_BYTES + 1));
-        assert!(pool.free.is_empty(), "oversized output must not be cached");
-    }
-
-    #[test]
-    fn quotient_output_recycles_only_after_completion() {
-        type F = GoldilocksField;
-        let Some(device) = Device::system_default() else {
-            return;
-        };
-        let queue = device.new_command_queue();
-        let pool = Arc::new(Mutex::new(QuotientOutputPool::default()));
-        let output = || {
-            autoreleasepool(|| device.new_buffer(64, MTLResourceOptions::StorageModeShared))
-        };
-
-        let not_enqueued = queue.new_command_buffer().to_owned();
-        drop(PoseidonGateQuotientJob::<F> {
-            command_buffer: not_enqueued,
-            output: Some(output()),
-            output_pool: Arc::clone(&pool),
-            len: 8,
-            _job: GpuJobGuard::begin(),
-            _phantom: PhantomData,
-        });
-        assert!(pool.lock().unwrap().free.is_empty());
-
-        let completed = autoreleasepool(|| {
-            let command_buffer = queue.new_command_buffer();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
-            assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
-            command_buffer.to_owned()
-        });
-        let completed_output = output();
-        let completed_output_ptr = completed_output.contents();
-        drop(PoseidonGateQuotientJob::<F> {
-            command_buffer: completed,
-            output: Some(completed_output),
-            output_pool: Arc::clone(&pool),
-            len: 8,
-            _job: GpuJobGuard::begin(),
-            _phantom: PhantomData,
-        });
-        let reused = pool
-            .lock()
-            .unwrap()
-            .take_best_fit(64)
-            .expect("completed output must be reusable");
-        assert_eq!(reused.contents(), completed_output_ptr);
-        assert!(pool.lock().unwrap().free.is_empty());
     }
     use crate::gates::selectors::UNUSED_SELECTOR;
     use crate::hash::hash_types::HashOut;

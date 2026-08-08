@@ -2129,21 +2129,12 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
-                }
             },
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
+    let gpu_poseidon_values = if let Some((_, job)) = &gpu_poseidon {
+        Some(match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2173,23 +2164,14 @@ fn compute_quotient_polys<
                     false,
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        })
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
+    let gpu_range_values = if let Some((_, job)) = &gpu_range {
+        Some(match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2219,19 +2201,45 @@ fn compute_quotient_polys<
                     false,
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+        })
+    } else {
+        None
+    };
+
+    // Normalize the CPU numerator and merge every successful GPU numerator in
+    // one traversal. Previously the CPU batch loop normalized first, then each
+    // GPU job recomputed the same inverse and streamed the whole quotient
+    // buffer again. Keep the operation order per cell unchanged:
+    // `cpu *= inv`, then Poseidon, then RangeCheck.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    quotient_values
+        .par_chunks_exact_mut(num_challenges)
+        .enumerate()
+        .for_each(|(i, cpu_values)| {
+            let denominator_inv = z_h_on_coset.eval_inverse(i);
+            let offset = i * num_challenges;
+            for challenge in 0..num_challenges {
+                let cpu = &mut cpu_values[challenge];
+                *cpu *= denominator_inv;
+                if let Some(gpu_values) = gpu_poseidon_values {
+                    *cpu += gpu_values[offset + challenge] * denominator_inv;
                 }
-            });
-    }
+                if let Some(gpu_values) = gpu_range_values {
+                    *cpu += gpu_values[offset + challenge] * denominator_inv;
+                }
+            }
+        });
+
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    quotient_values
+        .par_chunks_exact_mut(num_challenges)
+        .enumerate()
+        .for_each(|(i, cpu_values)| {
+            let denominator_inv = z_h_on_coset.eval_inverse(i);
+            cpu_values
+                .iter_mut()
+                .for_each(|value| *value *= denominator_inv);
+        });
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
     // Parallel scatter of the interleaved point-major buffer into the
