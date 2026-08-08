@@ -122,6 +122,46 @@ fn bitrev_flatten<F: RichField + Extendable<D>, const D: usize>(values: &[F::Ext
     flat
 }
 
+/// Converts a natural-order extension codeword into the column-major leaf
+/// layout already supported by [`MerkleTree::new_columns`]. For an arity of
+/// `2^a`, tree leaf `i`, slot `j` historically reads
+/// `values[reverse_bits(i * 2^a + j, log_n)]`. Splitting that reversal at the
+/// arity boundary gives
+/// `values[reverse_bits(j, a) * leaf_count + reverse_bits(i, log_leaf_count)]`.
+///
+/// Therefore column `j * D + limb` is the contiguous natural block
+/// `reverse_bits(j, a)`, deinterleaved by base-field limb. The existing
+/// column-major Merkle backend performs the remaining row-bit reversal while
+/// hashing. All source reads are linear within large disjoint blocks; no
+/// full-domain random gather is materialized.
+fn fri_natural_columns<F: RichField + Extendable<D>, const D: usize>(
+    values: Vec<F::Extension>,
+    arity_bits: usize,
+) -> Vec<Vec<F>> {
+    let arity = 1usize << arity_bits;
+    assert!(values.len().is_power_of_two());
+    assert_eq!(values.len() % arity, 0);
+    let leaf_count = values.len() / arity;
+
+    let grouped = (0..arity)
+        .into_par_iter()
+        .map(|slot| {
+            let natural_slot = reverse_bits(slot, arity_bits);
+            let source = &values[natural_slot * leaf_count..(natural_slot + 1) * leaf_count];
+            let mut limbs: [Vec<F>; D] = core::array::from_fn(|_| Vec::with_capacity(leaf_count));
+            for value in source {
+                let base = value.to_basefield_array();
+                for limb in 0..D {
+                    limbs[limb].push(base[limb]);
+                }
+            }
+            limbs
+        })
+        .collect::<Vec<_>>();
+
+    grouped.into_iter().flatten().collect()
+}
+
 fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     mut coeffs: PolynomialCoeffs<F::Extension>,
     mut values: PolynomialValues<F::Extension>,
@@ -137,17 +177,28 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     for (round, arity_bits) in fri_params.reduction_arity_bits.iter().enumerate() {
         let arity = 1 << arity_bits;
 
-        // Fused bit-reversal + flatten: one gather pass writes the flat leaf
-        // buffer directly (leaf `i` is the `arity`-chunk of the bit-reversed
-        // codeword starting at `i * arity`), instead of a random-access
-        // in-place permutation followed by a separate flattening pass with a
-        // heap allocation per element.
-        let flat_values = bitrev_flatten::<F, D>(&values.values);
-        let tree = MerkleTree::<F, C::Hasher>::new_flat(
-            flat_values,
-            arity * D,
-            fri_params.config.cap_height,
-        );
+        // A degree-2^18 circuit's first FRI codeword has 2^21 extension
+        // values. With the production arity 16 this becomes a 2^17-by-32
+        // leaf matrix, a shape routed to the column-major Metal backend in
+        // the exclusive final-proof phase. Split full-index bit reversal into
+        // an arity-column permutation and the row reversal already performed
+        // by that backend. Smaller FRI rounds can route to the CPU, where
+        // `new_columns` would have to transpose the columns back to row-major;
+        // preserve the direct flat path for those rounds.
+        const MIN_NATURAL_COLUMN_VALUES: usize = 1 << 21;
+        let use_natural_columns = cfg!(all(
+            feature = "std",
+            target_arch = "aarch64",
+            target_os = "macos"
+        )) && values.values.len() >= MIN_NATURAL_COLUMN_VALUES;
+        let tree = if use_natural_columns {
+            let columns =
+                fri_natural_columns::<F, D>(core::mem::take(&mut values.values), *arity_bits);
+            MerkleTree::<F, C::Hasher>::new_columns(columns, fri_params.config.cap_height)
+        } else {
+            let leaves = bitrev_flatten::<F, D>(&values.values);
+            MerkleTree::<F, C::Hasher>::new_flat(leaves, arity * D, fri_params.config.cap_height)
+        };
 
         challenger.observe_cap(&tree.cap);
         trees.push(tree);
@@ -329,8 +380,10 @@ fn fri_prover_query_round<
         .collect::<Vec<_>>();
     for (i, tree) in trees.iter().enumerate() {
         let arity_bits = fri_params.reduction_arity_bits[i];
-        let evals = unflatten(tree.get(x_index >> arity_bits));
-        let merkle_proof = tree.prove(x_index >> arity_bits);
+        let leaf_index = x_index >> arity_bits;
+        let leaf = tree.leaf_vec(leaf_index);
+        let evals = unflatten(&leaf);
+        let merkle_proof = tree.prove(leaf_index);
 
         query_steps.push(FriQueryStep {
             evals,
@@ -353,6 +406,7 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::plonk::config::PoseidonGoldilocksConfig;
 
     /// `bitrev_flatten` must be raw-`u64`-identical to the serial
     /// gather-and-extend loop it replaced, for every leaf and every limb.
@@ -379,6 +433,38 @@ mod tests {
             assert_eq!(actual.len(), expected.len(), "length for n = {n}");
             for (k, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
                 assert_eq!(a.0, e.0, "limb {k} of {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn fri_natural_columns_match_bitrev_flat_tree() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type FE = <F as Extendable<D>>::Extension;
+        type C = PoseidonGoldilocksConfig;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        for &(log_n, arity_bits, cap_height) in &[(5usize, 1usize, 0usize), (9, 2, 2), (13, 4, 3)] {
+            let n = 1usize << log_n;
+            let arity = 1usize << arity_bits;
+            let values: Vec<FE> = (0..n).map(|_| FE::rand()).collect();
+
+            let expected = MerkleTree::<F, H>::new_flat(
+                bitrev_flatten::<F, D>(&values),
+                arity * D,
+                cap_height,
+            );
+            let actual = MerkleTree::<F, H>::new_columns(
+                fri_natural_columns::<F, D>(values, arity_bits),
+                cap_height,
+            );
+
+            assert_eq!(actual.cap, expected.cap);
+            assert_eq!(actual.num_leaves, expected.num_leaves);
+            for leaf in 0..actual.num_leaves {
+                assert_eq!(actual.leaf_vec(leaf), expected.leaf_vec(leaf));
+                assert_eq!(actual.prove(leaf), expected.prove(leaf));
             }
         }
     }
