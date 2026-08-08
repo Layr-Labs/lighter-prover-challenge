@@ -468,6 +468,16 @@ fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
 
 impl Poseidon2 for F {
     #[inline]
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    fn external_linear_layer(state: &mut [Self; WIDTH]) {
+        unsafe {
+            crate::hash::arch::aarch64::poseidon_goldilocks_neon::poseidon2_external_linear_layer(
+                state,
+            );
+        }
+    }
+
+    #[inline]
     fn internal_linear_layer(state: &mut [Self; WIDTH]) {
         type Packing = <F as Packable>::Packing;
 
@@ -1086,6 +1096,200 @@ mod test {
 
         let proof = circuit.prove(pw).unwrap();
         circuit.verify(proof.clone())
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[inline(always)]
+    fn portable_external_linear_layer(state: &mut [F; WIDTH]) {
+        let mut wide = state.map(|value| value.0 as u128);
+        external_linear_layer_u128(&mut wide);
+        for (value, wide) in state.iter_mut().zip(wide) {
+            *value = F::from_noncanonical_u128_with_96_bits(wide);
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    fn external_linear_layer_words(
+        raw: [u64; WIDTH],
+        candidate: bool,
+    ) -> [u64; WIDTH] {
+        let mut state = raw.map(F);
+        if candidate {
+            <F as Poseidon2>::external_linear_layer(&mut state);
+        } else {
+            portable_external_linear_layer(&mut state);
+        }
+        state.map(|value| value.0)
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// The NEON layer must reproduce the portable layer's raw, possibly non-canonical `u64`
+    /// representative. Comparing `GoldilocksField` values would be insufficient because its
+    /// `PartialEq` canonicalizes aliases.
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[test]
+    fn neon_external_linear_layer_matches_portable_raw_words() {
+        const EDGES: &[u64] = &[
+            0,
+            1,
+            2,
+            0xFFFF_FFFE,
+            0xFFFF_FFFF,
+            0x1_0000_0000,
+            0x1_0000_0001,
+            0xFFFF_FFFE_FFFF_FFFF,
+            0xFFFF_FFFF_0000_0000,
+            0xFFFF_FFFF_0000_0001,
+            0xFFFF_FFFF_0000_0002,
+            0xFFFF_FFFF_FFFF_FFFE,
+            u64::MAX,
+        ];
+
+        let check = |raw: [u64; WIDTH], label: &str| {
+            assert_eq!(
+                external_linear_layer_words(raw, true),
+                external_linear_layer_words(raw, false),
+                "raw external-layer mismatch for {label}"
+            );
+        };
+
+        for (edge_index, &edge) in EDGES.iter().enumerate() {
+            check([edge; WIDTH], &format!("uniform edge {edge_index}"));
+            for position in 0..WIDTH {
+                let mut one_hot = [0; WIDTH];
+                one_hot[position] = edge;
+                check(
+                    one_hot,
+                    &format!("one-hot edge {edge_index} position {position}"),
+                );
+
+                let mut dense = [u64::MAX; WIDTH];
+                dense[position] = edge;
+                check(
+                    dense,
+                    &format!("dense edge {edge_index} position {position}"),
+                );
+            }
+        }
+
+        for shift in 0..EDGES.len() {
+            let striped = core::array::from_fn(|i| EDGES[(i + shift) % EDGES.len()]);
+            check(striped, &format!("striped shift {shift}"));
+        }
+
+        let mut seed = 0x243F_6A88_85A3_08D3;
+        for case in 0..200_000 {
+            let raw = core::array::from_fn(|_| splitmix64(&mut seed));
+            assert_eq!(
+                external_linear_layer_words(raw, true),
+                external_linear_layer_words(raw, false),
+                "raw external-layer mismatch for random case {case}"
+            );
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    fn measure_external_linear_layer(
+        base: &[[F; WIDTH]],
+        passes: usize,
+        candidate: bool,
+    ) -> (std::time::Duration, Vec<[F; WIDTH]>) {
+        use core::hint::black_box;
+
+        let mut states = base.to_vec();
+        let start = std::time::Instant::now();
+        if candidate {
+            for _ in 0..passes {
+                for state in &mut states {
+                    <F as Poseidon2>::external_linear_layer(black_box(state));
+                }
+            }
+        } else {
+            for _ in 0..passes {
+                for state in &mut states {
+                    portable_external_linear_layer(black_box(state));
+                }
+            }
+        }
+        let elapsed = start.elapsed();
+        black_box(&states);
+        (elapsed, states)
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    fn assert_raw_states_eq(left: &[[F; WIDTH]], right: &[[F; WIDTH]]) {
+        assert_eq!(left.len(), right.len());
+        for (state_index, (left, right)) in left.iter().zip(right).enumerate() {
+            assert_eq!(
+                left.map(|value| value.0),
+                right.map(|value| value.0),
+                "timing output mismatch at state {state_index}"
+            );
+        }
+    }
+
+    /// Test-local ABBA component harness; no code from this function is linked into production.
+    /// Run with:
+    /// `cargo test --release -p plonky2 neon_external_linear_layer_component_abba -- --ignored --nocapture`
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[test]
+    #[ignore = "manual component timing harness"]
+    fn neon_external_linear_layer_component_abba() {
+        const STATES: usize = 512;
+        const PASSES: usize = 512;
+        const BLOCKS: usize = 5;
+
+        let mut seed = 0x1319_8A2E_0370_7344;
+        let base: Vec<[F; WIDTH]> = (0..STATES)
+            .map(|_| core::array::from_fn(|_| F(splitmix64(&mut seed))))
+            .collect();
+
+        // Warm both instruction paths and their data before collecting paired blocks.
+        let _ = measure_external_linear_layer(&base, 8, false);
+        let _ = measure_external_linear_layer(&base, 8, true);
+
+        let mut portable_total = std::time::Duration::ZERO;
+        let mut candidate_total = std::time::Duration::ZERO;
+        for block in 0..BLOCKS {
+            let (a1_time, a1) = measure_external_linear_layer(&base, PASSES, false);
+            let (b1_time, b1) = measure_external_linear_layer(&base, PASSES, true);
+            let (b2_time, b2) = measure_external_linear_layer(&base, PASSES, true);
+            let (a2_time, a2) = measure_external_linear_layer(&base, PASSES, false);
+
+            assert_raw_states_eq(&a1, &b1);
+            assert_raw_states_eq(&a1, &b2);
+            assert_raw_states_eq(&a1, &a2);
+
+            let portable = a1_time + a2_time;
+            let candidate = b1_time + b2_time;
+            portable_total += portable;
+            candidate_total += candidate;
+            println!(
+                "block {block}: portable {:.6}s candidate {:.6}s speedup {:.3}x",
+                portable.as_secs_f64(),
+                candidate.as_secs_f64(),
+                portable.as_secs_f64() / candidate.as_secs_f64(),
+            );
+        }
+
+        let calls = (BLOCKS * 2 * STATES * PASSES) as f64;
+        println!(
+            "external layer ABBA total: portable {:.6}s ({:.2} ns/call), candidate {:.6}s ({:.2} ns/call), speedup {:.3}x ({:.2}% faster)",
+            portable_total.as_secs_f64(),
+            portable_total.as_secs_f64() * 1e9 / calls,
+            candidate_total.as_secs_f64(),
+            candidate_total.as_secs_f64() * 1e9 / calls,
+            portable_total.as_secs_f64() / candidate_total.as_secs_f64(),
+            (portable_total.as_secs_f64() / candidate_total.as_secs_f64() - 1.0) * 100.0,
+        );
     }
 }
 

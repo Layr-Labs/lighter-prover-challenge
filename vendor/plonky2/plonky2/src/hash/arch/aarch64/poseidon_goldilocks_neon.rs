@@ -904,6 +904,96 @@ pub unsafe fn poseidon(state: [GoldilocksField; 12]) -> [GoldilocksField; 12] {
 }
 */
 
+// ====================================== POSEIDON2 EXTERNAL ======================================
+
+/// Widen the two 32-bit halves of a raw Goldilocks word into independent 64-bit lanes.
+///
+/// The Poseidon2 external matrix has row weight 28. Evaluating it independently on these
+/// limbs therefore stays below `28 * (2^32 - 1) < 2^37`, so every NEON addition below is an
+/// exact integer addition and carries can be deferred until the final reduction.
+#[inline(always)]
+unsafe fn widen_u64_halves(x: u64) -> uint64x2_t {
+    vmovl_u32(vreinterpret_u32_u64(vcreate_u64(x)))
+}
+
+/// Goldilocks addition with the same non-canonical output convention as
+/// `add_no_canonicalize_trashing_input`: add `EPSILON` exactly when the `u64` addition wraps.
+#[inline(always)]
+unsafe fn add_with_wraparound_neon(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    let sum = vaddq_u64(a, b);
+    let overflow = vcltq_u64(sum, a);
+    vsraq_n_u64::<32>(sum, overflow)
+}
+
+/// Reduce two widened-limb matrix outputs to the exact raw words returned by
+/// `GoldilocksField::from_noncanonical_u128_with_96_bits`.
+#[inline(always)]
+unsafe fn reduce_poseidon2_limb_pair(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    // a = [A0, B0], b = [A1, B1], where y_i = A_i + B_i * 2^32.
+    let low_limbs = vuzp1q_u64(a, b);
+    let high_limbs = vuzp2q_u64(a, b);
+
+    let low = vaddq_u64(low_limbs, vshlq_n_u64::<32>(high_limbs));
+    let low_carry = vcltq_u64(low, low_limbs);
+    // The carry mask is either zero or `u64::MAX`; subtracting it adds the carry bit.
+    let high = vsubq_u64(vshrq_n_u64::<32>(high_limbs), low_carry);
+
+    // ORDER = 2^64 - EPSILON, hence 2^64 == EPSILON (mod ORDER).
+    // `high <= 27`, so `(high << 32) - high` is the exact product high * EPSILON.
+    let high_times_epsilon = vsubq_u64(vshlq_n_u64::<32>(high), high);
+    add_with_wraparound_neon(low, high_times_epsilon)
+}
+
+/// Poseidon2's width-12 external linear layer over raw Goldilocks words.
+///
+/// Each vector lane is one widened 32-bit limb, not a separate field element. This computes the
+/// exact integer matrix product first and performs the same single Goldilocks reduction as the
+/// portable `u128` path, preserving even its non-canonical raw representative.
+#[inline(always)]
+#[unroll_for_loops]
+pub(crate) unsafe fn poseidon2_external_linear_layer(state: &mut [GoldilocksField; WIDTH]) {
+    let mut limbs = [vdupq_n_u64(0); WIDTH];
+    for i in 0..WIDTH {
+        limbs[i] = widen_u64_halves(state[i].0);
+    }
+
+    // Apply M_4 to each consecutive block. The shared intermediates use 11 vector operations per
+    // block versus 13 additions in the direct formula, while retaining the identical matrix.
+    for i in (0..WIDTH).step_by(4) {
+        let x0 = limbs[i];
+        let x2 = limbs[i + 2];
+        let t01 = vaddq_u64(limbs[i], limbs[i + 1]);
+        let t23 = vaddq_u64(limbs[i + 2], limbs[i + 3]);
+        let t0123 = vaddq_u64(t01, t23);
+        let t01123 = vaddq_u64(t0123, limbs[i + 1]);
+        let t01233 = vaddq_u64(t0123, limbs[i + 3]);
+
+        limbs[i] = vaddq_u64(t01123, t01);
+        limbs[i + 1] = vaddq_u64(t01123, vshlq_n_u64::<1>(x2));
+        limbs[i + 2] = vaddq_u64(t01233, t23);
+        limbs[i + 3] = vaddq_u64(t01233, vshlq_n_u64::<1>(x0));
+    }
+
+    let sums = [
+        vaddq_u64(vaddq_u64(limbs[0], limbs[4]), limbs[8]),
+        vaddq_u64(vaddq_u64(limbs[1], limbs[5]), limbs[9]),
+        vaddq_u64(vaddq_u64(limbs[2], limbs[6]), limbs[10]),
+        vaddq_u64(vaddq_u64(limbs[3], limbs[7]), limbs[11]),
+    ];
+    for i in 0..WIDTH {
+        limbs[i] = vaddq_u64(limbs[i], sums[i % 4]);
+    }
+
+    // GoldilocksField is repr(transparent) over u64 and every raw word is a valid value.
+    let output = state.as_mut_ptr().cast::<u64>();
+    for i in (0..WIDTH).step_by(2) {
+        vst1q_u64(
+            output.add(i),
+            reduce_poseidon2_limb_pair(limbs[i], limbs[i + 1]),
+        );
+    }
+}
+
 #[inline(always)]
 pub unsafe fn sbox_layer(state: &mut [GoldilocksField; WIDTH]) {
     *state = wrap_state(sbox_layer_full(unwrap_state(*state)));
