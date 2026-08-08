@@ -378,6 +378,92 @@ unsafe fn gl_sub_neon(
     vsubq_u64(diff2, vandq_u64(under2, eps))
 }
 
+/// Four-at-a-time variant of `fft_classic_simd_single_layer_neon`.
+///
+/// Same butterflies, same twiddles, same order, same writes -- only the
+/// iteration width differs. The two-wide body keeps exactly one multiply
+/// dependency chain in flight, so the paired `umulh`/`mul` latency is exposed
+/// between iterations; issuing two independent pairs lets the out-of-order
+/// engine overlap them and halves the loop bookkeeping per element.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_single_layer_neon_x4(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    lg_half_m: usize,
+    omega_row: &[crate::goldilocks_field::GoldilocksField],
+) {
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+    use core::arch::aarch64::*;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    let half = 1usize << lg_half_m;
+    let m = half << 1;
+    debug_assert!(omega_row.len() >= half);
+    let base = values.as_mut_ptr().cast::<u64>();
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        let mut k = 0;
+        while k + m <= values.len() {
+            let mut j = 0;
+            while j + 4 <= half {
+                let v0 = NeonGoldilocksField([
+                    *values.get_unchecked(k + half + j),
+                    *values.get_unchecked(k + half + j + 1),
+                ]);
+                let v1 = NeonGoldilocksField([
+                    *values.get_unchecked(k + half + j + 2),
+                    *values.get_unchecked(k + half + j + 3),
+                ]);
+                let w0 = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j),
+                    *omega_row.get_unchecked(j + 1),
+                ]);
+                let w1 = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j + 2),
+                    *omega_row.get_unchecked(j + 3),
+                ]);
+                // Two independent asm blocks: `options(pure, nomem)` lets the
+                // scheduler interleave them.
+                let t0 = w0 * v0;
+                let t1 = w1 * v1;
+                let tv0 = vcombine_u64(vcreate_u64(t0.0[0].0), vcreate_u64(t0.0[1].0));
+                let tv1 = vcombine_u64(vcreate_u64(t1.0[0].0), vcreate_u64(t1.0[1].0));
+                let u0 = vld1q_u64(base.add(k + j));
+                let u1 = vld1q_u64(base.add(k + j + 2));
+                vst1q_u64(base.add(k + j), gl_add_neon(u0, tv0, eps));
+                vst1q_u64(base.add(k + j + 2), gl_add_neon(u1, tv1, eps));
+                vst1q_u64(base.add(k + half + j), gl_sub_neon(u0, tv0, eps));
+                vst1q_u64(base.add(k + half + j + 2), gl_sub_neon(u1, tv1, eps));
+                j += 4;
+            }
+            while j + 2 <= half {
+                let v = NeonGoldilocksField([
+                    *values.get_unchecked(k + half + j),
+                    *values.get_unchecked(k + half + j + 1),
+                ]);
+                let w = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j),
+                    *omega_row.get_unchecked(j + 1),
+                ]);
+                let t = w * v;
+                let tv = vcombine_u64(vcreate_u64(t.0[0].0), vcreate_u64(t.0[1].0));
+                let u = vld1q_u64(base.add(k + j));
+                vst1q_u64(base.add(k + j), gl_add_neon(u, tv, eps));
+                vst1q_u64(base.add(k + half + j), gl_sub_neon(u, tv, eps));
+                j += 2;
+            }
+            while j < half {
+                let t = omega_row[j] * values[k + half + j];
+                let u = values[k + j];
+                values[k + j] = u + t;
+                values[k + half + j] = u - t;
+                j += 1;
+            }
+            k += m;
+        }
+    }
+}
+
 /// One butterfly layer over base-field scalars, with the modular reduction in
 /// vector registers.
 ///
@@ -480,7 +566,16 @@ fn fft_classic_simd_single_layer<P: PackedField>(
                 row.len(),
             )
         };
-        fft_classic_simd_single_layer_neon(scalars, lg_half_m, omega_row);
+        // Four-wide from `half >= 8` onwards. At `half == 4` the wider body
+        // runs its unrolled block exactly once per sub-block, so the extra
+        // bookkeeping is not amortised and it measures consistently slower;
+        // every larger shape gains 4-9% from the second in-flight multiply
+        // chain. Both kernels write identical raw words.
+        if lg_half_m >= 3 {
+            fft_classic_simd_single_layer_neon_x4(scalars, lg_half_m, omega_row);
+        } else {
+            fft_classic_simd_single_layer_neon(scalars, lg_half_m, omega_row);
+        }
         return;
     }
 
@@ -2017,6 +2112,47 @@ mod tests {
                 for (a, e) in actual.iter().zip(expected.iter()) {
                     assert_eq!(a.0[0].to_canonical_u64(), e.0[0].to_canonical_u64());
                     assert_eq!(a.0[1].to_canonical_u64(), e.0[1].to_canonical_u64());
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_single_layer_x4_matches_two_wide_raw_words() {
+        use crate::fft::{
+            fft_classic_simd_single_layer_neon, fft_classic_simd_single_layer_neon_x4,
+        };
+        use crate::types::Field64;
+
+        fn adversarial(n: usize) -> Vec<GoldilocksField> {
+            (0..n)
+                .map(|i| {
+                    GoldilocksField::from_noncanonical_u64(match i % 5 {
+                        0 => (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                        1 => GoldilocksField::ORDER.wrapping_add(i as u64 % 1000),
+                        2 => u64::MAX - (i as u64 % 97),
+                        3 => (i as u64).wrapping_mul(0xdead_beef) | (1 << 63),
+                        _ => i as u64,
+                    })
+                })
+                .collect()
+        }
+
+        for lg_n in [6usize, 8, 11, 13, 16] {
+            let n = 1usize << lg_n;
+            let roots = fft_root_table::<GoldilocksField>(n);
+            for lg_half_m in 1..lg_n {
+                let mut expected = adversarial(n);
+                let mut actual = expected.clone();
+                let omega_row = &roots[lg_half_m];
+                fft_classic_simd_single_layer_neon(&mut expected, lg_half_m, omega_row);
+                fft_classic_simd_single_layer_neon_x4(&mut actual, lg_half_m, omega_row);
+                for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                    assert_eq!(
+                        a.0, e.0,
+                        "raw word mismatch at 2^{lg_n} layer {lg_half_m} index {i}"
+                    );
                 }
             }
         }
