@@ -1831,7 +1831,20 @@ fn compute_quotient_polys<
         s_sigmas_flat: Vec<F>,
         zs_local_flat: Vec<F>,
         zs_next_flat: Vec<F>,
+        quotient_values: Vec<F>,
         vanishing: VanishingScratch<F>,
+    }
+
+    struct QuotientPtr<T>(*mut T);
+    unsafe impl<T> Send for QuotientPtr<T> {}
+    unsafe impl<T> Sync for QuotientPtr<T> {}
+    impl<T> QuotientPtr<T> {
+        unsafe fn slice_mut(&self, start: usize, len: usize) -> &mut [T] {
+            unsafe { core::slice::from_raw_parts_mut(self.0.add(start), len) }
+        }
+        unsafe fn write(&self, index: usize, value: T) {
+            unsafe { self.0.add(index).write(value) };
+        }
     }
 
     let zs_row_width = zs_partial_products_and_lookup_commitment.lde_row_width();
@@ -1889,15 +1902,30 @@ fn compute_quotient_polys<
     // real serial store loop, not `alloc_zeroed`: 8 MiB per d16 tx proof,
     // 2 MiB per chain-step proof, on the per-proof spine between the Zs
     // commitment and the quotient commitment.
+    let direct_two_challenges = num_challenges == 2;
     let quotient_len = points.len() * num_challenges;
-    let mut quotient_values: Vec<F> = Vec::with_capacity(quotient_len);
+    let mut quotient_values: Vec<F> = Vec::with_capacity(if direct_two_challenges { 0 } else { quotient_len });
     // SAFETY: capacity is exactly `quotient_len`, and the parallel pass below
     // writes every element before any is read (see above). Same idiom as the
     // promoted zero-tail fast path in `fri/oracle.rs`.
-    unsafe { quotient_values.set_len(quotient_len) };
-    quotient_values
-        .par_chunks_mut(BATCH_SIZE * num_challenges)
-        .zip(points_batches)
+    if !direct_two_challenges {
+        unsafe { quotient_values.set_len(quotient_len) };
+    }
+    let quotient_values_ptr = QuotientPtr(quotient_values.as_mut_ptr());
+    let mut challenge_columns: Vec<Vec<F>> = if direct_two_challenges {
+        (0..2).map(|_| {
+            let mut column = Vec::with_capacity(points.len());
+            // SAFETY: point batches initialize disjoint ranges before any read.
+            unsafe { column.set_len(points.len()) };
+            column
+        }).collect()
+    } else {
+        Vec::new()
+    };
+    let direct_column_ptrs: Vec<QuotientPtr<F>> = challenge_columns
+        .iter_mut().map(|column| QuotientPtr(column.as_mut_ptr())).collect();
+
+    points_batches
         .enumerate()
         .for_each_init(
             || QuotientScratch::<F> {
@@ -1908,9 +1936,10 @@ fn compute_quotient_polys<
                 s_sigmas_flat: Vec::new(),
                 zs_local_flat: Vec::new(),
                 zs_next_flat: Vec::new(),
+                quotient_values: Vec::with_capacity(BATCH_SIZE * num_challenges),
                 vanishing: VanishingScratch::default(),
             },
-            |scratch, (batch_i, (quotient_values_batch, xs_batch))| {
+            |scratch, (batch_i, xs_batch)| {
                 // Each batch must be the same size, except the last one, which may be smaller.
                 debug_assert!(
                     xs_batch.len() == BATCH_SIZE
@@ -2107,7 +2136,15 @@ fn compute_quotient_polys<
                     public_inputs_hash,
                 );
 
-                let quotient_values_batch = &mut quotient_values_batch[..n * num_challenges];
+                let quotient_values_batch = if direct_two_challenges {
+                    scratch.quotient_values.resize(n * 2, F::ZERO);
+                    &mut scratch.quotient_values[..]
+                } else {
+                    // SAFETY: each batch owns this disjoint point-major range.
+                    unsafe { quotient_values_ptr.slice_mut(
+                        BATCH_SIZE * batch_i * num_challenges, n * num_challenges
+                    ) }
+                };
                 eval_vanishing_poly_base_batch::<F, D>(
                     common_data,
                     indices_batch,
@@ -2137,6 +2174,17 @@ fn compute_quotient_polys<
                     quotient_values
                         .iter_mut()
                         .for_each(|v| *v *= denominator_inv);
+                }
+
+                if direct_two_challenges {
+                    let base = BATCH_SIZE * batch_i;
+                    for (k, pair) in quotient_values_batch.chunks_exact(2).enumerate() {
+                        // SAFETY: batches own disjoint point ranges in both columns.
+                        unsafe {
+                            direct_column_ptrs[0].write(base + k, pair[0]);
+                            direct_column_ptrs[1].write(base + k, pair[1]);
+                        }
+                    }
                 }
             },
         );
@@ -2174,8 +2222,15 @@ fn compute_quotient_polys<
                 );
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
+        debug_assert_eq!(gpu_values.len(), quotient_len);
+        if direct_two_challenges {
+            challenge_columns.par_iter_mut().enumerate().for_each(|(challenge, column)| {
+                column.iter_mut().enumerate().for_each(|(i, cpu)| {
+                    *cpu += gpu_values[2 * i + challenge] * z_h_on_coset.eval_inverse(i);
+                });
+            });
+        } else {
+            quotient_values
             .par_chunks_exact_mut(num_challenges)
             .zip(gpu_values.par_chunks_exact(num_challenges))
             .enumerate()
@@ -2185,6 +2240,7 @@ fn compute_quotient_polys<
                     *cpu += gpu * denominator_inv;
                 }
             });
+        }
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2220,8 +2276,15 @@ fn compute_quotient_polys<
                 );
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
+        debug_assert_eq!(gpu_values.len(), quotient_len);
+        if direct_two_challenges {
+            challenge_columns.par_iter_mut().enumerate().for_each(|(challenge, column)| {
+                column.iter_mut().enumerate().for_each(|(i, cpu)| {
+                    *cpu += gpu_values[2 * i + challenge] * z_h_on_coset.eval_inverse(i);
+                });
+            });
+        } else {
+            quotient_values
             .par_chunks_exact_mut(num_challenges)
             .zip(gpu_values.par_chunks_exact(num_challenges))
             .enumerate()
@@ -2231,9 +2294,10 @@ fn compute_quotient_polys<
                     *cpu += gpu * denominator_inv;
                 }
             });
+        }
     }
 
-    debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
+    debug_assert!(direct_two_challenges || quotient_values.len() == quotient_len);
     // Parallel scatter of the interleaved point-major buffer into the
     // per-challenge columns. The former single streaming pass was serial:
     // 16 MiB of traffic per d16 proof (32 MiB for the final block proof)
@@ -2241,10 +2305,8 @@ fn compute_quotient_polys<
     // parallel IFFT while every other core sat idle. Each parallel chunk
     // below owns a disjoint point range, and column position `i` is written
     // exactly once with the identical value the serial pass stored there.
-    struct ColPtr<T>(*mut T);
-    unsafe impl<T> Send for ColPtr<T> {}
-    unsafe impl<T> Sync for ColPtr<T> {}
-    let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
+    if !direct_two_challenges {
+        challenge_columns = (0..num_challenges)
         .map(|_| {
             let mut column = Vec::with_capacity(points.len());
             // SAFETY: the disjoint parallel scatter below writes every element
@@ -2254,9 +2316,9 @@ fn compute_quotient_polys<
             column
         })
         .collect();
-    let column_ptrs: Vec<ColPtr<F>> = challenge_columns
+    let column_ptrs: Vec<QuotientPtr<F>> = challenge_columns
         .iter_mut()
-        .map(|column| ColPtr(column.as_mut_ptr()))
+        .map(|column| QuotientPtr(column.as_mut_ptr()))
         .collect();
     let column_ptrs = &column_ptrs;
     quotient_values
@@ -2267,10 +2329,11 @@ fn compute_quotient_polys<
             for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
                 for (column, &value) in column_ptrs.iter().zip(point_values) {
                     // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
+                    unsafe { column.write(base + k, value) };
                 }
             }
         });
+    }
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
