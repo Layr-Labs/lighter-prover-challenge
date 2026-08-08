@@ -77,7 +77,8 @@ fn claims_exclusive_gpu_phase(active_paths: &AtomicUsize) -> bool {
     active_paths.load(Ordering::Acquire) == 1
 }
 
-/// Marks the calling thread as latency-critical to the macOS scheduler.
+/// Marks a critical-path proof coordinator as latency-critical to the macOS
+/// scheduler.
 ///
 /// The 49 sequential chain folds are the whole critical path of a block
 /// bundle: every serial section of a fold (witness feed, opening
@@ -234,6 +235,12 @@ fn prove_tx_witness(
     tx_data: &CircuitData<F, C, D>,
     partition_witness: PartitionWitness<'_, F>,
 ) -> Proof {
+    // The Light path has forty-nine sequential transaction proofs and controls
+    // the final join. Prioritize only its coordinator thread; Rayon workers
+    // and the three-proof Heavy path retain their default QoS.
+    if path == TxPath::Light {
+        mark_spine_thread_latency_critical();
+    }
     let proof = prove_with_partition_witness::<F, C, D>(
         &tx_data.prover_only,
         &tx_data.common,
