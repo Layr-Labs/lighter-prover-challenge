@@ -21,8 +21,6 @@ use api::{
 use circuit::block_pre_execution_constraints::Circuit as _;
 use circuit::block::Block;
 use circuit::types::config::{C, F};
-use plonky2::fri::oracle::PolynomialBatch;
-
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -130,7 +128,11 @@ fn main() {
             // contend for the machine's memory. Value-exact and free: no
             // quantity is computed differently and no work is added — storage
             // that no subsequent read can reach is returned earlier.
-            pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            //
+            // Extend the tip's LDE-only release to the rest of the prover-only
+            // flat payload (sigmas, subgroup, generators, maps, FFT tables):
+            // the same reachability argument covers every field.
+            api::release_prover_only_storage(&mut pre_data.prover_only);
             (pre_target, pre_data, pre_proof)
         })
         .expect("pre-execution startup thread must start");

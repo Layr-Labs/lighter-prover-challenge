@@ -2,6 +2,8 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
+use std::collections::BTreeMap;
+
 use circuit::block_constraints::{BlockCircuit, BlockTarget, Circuit as _};
 use circuit::block_pre_execution_constraints::{
     BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
@@ -11,7 +13,7 @@ use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _}
 use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
 use plonky2::fri::oracle::PolynomialBatch;
-use plonky2::plonk::circuit_data::CircuitData;
+use plonky2::plonk::circuit_data::{CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData};
 use plonky2::plonk::proof::ProofWithPublicInputs;
 
 pub type Proof = ProofWithPublicInputs<F, C, D>;
@@ -120,84 +122,59 @@ impl Circuits {
         }
     }
 
-    /// Releases the extended (LDE) constants/sigmas commitment of every circuit
-    /// whose proving has already finished when the final block proof starts.
+    /// Releases the full prover-only payload of every circuit whose proving has
+    /// already finished when the final block proof starts.
     ///
-    /// `ProverOnlyCircuitData::constants_sigmas_commitment` holds a rate-`2^3`
-    /// low-degree extension of that circuit's preprocessed columns, built once
-    /// at circuit-build time and otherwise kept alive for the whole process. It
-    /// is read only by proofs *of that circuit* — the quotient evaluation's
-    /// `fill_lde_batch` and the FRI query openings — so once the pre-execution
-    /// proof and both transaction chains have produced their proofs, the
-    /// pre-execution, transaction and chain extensions are unreachable: the
-    /// final block proof reads only `block_data`, those three finished proofs
-    /// and the block itself.
+    /// The tip already returns the rate-`2^3` constants/sigmas LDE commitment
+    /// (Metal shared buffers, ~1.01 GB across five circuits). The rest of
+    /// [`ProverOnlyCircuitData`] — sigma polynomials, subgroup table,
+    /// generators/watch index, representative map, FFT root table, lookup
+    /// placement, and the optional quotient-domain cache — is equally dead
+    /// after that circuit's last proof: the final block proof reads only
+    /// `block_data`, the three finished proofs and the block (`BlockCircuit::define`
+    /// → `handle_proofs` uses `verifier_only` and `common` only).
     ///
-    /// Those five extensions are `2 * 2^19 * 88 + 3 * 2^17 * 86` field elements
-    /// = 1.01 GB, and on this host they are resident in CPU-visible Metal
-    /// shared buffers whose release returns the pages to the OS immediately.
-    /// The final block proof is the process's peak-RSS moment — it stacks its
-    /// own `2^21`-row wires, Z and quotient extensions (2.89 GB) on top of
-    /// every retained extension — so releasing these first takes 1.01 GB
-    /// straight off the high-water mark.
-    ///
-    /// Nothing else is released here. Generators, representative maps and
-    /// witness buffers are CPU-heap objects whose recursive drop is not free.
+    /// With five concurrent workers and `dirty_decay_ms:0`, those flat CPU-heap
+    /// tails stay in the per-worker resident set and contend with the other
+    /// four workers through the light-phase and final-block peak. Emptying them
+    /// at the same release points returns the pages earlier without changing
+    /// any computed value.
     ///
     /// The heavy pair is normally already empty by the time this runs — see
-    /// [`Self::release_heavy_circuit_extensions`], which retires them the moment
-    /// the three-chunk heavy path finishes rather than twenty-plus seconds later
-    /// here. Re-assigning the same empty value is idempotent, so this stays the
-    /// single backstop covering every circuit, including on the
-    /// build-from-scratch fallback path where no early release runs.
-    ///
-    /// Value-exact: no quantity is computed differently, only storage that no
-    /// subsequent read can reach is returned early.
+    /// [`Self::release_heavy_circuit_extensions`]. Re-assigning empty values is
+    /// idempotent, so this stays the single backstop covering every circuit.
     pub fn release_finished_circuit_extensions(&mut self) {
         for data in [
             &mut self.pre_data,
             &mut self.light_tx_data,
             &mut self.light_chain_data,
         ] {
-            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            release_prover_only_storage(&mut data.prover_only);
         }
         for lock in [&mut self.heavy_tx_data, &mut self.heavy_chain_data] {
-            lock.get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .prover_only
-                .constants_sigmas_commitment = PolynomialBatch::default();
+            release_prover_only_storage(
+                &mut lock
+                    .get_mut()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .prover_only,
+            );
         }
     }
 
-    /// Releases the heavy transaction and chain circuits' preprocessed
-    /// extensions as soon as the heavy path has produced its chain proof.
+    /// Releases the heavy transaction and chain circuits' full prover-only
+    /// payload as soon as the heavy path has produced its chain proof.
     ///
-    /// The heavy path proves three chunks; the light path proves forty-nine.
-    /// The heavy pair therefore stops being read after a small fraction of the
-    /// process lifetime, but until now its two extensions — `2^19 * 88 + 2^17 *
-    /// 86` field elements = 438 MiB of CPU-visible Metal shared buffers whose
-    /// release returns the pages to the OS immediately — stayed resident until
-    /// the pipeline joined, i.e. across the whole light phase, which is exactly
-    /// the window in which five concurrent workers contend for the machine's
-    /// memory.
-    ///
-    /// The `RwLock` is what makes the release provable rather than merely
-    /// plausible: acquiring the exclusive guard *is* the proof that no reader
-    /// remains, because every reader of these two circuits holds a shared guard
-    /// for the whole span in which it may touch them — the heavy path from
-    /// before its first witness until after its chain proof, and
-    /// [`Self::build_block_circuit`] for the duration of `BlockCircuit::define`.
-    /// The caller runs this after joining the heavy path's thread, so both
-    /// guards are already gone and the acquisition is uncontended.
-    ///
-    /// Value-exact and free: no quantity is computed differently and no work is
-    /// added — storage that no subsequent read can reach is returned earlier.
+    /// Same contract as the tip's LDE-only early release: the exclusive
+    /// `RwLock` guard proves no reader remains. Extends that release from the
+    /// Metal LDE commitment alone to the flat CPU-heap prover-only tail.
     pub fn release_heavy_circuit_extensions(&self) {
         for lock in [&self.heavy_tx_data, &self.heavy_chain_data] {
-            lock.write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .prover_only
-                .constants_sigmas_commitment = PolynomialBatch::default();
+            release_prover_only_storage(
+                &mut lock
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .prover_only,
+            );
         }
     }
 
@@ -223,6 +200,26 @@ impl Circuits {
         drop(heavy_chain_data);
         (block.target, block.builder.build::<C>())
     }
+}
+
+/// Empties every prover-only field that is only read by proofs of its own
+/// circuit. Called from the tip's existing early-release sites once that
+/// circuit's last proof (and any concurrent `define` that held a shared guard)
+/// has finished. Value-exact: assigns empty storage; no arithmetic changes.
+pub fn release_prover_only_storage(data: &mut ProverOnlyCircuitData<F, C, D>) {
+    data.generators = Vec::new();
+    data.generator_indices_by_watches = GeneratorWatchIndex::from_map(BTreeMap::new());
+    data.generator_watch_counts = Vec::new();
+    data.constants_sigmas_commitment = PolynomialBatch::default();
+    data.sigmas = Vec::new();
+    data.subgroup = Vec::new();
+    data.public_inputs = Vec::new();
+    data.representative_map = Vec::new();
+    data.fft_root_table = None;
+    data.circuit_digest = Default::default();
+    data.lookup_rows = Vec::new();
+    data.lut_to_lookups = Vec::new();
+    data.constants_sigmas_quotient_cache = None;
 }
 
 #[cfg(test)]
