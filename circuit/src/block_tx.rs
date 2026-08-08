@@ -1,6 +1,8 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
+use std::sync::Arc;
+
 use plonky2::field::extension::Extendable;
 use plonky2::field::types::Field;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget, RichField};
@@ -225,7 +227,7 @@ where
     pub state_metadata_hash: HashOut<F>,
     pub old_jump: JumpState<F>,
 
-    pub txs: Vec<Tx<F>>,
+    pub txs: Vec<Arc<Tx<F>>>,
 }
 
 #[derive(Debug, Clone)]

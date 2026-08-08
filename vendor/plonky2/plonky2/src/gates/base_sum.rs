@@ -170,6 +170,8 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> PackedEvaluab
     ) {
         let sum = vars.local_wires[Self::WIRE_SUM];
         let limbs = vars.local_wires.view(self.limbs());
+        // B=2 folds radix powers by doubling, which is cheaper than the generic
+        // multiply-by-radix Horner fold and value-identical to it.
         let computed_sum = if B == 2 {
             let mut radix_sum = P::ZEROS;
             for &limb in limbs.iter().rev() {
