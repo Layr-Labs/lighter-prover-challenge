@@ -1,4 +1,4 @@
-// Redraw marker 123
+// Redraw marker 124
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
@@ -41,14 +41,23 @@ pub struct Circuits {
     /// obligation discharged by the type system, not a scheduling change.
     pub heavy_tx_data: std::sync::RwLock<CircuitData<F, C, D>>,
     pub light_tx_target: BlockTxTarget,
-    pub light_tx_data: CircuitData<F, C, D>,
+    /// The light pair's extensions are dead the moment the light path's thread
+    /// exits (the last light transaction proof and the last light chain step
+    /// both read them), while the final block proof and the block-circuit lane
+    /// only need `common`/`verifier_only`. The same `RwLock` proof obligation
+    /// as [`Circuits::heavy_tx_data`] lets
+    /// [`Circuits::release_light_circuit_extensions`] retire them right after
+    /// the light thread joins — during the remaining block-lane join and final
+    /// witness setup — instead of at [`Self::release_finished_circuit_extensions`].
+    pub light_tx_data: std::sync::RwLock<CircuitData<F, C, D>>,
     pub pre_target: BlockPreExecutionTarget,
     pub pre_data: CircuitData<F, C, D>,
     pub heavy_chain_target: BlockTxChainTarget,
     /// See [`Circuits::heavy_tx_data`].
     pub heavy_chain_data: std::sync::RwLock<CircuitData<F, C, D>>,
     pub light_chain_target: BlockTxChainTarget,
-    pub light_chain_data: CircuitData<F, C, D>,
+    /// See [`Circuits::light_tx_data`].
+    pub light_chain_data: std::sync::RwLock<CircuitData<F, C, D>>,
     pub dummy_heavy_proof: Proof,
     pub dummy_light_proof: Proof,
 }
@@ -108,13 +117,13 @@ impl Circuits {
             heavy_tx_target: heavy.tx_target,
             heavy_tx_data: std::sync::RwLock::new(heavy.tx_data),
             light_tx_target: light.tx_target,
-            light_tx_data: light.tx_data,
+            light_tx_data: std::sync::RwLock::new(light.tx_data),
             pre_target,
             pre_data,
             heavy_chain_target: heavy.chain_target,
             heavy_chain_data: std::sync::RwLock::new(heavy.chain_data),
             light_chain_target: light.chain_target,
-            light_chain_data: light.chain_data,
+            light_chain_data: std::sync::RwLock::new(light.chain_data),
             dummy_heavy_proof: heavy.dummy_proof,
             dummy_light_proof: light.dummy_proof,
         }
@@ -144,24 +153,24 @@ impl Circuits {
     /// Nothing else is released here. Generators, representative maps and
     /// witness buffers are CPU-heap objects whose recursive drop is not free.
     ///
-    /// The heavy pair is normally already empty by the time this runs — see
-    /// [`Self::release_heavy_circuit_extensions`], which retires them the moment
-    /// the three-chunk heavy path finishes rather than twenty-plus seconds later
-    /// here. Re-assigning the same empty value is idempotent, so this stays the
-    /// single backstop covering every circuit, including on the
-    /// build-from-scratch fallback path where no early release runs.
+    /// The heavy pair and light pair are normally already empty by the time this
+    /// runs — see [`Self::release_heavy_circuit_extensions`] and
+    /// [`Self::release_light_circuit_extensions`], which retire them the moment
+    /// their paths finish rather than seconds later here. Re-assigning the same
+    /// empty value is idempotent, so this stays the single backstop covering
+    /// every circuit, including on the build-from-scratch fallback path where no
+    /// early release runs.
     ///
     /// Value-exact: no quantity is computed differently, only storage that no
     /// subsequent read can reach is returned early.
     pub fn release_finished_circuit_extensions(&mut self) {
-        for data in [
-            &mut self.pre_data,
+        self.pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+        for lock in [
             &mut self.light_tx_data,
             &mut self.light_chain_data,
+            &mut self.heavy_tx_data,
+            &mut self.heavy_chain_data,
         ] {
-            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
-        }
-        for lock in [&mut self.heavy_tx_data, &mut self.heavy_chain_data] {
             lock.get_mut()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .prover_only
@@ -201,6 +210,26 @@ impl Circuits {
         }
     }
 
+    /// Releases the light transaction and chain circuits' preprocessed
+    /// extensions as soon as the light path's thread has produced its chain
+    /// proof. Same shape and proof obligation as
+    /// [`Self::release_heavy_circuit_extensions`]: the light path holds the
+    /// shared guards for its whole run, [`Self::build_block_circuit`] holds a
+    /// light-chain guard for the duration of `define` (which finishes long
+    /// before the light path), and the caller joins the light thread before
+    /// acquiring the exclusive guard, so the acquisition is uncontended. The
+    /// extensions are `2^19 * 88 + 2^17 * 86` field elements = 438 MiB of
+    /// CPU-visible Metal shared buffers released seconds before
+    /// [`Self::release_finished_circuit_extensions`] would.
+    pub fn release_light_circuit_extensions(&self) {
+        for lock in [&self.light_tx_data, &self.light_chain_data] {
+            lock.write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .prover_only
+                .constants_sigmas_commitment = PolynomialBatch::default();
+        }
+    }
+
     /// Builds the final block circuit, which depends on the pre-execution and
     /// both chain circuits but is only needed for the final proof. Callers run
     /// this concurrently with transaction/chain proving.
@@ -213,13 +242,18 @@ impl Circuits {
             .heavy_chain_data
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let light_chain_data = self
+            .light_chain_data
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let block = BlockCircuit::define(
             CIRCUIT_CONFIG,
             &self.pre_data,
-            &self.light_chain_data,
+            &light_chain_data,
             &heavy_chain_data,
             ON_CHAIN_OPERATIONS_LIMIT,
         );
+        drop(light_chain_data);
         drop(heavy_chain_data);
         (block.target, block.builder.build::<C>())
     }

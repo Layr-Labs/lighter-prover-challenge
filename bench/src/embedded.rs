@@ -55,13 +55,13 @@ impl RemainingEmbeddedCircuits {
             heavy_tx_target,
             heavy_tx_data: std::sync::RwLock::new(heavy_tx_data),
             light_tx_target,
-            light_tx_data,
+            light_tx_data: std::sync::RwLock::new(light_tx_data),
             pre_target,
             pre_data,
             heavy_chain_target,
             heavy_chain_data: std::sync::RwLock::new(heavy_chain_data),
             light_chain_target,
-            light_chain_data,
+            light_chain_data: std::sync::RwLock::new(light_chain_data),
             dummy_heavy_proof: self.dummy_heavy_proof,
             dummy_light_proof: self.dummy_light_proof,
         }
@@ -313,20 +313,35 @@ mod tests {
             );
             assert_circuit_pair_identical(
                 "light_tx",
-                (&rebuilt.light_tx_target, &rebuilt.light_tx_data),
-                (&embedded.light_tx_target, &embedded.light_tx_data),
+                (
+                    &rebuilt.light_tx_target,
+                    &rebuilt.light_tx_data.read().unwrap(),
+                ),
+                (
+                    &embedded.light_tx_target,
+                    &embedded.light_tx_data.read().unwrap(),
+                ),
             );
             assert_circuit_pair_identical(
                 "light_chain",
-                (&rebuilt.light_chain_target, &rebuilt.light_chain_data),
-                (&embedded.light_chain_target, &embedded.light_chain_data),
+                (
+                    &rebuilt.light_chain_target,
+                    &rebuilt.light_chain_data.read().unwrap(),
+                ),
+                (
+                    &embedded.light_chain_target,
+                    &embedded.light_chain_data.read().unwrap(),
+                ),
             );
 
             // The gate serializer round trip below also pins the common data
             // encoding used by the blobs.
             let mut bytes = Vec::new();
             bytes
-                .write_common_circuit_data(&rebuilt.light_tx_data.common, &BlockGateSerializer)
+                .write_common_circuit_data(
+                    &rebuilt.light_tx_data.read().unwrap().common,
+                    &BlockGateSerializer,
+                )
                 .expect("common data must serialize");
             assert!(!bytes.is_empty());
 
