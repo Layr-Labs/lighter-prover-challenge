@@ -32,17 +32,26 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 //
 // ABI note: jemalloc reads `const char *malloc_conf` (prefixed `_rjem_` in
 // tikv-jemalloc-sys), i.e. a pointer-sized slot holding the address of a
-// NUL-terminated string. `&[u8; 36]` is a thin pointer to the NUL-terminated
+// NUL-terminated string. `&[u8; 64]` is a thin pointer to the NUL-terminated
 // bytes, which matches that ABI exactly. Exporting the bare byte array itself
 // (no indirection) or omitting the trailing NUL would make jemalloc read the
 // string bytes as a pointer and crash. This is a default: the environment and
 // /etc/malloc.conf can still override it.
+//
+// tcache_nslots_small_max:256 raises the per-size-class tcache slot count for
+// small allocations (default 20), cutting arena traffic under the prover's
+// ten-plus-thread small-Vec churn without changing retained-memory policy
+// (decay is already disabled).
 #[cfg(not(target_env = "msvc"))]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
+static MALLOC_CONF: &[u8; 64] =
+    b"dirty_decay_ms:-1,muzzy_decay_ms:-1,tcache_nslots_small_max:256\0";
 
-// Keep the promoted writer path while exercising a second submission from that baseline.
-const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+// The final proof is serialized only after all proving has finished, so spend a
+// little otherwise-dead tail memory to batch substantially more bincode output
+// per write. This keeps allocator/prover peak memory unchanged while reducing
+// filesystem crossings on the scored post-proof tail.
+const PROOF_OUTPUT_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 fn main() {
     // First statement in the process: the Metal shader compile and pipeline
