@@ -2050,17 +2050,35 @@ fn compute_quotient_polys<
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
-    // One streaming pass splits the interleaved point-major buffer into the
-    // per-challenge columns, instead of `num_challenges` parallel passes each
-    // stride-reading the whole buffer. Same values in the same order; only
-    // which pass writes them changes.
+    // Parallel scatter over disjoint point ranges into pre-sized columns.
+    // Same stores, same values as the serial streaming push; each (column, i)
+    // is written exactly once.
+    let n_points = points.len();
     let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
-        .map(|_| Vec::with_capacity(points.len()))
+        .map(|_| vec![F::ZERO; n_points])
         .collect();
-    for point_values in quotient_values.chunks_exact(num_challenges) {
-        for (column, &value) in challenge_columns.iter_mut().zip(point_values) {
-            column.push(value);
-        }
+    {
+        #[derive(Copy, Clone)]
+        struct SendPtr<T>(*mut T);
+        // SAFETY: each parallel iteration writes a distinct point index `i`.
+        unsafe impl<T: Send> Send for SendPtr<T> {}
+        unsafe impl<T: Sync> Sync for SendPtr<T> {}
+
+        let col_ptrs: Vec<SendPtr<F>> = challenge_columns
+            .iter_mut()
+            .map(|c| SendPtr(c.as_mut_ptr()))
+            .collect();
+        let col_ptrs = &col_ptrs;
+        let w = num_challenges;
+        (0..n_points).into_par_iter().for_each(|i| {
+            let base = i * w;
+            for c in 0..w {
+                // SAFETY: i < n_points, c < w; each (c,i) written once.
+                unsafe {
+                    *col_ptrs[c].0.add(i) = quotient_values[base + c];
+                }
+            }
+        });
     }
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
