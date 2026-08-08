@@ -324,6 +324,103 @@ inline void internal_linear_layer(thread ulong state[12], constant ulong* diagon
     }
 }
 
+// Two adjacent SIMD lanes cooperatively own one width-12 permutation. Lane 0
+// owns the even state indices and lane 1 the odd indices, so each lane keeps
+// six words. Within each 4x4 external-MDS block this is (x0, x2) in lane 0
+// and (x1, x3) in lane 1. Exchanging those two words once gives both lanes the
+// exact cyclic successor needed by
+//     y_i = (x0 + x1 + x2 + x3) + x_i + 2*x_(i+1).
+// The three-block column sums are pair-local after that transform.
+inline lazy_t simd2_word_at(ulong value, ushort lane) {
+    uint2 limbs = simd_shuffle(uint2((uint)value, (uint)(value >> 32)), lane);
+    return { (ulong)limbs.x, (ulong)limbs.y };
+}
+
+inline void external_linear_layer_simd2(
+    thread ulong state[6],
+    ushort lane2,
+    ushort simd_lane) {
+    lazy_t block[6];
+    ushort partner_lane = simd_lane ^ 1;
+    for (uint block_index = 0; block_index < 3; ++block_index) {
+        uint first = block_index * 2;
+        ulong own_a_word = state[first];
+        ulong own_c_word = state[first + 1];
+        lazy_t own_a = lazy_of(own_a_word);
+        lazy_t own_c = lazy_of(own_c_word);
+        lazy_t remote_a = simd2_word_at(own_a_word, partner_lane);
+        lazy_t remote_c = simd2_word_at(own_c_word, partner_lane);
+        lazy_t total = lazy_add(lazy_add(own_a, own_c), lazy_add(remote_a, remote_c));
+        lazy_t next_a = lane2 == 0 ? remote_a : remote_c;
+        lazy_t next_c = lane2 == 0 ? remote_c : remote_a;
+        block[first] = lazy_add(lazy_add(total, own_a), lazy_add(next_a, next_a));
+        block[first + 1] = lazy_add(lazy_add(total, own_c), lazy_add(next_c, next_c));
+    }
+
+    lazy_t first_sum = lazy_add(lazy_add(block[0], block[2]), block[4]);
+    lazy_t second_sum = lazy_add(lazy_add(block[1], block[3]), block[5]);
+    for (uint block_index = 0; block_index < 3; ++block_index) {
+        uint first = block_index * 2;
+        state[first] = lazy_materialize(lazy_add(block[first], first_sum));
+        state[first + 1] = lazy_materialize(lazy_add(block[first + 1], second_sum));
+    }
+}
+
+inline ulong sum_state_simd2(
+    thread const ulong state[6],
+    ushort simd_lane) {
+    lazy_t local = lazy_of(state[0]);
+    for (uint i = 1; i < 6; ++i) {
+        local = lazy_add(local, lazy_of(state[i]));
+    }
+    ulong local_word = lazy_materialize(local);
+    lazy_t remote = simd2_word_at(local_word, simd_lane ^ 1);
+    return lazy_materialize(lazy_add(lazy_of(local_word), remote));
+}
+
+inline void poseidon2_simd2(
+    thread ulong state[6],
+    constant ulong* parameters,
+    ushort lane2,
+    ushort simd_lane) {
+    constant ulong* external_constants = parameters;
+    constant ulong* internal_constants = parameters + 96;
+    constant ulong* diagonal = parameters + 118;
+
+    external_linear_layer_simd2(state, lane2, simd_lane);
+
+    for (uint round = 0; round < 4; ++round) {
+        for (uint slot = 0; slot < 6; ++slot) {
+            uint state_index = slot * 2 + lane2;
+            state[slot] = pow7(gl_add(
+                state[slot],
+                external_constants[round * 12 + state_index]));
+        }
+        external_linear_layer_simd2(state, lane2, simd_lane);
+    }
+
+    for (uint round = 0; round < 22; ++round) {
+        if (lane2 == 0) {
+            state[0] = pow7(gl_add(state[0], internal_constants[round]));
+        }
+        ulong sum = sum_state_simd2(state, simd_lane);
+        for (uint slot = 0; slot < 6; ++slot) {
+            uint state_index = slot * 2 + lane2;
+            state[slot] = gl_mul_add(state[slot], diagonal[state_index], sum);
+        }
+    }
+
+    for (uint round = 4; round < 8; ++round) {
+        for (uint slot = 0; slot < 6; ++slot) {
+            uint state_index = slot * 2 + lane2;
+            state[slot] = pow7(gl_add(
+                state[slot],
+                external_constants[round * 12 + state_index]));
+        }
+        external_linear_layer_simd2(state, lane2, simd_lane);
+    }
+}
+
 // Parameter layout: 8 x 12 external constants, 22 internal constants,
 // then the 12-element internal diagonal.
 inline void poseidon2(thread ulong state[12], constant ulong* parameters) {
@@ -1434,6 +1531,32 @@ kernel void poseidon2_hash_parents(
     }
 }
 
+kernel void poseidon2_hash_parents_simd2(
+    const device ulong* children [[buffer(0)]],
+    device ulong* parents [[buffer(1)]],
+    constant ulong* parameters [[buffer(2)]],
+    constant uint& parent_count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]]) {
+    uint parent = gid >> 1;
+    if (parent >= parent_count) {
+        return;
+    }
+    ushort lane2 = simd_lane & 1;
+
+    const device ulong* input = children + (ulong)parent * 8;
+    ulong state[6];
+    for (uint slot = 0; slot < 6; ++slot) {
+        uint state_index = slot * 2 + lane2;
+        state[slot] = state_index < 8 ? input[state_index] : 0;
+    }
+    poseidon2_simd2(state, parameters, lane2, simd_lane);
+
+    device ulong* output = parents + (ulong)parent * 4;
+    output[lane2] = gl_canonicalize(state[0]);
+    output[2 + lane2] = gl_canonicalize(state[1]);
+}
+
 // One sponge absorption pass over a group of at most eight natural-order
 // columns, with the running 12-lane state parked in `state` between passes
 // (column-major: lane i of row gid at state[i * leaf_count + gid]). The
@@ -1478,6 +1601,57 @@ kernel void poseidon2_absorb_pass(
     } else {
         for (uint i = 0; i < 12; ++i) {
             state[(ulong)i * leaf_count + gid] = st[i];
+        }
+    }
+}
+
+
+kernel void poseidon2_absorb_pass_simd2(
+    const device ulong* leaves [[buffer(0)]],
+    device ulong* state [[buffer(1)]],
+    device ulong* hashes [[buffer(2)]],
+    constant ulong* parameters [[buffer(3)]],
+    constant uint& leaf_count [[buffer(4)]],
+    constant uint& log_leaf_count [[buffer(5)]],
+    constant uint& col_start [[buffer(6)]],
+    constant uint& chunk_size [[buffer(7)]],
+    constant uint& first_pass [[buffer(8)]],
+    constant uint& final_pass [[buffer(9)]],
+    uint gid [[thread_position_in_grid]],
+    ushort simd_lane [[thread_index_in_simdgroup]]) {
+    uint row = gid >> 1;
+    if (row >= leaf_count) {
+        return;
+    }
+    ushort lane2 = simd_lane & 1;
+
+    ulong st[6] = { 0 };
+    if (first_pass == 0u) {
+        for (uint slot = 0; slot < 6; ++slot) {
+            uint state_index = slot * 2 + lane2;
+            st[slot] = state[(ulong)state_index * leaf_count + row];
+        }
+    }
+    for (uint slot = 0; slot < 4; ++slot) {
+        uint state_index = slot * 2 + lane2;
+        if (state_index < chunk_size) {
+            st[slot] = gl_canonicalize(
+                leaves[(ulong)(col_start + state_index) * leaf_count + row]);
+        }
+    }
+
+    poseidon2_simd2(st, parameters, lane2, simd_lane);
+    if (final_pass != 0u) {
+        uint out_row = log_leaf_count == 0
+            ? row
+            : (reverse_bits(row) >> (32 - log_leaf_count));
+        device ulong* output = hashes + (ulong)out_row * 4;
+        output[lane2] = gl_canonicalize(st[0]);
+        output[2 + lane2] = gl_canonicalize(st[1]);
+    } else {
+        for (uint slot = 0; slot < 6; ++slot) {
+            uint state_index = slot * 2 + lane2;
+            state[(ulong)state_index * leaf_count + row] = st[slot];
         }
     }
 }
