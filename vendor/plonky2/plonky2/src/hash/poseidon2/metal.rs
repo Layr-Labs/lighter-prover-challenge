@@ -2,6 +2,7 @@ use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::mem::{size_of, size_of_val};
 use core::slice;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
@@ -320,6 +321,7 @@ struct BufferPool {
     free: Vec<BufferSet>,
     created: usize,
     waiters: usize,
+    critical_waiters: usize,
     spare_output: Option<Buffer>,
     detached_readback: bool,
 }
@@ -515,6 +517,37 @@ pub fn prewarm() {
             let _ = &*CONTEXT;
         })
         .ok();
+}
+
+thread_local! {
+    /// Set only on the serial chain-spine thread. Unlike the exclusive-phase
+    /// flag, this is deliberately thread-local: transaction proofs continue
+    /// to run concurrently, but their Metal tree builds are hideable work.
+    static LATENCY_CRITICAL_GPU_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `f` with priority when contending for the single Metal tree buffer.
+///
+/// This changes only which already-runnable tree build acquires the serialized
+/// GPU resource next. It does not change routing, kernels, or proof values.
+pub fn with_latency_critical_gpu_thread<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LATENCY_CRITICAL_GPU_THREAD.with(|critical| critical.set(self.0));
+        }
+    }
+
+    let previous = LATENCY_CRITICAL_GPU_THREAD.with(|critical| critical.replace(true));
+    let restore = Restore(previous);
+    let result = f();
+    drop(restore);
+    result
+}
+
+fn latency_critical_gpu_thread() -> bool {
+    LATENCY_CRITICAL_GPU_THREAD.with(Cell::get)
 }
 
 /// True while the prover is inside an exclusive serial phase (pre-execution
@@ -1535,6 +1568,7 @@ impl MetalShared {
                     free: Vec::new(),
                     created: 0,
                     waiters: 0,
+                    critical_waiters: 0,
                     spare_output: None,
                     detached_readback: false,
                 }),
@@ -1700,17 +1734,38 @@ impl MetalShared {
     }
 
     fn acquire_set(&self) -> Result<BufferSet, String> {
+        self.acquire_set_with_priority(latency_critical_gpu_thread())
+    }
+
+    fn acquire_set_with_priority(&self, critical: bool) -> Result<BufferSet, String> {
         let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
+        let mut registered_critical_waiter = false;
         loop {
-            if let Some(set) = pool.free.pop() {
-                return Ok(set);
+            // Once a critical chain build is waiting, normal transaction
+            // builds yield the next free set. `notify_all` in `release_set`
+            // is required here: waking only a normal waiter could otherwise
+            // leave a free set stranded while the critical waiter sleeps.
+            if critical || pool.critical_waiters == 0 {
+                if let Some(set) = pool.free.pop() {
+                    if registered_critical_waiter {
+                        pool.critical_waiters -= 1;
+                    }
+                    return Ok(set);
+                }
+                if pool.created < MAX_BUFFER_SETS {
+                    pool.created += 1;
+                    if registered_critical_waiter {
+                        pool.critical_waiters -= 1;
+                    }
+                    return Ok(BufferSet {
+                        input: None,
+                        output: None,
+                    });
+                }
             }
-            if pool.created < MAX_BUFFER_SETS {
-                pool.created += 1;
-                return Ok(BufferSet {
-                    input: None,
-                    output: None,
-                });
+            if critical && !registered_critical_waiter {
+                pool.critical_waiters += 1;
+                registered_critical_waiter = true;
             }
             pool.waiters += 1;
             match self.available.wait(pool) {
@@ -1721,6 +1776,9 @@ impl MetalShared {
                 Err(poisoned) => {
                     let mut next = poisoned.into_inner();
                     next.waiters -= 1;
+                    if registered_critical_waiter {
+                        next.critical_waiters -= 1;
+                    }
                     return Err("buffer pool poisoned".to_string());
                 }
             }
@@ -1733,7 +1791,7 @@ impl MetalShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.free.push(set);
-        self.available.notify_one();
+        self.available.notify_all();
     }
 
     fn try_detach_completed_output(
@@ -2816,6 +2874,92 @@ mod tests {
     use crate::hash::merkle_tree::{capacity_up_to_mut, fill_digests_buf, merkle_tree_prove};
     use crate::hash::poseidon2::hash::Poseidon2Hash;
     use crate::plonk::vars::EvaluationVarsBaseBatch;
+
+    #[test]
+    fn latency_critical_scope_restores_thread_state() {
+        assert!(!latency_critical_gpu_thread());
+        with_latency_critical_gpu_thread(|| {
+            assert!(latency_critical_gpu_thread());
+            with_latency_critical_gpu_thread(|| assert!(latency_critical_gpu_thread()));
+            assert!(latency_critical_gpu_thread());
+        });
+        assert!(!latency_critical_gpu_thread());
+    }
+
+    #[test]
+    fn latency_critical_waiter_gets_next_buffer_set() {
+        use std::sync::mpsc;
+
+        let context = MetalShared::new().expect("Metal context");
+        let held = context
+            .acquire_set_with_priority(false)
+            .expect("initial set");
+
+        std::thread::scope(|scope| {
+            let (order_tx, order_rx) = mpsc::channel();
+            let normal_tx = order_tx.clone();
+            let context_ref = &context;
+            scope.spawn(move || {
+                let set = context_ref
+                    .acquire_set_with_priority(false)
+                    .expect("normal waiter set");
+                normal_tx.send(false).expect("record normal acquisition");
+                context_ref.release_set(set);
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while context.pool.lock().unwrap().waiters != 1 {
+                assert!(
+                    Instant::now() < deadline,
+                    "normal waiter did not block on the set"
+                );
+                std::thread::yield_now();
+            }
+
+            let critical_tx = order_tx.clone();
+            let context_ref = &context;
+            scope.spawn(move || {
+                let set = context_ref
+                    .acquire_set_with_priority(true)
+                    .expect("critical waiter set");
+                critical_tx
+                    .send(true)
+                    .expect("record critical acquisition");
+                context_ref.release_set(set);
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let pool = context.pool.lock().unwrap();
+                if pool.waiters == 2 && pool.critical_waiters == 1 {
+                    break;
+                }
+                drop(pool);
+                assert!(
+                    Instant::now() < deadline,
+                    "critical waiter did not register"
+                );
+                std::thread::yield_now();
+            }
+
+            context.release_set(held);
+            assert!(
+                order_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("first acquisition")
+            );
+            assert!(
+                !order_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("second acquisition")
+            );
+        });
+
+        let pool = context.pool.lock().unwrap();
+        assert_eq!(pool.waiters, 0);
+        assert_eq!(pool.critical_waiters, 0);
+        assert_eq!(pool.free.len(), 1);
+    }
 
     #[test]
     fn does_not_detach_output_without_a_waiting_build() {

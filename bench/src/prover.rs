@@ -138,7 +138,7 @@ fn chain_step_proof(
     tx_proof: &Proof,
 ) -> Proof {
     mark_spine_thread_latency_critical();
-    let result = (|| {
+    let result = plonky2::hash::poseidon2::with_latency_critical_gpu_thread(|| (|| {
         // Phase 1: run every generator that does not depend on the previous chain proof while
         // that proof may still be in flight. Inputs are written directly into
         // the partition's representative slots — no PartialWitness map, no
@@ -168,7 +168,7 @@ fn chain_step_proof(
             )
         })?;
         BlockTxChainCircuit::prove_prepared(pending, chain_data)
-    })();
+    })());
     result.unwrap_or_else(|error| {
         panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")
     })
