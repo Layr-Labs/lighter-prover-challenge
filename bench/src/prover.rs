@@ -1,3 +1,4 @@
+// Cycle rebase: borrow + diet on the tip at fire time (draws 22.2893, 22.3352, 22.6360, 23.3742 - each above its base tip by up to +1.16%, each graft-raced).
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
