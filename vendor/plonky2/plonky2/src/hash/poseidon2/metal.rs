@@ -61,13 +61,6 @@ struct MetalShared {
     ntt_prepare_pipeline: ComputePipelineState,
     ntt_stage_pipeline: ComputePipelineState,
     ifft_finalize_pipeline: ComputePipelineState,
-    /// Optional so a quotient-kernel setup failure cannot disable the
-    /// already-proven Metal commitment backend.
-    poseidon_gate_quotient_pipeline: Option<ComputePipelineState>,
-    /// Kept independent from the Poseidon gate pipeline so either optional
-    /// specialization can fail closed without disabling commitments or the
-    /// other quotient kernel.
-    range_check_gate_quotient_pipeline: Option<ComputePipelineState>,
     parameters: Buffer,
     pool: Mutex<BufferPool>,
     available: Condvar,
@@ -361,6 +354,107 @@ impl<F: RichField> TreeReadback<'_, F> {
                     slice::from_raw_parts(output.buffer().contents().cast::<u64>(), output_len)
                 };
                 tree_from_levels(nodes, &level_offsets, leaf_count, cap_height)
+            }
+        }
+    }
+}
+
+/// The two gate-quotient pipelines, lowered off the context's blocking path.
+///
+/// Each is `None` until its background build finishes and `Some(None)` if that
+/// build failed. Both readers already treat an absent pipeline as "evaluate
+/// this gate on the CPU", which is the same behaviour a failed build produced
+/// before, so a caller that arrives early simply takes the CPU path it would
+/// have taken had the kernel been unbuildable.
+struct LazyPipeline {
+    built: std::sync::OnceLock<Option<ComputePipelineState>>,
+    builder: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl LazyPipeline {
+    const fn new() -> Self {
+        Self {
+            built: std::sync::OnceLock::new(),
+            builder: Mutex::new(None),
+        }
+    }
+
+    /// Waits for the build if it has not finished.
+    ///
+    /// Waiting rather than reporting the kernel absent keeps the worst case at
+    /// exactly today's behaviour — the caller blocks for the same lowering the
+    /// context used to block on — while a caller that arrives after the build
+    /// lands, which is every caller in a real proof, pays nothing. Reporting it
+    /// absent instead would quietly move those gates onto the CPU, which can
+    /// cost more than the startup this saves.
+    fn get(&self) -> Option<&ComputePipelineState> {
+        if self.built.get().is_none() {
+            let handle = self.builder.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(handle) = handle {
+                // A panicked builder leaves `built` unset, which reads as an
+                // unavailable kernel — the same outcome a failed lowering had.
+                let _ = handle.join();
+            }
+        }
+        self.built.get()?.as_ref()
+    }
+}
+
+static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
+static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
+
+fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
+    POSEIDON_GATE_QUOTIENT_PIPELINE.get()
+}
+
+fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
+    RANGE_CHECK_GATE_QUOTIENT_PIPELINE.get()
+}
+
+/// Starts the two gate-quotient pipeline builds on detached threads.
+///
+/// One thread each rather than one for both: they are the two slowest kernels
+/// in the shader, so serializing them would keep the GPU quotient path on the
+/// CPU for the sum of their lowerings instead of the larger of the two.
+///
+/// Scheduling only. The pipelines are the same objects the blocking build
+/// produced, lowered from the same library, so nothing they later compute can
+/// differ; only the instant at which they become available does.
+fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
+    for (name, slot) in [
+        ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
+        (
+            "range_check_gate_quotient",
+            &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
+        ),
+    ] {
+        let device = device.clone();
+        let library = library.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("poseidon2-metal-{name}"))
+            .spawn(move || {
+                let pipeline = autoreleasepool(|| {
+                    library.get_function(name, None).ok().and_then(|function| {
+                        device
+                            .new_compute_pipeline_state_with_function(&function)
+                            .ok()
+                    })
+                });
+                if pipeline.is_none() {
+                    log::debug!("{name} pipeline unavailable; evaluating those gates on the CPU");
+                }
+                let _ = slot.built.set(pipeline);
+            });
+        match spawned {
+            Ok(handle) => {
+                if let Ok(mut builder) = slot.builder.lock() {
+                    *builder = Some(handle);
+                }
+            }
+            // No thread means nothing will ever populate the slot; settle it now
+            // so readers fall back instead of looking for a build in flight.
+            Err(_) => {
+                let _ = slot.built.set(None);
             }
         }
     }
@@ -1097,20 +1191,27 @@ impl MetalShared {
                     })
                 }
             };
-            let optional = |name: &'static str| {
-                move || -> Option<ComputePipelineState> {
-                    autoreleasepool(|| {
-                        library_ref
-                            .get_function(name, None)
-                            .ok()
-                            .and_then(|function| {
-                                device_ref
-                                    .new_compute_pipeline_state_with_function(&function)
-                                    .ok()
-                            })
-                    })
-                }
-            };
+            // The two gate-quotient kernels are the two most expensive to lower
+            // and the only two the context can do without: every caller already
+            // treats an absent pipeline as "run this on the CPU". Lowering them
+            // on the blocking path makes the whole context wait for the slowest
+            // kernel in the shader; measured cold under the benchmark's sandbox
+            // profile, where the OS shader cache is disabled:
+            //
+            //     range_check_gate_quotient   679 ms
+            //     poseidon2_gate_quotient     601 ms
+            //     the six required kernels    491 ms and below
+            //
+            // Lowering all eight in parallel takes 886 ms against 474 ms for the
+            // six required ones, because the two extra kernels both raise the
+            // maximum and add contention on MTLCompilerService. Building them
+            // off the blocking path instead leaves the context ready in 838 ms
+            // rather than 1270 ms, and they land shortly after, long before the
+            // first quotient evaluation of a proof asks for them.
+            //
+            // Started below, once the required six have finished, so they do not
+            // simply move their MTLCompilerService contention onto the path they
+            // are being taken off.
             let (
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
@@ -1118,8 +1219,6 @@ impl MetalShared {
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
-                poseidon_gate_quotient_pipeline,
-                range_check_gate_quotient_pipeline,
             ) = std::thread::scope(|scope| {
                 let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
                 let leaf_colmajor =
@@ -1128,8 +1227,6 @@ impl MetalShared {
                 let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
                 let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
                 let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
-                let poseidon_gate = scope.spawn(optional("poseidon2_gate_quotient"));
-                let range_check_gate = scope.spawn(optional("range_check_gate_quotient"));
                 // A panic inside a pipeline build is a bug, not a runtime
                 // condition; propagate it rather than papering over it.
                 (
@@ -1147,12 +1244,6 @@ impl MetalShared {
                     ifft_finalize
                         .join()
                         .expect("ifft finalize pipeline thread panicked"),
-                    poseidon_gate
-                        .join()
-                        .expect("poseidon2 gate quotient pipeline thread panicked"),
-                    range_check_gate
-                        .join()
-                        .expect("range check gate quotient pipeline thread panicked"),
                 )
             });
             // Surfaced in kernel order, so a single missing or unbuildable
@@ -1167,6 +1258,8 @@ impl MetalShared {
             let ntt_prepare_pipeline = ntt_prepare_pipeline?;
             let ntt_stage_pipeline = ntt_stage_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
+
+            spawn_optional_pipelines(&device, &library);
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -1188,8 +1281,6 @@ impl MetalShared {
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
-                poseidon_gate_quotient_pipeline,
-                range_check_gate_quotient_pipeline,
                 parameters,
                 pool: Mutex::new(BufferPool {
                     free: Vec::new(),
@@ -1243,9 +1334,7 @@ impl MetalShared {
         include_unused_selector: bool,
         alpha_powers: &[u64],
     ) -> Result<PoseidonGateQuotientJob<F>, String> {
-        let pipeline = self
-            .poseidon_gate_quotient_pipeline
-            .as_ref()
+        let pipeline = poseidon_gate_quotient_pipeline()
             .ok_or("Poseidon2 gate quotient pipeline unavailable")?;
         let len = quotient_rows
             .checked_mul(2)
@@ -1306,9 +1395,7 @@ impl MetalShared {
         alpha_powers: &[u64],
         alpha_stride: usize,
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
-        let pipeline = self
-            .range_check_gate_quotient_pipeline
-            .as_ref()
+        let pipeline = range_check_gate_quotient_pipeline()
             .ok_or("RangeCheck gate quotient pipeline unavailable")?;
         if metadata.len() != (range_count + u32_count) * 10
             || alpha_powers.len() != alpha_stride * 2
