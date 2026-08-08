@@ -42,6 +42,33 @@ pub(crate) enum BatchLayout {
     /// `out[column * num_points + point]`
     PolyMajor,
 }
+/// A non-owning view of consecutive points across a range of column-backed
+/// LDE polynomials.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ContiguousLdeColumns<'a, F: RichField> {
+    columns: &'a ColumnStore<F>,
+    column_start: usize,
+    num_columns: usize,
+    point_start: usize,
+    num_points: usize,
+}
+
+impl<'a, F: RichField> ContiguousLdeColumns<'a, F> {
+    pub(crate) const fn num_columns(&self) -> usize {
+        self.num_columns
+    }
+
+    pub(crate) const fn num_points(&self) -> usize {
+        self.num_points
+    }
+
+    pub(crate) fn column(&self, column: usize) -> &'a [F] {
+        assert!(column < self.num_columns);
+        let point_end = self.point_start + self.num_points;
+        &self.columns.col(self.column_start + column)[self.point_start..point_end]
+    }
+}
+
 
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
 #[derive(Eq, PartialEq, Debug)]
@@ -457,6 +484,46 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             }
         }
     }
+    /// Borrows a contiguous PolyMajor batch directly from column-backed LDE
+    /// storage. Unsupported strides, shapes and storage layouts retain the
+    /// existing gather path.
+    pub(crate) fn contiguous_lde_columns(
+        &self,
+        indices: &[usize],
+        step: usize,
+        col_range: core::ops::Range<usize>,
+    ) -> Option<ContiguousLdeColumns<'_, F>> {
+        if step != 1
+            || indices.is_empty()
+            || col_range.start > col_range.end
+            || col_range.end > self.lde_row_width()
+        {
+            return None;
+        }
+        let point_start = indices[0];
+        if !indices
+            .iter()
+            .enumerate()
+            .all(|(offset, &index)| point_start.checked_add(offset) == Some(index))
+        {
+            return None;
+        }
+        let point_end = point_start.checked_add(indices.len())?;
+        let MerkleLeaves::Columns { columns, .. } = &self.merkle_tree.leaves else {
+            return None;
+        };
+        if point_end > columns.num_rows() {
+            return None;
+        }
+        Some(ContiguousLdeColumns {
+            columns,
+            column_start: col_range.start,
+            num_columns: col_range.len(),
+            point_start,
+            num_points: indices.len(),
+        })
+    }
+
 
     /// Copies consecutive LDE points into a PolyMajor output buffer.
     ///
