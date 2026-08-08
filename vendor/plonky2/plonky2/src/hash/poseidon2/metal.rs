@@ -532,6 +532,13 @@ pub fn set_exclusive_gpu_phase(enabled: bool) {
     EXCLUSIVE_GPU_PHASE.store(enabled, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Returns whether the prover is currently in the process-global exclusive
+/// proving phase. Scheduling-only consumers may use this to borrow otherwise
+/// idle CPU workers without changing proof semantics.
+pub fn is_exclusive_gpu_phase() -> bool {
+    EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Number of Merkle builds currently occupying the serialized GPU stream
 /// (from buffer acquisition through `wait_until_completed`). Routing reads
 /// this to decide whether a small serial-path tree would enqueue behind
