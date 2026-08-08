@@ -1,3 +1,4 @@
+// Borrowed permutation columns, rebased onto the 22.42 tip (prior draw 22.2893 on the 22.14 tip).
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
