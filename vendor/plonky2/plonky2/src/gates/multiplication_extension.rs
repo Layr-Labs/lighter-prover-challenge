@@ -127,7 +127,19 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for MulExtensionGa
             F::Extension::from_basefield_array(arr)
         };
 
-        let mut scratch = vec![F::ZERO; D * n];
+        // The prover evaluates at most 32 points per batch, and production
+        // recursion uses D = 2. Keep that 64-element hot scratch on the stack
+        // instead of allocating it for every gate batch. Retain the heap
+        // fallback for callers with a larger extension degree or batch.
+        let scratch_len = D * n;
+        let mut scratch_stack = [F::ZERO; 64];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if scratch_len <= scratch_stack.len() {
+            &mut scratch_stack[..scratch_len]
+        } else {
+            scratch_heap = vec![F::ZERO; scratch_len];
+            &mut scratch_heap
+        };
         for i in 0..self.num_ops {
             let m0_start = Self::wires_ith_multiplicand_0(i).start;
             let m1_start = Self::wires_ith_multiplicand_1(i).start;
@@ -271,8 +283,10 @@ mod tests {
     use anyhow::Result;
 
     use super::*;
+    use crate::field::types::Sample;
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
+    use crate::hash::hash_types::HashOut;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     #[test]
@@ -288,5 +302,39 @@ mod tests {
         type F = <C as GenericConfig<D>>::F;
         let gate = MulExtensionGate::new_from_config(&CircuitConfig::standard_recursion_config());
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    #[test]
+    fn batch_accumulate_matches_materialized_at_stack_boundary() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+
+        let gate = MulExtensionGate::<D>::new_from_config(
+            &CircuitConfig::standard_recursion_config(),
+        );
+        let num_wires = <MulExtensionGate<D> as Gate<F, D>>::num_wires(&gate);
+        let num_constants = <MulExtensionGate<D> as Gate<F, D>>::num_constants(&gate);
+        let num_constraints = <MulExtensionGate<D> as Gate<F, D>>::num_constraints(&gate);
+        for n in [1, 32, 33] {
+            let wires = F::rand_vec(num_wires * n);
+            let constants = F::rand_vec(num_constants * n);
+            let filters = F::rand_vec(n);
+            let hash = HashOut::ZERO;
+            let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+
+            let materialized = gate.eval_unfiltered_base_batch(vars);
+            let initial = F::rand_vec(num_constraints * n);
+            let mut expected = initial.clone();
+            for (combined, constraints) in expected
+                .chunks_exact_mut(n)
+                .zip(materialized.chunks_exact(n))
+            {
+                batch_multiply_add_inplace(combined, constraints, &filters);
+            }
+
+            let mut actual = initial;
+            gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+            assert_eq!(actual, expected, "batch size {n}");
+        }
     }
 }
