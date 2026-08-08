@@ -63,29 +63,19 @@ fn main() {
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
-    // Overlap fixture parse with embedded circuit load: independent work that
-    // previously ran fully serial on the scored critical path.
-    let (block, circuits) = rayon::join(
-        || {
-            let json = fs::read(&fixture).expect("cannot read prover fixture");
-            Block::<F>::from_json_with_empty_txs(
-                &json,
-                HEAVY_TX_PER_PROOF,
-                LIGHT_TX_PER_PROOF,
-                PUBLIC_HEAVY_TX_COUNT,
-                PUBLIC_LIGHT_TX_COUNT,
-            )
-            .expect("invalid prover fixture")
-        },
-        // Embedded circuits (deserialized from compile-time blobs) by default;
-        // falls back to building from scratch if they are unavailable, and
-        // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B measurement.
-        Circuits::load,
-    );
+    let json = fs::read(fixture).expect("cannot read prover fixture");
+    let block = Block::<F>::from_json_with_empty_txs(
+        &json,
+        HEAVY_TX_PER_PROOF,
+        LIGHT_TX_PER_PROOF,
+        PUBLIC_HEAVY_TX_COUNT,
+        PUBLIC_LIGHT_TX_COUNT,
+    )
+    .expect("invalid prover fixture");
     // Embedded circuits (deserialized from compile-time blobs) by default;
     // falls back to building from scratch if they are unavailable, and
     // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B measurement.
-    let proof = prover::prove_block(block, circuits);
+    let proof = prover::prove_block(block, Circuits::load());
     let mut writer = BufWriter::with_capacity(
         PROOF_OUTPUT_BUFFER_BYTES,
         File::create(output).expect("cannot create proof output"),
@@ -113,23 +103,7 @@ fn main() {
     // is the GPU pre-warm above, which only populates a cache of compiled
     // kernels and produces nothing anyone reads back, so there is no in-flight
     // background work left to lose here.
-    // `std::process::exit` skips Rust destructors but still enters libc
-    // `exit(3)`, which runs every registered `atexit`/`__cxa_atexit` handler and
-    // finalises each loaded image — the Objective-C runtime, Metal and the
-    // driver bundle among them — before it reaches `_exit(2)`. That teardown
-    // releases objects the kernel reclaims at process death anyway, and it runs
-    // after the last proof byte has reached its descriptor, so it is dead work
-    // by the same argument that motivates skipping the destructors above.
-    // Entering `_exit(2)` directly is safe for the same reason the fast exit
-    // already was: the proof was flushed by `into_inner` and its descriptor
-    // closed, so every byte is with the kernel; the only thing additionally
-    // discarded is userspace stdio buffering, and nothing is written to stdout
-    // on the scored path. Declared in an `extern "C"` block rather than through
-    // a new dependency, so the dependency graph and `Cargo.lock` are untouched.
-    unsafe extern "C" {
-        fn _exit(status: i32) -> !;
-    }
-    unsafe { _exit(0) }
+    std::process::exit(0);
 }
 
-// p90-fire-174-1786149031
+// p90-fire-271-1786159236

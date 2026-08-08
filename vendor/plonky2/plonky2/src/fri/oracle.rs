@@ -446,11 +446,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     /// circuit-fixed, so the caller caches the result once per circuit and
     /// every subsequent proof's quotient gathers copy from it instead of
     /// re-walking the strided LDE.
-    ///
-    /// When `step == 1` (production: `rate_bits == quotient_degree_bits`) each
-    /// column's contribution is a contiguous LDE prefix, so the strided map
-    /// collapses to a per-column memcpy. Columns are independent and fan
-    /// across the pool; the `step > 1` path is unchanged.
     pub fn extract_lde_batch_columns(
         &self,
         step: usize,
@@ -458,33 +453,14 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         q_domain: usize,
     ) -> Option<Vec<F>> {
         let w = col_range.len();
+        let mut out = Vec::with_capacity(w * q_domain);
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
-                if step == 1 {
-                    // Contiguous: column[i * 1] == column[i] for i in 0..q_domain,
-                    // so memcpy of the prefix is bit-identical to the strided map.
-                    let mut out = Vec::with_capacity(w * q_domain);
-                    // SAFETY: every of the `w * q_domain` slots is overwritten by
-                    // `copy_from_slice` below before any is read. `F` is a plain
-                    // field wrapper (any bit pattern is a valid `F`).
-                    unsafe {
-                        out.set_len(w * q_domain);
-                    }
-                    let col_start = col_range.start;
-                    out.par_chunks_mut(q_domain)
-                        .enumerate()
-                        .for_each(|(ci, dest)| {
-                            dest.copy_from_slice(&columns.col(col_start + ci)[..q_domain]);
-                        });
-                    Some(out)
-                } else {
-                    let mut out = Vec::with_capacity(w * q_domain);
-                    for c in col_range {
-                        let column = columns.col(c);
-                        out.extend((0..q_domain).map(|i| column[i * step]));
-                    }
-                    Some(out)
+                for c in col_range {
+                    let column = columns.col(c);
+                    out.extend((0..q_domain).map(|i| column[i * step]));
                 }
+                Some(out)
             }
             _ => None,
         }
