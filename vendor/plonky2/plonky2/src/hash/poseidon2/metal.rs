@@ -435,6 +435,17 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             .spawn(move || {
                 let pipeline = autoreleasepool(|| {
                     library.get_function(name, None).ok().and_then(|function| {
+                        if let Some(archive) = pipeline_archive(&device) {
+                            let archive_try = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                let descriptor = metal::ComputePipelineDescriptor::new();
+                                descriptor.set_compute_function(Some(&function));
+                                descriptor.set_binary_archives(&[&archive]);
+                                device.new_compute_pipeline_state(&descriptor)
+                            }));
+                            if let Ok(Ok(pipeline)) = archive_try {
+                                return Some(pipeline);
+                            }
+                        }
                         device
                             .new_compute_pipeline_state_with_function(&function)
                             .ok()
@@ -459,6 +470,64 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
         }
     }
 }
+
+
+static PIPELINE_ARCHIVE_BYTES: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+static PIPELINE_ARCHIVE_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+pub fn install_pipeline_archive(bytes: &'static [u8]) {
+    if bytes.len() < 64 {
+        return;
+    }
+    let _ = PIPELINE_ARCHIVE_BYTES.set(bytes);
+}
+
+fn materialize_pipeline_archive() -> Option<&'static std::path::Path> {
+    if let Some(path) = PIPELINE_ARCHIVE_PATH.get() {
+        return Some(path.as_path());
+    }
+    let bytes = *PIPELINE_ARCHIVE_BYTES.get()?;
+    let file_name = format!("lighter_poseidon2_pipelines_{}.metalar", std::process::id());
+    let mut dirs = Vec::new();
+    if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+        dirs.push(std::path::PathBuf::from(tmpdir));
+    }
+    dirs.push(std::env::temp_dir());
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    for dir in dirs {
+        let path = dir.join(&file_name);
+        if std::fs::write(&path, bytes).is_ok() {
+            let _ = PIPELINE_ARCHIVE_PATH.set(path);
+            return PIPELINE_ARCHIVE_PATH.get().map(|p| p.as_path());
+        }
+    }
+    None
+}
+
+fn pipeline_archive(device: &Device) -> Option<metal::BinaryArchive> {
+    let path = materialize_pipeline_archive()?;
+    if !path.is_file() {
+        return None;
+    }
+    let path_str = path.display().to_string();
+    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let descriptor = metal::BinaryArchiveDescriptor::new();
+        let url = std::mem::ManuallyDrop::new(metal::URL::new_with_string(&format!(
+            "file://{path_str}"
+        )));
+        descriptor.set_url(&url);
+        device.new_binary_archive_with_descriptor(&descriptor)
+    }));
+    match opened {
+        Ok(Ok(archive)) => Some(archive),
+        _ => None,
+    }
+}
+
 
 static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShared::new);
 
@@ -1179,12 +1248,25 @@ impl MetalShared {
             // that created them rather than leaking.
             let device_ref = &device;
             let library_ref = &library;
+            let archive = pipeline_archive(device_ref);
+            let archive_ref = archive.as_deref();
             let required = |name: &'static str, kind: &'static str| {
                 move || -> Result<ComputePipelineState, String> {
                     autoreleasepool(|| {
                         let function = library_ref
                             .get_function(name, None)
                             .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
+                        if let Some(archive) = archive_ref {
+                            let archive_try = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                let descriptor = metal::ComputePipelineDescriptor::new();
+                                descriptor.set_compute_function(Some(&function));
+                                descriptor.set_binary_archives(&[&archive]);
+                                device_ref.new_compute_pipeline_state(&descriptor)
+                            }));
+                            if let Ok(Ok(pipeline)) = archive_try {
+                                return Ok(pipeline);
+                            }
+                        }
                         device_ref
                             .new_compute_pipeline_state_with_function(&function)
                             .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
