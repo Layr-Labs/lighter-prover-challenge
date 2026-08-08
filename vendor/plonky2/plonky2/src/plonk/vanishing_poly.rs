@@ -1,5 +1,6 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
+use core::any::TypeId;
 use core::cmp::min;
 
 use plonky2_field::polynomial::PolynomialCoeffs;
@@ -7,6 +8,8 @@ use plonky2_field::polynomial::PolynomialCoeffs;
 use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::goldilocks_field::GoldilocksField;
+use crate::field::packable::Packable;
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::gates::lookup::LookupGate;
@@ -245,6 +248,59 @@ fn reduce_gate_constraints_base_batch<F: Field>(
             // No constraint rows: preserve the "every slot written" contract.
             None => res_out.fill(F::ZERO),
         }
+    }
+
+    // Production uses Goldilocks, two challenges, and a four-lane AArch64
+    // packing. Two adjacent points therefore occupy exactly one packed value:
+    // [point0/alpha0, point0/alpha1, point1/alpha0, point1/alpha1]. Advancing
+    // those four independent Horner chains together preserves every chain's
+    // operation order and raw Goldilocks representative while replacing four
+    // scalar reduction blocks with the field backend's two interleaved pairs.
+    // Other fields, challenge counts, and packing widths retain the generic
+    // path below.
+    if TypeId::of::<F>() == TypeId::of::<GoldilocksField>()
+        && alphas.len() == 2
+        && <<F as Packable>::Packing as crate::field::packed::PackedField>::WIDTH == 4
+    {
+        let repeated_alphas = [alphas[0], alphas[1], alphas[0], alphas[1]];
+        let packed_alphas =
+            *<<F as Packable>::Packing as crate::field::packed::PackedField>::from_slice(
+                &repeated_alphas,
+            );
+        for constraint_row in rows {
+            for pair in 0..batch_size / 2 {
+                let point = pair * 2;
+                let repeated_terms = [
+                    constraint_row[point],
+                    constraint_row[point],
+                    constraint_row[point + 1],
+                    constraint_row[point + 1],
+                ];
+                let packed_term =
+                    *<<F as Packable>::Packing as crate::field::packed::PackedField>::from_slice(
+                        &repeated_terms,
+                    );
+                let result = &mut res_out[point * 2..point * 2 + 4];
+                let packed_result =
+                    *<<F as Packable>::Packing as crate::field::packed::PackedField>::from_slice(
+                        result,
+                    );
+                let reduced = crate::field::packed::PackedField::multiply_accumulate(
+                    &packed_term,
+                    packed_result,
+                    packed_alphas,
+                );
+                result.copy_from_slice(crate::field::packed::PackedField::as_slice(&reduced));
+            }
+            if batch_size % 2 != 0 {
+                let point = batch_size - 1;
+                let term = constraint_row[point];
+                let result = &mut res_out[point * 2..point * 2 + 2];
+                result[0] = term.multiply_accumulate(result[0], alphas[0]);
+                result[1] = term.multiply_accumulate(result[1], alphas[1]);
+            }
+        }
+        return;
     }
 
     for constraint_row in rows {
@@ -1364,6 +1420,84 @@ mod tests {
             let mut actual = initial;
             reduce_gate_constraints_base_batch(&terms, batch_size, &alphas, &mut actual, false);
             assert_eq!(actual, expected, "batch size {batch_size}");
+        }
+    }
+
+    fn scalar_constraint_reduction_reference(
+        terms: &[GoldilocksField],
+        batch_size: usize,
+        alphas: &[GoldilocksField],
+        out: &mut [GoldilocksField],
+        zero_seed: bool,
+    ) {
+        let mut rows = terms.chunks_exact(batch_size).rev();
+        if zero_seed {
+            match rows.next() {
+                Some(first_row) => {
+                    for (point, &term) in first_row.iter().enumerate() {
+                        out[point * alphas.len()..(point + 1) * alphas.len()].fill(term);
+                    }
+                }
+                None => out.fill(GoldilocksField::ZERO),
+            }
+        }
+        for row in rows {
+            for (point, &term) in row.iter().enumerate() {
+                let result = &mut out[point * alphas.len()..(point + 1) * alphas.len()];
+                for (value, &alpha) in result.iter_mut().zip(alphas) {
+                    *value = Field::multiply_accumulate(&term, *value, alpha);
+                }
+            }
+        }
+    }
+
+    fn raw_goldilocks_fixture(len: usize, state: &mut u64) -> Vec<GoldilocksField> {
+        (0..len)
+            .map(|_| {
+                *state ^= *state << 13;
+                *state ^= *state >> 7;
+                *state ^= *state << 17;
+                GoldilocksField(*state)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn packed_constraint_reduction_matches_scalar_raw_words() {
+        let alphas = [
+            GoldilocksField(0xffff_ffff_0000_0001),
+            GoldilocksField(u64::MAX),
+        ];
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for batch_size in [1usize, 11, 31, 32] {
+            for rows in [0usize, 1, 2, 7, 137] {
+                for zero_seed in [false, true] {
+                    let terms = raw_goldilocks_fixture(batch_size * rows, &mut state);
+                    let initial = raw_goldilocks_fixture(batch_size * alphas.len(), &mut state);
+                    let mut expected = initial.clone();
+                    let mut actual = initial;
+                    scalar_constraint_reduction_reference(
+                        &terms,
+                        batch_size,
+                        &alphas,
+                        &mut expected,
+                        zero_seed,
+                    );
+                    reduce_gate_constraints_base_batch(
+                        &terms,
+                        batch_size,
+                        &alphas,
+                        &mut actual,
+                        zero_seed,
+                    );
+                    for (i, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                        assert_eq!(
+                            actual.0, expected.0,
+                            "raw mismatch at {i}, batch={batch_size}, rows={rows}, zero={zero_seed}"
+                        );
+                    }
+                }
+            }
         }
     }
 
