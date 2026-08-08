@@ -65,7 +65,7 @@ pub struct L2TransferTx {
     pub memo: [u8; TRANSFER_MEMO_BYTES],
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug)]
 pub struct L2TransferTxTarget {
     pub from_account_index: Target,
     pub api_key_index: Target,

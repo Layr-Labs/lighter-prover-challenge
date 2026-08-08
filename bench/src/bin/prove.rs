@@ -5,8 +5,6 @@
 
 #[path = "../api.rs"]
 mod api;
-#[path = "../embedded.rs"]
-mod embedded;
 #[path = "../prover.rs"]
 mod prover;
 
@@ -18,9 +16,8 @@ use api::{
     Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
     PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
 };
-use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
 use circuit::block::Block;
-use circuit::types::config::{C, CIRCUIT_CONFIG, F};
+use circuit::types::config::F;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -45,14 +42,6 @@ static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
-    // First statement in the process: the Metal shader compile and pipeline
-    // lowering behind the GPU hash path cost the better part of a second on a
-    // cold OS shader cache, and the benchmark sandbox denies writes to that
-    // cache, which disables it entirely — so every scored worker pays the full
-    // price. Starting it here overlaps it with the startup work below instead
-    // of stalling the first proving step that wants the GPU. Pure scheduling:
-    // the compiled kernels are identical either way.
-    plonky2::hash::poseidon2::prewarm_gpu();
     env_logger::init();
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -64,45 +53,16 @@ fn main() {
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
-    // Fixture parse overlaps the pre-execution circuit load; both are fast.
-    let (block, pre_circuits) = rayon::join(
-        || {
-            let json = fs::read(&fixture).expect("cannot read prover fixture");
-            Block::<F>::from_json_with_empty_txs(
-                &json,
-                HEAVY_TX_PER_PROOF,
-                LIGHT_TX_PER_PROOF,
-                PUBLIC_HEAVY_TX_COUNT,
-                PUBLIC_LIGHT_TX_COUNT,
-            )
-            .expect("invalid prover fixture")
-        },
-        || match Circuits::load_pre() {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                log::warn!("embedded pre circuit unavailable ({error:#}); building from scratch");
-                let pre = circuit::block_pre_execution_constraints::BlockPreExecutionCircuit::define(
-                    circuit::types::config::CIRCUIT_CONFIG,
-                );
-                (pre.target, pre.builder.build::<C>())
-            }
-        },
-    );
-    let pre_exec = circuit::block_pre_execution::BlockPreExec::from_block(&block);
-    let pre_handle = std::thread::Builder::new()
-        .name("pre-exec-startup".into())
-        .stack_size(PROVER_THREAD_STACK_BYTES)
-        .spawn(move || {
-            let (pre_target, pre_data) = pre_circuits;
-            prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec)
-        })
-        .expect("pre-execution startup thread must start");
-    // Embedded circuits (deserialized from compile-time blobs) by default;
-    // falls back to building from scratch if they are unavailable, and
-    // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B measurement.
-    let circuits = Circuits::load();
-    let pre_proof = pre_handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-    let proof = prover::prove_block_after_pre(block, circuits, pre_proof);
+    let json = fs::read(fixture).expect("cannot read prover fixture");
+    let block = Block::<F>::from_json_with_empty_txs(
+        &json,
+        HEAVY_TX_PER_PROOF,
+        LIGHT_TX_PER_PROOF,
+        PUBLIC_HEAVY_TX_COUNT,
+        PUBLIC_LIGHT_TX_COUNT,
+    )
+    .expect("invalid prover fixture");
+    let proof = prover::prove_block(block, Circuits::new());
     let mut writer = BufWriter::with_capacity(
         PROOF_OUTPUT_BUFFER_BYTES,
         File::create(output).expect("cannot create proof output"),
@@ -126,27 +86,7 @@ fn main() {
     // every allocation one by one, and none of it is observable — the kernel
     // reclaims the address space wholesale at exit. Every Metal command buffer
     // in the hash path is `commit()`ed and then `wait_until_completed()`ed
-    // before its results are read. The one detached thread this binary spawns
-    // is the GPU pre-warm above, which only populates a cache of compiled
-    // kernels and produces nothing anyone reads back, so there is no in-flight
-    // background work left to lose here.
-    // `std::process::exit` skips Rust destructors but still enters libc
-    // `exit(3)`, which runs every registered `atexit`/`__cxa_atexit` handler and
-    // finalises each loaded image — the Objective-C runtime, Metal and the
-    // driver bundle among them — before it reaches `_exit(2)`. That teardown
-    // releases objects the kernel reclaims at process death anyway, and it runs
-    // after the last proof byte has reached its descriptor, so it is dead work
-    // by the same argument that motivates skipping the destructors above.
-    // Entering `_exit(2)` directly is safe for the same reason the fast exit
-    // already was: the proof was flushed by `into_inner` and its descriptor
-    // closed, so every byte is with the kernel; the only thing additionally
-    // discarded is userspace stdio buffering, and nothing is written to stdout
-    // on the scored path. Declared in an `extern "C"` block rather than through
-    // a new dependency, so the dependency graph and `Cargo.lock` are untouched.
-    unsafe extern "C" {
-        fn _exit(status: i32) -> !;
-    }
-    unsafe { _exit(0) }
+    // before its results are read, and nothing in this binary spawns a detached
+    // thread, so there is no in-flight background work left to lose here.
+    std::process::exit(0);
 }
-
-// p90-fire-174-1786149031

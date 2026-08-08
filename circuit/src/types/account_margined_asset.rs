@@ -32,7 +32,7 @@ impl AccountMarginedAsset {
     }
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct AccountMarginedAssetTarget {
     pub balance: BigIntTarget,
     pub margin_mode: Target,

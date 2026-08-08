@@ -58,8 +58,7 @@ pub struct BlockTxCircuit {
     pub target: BlockTxTarget,
 }
 
-#[serde_with::serde_as]
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug)]
 pub struct BlockTxTarget {
     pub created_at: Target, // 48 bits
 
@@ -89,7 +88,6 @@ pub struct BlockTxTarget {
     // /*************************/
     pub new_account_delta_tree_root: HashOutTarget,
     pub priority_operations_count: Target,
-    #[serde_as(as = "[_; MAX_PRIORITY_OPERATIONS_PUB_DATA_BYTES_PER_TX]")]
     pub priority_operations_pub_data: [U8Target; MAX_PRIORITY_OPERATIONS_PUB_DATA_BYTES_PER_TX],
     pub on_chain_operations_count: Target,
     pub on_chain_operations_pub_data: [U8Target; ON_CHAIN_OPERATIONS_PUB_DATA_BYTES_SIZE],

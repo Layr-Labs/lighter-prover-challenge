@@ -3,7 +3,3 @@
 # mechanisms and breaking the pinned fixture bytes. (Re-roll of 7f5b84fe:
 # host draw 12.1721 vs 12.3276 bar, within host variance of the tip.)
 * -text
-# roll u5-2
-# roll u6-2
-# roll 3 (20260807T230105Z)
-# roll 4 (20260807T230206Z)

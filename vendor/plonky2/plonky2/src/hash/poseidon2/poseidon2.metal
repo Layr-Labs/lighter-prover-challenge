@@ -124,64 +124,6 @@ inline ulong gl_canonicalize(ulong value) {
     return value >= GOLDILOCKS_PRIME ? value - GOLDILOCKS_PRIME : value;
 }
 
-// A lazy value is (v, c) representing v + c * 2^64; since 2^64 = EPSILON
-// (mod p), its field value is v + c * EPSILON. Raw u64 adds accumulate the
-// wrap count instead of folding EPSILON back per addition; one materialize
-// per element per layer replaces the per-add reduction chains. Carry counts
-// in the layers below stay < 32, so c * EPSILON < 2^37 and the single
-// materializing gl_add is exact. Every materialized output is an ordinary
-// u64 representative, so downstream arithmetic and gl_canonicalize see the
-// same canonical field values as the strict per-op path.
-struct lazy_t {
-    ulong v;
-    uint c;
-};
-
-inline lazy_t lazy_of(ulong v) {
-    return { v, 0u };
-}
-
-inline lazy_t lazy_add(lazy_t a, lazy_t b) {
-    ulong next = a.v + b.v;
-    return { next, a.c + b.c + (uint)(next < a.v) };
-}
-
-inline ulong lazy_materialize(lazy_t a) {
-    return gl_add(a.v, (ulong)a.c * GOLDILOCKS_EPSILON);
-}
-
-// r = a * b + addend (mod p): the 128-bit product absorbs the addend before
-// one shared reduction, deleting the separate post-multiply gl_add. mulhi is
-// at most 2^64 - 2, so the absorbed carry cannot overflow the high word. The
-// reduction below is byte-identical to gl_mul's.
-inline ulong gl_mul_add(ulong a, ulong b, ulong addend) {
-    ulong low = a * b;
-    ulong high = metal::mulhi(a, b);
-    ulong low2 = low + addend;
-    high += (ulong)(low2 < low);
-    uint l0 = (uint)low2;
-    uint l1 = (uint)(low2 >> 32);
-    uint h0 = (uint)high;
-    uint h1 = (uint)(high >> 32);
-
-    uint r0 = l0 - h0;
-    uint borrow = (uint)(r0 > l0);
-    uint next = r0 - h1;
-    borrow += (uint)(next > r0);
-    r0 = next;
-
-    uint r1 = l1 + h0;
-    uint carry = (uint)(r1 < l1);
-    next = r1 - borrow;
-    uint under = (uint)(next > r1);
-    r1 = next;
-
-    int top = (int)carry - (int)under;
-    add_epsilon_u32(r0, r1, (uint)(top > 0));
-    sub_epsilon_u32(r0, r1, (uint)(top < 0));
-    return ((ulong)r1 << 32) | (ulong)r0;
-}
-
 inline ulong pow7(ulong value) {
     ulong value2 = gl_mul(value, value);
     ulong value4 = gl_mul(value2, value2);
@@ -189,36 +131,32 @@ inline ulong pow7(ulong value) {
     return gl_mul(value3, value4);
 }
 
-inline void mat4(thread lazy_t* values) {
-    lazy_t x0 = values[0];
-    lazy_t x1 = values[1];
-    lazy_t x2 = values[2];
-    lazy_t x3 = values[3];
-    lazy_t t01 = lazy_add(x0, x1);
-    lazy_t t23 = lazy_add(x2, x3);
-    lazy_t total = lazy_add(t01, t23);
+inline void mat4(thread ulong* values) {
+    ulong x0 = values[0];
+    ulong x1 = values[1];
+    ulong x2 = values[2];
+    ulong x3 = values[3];
+    ulong t01 = gl_add(x0, x1);
+    ulong t23 = gl_add(x2, x3);
+    ulong total = gl_add(t01, t23);
 
-    values[0] = lazy_add(lazy_add(total, t01), x1);
-    values[1] = lazy_add(lazy_add(lazy_add(total, x1), x2), x2);
-    values[2] = lazy_add(lazy_add(total, t23), x3);
-    values[3] = lazy_add(lazy_add(lazy_add(total, x3), x0), x0);
+    values[0] = gl_add(gl_add(total, t01), x1);
+    values[1] = gl_add(gl_add(gl_add(total, x1), x2), x2);
+    values[2] = gl_add(gl_add(total, t23), x3);
+    values[3] = gl_add(gl_add(gl_add(total, x3), x0), x0);
 }
 
 inline void external_linear_layer(thread ulong state[12]) {
-    lazy_t lazy[12];
-    for (uint i = 0; i < 12; ++i) {
-        lazy[i] = lazy_of(state[i]);
-    }
-    mat4(lazy);
-    mat4(lazy + 4);
-    mat4(lazy + 8);
+    mat4(state);
+    mat4(state + 4);
+    mat4(state + 8);
 
-    lazy_t sums[4];
+    ulong sums[4];
     for (uint i = 0; i < 4; ++i) {
-        sums[i] = lazy_add(lazy_add(lazy[i], lazy[i + 4]), lazy[i + 8]);
+        sums[i] = gl_add(gl_add(state[i], state[i + 4]), state[i + 8]);
     }
     for (uint i = 0; i < 12; ++i) {
-        state[i] = lazy_materialize(lazy_add(lazy[i], sums[i & 3]));
+        state[i] = gl_add(state[i], sums[i & 3]);
     }
 }
 
@@ -236,7 +174,7 @@ inline ulong sum_state(thread const ulong state[12]) {
 inline void internal_linear_layer(thread ulong state[12], constant ulong* diagonal) {
     ulong sum = sum_state(state);
     for (uint i = 0; i < 12; ++i) {
-        state[i] = gl_mul_add(state[i], diagonal[i], sum);
+        state[i] = gl_add(sum, gl_mul(state[i], diagonal[i]));
     }
 }
 
@@ -282,10 +220,12 @@ inline void poseidon2_gate_emit(
     constant ulong* alpha_powers,
     thread ulong accumulators[2],
     thread uint& constraint_index) {
-    accumulators[0] =
-        gl_mul_add(constraint, alpha_powers[constraint_index], accumulators[0]);
-    accumulators[1] =
-        gl_mul_add(constraint, alpha_powers[123 + constraint_index], accumulators[1]);
+    accumulators[0] = gl_add(
+        accumulators[0],
+        gl_mul(constraint, alpha_powers[constraint_index]));
+    accumulators[1] = gl_add(
+        accumulators[1],
+        gl_mul(constraint, alpha_powers[123 + constraint_index]));
     ++constraint_index;
 }
 
@@ -434,60 +374,25 @@ inline void range_check_gate_emit(
     uint alpha_stride,
     thread ulong accumulators[2],
     uint constraint_index) {
-    accumulators[0] =
-        gl_mul_add(constraint, alpha_powers[constraint_index], accumulators[0]);
-    accumulators[1] = gl_mul_add(
-        constraint, alpha_powers[alpha_stride + constraint_index], accumulators[1]);
+    accumulators[0] = gl_add(
+        accumulators[0],
+        gl_mul(constraint, alpha_powers[constraint_index]));
+    accumulators[1] = gl_add(
+        accumulators[1],
+        gl_mul(constraint, alpha_powers[alpha_stride + constraint_index]));
 }
 
-// Each RangeCheck metadata record is ten uints:
+// Each RangeCheck metadata record is eight uints:
 //   selector column, gate index, group start/end, include UNUSED selector,
-//   operation count, base-4 limbs per operation, final-limb range (2 or 4),
-//   then two unused words that keep both record kinds the same stride.
-// It is followed by promoted-family records with the same five selector words,
-// then kind (arithmetic=0, subtraction=1, add-many=2, byte-decomposition=3,
-// quintic-multiplication=4, quintic-squaring=5, random-access=6,
-// exponentiation=7, equality=8, reducing=9), operation or copy count, and
-// three explicit kind words. Random access uses the final words for index
-// bits, extra constants, and the raw constant-column base; equality carries
-// its constants column and reducing its extension-coefficient flag in the
-// addend-count word.
-// The result-limb count is what makes the subtraction and add-many branches
-// width-generic: a `2 * result_limbs`-bit word recomposes from that many
-// base-4 limbs and its overflow weight is `1 << (2 * result_limbs)`, which
-// covers the 16-, 32- and 48-bit production gates with one code path.
+//   operation count, base-4 limbs per operation, final-limb range (2 or 4).
+// It is followed by U32 records with the same five selector words, then:
+//   kind (arithmetic=0, subtraction=1, add-many=2), operation count,
+//   addend count (zero except for add-many).
+// RandomAccess records are nine uints: the same five selector words, then
+//   bits, num_copies, num_extra_constants, num_selectors.
 // Every gate starts again at constraint row zero. This matches the CPU's
 // shared row accumulator: reducing each filtered gate locally with the same
 // alpha powers and then adding the results is linear in those row values.
-
-// Select within one contiguous eight-item block using the low three index bits.
-// Keeping only this block and the at-most-eight block results private avoids a
-// 64-word private array for the audited six-bit gate.
-inline ulong random_access_select_8(
-    const device ulong* wires,
-    uint lde_rows,
-    uint source_row,
-    ulong list_base,
-    ulong bit_base,
-    uint block) {
-    ulong items[8];
-    for (uint i = 0; i < 8u; ++i) {
-        ulong column = list_base + (ulong)block * 8u + i;
-        items[i] = wires[column * lde_rows + source_row];
-    }
-    uint level_size = 8u;
-    for (uint level = 0; level < 3u; ++level) {
-        ulong b = wires[(bit_base + level) * lde_rows + source_row];
-        for (uint k = 0; k < level_size / 2u; ++k) {
-            ulong x = items[2u * k];
-            ulong y = items[2u * k + 1u];
-            items[k] = gl_add(x, gl_mul(b, gl_sub(y, x)));
-        }
-        level_size /= 2u;
-    }
-    return items[0];
-}
-
 kernel void range_check_gate_quotient(
     const device ulong* wires [[buffer(0)]],
     const device ulong* constants [[buffer(1)]],
@@ -500,6 +405,7 @@ kernel void range_check_gate_quotient(
     constant uint& alpha_stride [[buffer(8)]],
     constant uint& range_count [[buffer(9)]],
     constant uint& u32_count [[buffer(10)]],
+    constant uint& random_access_count [[buffer(11)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= quotient_rows) {
         return;
@@ -508,7 +414,7 @@ kernel void range_check_gate_quotient(
     uint source_row = gid * step;
     ulong total[2] = { 0, 0 };
     for (uint range_index = 0; range_index < range_count; ++range_index) {
-        constant uint* spec = metadata + range_index * 10u;
+        constant uint* spec = metadata + range_index * 8u;
         uint selector_column = spec[0];
         uint gate_index = spec[1];
         uint group_start = spec[2];
@@ -567,13 +473,13 @@ kernel void range_check_gate_quotient(
             }
         }
 
-        total[0] = gl_mul_add(filter, gate_accumulators[0], total[0]);
-        total[1] = gl_mul_add(filter, gate_accumulators[1], total[1]);
+        total[0] = gl_add(total[0], gl_mul(filter, gate_accumulators[0]));
+        total[1] = gl_add(total[1], gl_mul(filter, gate_accumulators[1]));
     }
 
-    constant uint* u32_metadata = metadata + range_count * 10u;
+    constant uint* u32_metadata = metadata + range_count * 8u;
     for (uint u32_index = 0; u32_index < u32_count; ++u32_index) {
-        constant uint* spec = u32_metadata + u32_index * 10u;
+        constant uint* spec = u32_metadata + u32_index * 8u;
         uint selector_column = spec[0];
         uint gate_index = spec[1];
         uint group_start = spec[2];
@@ -582,10 +488,6 @@ kernel void range_check_gate_quotient(
         uint kind = spec[5];
         uint num_ops = spec[6];
         uint num_addends = spec[7];
-        uint result_limbs = spec[8];
-        uint num_carry_limbs = spec[9];
-        // Overflow weight of the recomposed word: 2^16, 2^32 or 2^48.
-        ulong word_base = 1UL << (2u * result_limbs);
 
         ulong selector = constants[(ulong)selector_column * lde_rows + source_row];
         ulong filter = 1;
@@ -663,8 +565,8 @@ kernel void range_check_gate_quotient(
                     constraint_index++);
             }
         } else if (kind == 1u) {
-            // U16/U32/U48 SubtractionGate: five routed words followed by
-            // `result_limbs` base-4 result limbs per operation.
+            // U32SubtractionGate: five routed words followed by 16 base-4
+            // result limbs per operation.
             for (uint op = 0; op < num_ops; ++op) {
                 ulong routed_base = (ulong)op * 5u;
                 ulong input_x = wires[(routed_base + 0u) * lde_rows + source_row];
@@ -675,7 +577,7 @@ kernel void range_check_gate_quotient(
                 ulong result_initial = gl_sub(gl_sub(input_x, input_y), input_borrow);
                 ulong borrowed = gl_add(
                     result_initial,
-                    gl_mul(word_base, output_borrow));
+                    gl_mul(4294967296UL, output_borrow));
                 range_check_gate_emit(
                     gl_sub(output_result, borrowed),
                     alpha_powers,
@@ -683,9 +585,9 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
 
-                ulong limb_base = (ulong)num_ops * 5u + (ulong)op * result_limbs;
+                ulong limb_base = (ulong)num_ops * 5u + (ulong)op * 16u;
                 ulong recomposed = 0;
-                for (uint remaining = result_limbs; remaining > 0u; --remaining) {
+                for (uint remaining = 16u; remaining > 0u; --remaining) {
                     uint j = remaining - 1u;
                     ulong x = wires[(limb_base + j) * lde_rows + source_row];
                     ulong y = gl_mul(x, gl_sub(x, 3));
@@ -710,10 +612,9 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 2u) {
-            // U16/U32 AddManyGate: num_addends inputs, carry/result/output-carry,
-            // then `result_limbs` result and `num_carry_limbs` carry base-4
-            // limbs per operation.
+        } else {
+            // U32AddManyGate: num_addends inputs, carry/result/output-carry,
+            // then 16 result and two carry base-4 limbs per operation.
             uint routed_per_op = num_addends + 3u;
             for (uint op = 0; op < num_ops; ++op) {
                 ulong routed_base = (ulong)op * routed_per_op;
@@ -727,7 +628,7 @@ kernel void range_check_gate_quotient(
                     wires[(routed_base + num_addends + 1u) * lde_rows + source_row];
                 ulong output_carry =
                     wires[(routed_base + num_addends + 2u) * lde_rows + source_row];
-                ulong combined = gl_add(gl_mul(output_carry, word_base), output_result);
+                ulong combined = gl_add(gl_mul(output_carry, 4294967296UL), output_result);
                 range_check_gate_emit(
                     gl_sub(combined, computed),
                     alpha_powers,
@@ -735,12 +636,11 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
 
-                uint total_limbs = result_limbs + num_carry_limbs;
                 ulong limb_base =
-                    (ulong)routed_per_op * num_ops + (ulong)op * total_limbs;
+                    (ulong)routed_per_op * num_ops + (ulong)op * 18u;
                 ulong combined_result = 0;
                 ulong combined_carry = 0;
-                for (uint remaining = total_limbs; remaining > 0u; --remaining) {
+                for (uint remaining = 18u; remaining > 0u; --remaining) {
                     uint j = remaining - 1u;
                     ulong x = wires[(limb_base + j) * lde_rows + source_row];
                     ulong y = gl_mul(x, gl_sub(x, 3));
@@ -750,7 +650,7 @@ kernel void range_check_gate_quotient(
                         alpha_stride,
                         gate_accumulators,
                         constraint_index++);
-                    if (j < result_limbs) {
+                    if (j < 16u) {
                         combined_result = gl_add(gl_mul(combined_result, 4), x);
                     } else {
                         combined_carry = gl_add(gl_mul(combined_carry, 4), x);
@@ -769,398 +669,131 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 3u) {
-            // ByteDecompositionGate: per operation, one routed sum wire and
-            // `num_addends` routed byte wires (the metadata word carries the
-            // byte count for this kind), then four base-4 aux limbs per
-            // byte. Constraint order matches the CPU gate exactly: aux range
-            // products in ascending wire order, one base-4 recomposition per
-            // byte, then the base-256 byte-to-sum recomposition.
-            uint num_limbs = num_addends;
-            uint routed_per_op = 1u + num_limbs;
-            uint aux_per_op = 4u * num_limbs;
-            for (uint op = 0; op < num_ops; ++op) {
-                ulong routed_base = (ulong)op * routed_per_op;
-                ulong aux_base =
-                    (ulong)routed_per_op * num_ops + (ulong)op * aux_per_op;
-                for (uint j = 0; j < aux_per_op; ++j) {
-                    ulong x = wires[(aux_base + j) * lde_rows + source_row];
-                    ulong y = gl_mul(x, gl_sub(x, 3));
-                    range_check_gate_emit(
-                        gl_mul(y, gl_add(y, 2)),
-                        alpha_powers,
-                        alpha_stride,
-                        gate_accumulators,
-                        constraint_index++);
-                }
-                for (uint byte_index = 0; byte_index < num_limbs; ++byte_index) {
-                    ulong chunk = aux_base + (ulong)byte_index * 4u;
-                    ulong recomposed = wires[(chunk + 3u) * lde_rows + source_row];
-                    for (uint remaining = 3u; remaining > 0u; --remaining) {
-                        uint k = remaining - 1u;
-                        recomposed = gl_add(
-                            gl_mul(recomposed, 4),
-                            wires[(chunk + k) * lde_rows + source_row]);
-                    }
-                    ulong byte_value =
-                        wires[(routed_base + 1u + byte_index) * lde_rows + source_row];
-                    range_check_gate_emit(
-                        gl_sub(recomposed, byte_value),
-                        alpha_powers,
-                        alpha_stride,
-                        gate_accumulators,
-                        constraint_index++);
-                }
-                ulong recomposed_sum =
-                    wires[(routed_base + num_limbs) * lde_rows + source_row];
-                for (uint remaining = num_limbs - 1u; remaining > 0u; --remaining) {
-                    uint k = remaining - 1u;
-                    recomposed_sum = gl_add(
-                        gl_mul(recomposed_sum, 256),
-                        wires[(routed_base + 1u + k) * lde_rows + source_row]);
-                }
-                ulong expected_sum = wires[routed_base * lde_rows + source_row];
+        }
+
+        total[0] = gl_add(total[0], gl_mul(filter, gate_accumulators[0]));
+        total[1] = gl_add(total[1], gl_mul(filter, gate_accumulators[1]));
+    }
+
+    // RandomAccess records follow the U32 records with a nine-word layout:
+    // the five selector words, then bits, num_copies, num_extra_constants,
+    // and num_selectors (the constant-column base). Constraint rows are
+    // emitted in the CPU's order: per copy, `bits` boolean checks, the
+    // reconstructed-index check, the list-fold selection check, then the
+    // extra constant equalities. The fold mirrors the CPU accumulate path:
+    // the first level reads wire columns directly and later levels read the
+    // thread-local mirror, so every field operation happens in the same
+    // order with the same alpha powers.
+    constant uint* ra_metadata = metadata + ((ulong)range_count + (ulong)u32_count) * 8u;
+    for (uint ra_index = 0; ra_index < random_access_count; ++ra_index) {
+        constant uint* spec = ra_metadata + (ulong)ra_index * 9u;
+        uint selector_column = spec[0];
+        uint gate_index = spec[1];
+        uint group_start = spec[2];
+        uint group_end = spec[3];
+        uint include_unused_selector = spec[4];
+        uint bits = spec[5];
+        uint num_copies = spec[6];
+        uint num_extra_constants = spec[7];
+        uint num_selectors = spec[8];
+
+        ulong selector = constants[(ulong)selector_column * lde_rows + source_row];
+        ulong filter = 1;
+        for (uint i = group_start; i < group_end; ++i) {
+            if (i != gate_index) {
+                filter = gl_mul(filter, gl_sub((ulong)i, selector));
+            }
+        }
+        if (include_unused_selector != 0u) {
+            filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
+        }
+
+        uint vec_size = 1u << bits;
+        uint routed_per_copy = 2u + vec_size;
+        uint num_routed_wires = routed_per_copy * num_copies + num_extra_constants;
+
+        ulong gate_accumulators[2] = { 0, 0 };
+        uint constraint_index = 0;
+        // Bounded by the Rust-side guard bits <= 6 (vec_size <= 64).
+        thread ulong ra_items[64];
+
+        for (uint copy = 0; copy < num_copies; ++copy) {
+            for (uint i = 0; i < bits; ++i) {
+                ulong b = wires[
+                    (ulong)(num_routed_wires + copy * bits + i) * lde_rows + source_row];
                 range_check_gate_emit(
-                    gl_sub(recomposed_sum, expected_sum),
+                    gl_mul(b, gl_sub(b, 1)),
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 4u) {
-            // QuinticMultiplicationGate: fifteen routed words per operation
-            // (five limbs each for a, b and the claimed product c). The five
-            // constraints are the schoolbook product limbs reduced by
-            // u^5 = 3, minus the claimed output limbs, in ascending limb
-            // order exactly like the CPU accumulator.
-            for (uint op = 0; op < num_ops; ++op) {
-                ulong routed_base = (ulong)op * 15u;
-                ulong a[5];
-                ulong b[5];
-                for (uint j = 0; j < 5u; ++j) {
-                    a[j] = wires[(routed_base + j) * lde_rows + source_row];
-                    b[j] = wires[(routed_base + 5u + j) * lde_rows + source_row];
-                }
-                ulong d[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-                for (uint j = 0; j < 5u; ++j) {
-                    for (uint k = 0; k < 5u; ++k) {
-                        d[j + k] = gl_add(d[j + k], gl_mul(a[j], b[k]));
-                    }
-                }
-                for (uint k = 0; k < 5u; ++k) {
-                    ulong term = k < 4u
-                        ? gl_add(d[k], gl_mul(3, d[k + 5u]))
-                        : d[k];
-                    ulong c = wires[(routed_base + 10u + k) * lde_rows + source_row];
-                    range_check_gate_emit(
-                        gl_sub(term, c),
-                        alpha_powers,
-                        alpha_stride,
-                        gate_accumulators,
-                        constraint_index++);
-                }
+
+            ulong acc = 0;
+            for (uint i = bits; i > 0u; --i) {
+                ulong b = wires[
+                    (ulong)(num_routed_wires + copy * bits + i - 1u) * lde_rows + source_row];
+                acc = gl_add(gl_mul(acc, 2), b);
             }
-        } else if (kind == 5u) {
-            // QuinticSquaringGate: ten routed words per operation (input
-            // limbs a then output limbs c) plus ten temporary wires. Each
-            // constraint checks one accumulation step of the squaring
-            // against its temporary or output, in the exact CPU emission
-            // order.
-            for (uint op = 0; op < num_ops; ++op) {
-                ulong routed_base = (ulong)op * 10u;
-                ulong temp_base = (ulong)num_ops * 10u + (ulong)op * 10u;
-                ulong a[5];
-                ulong c[5];
-                ulong extra[10];
-                for (uint j = 0; j < 5u; ++j) {
-                    a[j] = wires[(routed_base + j) * lde_rows + source_row];
-                    c[j] = wires[(routed_base + 5u + j) * lde_rows + source_row];
+            ulong access_index =
+                wires[(ulong)(routed_per_copy * copy) * lde_rows + source_row];
+            range_check_gate_emit(
+                gl_sub(acc, access_index),
+                alpha_powers,
+                alpha_stride,
+                gate_accumulators,
+                constraint_index++);
+
+            if (bits != 0u) {
+                ulong b0 = wires[
+                    (ulong)(num_routed_wires + copy * bits) * lde_rows + source_row];
+                for (uint k = 0; k < vec_size / 2u; ++k) {
+                    ulong x = wires[
+                        (ulong)(routed_per_copy * copy + 2u + 2u * k) * lde_rows + source_row];
+                    ulong y = wires[
+                        (ulong)(routed_per_copy * copy + 2u + 2u * k + 1u) * lde_rows
+                        + source_row];
+                    ra_items[k] = gl_add(x, gl_mul(b0, gl_sub(y, x)));
                 }
-                for (uint j = 0; j < 10u; ++j) {
-                    extra[j] = wires[(temp_base + j) * lde_rows + source_row];
-                }
-
-                // c[0]
-                range_check_gate_emit(
-                    gl_sub(gl_mul(a[0], a[0]), extra[0]),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-                range_check_gate_emit(
-                    gl_sub(gl_add(gl_mul(gl_mul(6, a[1]), a[4]), extra[0]), extra[1]),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-                range_check_gate_emit(
-                    gl_sub(gl_add(gl_mul(gl_mul(6, a[2]), a[3]), extra[1]), c[0]),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-
-                // c[1]
-                range_check_gate_emit(
-                    gl_sub(gl_mul(gl_mul(3, a[3]), a[3]), extra[2]),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-                range_check_gate_emit(
-                    gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[1]), extra[2]), extra[3]),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-                range_check_gate_emit(
-                    gl_sub(gl_add(gl_mul(gl_mul(6, a[2]), a[4]), extra[3]), c[1]),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-
-                // c[2]
-                range_check_gate_emit(
-                    gl_sub(gl_mul(a[1], a[1]), extra[4]),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-                range_check_gate_emit(
-                    gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[2]), extra[4]), extra[5]),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-                range_check_gate_emit(
-                    gl_sub(gl_add(gl_mul(gl_mul(6, a[3]), a[4]), extra[5]), c[2]),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-
-                // c[3]
-                range_check_gate_emit(
-                    gl_sub(gl_mul(gl_mul(3, a[4]), a[4]), extra[6]),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-                range_check_gate_emit(
-                    gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[3]), extra[6]), extra[7]),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-                range_check_gate_emit(
-                    gl_sub(gl_add(gl_mul(gl_mul(2, a[1]), a[2]), extra[7]), c[3]),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-
-                // c[4]
-                range_check_gate_emit(
-                    gl_sub(gl_mul(a[2], a[2]), extra[8]),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-                range_check_gate_emit(
-                    gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[4]), extra[8]), extra[9]),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-                range_check_gate_emit(
-                    gl_sub(gl_add(gl_mul(gl_mul(2, a[1]), a[3]), extra[9]), c[4]),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-            }
-        } else if (kind == 6u) {
-            uint bits = num_addends;
-            uint num_extra_constants = result_limbs;
-            uint constant_base = num_carry_limbs;
-            uint num_copies = num_ops;
-            ulong vec_size = 1UL << bits;
-            ulong routed_per_copy = vec_size + 2u;
-            ulong extra_wire_base = routed_per_copy * num_copies;
-            ulong bit_base = extra_wire_base + num_extra_constants;
-
-            for (uint copy = 0; copy < num_copies; ++copy) {
-                ulong copy_base = routed_per_copy * copy;
-
-                // RandomAccessGate emits boolean constraints for b_0 upward.
-                for (uint i = 0; i < bits; ++i) {
-                    ulong b = wires[(bit_base + (ulong)copy * bits + i)
-                        * lde_rows + source_row];
-                    range_check_gate_emit(
-                        gl_mul(b, gl_sub(b, 1)),
-                        alpha_powers,
-                        alpha_stride,
-                        gate_accumulators,
-                        constraint_index++);
-                }
-
-                // Reconstruct the little-endian index in the CPU's exact
-                // reverse-bit `acc.double() + b` order.
-                ulong reconstructed_index = 0;
-                for (uint remaining = bits; remaining > 0u; --remaining) {
-                    uint i = remaining - 1u;
-                    ulong b = wires[(bit_base + (ulong)copy * bits + i)
-                        * lde_rows + source_row];
-                    reconstructed_index = gl_add(
-                        gl_add(reconstructed_index, reconstructed_index), b);
-                }
-                ulong access_index = wires[copy_base * lde_rows + source_row];
-                range_check_gate_emit(
-                    gl_sub(reconstructed_index, access_index),
-                    alpha_powers,
-                    alpha_stride,
-                    gate_accumulators,
-                    constraint_index++);
-
-                // Fold each eight-item block in ascending pair order, then fold
-                // block results with the remaining bits in the same order.
-                ulong block_results[8];
-                uint block_count = (uint)(vec_size / 8u);
-                ulong list_base = copy_base + 2u;
-                ulong copy_bit_base = bit_base + (ulong)copy * bits;
-                for (uint block = 0; block < block_count; ++block) {
-                    block_results[block] = random_access_select_8(
-                        wires, lde_rows, source_row, list_base, copy_bit_base, block);
-                }
-                uint level_size = block_count;
-                for (uint i = 3u; i < bits; ++i) {
-                    ulong b = wires[(copy_bit_base + i) * lde_rows + source_row];
+                uint level_size = vec_size / 2u;
+                for (uint i = 1u; i < bits; ++i) {
+                    ulong bi = wires[
+                        (ulong)(num_routed_wires + copy * bits + i) * lde_rows + source_row];
                     for (uint k = 0; k < level_size / 2u; ++k) {
-                        ulong x = block_results[2u * k];
-                        ulong y = block_results[2u * k + 1u];
-                        block_results[k] = gl_add(x, gl_mul(b, gl_sub(y, x)));
+                        ra_items[k] = gl_add(
+                            ra_items[2u * k],
+                            gl_mul(bi, gl_sub(ra_items[2u * k + 1u], ra_items[2u * k])));
                     }
                     level_size /= 2u;
                 }
-                ulong claimed_element = wires[(copy_base + 1u) * lde_rows + source_row];
-                range_check_gate_emit(
-                    gl_sub(block_results[0], claimed_element),
-                    alpha_powers,
-                    alpha_stride,
-                    gate_accumulators,
-                    constraint_index++);
             }
-
-            // Raw local constants follow all gate and lookup selectors.
-            for (uint i = 0; i < num_extra_constants; ++i) {
-                ulong local_constant = constants[
-                    ((ulong)constant_base + i) * lde_rows + source_row];
-                ulong extra_wire = wires[
-                    (extra_wire_base + i) * lde_rows + source_row];
-                range_check_gate_emit(
-                    gl_sub(local_constant, extra_wire),
-                    alpha_powers,
-                    alpha_stride,
-                    gate_accumulators,
-                    constraint_index++);
-            }
-        } else if (kind == 7u) {
-            // ExponentiationGate: wire 0 is the base, wires 1..=n the power
-            // bits in little-endian order, wire 1+n the output and wires
-            // 2+n..2+2n the running intermediate values; `num_ops` carries n.
-            // The accumulation walks the bits big-endian and seeds the chain
-            // with ONE rather than a square, exactly as the CPU evaluator.
-            uint num_power_bits = num_ops;
-            ulong exponent_base = wires[(ulong)0 * lde_rows + source_row];
-            for (uint i = 0; i < num_power_bits; ++i) {
-                ulong previous;
-                if (i == 0u) {
-                    previous = 1;
-                } else {
-                    ulong last = wires[((ulong)2u + num_power_bits + i - 1u) * lde_rows
-                                       + source_row];
-                    previous = gl_mul(last, last);
-                }
-                ulong current_bit =
-                    wires[((ulong)1u + (num_power_bits - i - 1u)) * lde_rows + source_row];
-                ulong multiplier =
-                    gl_add(gl_mul(current_bit, exponent_base), gl_sub(1, current_bit));
-                ulong intermediate =
-                    wires[((ulong)2u + num_power_bits + i) * lde_rows + source_row];
-                range_check_gate_emit(
-                    gl_sub(gl_mul(previous, multiplier), intermediate),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-            }
-            ulong output_value = wires[((ulong)1u + num_power_bits) * lde_rows + source_row];
-            ulong final_intermediate =
-                wires[((ulong)1u + 2u * num_power_bits) * lde_rows + source_row];
+            ulong claimed_element =
+                wires[(ulong)(routed_per_copy * copy + 1u) * lde_rows + source_row];
+            ulong selected = (bits == 0u)
+                ? wires[(ulong)(routed_per_copy * copy + 2u) * lde_rows + source_row]
+                : ra_items[0];
             range_check_gate_emit(
-                gl_sub(output_value, final_intermediate),
-                alpha_powers, alpha_stride, gate_accumulators,
-                constraint_index++);
-        } else if (kind == 8u) {
-            // EqualityGate: three routed words per operation (x, y, equal)
-            // followed by three unrouted temporaries (diff, invdiff, prod).
-            // The addend slot carries the constants column holding the gate's
-            // first constant, its "one" value.
-            uint constant_column = num_addends;
-            ulong const_0 = constants[(ulong)constant_column * lde_rows + source_row];
-            for (uint op = 0; op < num_ops; ++op) {
-                ulong routed_base = (ulong)op * 3u;
-                ulong x = wires[(routed_base + 0u) * lde_rows + source_row];
-                ulong y = wires[(routed_base + 1u) * lde_rows + source_row];
-                ulong equal = wires[(routed_base + 2u) * lde_rows + source_row];
-                ulong temporary_base = (ulong)num_ops * 3u + (ulong)op * 3u;
-                ulong difference = wires[(temporary_base + 0u) * lde_rows + source_row];
-                ulong inverse = wires[(temporary_base + 1u) * lde_rows + source_row];
-                ulong product = wires[(temporary_base + 2u) * lde_rows + source_row];
-
-                range_check_gate_emit(
-                    gl_sub(gl_sub(x, y), difference),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-                range_check_gate_emit(
-                    gl_sub(gl_mul(difference, inverse), product),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-                range_check_gate_emit(
-                    gl_sub(gl_mul(product, difference), difference),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-                range_check_gate_emit(
-                    gl_sub(gl_sub(const_0, product), equal),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-            }
-        } else if (kind == 9u) {
-            // ReducingGate / ReducingExtensionGate at D == 2. Wires 0..2 are
-            // the output, 2..4 alpha, 4..6 the incoming accumulator, then one
-            // (base) or two (extension) wires per coefficient, then one
-            // two-wire accumulator per step except the last, which aliases the
-            // output. Each step emits the two components of
-            // `acc * alpha + coeff - next_acc` in that order.
-            //
-            // The quadratic extension is F[x]/(x^2 - 7) for Goldilocks:
-            //   (a0 + a1 x)(b0 + b1 x) = (a0 b0 + 7 a1 b1) + (a0 b1 + a1 b0) x.
-            uint extension_coeffs = num_addends;
-            uint coeff_wires = extension_coeffs != 0u ? 2u : 1u;
-            uint coeff_start = 6u;
-            uint acc_start = coeff_start + num_ops * coeff_wires;
-            ulong alpha_0 = wires[(ulong)2u * lde_rows + source_row];
-            ulong alpha_1 = wires[(ulong)3u * lde_rows + source_row];
-            ulong acc_0 = wires[(ulong)4u * lde_rows + source_row];
-            ulong acc_1 = wires[(ulong)5u * lde_rows + source_row];
-            for (uint i = 0; i < num_ops; ++i) {
-                uint next_start = (i + 1u == num_ops) ? 0u : acc_start + 2u * i;
-                ulong next_0 = wires[(ulong)next_start * lde_rows + source_row];
-                ulong next_1 = wires[((ulong)next_start + 1u) * lde_rows + source_row];
-
-                uint coeff_wire = coeff_start + i * coeff_wires;
-                ulong coeff_0 = wires[(ulong)coeff_wire * lde_rows + source_row];
-                ulong coeff_1 = extension_coeffs != 0u
-                    ? wires[((ulong)coeff_wire + 1u) * lde_rows + source_row]
-                    : 0;
-
-                ulong product_0 = gl_add(
-                    gl_mul(acc_0, alpha_0),
-                    gl_mul(7, gl_mul(acc_1, alpha_1)));
-                ulong product_1 = gl_add(
-                    gl_mul(acc_0, alpha_1),
-                    gl_mul(acc_1, alpha_0));
-                range_check_gate_emit(
-                    gl_sub(gl_add(product_0, coeff_0), next_0),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-                range_check_gate_emit(
-                    gl_sub(gl_add(product_1, coeff_1), next_1),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-
-                acc_0 = next_0;
-                acc_1 = next_1;
-            }
-        } else {
-            // The Rust encoder rejects unknown discriminants; if a malformed
-            // record reaches the shader, make its selected row unsatisfiable.
-            range_check_gate_emit(
-                1, alpha_powers, alpha_stride, gate_accumulators,
+                gl_sub(selected, claimed_element),
+                alpha_powers,
+                alpha_stride,
+                gate_accumulators,
                 constraint_index++);
         }
 
-        total[0] = gl_mul_add(filter, gate_accumulators[0], total[0]);
-        total[1] = gl_mul_add(filter, gate_accumulators[1], total[1]);
+        for (uint i = 0; i < num_extra_constants; ++i) {
+            ulong const_value = constants[(ulong)(num_selectors + i) * lde_rows + source_row];
+            ulong wire = wires[
+                (ulong)(routed_per_copy * num_copies + i) * lde_rows + source_row];
+            range_check_gate_emit(
+                gl_sub(const_value, wire),
+                alpha_powers,
+                alpha_stride,
+                gate_accumulators,
+                constraint_index++);
+        }
+
+        total[0] = gl_add(total[0], gl_mul(filter, gate_accumulators[0]));
+        total[1] = gl_add(total[1], gl_mul(filter, gate_accumulators[1]));
     }
 
     output[(ulong)gid * 2] = gl_canonicalize(total[0]);
@@ -1347,53 +980,5 @@ kernel void poseidon2_hash_parents(
     device ulong* output = parents + (ulong)gid * 4;
     for (uint i = 0; i < 4; ++i) {
         output[i] = gl_canonicalize(state[i]);
-    }
-}
-
-// One sponge absorption pass over a group of at most eight natural-order
-// columns, with the running 12-lane state parked in `state` between passes
-// (column-major: lane i of row gid at state[i * leaf_count + gid]). The
-// final pass writes the four-lane digests to `hashes` at the bit-reversed
-// row, exactly like poseidon2_hash_leaves_colmajor. Splitting the sponge by
-// column group lets the CPU compute group g+1's LDE columns while the GPU
-// absorbs group g; the arithmetic per pass is identical to the fused
-// kernel's corresponding loop iteration.
-kernel void poseidon2_absorb_pass(
-    const device ulong* leaves [[buffer(0)]],
-    device ulong* state [[buffer(1)]],
-    device ulong* hashes [[buffer(2)]],
-    constant ulong* parameters [[buffer(3)]],
-    constant uint& leaf_count [[buffer(4)]],
-    constant uint& log_leaf_count [[buffer(5)]],
-    constant uint& col_start [[buffer(6)]],
-    constant uint& chunk_size [[buffer(7)]],
-    constant uint& first_pass [[buffer(8)]],
-    constant uint& final_pass [[buffer(9)]],
-    uint gid [[thread_position_in_grid]]) {
-    if (gid >= leaf_count) {
-        return;
-    }
-    ulong st[12] = { 0 };
-    if (first_pass == 0u) {
-        for (uint i = 0; i < 12; ++i) {
-            st[i] = state[(ulong)i * leaf_count + gid];
-        }
-    }
-    for (uint i = 0; i < chunk_size; ++i) {
-        st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
-    }
-    poseidon2(st, parameters);
-    if (final_pass != 0u) {
-        uint out_row = log_leaf_count == 0
-            ? gid
-            : (reverse_bits(gid) >> (32 - log_leaf_count));
-        device ulong* output = hashes + (ulong)out_row * 4;
-        for (uint i = 0; i < 4; ++i) {
-            output[i] = gl_canonicalize(st[i]);
-        }
-    } else {
-        for (uint i = 0; i < 12; ++i) {
-            state[(ulong)i * leaf_count + gid] = st[i];
-        }
     }
 }

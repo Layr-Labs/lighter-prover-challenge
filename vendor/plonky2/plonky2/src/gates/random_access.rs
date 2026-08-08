@@ -15,7 +15,7 @@ use crate::field::extension::Extendable;
 use crate::field::packable::Packable;
 use crate::field::packed::PackedField;
 use crate::field::types::Field;
-use crate::gates::gate::{Gate, U32QuotientGate};
+use crate::gates::gate::{Gate, RandomAccessQuotientGate};
 use crate::gates::packed_util::PackedEvaluableBase;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -525,18 +525,18 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
         self.num_copies * constraints_per_copy + self.num_extra_constants
     }
 
-    fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
-        Some(U32QuotientGate::RandomAccess {
-            bits: self.bits,
-            num_ops: self.num_copies,
-            num_extra_constants: self.num_extra_constants,
-        })
-    }
-
     fn extra_constant_wires(&self) -> Vec<(usize, usize)> {
         (0..self.num_extra_constants)
             .map(|i| (i, self.wire_extra_constant(i)))
             .collect()
+    }
+
+    fn random_access_quotient_gate(&self) -> Option<RandomAccessQuotientGate> {
+        Some(RandomAccessQuotientGate {
+            bits: self.bits,
+            num_copies: self.num_copies,
+            num_extra_constants: self.num_extra_constants,
+        })
     }
 }
 

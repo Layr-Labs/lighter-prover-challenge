@@ -648,6 +648,8 @@ mod tests {
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::uint::u32::gates::arithmetic_u32::U32ArithmeticGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use plonky2::gates::random_access::RandomAccessGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::uint::u32::gates::subtraction_u32::U32SubtractionGate;
 
     use super::*;
@@ -748,6 +750,26 @@ mod tests {
         builder.connect(carry, Target::wire(row, add_many.wire_ith_carry(op)));
         u32_inputs.push((carry, 7));
 
+        // RandomAccessGate with the production-ranked shape (bits=4). One
+        // copy's index and list are driven from virtual targets so the
+        // witness generator produces a nontrivial selection.
+        let random_access = RandomAccessGate::<F, D>::new_from_config(&config, 4);
+        assert_eq!(random_access.bits, 4);
+        assert_eq!(random_access.num_extra_constants, 2);
+        let (row, _op) = builder.find_slot(
+            random_access,
+            &[F::from_canonical_usize(7), F::from_canonical_usize(11)],
+            &[],
+        );
+        let ra_index = builder.add_virtual_target();
+        builder.connect(ra_index, Target::wire(row, random_access.wire_access_index(0)));
+        let mut ra_inputs = Vec::new();
+        for j in 0..(1usize << random_access.bits) {
+            let input = builder.add_virtual_target();
+            builder.connect(input, Target::wire(row, random_access.wire_list_item(j, 0)));
+            ra_inputs.push(input);
+        }
+
         // 4097 rows pad to degree 8192. Its rate-8 constants/sigmas and wire
         // commitments both exceed the retained-Metal routing threshold.
         while builder.num_gates() < 4097 {
@@ -767,6 +789,10 @@ mod tests {
         }
         for (input, value) in u32_inputs {
             pw.set_target(input, F::from_canonical_u64(value))?;
+        }
+        pw.set_target(ra_index, F::from_canonical_usize(5))?;
+        for (j, input) in ra_inputs.iter().enumerate() {
+            pw.set_target(*input, F::from_canonical_usize(j + 1))?;
         }
 
         let before = plonky2::plonk::prover::gpu_poseidon_quotient_stats();
