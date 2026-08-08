@@ -165,7 +165,26 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
             .par_chunks_exact(arity)
             .map(|chunk| reduce_with_powers(chunk, beta))
             .collect::<Vec<_>>();
-        folded.resize(n_chunks, F::Extension::ZERO);
+        // The historical `resize(n_chunks, ZERO)` zero-filled the whole dead
+        // tail. Zeros are actually *read as values* only where the next
+        // round's exact-`arity` chunking can reach past the live support —
+        // at most `arity_next - 1` slots past `live` — because every other
+        // tail consumer (the zero-tail coset FFT and the final truncation +
+        // transcript observation) reads only the live prefix. Extend the
+        // length without storing the rest.
+        let live = folded.len();
+        folded.reserve(n_chunks - live);
+        // SAFETY: length equals capacity; the slots beyond `pad_end` are
+        // never read (see above), and `F::Extension` is plain data.
+        unsafe { folded.set_len(n_chunks) };
+        let pad_end = if round + 1 < num_rounds {
+            n_chunks.min(live + (1 << fri_params.reduction_arity_bits[round + 1]))
+        } else {
+            live
+        };
+        for value in folded[live..pad_end].iter_mut() {
+            *value = F::Extension::ZERO;
+        }
         coeffs = PolynomialCoeffs::new(folded);
         shift = shift.exp_u64(arity as u64);
         // Chunk-wise folding preserves the zero tail: the coefficient vector
