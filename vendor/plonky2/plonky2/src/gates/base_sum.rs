@@ -170,14 +170,33 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> PackedEvaluab
     ) {
         let sum = vars.local_wires[Self::WIRE_SUM];
         let limbs = vars.local_wires.view(self.limbs());
-        let computed_sum = reduce_with_powers(limbs, F::from_canonical_usize(B));
+        let computed_sum = if B == 2 {
+            limbs
+                .iter()
+                .rev()
+                .fold(P::ZEROS, |acc, &limb| acc + acc + limb)
+        } else if B == 4 {
+            limbs.iter().rev().fold(P::ZEROS, |acc, &limb| {
+                let doubled = acc + acc;
+                doubled + doubled + limb
+            })
+        } else {
+            reduce_with_powers(limbs, F::from_canonical_usize(B))
+        };
 
         yield_constr.one(computed_sum - sum);
 
         let constraints_iter = limbs.iter().map(|&limb| {
-            (0..B)
-                .map(|i| limb - F::from_canonical_usize(i))
-                .product::<P>()
+            if B == 2 {
+                limb * (limb - F::ONE)
+            } else if B == 4 {
+                let y = limb * (limb - F::from_canonical_usize(3));
+                y * (y + F::TWO)
+            } else {
+                (0..B)
+                    .map(|i| limb - F::from_canonical_usize(i))
+                    .product::<P>()
+            }
         });
         yield_constr.many(constraints_iter);
     }
@@ -261,6 +280,15 @@ mod tests {
         type C = PoseidonGoldilocksConfig;
         type F = <C as GenericConfig<D>>::F;
         test_eval_fns::<F, C, _, D>(BaseSumGate::<6>::new(11))
+    }
+
+    #[test]
+    fn optimized_binary_and_quaternary_eval_fns() -> Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        test_eval_fns::<F, C, _, D>(BaseSumGate::<2>::new(63))?;
+        test_eval_fns::<F, C, _, D>(BaseSumGate::<4>::new(32))
     }
 
     /// Manual timing harness for the packed accumulate path of the production
