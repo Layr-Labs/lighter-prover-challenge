@@ -374,15 +374,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         let chunk_size = max_degree;
         let num_chunks = num_routed_wires.div_ceil(chunk_size);
         debug_assert_eq!(num_chunks, num_prods + 1);
-        // The per-point loop chains ALL z_1 terms (i ascending) before ALL
-        // partial-product terms (i-major, chunk-minor); the row layout must
-        // match exactly so each term meets the same alpha power.
-        let num_rows = num_challenges * (1 + num_chunks);
-
         let term_rows = &mut scratch.vanishing_partial_products_terms;
-        if term_rows.len() != num_rows * n {
-            term_rows.resize(num_rows * n, F::ZERO);
-        }
 
         let l_0_xs = &mut scratch.vanishing_z_1_terms;
         l_0_xs.clear();
@@ -415,14 +407,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             }
         };
 
-        for i in 0..num_challenges {
-            let z_col = acc_col(i, 0);
-            let z1_row = &mut term_rows[i * n..][..n];
-            for k in 0..n {
-                z1_row[k] = l_0_xs[k] * z_col[k].sub_one();
-            }
-        }
-
         if num_challenges == 2 {
             // Both production challenges traverse the same routed-wire,
             // sigma and point columns. Keep their arithmetic chains separate,
@@ -433,7 +417,14 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             let beta_1 = betas[1];
             let gamma_0 = gammas[0];
             let gamma_1 = gammas[1];
-            for c in 0..num_chunks {
+            // Horner consumes challenge 1's partial-product rows from the
+            // last chunk to the first, followed by challenge 0 in the same
+            // order. Traverse chunks backwards and fold challenge 1 directly
+            // into `res_out`; only challenge 0 needs temporary rows. This
+            // preserves the exact term and field-operation order while
+            // deleting challenge 1's row writes and later reads.
+            term_rows.resize(num_chunks * n, F::ZERO);
+            for c in (0..num_chunks).rev() {
                 let j_start = c * chunk_size;
                 let j_end = ((c + 1) * chunk_size).min(num_routed_wires);
 
@@ -472,22 +463,66 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     }
                 }
 
-                let row_0 = (num_challenges + c) * n;
-                let row_1 = (num_challenges + num_chunks + c) * n;
-                let (rows_before_1, rows_from_1) = term_rows.split_at_mut(row_1);
-                let row_0 = &mut rows_before_1[row_0..row_0 + n];
-                let row_1 = &mut rows_from_1[..n];
+                let row_0 = &mut term_rows[c * n..][..n];
                 let prev_0 = acc_col(0, c);
                 let next_0 = acc_col(0, c + 1);
                 let prev_1 = acc_col(1, c);
                 let next_1 = acc_col(1, c + 1);
                 for k in 0..n {
                     row_0[k] = prev_0[k] * num_prod[k] - next_0[k] * den_prod[k];
-                    row_1[k] = prev_1[k] * num_prod_second[k]
+                    let term_1 = prev_1[k] * num_prod_second[k]
                         - next_1[k] * den_prod_second[k];
+                    let res = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
+                    for (value, &alpha) in res.iter_mut().zip(alphas) {
+                        *value = term_1.multiply_accumulate(*value, alpha);
+                    }
                 }
             }
+
+            // Challenge 0 follows challenge 1 in reversed Horner order.
+            for c in (0..num_chunks).rev() {
+                let row_0 = &term_rows[c * n..][..n];
+                for k in 0..n {
+                    let res = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
+                    for (value, &alpha) in res.iter_mut().zip(alphas) {
+                        *value = row_0[k].multiply_accumulate(*value, alpha);
+                    }
+                }
+            }
+
+            // The two Z-at-one rows precede partial products in forward term
+            // order, hence follow them here as challenge 1 then challenge 0.
+            for i in (0..num_challenges).rev() {
+                let z_col = acc_col(i, 0);
+                for k in 0..n {
+                    let term = l_0_xs[k] * z_col[k].sub_one();
+                    let res = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
+                    for (value, &alpha) in res.iter_mut().zip(alphas) {
+                        *value = term.multiply_accumulate(*value, alpha);
+                    }
+                }
+            }
+
+            l_0_xs.clear();
+            num_prod.clear();
+            den_prod.clear();
+            num_prod_second.clear();
+            den_prod_second.clear();
+            return;
         } else {
+            // The per-point loop chains ALL z_1 terms (i ascending) before
+            // ALL partial-product terms (i-major, chunk-minor); the row
+            // layout must match exactly so each term meets the same alpha
+            // power.
+            let num_rows = num_challenges * (1 + num_chunks);
+            term_rows.resize(num_rows * n, F::ZERO);
+            for i in 0..num_challenges {
+                let z_col = acc_col(i, 0);
+                let z1_row = &mut term_rows[i * n..][..n];
+                for k in 0..n {
+                    z1_row[k] = l_0_xs[k] * z_col[k].sub_one();
+                }
+            }
             for i in 0..num_challenges {
                 for c in 0..num_chunks {
                     let j_start = c * chunk_size;
@@ -531,7 +566,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         }
 
         // Same reversed-order Horner reduction as the per-point loop.
-        for t in (0..num_rows).rev() {
+        for t in (0..num_challenges * (1 + num_chunks)).rev() {
             let row = &term_rows[t * n..][..n];
             for k in 0..n {
                 let res = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
