@@ -265,7 +265,13 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     }
     write_compressed_section(&mut out, &buf);
 
-    Ok(out)
+    // Outer entropy-coded wrap: LZ4 sections carry no entropy stage, so the
+    // assembled blob still shrinks ~3x under zstd. Binary bytes are what the
+    // per-spawn signature-validation tax charges for, so the wrap is applied
+    // to the whole blob rather than per section.
+    let wrapped = zstd::stream::encode_all(&out[..], 19)
+        .context("zstd-wrapping embedded circuit blob")?;
+    Ok(wrapped)
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +290,18 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
 pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, CircuitData<F, C, D>)> {
     let gate_serializer = BlockGateSerializer;
     let generator_serializer = embed_generator_serializer();
+
+    // Blobs are zstd-wrapped as a whole (frame magic 0x28 B5 2F FD); unwrap
+    // before parsing. Unwrapped blobs still parse directly, so a build with
+    // the wrap disabled degrades to the previous format instead of failing.
+    let unwrapped;
+    let bytes = if bytes.len() >= 4 && bytes[0..4] == [0x28, 0xB5, 0x2F, 0xFD] {
+        unwrapped = zstd::stream::decode_all(bytes)
+            .context("embedded circuit blob failed zstd unwrap")?;
+        &unwrapped[..]
+    } else {
+        bytes
+    };
 
     ensure!(bytes.len() >= 8, "embedded circuit blob too short");
     let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
