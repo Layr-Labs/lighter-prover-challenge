@@ -369,16 +369,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         let chunk_size = max_degree;
         let num_chunks = num_routed_wires.div_ceil(chunk_size);
         debug_assert_eq!(num_chunks, num_prods + 1);
-        // The per-point loop chains ALL z_1 terms (i ascending) before ALL
-        // partial-product terms (i-major, chunk-minor); the row layout must
-        // match exactly so each term meets the same alpha power.
-        let num_rows = num_challenges * (1 + num_chunks);
-
-        let term_rows = &mut scratch.vanishing_partial_products_terms;
-        if term_rows.len() != num_rows * n {
-            term_rows.resize(num_rows * n, F::ZERO);
-        }
-
         let l_0_xs = &mut scratch.vanishing_z_1_terms;
         l_0_xs.clear();
         l_0_xs.extend(
@@ -408,14 +398,14 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             }
         };
 
-        for i in 0..num_challenges {
-            let z_col = acc_col(i, 0);
-            let z1_row = &mut term_rows[i * n..][..n];
-            for k in 0..n {
-                z1_row[k] = l_0_xs[k] * z_col[k].sub_one();
-            }
-
-            for c in 0..num_chunks {
+        // The logical term order is every z_1 row, followed by partial-product
+        // rows in (challenge, chunk) order. Horner reduction consumes that list
+        // backwards, so generate partial rows in reverse order and reduce each
+        // one immediately, then do the z_1 rows in reverse. This deletes the
+        // term matrix and its second traversal without changing a single
+        // multiply-accumulate in the reduction chain.
+        for i in (0..num_challenges).rev() {
+            for c in (0..num_chunks).rev() {
                 let j_start = c * chunk_size;
                 let j_end = ((c + 1) * chunk_size).min(num_routed_wires);
                 let beta = betas[i];
@@ -447,25 +437,27 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     }
                 }
 
-                let row =
-                    &mut term_rows[(num_challenges + i * num_chunks + c) * n..][..n];
                 // Chunk c reads accumulator column c as prev and column c+1
                 // as next.
                 let prev_col = acc_col(i, c);
                 let next_col = acc_col(i, c + 1);
                 for k in 0..n {
-                    row[k] = prev_col[k] * num_prod[k] - next_col[k] * den_prod[k];
+                    let term = prev_col[k] * num_prod[k] - next_col[k] * den_prod[k];
+                    let res = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
+                    for (value, &alpha) in res.iter_mut().zip(alphas) {
+                        *value = term.multiply_accumulate(*value, alpha);
+                    }
                 }
             }
         }
 
-        // Same reversed-order Horner reduction as the per-point loop.
-        for t in (0..num_rows).rev() {
-            let row = &term_rows[t * n..][..n];
+        for i in (0..num_challenges).rev() {
+            let z_col = acc_col(i, 0);
             for k in 0..n {
+                let term = l_0_xs[k] * z_col[k].sub_one();
                 let res = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
-                for (c, &alpha) in res.iter_mut().zip(alphas) {
-                    *c = row[k].multiply_accumulate(*c, alpha);
+                for (value, &alpha) in res.iter_mut().zip(alphas) {
+                    *value = term.multiply_accumulate(*value, alpha);
                 }
             }
         }
