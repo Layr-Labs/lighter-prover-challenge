@@ -1,32 +1,30 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use circuit::block::Block;
-use circuit::block_constraints::{BlockCircuit, Circuit as _};
+use circuit::block_constraints::BlockCircuit;
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
 use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
 use circuit::block_tx::{BlockTx, JumpState, JumpStateTarget};
 use circuit::block_tx_chain_constraints::{
-    BlockTxChainCircuit, BlockTxChainTarget, cyclic_base_witness,
+    cyclic_base_witness, BlockTxChainCircuit, BlockTxChainTarget,
 };
-use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget};
 #[cfg(test)]
 use circuit::block_tx_constraints::Circuit as _;
+use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget};
 use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
-use plonky2::iop::generator::{ParallelWitnessGuard, PendingPartitionWitness};
 #[cfg(test)]
 use plonky2::iop::generator::generate_partial_witness;
-use plonky2::iop::witness::{PartitionWitness, Witness};
+use plonky2::iop::generator::{ParallelWitnessGuard, PendingPartitionWitness};
+use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::util::timing::TimingTree;
 
-use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
+use crate::api::{Circuits, Proof, PROVER_THREAD_STACK_BYTES};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxPath {
@@ -34,45 +32,15 @@ enum TxPath {
     Light,
 }
 
-const LIGHT_TX_PROOF_WINDOW: usize = 2;
+const LIGHT_TX_PROOF_WINDOW: usize = 3;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
-const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
+const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 2;
 
 fn chunk_is_light(txs: &[Tx<F>]) -> bool {
     txs.first()
         .expect("block transaction chunk must not be empty")
         .tx_circuit_type
         == TX_LIGHT
-}
-
-fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
-    (light, heavy)
-}
-
-/// Whether the calling transaction path may claim the process-global exclusive
-/// GPU phase for its chain tail.
-///
-/// `set_exclusive_gpu_phase` lowers the CPU/GPU Merkle routing cutoff and makes
-/// the 2^17-leaf narrow commitment trees (the chain steps' Z/partial-product and
-/// quotient trees) bypass the GPU occupancy check entirely. Its documented
-/// contract is that no other proof runs concurrently while it is enabled, because
-/// Metal command buffers execute FIFO on one queue: a fold's ~8 ms tree enqueued
-/// behind a pipelined 2^19-leaf chunk tree waits hundreds of milliseconds instead
-/// of ~15 ms on the CPU.
-///
-/// The tail-drain condition each path can test locally — "this path spawns no
-/// further chunk work" — is *not* that contract. The heavy path has three chunks
-/// and the light path forty-nine, so the heavy path reaches its drain while the
-/// light pipeline is at full saturation. Claiming the exclusive phase there
-/// disables occupancy-conditional routing process-wide for the light pipeline and
-/// simultaneously force-routes this path's own fold trees behind the light
-/// pipeline's chunk trees — it hurts both sides. The claim is legitimate only for
-/// the path that is the last one still proving, which this counter identifies.
-///
-/// Routing is a scheduling heuristic: either outcome hashes the identical tree,
-/// so a stale read here is benign and no proof byte depends on the answer.
-fn claims_exclusive_gpu_phase(active_paths: &AtomicUsize) -> bool {
-    active_paths.load(Ordering::Acquire) == 1
 }
 
 /// Marks the calling thread as latency-critical to the macOS scheduler.
@@ -220,7 +188,9 @@ fn generate_tx_witness<'a>(
     )
     .and_then(PendingPartitionWitness::finish)
     .unwrap_or_else(|error| {
-        panic!("{path:?} block transaction chunk #{chunk_index} witness generation failed: {error:?}")
+        panic!(
+            "{path:?} block transaction chunk #{chunk_index} witness generation failed: {error:?}"
+        )
     });
     let new_jump = jump_from_witness(&partition_witness, &tx_target.new_jump);
     (partition_witness, new_jump)
@@ -252,35 +222,27 @@ fn prove_tx_witness(
 fn prove_path(
     path: TxPath,
     chunks: Vec<(usize, Vec<Tx<F>>)>,
-    circuits: &Circuits,
+    tx_data: &mut CircuitData<F, C, D>,
+    tx_target: &BlockTxTarget,
+    chain_data: &CircuitData<F, C, D>,
+    chain_target: &BlockTxChainTarget,
+    dummy_proof: &Proof,
     block_number: u64,
     created_at: i64,
     old_account_delta_tree_root: HashOut<F>,
     pre_output: &BlockPreExecWitness<F>,
     state_metadata_hash: HashOut<F>,
-    active_paths: &AtomicUsize,
 ) -> Proof {
     assert!(
         !chunks.is_empty(),
         "{path:?} transaction path must contain at least one chunk"
     );
-    let (tx_data, tx_target, chain_data, chain_target, dummy_proof) = match path {
-        TxPath::Light => (
-            &circuits.light_tx_data,
-            &circuits.light_tx_target,
-            &circuits.light_chain_data,
-            &circuits.light_chain_target,
-            &circuits.dummy_light_proof,
-        ),
-        TxPath::Heavy => (
-            &circuits.heavy_tx_data,
-            &circuits.heavy_tx_target,
-            &circuits.heavy_chain_data,
-            &circuits.heavy_chain_target,
-            &circuits.dummy_heavy_proof,
-        ),
-    };
-
+    // The light-path caller generates each next witness between proof launches and
+    // therefore advances the same ordered spine as the chain-fold threads. Keep that
+    // orchestrator on a performance core too; the concurrent heavy path stays default QoS.
+    if path == TxPath::Light {
+        mark_spine_thread_latency_critical();
+    }
     let base_proof = cyclic_base_witness(
         dummy_proof,
         block_number,
@@ -304,9 +266,9 @@ fn prove_path(
         jump,
     );
     jump = next_jump;
-
-
-    let chain_proof = std::thread::scope(|scope| {
+    let chain_proof = {
+        let tx_data = &*tx_data;
+        std::thread::scope(|scope| {
         let base = &base_proof;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
@@ -319,7 +281,6 @@ fn prove_path(
                 // after its tx-proof-side witness generation: the path thread never blocks here.
                 let previous = chain.take();
                 let handle = std::thread::Builder::new()
-                    .name(format!("{path:?}-chain-step-{chain_step}"))
                     .stack_size(PROVER_THREAD_STACK_BYTES)
                     .spawn_scoped(scope, move || {
                         chain_step_proof(
@@ -339,7 +300,6 @@ fn prove_path(
 
             let witness = current_witness;
             let proof_handle = std::thread::Builder::new()
-                .name(format!("{path:?}-tx-proof-{current_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
                     prove_tx_witness(path, current_chunk_index, tx_data, witness)
@@ -368,7 +328,13 @@ fn prove_path(
                 } else {
                     1
                 };
-            if in_flight.len() >= max_in_flight {
+            // A completed proof no longer consumes compute capacity, so dispatch it to
+            // the ordered chain immediately instead of waiting for the fixed overlap
+            // window to fill. Running proofs still retain the full light-path window.
+            let front_is_ready = in_flight
+                .front()
+                .is_some_and(|(_, proof_handle)| proof_handle.is_finished());
+            if in_flight.len() >= max_in_flight || front_is_ready {
                 let (proof_step, proof_handle) = in_flight
                     .pop_front()
                     .expect("transaction proof window must not be empty");
@@ -391,7 +357,6 @@ fn prove_path(
         if let Some((chain_step, tx_proof)) = pending_tx.take() {
             let previous = chain.take();
             let handle = std::thread::Builder::new()
-                .name(format!("{path:?}-chain-step-{chain_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
                     chain_step_proof(
@@ -408,59 +373,74 @@ fn prove_path(
                 .expect("chain step pipeline thread must start");
             chain = Some(ChainState::InFlight(handle));
         }
-        // Past this point the pipeline spawns no new chunk work: the drain
-        // below is the strictly sequential chain tail, so its mid-size
-        // commitment trees can use the mostly idle GPU exactly like the
-        // pre-execution and final block phases — but only once this path is the
-        // last one proving, since the switch is process-global (see
-        // [`claims_exclusive_gpu_phase`]).
-        let exclusive_drain = claims_exclusive_gpu_phase(active_paths);
-        if exclusive_drain {
-            plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-        }
+        // The tail is sequential in chain order, but remaining transaction proofs and
+        // predecessor-linked chain threads are still alive concurrently. Do not lower
+        // the process-global GPU routing threshold here: that would also send their
+        // mid-size trees into the single serialized GPU queue and create priority inversion.
         while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
             let tx_proof = proof_handle
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             let previous = chain.take();
-            chain = Some(ChainState::Ready(chain_step_proof(
-                path,
-                chain_target,
-                chain_data,
-                chain_step,
-                previous,
-                base,
-                dummy_proof,
-                &tx_proof,
-            )));
+            let handle = std::thread::Builder::new()
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    chain_step_proof(
+                        path,
+                        chain_target,
+                        chain_data,
+                        chain_step,
+                        previous,
+                        base,
+                        dummy_proof,
+                        &tx_proof,
+                    )
+                })
+                .expect("chain tail pipeline thread must start");
+            chain = Some(ChainState::InFlight(handle));
         }
-        let chain_proof = chain
+        chain
             .map(ChainState::wait)
-            .expect("transaction path must produce a chain proof");
-        if exclusive_drain {
-            plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
-        }
-        chain_proof
-    });
-    // This path has produced its last proof. Retiring it here — after the scope,
-    // so every thread it spawned has joined — is what lets the sibling path's
-    // drain observe that it is alone and claim the exclusive GPU phase.
-    active_paths.fetch_sub(1, Ordering::Release);
+            .expect("transaction path must produce a chain proof")
+    })
+    };
+    // This path has completed every transaction proof, so its preprocessed
+    // transaction-circuit LDE cannot be read by the remaining independent path.
+    // Release it as soon as the path joins instead of retaining both transaction
+    // LDEs until the light and heavy chains have both completed.
+    tx_data.prover_only.constants_sigmas_commitment = Default::default();
     chain_proof
 }
 
 pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
-    // The pre-execution proof runs strictly before any other proving work, so
-    // the serialized GPU stream is otherwise idle: route its mid-size column
-    // trees to the GPU for just this phase.
+    // Final-circuit synthesis is CPU-only and independent of the pre-execution
+    // witness. Start it before the pre-proof so it does not compete with the
+    // transaction pipeline later.
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-    let pre_proof = BlockPreExecutionCircuit::prove(
-        &circuits.pre_data,
-        &BlockPreExec::from_block(&block),
-        &circuits.pre_target,
-    )
-    .expect("block pre-execution proof failed");
+    let (pre_proof, block_target, block_data) = std::thread::scope(|scope| {
+        let block_circuit_handle = std::thread::Builder::new()
+            .name("block-circuit-build".into())
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, || circuits.build_block_circuit())
+            .expect("block circuit build thread must start");
+        let pre_proof = BlockPreExecutionCircuit::prove(
+            &circuits.pre_data,
+            &BlockPreExec::from_block(&block),
+            &circuits.pre_target,
+        )
+        .expect("block pre-execution proof failed");
+        let (block_target, block_data) = block_circuit_handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        let block_data: &'static CircuitData<F, C, D> = Box::leak(Box::new(block_data));
+        (pre_proof, block_target, block_data)
+    });
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+    // The pre-execution circuit has produced its only proof and final-circuit
+    // synthesis has joined, so its preprocessed LDE has no remaining reader.
+    // Return that Metal-backed allocation before the long transaction pipeline
+    // instead of retaining it until the final-proof memory-pressure point.
+    circuits.release_pre_execution_extension();
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
@@ -477,36 +457,20 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
     block.tx_chunks = tx_chunks;
     block.tx_chunks.push(Vec::new());
 
-    // Both transaction paths prove concurrently and each ends in a strictly
-    // sequential chain tail, but the exclusive-GPU switch that tail wants is
-    // process-global. This counter lets a path tell "my own pipeline is done"
-    // apart from "no other proof is running": each path retires itself when its
-    // chain proof is finished, so only the last one standing claims the phase.
-    let active_paths = AtomicUsize::new(2);
-    let (light_chain_proof, heavy_chain_proof, block_target, block_data, block_pending) = {
-        // The pipeline only ever reads the circuits; the borrow ends with this
-        // block so the finished extensions can be released below.
-        let circuits = &circuits;
-        let active_paths = &active_paths;
+    let (light_chain_proof, block_pending) = {
+        let heavy_tx_data = &mut circuits.heavy_tx_data;
+        let light_tx_data = &mut circuits.light_tx_data;
+        let heavy_tx_target = &circuits.heavy_tx_target;
+        let light_tx_target = &circuits.light_tx_target;
+        let heavy_chain_data = &circuits.heavy_chain_data;
+        let light_chain_data = &circuits.light_chain_data;
+        let heavy_chain_target = &circuits.heavy_chain_target;
+        let light_chain_target = &circuits.light_chain_target;
+        let dummy_heavy_proof = &circuits.dummy_heavy_proof;
+        let dummy_light_proof = &circuits.dummy_light_proof;
         std::thread::scope(|scope| {
-            // The final block circuit depends only on already-built circuit data
-            // and is not needed until the final proof, so it builds concurrently
-            // with the entire transaction/chain proving pipeline.
-            // Two-phase final-block witness (H13): this lane also runs the
-            // EARLY witness phase (block data + pre-proof generators) after the
-            // build, then joins the heavy path — which finishes ~30 s before
-            // the light path — and feeds its verify subtree here, mid-pipeline.
-            // Measured feed split: light 0.018 s vs heavy 0.575 s; the heavy
-            // verify subtree (ECDSA/keccak) owns the late witness cost, and
-            // moving it here deletes it from the serial tail. Both phases run
-            // WITHOUT `ParallelWitnessGuard` (thread-local; parallel rounds
-            // here would contend with the pipeline's pool). This is witness
-            // WORK MOVED OFF THE TAIL onto an otherwise-idle lane, not new
-            // parallelism: the lane sleeps in `join` until the heavy proof
-            // arrives, then does 0.6 s of serial work while ~the light spine
-            // alone is running. The circuit data is leaked to hand the pending
-            // witness a 'static borrow across the thread boundary — free, the
-            // worker exits via `process::exit`.
+            // Pre-feed the final witness while transaction proving runs. The
+            // circuit itself was synthesized alongside the pre-proof above.
             let heavy_handle_outer = std::thread::Builder::new()
                 .name("heavy-tx-chain".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -514,76 +478,77 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
                     prove_path(
                         TxPath::Heavy,
                         heavy_chunks,
-                        circuits,
+                        heavy_tx_data,
+                        heavy_tx_target,
+                        heavy_chain_data,
+                        heavy_chain_target,
+                        dummy_heavy_proof,
                         block.block_number,
                         block.created_at,
                         block.old_account_delta_tree_root,
                         &pre_output,
                         state_metadata_hash,
-                        active_paths,
                     )
                 })
                 .expect("heavy transaction chain thread must start");
             let block_ref = &block;
             let pre_proof_ref = &pre_proof;
-            let block_circuit_handle = std::thread::Builder::new()
-                .name("block-circuit-build".into())
+            let block_witness_handle = std::thread::Builder::new()
+                .name("block-witness-prefeed".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, move || {
-                    let (block_target, block_data) = circuits.build_block_circuit();
-                    let block_data: &'static CircuitData<F, C, D> =
-                        Box::leak(Box::new(block_data));
-                    let early = BlockCircuit::witness_inputs_early(
-                        &block_target,
-                        block_ref,
-                        pre_proof_ref,
-                    )
-                    .expect("final block early witness inputs failed");
-                    let mut pending = PendingPartitionWitness::start(
-                        early,
+                .spawn_scoped(scope, || {
+                    let mut pending = PendingPartitionWitness::start_seeded(
                         &block_data.prover_only,
                         &block_data.common,
+                        |seeder| {
+                            BlockCircuit::seed_witness_early_into(
+                                &block_target,
+                                block_ref,
+                                pre_proof_ref,
+                                seeder,
+                            )
+                        },
                     )
                     .expect("final block early witness phase failed");
                     let heavy_chain_proof = heavy_handle_outer
                         .join()
                         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                     pending
-                        .feed(
-                            BlockCircuit::witness_inputs_heavy_chain(
-                                &block_target,
+                        .feed_seeded(|feeder| {
+                            feeder.set_proof_with_pis_target(
+                                &block_target.heavy_tx_chain_proof,
                                 &heavy_chain_proof,
                             )
-                            .expect("final block heavy-chain witness inputs failed"),
-                        )
+                        })
                         .expect("final block heavy-chain witness feed failed");
-                    (block_target, block_data, pending, heavy_chain_proof)
+                    drop(heavy_chain_proof);
+                    pending
                 })
-                .expect("block circuit build thread must start");
+                .expect("block witness prefeed thread must start");
             let light_chain_proof = prove_path(
                 TxPath::Light,
                 light_chunks,
-                circuits,
+                light_tx_data,
+                light_tx_target,
+                light_chain_data,
+                light_chain_target,
+                dummy_light_proof,
                 block.block_number,
                 block.created_at,
                 block.old_account_delta_tree_root,
                 &pre_output,
                 state_metadata_hash,
-                active_paths,
             );
-            let (block_target, block_data, block_pending, heavy_chain_proof) =
-                block_circuit_handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            (
-                light_chain_proof,
-                heavy_chain_proof,
-                block_target,
-                block_data,
-                block_pending,
-            )
+            let block_pending = block_witness_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            (light_chain_proof, block_pending)
         })
     };
+    // The pre-execution proof was copied into the final partition witness by
+    // the prefeed thread; release its recursive proof buffers before the final
+    // proof allocates its own witness and commitment layers.
+    drop(pre_proof);
 
     // Every circuit but the block circuit has now produced its last proof, so
     // their preprocessed low-degree extensions are unreachable. Release them
@@ -591,8 +556,8 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
     // own extensions on top of them.
     circuits.release_finished_circuit_extensions();
 
-    let (light_chain_input, heavy_chain_input) =
-        final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
+    // Both chain proofs are consumed directly into the pending final witness;
+    // neither needs to survive into final-block proving.
     // The final block witness runs on the serial tail with nothing else proving, so it alone
     // opts into parallel worklist rounds; tx-proof and chain witness generation run concurrently
     // with proving and stay sequential.
@@ -603,14 +568,13 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
     let mut block_pending = block_pending;
     block_pending
-        .feed(
-            BlockCircuit::witness_inputs_light_chain(&block_target, light_chain_input)
-                .expect("final block light-chain witness inputs failed"),
-        )
+        .feed_seeded(|feeder| {
+            feeder.set_proof_with_pis_target(&block_target.light_tx_chain_proof, &light_chain_proof)
+        })
         .expect("final block light-chain witness feed failed");
-    let _ = heavy_chain_input;
-    let final_proof = BlockCircuit::prove_prepared(block_pending, block_data)
-        .expect("final block proof failed");
+    drop(light_chain_proof);
+    let final_proof =
+        BlockCircuit::prove_prepared(block_pending, block_data).expect("final block proof failed");
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
     final_proof
 }
@@ -657,31 +621,6 @@ mod tests {
             .expect("orchestration test thread must finish");
     }
 
-    #[test]
-    fn exclusive_gpu_phase_is_claimed_only_by_the_last_running_path() {
-        // Two paths proving: the one that reaches its drain first (the three-chunk
-        // heavy path) must not claim the process-global exclusive phase while the
-        // forty-nine-chunk light pipeline is still running.
-        let active_paths = AtomicUsize::new(2);
-        assert!(!claims_exclusive_gpu_phase(&active_paths));
-
-        // The heavy path retires; the light path's drain is now genuinely alone.
-        active_paths.fetch_sub(1, Ordering::Release);
-        assert!(claims_exclusive_gpu_phase(&active_paths));
-
-        // Both retired: nothing is proving, so nothing claims the phase either.
-        active_paths.fetch_sub(1, Ordering::Release);
-        assert!(!claims_exclusive_gpu_phase(&active_paths));
-    }
-
-    #[test]
-    fn final_block_chain_inputs_are_light_then_heavy() {
-        let light = "light";
-        let heavy = "heavy";
-
-        assert_eq!(final_chain_inputs(&light, &heavy), (&light, &heavy));
-    }
-
     /// Manual timing harness for the two-phase chain-step witness split. Run with:
     /// `RAYON_NUM_THREADS=8 cargo test --release -p bench --bin prove -- --ignored chain_step`
     #[test]
@@ -708,7 +647,7 @@ mod tests {
         use circuit::types::constants::TX_TYPE_EMPTY;
         use plonky2::field::types::{Field, PrimeField64};
 
-        use crate::api::{LIGHT_TX_MODE, PathCircuits};
+        use crate::api::{PathCircuits, LIGHT_TX_MODE};
 
         let build_start = Instant::now();
         let circuits = PathCircuits::new(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE);
