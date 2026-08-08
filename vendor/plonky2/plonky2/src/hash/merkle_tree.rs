@@ -619,13 +619,33 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             ColumnStore::Owned(owned) => crate::util::transpose_to_bitrev_flat(owned),
             #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
             ColumnStore::Shared(_) => {
-                let mut flat = vec![F::ZERO; num_leaves * num_columns];
+                // Hoist the column slices out of the innermost loop. `col()` on
+                // a shared store dispatches to `MetalColumns::col`, whose body is
+                // `[MTLBuffer contents]` — an Objective-C message send. Calling
+                // it per element costs one msgSend per element (~2.6 M per
+                // 2^17-leaf tree); the `Owned` arm above hoists and pays none.
+                let cols: Vec<&[F]> = (0..num_columns).map(|j| columns.col(j)).collect();
+                // `with_capacity` + `set_len` instead of `vec![F::ZERO; ..]`,
+                // which writes a full 17-21 MB zero pass that the loop below
+                // immediately overwrites. `transpose_to_bitrev_flat` (the
+                // `Owned` arm) already avoids exactly this the same way.
+                //
+                // SAFETY: capacity is `num_leaves * num_columns`; `par_chunks_mut`
+                // partitions that range into `num_leaves` disjoint rows of
+                // `num_columns`, and the loop writes every element of every row
+                // before any is read. `F: Field` is `Copy` with no `Drop`, so no
+                // uninitialized value is ever dropped or observed.
+                let mut flat = Vec::<F>::with_capacity(num_leaves * num_columns);
+                #[allow(clippy::uninit_vec)]
+                unsafe {
+                    flat.set_len(num_leaves * num_columns);
+                }
                 flat.par_chunks_mut(num_columns)
                     .enumerate()
                     .for_each(|(leaf, row)| {
                         let natural = crate::util::reverse_bits(leaf, log_rows);
                         for (column, value) in row.iter_mut().enumerate() {
-                            *value = columns.col(column)[natural];
+                            *value = cols[column][natural];
                         }
                     });
                 flat

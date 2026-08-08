@@ -13,6 +13,7 @@ mod prover;
 use std::env;
 use std::fs::{self, File};
 use std::io::BufWriter;
+use std::path::Path;
 
 use api::{
     Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
@@ -44,24 +45,39 @@ static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
-    // First statement in the process: the Metal shader compile and pipeline
-    // lowering behind the GPU hash path cost the better part of a second on a
-    // cold OS shader cache, and the benchmark sandbox denies writes to that
-    // cache, which disables it entirely — so every scored worker pays the full
-    // price. Starting it here overlaps it with the startup work below instead
-    // of stalling the first proving step that wants the GPU. Pure scheduling:
-    // the compiled kernels are identical either way.
+    // Arguments first, and only because the GPU pre-warm below needs one of
+    // them: the precompiled pipeline archive can only be handed to Metal as a
+    // file, and the proof output's directory is the one location the scored
+    // worker's sandbox profile makes writable. Parsing two `String`s costs
+    // nothing and must happen before the context starts building.
+    let mut args = env::args().skip(1);
+    let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
+    let output = args.next().expect("usage: prove FIXTURE OUTPUT");
+    assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
+    if let Some(dir) = Path::new(&output).parent() {
+        // An empty parent means the output is a bare filename in the working
+        // directory; `"."` is the same place and is a valid path to write to.
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        plonky2::hash::poseidon2::set_gpu_archive_dir(dir.to_path_buf());
+    }
+
+    // Effectively the first statement in the process: the Metal shader compile
+    // and pipeline lowering behind the GPU hash path cost the better part of a
+    // second on a cold OS shader cache, and the benchmark sandbox denies writes
+    // to that cache, which disables it entirely — so every scored worker pays
+    // the full price. Starting it here overlaps it with the startup work below
+    // instead of stalling the first proving step that wants the GPU. Pure
+    // scheduling: the compiled kernels are identical either way.
     plonky2::hash::poseidon2::prewarm_gpu();
     env_logger::init();
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
         .expect("cannot configure prover thread pool");
-
-    let mut args = env::args().skip(1);
-    let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
-    let output = args.next().expect("usage: prove FIXTURE OUTPUT");
-    assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
     let json = fs::read(fixture).expect("cannot read prover fixture");
     let block = Block::<F>::from_json_with_empty_txs(

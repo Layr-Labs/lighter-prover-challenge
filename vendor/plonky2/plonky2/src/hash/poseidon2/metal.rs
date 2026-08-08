@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use metal::{
-    Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSUInteger,
+    BinaryArchive, BinaryArchiveDescriptor, BinaryArchiveRef, Buffer, CommandBuffer, CommandQueue,
+    CompileOptions, ComputePipelineDescriptor, ComputePipelineState, Device, Library,
+    MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSUInteger, URL,
 };
 use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
@@ -18,6 +19,33 @@ use crate::hash::merkle_tree::LevelOrderDigests;
 use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
+/// `poseidon2.metal` compiled ahead of time by
+/// `tools/build-poseidon2-metallib.sh`. Loading this with `newLibraryWithData:`
+/// skips the Metal front end entirely; see [`build_library`].
+const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
+/// The eight pipelines of [`MetalShared`], pre-lowered to this GPU family's
+/// machine code by `tools/build-poseidon2-metallib.sh`; see
+/// [`load_binary_archive`].
+const SHADER_BINARY_ARCHIVE: &[u8] = include_bytes!("poseidon2.binarchive");
+include!(concat!(env!("OUT_DIR"), "/poseidon2_metallib_guard.rs"));
+
+/// Every kernel `MetalShared::new` builds a pipeline for, in construction
+/// order. Single source of truth: the archive generator walks this list, so an
+/// archive can never be built for a different set than the one loaded.
+const ARCHIVED_KERNELS: [&str; 8] = [
+    "poseidon2_hash_leaves",
+    "poseidon2_hash_leaves_colmajor",
+    "poseidon2_hash_parents",
+    "ntt_prepare",
+    "ntt_stage",
+    "ifft_finalize",
+    "poseidon2_gate_quotient",
+    "range_check_gate_quotient",
+];
+
+/// Directory the binary archive may be materialized in, set by the process
+/// entry point. See [`set_gpu_archive_dir`].
+static GPU_ARCHIVE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
 /// (6654d43) ranked-validated this raised value inside its composition; my
 /// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
@@ -1056,14 +1084,231 @@ enum LeafSource<'a, F> {
     Shared(&'a MetalColumns<F>),
 }
 
+/// Builds a `file://` `NSURL` that must NOT be released by Rust.
+///
+/// `+[NSURL URLWithString:]` returns an **autoreleased** object — the caller
+/// does not own it — but metal-rs wraps the result in an owning `URL` that
+/// sends `release` on drop. Dropping it inside an `autoreleasepool` therefore
+/// over-releases, and the process dies when the pool drains. (Outside a pool
+/// the crash hides: the process-level pool never drains, so the imbalance is
+/// never collected. This was found by `generate_binary_archive` segfaulting
+/// *after* successfully writing its output — every Metal call had already
+/// succeeded.) `ManuallyDrop` restores correct ownership: the enclosing pool
+/// performs the one release that is owed, and Rust performs none.
+///
+/// A path needing percent-encoding yields a nil URL, which surfaces as an error
+/// from the archive call and falls back to lowering — never a crash.
+fn file_url(path: &std::path::Path) -> core::mem::ManuallyDrop<URL> {
+    core::mem::ManuallyDrop::new(URL::new_with_string(&format!(
+        "file://{}",
+        path.to_string_lossy()
+    )))
+}
+
+/// Nominates a directory the GPU binary archive may be written to.
+///
+/// `MTLBinaryArchiveDescriptor` exposes exactly one input — a file `url`. There
+/// is no data-based constructor in the Metal API, so a blob compiled into the
+/// binary has to reach the disk before Metal will read it. The scored worker
+/// runs under a Seatbelt profile that is `(deny file-write*)` with a single
+/// `(allow file-write* (subpath "<scratch>"))`, and it is *copied* to the
+/// bridge work directory before it runs, so neither the build's `OUT_DIR` nor
+/// `TMPDIR` is writable. The one directory known to be writable is the one the
+/// proof output path lives in, which only the entry point knows.
+///
+/// Call before the GPU context is first touched (i.e. before `prewarm`). If it
+/// is never called the archive is simply not used — the pipelines are lowered
+/// the way they were before this path existed.
+pub fn set_gpu_archive_dir(dir: std::path::PathBuf) {
+    let _ = GPU_ARCHIVE_DIR.set(dir);
+}
+
+/// Deletes the materialized archive file when the pipelines no longer need it.
+///
+/// Metal is not documented to read the archive lazily, but it is not documented
+/// *not* to either, so the file outlives every `newComputePipelineState` call
+/// and is removed only when this guard drops at the end of context
+/// construction. Nothing else observes the file: it is written, read once by
+/// Metal, and unlinked inside one process.
+struct TempArchiveFile(std::path::PathBuf);
+
+impl Drop for TempArchiveFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Materializes and opens the precompiled GPU binary archive, or returns
+/// `None`.
+///
+/// A `.metallib` removes the Metal *front end* (source to AIR) from startup but
+/// not the *back end*: `newComputePipelineStateWithFunction:` still lowers AIR
+/// to this GPU's machine code, which measured **663.9 ms** for these eight
+/// kernels against a cold cache — 79% of the whole context construction, and
+/// the scored sandbox may read the OS shader cache but never write it, so the
+/// cache never warms and every worker process pays it. An `MTLBinaryArchive`
+/// holds the *lowered* pipelines, and resolving all eight from one measured
+/// **0.7 ms**.
+///
+/// **The archive is advisory, and every failure mode is "no speedup", never
+/// "wrong answer".** No `MTLPipelineOption::FailOnBinaryArchiveMiss` is set, so
+/// if this archive was built for a different GPU family or driver than the one
+/// running, the pipeline is simply lowered normally. Likewise an unset or
+/// unwritable directory, a short write, a stale blob, or a rejected archive all
+/// return `None` and leave the previous behaviour in place. The pipelines that
+/// come out are the same pipelines either way — an archive is a cache of the
+/// compiler's output, not an input to it.
+///
+/// `LIGHTER_DISABLE_GPU_ARCHIVE=1` forces the lowering path for A/B work.
+fn load_binary_archive(device: &Device) -> Option<(BinaryArchive, TempArchiveFile)> {
+    if !ARCHIVE_MATCHES_METALLIB || !METALLIB_MATCHES_SOURCE {
+        return None;
+    }
+    if std::env::var_os("LIGHTER_DISABLE_GPU_ARCHIVE").is_some()
+        || std::env::var_os("LIGHTER_DISABLE_METALLIB").is_some()
+    {
+        return None;
+    }
+    let dir = GPU_ARCHIVE_DIR.get()?;
+    // PID-suffixed: the five ranked fixtures are five worker processes and may
+    // share a directory, and two provers in one directory must not collide.
+    let path = dir.join(format!(".poseidon2-{}.binarchive", std::process::id()));
+    // Write first, then take the guard, so a failed write leaves nothing behind.
+    if let Err(error) = std::fs::write(&path, SHADER_BINARY_ARCHIVE) {
+        log::warn!(
+            "GPU binary archive not materialized in {}: {error}; lowering pipelines instead",
+            dir.display()
+        );
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    let guard = TempArchiveFile(path.clone());
+    let descriptor = BinaryArchiveDescriptor::new();
+    descriptor.set_url(&file_url(&path));
+    match device.new_binary_archive_with_descriptor(&descriptor) {
+        Ok(archive) => Some((archive, guard)),
+        Err(error) => {
+            log::warn!("GPU binary archive rejected ({error}); lowering pipelines instead");
+            None
+        }
+    }
+}
+
+/// Builds one compute pipeline, resolving it from `archive` when one is loaded.
+///
+/// The no-archive arm is the original `newComputePipelineStateWithFunction:`
+/// call, untouched, so the fallback path is byte-for-byte the behaviour that
+/// shipped before the archive existed rather than a descriptor-based
+/// reimplementation of it.
+fn build_pipeline(
+    device: &Device,
+    function: &metal::FunctionRef,
+    archive: Option<&BinaryArchiveRef>,
+) -> Result<ComputePipelineState, String> {
+    match archive {
+        None => device
+            .new_compute_pipeline_state_with_function(function)
+            .map_err(|error| error.to_string()),
+        Some(archive) => {
+            let descriptor = ComputePipelineDescriptor::new();
+            descriptor.set_compute_function(Some(function));
+            descriptor.set_binary_archives(&[archive]);
+            device
+                .new_compute_pipeline_state(&descriptor)
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
+/// Builds a GPU binary archive for [`ARCHIVED_KERNELS`] and serializes it.
+///
+/// Developer tool, driven by `tools/build-poseidon2-metallib.sh` through
+/// `bench/src/bin/gen-gpu-archive.rs`; never called while proving. It reads the
+/// same `SHADER_METALLIB` the prover loads, so the archive cannot be generated
+/// against a library the prover will not use.
+#[doc(hidden)]
+pub fn generate_binary_archive(path: &std::path::Path) -> Result<(), String> {
+    autoreleasepool(|| {
+        // No capability pre-check: `newBinaryArchiveWithDescriptor:` is itself
+        // the authoritative test and reports why it failed, which a feature-set
+        // guess cannot.
+        let device = Device::system_default().ok_or("no Metal device")?;
+        let library = device
+            .new_library_with_data(SHADER_METALLIB)
+            .map_err(|error| format!("metallib rejected: {error}"))?;
+        let archive = device
+            .new_binary_archive_with_descriptor(&BinaryArchiveDescriptor::new())
+            .map_err(|error| format!("archive creation failed: {error}"))?;
+        for name in ARCHIVED_KERNELS {
+            let function = library
+                .get_function(name, None)
+                .map_err(|error| format!("{name} unavailable: {error}"))?;
+            let descriptor = ComputePipelineDescriptor::new();
+            descriptor.set_compute_function(Some(&function));
+            archive
+                .add_compute_pipeline_functions_with_descriptor(&descriptor)
+                .map_err(|error| format!("{name} not added to archive: {error}"))?;
+        }
+        archive
+            .serialize_to_url(&file_url(path))
+            .map_err(|error| format!("archive serialization failed: {error}"))?;
+        Ok(())
+    })
+}
+
+/// Obtains the Poseidon2 shader library, preferring the precompiled blob.
+///
+/// `newLibraryWithSource:` runs the Metal front end — source through to AIR —
+/// inside `MTLCompilerService`, and it is **not** parallelized by the pipeline
+/// scope below: it is one serial call on the startup path of every worker
+/// process. Measured on an M4 Max against a cold OS shader cache it costs
+/// ~166 ms, and the scored sandbox's profile grants only `file-read*` on
+/// `com.apple.metal`, so that cache can never be written and never warms:
+/// the cost is paid in full, every process, every fixture.
+///
+/// `newLibraryWithData:` instead deserializes AIR that was produced at build
+/// time, which is a parse rather than a compile.
+///
+/// **Fallback is unconditional by design, and the `log::warn!` below is the
+/// only reliable staleness signal that reaches a human**: `build.rs` also emits
+/// a `cargo:warning`, but Cargo suppresses build-script warnings from
+/// non-workspace path dependencies, which this crate is.
+///
+/// Any reason the blob is
+/// unusable — stale relative to `poseidon2.metal` (`METALLIB_MATCHES_SOURCE`,
+/// written by `build.rs`), truncated, or rejected by a Metal version that
+/// cannot read this AIR revision — falls through to compiling the source,
+/// which is exactly the behaviour that shipped before this path existed. The
+/// optimization can therefore only fail by not applying, never by failing the
+/// proof. `LIGHTER_DISABLE_METALLIB=1` forces the source path for A/B work.
+///
+/// Value-exactness: both paths compile the same `poseidon2.metal` with default
+/// options, and every kernel in it is 64-bit integer arithmetic over Goldilocks
+/// limbs — there is no floating-point operation whose rounding a compiler flag
+/// could alter. The differential tests at the bottom of this file gate it.
+fn build_library(device: &Device) -> Result<Library, String> {
+    if METALLIB_MATCHES_SOURCE && std::env::var_os("LIGHTER_DISABLE_METALLIB").is_none() {
+        match device.new_library_with_data(SHADER_METALLIB) {
+            Ok(library) => return Ok(library),
+            Err(error) => log::warn!(
+                "precompiled Poseidon2 metallib rejected ({error}); compiling shader from source"
+            ),
+        }
+    }
+    let options = CompileOptions::new();
+    device
+        .new_library_with_source(SHADER_SOURCE, &options)
+        .map_err(|error| format!("shader compilation failed: {error}"))
+}
+
 impl MetalShared {
     fn new() -> Result<Self, String> {
         autoreleasepool(|| {
             let device = Device::system_default().ok_or("no Metal device")?;
-            let options = CompileOptions::new();
-            let library = device
-                .new_library_with_source(SHADER_SOURCE, &options)
-                .map_err(|error| format!("shader compilation failed: {error}"))?;
+            let library = build_library(&device)?;
+            // Held across the whole pipeline scope; dropping it unlinks the file.
+            let archive = load_binary_archive(&device);
+            let archive_ref = archive.as_ref().map(|(archive, _)| &**archive);
             // Build the eight compute pipelines concurrently, one thread each.
             //
             // Every `newComputePipelineStateWithFunction:` lowers that kernel's
@@ -1091,8 +1336,7 @@ impl MetalShared {
                         let function = library_ref
                             .get_function(name, None)
                             .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
-                        device_ref
-                            .new_compute_pipeline_state_with_function(&function)
+                        build_pipeline(device_ref, &function, archive_ref)
                             .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
                     })
                 }
@@ -1104,9 +1348,7 @@ impl MetalShared {
                             .get_function(name, None)
                             .ok()
                             .and_then(|function| {
-                                device_ref
-                                    .new_compute_pipeline_state_with_function(&function)
-                                    .ok()
+                                build_pipeline(device_ref, &function, archive_ref).ok()
                             })
                     })
                 }
@@ -1167,6 +1409,8 @@ impl MetalShared {
             let ntt_prepare_pipeline = ntt_prepare_pipeline?;
             let ntt_stage_pipeline = ntt_stage_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
+            // Every pipeline now exists; the archive file has served its purpose.
+            drop(archive);
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
