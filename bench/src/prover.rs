@@ -1,3 +1,4 @@
+// Redraw 2: packed permutation + exclusive-phase GPU NTT (pre-registered two-draw protocol).
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
