@@ -24,16 +24,6 @@ impl Extendable<2> for GoldilocksField {
     const EXT_MULTIPLICATIVE_GROUP_GENERATOR: [Self; 2] = [Self(0), Self(11713931119993638672)];
 
     const EXT_POWER_OF_TWO_GENERATOR: [Self; 2] = [Self(0), Self(7226896044987257365)];
-
-    #[inline(always)]
-    fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
-        // FFT rows below the quadratic extension's extra two-adic level
-        // contain [w, 0], so scalar-multiply the two value limbs. Each limb
-        // is one widening product instead of general ext2's four total.
-        let [w, _] = twiddle;
-        let [a0, a1] = value;
-        [w * a0, w * a1]
-    }
 }
 
 impl Mul for QuadraticExtension<GoldilocksField> {
