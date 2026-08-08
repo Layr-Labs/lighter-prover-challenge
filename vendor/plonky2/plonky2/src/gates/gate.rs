@@ -61,6 +61,10 @@ pub enum U32QuotientGate {
     /// plus `4 * num_limbs` base-4 aux limbs per operation,
     /// `1 + 5 * num_limbs` constraint rows per operation.
     ByteDecomposition { num_ops: usize, num_limbs: usize },
+    /// Little-endian base-`base` decomposition (`BaseSumGate<B>`): one
+    /// operation per gate row with `1 + num_limbs` routed words (sum then
+    /// limbs) and `1 + num_limbs` constraint rows.
+    BaseSum { num_limbs: usize, base: usize },
     /// Degree-5 extension-field multiplication over the base field: fifteen
     /// routed words per operation (five limbs each for the two inputs and
     /// the output), five constraint rows per operation.
