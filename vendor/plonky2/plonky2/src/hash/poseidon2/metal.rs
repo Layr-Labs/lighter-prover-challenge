@@ -382,6 +382,51 @@ static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShare
 /// compiling blocks until it finishes and then observes the same context.
 /// Callers that never touch the GPU pay only the thread spawn. Nothing here
 /// is observable in a proof — the context holds compiled kernels, not values.
+/// Path to a pipeline binary archive produced by the build script, if one was
+/// built. Set once from the process entry point, before [`prewarm`].
+static PIPELINE_ARCHIVE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Offers a prebuilt pipeline archive to [`MetalShared::new`].
+///
+/// Creating a compute pipeline lowers its kernel's AIR to a GPU binary, and
+/// under the benchmark sandbox that costs hundreds of milliseconds per kernel
+/// because the OS shader cache is disabled there. An archive built at compile
+/// time carries those lowerings, so the worker can load them instead.
+///
+/// Ignored after the first call and after the context has been built. Purely a
+/// source of already-compiled kernels: a pipeline created from the archive is
+/// the same pipeline the runtime compile would have produced, so no computed
+/// value depends on whether this is set.
+pub fn set_pipeline_archive(path: Option<&str>) {
+    if let Some(path) = path {
+        let _ = PIPELINE_ARCHIVE.set(path.to_owned());
+    }
+}
+
+/// Loads the archive named by [`set_pipeline_archive`], if it is usable.
+///
+/// Every failure here is non-fatal: a missing, unreadable or stale archive
+/// leaves the caller on its normal compile path.
+fn pipeline_archive(device: &Device) -> Option<metal::BinaryArchive> {
+    let path = PIPELINE_ARCHIVE.get()?;
+    if !std::path::Path::new(path).is_file() {
+        log::debug!("pipeline archive {path} is missing; compiling kernels instead");
+        return None;
+    }
+    let descriptor = metal::BinaryArchiveDescriptor::new();
+    // `URLWithString:` returns an autoreleased object that the binding wraps as
+    // owned and would release a second time.
+    let url = std::mem::ManuallyDrop::new(metal::URL::new_with_string(&format!("file://{path}")));
+    descriptor.set_url(&url);
+    match device.new_binary_archive_with_descriptor(&descriptor) {
+        Ok(archive) => Some(archive),
+        Err(error) => {
+            log::debug!("pipeline archive {path} unusable ({error}); compiling kernels instead");
+            None
+        }
+    }
+}
+
 pub fn prewarm() {
     std::thread::Builder::new()
         .name("poseidon2-metal-prewarm".to_owned())
@@ -1085,14 +1130,36 @@ impl MetalShared {
             // that created them rather than leaking.
             let device_ref = &device;
             let library_ref = &library;
+            // A build-time archive, when present, turns each pipeline creation
+            // below into a lookup instead of a compile. It is consulted through
+            // a descriptor, so a kernel the archive does not carry still
+            // compiles normally rather than failing.
+            let archive = pipeline_archive(device_ref);
+            let archive_ref = archive.as_deref();
+            let build = move |function: &metal::FunctionRef| -> Result<ComputePipelineState, String> {
+                let Some(archive) = archive_ref else {
+                    return device_ref
+                        .new_compute_pipeline_state_with_function(function)
+                        .map_err(|error| error.to_string());
+                };
+                let descriptor = metal::ComputePipelineDescriptor::new();
+                descriptor.set_compute_function(Some(function));
+                descriptor.set_binary_archives(&[archive]);
+                device_ref
+                    .new_compute_pipeline_state(&descriptor)
+                    .or_else(|_| {
+                        device_ref
+                            .new_compute_pipeline_state_with_function(function)
+                            .map_err(|error| error.to_string())
+                    })
+            };
             let required = |name: &'static str, kind: &'static str| {
                 move || -> Result<ComputePipelineState, String> {
                     autoreleasepool(|| {
                         let function = library_ref
                             .get_function(name, None)
                             .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
-                        device_ref
-                            .new_compute_pipeline_state_with_function(&function)
+                        build(&function)
                             .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
                     })
                 }
@@ -1103,11 +1170,7 @@ impl MetalShared {
                         library_ref
                             .get_function(name, None)
                             .ok()
-                            .and_then(|function| {
-                                device_ref
-                                    .new_compute_pipeline_state_with_function(&function)
-                                    .ok()
-                            })
+                            .and_then(|function| build(&function).ok())
                     })
                 }
             };

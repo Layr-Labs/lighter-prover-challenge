@@ -72,6 +72,97 @@ fn build_path_blobs(tx_per_proof: usize, tx_mode: u8) -> (Vec<u8>, Vec<u8>) {
     (tx_blob, chain_blob)
 }
 
+/// Compiles the Poseidon2 Metal kernels into a serialized pipeline binary
+/// archive and points the prove binary at it.
+///
+/// The worker compiles its Metal shaders at runtime. Under the benchmark's
+/// sandbox profile that is expensive and unavoidable there: writes to the OS
+/// shader cache are denied, which disables the cache for reads too, so every
+/// worker process lowers all eight kernels from scratch. Measured cold under
+/// the profile: 415 ms for the MSL-to-AIR compile plus 2.69 s of pipeline
+/// lowering.
+///
+/// The lowering can be moved here instead. This script runs in the untimed
+/// build job with no sandbox, so it can build an `MTLBinaryArchive` and
+/// serialize it; the worker then creates its pipelines from that archive
+/// instead of paying the lowering again. Building the archive *inside* the
+/// sandbox is not an option — `addComputePipelineFunctionsWithDescriptor:`
+/// dies with SIGSEGV there — which is why this belongs at build time.
+///
+/// Everything here is scheduling: the archive holds the same kernels compiled
+/// from the same source, so no value the GPU computes can change. A failure
+/// at any step is reported and skipped, and the worker keeps its existing
+/// runtime-compile path.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn build_pipeline_archive(out_dir: &Path) {
+    use metal::{BinaryArchiveDescriptor, CompileOptions, ComputePipelineDescriptor, Device, URL};
+
+    const KERNELS: [&str; 8] = [
+        "poseidon2_hash_leaves",
+        "poseidon2_hash_leaves_colmajor",
+        "poseidon2_hash_parents",
+        "ntt_prepare",
+        "ntt_stage",
+        "ifft_finalize",
+        "poseidon2_gate_quotient",
+        "range_check_gate_quotient",
+    ];
+    const SHADER: &str = "../vendor/plonky2/plonky2/src/hash/poseidon2/poseidon2.metal";
+
+    println!("cargo:rerun-if-changed={SHADER}");
+
+    let skip = |reason: &str| {
+        println!("cargo:warning=pipeline archive not built ({reason}); worker will compile kernels at startup");
+    };
+
+    let source = match std::fs::read_to_string(SHADER) {
+        Ok(source) => source,
+        Err(error) => return skip(&format!("cannot read shader source: {error}")),
+    };
+    let Some(device) = Device::system_default() else {
+        return skip("no Metal device on the build host");
+    };
+    let library = match device.new_library_with_source(&source, &CompileOptions::new()) {
+        Ok(library) => library,
+        Err(error) => return skip(&format!("shader compilation failed: {error}")),
+    };
+    let archive = match device.new_binary_archive_with_descriptor(&BinaryArchiveDescriptor::new()) {
+        Ok(archive) => archive,
+        Err(error) => return skip(&format!("cannot create binary archive: {error}")),
+    };
+    for name in KERNELS {
+        let function = match library.get_function(name, None) {
+            Ok(function) => function,
+            Err(error) => return skip(&format!("kernel {name} unavailable: {error}")),
+        };
+        let descriptor = ComputePipelineDescriptor::new();
+        descriptor.set_compute_function(Some(&function));
+        if let Err(error) = archive.add_compute_pipeline_functions_with_descriptor(&descriptor) {
+            return skip(&format!("cannot add {name} to the archive: {error}"));
+        }
+    }
+
+    let path = out_dir.join("poseidon2_pipelines.metalar");
+    // Serializing onto an existing file fails, so a rebuild starts clean.
+    let _ = std::fs::remove_file(&path);
+    // `URLWithString:` hands back an autoreleased object that the binding
+    // wraps as owned and would release a second time.
+    let url = std::mem::ManuallyDrop::new(URL::new_with_string(&format!(
+        "file://{}",
+        path.display()
+    )));
+    if let Err(error) = archive.serialize_to_url(&url) {
+        return skip(&format!("cannot serialize the archive: {error}"));
+    }
+
+    let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+    println!("cargo:warning=pipeline archive: {:.2} MiB", bytes as f64 / (1024.0 * 1024.0));
+    println!("cargo:rustc-env=LIGHTER_PIPELINE_ARCHIVE={}", path.display());
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+fn build_pipeline_archive(_out_dir: &Path) {}
+
 fn main() {
     // A dependency change (circuit/, vendor/plonky2/) rebuilds this script and
     // re-runs it regardless of these directives; bench's own sources do not
@@ -81,6 +172,8 @@ fn main() {
 
     let out_dir =
         PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR must be set for build scripts"));
+
+    build_pipeline_archive(&out_dir);
 
     if std::env::var_os("LIGHTER_SKIP_EMBED").is_some_and(|v| v == "1") {
         for name in BLOB_NAMES {

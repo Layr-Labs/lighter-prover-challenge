@@ -51,6 +51,10 @@ fn main() {
     // price. Starting it here overlaps it with the startup work below instead
     // of stalling the first proving step that wants the GPU. Pure scheduling:
     // the compiled kernels are identical either way.
+    // Hands the prewarm the pipeline archive the build script produced, so the
+    // kernels are loaded rather than lowered again in this process. Absent on a
+    // build host without Metal, in which case the prewarm compiles as before.
+    plonky2::hash::poseidon2::set_gpu_pipeline_archive(option_env!("LIGHTER_PIPELINE_ARCHIVE"));
     plonky2::hash::poseidon2::prewarm_gpu();
     env_logger::init();
     rayon::ThreadPoolBuilder::new()
