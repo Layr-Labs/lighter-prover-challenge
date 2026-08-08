@@ -2,6 +2,8 @@
 use alloc::{format, vec, vec::Vec};
 use core::cmp::min;
 
+use plonky2_field::packable::Packable;
+use plonky2_field::packed::PackedField;
 use plonky2_field::polynomial::PolynomialCoeffs;
 
 use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
@@ -268,6 +270,22 @@ fn reduce_gate_constraints_base_batch<F: Field>(
 /// `res_out[k * num_challenges..(k + 1) * num_challenges]`. `res_out` must be
 /// zero-initialized by the caller.
 #[allow(clippy::too_many_arguments)]
+/// Views a contiguous batch-axis run of scalars as packed lanes.
+///
+/// The permutation-argument evaluator's operands are all contiguous runs over
+/// the batch axis, so packing is a reinterpret: every packed type in this crate
+/// is `repr(transparent)` over its scalar array, and `pack_slice` asserts the
+/// length is a whole number of lanes.
+#[inline]
+fn pack_cols<F: RichField>(buf: &[F]) -> &[<F as Packable>::Packing] {
+    <F as Packable>::Packing::pack_slice(buf)
+}
+
+#[inline]
+fn pack_cols_mut<F: RichField>(buf: &mut [F]) -> &mut [<F as Packable>::Packing] {
+    <F as Packable>::Packing::pack_slice_mut(buf)
+}
+
 pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
     indices_batch: &[usize],
@@ -429,31 +447,77 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             // but update them side by side so every shared input is loaded
             // once. Operations within either challenge retain the old exact
             // j-ascending order and expression association.
+            //
+            // The batch axis is evaluated through `F::Packing` — the same
+            // packing the promoted packed gate evaluators next door already
+            // use. This loop is the permutation argument's whole arithmetic
+            // cost: `num_routed_wires` (80) columns times two challenges times
+            // four field operations per point, executed once per quotient
+            // point, and until now it was the only scalar hot loop left in the
+            // quotient evaluator. Every operand is a contiguous run of `n`
+            // scalars over the batch axis — wires, sigmas and points straight
+            // out of the `PolyMajor` gather buffers, products out of the reused
+            // scratch — so each maps onto a packed lane group with no gather,
+            // shuffle or transpose.
+            //
+            // Lane-for-lane identical arithmetic: `PackedField`'s operators are
+            // defined to agree elementwise with the scalar field's, the
+            // expression association and the j-ascending multiplication order
+            // are untouched. The two scalar factors are applied through
+            // `PackedField`'s `Mul<Scalar>` (`x * beta_k_0` for the scalar
+            // body's `beta_k_0 * x`), which is the same broadcast product with
+            // its commutative operands written in the order the trait exposes.
+            // The tail below `packed_len`
+            // runs the original scalar body, so a batch that is not a multiple
+            // of the packing width is handled by the code it always was.
+            let width = <<F as Packable>::Packing as PackedField>::WIDTH;
+            let packed_len = n - n % width;
+
             let beta_0 = betas[0];
             let beta_1 = betas[1];
             let gamma_0 = gammas[0];
             let gamma_1 = gammas[1];
+            num_prod.resize(n, F::ZERO);
+            den_prod.resize(n, F::ZERO);
+            num_prod_second.resize(n, F::ZERO);
+            den_prod_second.resize(n, F::ZERO);
             for c in 0..num_chunks {
                 let j_start = c * chunk_size;
                 let j_end = ((c + 1) * chunk_size).min(num_routed_wires);
 
-                num_prod.clear();
-                den_prod.clear();
-                num_prod_second.clear();
-                den_prod_second.clear();
                 {
                     let wire_col = &wires[j_start * n..][..n];
                     let sigma_col = &s_sigmas_cols[j_start * n..][..n];
                     let beta_k_0 = beta_k_is[j_start];
                     let beta_k_1 = beta_k_is[num_routed_wires + j_start];
-                    for k in 0..n {
+                    {
+                        let wire_p = pack_cols(&wire_col[..packed_len]);
+                        let sigma_p = pack_cols(&sigma_col[..packed_len]);
+                        let x_p = pack_cols(&xs_batch[..packed_len]);
+                        let num_p = pack_cols_mut(&mut num_prod[..packed_len]);
+                        let den_p = pack_cols_mut(&mut den_prod[..packed_len]);
+                        let num_p2 =
+                            pack_cols_mut(&mut num_prod_second[..packed_len]);
+                        let den_p2 =
+                            pack_cols_mut(&mut den_prod_second[..packed_len]);
+                        for b in 0..num_p.len() {
+                            let wire = wire_p[b];
+                            let sigma = sigma_p[b];
+                            let x = x_p[b];
+                            num_p[b] = wire + x * beta_k_0 + gamma_0;
+                            den_p[b] = wire + sigma * beta_0 + gamma_0;
+                            num_p2[b] = wire + x * beta_k_1 + gamma_1;
+                            den_p2[b] = wire + sigma * beta_1 + gamma_1;
+                        }
+                    }
+                    for k in packed_len..n {
                         let wire = wire_col[k];
                         let sigma = sigma_col[k];
                         let x = xs_batch[k];
-                        num_prod.push(wire + beta_k_0 * x + gamma_0);
-                        den_prod.push(wire + beta_0 * sigma + gamma_0);
-                        num_prod_second.push(wire + beta_k_1 * x + gamma_1);
-                        den_prod_second.push(wire + beta_1 * sigma + gamma_1);
+                        num_prod[k] = wire + beta_k_0 * x + gamma_0;
+                        den_prod[k] = wire + beta_0 * sigma + gamma_0;
+                        num_prod_second[k] = wire + beta_k_1 * x + gamma_1;
+                        den_prod_second[k] = wire + beta_1 * sigma + gamma_1;
                     }
                 }
                 for j in j_start + 1..j_end {
@@ -461,7 +525,27 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     let sigma_col = &s_sigmas_cols[j * n..][..n];
                     let beta_k_0 = beta_k_is[j];
                     let beta_k_1 = beta_k_is[num_routed_wires + j];
-                    for k in 0..n {
+                    {
+                        let wire_p = pack_cols(&wire_col[..packed_len]);
+                        let sigma_p = pack_cols(&sigma_col[..packed_len]);
+                        let x_p = pack_cols(&xs_batch[..packed_len]);
+                        let num_p = pack_cols_mut(&mut num_prod[..packed_len]);
+                        let den_p = pack_cols_mut(&mut den_prod[..packed_len]);
+                        let num_p2 =
+                            pack_cols_mut(&mut num_prod_second[..packed_len]);
+                        let den_p2 =
+                            pack_cols_mut(&mut den_prod_second[..packed_len]);
+                        for b in 0..num_p.len() {
+                            let wire = wire_p[b];
+                            let sigma = sigma_p[b];
+                            let x = x_p[b];
+                            num_p[b] *= wire + x * beta_k_0 + gamma_0;
+                            den_p[b] *= wire + sigma * beta_0 + gamma_0;
+                            num_p2[b] *= wire + x * beta_k_1 + gamma_1;
+                            den_p2[b] *= wire + sigma * beta_1 + gamma_1;
+                        }
+                    }
+                    for k in packed_len..n {
                         let wire = wire_col[k];
                         let sigma = sigma_col[k];
                         let x = xs_batch[k];
@@ -481,7 +565,23 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 let next_0 = acc_col(0, c + 1);
                 let prev_1 = acc_col(1, c);
                 let next_1 = acc_col(1, c + 1);
-                for k in 0..n {
+                {
+                    let prev_0_p = pack_cols(&prev_0[..packed_len]);
+                    let next_0_p = pack_cols(&next_0[..packed_len]);
+                    let prev_1_p = pack_cols(&prev_1[..packed_len]);
+                    let next_1_p = pack_cols(&next_1[..packed_len]);
+                    let num_p = pack_cols(&num_prod[..packed_len]);
+                    let den_p = pack_cols(&den_prod[..packed_len]);
+                    let num_p2 = pack_cols(&num_prod_second[..packed_len]);
+                    let den_p2 = pack_cols(&den_prod_second[..packed_len]);
+                    let row_0_p = pack_cols_mut(&mut row_0[..packed_len]);
+                    let row_1_p = pack_cols_mut(&mut row_1[..packed_len]);
+                    for b in 0..row_0_p.len() {
+                        row_0_p[b] = prev_0_p[b] * num_p[b] - next_0_p[b] * den_p[b];
+                        row_1_p[b] = prev_1_p[b] * num_p2[b] - next_1_p[b] * den_p2[b];
+                    }
+                }
+                for k in packed_len..n {
                     row_0[k] = prev_0[k] * num_prod[k] - next_0[k] * den_prod[k];
                     row_1[k] = prev_1[k] * num_prod_second[k]
                         - next_1[k] * den_prod_second[k];
