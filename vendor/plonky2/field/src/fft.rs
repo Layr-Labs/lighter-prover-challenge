@@ -742,6 +742,114 @@ fn fft_classic_simd_single_layer_neon_ext(
     }
 }
 
+/// Two consecutive FRI butterfly layers over quadratic-extension elements in
+/// one traversal, mirroring `fft_classic_simd_two_layers_neon`'s pair-column
+/// structure with one extension element (two Goldilocks words) per quarter
+/// position: layer `lg_half_m` pairs (A,B)/(C,D) with `w1_row[j]`, layer
+/// `lg_half_m + 1` pairs (A,C)/(B,D) with `w2_row[j]` and `w2_row[q + j]` —
+/// exactly the butterflies, twiddles and per-element order of running
+/// `fft_classic_simd_single_layer_neon_ext` for the two layers back to back.
+///
+/// The math rides on the same primitives as the single-layer ext kernel:
+/// two-lane `gl_add_neon`/`gl_sub_neon` reductions, paired
+/// `NeonGoldilocksField` multiplies with the row-level base-subfield fast
+/// path (`[w,0] * [v0,v1] = [w*v0, w*v1]`, one paired mul) and the W = 7
+/// conjugation fallback, so every raw `GoldilocksField.0` word is identical
+/// to the two back-to-back single-layer passes. Each element is loaded and
+/// stored once per layer PAIR instead of once per layer, halving whole-array
+/// passes for the fused layers, under the same pair-column register
+/// discipline as the base-field kernel (one element per quarter position is
+/// exactly two words, i.e. one 128-bit vector).
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_two_layers_neon_ext(
+    values: &mut [crate::extension::quadratic::QuadraticExtension<
+        crate::goldilocks_field::GoldilocksField,
+    >],
+    lg_half_m: usize,
+    w1_row: &[crate::extension::quadratic::QuadraticExtension<
+        crate::goldilocks_field::GoldilocksField,
+    >],
+    w2_row: &[crate::extension::quadratic::QuadraticExtension<
+        crate::goldilocks_field::GoldilocksField,
+    >],
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+    use crate::extension::quadratic::QuadraticExtension;
+    use crate::goldilocks_field::GoldilocksField;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    const W: u64 = 7;
+    debug_assert!(lg_half_m >= 1);
+    let q = 1usize << lg_half_m;
+    let w1_row = &w1_row[..q];
+    let (w2_lo, w2_hi) = w2_row[..2 * q].split_at(q);
+    // Row-level base-subfield check across both layers, exactly like the
+    // single-layer ext kernel's: production FRI twiddle rows are base
+    // subfield, for which each product is one paired mul instead of four.
+    let base_subfield =
+        w1_row.iter().all(|w| w.0[1].0 == 0) && w2_lo.iter().chain(w2_hi).all(|w| w.0[1].0 == 0);
+    let product = |tw: &QuadraticExtension<GoldilocksField>, v: (u64, u64)| -> (u64, u64) {
+        if base_subfield {
+            // [w0, 0] * [v0, v1] = [w0*v0, w0*v1]: one paired mul.
+            let p = NeonGoldilocksField([tw.0[0], tw.0[0]]) * NeonGoldilocksField([GoldilocksField(v.0), GoldilocksField(v.1)]);
+            (p.0[0].0, p.0[1].0)
+        } else {
+            // General extension product with the W = 7 conjugation.
+            let p = NeonGoldilocksField([tw.0[0], tw.0[1]]) * NeonGoldilocksField([GoldilocksField(v.0), GoldilocksField(v.1)]);
+            let q = NeonGoldilocksField([tw.0[0], tw.0[1]]) * NeonGoldilocksField([GoldilocksField(v.1), GoldilocksField(v.0)]);
+            let c0 = (p.0[0] + GoldilocksField(W) * p.0[1]).0;
+            let c1 = (q.0[0] + q.0[1]).0;
+            (c0, c1)
+        }
+    };
+
+    let eps = unsafe { vdupq_n_u64(EPSILON) };
+    for block in values.chunks_exact_mut(4 * q) {
+        let (ab, cd) = block.split_at_mut(2 * q);
+        let (quarter_a, quarter_b) = ab.split_at_mut(q);
+        let (quarter_c, quarter_d) = cd.split_at_mut(q);
+        for (((((a, b), c), d), (w1, w2a)), w2b) in quarter_a
+            .iter_mut()
+            .zip(quarter_b.iter_mut())
+            .zip(quarter_c.iter_mut())
+            .zip(quarter_d.iter_mut())
+            .zip(w1_row.iter().zip(w2_lo.iter()))
+            .zip(w2_hi.iter())
+        {
+            // Stage-1 products for both butterflies.
+            let (t1_0, t1_1) = product(w1, (b.0[0].0, b.0[1].0));
+            let (t2_0, t2_1) = product(w1, (d.0[0].0, d.0[1].0));
+            // C/D stage-1 butterfly in scalar registers: these values are the
+            // stage-2 multiplier inputs, so keeping them out of the vector
+            // file avoids a NEON->GPR crossing on the critical path.
+            let cd0 = [c.0[0] + GoldilocksField(t2_0), c.0[1] + GoldilocksField(t2_1)];
+            let cd1 = [c.0[0] - GoldilocksField(t2_0), c.0[1] - GoldilocksField(t2_1)];
+            // Stage-2 products.
+            let (t3_0, t3_1) = product(w2a, (cd0[0].0, cd0[1].0));
+            let (t4_0, t4_1) = product(w2b, (cd1[0].0, cd1[1].0));
+            // SAFETY: every element slot belongs to its own quarter
+            // (`iter_mut` slices are disjoint), each twiddle read stays
+            // inside the row slices, and the vector intrinsics are the same
+            // two-lane adds/subs the single-layer ext kernel uses, applied
+            // to one element (two words) per position.
+            unsafe {
+                let av = vld1q_u64(a.0.as_ptr().cast::<u64>());
+                let t1v = vcombine_u64(vcreate_u64(t1_0), vcreate_u64(t1_1));
+                let ab0 = gl_add_neon(av, t1v, eps);
+                let ab1 = gl_sub_neon(av, t1v, eps);
+                let t3v = vcombine_u64(vcreate_u64(t3_0), vcreate_u64(t3_1));
+                let t4v = vcombine_u64(vcreate_u64(t4_0), vcreate_u64(t4_1));
+                vst1q_u64(a.0.as_mut_ptr().cast::<u64>(), gl_add_neon(ab0, t3v, eps));
+                vst1q_u64(c.0.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab0, t3v, eps));
+                vst1q_u64(b.0.as_mut_ptr().cast::<u64>(), gl_add_neon(ab1, t4v, eps));
+                vst1q_u64(d.0.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab1, t4v, eps));
+            }
+        }
+    }
+}
+
 #[inline(always)]
 fn fft_classic_simd_single_layer_with<P, M>(
     packed_values: &mut [P],
@@ -1010,6 +1118,77 @@ fn fft_classic_simd_layers<P, M>(
                     )
                 };
                 fft_classic_simd_two_layers_neon(scalars, lg_half_m, w1_row, w2_row);
+                lg_half_m += 2;
+            }
+        }
+        if lg_half_m < end {
+            fft_classic_simd_single_layer_with::<P, M>(
+                packed_values,
+                lg_half_m,
+                lg_packed_width,
+                root_table,
+            );
+        }
+        return;
+    }
+
+    // Quadratic-extension (FRI) fused-pair arm: same two-layer fusion, one
+    // extension element (two words) per quarter position. Guarded on exact
+    // `QuadraticExtension<GoldilocksField>` identity the same way the
+    // single-layer ext fast path is; reaching it proves `P::Scalar` is
+    // exactly `GoldilocksField`, whose `mul_fft_base_twiddle` is the default
+    // full multiplication, so both markers denote the same product and the
+    // arm is untouched by the twiddle specialization. The kernel applies the
+    // exact butterflies, twiddles and per-element order of two back-to-back
+    // single-layer ext passes, so every raw word is identical.
+    #[cfg(target_arch = "aarch64")]
+    if start + 2 <= end
+        && (packed_values.len() << lg_packed_width) >= FUSED_PAIR_MIN_SCALARS
+        && core::any::TypeId::of::<P>()
+            == core::any::TypeId::of::<
+                crate::extension::quadratic::QuadraticExtension<
+                    crate::goldilocks_field::GoldilocksField,
+                >,
+            >()
+    {
+        let mut lg_half_m = start;
+        {
+            // SAFETY: the `TypeId` compare proves `P` is exactly
+            // `QuadraticExtension<GoldilocksField>`, whose `PackedField`
+            // `WIDTH` is 1, so `packed_values` is exactly `len` contiguous
+            // extension elements with the same alignment (a single
+            // `[GoldilocksField; 2]` field, no padding), and the rows are
+            // already that type. Only the generic spelling differs.
+            let ext_values = unsafe {
+                core::slice::from_raw_parts_mut(
+                    packed_values
+                        .as_mut_ptr()
+                        .cast::<crate::extension::quadratic::QuadraticExtension<
+                            crate::goldilocks_field::GoldilocksField,
+                        >>(),
+                    packed_values.len() * P::WIDTH,
+                )
+            };
+            while lg_half_m + 2 <= end {
+                let w1_row = unsafe {
+                    let row = &root_table[lg_half_m];
+                    core::slice::from_raw_parts(
+                        row.as_ptr().cast::<crate::extension::quadratic::QuadraticExtension<
+                            crate::goldilocks_field::GoldilocksField,
+                        >>(),
+                        row.len(),
+                    )
+                };
+                let w2_row = unsafe {
+                    let row = &root_table[lg_half_m + 1];
+                    core::slice::from_raw_parts(
+                        row.as_ptr().cast::<crate::extension::quadratic::QuadraticExtension<
+                            crate::goldilocks_field::GoldilocksField,
+                        >>(),
+                        row.len(),
+                    )
+                };
+                fft_classic_simd_two_layers_neon_ext(ext_values, lg_half_m, w1_row, w2_row);
                 lg_half_m += 2;
             }
         }
@@ -3161,6 +3340,134 @@ mod tests {
         fft_in_place_with_options(&mut serial, Some(3), None);
         fft_in_place_with_options_parallel(&mut parallel, Some(3), None);
         assert_eq!(parallel, serial, "packed base-field public entry diverged");
+    }
+
+
+    /// Portable copy of the two-layer FRI fusion over extension elements:
+    /// layer `lg_half_m` pairs (A,B)/(C,D) with `w1_row[j]`, layer
+    /// `lg_half_m + 1` pairs (A,C)/(B,D) with `w2_row[j]` and `w2_row[q + j]`.
+    /// This is the generic-math oracle for both the production arm and the
+    /// NEON kernel: the two layers in one traversal must be **bit**-identical
+    /// to two back-to-back single-layer passes, not merely congruent.
+    fn fused_two_layers_ext_portable(
+        values: &mut [QuadraticExtension<GoldilocksField>],
+        lg_half_m: usize,
+        w1_row: &[QuadraticExtension<GoldilocksField>],
+        w2_row: &[QuadraticExtension<GoldilocksField>],
+    ) {
+        let q = 1usize << lg_half_m;
+        for block in values.chunks_exact_mut(4 * q) {
+            let (ab, cd) = block.split_at_mut(2 * q);
+            let (quarter_a, quarter_b) = ab.split_at_mut(q);
+            let (quarter_c, quarter_d) = cd.split_at_mut(q);
+            for j in 0..q {
+                let t1 = w1_row[j] * quarter_b[j]; // A-side stage 1.
+                let t2 = w1_row[j] * quarter_d[j]; // C-side stage 1.
+                let cd0 = quarter_c[j] + t2;
+                let cd1 = quarter_c[j] - t2;
+                let t3 = w2_row[j] * cd0;
+                let t4 = w2_row[q + j] * cd1;
+                let u0 = quarter_a[j] + t1;
+                let u1 = quarter_a[j] - t1;
+                quarter_a[j] = u0 + t3;
+                quarter_c[j] = u0 - t3;
+                quarter_b[j] = u1 + t4;
+                quarter_d[j] = u1 - t4;
+            }
+        }
+    }
+
+    /// Verbatim generic single-layer body for `QuadraticExtension` (WIDTH 1):
+    /// the oracle the NEON ext kernels replace.
+    fn generic_ext_single_layer(
+        values: &mut [QuadraticExtension<GoldilocksField>],
+        lg_half_m: usize,
+        root_table: &FftRootTable<QuadraticExtension<GoldilocksField>>,
+    ) {
+        let m = 1usize << (lg_half_m + 1);
+        let half = m / 2;
+        let omega = &root_table[lg_half_m][..half];
+        for block in values.chunks_exact_mut(m) {
+            let (lows, highs) = block.split_at_mut(half);
+            for ((u, v), &w) in lows.iter_mut().zip(highs.iter_mut()).zip(omega) {
+                let t = w * *v;
+                let u_value = *u;
+                *u = u_value + t;
+                *v = u_value - t;
+            }
+        }
+    }
+
+    fn ext_deterministic_values(n: usize) -> Vec<QuadraticExtension<GoldilocksField>> {
+        (0..n)
+            .map(|i| {
+                QuadraticExtension::<GoldilocksField>([
+                    deterministic_value(2 * i + 1),
+                    deterministic_value(2 * i + 2),
+                ])
+            })
+            .collect()
+    }
+
+    /// The two-layer ext fusion (generic math, all platforms) must be
+    /// raw-word identical to two consecutive single-layer passes, across
+    /// sizes and start stages.
+    #[test]
+    fn ext_fused_two_layers_matches_two_single_layers() {
+        type F = QuadraticExtension<GoldilocksField>;
+        for lg_n in [4usize, 5, 8, 11, 13, 16] {
+            let n = 1 << lg_n;
+            let roots = fft_root_table::<F>(n);
+            for start in 2..lg_n - 1 {
+                let mut expected = ext_deterministic_values(n);
+                let mut actual = expected.clone();
+                // Two single-layer passes, layers start and start+1.
+                generic_ext_single_layer(&mut expected, start, &roots);
+                generic_ext_single_layer(&mut expected, start + 1, &roots);
+                fused_two_layers_ext_portable(&mut actual, start, &roots[start], &roots[start + 1]);
+                for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                    assert_eq!(
+                        [a.0[0].0, a.0[1].0],
+                        [e.0[0].0, e.0[1].0],
+                        "portable ext fusion mismatch at 2^{lg_n} start {start} index {i}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The NEON two-layer ext kernel must be **bit**-identical to two generic
+    /// single-layer ext passes, the same oracle the single-layer NEON ext
+    /// kernel is already held against: same butterflies, same twiddles, same
+    /// order, so the raw `GoldilocksField.0` words must match exactly.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_two_layers_ext_matches_generic_raw_words() {
+        use super::fft_classic_simd_two_layers_neon_ext;
+        type F = QuadraticExtension<GoldilocksField>;
+        for lg_n in [4usize, 5, 8, 11, 13, 16] {
+            let n = 1 << lg_n;
+            let roots = fft_root_table::<F>(n);
+            for start in 2..lg_n - 1 {
+                let mut expected = ext_deterministic_values(n);
+                let mut actual = expected.clone();
+                generic_ext_single_layer(&mut expected, start, &roots);
+                generic_ext_single_layer(&mut expected, start + 1, &roots);
+                fft_classic_simd_two_layers_neon_ext(
+                    &mut actual,
+                    start,
+                    &roots[start],
+                    &roots[start + 1],
+                );
+                for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                    assert_eq!(
+                        [a.0[0].0, a.0[1].0],
+                        [e.0[0].0, e.0[1].0],
+                        "NEON ext fusion mismatch at 2^{lg_n} start {start} index {i}"
+                    );
+                }
+            }
+        }
     }
 
 }
