@@ -1405,12 +1405,24 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // gathers read the same values. Extract them once (bounded by 1 GiB so
         // the final block circuit — which is proven once — stays uncached) and
         // let the quotient batch loop copy instead of re-walking the LDE.
+        //
+        // Only worth materializing when the gather actually strides. At
+        // `step == 1` the quotient domain *is* the LDE domain, and the indices
+        // the quotient loop gathers with are always the contiguous run
+        // `BATCH_SIZE * batch_i .. + n`, so `fill_lde_batch` takes its
+        // `fill_lde_batch_contiguous` fast path and issues exactly the same
+        // `copy_from_slice`, from exactly the same column slice, that a cache
+        // hit would. The cache would then be a verbatim second copy of the
+        // whole constants/sigmas extension (352 MiB for a 2^16-row circuit,
+        // 86 MiB for a 2^14 one) that saves no gather work and stays resident
+        // past `PolynomialBatch` release. Keep it strictly for strided
+        // configurations (`rate_bits > log2_ceil(quotient_degree_factor)`).
         let quotient_degree_bits = log2_ceil(common.quotient_degree_factor);
         let (constants_sigmas_quotient_cache, constants_sigmas_quotient_step, constants_sigmas_quotient_domain) = {
             let step = 1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
             let domain = 1 << (common.degree_bits() + quotient_degree_bits);
             let cols = common.constants_range().len() + common.sigmas_range().len();
-            if cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
+            if step > 1 && cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
                 match (
                     constants_sigmas_commitment.extract_lde_batch_columns(
                         step,
