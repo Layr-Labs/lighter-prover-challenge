@@ -281,14 +281,30 @@ where
     let partial_products_zs_and_lookup_commitment = timed!(
         timing,
         "commit to partial products, Z's and, if any, lookup polynomials",
-        PolynomialBatch::from_values(
-            zs_partial_products,
-            config.fri_config.rate_bits,
-            config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
-            config.fri_config.cap_height,
-            timing,
-            prover_data.fft_root_table.as_ref(),
-        )
+        {
+            #[cfg(target_arch = "aarch64")]
+            {
+                PolynomialBatch::from_values_bowers_rate_8(
+                    zs_partial_products,
+                    config.fri_config.rate_bits,
+                    config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
+                    config.fri_config.cap_height,
+                    timing,
+                    prover_data.fft_root_table.as_ref(),
+                )
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                PolynomialBatch::from_values(
+                    zs_partial_products,
+                    config.fri_config.rate_bits,
+                    config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
+                    config.fri_config.cap_height,
+                    timing,
+                    prover_data.fft_root_table.as_ref(),
+                )
+            }
+        }
     );
 
     challenger.observe_cap::<C::Hasher>(&partial_products_zs_and_lookup_commitment.merkle_tree.cap);

@@ -123,6 +123,176 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         )
     }
 
+    /// Z/partial-products commitment path for the AArch64 Goldilocks rate-8
+    /// shape. Bowers G^T leaves coefficients bit-reversed; the retained LDE
+    /// consumes that order directly, after which one final in-place bit
+    /// reversal restores the natural coefficient polynomials used by opening
+    /// proofs. Unsupported shapes take the established path unchanged.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn from_values_bowers_rate_8(
+        mut values: Vec<PolynomialValues<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Self {
+        use core::any::TypeId;
+
+        use crate::field::goldilocks_field::GoldilocksField;
+
+        const RATE_BITS: usize = 3;
+        if rate_bits != RATE_BITS
+            || blinding
+            || values.is_empty()
+            || TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
+        {
+            return Self::from_values(
+                values,
+                rate_bits,
+                blinding,
+                cap_height,
+                timing,
+                fft_root_table,
+            );
+        }
+
+        let degree = values[0].len();
+        assert!(values.iter().all(|column| column.len() == degree));
+        let lde_len = degree << RATE_BITS;
+        let computed_roots;
+        let roots = if let Some(roots) = fft_root_table {
+            roots
+        } else {
+            computed_roots = crate::field::fft::fft_root_table::<F>(lde_len);
+            &computed_roots
+        };
+        assert_eq!(roots.len(), log2_strict(lde_len));
+
+        // SAFETY: the TypeId guard proves every generic `F` allocation and
+        // table below has the exact Goldilocks element type and layout.
+        let roots_goldilocks = unsafe {
+            &*(roots as *const FftRootTable<F>
+                as *const FftRootTable<GoldilocksField>)
+        };
+        timed!(timing, "IFFT", {
+            values.par_iter_mut().for_each(|column| {
+                let column = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        column.values.as_mut_ptr().cast::<GoldilocksField>(),
+                        column.values.len(),
+                    )
+                };
+                crate::field::fft::ifft_bowers_bit_reversed_goldilocks(
+                    column,
+                    roots_goldilocks,
+                );
+            });
+        });
+
+        let coset_powers = crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
+        let coset_powers_goldilocks = unsafe {
+            core::slice::from_raw_parts(
+                coset_powers.as_ptr().cast::<GoldilocksField>(),
+                coset_powers.len(),
+            )
+        };
+        let mut columns = C::Hasher::try_allocate_merkle_tree_columns(
+            values.len(),
+            lde_len,
+            cap_height,
+        )
+        .unwrap_or_else(|| ColumnStore::Owned(vec![vec![F::ZERO; lde_len]; values.len()]));
+
+        let fill_group = |group: usize, destinations: &mut [&mut [F]]| {
+            destinations
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(k, destination)| {
+                    let source = &values[group * 8 + k].values;
+                    let source = unsafe {
+                        core::slice::from_raw_parts(
+                            source.as_ptr().cast::<GoldilocksField>(),
+                            source.len(),
+                        )
+                    };
+                    let destination = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            destination.as_mut_ptr().cast::<GoldilocksField>(),
+                            destination.len(),
+                        )
+                    };
+                    crate::field::fft::fft_bowers_rate_8_from_bit_reversed_coeffs(
+                        source,
+                        destination,
+                        coset_powers_goldilocks,
+                        roots_goldilocks,
+                    );
+                });
+        };
+
+        let streamed = C::Hasher::try_build_merkle_tree_column_store_streamed(
+            &columns,
+            cap_height,
+            &fill_group,
+        );
+        let merkle_tree = if let Some((level_digests, cap)) = streamed {
+            timed!(
+                timing,
+                "build Merkle tree",
+                MerkleTree::from_prebuilt_columns(columns, level_digests, cap)
+            )
+        } else {
+            let mut destinations = columns
+                .columns_mut()
+                .expect("newly allocated column storage must be writable");
+            destinations
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(column, destination)| {
+                    let source = &values[column].values;
+                    let source = unsafe {
+                        core::slice::from_raw_parts(
+                            source.as_ptr().cast::<GoldilocksField>(),
+                            source.len(),
+                        )
+                    };
+                    let destination = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            destination.as_mut_ptr().cast::<GoldilocksField>(),
+                            destination.len(),
+                        )
+                    };
+                    crate::field::fft::fft_bowers_rate_8_from_bit_reversed_coeffs(
+                        source,
+                        destination,
+                        coset_powers_goldilocks,
+                        roots_goldilocks,
+                    );
+                });
+            timed!(
+                timing,
+                "build Merkle tree",
+                MerkleTree::new_column_store(columns, cap_height)
+            )
+        };
+
+        let polynomials = values
+            .into_par_iter()
+            .map(|mut column| {
+                plonky2_util::reverse_index_bits_in_place(&mut column.values);
+                PolynomialCoeffs::new(column.values)
+            })
+            .collect();
+        Self {
+            polynomials,
+            merkle_tree,
+            degree_log: log2_strict(degree),
+            rate_bits: RATE_BITS,
+            blinding,
+        }
+    }
+
     /// Creates a list polynomial commitment for the polynomials `polynomials`.
     pub fn from_coeffs(
         polynomials: Vec<PolynomialCoeffs<F>>,
@@ -802,6 +972,40 @@ mod tests {
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::Sample;
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn bowers_from_values_route_matches_classic_commitment() {
+        const D: usize = 2;
+        const RATE_BITS: usize = 3;
+        const CAP_HEIGHT: usize = 1;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let values = (0..3)
+            .map(|_| PolynomialValues::new(F::rand_vec(1 << 6)))
+            .collect::<Vec<_>>();
+        let roots = crate::field::fft::fft_root_table::<F>((1 << 6) << RATE_BITS);
+        let expected = PolynomialBatch::<F, C, D>::from_values(
+            values.clone(),
+            RATE_BITS,
+            false,
+            CAP_HEIGHT,
+            &mut TimingTree::default(),
+            Some(&roots),
+        );
+        let actual = PolynomialBatch::<F, C, D>::from_values_bowers_rate_8(
+            values,
+            RATE_BITS,
+            false,
+            CAP_HEIGHT,
+            &mut TimingTree::default(),
+            Some(&roots),
+        );
+
+        assert_eq!(actual.polynomials, expected.polynomials);
+        assert_eq!(actual.merkle_tree, expected.merkle_tree);
+    }
 
     #[test]
     fn shared_coset_powers_match_per_polynomial_shifts() {

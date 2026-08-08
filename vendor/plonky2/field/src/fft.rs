@@ -311,6 +311,95 @@ pub fn ifft_borrowed<F: Field>(values: &[F]) -> PolynomialCoeffs<F> {
     PolynomialCoeffs { coeffs: buffer }
 }
 
+/// Inverse decimation-in-frequency transform for the exact AArch64
+/// Goldilocks field. Natural-order subgroup evaluations are transformed in
+/// place into normalized coefficients in bit-reversed order, so a following
+/// DIT LDE can consume the layout without another global permutation.
+#[cfg(target_arch = "aarch64")]
+pub fn ifft_bowers_bit_reversed_goldilocks(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    root_table: &FftRootTable<crate::goldilocks_field::GoldilocksField>,
+) {
+    use core::arch::aarch64::*;
+
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+
+    let lg_n = log2_strict(values.len());
+    assert!(root_table.len() >= lg_n);
+    let base = values.as_mut_ptr().cast::<u64>();
+
+    let full_roots = &root_table[lg_n - 1];
+    let full_half = values.len() >> 1;
+    for lg_half_m in (0..lg_n).rev() {
+        let half = 1usize << lg_half_m;
+        let m = half << 1;
+        let num_blocks = values.len() / m;
+
+        for block in 0..num_blocks {
+            let k = block * m;
+            // Plonky3's Bowers G^T table is the inverse-root power row with
+            // its indices bit-reversed. Compute the one entry used by this
+            // whole block directly; `rbit` replaces an N/2-element table
+            // allocation on every column.
+            let exponent = if lg_n == 1 {
+                0
+            } else {
+                block.reverse_bits() >> (usize::BITS as usize - (lg_n - 1))
+            };
+            let twiddle = if exponent == 0 {
+                full_roots[0]
+            } else {
+                -full_roots[full_half - exponent]
+            };
+
+            unsafe {
+                let eps = vdupq_n_u64(EPSILON);
+                let mut j = 0;
+                while j + 2 <= half {
+                    let u = vld1q_u64(base.add(k + j));
+                    let v = vld1q_u64(base.add(k + half + j));
+                    let product = if block == 0 {
+                        v
+                    } else {
+                        let products = NeonGoldilocksField([
+                            crate::goldilocks_field::GoldilocksField(vgetq_lane_u64(v, 0)),
+                            crate::goldilocks_field::GoldilocksField(vgetq_lane_u64(v, 1)),
+                        ]) * NeonGoldilocksField([twiddle, twiddle]);
+                        vcombine_u64(
+                            vcreate_u64(products.0[0].0),
+                            vcreate_u64(products.0[1].0),
+                        )
+                    };
+                    vst1q_u64(base.add(k + j), gl_add_neon(u, product, eps));
+                    vst1q_u64(base.add(k + half + j), gl_sub_neon(u, product, eps));
+                    j += 2;
+                }
+                while j < half {
+                    let u = *values.get_unchecked(k + j);
+                    let v = *values.get_unchecked(k + half + j);
+                    let product = if block == 0 {
+                        v
+                    } else {
+                        v * twiddle
+                    };
+                    *values.get_unchecked_mut(k + j) = u + product;
+                    *values.get_unchecked_mut(k + half + j) = u - product;
+                    j += 1;
+                }
+            }
+        }
+    }
+
+    let n_inv = crate::goldilocks_field::GoldilocksField::inverse_2exp(lg_n);
+    for pair in values.chunks_exact_mut(2) {
+        let scaled = NeonGoldilocksField([pair[0], pair[1]])
+            * NeonGoldilocksField([n_inv, n_inv]);
+        pair.copy_from_slice(&scaled.0);
+    }
+}
+
 /// Generic FFT implementation that works with both scalar and packed inputs.
 #[unroll_for_loops]
 fn fft_classic_simd_with<P, M>(
@@ -931,7 +1020,7 @@ fn fft_zero_padded_cache_blocks<P, M>(
 }
 
 #[inline(never)]
-fn prepare_zero_padded_fft<F, M>(
+fn prepare_zero_padded_fft_from_bit_reversed<F, M>(
     values: &mut [F],
     r: usize,
     lg_n: usize,
@@ -944,13 +1033,10 @@ where
 {
     debug_assert!(r > 0 && r <= lg_n);
 
-    // A zero-padded input only has n/2^r live coefficients. Bit-reversing the full buffer would
-    // place those coefficients at multiples of 2^r, after which the skipped FFT layers copy each
-    // one across its following 2^r-element run. Produce that exact state directly by reversing
-    // just the live prefix.
+    // The live prefix is already bit-reversed. Expanding it directly produces
+    // the exact state the skipped FFT layers would have created.
     let repeat = 1 << r;
     let nonzero_len = values.len() >> r;
-    reverse_index_bits_in_place(&mut values[..nonzero_len]);
 
     if r >= lg_packed_width && r < lg_n {
         // Keep values plus the largest local twiddle row within Apple Silicon's 128 KiB L1D.
@@ -978,6 +1064,91 @@ where
         }
         r
     }
+}
+
+#[inline(never)]
+fn prepare_zero_padded_fft<F, M>(
+    values: &mut [F],
+    r: usize,
+    lg_n: usize,
+    lg_packed_width: usize,
+    root_table: &FftRootTable<F>,
+) -> usize
+where
+    F: Field,
+    M: FftTwiddleMul<<F as Packable>::Packing>,
+{
+    let nonzero_len = values.len() >> r;
+    reverse_index_bits_in_place(&mut values[..nonzero_len]);
+    prepare_zero_padded_fft_from_bit_reversed::<F, M>(
+        values,
+        r,
+        lg_n,
+        lg_packed_width,
+        root_table,
+    )
+}
+
+/// Scale bit-reversed Goldilocks coefficients onto the standard coset and
+/// feed them directly into the existing rate-8 zero-padding/cache-block DIT.
+/// The destination prefix is written sequentially; no full-size permutation
+/// or deinterleave buffer is materialized.
+#[cfg(target_arch = "aarch64")]
+pub fn fft_bowers_rate_8_from_bit_reversed_coeffs(
+    bit_reversed_coeffs: &[crate::goldilocks_field::GoldilocksField],
+    destination: &mut [crate::goldilocks_field::GoldilocksField],
+    coset_powers: &[crate::goldilocks_field::GoldilocksField],
+    root_table: &FftRootTable<crate::goldilocks_field::GoldilocksField>,
+) {
+    let degree = bit_reversed_coeffs.len();
+    let lg_degree = log2_strict(degree);
+    let lg_n = log2_strict(destination.len());
+    const RATE_BITS: usize = 3;
+    assert_eq!(destination.len(), degree << RATE_BITS);
+    assert_eq!(coset_powers.len(), degree);
+    assert_eq!(root_table.len(), lg_n);
+
+    let reverse = |position: usize| {
+        if lg_degree == 0 {
+            0
+        } else {
+            position.reverse_bits() >> (usize::BITS as usize - lg_degree)
+        }
+    };
+    let mut position = 0;
+    while position + WideGoldilocksField::WIDTH <= degree {
+        let powers: [crate::goldilocks_field::GoldilocksField; 4] =
+            core::array::from_fn(|lane| coset_powers[reverse(position + lane)]);
+        let scaled = *WideGoldilocksField::from_slice(
+            &bit_reversed_coeffs[position..position + WideGoldilocksField::WIDTH],
+        ) * *WideGoldilocksField::from_slice(&powers);
+        destination[position..position + WideGoldilocksField::WIDTH]
+            .copy_from_slice(scaled.as_slice());
+        position += WideGoldilocksField::WIDTH;
+    }
+    while position < degree {
+        destination[position] = bit_reversed_coeffs[position] * coset_powers[reverse(position)];
+        position += 1;
+    }
+
+    let lg_packed_width = log2_strict(WideGoldilocksField::WIDTH);
+    let first_layer =
+        prepare_zero_padded_fft_from_bit_reversed::<
+            crate::goldilocks_field::GoldilocksField,
+            BaseSubfieldTwiddle,
+        >(
+            destination,
+            RATE_BITS,
+            lg_n,
+            lg_packed_width,
+            root_table,
+        );
+    fft_classic_simd_with::<WideGoldilocksField, BaseSubfieldTwiddle>(
+        destination,
+        first_layer,
+        lg_n,
+        root_table,
+    );
 }
 
 /// FFT implementation based on Section 32.3 of "Introduction to
@@ -2150,6 +2321,106 @@ mod tests {
         check::<GoldilocksField>();
         check::<QuadraticExtension<GoldilocksField>>();
         check::<QuarticExtension<GoldilocksField>>();
+    }
+
+    /// A Bowers inverse DIF consumes natural-order subgroup evaluations and
+    /// leaves normalized coefficients in bit-reversed order. This is the
+    /// layout the rate-8 DIT expansion can consume without another global
+    /// bit-reversal pass.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn bowers_inverse_dif_matches_ifft_in_bit_reversed_order() {
+        use crate::types::PrimeField64;
+
+        for lg_n in [1usize, 2, 5, 8, 11, 14, 17] {
+            let n = 1usize << lg_n;
+            let roots = fft_root_table::<GoldilocksField>(n);
+            let values = deterministic_values(n);
+            let expected = ifft(PolynomialValues::new(values.clone())).coeffs;
+            let mut actual = values;
+
+            super::ifft_bowers_bit_reversed_goldilocks(&mut actual, &roots);
+
+            for (position, value) in actual.iter().enumerate() {
+                let natural_index = position.reverse_bits() >> (usize::BITS as usize - lg_n);
+                assert_eq!(
+                    value.to_canonical_u64(),
+                    expected[natural_index].to_canonical_u64(),
+                    "Bowers IFFT mismatch at 2^{lg_n}, bit-reversed position {position}"
+                );
+            }
+        }
+    }
+
+    /// The full hybrid must preserve both consumers of `from_values`: the
+    /// retained natural-order coefficient polynomials and the rate-8 coset
+    /// LDE committed by the Merkle tree.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn bowers_rate_8_hybrid_matches_retained_coefficients_and_lde() {
+        use crate::types::PrimeField64;
+
+        let rate_bits = 3;
+        for base_lg_n in [5usize, 10, 12, 14] {
+            let degree = 1usize << base_lg_n;
+            let lde_len = degree << rate_bits;
+            let roots = fft_root_table::<GoldilocksField>(lde_len);
+            let values = deterministic_values(degree);
+            let expected_coeffs = ifft(PolynomialValues::new(values.clone())).coeffs;
+            let expected_padded = expected_coeffs
+                .iter()
+                .copied()
+                .chain(core::iter::repeat_n(
+                    GoldilocksField::ZERO,
+                    lde_len - degree,
+                ))
+                .collect::<Vec<_>>();
+            let expected_lde = PolynomialCoeffs::new(expected_padded)
+                .coset_fft_with_options(
+                    GoldilocksField::coset_shift(),
+                    Some(rate_bits),
+                    Some(&roots),
+                )
+                .values;
+
+            let mut bit_reversed_coeffs = values;
+            let ifft_roots = fft_root_table::<GoldilocksField>(degree);
+            super::ifft_bowers_bit_reversed_goldilocks(
+                &mut bit_reversed_coeffs,
+                &ifft_roots,
+            );
+            let coset_powers = GoldilocksField::coset_shift()
+                .powers()
+                .take(degree)
+                .collect::<Vec<_>>();
+            let mut actual_lde = vec![GoldilocksField::ZERO; lde_len];
+            super::fft_bowers_rate_8_from_bit_reversed_coeffs(
+                &bit_reversed_coeffs,
+                &mut actual_lde,
+                &coset_powers,
+                &roots,
+            );
+            reverse_index_bits_in_place(&mut bit_reversed_coeffs);
+
+            for (index, (actual, expected)) in bit_reversed_coeffs
+                .iter()
+                .zip(&expected_coeffs)
+                .enumerate()
+            {
+                assert_eq!(
+                    actual.to_canonical_u64(),
+                    expected.to_canonical_u64(),
+                    "retained coefficient mismatch at 2^{base_lg_n}, index {index}"
+                );
+            }
+            for (index, (actual, expected)) in actual_lde.iter().zip(&expected_lde).enumerate() {
+                assert_eq!(
+                    actual.to_canonical_u64(),
+                    expected.to_canonical_u64(),
+                    "Bowers rate-8 LDE mismatch at 2^{base_lg_n}, index {index}"
+                );
+            }
+        }
     }
 
     /// The cached-table dispatch path (no caller-supplied table) must return
