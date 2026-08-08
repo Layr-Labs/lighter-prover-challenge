@@ -531,12 +531,18 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         }
 
         // Same reversed-order Horner reduction as the per-point loop.
-        for t in (0..num_rows).rev() {
-            let row = &term_rows[t * n..][..n];
-            for k in 0..n {
-                let res = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
+        // Iterate point-major (k outer, t inner): each point's `num_challenges`
+        // accumulator slots stay hot in registers/cache across the whole row
+        // chain, instead of re-walking `res_out` once per term row. The
+        // per-point chain order (t descending) is unchanged, so every value is
+        // raw-limb identical to the previous row-major scan.
+        for k in 0..n {
+            let res = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
+            for t in (0..num_rows).rev() {
+                let row = &term_rows[t * n..][..n];
+                let term = row[k];
                 for (c, &alpha) in res.iter_mut().zip(alphas) {
-                    *c = row[k].multiply_accumulate(*c, alpha);
+                    *c = term.multiply_accumulate(*c, alpha);
                 }
             }
         }
