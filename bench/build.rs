@@ -49,9 +49,25 @@ fn write_blob(out_dir: &Path, name: &str, bytes: &[u8]) {
     std::fs::write(&path, bytes).unwrap_or_else(|error| {
         panic!("cannot write embedded circuit blob {}: {error}", path.display())
     });
+    // Also write an lz4-compressed sibling that `src/embedded.rs` embeds
+    // instead: the ~41 MB of raw circuit blobs shrink to ~19 MB, cutting the
+    // mapped binary the ranked worker spawns (codesign validation and page-in
+    // are per-spawn weight on the scored path). Compression happens here in
+    // the untimed compile job; decompression happens once per worker at
+    // blob-load time and is value-identical after `deserialize_embedded`.
+    let lz4_path = out_dir.join(format!("{name}.lz4"));
+    let compressed = if bytes.is_empty() {
+        Vec::new()
+    } else {
+        lz4_flex::block::compress_prepend_size(bytes)
+    };
+    std::fs::write(&lz4_path, &compressed).unwrap_or_else(|error| {
+        panic!("cannot write embedded circuit blob {}: {error}", lz4_path.display())
+    });
     println!(
-        "cargo:warning=embedded circuit blob {name}: {:.2} MiB",
-        bytes.len() as f64 / (1024.0 * 1024.0)
+        "cargo:warning=embedded circuit blob {name}: {:.2} MiB raw -> {:.2} MiB lz4",
+        bytes.len() as f64 / (1024.0 * 1024.0),
+        compressed.len() as f64 / (1024.0 * 1024.0)
     );
 }
 
