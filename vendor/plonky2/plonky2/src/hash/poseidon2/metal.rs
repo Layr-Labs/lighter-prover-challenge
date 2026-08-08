@@ -1215,7 +1215,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || leaf_width < 16
-        || leaf_count < 1 << 20
+        || (leaf_count < 1 << 20 && !(leaf_width >= 80 && leaf_count >= 1 << 17))
         || !leaf_count.is_power_of_two()
         || leaf_count > u32::MAX as usize
         || leaf_width > u32::MAX as usize

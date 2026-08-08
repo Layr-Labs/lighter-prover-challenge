@@ -8,6 +8,8 @@ use plonky2_maybe_rayon::*;
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
 use crate::field::extension::Extendable;
 use crate::field::fft::{fft_in_place_with_options, FftRootTable};
+#[cfg(feature = "std")]
+use crate::field::fft::ifft_borrowed;
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
@@ -43,6 +45,33 @@ pub(crate) enum BatchLayout {
     PolyMajor,
 }
 
+/// A wire column whose coefficient polynomial can be produced on demand by the
+/// streamed commitment path. Routed columns stay borrowed because the
+/// permutation argument consumes their evaluation values later. Non-routed
+/// columns are moved into the source and transformed in place.
+#[cfg(feature = "std")]
+pub(crate) enum WirePolynomialSource<'a, F: Field> {
+    Borrowed(&'a [F]),
+    Owned(std::sync::Mutex<Option<Vec<F>>>),
+}
+
+#[cfg(feature = "std")]
+impl<F: Field> WirePolynomialSource<'_, F> {
+    fn compute(&self) -> PolynomialCoeffs<F> {
+        match self {
+            Self::Borrowed(values) => ifft_borrowed(values),
+            Self::Owned(values) => {
+                let values = values
+                    .lock()
+                    .expect("wire polynomial source mutex poisoned")
+                    .take()
+                    .expect("wire polynomial source consumed twice");
+                PolynomialValues::new(values).ifft()
+            }
+        }
+    }
+}
+
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
 #[derive(Eq, PartialEq, Debug)]
 pub struct PolynomialBatch<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
@@ -71,6 +100,121 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> D
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     PolynomialBatch<F, C, D>
 {
+    /// Commits wire columns while producing their coefficient polynomials in
+    /// the same eight-column groups consumed by the exclusive Metal stream.
+    /// This folds the formerly serial all-column IFFT prefix into the existing
+    /// CPU-LDE/GPU-sponge overlap. If the backend declines or fails, every
+    /// coefficient is retained and the ordinary commitment path is used.
+    #[cfg(feature = "std")]
+    pub(crate) fn from_wire_sources_streamed(
+        sources: Vec<WirePolynomialSource<'_, F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Self {
+        use std::sync::OnceLock;
+
+        assert!(!sources.is_empty());
+        let degree = match &sources[0] {
+            WirePolynomialSource::Borrowed(values) => values.len(),
+            WirePolynomialSource::Owned(values) => values
+                .lock()
+                .expect("wire polynomial source mutex poisoned")
+                .as_ref()
+                .expect("fresh wire polynomial source missing")
+                .len(),
+        };
+        let coefficients: Vec<OnceLock<PolynomialCoeffs<F>>> =
+            (0..sources.len()).map(|_| OnceLock::new()).collect();
+        let lde_len = degree << rate_bits;
+
+        if !blinding {
+            if let Some(columns) =
+                C::Hasher::try_allocate_merkle_tree_columns(sources.len(), lde_len, cap_height)
+            {
+                let coset_powers =
+                    crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
+                let streamed = C::Hasher::try_build_merkle_tree_column_store_streamed(
+                    &columns,
+                    cap_height,
+                    &|group, destinations: &mut [&mut [F]]| {
+                        destinations.par_iter_mut().enumerate().for_each(
+                            |(k, destination)| {
+                                let index = group * 8 + k;
+                                let polynomial = coefficients[index]
+                                    .get_or_init(|| sources[index].compute());
+                                assert_eq!(polynomial.len(), degree);
+                                batch_multiply_into(
+                                    &mut destination[..degree],
+                                    &polynomial.coeffs,
+                                    &coset_powers,
+                                );
+                                if rate_bits == 0 || degree < 2 {
+                                    destination[degree..].fill(F::ZERO);
+                                }
+                                fft_in_place_with_options(
+                                    destination,
+                                    Some(rate_bits),
+                                    fft_root_table,
+                                );
+                            },
+                        );
+                    },
+                );
+                if let Some((level_digests, cap)) = streamed {
+                    let polynomials = coefficients
+                        .into_iter()
+                        .map(|polynomial| {
+                            polynomial
+                                .into_inner()
+                                .expect("stream omitted a wire polynomial")
+                        })
+                        .collect();
+                    return Self {
+                        polynomials,
+                        merkle_tree: MerkleTree::from_prebuilt_columns(
+                            columns,
+                            level_digests,
+                            cap,
+                        ),
+                        degree_log: log2_strict(degree),
+                        rate_bits,
+                        blinding,
+                    };
+                }
+            }
+        }
+
+        timed!(
+            timing,
+            "compute remaining wire polynomials (IFFT)",
+            coefficients
+                .par_iter()
+                .zip(sources.par_iter())
+                .for_each(|(polynomial, source)| {
+                    polynomial.get_or_init(|| source.compute());
+                })
+        );
+        let polynomials = coefficients
+            .into_iter()
+            .map(|polynomial| {
+                polynomial
+                    .into_inner()
+                    .expect("wire polynomial was not computed")
+            })
+            .collect();
+        Self::from_coeffs(
+            polynomials,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+        )
+    }
+
     /// Creates a list polynomial commitment for the polynomials interpolating the values in `values`.
     pub fn from_values(
         values: Vec<PolynomialValues<F>>,
@@ -825,6 +969,61 @@ mod tests {
         let actual = PolynomialBatch::<F, C, D>::lde_values(&polynomials, RATE_BITS, false, None);
 
         assert_eq!(actual, expected);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn lazy_wire_sources_match_eager_ifft_and_preserve_routed_values() {
+        use crate::field::types::PrimeField64;
+
+        const D: usize = 2;
+        const RATE_BITS: usize = 3;
+        const CAP_HEIGHT: usize = 2;
+        const ROUTED: usize = 3;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let mut values = (0..11)
+            .map(|_| F::rand_vec(1 << 6))
+            .collect::<Vec<_>>();
+        let routed_before = values[..ROUTED].to_vec();
+        let expected = values
+            .iter()
+            .map(|column| ifft_borrowed(column))
+            .collect::<Vec<_>>();
+        let sources = values
+            .iter_mut()
+            .enumerate()
+            .map(|(column, values)| {
+                if column < ROUTED {
+                    WirePolynomialSource::Borrowed(values)
+                } else {
+                    WirePolynomialSource::Owned(std::sync::Mutex::new(Some(core::mem::take(
+                        values,
+                    ))))
+                }
+            })
+            .collect();
+        let actual = PolynomialBatch::<F, C, D>::from_wire_sources_streamed(
+            sources,
+            RATE_BITS,
+            false,
+            CAP_HEIGHT,
+            &mut TimingTree::default(),
+            None,
+        );
+
+        assert_eq!(&values[..ROUTED], routed_before.as_slice());
+        assert!(values[ROUTED..].iter().all(Vec::is_empty));
+        for (actual, expected) in actual.polynomials.iter().zip(&expected) {
+            assert_eq!(actual.len(), expected.len());
+            for (&actual, &expected) in actual.coeffs.iter().zip(&expected.coeffs) {
+                assert_eq!(
+                    actual.to_noncanonical_u64(),
+                    expected.to_noncanonical_u64()
+                );
+            }
+        }
     }
 
     /// Filling retained column storage must preserve the exact raw field-word
