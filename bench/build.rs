@@ -72,6 +72,101 @@ fn build_path_blobs(tx_per_proof: usize, tx_mode: u8) -> (Vec<u8>, Vec<u8>) {
     (tx_blob, chain_blob)
 }
 
+
+const PIPELINE_ARCHIVE_NAME: &str = "poseidon2_pipelines.metalar";
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn build_pipeline_archive(out_dir: &std::path::Path) {
+    let path = out_dir.join(PIPELINE_ARCHIVE_NAME);
+    let _ = std::fs::write(&path, []);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        build_pipeline_archive_inner(out_dir)
+    }));
+    match outcome {
+        Ok(Ok(bytes)) => println!(
+            "cargo:warning=pipeline archive: {:.2} MiB (embedded into prove via include_bytes!)",
+            bytes as f64 / (1024.0 * 1024.0)
+        ),
+        Ok(Err(reason)) => {
+            let _ = std::fs::write(&path, []);
+            println!("cargo:warning=pipeline archive not built ({reason}); worker will compile kernels at startup");
+        }
+        Err(_) => {
+            let _ = std::fs::write(&path, []);
+            println!("cargo:warning=pipeline archive build panicked; worker will compile kernels at startup");
+        }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn build_pipeline_archive_inner(out_dir: &std::path::Path) -> Result<u64, String> {
+    use metal::{BinaryArchiveDescriptor, CompileOptions, ComputePipelineDescriptor, Device, URL};
+    const KERNELS: [&str; 8] = [
+        "poseidon2_hash_leaves",
+        "poseidon2_hash_leaves_colmajor",
+        "poseidon2_hash_parents",
+        "ntt_prepare",
+        "ntt_stage",
+        "ifft_finalize",
+        "poseidon2_gate_quotient",
+        "range_check_gate_quotient",
+    ];
+    let manifest = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .ok_or_else(|| String::from("CARGO_MANIFEST_DIR unset"))?,
+    );
+    let shader = manifest.join("../vendor/plonky2/plonky2/src/hash/poseidon2/poseidon2.metal");
+    println!("cargo:rerun-if-changed={}", shader.display());
+    let source = std::fs::read_to_string(&shader)
+        .map_err(|e| format!("cannot read shader source: {e}"))?;
+    let device = Device::system_default().ok_or_else(|| String::from("no Metal device"))?;
+    let library = device
+        .new_library_with_source(&source, &CompileOptions::new())
+        .map_err(|e| format!("shader compilation failed: {e}"))?;
+    let archive = device
+        .new_binary_archive_with_descriptor(&BinaryArchiveDescriptor::new())
+        .map_err(|e| format!("cannot create binary archive: {e}"))?;
+    for name in KERNELS {
+        let function = library
+            .get_function(name, None)
+            .map_err(|e| format!("kernel {name} unavailable: {e}"))?;
+        let descriptor = ComputePipelineDescriptor::new();
+        descriptor.set_compute_function(Some(&function));
+        archive
+            .add_compute_pipeline_functions_with_descriptor(&descriptor)
+            .map_err(|e| format!("cannot add {name}: {e}"))?;
+    }
+    let path = out_dir.join(PIPELINE_ARCHIVE_NAME);
+    let abs = if path.is_absolute() {
+        path.clone()
+    } else {
+        std::env::current_dir()
+            .map(|c| c.join(&path))
+            .unwrap_or_else(|_| path.clone())
+    };
+    let _ = std::fs::remove_file(&path);
+    let url = std::mem::ManuallyDrop::new(URL::new_with_string(&format!(
+        "file://{}",
+        abs.display()
+    )));
+    archive.serialize_to_url(&url).map_err(|e| {
+        let _ = std::fs::write(&path, []);
+        format!("cannot serialize: {e}")
+    })?;
+    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    if bytes < 64 {
+        let _ = std::fs::write(&path, []);
+        return Err(String::from("archive empty or tiny"));
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+fn build_pipeline_archive(out_dir: &std::path::Path) {
+    let _ = std::fs::write(out_dir.join(PIPELINE_ARCHIVE_NAME), []);
+}
+
+
 fn main() {
     // A dependency change (circuit/, vendor/plonky2/) rebuilds this script and
     // re-runs it regardless of these directives; bench's own sources do not
@@ -81,6 +176,7 @@ fn main() {
 
     let out_dir =
         PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR must be set for build scripts"));
+    build_pipeline_archive(&out_dir);
 
     if std::env::var_os("LIGHTER_SKIP_EMBED").is_some_and(|v| v == "1") {
         for name in BLOB_NAMES {
