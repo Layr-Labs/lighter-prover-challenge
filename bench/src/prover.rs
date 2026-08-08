@@ -6,9 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
-use circuit::block_pre_execution_constraints::{
-    BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
-};
+use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
 use circuit::block_tx::{BlockTx, JumpState, JumpStateTarget};
 use circuit::block_tx_chain_constraints::{
     BlockTxChainCircuit, BlockTxChainTarget, cyclic_base_witness,
@@ -451,72 +449,18 @@ fn prove_path(
     chain_proof
 }
 
-/// Proves the block pre-execution circuit. The startup-overlap path must NOT
-/// set the exclusive GPU phase, because the remaining circuit loads are still
-/// using the GPU normally; the serial path sets it around the call.
-///
-/// Measured, so nobody re-mines this (10 interleaved runs, one binary, the
-/// switch runtime-gated, census taken in `gpu_worthwhile`):
-/// `Circuits::load_remaining_embedded` recomputes each blob's
-/// `constants_sigmas_commitment` through `PolynomialBatch::from_values`, so
-/// four commitment trees — 2 x (2^19 leaves x 88 cols) for the transaction
-/// circuits and 2 x (2^17 x 86) for the chain circuits, all either above the
-/// routing cutoff or wider than 64 and therefore GPU-bound unconditionally —
-/// are hashing on the GPU *inside* the pre-execution window (8 of the window's
-/// routing decisions). With `MAX_BUFFER_SETS == 1` those builds serialize, and
-/// this proof's own narrow trees observe `GPU_JOBS_IN_FLIGHT` at 1-2 for 5-7 of
-/// their 9 routing decisions. So "no other proof runs concurrently" holds here
-/// while "the GPU stream is idle" does not, and only the latter is the switch's
-/// real contract. Enabling it does change routing — the 2^17 width-20
-/// Zs/partial-products tree goes 1/10 -> 10/10 GPU and the width-16 quotient
-/// tree 6/10 -> 10/10 — but each flipped tree then queues FIFO behind a
-/// 2^19-leaf load build, and the phase inflated from a 325 ms median to 425 ms.
-/// It buys nothing even when it wins: this proof finishes a median 187 ms before
-/// the loads it hides behind, so the join waits on the loads, not on it.
-/// Enabling the switch only spends that slack (median 187 ms -> 126 ms) and put
-/// the proof on the critical path in 1 of the 5 runs that had it enabled.
-pub(crate) fn prove_pre_execution_parallel(
-    pre_data: &CircuitData<F, C, D>,
-    pre_target: &BlockPreExecutionTarget,
-    pre_exec: &BlockPreExec<F>,
-) -> Proof {
-    BlockPreExecutionCircuit::prove(pre_data, pre_exec, pre_target)
-        .expect("block pre-execution proof failed")
-}
-
-/// The fully serial entry point: pre-execution proof first, then the pipeline.
-///
-/// Test-only. The `prove` binary starts the pre-execution proof on a startup
-/// thread that overlaps the remaining circuit loads and then calls
-/// [`prove_block_after_pre`] directly, so nothing on the scored path routes
-/// through here. It is retained as the reference for what the serial ordering
-/// looked like — in particular that the exclusive-GPU switch below is legitimate
-/// only under that ordering, which no longer exists (see
-/// [`prove_pre_execution_parallel`]). `#[cfg(test)]` because the release build
-/// would otherwise warn it dead.
-#[cfg(test)]
-pub fn prove_block(block: Block<F>, circuits: Circuits) -> Proof {
+pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
     // The pre-execution proof runs strictly before any other proving work, so
     // the serialized GPU stream is otherwise idle: route its mid-size column
     // trees to the GPU for just this phase.
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-    let pre_proof = prove_pre_execution_parallel(
+    let pre_proof = BlockPreExecutionCircuit::prove(
         &circuits.pre_data,
-        &circuits.pre_target,
         &BlockPreExec::from_block(&block),
-    );
+        &circuits.pre_target,
+    )
+    .expect("block pre-execution proof failed");
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
-    prove_block_after_pre(block, circuits, pre_proof)
-}
-
-/// The pipeline after the pre-execution proof. The startup-overlap path calls
-/// this once both the pre-execution proof and the remaining circuit loads have
-/// completed.
-pub(crate) fn prove_block_after_pre(
-    mut block: Block<F>,
-    mut circuits: Circuits,
-    pre_proof: Proof,
-) -> Proof {
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 

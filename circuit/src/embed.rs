@@ -43,7 +43,7 @@ use plonky2::plonk::circuit_data::{
 use plonky2::plonk::permutation_argument::Forest;
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
-use plonky2::util::{log2_ceil, transpose_poly_values_ref};
+use plonky2::util::{log2_ceil, transpose_poly_values};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -457,18 +457,10 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let sigma_vecs = wire_partition.get_sigma_polys(degree_bits, &common.k_is, &subgroup);
     let representative_map = forest.into_parents();
 
-    // `prover_only.sigmas` is the transpose of the sigma *values*, and the
-    // commitment below consumes those same values. Transposing first reads the
-    // columns in place, so they can then be moved into the commitment instead
-    // of cloned; the clone was one extra full copy of the sigma columns
-    // (`num_routed_wires * degree` field elements) per circuit. Only the order
-    // of two independent reads changes — no quantity is computed differently.
-    let sigmas = transpose_poly_values_ref(&sigma_vecs);
-
     // The builder's commitment path: values in, IFFT inside, LDE + Merkle.
     // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).
     let mut constants_sigmas_vecs = constant_values;
-    constants_sigmas_vecs.extend(sigma_vecs);
+    constants_sigmas_vecs.extend(sigma_vecs.iter().cloned());
     let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
         constants_sigmas_vecs,
         rate_bits,
@@ -484,6 +476,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         );
     }
 
+    let sigmas = transpose_poly_values(sigma_vecs);
     let circuit_digest = verifier_only.circuit_digest;
 
     // Mirror the builder's quotient-domain constants/sigmas cache (added by the
@@ -491,24 +484,12 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // freshly recomputed column-backed commitment — the same extraction the
     // builder performs — and the documented `None` fallback keeps the quotient
     // path correct if extraction declines.
-    // Skipped entirely at `step == 1`, where the cache cannot pay for itself:
-    // it exists to turn a strided gather into a contiguous copy, and at stride
-    // one the gather is *already* contiguous. Concretely,
-    // `extract_lde_batch_columns(1, range, domain)` memcpys
-    // `columns.col(c)[..domain]` per column, while the uncached quotient path
-    // reaches `fill_lde_batch` with `BatchLayout::PolyMajor`, `step == 1` and
-    // consecutive indices — which routes to `fill_lde_batch_contiguous` and
-    // copies `columns.col(c)[start..end]`. Same bytes out of the same buffer,
-    // one `copy_from_slice` per column either way. So the cache is a bit-exact
-    // duplicate of storage the commitment already retains, and building it
-    // costs one extra full-LDE allocation plus copy per circuit and holds that
-    // duplicate resident for the rest of the process.
     let quotient_degree_bits = plonky2::util::log2_ceil(common.quotient_degree_factor);
     let (constants_sigmas_quotient_cache, constants_sigmas_quotient_step, constants_sigmas_quotient_domain) = {
         let step = 1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
         let domain = 1 << (common.degree_bits() + quotient_degree_bits);
         let cols = common.constants_range().len() + common.sigmas_range().len();
-        if step != 1 && cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
+        if cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
             match (
                 constants_sigmas_commitment.extract_lde_batch_columns(
                     step,
