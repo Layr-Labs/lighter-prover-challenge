@@ -572,6 +572,73 @@ inline ulong random_access_select_8(
     return items[0];
 }
 
+// Multiply two degree-1 coefficient vectors with three field multiplications.
+// The middle coefficient uses the standard Karatsuba cross term.
+inline void mul2_coeffs(
+    ulong a0,
+    ulong a1,
+    ulong b0,
+    ulong b1,
+    thread ulong& c0,
+    thread ulong& c1,
+    thread ulong& c2) {
+    c0 = gl_mul(a0, b0);
+    c2 = gl_mul(a1, b1);
+    c1 = gl_sub(
+        gl_sub(gl_mul(gl_add(a0, a1), gl_add(b0, b1)), c0),
+        c2);
+}
+
+// Multiply two degree-2 coefficient vectors when the highest coefficient
+// a2*b2 is already available. The remaining four coefficients need five
+// field multiplications.
+inline void mul3_coeffs_known_c4(
+    ulong a0,
+    ulong a1,
+    ulong a2,
+    ulong b0,
+    ulong b1,
+    ulong b2,
+    ulong c4,
+    thread ulong& c0,
+    thread ulong& c1,
+    thread ulong& c2,
+    thread ulong& c3) {
+    c0 = gl_mul(a0, b0);
+    c2 = gl_mul(a1, b1);
+    c1 = gl_sub(
+        gl_sub(gl_mul(gl_add(a0, a1), gl_add(b0, b1)), c0),
+        c2);
+    c3 = gl_sub(
+        gl_sub(gl_mul(gl_add(a1, a2), gl_add(b1, b2)), c2),
+        c4);
+    c2 = gl_add(
+        c2,
+        gl_sub(
+            gl_sub(gl_mul(gl_add(a0, a2), gl_add(b0, b2)), c0),
+            c4));
+}
+
+// General degree-2 product. Keeping the five output coefficients separate
+// lets the quintic extension product reuse its existing a[] storage without
+// increasing live arrays.
+inline void mul3_coeffs(
+    ulong a0,
+    ulong a1,
+    ulong a2,
+    ulong b0,
+    ulong b1,
+    ulong b2,
+    thread ulong& c0,
+    thread ulong& c1,
+    thread ulong& c2,
+    thread ulong& c3,
+    thread ulong& c4) {
+    c4 = gl_mul(a2, b2);
+    mul3_coeffs_known_c4(
+        a0, a1, a2, b0, b1, b2, c4, c0, c1, c2, c3);
+}
+
 kernel void range_check_gate_quotient(
     const device ulong* wires [[buffer(0)]],
     const device ulong* constants [[buffer(1)]],
@@ -914,9 +981,13 @@ kernel void range_check_gate_quotient(
         } else if (kind == 4u) {
             // QuinticMultiplicationGate: fifteen routed words per operation
             // (five limbs each for a, b and the claimed product c). The five
-            // constraints are the schoolbook product limbs reduced by
-            // u^5 = 3, minus the claimed output limbs, in ascending limb
-            // order exactly like the CPU accumulator.
+            // constraints are the product limbs reduced by u^5 = 3, minus
+            // the claimed output limbs, in ascending limb order exactly like
+            // the CPU accumulator. Split at u^3: L=A0*B0, H=A1*B1 and
+            // C=(A0+A1)(B0+B1)-L-H. Its highest coefficient is the already
+            // computed L[4]=a2*b2, so it is reused. The two 3x3 products and
+            // one 2x2 product use 6/5/3 field multiplications, reducing the
+            // full product from 25 to 14.
             for (uint op = 0; op < num_ops; ++op) {
                 ulong routed_base = (ulong)op * 15u;
                 ulong a[5];
@@ -925,19 +996,41 @@ kernel void range_check_gate_quotient(
                     a[j] = wires[(routed_base + j) * lde_rows + source_row];
                     b[j] = wires[(routed_base + 5u + j) * lde_rows + source_row];
                 }
-                ulong d[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-                for (uint j = 0; j < 5u; ++j) {
-                    for (uint k = 0; k < 5u; ++k) {
-                        d[j + k] = gl_add(d[j + k], gl_mul(a[j], b[k]));
+
+                // Store L in d[0..5) and H in d[5..8). After both products
+                // are complete, the original low limbs are no longer needed;
+                // reuse a[] for the middle product and then the cross term C.
+                ulong d[8];
+                mul3_coeffs(
+                    a[0], a[1], a[2], b[0], b[1], b[2],
+                    d[0], d[1], d[2], d[3], d[4]);
+                mul2_coeffs(a[3], a[4], b[3], b[4], d[5], d[6], d[7]);
+
+                a[0] = gl_add(a[0], a[3]);
+                a[1] = gl_add(a[1], a[4]);
+                b[0] = gl_add(b[0], b[3]);
+                b[1] = gl_add(b[1], b[4]);
+                mul3_coeffs_known_c4(
+                    a[0], a[1], a[2], b[0], b[1], b[2], d[4],
+                    a[0], a[1], a[2], a[3]);
+                for (uint k = 0; k < 4u; ++k) {
+                    a[k] = gl_sub(a[k], d[k]);
+                    if (k < 3u) {
+                        a[k] = gl_sub(a[k], d[5u + k]);
                     }
                 }
+
+                // b[] is dead after the middle product; reuse it for the five
+                // reduced output coefficients instead of adding a live array.
+                b[0] = gl_add(d[0], gl_mul(3, a[2]));
+                b[1] = gl_add(d[1], gl_mul(3, gl_add(a[3], d[5])));
+                b[2] = gl_add(d[2], gl_mul(3, d[6]));
+                b[3] = gl_add(gl_add(d[3], a[0]), gl_mul(3, d[7]));
+                b[4] = gl_add(d[4], a[1]);
                 for (uint k = 0; k < 5u; ++k) {
-                    ulong term = k < 4u
-                        ? gl_add(d[k], gl_mul(3, d[k + 5u]))
-                        : d[k];
                     ulong c = wires[(routed_base + 10u + k) * lde_rows + source_row];
                     range_check_gate_emit(
-                        gl_sub(term, c),
+                        gl_sub(b[k], c),
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
