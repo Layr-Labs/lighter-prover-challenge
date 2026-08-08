@@ -2,6 +2,8 @@
 
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+use core::any::TypeId;
 use core::cmp::min;
 
 use anyhow::{ensure, Result};
@@ -11,6 +13,12 @@ use plonky2_maybe_rayon::*;
 use super::circuit_builder::{LookupChallenges, LookupWire};
 use crate::field::extension::Extendable;
 use crate::field::fft::ifft_borrowed;
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+use crate::field::goldilocks_field::GoldilocksField;
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+use crate::field::packable::Packable;
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
@@ -1654,6 +1662,58 @@ fn start_gpu_range_check_gate_quotient<
     Some((gate_indices, job))
 }
 
+/// Adds one completed point-major Metal quotient contribution to the CPU
+/// quotient while preserving the scalar operation order and raw field words.
+/// The scored AArch64 path has two challenges, so two adjacent points fill the
+/// four-lane Goldilocks packing exactly.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn merge_gpu_quotient_values<F: RichField>(
+    quotient_values: &mut [F],
+    gpu_values: &[F],
+    num_challenges: usize,
+    z_h_on_coset: &ZeroPolyOnCoset<F>,
+) {
+    type Packing<F> = <F as Packable>::Packing;
+
+    debug_assert_eq!(gpu_values.len(), quotient_values.len());
+    if TypeId::of::<F>() == TypeId::of::<GoldilocksField>()
+        && Packing::<F>::WIDTH == 4
+        && num_challenges == 2
+        && quotient_values.len() == gpu_values.len()
+        && quotient_values.len() % 4 == 0
+    {
+        quotient_values
+            .par_chunks_exact_mut(4)
+            .zip(gpu_values.par_chunks_exact(4))
+            .enumerate()
+            .for_each(|(pair_i, (cpu_values, gpu_values))| {
+                let point = pair_i * 2;
+                let d0 = z_h_on_coset.eval_inverse(point);
+                let d1 = z_h_on_coset.eval_inverse(point + 1);
+                let denominator_inverses = [d0, d0, d1, d1];
+                let cpu = Packing::<F>::from_slice_mut(cpu_values);
+                let gpu = *Packing::<F>::from_slice(gpu_values);
+                let denominators = *Packing::<F>::from_slice(&denominator_inverses);
+                // Keep the former lane-wise order: reduce `gpu * d`, then add
+                // the reduced word to the CPU accumulator. A fused packed MAC
+                // could choose a different noncanonical representative.
+                *cpu += gpu * denominators;
+            });
+        return;
+    }
+
+    quotient_values
+        .par_chunks_exact_mut(num_challenges)
+        .zip(gpu_values.par_chunks_exact(num_challenges))
+        .enumerate()
+        .for_each(|(i, (cpu_values, gpu_values))| {
+            let denominator_inv = z_h_on_coset.eval_inverse(i);
+            for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                *cpu += gpu * denominator_inv;
+            }
+        });
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2175,16 +2235,12 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        merge_gpu_quotient_values(
+            &mut quotient_values,
+            gpu_values,
+            num_challenges,
+            &z_h_on_coset,
+        );
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2221,16 +2277,12 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        merge_gpu_quotient_values(
+            &mut quotient_values,
+            gpu_values,
+            num_challenges,
+            &z_h_on_coset,
+        );
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
@@ -2413,15 +2465,21 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{precomputed, BatchLayout, BATCH_SIZE, COMPARE_QUOTIENT_LAYOUTS};
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use super::merge_gpu_quotient_values;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field, Field64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::field::zero_poly_coset::ZeroPolyOnCoset;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::gate::U32QuotientGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::noop::NoopGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::hash::poseidon2::hash::Poseidon2Hash;
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
@@ -2450,6 +2508,28 @@ mod quotient_layout_tests {
         (data, pw)
     }
 
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn force_metal_context_for_quotient_test() {
+        struct ExclusivePhaseReset;
+        impl Drop for ExclusivePhaseReset {
+            fn drop(&mut self) {
+                crate::hash::poseidon2::set_exclusive_gpu_phase(false);
+            }
+        }
+
+        // The first small allocation may intentionally spend the startup
+        // probe and fall back. A second request forces the real context, so
+        // the proof below tests retained Metal columns deterministically.
+        crate::hash::poseidon2::set_exclusive_gpu_phase(true);
+        let _reset = ExclusivePhaseReset;
+        let mut columns =
+            crate::hash::poseidon2::metal::allocate_columns::<F>(8, 1 << 16, 4);
+        if columns.is_none() {
+            columns = crate::hash::poseidon2::metal::allocate_columns::<F>(8, 1 << 16, 4);
+        }
+        assert!(columns.is_some(), "Metal context must initialize");
+    }
+
     /// B1/B2/D1 differential gate: within a single prove call — same witness,
     /// commitments and challenges — the default column-major (`PolyMajor`)
     /// quotient path and the per-point (`PointMajor`) reference path must
@@ -2476,8 +2556,14 @@ mod quotient_layout_tests {
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     #[test]
     fn metal_random_access_quotient_matches_cpu_and_verifies() -> Result<()> {
+        force_metal_context_for_quotient_test();
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<F, D>::new(config);
+        let hash_inputs = (0..12)
+            .map(|i| builder.constant(F::from_canonical_usize(100_000 + i)))
+            .collect();
+        let digest = builder.hash_n_to_hash_no_pad::<Poseidon2Hash>(hash_inputs);
+        builder.register_public_inputs(&digest.elements);
         for (bits, copies) in [(3usize, 8usize), (4, 4), (6, 1)] {
             let vec_size = 1usize << bits;
             for copy in 0..copies {
@@ -2525,10 +2611,74 @@ mod quotient_layout_tests {
         COMPARE_GPU_QUOTIENT.store(false, Ordering::SeqCst);
         let proof = proof?;
         let after = gpu_poseidon_quotient_stats();
+        assert!(after.started > before.started);
+        assert!(after.completed > before.completed);
         assert!(after.range_started > before.range_started);
         assert!(after.range_completed > before.range_completed);
         data.verify(proof)?;
         Ok(())
+    }
+
+    /// The four-lane merge (two points by two challenges) must retain the old
+    /// scalar multiply-then-add raw words. Odd point counts exercise the exact
+    /// scalar fallback; even counts exercise the packed production branch.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn packed_gpu_quotient_merge_matches_scalar_raw_words() {
+        const CHALLENGES: usize = 2;
+        let order = GoldilocksField::ORDER;
+        let raws = [
+            0,
+            1,
+            order - 1,
+            order,
+            order + 1,
+            0x8000_0000_0000_0001,
+            0xdead_beef_cafe_babe,
+            u64::MAX,
+        ];
+        let z_h_on_coset = ZeroPolyOnCoset::<F>::new(4, 3);
+
+        for points in [
+            1usize,
+            2,
+            BATCH_SIZE - 1,
+            BATCH_SIZE,
+            BATCH_SIZE + 1,
+            BATCH_SIZE + 2,
+            2 * BATCH_SIZE + 1,
+            2 * BATCH_SIZE + 2,
+        ] {
+            let len = points * CHALLENGES;
+            let values = |offset: usize| {
+                (0..len)
+                    .map(|i| GoldilocksField(raws[(i + offset) % raws.len()]))
+                    .collect::<Vec<_>>()
+            };
+            let mut scalar = values(0);
+            let mut candidate = scalar.clone();
+            let gpu = values(5);
+
+            for point in 0..points {
+                let denominator_inv = z_h_on_coset.eval_inverse(point);
+                for challenge in 0..CHALLENGES {
+                    let i = point * CHALLENGES + challenge;
+                    scalar[i] += gpu[i] * denominator_inv;
+                }
+            }
+            merge_gpu_quotient_values(
+                &mut candidate,
+                &gpu,
+                CHALLENGES,
+                &z_h_on_coset,
+            );
+
+            assert_eq!(
+                scalar.iter().map(|x| x.0).collect::<Vec<_>>(),
+                candidate.iter().map(|x| x.0).collect::<Vec<_>>(),
+                "points={points}",
+            );
+        }
     }
 
     /// Layout seam: `PolyMajor` output is exactly the transpose of
