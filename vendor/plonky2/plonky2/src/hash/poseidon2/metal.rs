@@ -8,6 +8,7 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use metal::{
     Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
     MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSUInteger,
+    BinaryArchive, BinaryArchiveDescriptor, ComputePipelineDescriptor, URL,
 };
 use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
@@ -24,6 +25,70 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// `poseidon2.metal` changes (see `MetalShared::new`); the
 /// `metallib_matches_shader_source` test enforces it.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
+/// Precompiled pipeline binary archive for the target GPU class, generated
+/// on Apple M4-family hardware by the ignored `generate_binary_archive` test
+/// and committed alongside the metallib. A binary archive carries the
+/// AIR-to-GPU-binary *pipeline lowerings* that the metallib alone cannot:
+/// under the ranked sandbox the OS shader cache is disabled, so without this
+/// every worker re-lowers every kernel (hundreds of milliseconds, bounded by
+/// the slowest kernel even when parallelized). Loading is best-effort in
+/// every direction: an empty or incompatible archive (different GPU class or
+/// driver) simply misses, and pipeline creation falls back to the normal
+/// lowering path with identical results.
+const SHADER_BINARY_ARCHIVE: &[u8] = include_bytes!("poseidon2.binaryarchive");
+
+/// Materializes the embedded binary archive for `device`, or `None` if it is
+/// absent or unusable. Archives load by URL only, so the bytes go to a file
+/// under `TMPDIR` (the benchmark scratch directory, which the sandbox allows;
+/// the file must outlive pipeline creation, so it is left for the scratch
+/// cleanup to collect).
+fn load_binary_archive(device: &Device) -> Option<BinaryArchive> {
+    if SHADER_BINARY_ARCHIVE.is_empty() {
+        return None;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "poseidon2-{}.binaryarchive",
+        std::process::id()
+    ));
+    std::fs::write(&path, SHADER_BINARY_ARCHIVE).ok()?;
+    let url = URL::new_with_string(&format!("file://{}", path.display()));
+    let descriptor = BinaryArchiveDescriptor::new();
+    descriptor.set_url(&url);
+    // `URLWithString:` returns an autoreleased object; metal-rs wraps it in an
+    // owning type whose drop would over-release it. Leak the wrapper (one tiny
+    // NSURL per process) instead of crashing at pool drain.
+    core::mem::forget(url);
+    match device.new_binary_archive_with_descriptor(&descriptor) {
+        Ok(archive) => Some(archive),
+        Err(error) => {
+            log::debug!("binary archive unavailable ({error}); lowering pipelines normally");
+            None
+        }
+    }
+}
+
+/// Creates a compute pipeline, consulting the binary archive first. On an
+/// archive hit the GPU binary is taken directly from the archive (no
+/// lowering); on any miss or error this falls back to the standard
+/// function-based creation, which produces an identical pipeline.
+fn pipeline_with_archive(
+    device: &Device,
+    archive: Option<&BinaryArchive>,
+    function: &metal::Function,
+) -> Result<ComputePipelineState, String> {
+    if let Some(archive) = archive {
+        let descriptor = ComputePipelineDescriptor::new();
+        descriptor.set_compute_function(Some(function));
+        descriptor.set_binary_archives(&[archive]);
+        if let Ok(pipeline) = device.new_compute_pipeline_state(&descriptor) {
+            return Ok(pipeline);
+        }
+    }
+    device
+        .new_compute_pipeline_state_with_function(function)
+        .map_err(|error| format!("pipeline creation failed: {error}"))
+}
+
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
@@ -452,6 +517,7 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
 /// produced, lowered from the same library, so nothing they later compute can
 /// differ; only the instant at which they become available does.
 fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
+    let archive = load_binary_archive(device);
     for (name, slot) in [
         ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
         (
@@ -462,14 +528,13 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
     ] {
         let device = device.clone();
         let library = library.clone();
+        let archive = archive.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("poseidon2-metal-{name}"))
             .spawn(move || {
                 let pipeline = autoreleasepool(|| {
                     library.get_function(name, None).ok().and_then(|function| {
-                        device
-                            .new_compute_pipeline_state_with_function(&function)
-                            .ok()
+                        pipeline_with_archive(&device, archive.as_ref(), &function).ok()
                     })
                 });
                 if pipeline.is_none() {
@@ -1428,15 +1493,16 @@ impl MetalShared {
             // that created them rather than leaking.
             let device_ref = &device;
             let library_ref = &library;
+            let binary_archive = load_binary_archive(&device);
+            let archive_ref = &binary_archive;
             let required = |name: &'static str, kind: &'static str| {
                 move || -> Result<ComputePipelineState, String> {
                     autoreleasepool(|| {
                         let function = library_ref
                             .get_function(name, None)
                             .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
-                        device_ref
-                            .new_compute_pipeline_state_with_function(&function)
-                            .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
+                        pipeline_with_archive(device_ref, archive_ref.as_ref(), &function)
+                            .map_err(|error| format!("{kind} {error}"))
                     })
                 }
             };
@@ -2796,6 +2862,50 @@ mod tests {
     /// The fallback in `MetalShared::new` hides a broken artifact behind a
     /// source compile, which would silently give back the cost this exists to
     /// remove. Assert the fast path is actually live on this machine.
+    /// Generates the committed pipeline binary archive for this machine's
+    /// GPU class. Run on target-class (Apple M4 family) hardware:
+    /// `cargo test --release -p plonky2 --lib generate_binary_archive -- --ignored --nocapture`
+    /// then commit `src/hash/poseidon2/poseidon2.binaryarchive`.
+    #[test]
+    #[ignore = "writes the committed binary archive; run on target-class hardware"]
+    fn generate_binary_archive() {
+        let device = Device::system_default().expect("no Metal device");
+        let library = device
+            .new_library_with_data(SHADER_METALLIB)
+            .expect("metallib must load");
+        let descriptor = BinaryArchiveDescriptor::new();
+        let archive = device
+            .new_binary_archive_with_descriptor(&descriptor)
+            .expect("empty binary archive must create");
+        for name in [
+            "poseidon2_hash_leaves",
+            "poseidon2_hash_leaves_colmajor",
+            "poseidon2_hash_parents",
+            "ntt_prepare",
+            "ntt_stage",
+            "ifft_finalize",
+            "poseidon2_gate_quotient",
+            "range_check_gate_quotient",
+            "poseidon2_absorb_pass",
+        ] {
+            let function = library.get_function(name, None).expect(name);
+            let pipeline_descriptor = ComputePipelineDescriptor::new();
+            pipeline_descriptor.set_compute_function(Some(&function));
+            archive
+                .add_compute_pipeline_functions_with_descriptor(&pipeline_descriptor)
+                .expect(name);
+        }
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/hash/poseidon2/poseidon2.binaryarchive"
+        );
+        let url = URL::new_with_string(&format!("file://{path}"));
+        let serialized = archive.serialize_to_url(&url);
+        core::mem::forget(url);
+        assert!(serialized.is_ok(), "serialize failed");
+        println!("binary archive written to {path}");
+    }
+
     #[test]
     fn metallib_loads_and_exposes_every_kernel() {
         let Some(device) = Device::system_default() else {
