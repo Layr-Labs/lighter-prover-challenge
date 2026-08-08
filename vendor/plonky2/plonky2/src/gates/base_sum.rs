@@ -170,15 +170,7 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> PackedEvaluab
     ) {
         let sum = vars.local_wires[Self::WIRE_SUM];
         let limbs = vars.local_wires.view(self.limbs());
-        let computed_sum = if B == 2 {
-            let mut radix_sum = P::ZEROS;
-            for &limb in limbs.iter().rev() {
-                radix_sum = (radix_sum + radix_sum) + limb;
-            }
-            radix_sum
-        } else {
-            reduce_with_powers(limbs, F::from_canonical_usize(B))
-        };
+        let computed_sum = reduce_with_powers(limbs, F::from_canonical_usize(B));
 
         yield_constr.one(computed_sum - sum);
 

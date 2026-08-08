@@ -96,6 +96,49 @@ inline ulong reduce_top(uint r0, uint r1, int top) {
     return r + (ulong)(((long)top << 32) - (long)top);
 }
 
+// Full 128-bit product of two 64-bit operands, delivered as four 32-bit limbs.
+//
+// `a * b` and `metal::mulhi(a, b)` are lowered as two independent 64-bit
+// expansions that each rebuild the 32x32 partial products they need; the
+// backend does not share them. Computing the four products once and assembling
+// only the limbs the reduction actually consumes removes that duplication and
+// the 64-bit pack/unpack around it.
+//
+// With B = 2^32 and a = a1*B + a0, b = b1*B + b0:
+//   t = p01 + (p00 >> 32) <= (B-1)^2 + (B-1) = B^2 - B, so t cannot wrap.
+//   m = t + p10 <= 2B^2 - 3B + 1 wraps at most once; `carry` is that 65th bit.
+//   low  = (m << 32) | (uint)p00 -> l0 = (uint)p00, l1 = (uint)m.
+//   high = p11 + (m >> 32) + carry * B, which is < B^2, so h1 cannot wrap.
+inline void mul_128(
+    ulong a,
+    ulong b,
+    thread uint& l0,
+    thread uint& l1,
+    thread uint& h0,
+    thread uint& h1) {
+    uint a0 = (uint)a;
+    uint a1 = (uint)(a >> 32);
+    uint b0 = (uint)b;
+    uint b1 = (uint)(b >> 32);
+    ulong p00 = (ulong)a0 * (ulong)b0;
+    ulong p01 = (ulong)a0 * (ulong)b1;
+    ulong p10 = (ulong)a1 * (ulong)b0;
+    ulong p11 = (ulong)a1 * (ulong)b1;
+
+    ulong t = p01 + (p00 >> 32);
+    ulong m = t + p10;
+    uint carry = (uint)(m < t);
+
+    l0 = (uint)p00;
+    l1 = (uint)m;
+
+    uint q0 = (uint)p11;
+    uint q1 = (uint)(p11 >> 32);
+    uint mh = (uint)(m >> 32);
+    h0 = q0 + mh;
+    h1 = q1 + (uint)(h0 < q0) + carry;
+}
+
 // Goldilocks multiplication with 32-bit reduction after the native product.
 // If low = l0 + l1*B and high = h0 + h1*B for B = 2^32, then
 //   low + high*B^2 = (l0 - h0 - h1) + (l1 + h0)*B  (mod p).
@@ -116,12 +159,11 @@ inline ulong gl_mul(ulong a, ulong b) {
     ulong result = reduced + addend;
     return result + (result < reduced) * GOLDILOCKS_EPSILON;
 #else
-    ulong low = a * b;
-    ulong high = metal::mulhi(a, b);
-    uint l0 = (uint)low;
-    uint l1 = (uint)(low >> 32);
-    uint h0 = (uint)high;
-    uint h1 = (uint)(high >> 32);
+    uint l0;
+    uint l1;
+    uint h0;
+    uint h1;
+    mul_128(a, b, l0, l1, h0, h1);
 
     uint r0 = l0 - h0;
     uint borrow = (uint)(r0 > l0);
@@ -143,46 +185,43 @@ inline ulong gl_canonicalize(ulong value) {
     return value >= GOLDILOCKS_PRIME ? value - GOLDILOCKS_PRIME : value;
 }
 
-// A lazy value is (v, c) representing v + c * 2^64; since 2^64 = EPSILON
-// (mod p), its field value is v + c * EPSILON. Raw u64 adds accumulate the
-// wrap count instead of folding EPSILON back per addition; one materialize
-// per element per layer replaces the per-add reduction chains. Carry counts
-// in the layers below stay < 32, so c * EPSILON < 2^37 and the single
-// materializing gl_add is exact. Every materialized output is an ordinary
-// u64 representative, so downstream arithmetic and gl_canonicalize see the
-// same canonical field values as the strict per-op path.
+// A lazy value is (lo, hi) representing hi * 2^32 + lo, with both halves held
+// in full 64-bit registers. Splitting the operand at the 32-bit boundary makes
+// addition carry-free: every accumulator below sums field elements with
+// coefficients totalling at most 28, so each half stays under
+// 28 * (2^32 - 1) < 2^37 and neither can overflow. lazy_add is then two
+// independent 64-bit adds; the single-word (v, c) form needed a third
+// operation per add to recover the carry a 64-bit add cannot report to MSL.
+// One materialize per element per layer still replaces the per-add reduction
+// chains, and every materialized output is an ordinary u64 representative, so
+// downstream arithmetic and gl_canonicalize see the same canonical field
+// values as the strict per-op path.
 struct lazy_t {
-    ulong v;
-    uint c;
+    ulong lo;
+    ulong hi;
 };
 
 inline lazy_t lazy_of(ulong v) {
-    return { v, 0u };
+    return { v & GOLDILOCKS_EPSILON, v >> 32 };
 }
 
 inline lazy_t lazy_add(lazy_t a, lazy_t b) {
-    ulong next = a.v + b.v;
-    return { next, a.c + b.c + (uint)(next < a.v) };
+    return { a.lo + b.lo, a.hi + b.hi };
 }
 
-// Folds a small wrap count back into an ordinary 64-bit representative: the
-// exact value is v + carries * 2^64 and 2^64 == EPSILON (mod p).
-//
-// This is gl_add(v, carries * EPSILON) with its unreachable half deleted, and
-// it is bit-identical to it rather than merely congruent. gl_add folds the
-// 64-bit carry out of `v + addend` back in as one more +EPSILON and then
-// corrects a *second* time in case that fold itself overflowed. Here
-// addend = carries * EPSILON with carries < 32, so addend < 2^37; if
-// `v + addend` wraps 2^64 the wrapped result is at most addend - 1 < 2^37, and
-// adding EPSILON < 2^32 to that cannot reach 2^64. The compiler cannot delete
-// the second round itself because it has no bound on `carries`.
-inline ulong fold_carries(ulong v, uint carries) {
-    ulong sum = v + (((ulong)carries << 32) - (ulong)carries);
-    return sum + (sum < v ? GOLDILOCKS_EPSILON : 0UL);
-}
-
+// Collapses (lo, hi) to an ordinary 64-bit representative. With
+//   hi = hh * 2^32 + hl  and  2^64 == EPSILON (mod p),
+//   hi * 2^32 + lo == hl * 2^32 + lo + hh * EPSILON.
+// `a.hi << 32` already discards hh, so s is the first two terms and c1 its
+// 65th bit. hh + c1 < 2^6, so the EPSILON fold is at most 2^38: if s wrapped,
+// s < 2^37 and the fold cannot wrap again; if it did not, one more fold of
+// EPSILON onto a value below 2^38 cannot either. Both correction rounds after
+// the first are therefore unreachable.
 inline ulong lazy_materialize(lazy_t a) {
-    return fold_carries(a.v, a.c);
+    ulong s = (a.hi << 32) + a.lo;
+    ulong extra = (a.hi >> 32) + (ulong)(s < a.lo);
+    ulong t = s + ((extra << 32) - extra);
+    return t + (t < s ? GOLDILOCKS_EPSILON : 0UL);
 }
 
 // r = a * b + addend (mod p): the 128-bit product absorbs the addend before
@@ -190,14 +229,28 @@ inline ulong lazy_materialize(lazy_t a) {
 // at most 2^64 - 2, so the absorbed carry cannot overflow the high word. The
 // reduction below is byte-identical to gl_mul's.
 inline ulong gl_mul_add(ulong a, ulong b, ulong addend) {
-    ulong low = a * b;
-    ulong high = metal::mulhi(a, b);
-    ulong low2 = low + addend;
-    high += (ulong)(low2 < low);
-    uint l0 = (uint)low2;
-    uint l1 = (uint)(low2 >> 32);
-    uint h0 = (uint)high;
-    uint h1 = (uint)(high >> 32);
+    uint l0;
+    uint l1;
+    uint h0;
+    uint h1;
+    mul_128(a, b, l0, l1, h0, h1);
+
+    // Absorb the addend into the low limbs and propagate its single carry into
+    // h0. h1 cannot wrap: the 128-bit product of two 64-bit operands is at most
+    // 2^128 - 2^65 + 1, so h1 == 0xffffffff forces h0 <= 0xfffffffe.
+    uint d0 = (uint)addend;
+    uint d1 = (uint)(addend >> 32);
+    uint s0 = l0 + d0;
+    uint c0 = (uint)(s0 < l0);
+    uint s1 = l1 + d1;
+    uint c1 = (uint)(s1 < l1);
+    uint s1b = s1 + c0;
+    c1 += (uint)(s1b < s1);
+    l0 = s0;
+    l1 = s1b;
+    uint hh0 = h0 + c1;
+    h1 += (uint)(hh0 < h0);
+    h0 = hh0;
 
     uint r0 = l0 - h0;
     uint borrow = (uint)(r0 > l0);
@@ -254,15 +307,14 @@ inline void external_linear_layer(thread ulong state[12]) {
     }
 }
 
+// Same carry-free split as lazy_t: twelve operands keep both halves below
+// 12 * (2^32 - 1) < 2^36.
 inline ulong sum_state(thread const ulong state[12]) {
-    ulong sum = 0;
-    uint carries = 0;
-    for (uint i = 0; i < 12; ++i) {
-        ulong next = sum + state[i];
-        carries += next < sum;
-        sum = next;
+    lazy_t sum = lazy_of(state[0]);
+    for (uint i = 1; i < 12; ++i) {
+        sum = lazy_add(sum, lazy_of(state[i]));
     }
-    return fold_carries(sum, carries);
+    return lazy_materialize(sum);
 }
 
 inline void internal_linear_layer(thread ulong state[12], constant ulong* diagonal) {
