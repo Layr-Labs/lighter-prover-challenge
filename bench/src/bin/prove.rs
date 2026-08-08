@@ -41,8 +41,12 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 #[unsafe(export_name = "_rjem_malloc_conf")]
 static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 
-// Keep the promoted writer path while exercising a second submission from that baseline.
-const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+// Frontier-promoted writer path (2 MiB). The only delta from the promoted
+// d8c0991 tree in this submission is the buffer raised to 8 MiB: the final
+// proof is bincode-serialized only after all proving finishes, so the larger
+// buffer trades a little otherwise-dead tail memory for fewer filesystem
+// crossings on the scored post-proof write path.
+const PROOF_OUTPUT_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 fn main() {
     // First statement in the process: the Metal shader compile and pipeline
