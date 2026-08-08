@@ -20,6 +20,35 @@ use crate::types::{Field, PrimeField, Sample};
 #[derive(Copy, Clone, Serialize, Deserialize)]
 pub struct Secp256K1Base(pub [u64; 4]);
 
+/// Extended-Euclid modular inverse (the locked num-bigint 0.3 has no
+/// `modinv`). Returns the unique canonical inverse or `None` for zero.
+pub(crate) fn modinv_biguint(value: &BigUint, modulus: &BigUint) -> Option<BigUint> {
+    use num::bigint::BigInt;
+    use num::{Signed, Zero};
+    let mut r0 = BigInt::from(modulus.clone());
+    let mut r1 = BigInt::from(value.clone());
+    let mut t0 = BigInt::zero();
+    let mut t1 = BigInt::from(1u8);
+    while !r1.is_zero() {
+        let q = &r0 / &r1;
+        let r = &r0 - &q * &r1;
+        let t = &t0 - &q * &t1;
+        r0 = r1;
+        r1 = r;
+        t0 = t1;
+        t1 = t;
+    }
+    if !r0.is_one() {
+        return None;
+    }
+    let modulus = BigInt::from(modulus.clone());
+    let mut inv = t0 % &modulus;
+    if inv.is_negative() {
+        inv += &modulus;
+    }
+    inv.to_biguint()
+}
+
 fn biguint_from_array(arr: [u64; 4]) -> BigUint {
     BigUint::from_slice(&[
         arr[0] as u32,
@@ -113,8 +142,12 @@ impl Field for Secp256K1Base {
             return None;
         }
 
-        // Fermat's Little Theorem
-        Some(self.exp_biguint(&(Self::order() - BigUint::one() - BigUint::one())))
+        // Extended Euclid instead of Fermat exponentiation (~380 nonnative
+        // 256-bit modmuls -> one gcd chain); the unique inverse in canonical
+        // form, identical to the previous value.
+        let inv = modinv_biguint(&self.to_canonical_biguint(), &Self::order())
+            .expect("nonzero element of a prime field is invertible");
+        Some(Self::from_noncanonical_biguint(inv))
     }
 
     fn from_noncanonical_biguint(val: BigUint) -> Self {
