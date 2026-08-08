@@ -79,7 +79,7 @@ fn claims_exclusive_gpu_phase(active_paths: &AtomicUsize) -> bool {
 
 /// Marks the calling thread as latency-critical to the macOS scheduler.
 ///
-/// The 49 sequential chain folds are the whole critical path of a block
+/// The 49 sequential light-chain folds are the whole critical path of a block
 /// bundle: every serial section of a fold (witness feed, opening
 /// evaluation, FRI reduce, transcript work) runs on a chain-step thread
 /// while the global worker pool is saturated by transaction proving that
@@ -110,6 +110,10 @@ fn mark_spine_thread_latency_critical() {
 #[cfg(not(target_os = "macos"))]
 fn mark_spine_thread_latency_critical() {}
 
+fn is_latency_critical_path(path: TxPath) -> bool {
+    path == TxPath::Light
+}
+
 enum ChainState<'scope> {
     Ready(Proof),
     InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
@@ -137,7 +141,9 @@ fn chain_step_proof(
     dummy_proof: &Proof,
     tx_proof: &Proof,
 ) -> Proof {
-    mark_spine_thread_latency_critical();
+    if is_latency_critical_path(path) {
+        mark_spine_thread_latency_critical();
+    }
     let result = (|| {
         // Phase 1: run every generator that does not depend on the previous chain proof while
         // that proof may still be in flight. Inputs are written directly into
@@ -696,6 +702,12 @@ mod tests {
         // Both retired: nothing is proving, so nothing claims the phase either.
         active_paths.fetch_sub(1, Ordering::Release);
         assert!(!claims_exclusive_gpu_phase(&active_paths));
+    }
+
+    #[test]
+    fn only_the_light_chain_is_latency_critical() {
+        assert!(is_latency_critical_path(TxPath::Light));
+        assert!(!is_latency_critical_path(TxPath::Heavy));
     }
 
     #[test]
