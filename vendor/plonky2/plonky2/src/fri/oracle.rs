@@ -458,6 +458,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         }
     }
 
+
     /// Copies consecutive LDE points into a PolyMajor output buffer.
     ///
     /// Column-backed commitments use one contiguous slice copy per column,

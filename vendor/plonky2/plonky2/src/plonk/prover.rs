@@ -1935,6 +1935,7 @@ fn compute_quotient_polys<
                         .all(|(&sx, &x)| sx == F::coset_shift() * x)
                 );
 
+
                 // The constants and sigma columns are circuit-fixed, so their
                 // quotient-domain values were extracted once at circuit build
                 // time; copy them per batch instead of re-walking the strided
@@ -2006,6 +2007,7 @@ fn compute_quotient_polys<
                 } else {
                     (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
                 };
+
                 wires_commitment.fill_lde_batch(
                     &scratch.indices,
                     step,
@@ -2605,6 +2607,7 @@ mod quotient_layout_tests {
 
         assert_eq!(contiguous, indexed);
     }
+
 
     /// Scratch reuse: `fill_lde_batch` writes every cell of `out` before any
     /// is read, so dropping the zero-fill of an already correctly sized buffer

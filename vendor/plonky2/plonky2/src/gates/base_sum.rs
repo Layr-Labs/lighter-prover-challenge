@@ -183,9 +183,13 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> PackedEvaluab
         yield_constr.one(computed_sum - sum);
 
         let constraints_iter = limbs.iter().map(|&limb| {
-            (0..B)
-                .map(|i| limb - F::from_canonical_usize(i))
-                .product::<P>()
+            if B == 2 {
+                limb * (limb - F::ONE)
+            } else {
+                (0..B)
+                    .map(|i| limb - F::from_canonical_usize(i))
+                    .product::<P>()
+            }
         });
         yield_constr.many(constraints_iter);
     }
