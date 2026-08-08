@@ -322,8 +322,24 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
         // otherwise run once per 32-point batch call.
         let domain = crate::field::fft::cached_two_adic_subgroup::<F>(self.subgroup_bits);
         let weights = &self.barycentric_weights;
-        let mut values = vec![F::Extension::ZERO; self.num_points()];
-        let mut scratch = vec![F::ZERO; num_constraints * n];
+        let num_points = self.num_points();
+        let mut values_stack = [F::Extension::ZERO; 16];
+        let mut values_heap;
+        let values: &mut [F::Extension] = if num_points <= values_stack.len() {
+            &mut values_stack[..num_points]
+        } else {
+            values_heap = vec![F::Extension::ZERO; num_points];
+            &mut values_heap
+        };
+        let scratch_len = num_constraints * n;
+        let mut scratch_stack = [F::ZERO; 512];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if scratch_len <= scratch_stack.len() {
+            &mut scratch_stack[..scratch_len]
+        } else {
+            scratch_heap = vec![F::ZERO; scratch_len];
+            &mut scratch_heap
+        };
 
         for (p, vars) in vars_base.iter().enumerate() {
             let shift = vars.local_wires[self.wire_shift()];

@@ -153,12 +153,37 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ReducingGate<D
             F::Extension::from_basefield_array(arr)
         };
 
-        let alphas: Vec<F::Extension> = (0..n).map(|p| ext(Self::wires_alpha().start, p)).collect();
-        let mut accs: Vec<F::Extension> = (0..n)
-            .map(|p| ext(Self::wires_old_acc().start, p))
-            .collect();
+        let extension_zero = F::Extension::from_basefield(F::ZERO);
+        let mut alphas_stack = [extension_zero; 32];
+        let mut alphas_heap;
+        let alphas: &mut [F::Extension] = if n <= alphas_stack.len() {
+            &mut alphas_stack[..n]
+        } else {
+            alphas_heap = vec![extension_zero; n];
+            &mut alphas_heap
+        };
+        let mut accs_stack = [extension_zero; 32];
+        let mut accs_heap;
+        let accs: &mut [F::Extension] = if n <= accs_stack.len() {
+            &mut accs_stack[..n]
+        } else {
+            accs_heap = vec![extension_zero; n];
+            &mut accs_heap
+        };
+        for p in 0..n {
+            alphas[p] = ext(Self::wires_alpha().start, p);
+            accs[p] = ext(Self::wires_old_acc().start, p);
+        }
 
-        let mut scratch = vec![F::ZERO; D * n];
+        let scratch_len = D * n;
+        let mut scratch_stack = [F::ZERO; 64];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if scratch_len <= scratch_stack.len() {
+            &mut scratch_stack[..scratch_len]
+        } else {
+            scratch_heap = vec![F::ZERO; scratch_len];
+            &mut scratch_heap
+        };
         for i in 0..self.num_coeffs {
             let coeff = &wires[(Self::START_COEFFS + i) * n..][..n];
             let acc_start = self.wires_accs(i).start;

@@ -138,7 +138,15 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticExte
             F::Extension::from_basefield_array(arr)
         };
 
-        let mut scratch = vec![F::ZERO; D * n];
+        let scratch_len = D * n;
+        let mut scratch_stack = [F::ZERO; 64];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if scratch_len <= scratch_stack.len() {
+            &mut scratch_stack[..scratch_len]
+        } else {
+            scratch_heap = vec![F::ZERO; scratch_len];
+            &mut scratch_heap
+        };
         for i in 0..self.num_ops {
             let m0_start = Self::wires_ith_multiplicand_0(i).start;
             let m1_start = Self::wires_ith_multiplicand_1(i).start;
