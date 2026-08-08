@@ -31,6 +31,7 @@ use plonky2::util::timing::TimingTree;
 use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// Null-control draw: frontier tree verbatim, this marker line only.
 enum TxPath {
     Heavy,
     Light,
