@@ -18,9 +18,8 @@ use api::{
     Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
     PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
 };
-use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
 use circuit::block::Block;
-use circuit::types::config::{C, CIRCUIT_CONFIG, F};
+use circuit::types::config::{C, F};
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -81,9 +80,10 @@ fn main() {
             Ok(loaded) => loaded,
             Err(error) => {
                 log::warn!("embedded pre circuit unavailable ({error:#}); building from scratch");
-                let pre = circuit::block_pre_execution_constraints::BlockPreExecutionCircuit::define(
-                    circuit::types::config::CIRCUIT_CONFIG,
-                );
+                let pre =
+                    circuit::block_pre_execution_constraints::BlockPreExecutionCircuit::define(
+                        circuit::types::config::CIRCUIT_CONFIG,
+                    );
                 (pre.target, pre.builder.build::<C>())
             }
         },
@@ -94,14 +94,30 @@ fn main() {
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .spawn(move || {
             let (pre_target, pre_data) = pre_circuits;
-            prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec)
+            let pre_proof =
+                prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec);
+            (pre_target, pre_data, pre_proof)
         })
         .expect("pre-execution startup thread must start");
-    // Embedded circuits (deserialized from compile-time blobs) by default;
-    // falls back to building from scratch if they are unavailable, and
-    // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B measurement.
-    let circuits = Circuits::load();
-    let pre_proof = pre_handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    // The pre circuit is owned by the startup proof until it completes. Load
+    // only the other four blobs in the meantime: loading all five here would
+    // deserialize the same pre circuit twice on the scored critical path.
+    // Keep the forced-build mode's established behavior unchanged.
+    let remaining = (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1"))
+        .then(Circuits::load_remaining_embedded);
+    let (pre_target, pre_data, pre_proof) = pre_handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let circuits = match remaining {
+        Some(Ok(remaining)) => remaining.into_circuits((pre_target, pre_data)),
+        Some(Err(error)) => {
+            log::warn!(
+                "embedded remaining circuits unavailable ({error:#}); building from scratch"
+            );
+            Circuits::load()
+        }
+        None => Circuits::load(),
+    };
     let proof = prover::prove_block_after_pre(block, circuits, pre_proof);
     let mut writer = BufWriter::with_capacity(
         PROOF_OUTPUT_BUFFER_BYTES,
