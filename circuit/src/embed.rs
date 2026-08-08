@@ -33,9 +33,8 @@
 //! building circuits from scratch.
 
 use anyhow::{Context, Result, bail, ensure};
-use plonky2::field::fft::fft_root_table;
+use plonky2::field::fft::{cached_fft_root_table, cached_two_adic_subgroup};
 use plonky2::field::polynomial::PolynomialValues;
-use plonky2::field::types::Field;
 use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::plonk::circuit_data::{
     CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
@@ -43,7 +42,7 @@ use plonky2::plonk::circuit_data::{
 use plonky2::plonk::permutation_argument::Forest;
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
-use plonky2::util::{log2_ceil, transpose_poly_values};
+use plonky2::util::{log2_ceil, log2_strict, transpose_poly_values};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -443,12 +442,14 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let num_wires = common.config.num_wires;
     let num_routed = common.config.num_routed_wires;
 
-    let subgroup = F::two_adic_subgroup(degree_bits);
+    let subgroup = cached_two_adic_subgroup::<F>(degree_bits).as_ref().clone();
 
     // Same table size expression as `try_build_with_options`.
     let max_fft_points =
         1usize << (degree_bits + rate_bits.max(log2_ceil(common.quotient_degree_factor)));
-    let root_table = fft_root_table::<F>(max_fft_points);
+    let root_table = cached_fft_root_table::<F>(log2_strict(max_fft_points))
+        .as_ref()
+        .clone();
 
     // Sigma values from the representative map, through the builder's own
     // forest partition code (`sigma_vecs` post-`compress_paths` state).

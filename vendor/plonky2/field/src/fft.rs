@@ -60,6 +60,20 @@ pub fn fft_root_table<F: Field>(n: usize) -> FftRootTable<F> {
     root_table
 }
 
+/// Process-wide cached FFT root table, value-identical to
+/// [`fft_root_table`]. Callers that need owned circuit data can clone the
+/// returned table while avoiding repeated root generation across concurrent
+/// loads of circuits with the same FFT domain.
+#[cfg(feature = "std")]
+pub fn cached_fft_root_table<F: Field>(lg_n: usize) -> alloc::sync::Arc<FftRootTable<F>> {
+    root_table_cache::get::<F>(lg_n)
+}
+
+#[cfg(not(feature = "std"))]
+pub fn cached_fft_root_table<F: Field>(lg_n: usize) -> alloc::sync::Arc<FftRootTable<F>> {
+    alloc::sync::Arc::new(fft_root_table::<F>(1 << lg_n))
+}
+
 /// Process-wide cache of FFT root tables for the prover's hot field types,
 /// contention-free on the steady-state path: one static fixed-size array of
 /// `OnceLock` slots per cached field type, indexed by log2(size). A hit is a
