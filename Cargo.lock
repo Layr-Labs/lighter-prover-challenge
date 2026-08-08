@@ -142,6 +142,7 @@ dependencies = [
  "itertools 0.13.0",
  "lazy_static",
  "log",
+ "metal",
  "num",
  "num_cpus",
  "paste",
