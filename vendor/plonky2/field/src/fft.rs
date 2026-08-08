@@ -886,7 +886,9 @@ fn fft_zero_padded_cache_blocks<P, M>(
         let source_start = block * nonzero_per_block;
         let destination = block * packed_block_len;
         #[cfg(target_arch = "aarch64")]
-        if r == 3 && core::any::TypeId::of::<P>() == core::any::TypeId::of::<WideGoldilocksField>()
+        let first_remaining = if r == 3
+            && core::any::TypeId::of::<P>()
+                == core::any::TypeId::of::<WideGoldilocksField>()
         {
             let wide_values = unsafe {
                 // SAFETY: The TypeId check proves this is the exact concrete packed type;
@@ -896,12 +898,23 @@ fn fft_zero_padded_cache_blocks<P, M>(
                     packed_values.len(),
                 )
             };
-            fft_zero_padded_rate_8_first_layer_block(
+            let omega4 = P::pack_slice(&root_table[r + 1]);
+            let wide_omega4 = unsafe {
+                // SAFETY: The same TypeId check proves that the packed root-table row has
+                // the exact WideGoldilocksField representation expected by the kernel.
+                core::slice::from_raw_parts(
+                    omega4.as_ptr().cast::<WideGoldilocksField>(),
+                    omega4.len(),
+                )
+            };
+            lab::fused_rate_8_expand_two_layers_block(
                 wide_values,
                 source_start,
                 nonzero_per_block,
                 destination,
+                wide_omega4,
             );
+            r + 2
         } else {
             fft_zero_padded_first_layer_block_with::<P, M>(
                 packed_values,
@@ -911,19 +924,23 @@ fn fft_zero_padded_cache_blocks<P, M>(
                 packed_repeat,
                 omega_table,
             );
-        }
+            r + 1
+        };
         #[cfg(not(target_arch = "aarch64"))]
-        fft_zero_padded_first_layer_block_with::<P, M>(
-            packed_values,
-            source_start,
-            nonzero_per_block,
-            destination,
-            packed_repeat,
-            omega_table,
-        );
+        let first_remaining = {
+            fft_zero_padded_first_layer_block_with::<P, M>(
+                packed_values,
+                source_start,
+                nonzero_per_block,
+                destination,
+                packed_repeat,
+                omega_table,
+            );
+            r + 1
+        };
         fft_classic_simd_layers::<P, M>(
             &mut packed_values[destination..destination + packed_block_len],
-            r + 1,
+            first_remaining,
             lg_block_n,
             root_table,
         );
@@ -1136,7 +1153,7 @@ pub mod lab {
     /// with the packed `root_table[4]` row.
     #[cfg(target_arch = "aarch64")]
     #[inline(always)]
-    fn fused_rate_8_expand_two_layers_block(
+    pub(super) fn fused_rate_8_expand_two_layers_block(
         packed_values: &mut [WideGoldilocksField],
         source_start: usize,
         nonzero_len: usize,
