@@ -482,6 +482,97 @@ fn fft_classic_simd_single_layer_neon(
     }
 }
 
+/// Two consecutive butterfly layers over base-field scalars in one traversal,
+/// for full-array ranges whose passes leave the caches.
+///
+/// Layer `lg_half_m` splits each 4q block (q = 2^lg_half_m) into quarters
+/// A|B|C|D and pairs (A[j], B[j]) and (C[j], D[j]) with `w1_row[j]`; layer
+/// `lg_half_m + 1` then pairs (A[j], C[j]) with `w2_row[j]` and (B[j], D[j])
+/// with `w2_row[q + j]`. Those are exactly the butterflies, twiddles and
+/// per-element order of running `fft_classic_simd_single_layer_neon` for the
+/// two layers back to back, through the same primitives — paired
+/// `NeonGoldilocksField` multiplies, `gl_add_neon`/`gl_sub_neon` (each
+/// documented word-for-word identical to scalar `Add`/`Sub`) and the scalar
+/// operators themselves — so every raw `GoldilocksField.0` word is identical.
+/// Each element is loaded and stored once per layer PAIR instead of once per
+/// layer, halving whole-array passes for the fused layers.
+///
+/// Register discipline is what separates this from the retired packed-width
+/// radix-4 fusion (four packed values plus three packed twiddles, 28 words
+/// live, heavy spilling): pair-column granularity holds four scalar pairs and
+/// three twiddle pairs. The A-side butterfly and all four final reductions
+/// run in vector registers like the single-layer kernel; the C/D stage-1
+/// butterfly stays in scalar registers *because its outputs feed the stage-2
+/// multiplies*, so the loop has six GPR->NEON `fmov`s, no NEON->GPR crossing,
+/// and compiles to 20 general + 8 vector registers with no stack traffic.
+///
+/// Bounds are discharged by construction — `chunks_exact_mut`/`split_at_mut`
+/// over the quarters and `chunks_exact` over the twiddle rows, `zip` stopping
+/// at the shortest — after the two row slicings below, which keep a short row
+/// loud at one check per call, exactly like the generic single-layer body.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_two_layers_neon(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    lg_half_m: usize,
+    w1_row: &[crate::goldilocks_field::GoldilocksField],
+    w2_row: &[crate::goldilocks_field::GoldilocksField],
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    debug_assert!(lg_half_m >= 1);
+    let q = 1usize << lg_half_m;
+    let w1_row = &w1_row[..q];
+    let (w2_lo, w2_hi) = w2_row[..2 * q].split_at(q);
+
+    let eps = unsafe { vdupq_n_u64(EPSILON) };
+    for block in values.chunks_exact_mut(4 * q) {
+        let (ab, cd) = block.split_at_mut(2 * q);
+        let (quarter_a, quarter_b) = ab.split_at_mut(q);
+        let (quarter_c, quarter_d) = cd.split_at_mut(q);
+        for (((((a2, b2), c2), d2), (w12, w2a2)), w2b2) in quarter_a
+            .chunks_exact_mut(2)
+            .zip(quarter_b.chunks_exact_mut(2))
+            .zip(quarter_c.chunks_exact_mut(2))
+            .zip(quarter_d.chunks_exact_mut(2))
+            .zip(w1_row.chunks_exact(2).zip(w2_lo.chunks_exact(2)))
+            .zip(w2_hi.chunks_exact(2))
+        {
+            // Stage-1 products for both butterflies, paired per twiddle row.
+            let t1 =
+                NeonGoldilocksField([w12[0], w12[1]]) * NeonGoldilocksField([b2[0], b2[1]]);
+            let t2 =
+                NeonGoldilocksField([w12[0], w12[1]]) * NeonGoldilocksField([d2[0], d2[1]]);
+            // C/D stage-1 butterfly in scalar registers: these values are the
+            // stage-2 multiplier inputs, so keeping them out of the vector
+            // file avoids a NEON->GPR crossing on the critical path.
+            let cd0 = [c2[0] + t2.0[0], c2[1] + t2.0[1]];
+            let cd1 = [c2[0] - t2.0[0], c2[1] - t2.0[1]];
+            // Stage-2 products.
+            let t3 = NeonGoldilocksField([w2a2[0], w2a2[1]]) * NeonGoldilocksField(cd0);
+            let t4 = NeonGoldilocksField([w2b2[0], w2b2[1]]) * NeonGoldilocksField(cd1);
+            // SAFETY: every chunk holds exactly 2 elements (`chunks_exact`),
+            // `GoldilocksField` is `#[repr(transparent)]` over `u64`, and each
+            // load/store stays inside its own chunk. Indexing never leaves the
+            // zips; only the vector intrinsics are unsafe.
+            unsafe {
+                let av = vld1q_u64(a2.as_ptr().cast::<u64>());
+                let t1v = vcombine_u64(vcreate_u64(t1.0[0].0), vcreate_u64(t1.0[1].0));
+                let ab0 = gl_add_neon(av, t1v, eps);
+                let ab1 = gl_sub_neon(av, t1v, eps);
+                let t3v = vcombine_u64(vcreate_u64(t3.0[0].0), vcreate_u64(t3.0[1].0));
+                let t4v = vcombine_u64(vcreate_u64(t4.0[0].0), vcreate_u64(t4.0[1].0));
+                vst1q_u64(a2.as_mut_ptr().cast::<u64>(), gl_add_neon(ab0, t3v, eps));
+                vst1q_u64(c2.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab0, t3v, eps));
+                vst1q_u64(b2.as_mut_ptr().cast::<u64>(), gl_add_neon(ab1, t4v, eps));
+                vst1q_u64(d2.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab1, t4v, eps));
+            }
+        }
+    }
+}
+
 /// One FRI butterfly layer over quadratic-extension elements, with the
 /// modular reduction in vector registers.
 ///
@@ -736,24 +827,47 @@ fn fft_classic_simd_fused_two_layers_with<P, M>(
     }
 }
 
-/// Run FFT stages `start..end`, one whole-buffer pass each.
+/// Base-field ranges at or above this many scalars take consecutive layers
+/// two at a time through `fft_classic_simd_two_layers_neon`. Below it —
+/// every 2^13 cache-blocked slice and every smaller transform — the
+/// single-layer schedule measures as fast or faster, so it stays.
+#[cfg(target_arch = "aarch64")]
+const FUSED_PAIR_MIN_SCALARS: usize = 1 << 19;
+
+/// Run FFT stages `start..end`, one whole-buffer pass each — except that
+/// base-field ranges streaming at least `FUSED_PAIR_MIN_SCALARS` take the
+/// stages two at a time, one whole-buffer pass per PAIR.
 ///
-/// A radix-4 traversal fusing stage pairs used to drive these layers, on
-/// the reasoning that it halved whole-array memory passes. Memory passes
-/// are not what this kernel is short of: removing the 2^13 cache blocking
-/// entirely changes the time by under 1% at every thread count from 1 to
-/// 12. What the fused form does cost is registers -- four packed values
-/// plus three twiddle vectors live, against two and one here, while the
-/// Goldilocks multiply is scalar GPR assembly. Measured on both production
-/// LDE shapes (2^19 and 2^17, rate 8) with interleaved arms and per-thread
-/// minimums, single layers are 3-7% faster at every thread count, and
-/// bit-identical: same butterflies, same twiddles, same per-element order,
-/// same raw `GoldilocksField.0` words.
+/// A packed-width radix-4 traversal fusing stage pairs used to drive these
+/// layers, on the reasoning that it halved whole-array memory passes. For
+/// cache-resident slices, memory passes are not what this kernel is short
+/// of: removing the 2^13 cache blocking entirely changes the time by under
+/// 1% at every thread count from 1 to 12, and defusing to single layers won
+/// 3-7% at every thread count because the packed-width fusion held four
+/// packed values plus three twiddle vectors live and spilled while the
+/// Goldilocks multiply ran in scalar registers.
+///
+/// Full-array passes are a different regime. Measured per element-layer
+/// (min of >=500 interleaved reps, bit-identical arms), the single-layer
+/// kernel costs 0.50 ns on a cache-resident 2^13 slice but 0.57-0.59 ns on
+/// 2^19/2^21 full arrays — deep layers pair elements across multi-MiB
+/// strides and stream multi-MiB twiddle rows, and every pass repays that.
+/// The pair-column two-layer fusion (which fits in registers; see its doc)
+/// holds ~0.50 ns at every measured size and depth: +14% at the 2^19 tail,
+/// +17% at 2^21, two-layer microshapes +2% (lg_half_m=4) rising
+/// monotonically to +20% (lg_half_m=19). Below 2^19 scalars it measures as
+/// a tie, so the gate keeps those ranges — in particular every in-block
+/// call — on the proven single-layer path, and a trailing odd layer runs
+/// as a single exactly as before.
 ///
 /// The twiddle marker `M` rides on this structure: it is chosen once per
 /// transform by the dispatch entry and resolved statically inside each layer,
-/// so it adds no live register and no per-butterfly branch to either the
-/// vector-reduction kernel or the generic body.
+/// so it adds no live register and no per-butterfly branch to any kernel.
+/// The fused arm is guarded on exact `WideGoldilocksField` identity the same
+/// way the single-layer fast path is; reaching it proves the scalar type is
+/// `GoldilocksField`, whose `mul_fft_base_twiddle` is the full multiplication,
+/// so both markers denote the same product and the arm is untouched by the
+/// twiddle specialization.
 #[inline(always)]
 fn fft_classic_simd_layers<P, M>(
     packed_values: &mut [P],
@@ -765,6 +879,63 @@ fn fft_classic_simd_layers<P, M>(
     M: FftTwiddleMul<P>,
 {
     let lg_packed_width = log2_strict(P::WIDTH);
+
+    #[cfg(target_arch = "aarch64")]
+    if start + 2 <= end
+        && (packed_values.len() << lg_packed_width) >= FUSED_PAIR_MIN_SCALARS
+        && core::any::TypeId::of::<P>()
+            == core::any::TypeId::of::<
+                crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField,
+            >()
+    {
+        let mut lg_half_m = start;
+        {
+            // SAFETY: the `TypeId` compare proves `P` is exactly
+            // `WideGoldilocksField`, hence `P::Scalar` is exactly
+            // `GoldilocksField`. `WideGoldilocksField` is
+            // `#[repr(transparent)]` over `[NeonGoldilocksField; 2]`, itself
+            // `#[repr(transparent)]` over `[GoldilocksField; 2]`, so the
+            // packed slice is exactly `4 * len` contiguous scalars with the
+            // same alignment, and the rows already hold that scalar type.
+            // Only the generic spelling of the types differs at this point.
+            let scalars = unsafe {
+                core::slice::from_raw_parts_mut(
+                    packed_values
+                        .as_mut_ptr()
+                        .cast::<crate::goldilocks_field::GoldilocksField>(),
+                    packed_values.len() * P::WIDTH,
+                )
+            };
+            while lg_half_m + 2 <= end {
+                let w1_row = unsafe {
+                    let row = &root_table[lg_half_m];
+                    core::slice::from_raw_parts(
+                        row.as_ptr().cast::<crate::goldilocks_field::GoldilocksField>(),
+                        row.len(),
+                    )
+                };
+                let w2_row = unsafe {
+                    let row = &root_table[lg_half_m + 1];
+                    core::slice::from_raw_parts(
+                        row.as_ptr().cast::<crate::goldilocks_field::GoldilocksField>(),
+                        row.len(),
+                    )
+                };
+                fft_classic_simd_two_layers_neon(scalars, lg_half_m, w1_row, w2_row);
+                lg_half_m += 2;
+            }
+        }
+        if lg_half_m < end {
+            fft_classic_simd_single_layer_with::<P, M>(
+                packed_values,
+                lg_half_m,
+                lg_packed_width,
+                root_table,
+            );
+        }
+        return;
+    }
+
     for lg_half_m in start..end {
         fft_classic_simd_single_layer_with::<P, M>(
             packed_values,
@@ -2621,6 +2792,37 @@ mod tests {
             assert_eq!(
                 actual_coset, expected_coset,
                 "zero-padded coset FFT mismatch for 2^{base_lg_n} -> 2^{lg_n}"
+            );
+        }
+    }
+
+    /// The fused-pair gate fires only at >= 2^19 scalars, above every other
+    /// test size in this module. Cover the gated shapes through the
+    /// production `fft_classic` entry against the stage-major reference, on
+    /// raw limbs: r=0 at 2^19 (non-blocked 2..19, seventeen layers — eight
+    /// fused pairs plus the trailing odd single at 18), r=3 at 2^20 (blocked
+    /// in-block layers unfused, tail 13..20 — three pairs plus the odd
+    /// single at 19), r=3 at 2^19 (even tail, no leftover), and r=0 at 2^18
+    /// just below the gate as an unfused control.
+    #[test]
+    fn fused_full_array_layer_pairs_match_reference() {
+        for (lg_n, r) in [(19usize, 0usize), (20, 3), (19, 3), (18, 0)] {
+            let n = 1 << lg_n;
+            let nonzero_len = n >> r;
+            let roots = fft_root_table(n);
+            let padded = deterministic_values(nonzero_len)
+                .into_iter()
+                .chain(core::iter::repeat_n(GoldilocksField::ZERO, n - nonzero_len))
+                .collect::<Vec<_>>();
+
+            let mut expected = padded.clone();
+            fft_classic_reference(&mut expected, r, &roots);
+            let mut actual = padded;
+            fft_classic(&mut actual, r, &roots);
+            assert_eq!(
+                actual.iter().map(|x| x.0).collect::<Vec<_>>(),
+                expected.iter().map(|x| x.0).collect::<Vec<_>>(),
+                "raw limb mismatch at 2^{lg_n}, r={r}"
             );
         }
     }
