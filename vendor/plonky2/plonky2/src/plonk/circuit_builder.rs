@@ -49,7 +49,7 @@ use crate::plonk::circuit_data::{
 };
 use crate::plonk::config::{AlgebraicHasher, GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::copy_constraint::CopyConstraint;
-use crate::plonk::permutation_argument::Forest;
+use crate::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::timed;
 use crate::util::context_tree::ContextTree;
@@ -1456,6 +1456,14 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             }
         };
 
+        let fixed_routed_wires = fixed_routed_wire_mask(
+            &forest.parents,
+            common.config.num_wires,
+            common.config.num_routed_wires,
+            subgroup.len(),
+        )
+        .expect("builder produced an invalid compressed representative map");
+
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,
             generator_indices_by_watches,
@@ -1465,6 +1473,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             subgroup,
             public_inputs: self.public_inputs,
             representative_map: forest.parents,
+            fixed_routed_wires,
             fft_root_table: Some(fft_root_table),
             circuit_digest,
             lookup_rows: self.lookup_rows.clone(),
