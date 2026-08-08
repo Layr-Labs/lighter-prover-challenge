@@ -234,6 +234,15 @@ fn prove_tx_witness(
     tx_data: &CircuitData<F, C, D>,
     partition_witness: PartitionWitness<'_, F>,
 ) -> Proof {
+    // The Light path runs the 52 sequential transaction proofs main blocks on
+    // (66.3% of wall); each runs on its own spawned thread, which starts at the
+    // default QoS and can therefore land on an efficiency core. Mark only this
+    // coordinator; Rayon workers and the Heavy path keep their default QoS.
+    // Adopted from tekuuu, who re-aimed the tip's existing helper from the
+    // chain spine (~0% of wall) at the path that actually binds.
+    if path == TxPath::Light {
+        mark_spine_thread_latency_critical();
+    }
     let proof = prove_with_partition_witness::<F, C, D>(
         &tx_data.prover_only,
         &tx_data.common,
