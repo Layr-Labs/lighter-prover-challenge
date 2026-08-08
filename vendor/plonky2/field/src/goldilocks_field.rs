@@ -522,6 +522,14 @@ fn reduce128(x: u128) -> GoldilocksField {
     GoldilocksField(t2)
 }
 
+/// Multiply by the FFT's primitive fourth root of unity,
+/// `2^48 mod ORDER`. This is exactly the ordinary field product, with the
+/// constant multiplication reduced to a shift before Goldilocks reduction.
+#[inline(always)]
+pub(crate) fn mul_fourth_root(value: GoldilocksField) -> GoldilocksField {
+    reduce128((value.0 as u128) << 48)
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub(crate) fn mul_16th_root_powers(value: GoldilocksField) -> [GoldilocksField; 8] {
@@ -634,6 +642,49 @@ mod tests {
 
     test_prime_field_arithmetic!(crate::goldilocks_field::GoldilocksField);
     test_field_arithmetic!(crate::goldilocks_field::GoldilocksField);
+
+    /// Multiplication by the FFT fourth root (`2^48`) has a shift-only
+    /// implementation. Its raw representative must be exactly the same as an
+    /// ordinary field multiplication, including for non-canonical inputs.
+    #[test]
+    fn fourth_root_shift_matches_ordinary_mul_raw_words() {
+        use super::{GoldilocksField, mul_fourth_root};
+
+        const FOURTH_ROOT: GoldilocksField = GoldilocksField(1 << 48);
+        const EDGES: &[u64] = &[
+            0,
+            1,
+            2,
+            0xFFFF_FFFF,
+            0x1_0000_0000,
+            0xFFFF_FFFE_FFFF_FFFF,
+            0xFFFF_FFFF_0000_0000,
+            0xFFFF_FFFF_0000_0001,
+            0xFFFF_FFFF_0000_0002,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+
+        for &raw in EDGES {
+            assert_eq!(
+                mul_fourth_root(GoldilocksField(raw)).0,
+                (GoldilocksField(raw) * FOURTH_ROOT).0,
+                "fourth-root raw mismatch for {raw:#018x}"
+            );
+        }
+
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        for _ in 0..100_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            assert_eq!(
+                mul_fourth_root(GoldilocksField(state)).0,
+                (GoldilocksField(state) * FOURTH_ROOT).0,
+                "fourth-root raw mismatch for {state:#018x}"
+            );
+        }
+    }
 
     /// Differential test for the AArch64 `multiply_accumulate` inline assembly
     /// against the portable expression it replaces.

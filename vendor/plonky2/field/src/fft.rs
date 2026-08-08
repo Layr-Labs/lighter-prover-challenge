@@ -7,7 +7,7 @@ use unroll::unroll_for_loops;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
 #[cfg(target_arch = "aarch64")]
-use crate::goldilocks_field::mul_16th_root_powers;
+use crate::goldilocks_field::{mul_16th_root_powers, mul_fourth_root};
 
 use crate::packable::Packable;
 use crate::packed::PackedField;
@@ -358,7 +358,7 @@ fn fft_classic_simd_with<P, M>(
 
     // We've already done the first lg_packed_width (if they were required) iterations.
     let s = max(r, lg_packed_width);
-    fft_classic_simd_layers::<P, M>(packed_values, s, lg_n, root_table);
+    fft_classic_simd_optimized_layers::<P, M>(packed_values, s, lg_n, root_table);
 }
 
 #[inline(always)]
@@ -736,6 +736,205 @@ fn fft_classic_simd_fused_two_layers_with<P, M>(
     }
 }
 
+/// Two FFT stages evaluated as a true radix-4 butterfly over Goldilocks
+/// scalars. If `p = q^2`, the historical stages
+///
+/// ```text
+/// (a, b), (c, d) --p--> ... --q,iq--> outputs
+/// ```
+///
+/// are algebraically identical to three general products
+/// `B = q*c`, `C = p*b`, `D = q^3*d`, followed by additions and one
+/// multiplication by `i = 2^48`. The latter is a shift plus reduction. The
+/// general multiplication count therefore drops from four to three per
+/// scalar butterfly. Two adjacent scalar butterflies share each paired NEON
+/// multiply and vector add/sub sequence.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_true_radix4_neon(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    lg_half_m: usize,
+    root_table: &FftRootTable<crate::goldilocks_field::GoldilocksField>,
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+    use crate::goldilocks_field::GoldilocksField;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    let h = 1usize << lg_half_m;
+    let block_len = h << 2;
+    let twice_h = h << 1;
+    let p_row = &root_table[lg_half_m];
+    let q_row = &root_table[lg_half_m + 1];
+    debug_assert!(p_row.len() >= h);
+    debug_assert!(q_row.len() >= twice_h);
+    debug_assert_eq!(values.len() % block_len, 0);
+
+    let base = values.as_mut_ptr().cast::<u64>();
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        let mut k = 0;
+        while k < values.len() {
+            let mut j = 0;
+            while j + 2 <= h {
+                let p = NeonGoldilocksField([
+                    *p_row.get_unchecked(j),
+                    *p_row.get_unchecked(j + 1),
+                ]);
+                let q = NeonGoldilocksField([
+                    *q_row.get_unchecked(j),
+                    *q_row.get_unchecked(j + 1),
+                ]);
+                let q3_at = |lane_j: usize| {
+                    let exponent = 3 * lane_j;
+                    if exponent < twice_h {
+                        *q_row.get_unchecked(exponent)
+                    } else {
+                        -*q_row.get_unchecked(exponent - twice_h)
+                    }
+                };
+                let q3 = NeonGoldilocksField([q3_at(j), q3_at(j + 1)]);
+
+                let b = NeonGoldilocksField([
+                    *values.get_unchecked(k + h + j),
+                    *values.get_unchecked(k + h + j + 1),
+                ]);
+                let c = NeonGoldilocksField([
+                    *values.get_unchecked(k + 2 * h + j),
+                    *values.get_unchecked(k + 2 * h + j + 1),
+                ]);
+                let d = NeonGoldilocksField([
+                    *values.get_unchecked(k + 3 * h + j),
+                    *values.get_unchecked(k + 3 * h + j + 1),
+                ]);
+
+                // Exactly three paired general multiplications.
+                let b_twiddled = q * c;
+                let c_twiddled = p * b;
+                let d_twiddled = q3 * d;
+                let bv = vcombine_u64(
+                    vcreate_u64(b_twiddled.0[0].0),
+                    vcreate_u64(b_twiddled.0[1].0),
+                );
+                let cv = vcombine_u64(
+                    vcreate_u64(c_twiddled.0[0].0),
+                    vcreate_u64(c_twiddled.0[1].0),
+                );
+                let dv = vcombine_u64(
+                    vcreate_u64(d_twiddled.0[0].0),
+                    vcreate_u64(d_twiddled.0[1].0),
+                );
+                let av = vld1q_u64(base.add(k + j));
+
+                let t0 = gl_add_neon(av, cv, eps);
+                let t1 = gl_sub_neon(av, cv, eps);
+                let t2 = gl_add_neon(bv, dv, eps);
+                let b_minus_d = gl_sub_neon(bv, dv, eps);
+                let t3 = vcombine_u64(
+                    vcreate_u64(
+                        mul_fourth_root(GoldilocksField(vgetq_lane_u64(b_minus_d, 0))).0,
+                    ),
+                    vcreate_u64(
+                        mul_fourth_root(GoldilocksField(vgetq_lane_u64(b_minus_d, 1))).0,
+                    ),
+                );
+
+                vst1q_u64(base.add(k + j), gl_add_neon(t0, t2, eps));
+                vst1q_u64(base.add(k + h + j), gl_add_neon(t1, t3, eps));
+                vst1q_u64(base.add(k + 2 * h + j), gl_sub_neon(t0, t2, eps));
+                vst1q_u64(base.add(k + 3 * h + j), gl_sub_neon(t1, t3, eps));
+                j += 2;
+            }
+
+            // Only the scalar `P = GoldilocksField`, `lg_half_m = 0` case has
+            // an odd quarter. It is tiny but keeps the exact-type scalar
+            // dispatch complete rather than adding a transform-level special
+            // case.
+            while j < h {
+                let exponent = 3 * j;
+                let q3 = if exponent < twice_h {
+                    q_row[exponent]
+                } else {
+                    -q_row[exponent - twice_h]
+                };
+                let a = values[k + j];
+                let b = values[k + h + j];
+                let c = values[k + 2 * h + j];
+                let d = values[k + 3 * h + j];
+                let b_twiddled = q_row[j] * c;
+                let c_twiddled = p_row[j] * b;
+                let d_twiddled = q3 * d;
+                let t0 = a + c_twiddled;
+                let t1 = a - c_twiddled;
+                let t2 = b_twiddled + d_twiddled;
+                let t3 = mul_fourth_root(b_twiddled - d_twiddled);
+                values[k + j] = t0 + t2;
+                values[k + h + j] = t1 + t3;
+                values[k + 2 * h + j] = t0 - t2;
+                values[k + 3 * h + j] = t1 - t3;
+                j += 1;
+            }
+            k += block_len;
+        }
+    }
+}
+
+/// Production layer driver. Exact AArch64 Goldilocks scalar/packed
+/// instantiations use true radix-4 stage pairs; all other field and packing
+/// types retain the historical generic driver unchanged. Type identity is
+/// tested once per layer range, never in the pair or butterfly loops.
+#[inline(always)]
+fn fft_classic_simd_optimized_layers<P, M>(
+    packed_values: &mut [P],
+    start: usize,
+    end: usize,
+    root_table: &FftRootTable<P::Scalar>,
+) where
+    P: PackedField,
+    M: FftTwiddleMul<P>,
+{
+    #[cfg(target_arch = "aarch64")]
+    {
+        use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
+        use crate::goldilocks_field::GoldilocksField;
+
+        let concrete = core::any::TypeId::of::<P>();
+        if concrete == core::any::TypeId::of::<GoldilocksField>()
+            || concrete == core::any::TypeId::of::<WideGoldilocksField>()
+        {
+            // SAFETY: either exact-type comparison proves the scalar storage is
+            // contiguous Goldilocks words. The packed case is transparent over
+            // four Goldilocks scalars; the scalar case has width one.
+            let scalars = unsafe {
+                core::slice::from_raw_parts_mut(
+                    packed_values.as_mut_ptr().cast::<GoldilocksField>(),
+                    packed_values.len() * P::WIDTH,
+                )
+            };
+            let roots = unsafe {
+                // The exact-type checks above also prove `P::Scalar` is
+                // Goldilocks for both accepted instantiations.
+                &*(root_table as *const FftRootTable<P::Scalar>
+                    as *const FftRootTable<GoldilocksField>)
+            };
+            let mut layer = start;
+            // Leave the most expensive (largest) layers paired when the count
+            // is odd by consuming one leading radix-2 layer.
+            if (end - start) & 1 == 1 {
+                fft_classic_simd_single_layer_neon(scalars, layer, &roots[layer]);
+                layer += 1;
+            }
+            while layer + 1 < end {
+                fft_classic_simd_true_radix4_neon(scalars, layer, roots);
+                layer += 2;
+            }
+            return;
+        }
+    }
+
+    fft_classic_simd_layers::<P, M>(packed_values, start, end, root_table);
+}
+
 /// Run FFT stages `start..end`, one whole-buffer pass each.
 ///
 /// A radix-4 traversal fusing stage pairs used to drive these layers, on
@@ -921,7 +1120,7 @@ fn fft_zero_padded_cache_blocks<P, M>(
             packed_repeat,
             omega_table,
         );
-        fft_classic_simd_layers::<P, M>(
+        fft_classic_simd_optimized_layers::<P, M>(
             &mut packed_values[destination..destination + packed_block_len],
             r + 1,
             lg_block_n,
@@ -2255,6 +2454,42 @@ mod tests {
                         "raw word mismatch at 2^{lg_n} start {start} index {i}"
                     );
                 }
+            }
+        }
+    }
+
+    /// The true radix-4 identity replaces four general twiddle products with
+    /// three plus the shift-only fourth-root product. Reassociation can select
+    /// a different non-canonical representative, so the contract here is field
+    /// equality against the two historical stages at every paired layer.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn true_radix4_pair_matches_two_layers_canonically() {
+        use crate::fft::{
+            fft_classic_simd_fused_two_layers_with, fft_classic_simd_true_radix4_neon,
+        };
+
+        type F = GoldilocksField;
+        type P = <F as Packable>::Packing;
+        let lg_packed_width = log2_strict(P::WIDTH);
+        for lg_n in [4usize, 5, 8, 11, 13, 16] {
+            let n = 1usize << lg_n;
+            let roots = fft_root_table::<F>(n);
+            for lg_half_m in lg_packed_width..lg_n - 1 {
+                let mut expected = deterministic_values(n);
+                let mut actual = expected.clone();
+                fft_classic_simd_fused_two_layers_with::<P, GeneralTwiddle>(
+                    P::pack_slice_mut(&mut expected),
+                    lg_half_m,
+                    lg_packed_width,
+                    &roots,
+                );
+                fft_classic_simd_true_radix4_neon(&mut actual, lg_half_m, &roots);
+                assert_eq!(
+                    actual, expected,
+                    "true radix-4 mismatch at 2^{lg_n}, layers {lg_half_m}/{}",
+                    lg_half_m + 1
+                );
             }
         }
     }
