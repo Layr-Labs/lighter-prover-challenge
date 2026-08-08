@@ -104,15 +104,6 @@ where
     fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
         *self + x * y
     }
-
-    /// Internal FFT hook for a twiddle known to be in a base subfield. Packed
-    /// backends keep their existing multiplication; width-one scalar packing
-    /// delegates to the scalar field's statically selected implementation.
-    #[doc(hidden)]
-    #[inline(always)]
-    fn mul_fft_base_twiddle(twiddle: Self, value: Self) -> Self {
-        twiddle * value
-    }
 }
 
 unsafe impl<F: Field> PackedField for F {
@@ -140,10 +131,5 @@ unsafe impl<F: Field> PackedField for F {
             1 => (*self, other),
             _ => panic!("unsupported block length"),
         }
-    }
-
-    #[inline(always)]
-    fn mul_fft_base_twiddle(twiddle: Self, value: Self) -> Self {
-        F::mul_fft_base_twiddle(twiddle, value)
     }
 }
