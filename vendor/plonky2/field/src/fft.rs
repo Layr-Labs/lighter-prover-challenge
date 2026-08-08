@@ -1,13 +1,20 @@
 use alloc::vec::Vec;
 use core::cmp::{max, min};
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+use core::cell::RefCell;
 
 use plonky2_util::{log2_strict, reverse_index_bits_in_place};
 use unroll::unroll_for_loops;
 
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+use crate::goldilocks_field::GoldilocksField;
 #[cfg(target_arch = "aarch64")]
 use crate::goldilocks_field::mul_16th_root_powers;
+
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+use std::sync::OnceLock;
 
 use crate::packable::Packable;
 use crate::packed::PackedField;
@@ -980,6 +987,266 @@ where
     }
 }
 
+/// Cached sqrt-matrix plan for the production rate-8 tail. After the local
+/// `2^13` transforms, the packed buffer is an `outer_len x packed_block_len`
+/// matrix. Transposing it makes the remaining transform of each matrix column
+/// cache-resident while preserving every original radix-2 butterfly.
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+struct BaileyTailPlan {
+    outer_len: usize,
+    packed_block_len: usize,
+    /// One row per packed offset. Each row concatenates the twiddles for the
+    /// remaining stages and therefore contains exactly `outer_len - 1` values.
+    twiddles: Vec<WideGoldilocksField>,
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+static BAILEY_TAIL_PLAN_17: OnceLock<BaileyTailPlan> = OnceLock::new();
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+static BAILEY_TAIL_PLAN_19: OnceLock<BaileyTailPlan> = OnceLock::new();
+
+#[cfg(all(test, feature = "std", target_arch = "aarch64"))]
+std::thread_local! {
+    /// Test-only, thread-local instrumentation proves the production dispatch
+    /// itself ran; plan initialization is not a reliable signal under parallel tests.
+    static BAILEY_TAIL_DISPATCH_HITS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+std::thread_local! {
+    /// At most one transform buffer per Rayon worker: 1 MiB for lg17 and
+    /// 4 MiB for lg19. `clear` retains that bounded allocation between calls.
+    static BAILEY_TAIL_SCRATCH: RefCell<Vec<WideGoldilocksField>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+fn bailey_tail_plan_slot(lg_n: usize) -> Option<&'static OnceLock<BaileyTailPlan>> {
+    match lg_n {
+        17 => Some(&BAILEY_TAIL_PLAN_17),
+        19 => Some(&BAILEY_TAIL_PLAN_19),
+        _ => None,
+    }
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+fn build_bailey_tail_plan(
+    lg_n: usize,
+    start: usize,
+    root_table: &FftRootTable<GoldilocksField>,
+) -> BaileyTailPlan {
+    const WIDTH: usize = 4;
+    let block_len = 1usize << start;
+    let packed_block_len = block_len / WIDTH;
+    let outer_len = 1usize << (lg_n - start);
+    let mut twiddles = Vec::with_capacity(packed_block_len * (outer_len - 1));
+
+    // Row-major twiddles avoid striding through the multi-megabyte root table
+    // while a transposed row is hot. At relative stage `s`, outer index `j`
+    // corresponds to original scalar offset `j * block_len + offset`.
+    for packed_offset in 0..packed_block_len {
+        for stage in start..lg_n {
+            let half_outer = 1usize << (stage - start);
+            let packed_roots = WideGoldilocksField::pack_slice(&root_table[stage]);
+            for j in 0..half_outer {
+                twiddles.push(packed_roots[j * packed_block_len + packed_offset]);
+            }
+        }
+    }
+
+    BaileyTailPlan {
+        outer_len,
+        packed_block_len,
+        twiddles,
+    }
+}
+
+/// Compare every twiddle used by the cached plan with the caller's table.
+/// `fft_*_with_options` accepts caller-owned tables, so checking only each
+/// row's generator would let a custom first call poison later process-wide
+/// plans. The exact comparison keeps all custom tables correct via fallback.
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+fn bailey_tail_plan_matches_root_table(
+    lg_n: usize,
+    start: usize,
+    root_table: &FftRootTable<GoldilocksField>,
+    plan: &BaileyTailPlan,
+) -> bool {
+    if root_table.len() != lg_n {
+        return false;
+    }
+
+    let mut cursor = 0;
+    for packed_offset in 0..plan.packed_block_len {
+        for stage in start..lg_n {
+            if root_table[stage].len() != 1usize << stage {
+                return false;
+            }
+            let half_outer = 1usize << (stage - start);
+            let packed_roots = WideGoldilocksField::pack_slice(&root_table[stage]);
+            for j in 0..half_outer {
+                if plan.twiddles[cursor]
+                    != packed_roots[j * plan.packed_block_len + packed_offset]
+                {
+                    return false;
+                }
+                cursor += 1;
+            }
+        }
+    }
+    cursor == plan.twiddles.len()
+}
+
+/// The f782 stage-major tail performs butterfly reductions with the explicit
+/// two-lane NEON helpers. Keep that exact fast path after multiplying two lane
+/// pairs at once through `WideGoldilocksField`; generic Wide Add/Sub would
+/// regress to four scalar reductions and their rare-overflow branches.
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+#[inline(always)]
+fn bailey_wide_add_sub_neon(
+    u: WideGoldilocksField,
+    t: WideGoldilocksField,
+) -> (WideGoldilocksField, WideGoldilocksField) {
+    use core::arch::aarch64::*;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    let mut sum = u;
+    let mut difference = u;
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        let u_ptr = u.as_slice().as_ptr().cast::<u64>();
+        let t_ptr = t.as_slice().as_ptr().cast::<u64>();
+        let sum_ptr = sum.as_slice_mut().as_mut_ptr().cast::<u64>();
+        let difference_ptr = difference.as_slice_mut().as_mut_ptr().cast::<u64>();
+
+        let u01 = vld1q_u64(u_ptr);
+        let t01 = vld1q_u64(t_ptr);
+        vst1q_u64(sum_ptr, gl_add_neon(u01, t01, eps));
+        vst1q_u64(difference_ptr, gl_sub_neon(u01, t01, eps));
+
+        let u23 = vld1q_u64(u_ptr.add(2));
+        let t23 = vld1q_u64(t_ptr.add(2));
+        vst1q_u64(sum_ptr.add(2), gl_add_neon(u23, t23, eps));
+        vst1q_u64(
+            difference_ptr.add(2),
+            gl_sub_neon(u23, t23, eps),
+        );
+    }
+    (sum, difference)
+}
+
+/// Complete the production Goldilocks FFT tail through a Bailey/four-step
+/// matrix transpose. This changes traversal only: each row executes the same
+/// DIT stages, twiddles, multiply and add/sub order as the stage-major driver.
+///
+/// Returns `false` without touching `values` when any production invariant is
+/// absent, allowing the caller to use the existing generic path.
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+#[inline(never)]
+fn fft_tail_transposed_goldilocks(
+    values: &mut [GoldilocksField],
+    start: usize,
+    lg_n: usize,
+    root_table: &FftRootTable<GoldilocksField>,
+) -> bool {
+    const START: usize = 13;
+    const OUTER_TILE: usize = 8;
+    const OFFSET_TILE: usize = 32;
+
+    if start != START || values.len() != 1usize << lg_n {
+        return false;
+    }
+    let Some(slot) = bailey_tail_plan_slot(lg_n) else {
+        return false;
+    };
+
+    // Build only from a fresh canonical table; caller-owned contents can never
+    // seed either process-wide slot. Exact eligibility is checked afterwards.
+    let plan = slot.get_or_init(|| {
+        let canonical_table = fft_root_table::<GoldilocksField>(1usize << lg_n);
+        build_bailey_tail_plan(lg_n, start, &canonical_table)
+    });
+    if !bailey_tail_plan_matches_root_table(lg_n, start, root_table, plan) {
+        return false;
+    }
+    let packed_values = WideGoldilocksField::pack_slice_mut(values);
+    debug_assert_eq!(packed_values.len(), plan.outer_len * plan.packed_block_len);
+
+    BAILEY_TAIL_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let packed_len = packed_values.len();
+        scratch.clear();
+        if scratch.capacity() < packed_len {
+            // `reserve_exact` is relative to length, which is zero after clear.
+            scratch.reserve_exact(packed_len);
+        }
+
+        // Q x P -> P x Q, where Q is 16 or 64 and P is 2048. Write every
+        // spare slot exactly once before publishing the vector length.
+        {
+            let spare = &mut scratch.spare_capacity_mut()[..packed_len];
+            for q0 in (0..plan.outer_len).step_by(OUTER_TILE) {
+                let q_end = min(q0 + OUTER_TILE, plan.outer_len);
+                for p0 in (0..plan.packed_block_len).step_by(OFFSET_TILE) {
+                    let p_end = min(p0 + OFFSET_TILE, plan.packed_block_len);
+                    for q in q0..q_end {
+                        for p in p0..p_end {
+                            spare[p * plan.outer_len + q]
+                                .write(packed_values[q * plan.packed_block_len + p]);
+                        }
+                    }
+                }
+            }
+        }
+        // SAFETY: the tiled loops cover the exact Cartesian product
+        // `0..packed_block_len x 0..outer_len`, so all `packed_len` slots were
+        // initialized above and `WideGoldilocksField` needs no drop glue.
+        unsafe { scratch.set_len(packed_len) };
+
+        let twiddles_per_row = plan.outer_len - 1;
+        for (row, row_twiddles) in scratch
+            .chunks_exact_mut(plan.outer_len)
+            .zip(plan.twiddles.chunks_exact(twiddles_per_row))
+        {
+            let mut twiddle_start = 0;
+            for relative_stage in 0..(lg_n - start) {
+                let half = 1usize << relative_stage;
+                let stage_twiddles = &row_twiddles[twiddle_start..twiddle_start + half];
+                for block in row.chunks_exact_mut(half * 2) {
+                    let (lows, highs) = block.split_at_mut(half);
+                    for ((u, v), &omega) in
+                        lows.iter_mut().zip(highs.iter_mut()).zip(stage_twiddles)
+                    {
+                        let t = BaseSubfieldTwiddle::mul(omega, *v);
+                        let u_value = *u;
+                        (*u, *v) = bailey_wide_add_sub_neon(u_value, t);
+                    }
+                }
+                twiddle_start += half;
+            }
+            debug_assert_eq!(twiddle_start, twiddles_per_row);
+        }
+
+        // P x Q -> Q x P. The same tile bounds keep both sides' active lines
+        // within L1 while writing the final packed buffer contiguously.
+        for q0 in (0..plan.outer_len).step_by(OUTER_TILE) {
+            let q_end = min(q0 + OUTER_TILE, plan.outer_len);
+            for p0 in (0..plan.packed_block_len).step_by(OFFSET_TILE) {
+                let p_end = min(p0 + OFFSET_TILE, plan.packed_block_len);
+                for q in q0..q_end {
+                    for p in p0..p_end {
+                        packed_values[q * plan.packed_block_len + p] =
+                            scratch[p * plan.outer_len + q];
+                    }
+                }
+            }
+        }
+        scratch.clear();
+    });
+    true
+}
+
 /// FFT implementation based on Section 32.3 of "Introduction to
 /// Algorithms" by Cormen et al.
 ///
@@ -1001,6 +1268,35 @@ where
     } else {
         prepare_zero_padded_fft::<F, M>(values, r, lg_n, lg_packed_width, root_table)
     };
+
+    // The prover's two large base-field LDE shapes reach this point after the
+    // exact same rate-8/cache-block prefix. Keep the dispatch deliberately
+    // narrow; every other field, size, padding rate and table remains on the
+    // established stage-major implementation.
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    if r == 3
+        && first_layer == 13
+        && matches!(lg_n, 17 | 19)
+        && core::any::TypeId::of::<F>() == core::any::TypeId::of::<GoldilocksField>()
+    {
+        // SAFETY: exact `TypeId` identity proves both the scalar slice and all
+        // nested root-table element vectors have `GoldilocksField` layout.
+        let gold_values = unsafe {
+            core::slice::from_raw_parts_mut(
+                values.as_mut_ptr().cast::<GoldilocksField>(),
+                values.len(),
+            )
+        };
+        let gold_root_table = unsafe {
+            &*(root_table as *const FftRootTable<F>
+                as *const FftRootTable<GoldilocksField>)
+        };
+        if fft_tail_transposed_goldilocks(gold_values, first_layer, lg_n, gold_root_table) {
+            #[cfg(test)]
+            BAILEY_TAIL_DISPATCH_HITS.with(|hits| hits.set(hits.get() + 1));
+            return;
+        }
+    }
 
     if lg_n <= lg_packed_width {
         // Need the slice to be at least the width of two packed vectors for the vectorized version
@@ -2506,6 +2802,131 @@ mod tests {
 
     fn deterministic_values(n: usize) -> Vec<GoldilocksField> {
         (0..n).map(deterministic_value).collect()
+    }
+
+    /// The transposed Bailey tail is only a change of traversal. It must run
+    /// every production tail butterfly with the same twiddle and arithmetic
+    /// order as the stage-major driver, including non-canonical raw words.
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    #[test]
+    fn bailey_tail_matches_stage_major_raw_words() {
+        use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
+        use crate::fft::{fft_classic_simd_layers, fft_tail_transposed_goldilocks};
+
+        const START: usize = 13;
+        for lg_n in [17usize, 19] {
+            let n = 1 << lg_n;
+            let roots = fft_root_table::<GoldilocksField>(n);
+            let mut expected = (0..n)
+                .map(|i| {
+                    GoldilocksField(match i & 3 {
+                        0 => deterministic_value(i).0,
+                        1 => 0xffff_ffff_0000_0001u64.wrapping_add(i as u64),
+                        2 => u64::MAX.wrapping_sub(i as u64 % 97),
+                        _ => (i as u64).wrapping_mul(0xdead_beef) | (1 << 63),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut actual = expected.clone();
+
+            fft_classic_simd_layers::<WideGoldilocksField, BaseSubfieldTwiddle>(
+                WideGoldilocksField::pack_slice_mut(&mut expected),
+                START,
+                lg_n,
+                &roots,
+            );
+            assert!(fft_tail_transposed_goldilocks(
+                &mut actual,
+                START,
+                lg_n,
+                &roots,
+            ));
+            for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(a.0, e.0, "raw tail mismatch at 2^{lg_n}, index {i}");
+            }
+        }
+    }
+
+    /// A caller-provided table must never seed or consume a process-wide plan
+    /// whose later powers differ, even when every row generator is unchanged.
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    #[test]
+    fn bailey_tail_rejects_noncanonical_later_twiddle_without_mutation() {
+        use crate::fft::fft_tail_transposed_goldilocks;
+
+        const LG_N: usize = 17;
+        const START: usize = 13;
+        let mut roots = fft_root_table::<GoldilocksField>(1 << LG_N);
+        roots[LG_N - 1][2] += GoldilocksField::ONE;
+        let mut actual = deterministic_values(1 << LG_N);
+        let expected = actual.clone();
+
+        assert!(!fft_tail_transposed_goldilocks(
+            &mut actual,
+            START,
+            LG_N,
+            &roots,
+        ));
+        for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(a.0, e.0, "fallback mutated input at index {i}");
+        }
+    }
+
+    /// The narrow rate-8 dispatch must actually select the Bailey tail after
+    /// the established zero-padding/cache-block prefix, and its complete
+    /// output must remain raw-word identical to that prefix plus the old tail.
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    #[test]
+    fn bailey_rate8_dispatch_matches_stage_major_raw_words() {
+        use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
+        use crate::fft::{
+            BAILEY_TAIL_DISPATCH_HITS, fft_classic, fft_classic_simd_layers,
+            prepare_zero_padded_fft,
+        };
+
+        const RATE_BITS: usize = 3;
+        const START: usize = 13;
+        for lg_n in [17usize, 19] {
+            let n = 1usize << lg_n;
+            let roots = fft_root_table::<GoldilocksField>(n);
+            let mut expected = vec![GoldilocksField::ZERO; n];
+            for (i, value) in expected[..n >> RATE_BITS].iter_mut().enumerate() {
+                *value = GoldilocksField(match i & 3 {
+                    0 => deterministic_value(i).0,
+                    1 => 0xffff_ffff_0000_0001u64.wrapping_add(i as u64),
+                    2 => u64::MAX.wrapping_sub(i as u64 % 97),
+                    _ => (i as u64).wrapping_mul(0xdead_beef) | (1 << 63),
+                });
+            }
+            let mut actual = expected.clone();
+            let hits_before = BAILEY_TAIL_DISPATCH_HITS.with(core::cell::Cell::get);
+
+            let first_layer = prepare_zero_padded_fft::<GoldilocksField, BaseSubfieldTwiddle>(
+                &mut expected,
+                RATE_BITS,
+                lg_n,
+                2,
+                &roots,
+            );
+            assert_eq!(first_layer, START);
+            fft_classic_simd_layers::<WideGoldilocksField, BaseSubfieldTwiddle>(
+                WideGoldilocksField::pack_slice_mut(&mut expected),
+                first_layer,
+                lg_n,
+                &roots,
+            );
+            fft_classic(&mut actual, RATE_BITS, &roots);
+
+            let hits_after = BAILEY_TAIL_DISPATCH_HITS.with(core::cell::Cell::get);
+            assert_eq!(
+                hits_after,
+                hits_before + 1,
+                "Bailey rate-8 dispatch not selected at 2^{lg_n}"
+            );
+            for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(a.0, e.0, "raw rate-8 mismatch at 2^{lg_n}, index {i}");
+            }
+        }
     }
 
     fn ifft_reference(
