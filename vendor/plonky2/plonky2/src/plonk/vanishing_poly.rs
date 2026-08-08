@@ -252,11 +252,25 @@ fn reduce_gate_constraints_base_batch<F: Field>(
         }
     }
 
-    for constraint_row in rows {
-        for (point, &term) in constraint_row.iter().enumerate() {
-            let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
-            for (value, &alpha) in result.iter_mut().zip(alphas) {
-                *value = term.multiply_accumulate(*value, alpha);
+    if let [alpha_0, alpha_1] = alphas {
+        // Ranked circuits have exactly two challenges. Keep this innermost
+        // quotient loop fixed-width so it does not rebuild dynamic slices and
+        // zip iterators for every (constraint, point) pair.
+        for constraint_row in rows {
+            for (point, &term) in constraint_row.iter().enumerate() {
+                let offset = point * 2;
+                res_out[offset] = term.multiply_accumulate(res_out[offset], *alpha_0);
+                res_out[offset + 1] =
+                    term.multiply_accumulate(res_out[offset + 1], *alpha_1);
+            }
+        }
+    } else {
+        for constraint_row in rows {
+            for (point, &term) in constraint_row.iter().enumerate() {
+                let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
+                for (value, &alpha) in result.iter_mut().zip(alphas) {
+                    *value = term.multiply_accumulate(*value, alpha);
+                }
             }
         }
     }
@@ -531,12 +545,28 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         }
 
         // Same reversed-order Horner reduction as the per-point loop.
-        for t in (0..num_rows).rev() {
-            let row = &term_rows[t * n..][..n];
-            for k in 0..n {
-                let res = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
-                for (c, &alpha) in res.iter_mut().zip(alphas) {
-                    *c = row[k].multiply_accumulate(*c, alpha);
+        if let [alpha_0, alpha_1] = alphas {
+            debug_assert_eq!(num_challenges, 2);
+            for t in (0..num_rows).rev() {
+                let row = &term_rows[t * n..][..n];
+                for k in 0..n {
+                    let offset = k * 2;
+                    let term = row[k];
+                    res_out[offset] =
+                        term.multiply_accumulate(res_out[offset], *alpha_0);
+                    res_out[offset + 1] =
+                        term.multiply_accumulate(res_out[offset + 1], *alpha_1);
+                }
+            }
+        } else {
+            for t in (0..num_rows).rev() {
+                let row = &term_rows[t * n..][..n];
+                for k in 0..n {
+                    let res =
+                        &mut res_out[k * num_challenges..(k + 1) * num_challenges];
+                    for (c, &alpha) in res.iter_mut().zip(alphas) {
+                        *c = row[k].multiply_accumulate(*c, alpha);
+                    }
                 }
             }
         }
