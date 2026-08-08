@@ -103,43 +103,59 @@ fn main() {
             }
         },
     );
-    let pre_exec = circuit::block_pre_execution::BlockPreExec::from_block(&block);
-    let pre_handle = std::thread::Builder::new()
-        .name("pre-exec-startup".into())
-        .stack_size(PROVER_THREAD_STACK_BYTES)
-        .spawn(move || {
-            let (pre_target, mut pre_data) = pre_circuits;
-            let pre_proof = prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec);
-            // The pre-execution circuit is proven exactly once, here, and this
-            // is that proof's last instruction. Its rate-2^3 constants/sigmas
-            // low-degree extension — 2^17 rows x 86 columns = 86 MiB, held in a
-            // CPU-visible Metal shared buffer whose release returns the pages to
-            // the OS immediately — is read only by proofs *of this circuit*
-            // (`fill_lde_batch` for the quotient and the FRI query openings), so
-            // it is unreachable from here on. The only later uses of `pre_data`
-            // are as an input to the final block circuit's construction, which
-            // reads `common` and `verifier_only` only (`BlockCircuit::define` ->
-            // `handle_proofs`: `constant_verifier_data(&..verifier_only)` and
-            // `verify_proof(.., &..common)`), and
-            // `release_finished_circuit_extensions`, which assigns the same
-            // empty value again.
-            //
-            // Without this the buffer stays resident from the first second of
-            // the process until the pipeline joins, i.e. across the entire
-            // transaction/chain phase, which is where five concurrent workers
-            // contend for the machine's memory. Value-exact and free: no
-            // quantity is computed differently and no work is added — storage
-            // that no subsequent read can reach is returned earlier.
-            pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
-            (pre_target, pre_data, pre_proof)
-        })
-        .expect("pre-execution startup thread must start");
-    // The pre circuit is owned by the startup proof until it completes. Load
-    // only the other four blobs in the meantime: loading all five here would
-    // deserialize the same pre circuit twice on the scored critical path.
+    // The pre-execution witness is pure block-derived data (no circuit
+    // dependency), and the remaining four circuit blobs take ~5x longer to
+    // load than it takes to compute. Load the blobs on a scoped thread while
+    // the main thread derives the pre-execution witness, then start the pre
+    // proof the moment its witness exists — the pre proof runs underneath the
+    // tail of the blob loads instead of waiting for them to finish first.
+    // Value-exact: no quantity is computed differently, only in parallel.
+    let (pre_handle, remaining) = std::thread::scope(|scope| {
+        let remaining_handle = scope.spawn(|| {
+            (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1"))
+                .then(Circuits::load_remaining_embedded)
+        });
+        let pre_exec = circuit::block_pre_execution::BlockPreExec::from_block(&block);
+        let pre_handle = std::thread::Builder::new()
+            .name("pre-exec-startup".into())
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(move || {
+                let (pre_target, mut pre_data) = pre_circuits;
+                let pre_proof =
+                    prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec);
+                // The pre-execution circuit is proven exactly once, here, and this
+                // is that proof's last instruction. Its rate-2^3 constants/sigmas
+                // low-degree extension — 2^17 rows x 86 columns = 86 MiB, held in a
+                // CPU-visible Metal shared buffer whose release returns the pages to
+                // the OS immediately — is read only by proofs *of this circuit*
+                // (`fill_lde_batch` for the quotient and the FRI query openings), so
+                // it is unreachable from here on. The only later uses of `pre_data`
+                // are as an input to the final block circuit's construction, which
+                // reads `common` and `verifier_only` only (`BlockCircuit::define` ->
+                // `handle_proofs`: `constant_verifier_data(&..verifier_only)` and
+                // `verify_proof(.., &..common)`), and
+                // `release_finished_circuit_extensions`, which assigns the same
+                // empty value again.
+                //
+                // Without this the buffer stays resident from the first second of
+                // the process until the pipeline joins, i.e. across the entire
+                // transaction/chain phase, which is where five concurrent workers
+                // contend for the machine's memory. Value-exact and free: no
+                // quantity is computed differently and no work is added — storage
+                // that no subsequent read can reach is returned earlier.
+                pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+                (pre_target, pre_data, pre_proof)
+            })
+            .expect("pre-execution startup thread must start");
+        let remaining = remaining_handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (pre_handle, remaining)
+    });
+    // The pre circuit is owned by the startup proof until it completes; only
+    // the other four blobs are loaded above (loading all five here would
+    // deserialize the same pre circuit twice on the scored critical path).
     // Keep the forced-build mode's established behavior unchanged.
-    let remaining = (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1"))
-        .then(Circuits::load_remaining_embedded);
     let (pre_target, pre_data, pre_proof) = pre_handle
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));

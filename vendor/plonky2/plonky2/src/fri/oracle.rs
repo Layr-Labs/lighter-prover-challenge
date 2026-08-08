@@ -7,7 +7,9 @@ use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
 use crate::field::extension::Extendable;
-use crate::field::fft::{fft_in_place_with_options, FftRootTable};
+use crate::field::fft::{
+    FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
+};
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
@@ -458,7 +460,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         }
     }
 
-
     /// Copies consecutive LDE points into a PolyMajor output buffer.
     ///
     /// Column-backed commitments use one contiguous slice copy per column,
@@ -750,7 +751,12 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
     } else {
         scaled.resize(len, F::ZERO);
     }
-    PolynomialCoeffs::new(scaled).fft_with_options(zero_factor, root_table)
+    if crate::hash::poseidon2::is_exclusive_gpu_phase() {
+        fft_in_place_with_options_parallel(&mut scaled, zero_factor, root_table);
+    } else {
+        fft_in_place_with_options(&mut scaled, zero_factor, root_table);
+    }
+    PolynomialValues::new(scaled)
 }
 
 /// Folds one batch's quotient `(p(X) - p(z))/(X - z)` into the running FRI
