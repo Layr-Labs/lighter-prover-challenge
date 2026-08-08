@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
@@ -40,7 +41,7 @@ const LIGHT_TX_PROOF_WINDOW: usize = 2;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
-fn chunk_is_light(txs: &[Tx<F>]) -> bool {
+fn chunk_is_light(txs: &[Arc<Tx<F>>]) -> bool {
     txs.first()
         .expect("block transaction chunk must not be empty")
         .tx_circuit_type
@@ -198,7 +199,7 @@ fn jump_from_witness(witness: &impl Witness<F>, target: &JumpStateTarget) -> Jum
 fn generate_tx_witness<'a>(
     path: TxPath,
     chunk_index: usize,
-    txs: Vec<Tx<F>>,
+    txs: Vec<Arc<Tx<F>>>,
     tx_data: &'a CircuitData<F, C, D>,
     tx_target: &BlockTxTarget,
     created_at: i64,
@@ -253,7 +254,7 @@ fn prove_tx_witness(
 #[allow(clippy::too_many_arguments)]
 fn prove_path(
     path: TxPath,
-    chunks: Vec<(usize, Vec<Tx<F>>)>,
+    chunks: Vec<(usize, Vec<Arc<Tx<F>>>)>,
     circuits: &Circuits,
     block_number: u64,
     created_at: i64,
@@ -521,8 +522,9 @@ pub(crate) fn prove_block_after_pre(
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
     let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
-    let mut heavy_chunks: Vec<(usize, Vec<Tx<F>>)> = Vec::new();
-    let mut light_chunks: Vec<(usize, Vec<Tx<F>>)> = Vec::with_capacity(tx_chunks.len());
+    let mut heavy_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> = Vec::new();
+    let mut light_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> =
+        Vec::with_capacity(tx_chunks.len());
     for (chunk_index, txs) in tx_chunks.drain(..).enumerate() {
         if chunk_is_light(&txs) {
             light_chunks.push((chunk_index, txs));
@@ -714,6 +716,52 @@ mod tests {
     }
 
     #[test]
+    fn empty_padding_transactions_share_storage_per_path() {
+        use std::sync::Arc;
+
+        std::thread::Builder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(|| {
+                let block = Block::<F>::from_json_with_empty_txs(
+                    include_bytes!("../bench_test.json"),
+                    HEAVY_TX_PER_PROOF,
+                    LIGHT_TX_PER_PROOF,
+                    PUBLIC_HEAVY_TX_COUNT,
+                    PUBLIC_LIGHT_TX_COUNT,
+                )
+                .expect("public fixture must parse");
+                let heavy = block
+                    .tx_chunks
+                    .iter()
+                    .flatten()
+                    .find(|tx| tx.tx_circuit_type != TX_LIGHT)
+                    .expect("heavy padding must exist");
+                let light = block
+                    .tx_chunks
+                    .iter()
+                    .flatten()
+                    .find(|tx| tx.tx_circuit_type == TX_LIGHT)
+                    .expect("light padding must exist");
+                assert!(block
+                    .tx_chunks
+                    .iter()
+                    .flatten()
+                    .filter(|tx| tx.tx_circuit_type != TX_LIGHT)
+                    .all(|tx| Arc::ptr_eq(tx, heavy)));
+                assert!(block
+                    .tx_chunks
+                    .iter()
+                    .flatten()
+                    .filter(|tx| tx.tx_circuit_type == TX_LIGHT)
+                    .all(|tx| Arc::ptr_eq(tx, light)));
+                assert!(!Arc::ptr_eq(heavy, light));
+            })
+            .expect("padding sharing test thread must start")
+            .join()
+            .expect("padding sharing test thread must finish");
+    }
+
+    #[test]
     fn exclusive_gpu_phase_is_claimed_only_by_the_last_running_path() {
         // Two paths proving: the one that reaches its drain first (the three-chunk
         // heavy path) must not claim the process-global exclusive phase while the
@@ -782,12 +830,12 @@ mod tests {
         // An all-empty (padding) chunk carries no state transition, so its embedded roots and
         // metadata hash are the only values the tx and chain constraints must agree on.
         // Chain-step cost is independent of tx contents: the chain circuit is fixed-size.
-        let mut empty_tx = block
+        let mut empty_tx = (**block
             .tx_chunks
             .iter()
             .flatten()
             .find(|tx| tx.tx_type == TX_TYPE_EMPTY)
-            .expect("fixture must contain an empty padding tx")
+            .expect("fixture must contain an empty padding tx"))
             .clone();
         empty_tx.tx_circuit_type = TX_LIGHT;
         empty_tx.tx_index = F::NEG_ONE.to_canonical_u64();
@@ -809,7 +857,7 @@ mod tests {
         let state_metadata_hash = new_state_metadata.hash();
         let jump = JumpState::initial(new_state_root, old_delta_root);
 
-        let light_chunk = vec![empty_tx; LIGHT_TX_PER_PROOF];
+        let light_chunk = vec![Arc::new(empty_tx); LIGHT_TX_PER_PROOF];
         let (witness, _) = generate_tx_witness(
             TxPath::Light,
             0,

@@ -618,6 +618,13 @@ pub fn set_exclusive_gpu_phase(enabled: bool) {
     EXCLUSIVE_GPU_PHASE.store(enabled, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Returns whether the prover is currently in the process-global exclusive
+/// proving phase. Scheduling-only consumers may use this to borrow otherwise
+/// idle CPU workers without changing proof semantics.
+pub fn is_exclusive_gpu_phase() -> bool {
+    EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Number of Merkle builds currently occupying the serialized GPU stream
 /// (from buffer acquisition through `wait_until_completed`). Routing reads
 /// this to decide whether a small serial-path tree would enqueue behind
@@ -2655,64 +2662,70 @@ impl MetalShared {
                 LeafSource::Columns(_) | LeafSource::Shared(_) => &self.leaf_colmajor_pipeline,
             };
             let command_buffer = self.queue.new_command_buffer();
-            let leaf_encoder = command_buffer.new_compute_command_encoder();
-            leaf_encoder.set_compute_pipeline_state(leaf_pipeline);
-            leaf_encoder.set_buffer(0, Some(input_buffer), 0);
-            leaf_encoder.set_buffer(1, Some(output_buffer), 0);
-            leaf_encoder.set_buffer(2, Some(&self.parameters), 0);
-            leaf_encoder.set_bytes(
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(leaf_pipeline);
+            encoder.set_buffer(0, Some(input_buffer), 0);
+            encoder.set_buffer(1, Some(output_buffer), 0);
+            encoder.set_buffer(2, Some(&self.parameters), 0);
+            encoder.set_bytes(
                 3,
                 size_of::<u32>() as NSUInteger,
                 (&leaf_width_u32 as *const u32).cast::<c_void>(),
             );
-            leaf_encoder.set_bytes(
+            encoder.set_bytes(
                 4,
                 size_of::<u32>() as NSUInteger,
                 (&leaf_count_u32 as *const u32).cast::<c_void>(),
             );
             if matches!(&source, LeafSource::Columns(_) | LeafSource::Shared(_)) {
-                leaf_encoder.set_bytes(
+                encoder.set_bytes(
                     5,
                     size_of::<u32>() as NSUInteger,
                     (&log_leaf_count_u32 as *const u32).cast::<c_void>(),
                 );
             }
-            dispatch(leaf_encoder, leaf_pipeline, leaf_count);
-            leaf_encoder.end_encoding();
+            dispatch(encoder, leaf_pipeline, leaf_count);
 
             let mut level_offset = 0usize;
             let mut child_count = leaf_count;
             level_offsets.push(level_offset);
+            let output_resource: &metal::ResourceRef = output_buffer;
+            if child_count > cap_count {
+                encoder.set_compute_pipeline_state(&self.parent_pipeline);
+            }
             while child_count > cap_count {
+                // Every parent level reads the output written by the preceding
+                // dispatch. Keep the whole tree in one compute encoder while
+                // preserving the leaf-to-parent and parent-to-parent hazards.
+                encoder.memory_barrier_with_resources(&[output_resource]);
+
                 let parent_count = child_count / 2;
                 let child_offset = level_offset;
                 level_offset += child_count * 4;
                 level_offsets.push(level_offset);
 
                 let parent_count_u32 = parent_count as u32;
-                let parent_encoder = command_buffer.new_compute_command_encoder();
-                parent_encoder.set_compute_pipeline_state(&self.parent_pipeline);
-                parent_encoder.set_buffer(
+                encoder.set_buffer(
                     0,
                     Some(output_buffer),
                     (child_offset * size_of::<u64>()) as NSUInteger,
                 );
-                parent_encoder.set_buffer(
+                encoder.set_buffer(
                     1,
                     Some(output_buffer),
                     (level_offset * size_of::<u64>()) as NSUInteger,
                 );
-                parent_encoder.set_buffer(2, Some(&self.parameters), 0);
-                parent_encoder.set_bytes(
+                encoder.set_buffer(2, Some(&self.parameters), 0);
+                encoder.set_bytes(
                     3,
                     size_of::<u32>() as NSUInteger,
                     (&parent_count_u32 as *const u32).cast::<c_void>(),
                 );
-                dispatch(parent_encoder, &self.parent_pipeline, parent_count);
-                parent_encoder.end_encoding();
+                dispatch(encoder, &self.parent_pipeline, parent_count);
 
                 child_count = parent_count;
             }
+            encoder.end_encoding();
 
             command_buffer.commit();
             command_buffer.to_owned()
@@ -2777,7 +2790,7 @@ fn dispatch(
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(64)
+        .min(128)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
