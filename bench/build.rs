@@ -43,11 +43,15 @@ const BLOB_NAMES: [&str; 5] = [
     "light_tx.embed",
     "light_chain.embed",
 ];
+const METAL_PIPELINE_ARCHIVE: &str = "poseidon2-pipelines.metallib";
 
 fn write_blob(out_dir: &Path, name: &str, bytes: &[u8]) {
     let path = out_dir.join(name);
     std::fs::write(&path, bytes).unwrap_or_else(|error| {
-        panic!("cannot write embedded circuit blob {}: {error}", path.display())
+        panic!(
+            "cannot write embedded circuit blob {}: {error}",
+            path.display()
+        )
     });
     println!(
         "cargo:warning=embedded circuit blob {name}: {:.2} MiB",
@@ -72,15 +76,61 @@ fn build_path_blobs(tx_per_proof: usize, tx_mode: u8) -> (Vec<u8>, Vec<u8>) {
     (tx_blob, chain_blob)
 }
 
+fn write_empty_metal_archive(path: &Path) {
+    std::fs::write(path, []).unwrap_or_else(|error| {
+        panic!(
+            "cannot write Metal archive fallback {}: {error}",
+            path.display()
+        )
+    });
+}
+
+fn build_metal_pipeline_archive(out_dir: &Path) {
+    let path = out_dir.join(METAL_PIPELINE_ARCHIVE);
+    if std::env::var_os("LIGHTER_SKIP_METAL_ARCHIVE").is_some_and(|value| value == "1") {
+        write_empty_metal_archive(&path);
+        println!(
+            "cargo:warning=LIGHTER_SKIP_METAL_ARCHIVE=1: embedded Metal archive is an empty fallback stub"
+        );
+        return;
+    }
+
+    match plonky2::hash::poseidon2::serialize_pipeline_archive(&path) {
+        Ok(()) => {
+            let bytes = std::fs::metadata(&path)
+                .unwrap_or_else(|error| {
+                    panic!("cannot inspect Metal archive {}: {error}", path.display())
+                })
+                .len();
+            println!(
+                "cargo:warning=embedded build-host Metal archive: {:.2} MiB",
+                bytes as f64 / (1024.0 * 1024.0)
+            );
+        }
+        Err(error) => {
+            println!(
+                "cargo:warning=build-host Metal archive unavailable ({error}); workers will use current pipeline lowering"
+            );
+            write_empty_metal_archive(&path);
+        }
+    }
+}
+
 fn main() {
     // A dependency change (circuit/, vendor/plonky2/) rebuilds this script and
     // re-runs it regardless of these directives; bench's own sources do not
     // affect the blobs, so they are deliberately not tracked.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=LIGHTER_SKIP_EMBED");
+    println!("cargo:rerun-if-env-changed=LIGHTER_SKIP_METAL_ARCHIVE");
 
     let out_dir =
         PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR must be set for build scripts"));
+
+    // The ranked workflow stages only the executable. Generate the archive on
+    // its build host and embed the bytes instead of retaining an OUT_DIR path
+    // or assuming that fixture scratch directories survive between workers.
+    build_metal_pipeline_archive(&out_dir);
 
     if std::env::var_os("LIGHTER_SKIP_EMBED").is_some_and(|v| v == "1") {
         for name in BLOB_NAMES {
