@@ -42,6 +42,13 @@ fn load_blob<T: serde::de::DeserializeOwned>(
 }
 
 impl Circuits {
+    /// Loads only the pre-execution circuit blob. This is the fast path used
+    /// by the startup overlap: the pre-execution proof can start (and hide)
+    /// behind the remaining circuit loads.
+    pub fn load_pre() -> anyhow::Result<(BlockPreExecutionTarget, CircuitData<F, C, D>)> {
+        load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB)
+    }
+
     /// Reconstructs all five startup circuits from the blobs embedded at
     /// compile time. Value-identical to [`Circuits::new`] (oracle:
     /// `embedded_matches_rebuilt`); errors if the blobs are absent, corrupt,
