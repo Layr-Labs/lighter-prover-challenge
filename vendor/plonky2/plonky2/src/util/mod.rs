@@ -18,8 +18,16 @@ pub mod strided_view;
 pub mod timing;
 
 pub fn transpose_poly_values<F: Field>(polys: Vec<PolynomialValues<F>>) -> Vec<Vec<F>> {
-    let poly_values = polys.into_iter().map(|p| p.values).collect::<Vec<_>>();
-    transpose(&poly_values)
+    transpose_poly_values_ref(&polys)
+}
+
+/// Transposes polynomial values without consuming or cloning their column storage.
+pub fn transpose_poly_values_ref<F: Field>(polys: &[PolynomialValues<F>]) -> Vec<Vec<F>> {
+    let len = polys[0].len();
+    (0..len)
+        .into_par_iter()
+        .map(|i| polys.iter().map(|poly| poly.values[i]).collect())
+        .collect()
 }
 
 pub fn transpose<T: Send + Sync + Copy>(matrix: &[Vec<T>]) -> Vec<Vec<T>> {
@@ -100,7 +108,52 @@ mod tests {
     #[cfg(not(feature = "std"))]
     use alloc::vec;
 
+    use crate::field::goldilocks_field::GoldilocksField;
+
     use super::*;
+
+    #[test]
+    fn test_transpose_poly_values_ref_matches_expected() {
+        let columns = vec![
+            PolynomialValues::new(vec![
+                GoldilocksField::from_canonical_u64(1),
+                GoldilocksField::from_canonical_u64(2),
+                GoldilocksField::from_canonical_u64(3),
+                GoldilocksField::from_canonical_u64(4),
+            ]),
+            PolynomialValues::new(vec![
+                GoldilocksField::from_canonical_u64(5),
+                GoldilocksField::from_canonical_u64(6),
+                GoldilocksField::from_canonical_u64(7),
+                GoldilocksField::from_canonical_u64(8),
+            ]),
+        ];
+
+        let transposed = transpose_poly_values_ref(&columns);
+
+        assert_eq!(
+            transposed,
+            vec![
+                vec![
+                    GoldilocksField::from_canonical_u64(1),
+                    GoldilocksField::from_canonical_u64(5),
+                ],
+                vec![
+                    GoldilocksField::from_canonical_u64(2),
+                    GoldilocksField::from_canonical_u64(6),
+                ],
+                vec![
+                    GoldilocksField::from_canonical_u64(3),
+                    GoldilocksField::from_canonical_u64(7),
+                ],
+                vec![
+                    GoldilocksField::from_canonical_u64(4),
+                    GoldilocksField::from_canonical_u64(8),
+                ],
+            ]
+        );
+        assert_eq!(columns[0].values[0], GoldilocksField::ONE);
+    }
 
     #[test]
     fn test_reverse_bits() {
