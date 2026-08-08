@@ -522,6 +522,15 @@ fn reduce128(x: u128) -> GoldilocksField {
     GoldilocksField(t2)
 }
 
+/// Multiply by the canonical primitive fourth root `2^48` without issuing a
+/// variable 64-by-64 multiplication. This is the fixed-root term in the
+/// Goldilocks split-radix FFT.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn mul_fourth_root(value: GoldilocksField) -> GoldilocksField {
+    reduce128((value.0 as u128) << 48)
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub(crate) fn mul_16th_root_powers(value: GoldilocksField) -> [GoldilocksField; 8] {

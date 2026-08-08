@@ -7,7 +7,7 @@ use unroll::unroll_for_loops;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
 #[cfg(target_arch = "aarch64")]
-use crate::goldilocks_field::mul_16th_root_powers;
+use crate::goldilocks_field::{mul_16th_root_powers, mul_fourth_root};
 
 use crate::packable::Packable;
 use crate::packed::PackedField;
@@ -438,6 +438,7 @@ fn fft_classic_simd_single_layer_neon(
     omega_row: &[crate::goldilocks_field::GoldilocksField],
 ) {
     use core::arch::aarch64::*;
+
     use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
 
     const EPSILON: u64 = (1 << 32) - 1;
@@ -980,6 +981,270 @@ where
     }
 }
 
+// Split-radix is used only above this cache-resident base. Each leaf keeps the
+// established radix-2/NEON kernel; the split recursion removes general
+// twiddle products from the expensive upper levels without allocating or
+// deinterleaving a field-sized temporary buffer.
+#[cfg(target_arch = "aarch64")]
+const SPLIT_RADIX_BASE_LOG: usize = 10;
+
+/// One decimation-in-frequency split-radix combine. Natural-order input is
+/// transformed in place into three contiguous child problems: the even
+/// frequencies (N/2), frequencies 1 mod 4 (N/4), and frequencies 3 mod 4
+/// (N/4). Two independent `j` values share each paired Goldilocks multiply.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn split_radix_dif_combine_neon(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    live_len: usize,
+    root_table: &FftRootTable<crate::goldilocks_field::GoldilocksField>,
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    let n = values.len();
+    let lg_n = log2_strict(n);
+    let quarter = n >> 2;
+    debug_assert!(lg_n > SPLIT_RADIX_BASE_LOG);
+    debug_assert_eq!(quarter & 1, 0);
+    debug_assert!(live_len <= n && live_len & 1 == 0);
+    let roots = &root_table[lg_n - 1];
+    let half = n >> 1;
+    let base = values.as_mut_ptr().cast::<u64>();
+
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        let mut j = 0;
+        let active = live_len.min(quarter);
+        while j < active {
+            let a = vld1q_u64(base.add(j));
+            let zero = vdupq_n_u64(0);
+            let b = if quarter + j < live_len {
+                vld1q_u64(base.add(quarter + j))
+            } else {
+                zero
+            };
+            let c = if 2 * quarter + j < live_len {
+                vld1q_u64(base.add(2 * quarter + j))
+            } else {
+                zero
+            };
+            let d = if 3 * quarter + j < live_len {
+                vld1q_u64(base.add(3 * quarter + j))
+            } else {
+                zero
+            };
+
+            let a_minus_c = gl_sub_neon(a, c, eps);
+            let b_minus_d = gl_sub_neon(b, d, eps);
+            vst1q_u64(base.add(j), gl_add_neon(a, c, eps));
+            vst1q_u64(base.add(quarter + j), gl_add_neon(b, d, eps));
+
+            let i_times_b_minus_d = vcombine_u64(
+                vcreate_u64(
+                    mul_fourth_root(crate::goldilocks_field::GoldilocksField(vgetq_lane_u64(
+                        b_minus_d, 0,
+                    )))
+                    .0,
+                ),
+                vcreate_u64(
+                    mul_fourth_root(crate::goldilocks_field::GoldilocksField(vgetq_lane_u64(
+                        b_minus_d, 1,
+                    )))
+                    .0,
+                ),
+            );
+            let odd_1 = gl_add_neon(a_minus_c, i_times_b_minus_d, eps);
+            let odd_3 = gl_sub_neon(a_minus_c, i_times_b_minus_d, eps);
+
+            let root_3 = |index: usize| {
+                let exponent = 3 * index;
+                if exponent < half {
+                    *roots.get_unchecked(exponent)
+                } else {
+                    -*roots.get_unchecked(exponent - half)
+                }
+            };
+            let w_1 = NeonGoldilocksField([*roots.get_unchecked(j), *roots.get_unchecked(j + 1)]);
+            let w_3 = NeonGoldilocksField([root_3(j), root_3(j + 1)]);
+            let odd_1 = w_1
+                * NeonGoldilocksField([
+                    crate::goldilocks_field::GoldilocksField(vgetq_lane_u64(odd_1, 0)),
+                    crate::goldilocks_field::GoldilocksField(vgetq_lane_u64(odd_1, 1)),
+                ]);
+            let odd_3 = w_3
+                * NeonGoldilocksField([
+                    crate::goldilocks_field::GoldilocksField(vgetq_lane_u64(odd_3, 0)),
+                    crate::goldilocks_field::GoldilocksField(vgetq_lane_u64(odd_3, 1)),
+                ]);
+
+            *values.get_unchecked_mut(2 * quarter + j) = odd_1.0[0];
+            *values.get_unchecked_mut(2 * quarter + j + 1) = odd_1.0[1];
+            *values.get_unchecked_mut(3 * quarter + j) = odd_3.0[0];
+            *values.get_unchecked_mut(3 * quarter + j + 1) = odd_3.0[1];
+            j += 2;
+        }
+    }
+
+    // Every unread sparse-tail word is initialized here before a child may
+    // inspect it. This preserves the existing zero-tail caller's set_len
+    // invariant: no uninitialized coefficient is ever read.
+    if live_len < quarter {
+        use crate::types::Field;
+        let zero = crate::goldilocks_field::GoldilocksField::ZERO;
+        values[live_len..quarter].fill(zero);
+        values[quarter + live_len..2 * quarter].fill(zero);
+        values[2 * quarter + live_len..3 * quarter].fill(zero);
+        values[3 * quarter + live_len..4 * quarter].fill(zero);
+    }
+}
+
+/// Recursive cache-aware split-radix DIF. The three child slices are disjoint,
+/// and cache-base leaves use the existing bit-reversed DIT/NEON implementation
+/// rather than a scalar or temporary-buffer fallback.
+#[cfg(target_arch = "aarch64")]
+fn split_radix_dif_recursive(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    live_len: usize,
+    root_table: &FftRootTable<crate::goldilocks_field::GoldilocksField>,
+) {
+    let lg_n = log2_strict(values.len());
+    if lg_n <= SPLIT_RADIX_BASE_LOG {
+        if live_len < values.len() {
+            use crate::types::Field;
+            values[live_len..].fill(crate::goldilocks_field::GoldilocksField::ZERO);
+        }
+        reverse_index_bits_in_place(values);
+        fft_classic_simd_with::<WideGoldilocksField, BaseSubfieldTwiddle>(
+            values, 0, lg_n, root_table,
+        );
+        return;
+    }
+
+    split_radix_dif_combine_neon(values, live_len, root_table);
+    let half = values.len() >> 1;
+    let quarter = values.len() >> 2;
+    let (even, odd) = values.split_at_mut(half);
+    let (odd_1, odd_3) = odd.split_at_mut(quarter);
+    split_radix_dif_recursive(even, live_len.min(half), root_table);
+    let odd_live = live_len.min(quarter);
+    split_radix_dif_recursive(odd_1, odd_live, root_table);
+    split_radix_dif_recursive(odd_3, odd_live, root_table);
+}
+
+/// Map one position in the recursive `[even, odd-1, odd-3]` layout to its
+/// natural frequency index. Cache-base leaves already return natural order.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn split_radix_natural_index(position: usize, lg_n: usize) -> usize {
+    if lg_n <= SPLIT_RADIX_BASE_LOG {
+        return position;
+    }
+    let half = 1usize << (lg_n - 1);
+    let quarter = half >> 1;
+    if position < half {
+        2 * split_radix_natural_index(position, lg_n - 1)
+    } else if position < half + quarter {
+        4 * split_radix_natural_index(position - half, lg_n - 2) + 1
+    } else {
+        4 * split_radix_natural_index(position - half - quarter, lg_n - 2) + 3
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "std"))]
+mod split_radix_permutation_cache {
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    pub(super) struct Plan {
+        pub(super) destinations: Vec<usize>,
+        pub(super) leaders: Vec<usize>,
+    }
+
+    static CACHE: OnceLock<Mutex<HashMap<usize, Arc<Plan>>>> = OnceLock::new();
+
+    pub(super) fn get(lg_n: usize) -> Arc<Plan> {
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(plan) = cache.get(&lg_n) {
+            return Arc::clone(plan);
+        }
+
+        let n = 1usize << lg_n;
+        let destinations = (0..n)
+            .map(|index| super::split_radix_natural_index(index, lg_n))
+            .collect::<Vec<_>>();
+        let mut seen = alloc::vec![false; n];
+        let mut leaders = Vec::new();
+        for start in 0..n {
+            if seen[start] {
+                continue;
+            }
+            let mut current = start;
+            loop {
+                seen[current] = true;
+                current = destinations[current];
+                if current == start {
+                    break;
+                }
+            }
+            if destinations[start] != start {
+                leaders.push(start);
+            }
+        }
+        debug_assert!(seen.into_iter().all(|bit| bit));
+        let plan = Arc::new(Plan {
+            destinations,
+            leaders,
+        });
+        cache.insert(lg_n, Arc::clone(&plan));
+        plan
+    }
+}
+
+/// Apply the one required layout pass in place. This replaces the production
+/// FFT's initial global bit-reversal. Cycle metadata is built once per size and
+/// cached; each transform uses only one field element of scratch rather than an
+/// N-element field deinterleave buffer.
+#[cfg(all(target_arch = "aarch64", feature = "std"))]
+fn split_radix_to_natural_order(values: &mut [crate::goldilocks_field::GoldilocksField]) {
+    let lg_n = log2_strict(values.len());
+    let plan = split_radix_permutation_cache::get(lg_n);
+    for &start in &plan.leaders {
+        let mut current = start;
+        let mut carry = values[start];
+        loop {
+            let next = plan.destinations[current];
+            core::mem::swap(&mut carry, &mut values[next]);
+            current = next;
+            if current == start {
+                break;
+            }
+        }
+    }
+}
+
+/// AArch64 Goldilocks split-radix prototype. It preserves the transform and
+/// verifier-visible values while reducing upper-level general twiddle products
+/// according to `M(N)=M(N/2)+2M(N/4)+N/2`.
+#[cfg(all(target_arch = "aarch64", feature = "std"))]
+pub(crate) fn fft_split_radix_goldilocks(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    zero_factor: usize,
+    root_table: &FftRootTable<crate::goldilocks_field::GoldilocksField>,
+) {
+    let lg_n = log2_strict(values.len());
+    assert_eq!(root_table.len(), lg_n);
+    assert!(zero_factor <= lg_n);
+    split_radix_dif_recursive(values, values.len() >> zero_factor, root_table);
+    split_radix_to_natural_order(values);
+}
+
 /// FFT implementation based on Section 32.3 of "Introduction to
 /// Algorithms" by Cormen et al.
 ///
@@ -994,6 +1259,29 @@ where
 {
     let n = values.len();
     let lg_n = log2_strict(n);
+
+    #[cfg(all(target_arch = "aarch64", feature = "std"))]
+    if lg_n >= 14
+        && (r == 0 || r == 3)
+        && core::any::TypeId::of::<F>()
+            == core::any::TypeId::of::<crate::goldilocks_field::GoldilocksField>()
+    {
+        let values = unsafe {
+            core::slice::from_raw_parts_mut(
+                values
+                    .as_mut_ptr()
+                    .cast::<crate::goldilocks_field::GoldilocksField>(),
+                values.len(),
+            )
+        };
+        let root_table = unsafe {
+            &*(root_table as *const FftRootTable<F>
+                as *const FftRootTable<crate::goldilocks_field::GoldilocksField>)
+        };
+        fft_split_radix_goldilocks(values, r, root_table);
+        return;
+    }
+
     let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
     let first_layer = if r == 0 {
         reverse_index_bits_in_place(values);
@@ -2540,6 +2828,66 @@ mod tests {
             fft_classic_reference(&mut expected, 0, &roots);
             fft_classic(&mut actual, 0, &roots);
             assert_eq!(actual, expected, "FFT mismatch at 2^{lg_n}");
+        }
+    }
+
+    /// The split-radix prototype consumes natural-order coefficients and
+    /// returns the same natural-order evaluations as the production radix-2
+    /// transform.  Compare canonical values because split-radix deliberately
+    /// reassociates the exact field arithmetic.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn split_radix_goldilocks_matches_production_fft() {
+        use crate::types::PrimeField64;
+
+        type F = GoldilocksField;
+
+        for lg_n in [4usize, 5, 8, 11, 13, 14, 16] {
+            let n = 1 << lg_n;
+            let roots = fft_root_table::<F>(n);
+            let mut expected = deterministic_values(n);
+            let mut actual = expected.clone();
+
+            fft_classic_reference(&mut expected, 0, &roots);
+            super::fft_split_radix_goldilocks(&mut actual, 0, &roots);
+
+            for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    actual.to_canonical_u64(),
+                    expected.to_canonical_u64(),
+                    "split-radix mismatch at 2^{lg_n}, index {index}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn split_radix_goldilocks_matches_rate_8_zero_tail() {
+        use crate::types::PrimeField64;
+
+        type F = GoldilocksField;
+        let r = 3;
+        for lg_n in [14usize, 17, 19] {
+            let n = 1 << lg_n;
+            let live = n >> r;
+            let roots = fft_root_table::<F>(n);
+            let mut expected = deterministic_values(live)
+                .into_iter()
+                .chain(core::iter::repeat_n(F::ZERO, n - live))
+                .collect::<Vec<_>>();
+            let mut actual = expected.clone();
+
+            fft_classic_reference(&mut expected, r, &roots);
+            super::fft_split_radix_goldilocks(&mut actual, r, &roots);
+
+            for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    actual.to_canonical_u64(),
+                    expected.to_canonical_u64(),
+                    "rate-8 split-radix mismatch at 2^{lg_n}, index {index}"
+                );
+            }
         }
     }
 
