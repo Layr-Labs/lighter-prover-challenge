@@ -132,10 +132,16 @@ fn run_generator_worklist<
 
     let parallel_rounds = parallel_rounds_enabled();
     let mut buffer = GeneratedValues::empty();
+    let mut next_pending_generator_indices = Vec::with_capacity(pending_generator_indices.len());
+    #[allow(clippy::type_complexity)]
+    let mut round_outputs: Vec<(
+        Vec<(usize, bool, usize)>,
+        Vec<(Target, F, Option<&[usize]>)>,
+    )> = Vec::new();
 
     // Keep running generators until we fail to make progress.
     while !pending_generator_indices.is_empty() {
-        let mut next_pending_generator_indices = Vec::new();
+        next_pending_generator_indices.clear();
 
         if parallel_rounds && pending_generator_indices.len() >= parallel_threshold {
             // A generator can be enqueued once per newly populated watch, and may have expired
@@ -154,11 +160,7 @@ fn run_generator_worklist<
             let round_witness: &PartitionWitness<F> = witness;
             let round_unresolved_watches: &[usize] = unresolved_watches;
             let round_generator_is_expired: &[bool] = generator_is_expired;
-            #[allow(clippy::type_complexity)]
-            let round_outputs: Vec<(
-                Vec<(usize, bool, usize)>,
-                Vec<(Target, F, Option<&[usize]>)>,
-            )> = pending_generator_indices
+            pending_generator_indices
                 .par_chunks(PARALLEL_WORKLIST_CHUNK)
                 .map(|chunk| {
                     let mut entries = Vec::with_capacity(chunk.len());
@@ -190,11 +192,11 @@ fn run_generator_worklist<
                     }
                     (entries, annotated_values)
                 })
-                .collect();
+                .collect_into_vec(&mut round_outputs);
 
             // Merge phase: sequential and in ascending generator-index order, exactly like the
             // sequential loop's per-generator merge.
-            for (entries, annotated_values) in round_outputs {
+            for (entries, annotated_values) in round_outputs.drain(..) {
                 let mut annotated_values = annotated_values.into_iter();
                 for (generator_idx, finished, value_count) in entries {
                     if finished {
@@ -219,7 +221,10 @@ fn run_generator_worklist<
                 }
             }
 
-            pending_generator_indices = next_pending_generator_indices;
+            core::mem::swap(
+                &mut pending_generator_indices,
+                &mut next_pending_generator_indices,
+            );
             continue;
         }
 
@@ -260,7 +265,10 @@ fn run_generator_worklist<
             }
         }
 
-        pending_generator_indices = next_pending_generator_indices;
+        core::mem::swap(
+            &mut pending_generator_indices,
+            &mut next_pending_generator_indices,
+        );
     }
 
     Ok(())
