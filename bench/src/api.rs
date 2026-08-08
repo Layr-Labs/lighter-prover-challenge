@@ -1,4 +1,3 @@
-// Redraw marker 45
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
@@ -24,7 +23,7 @@ pub const LIGHT_TX_MODE: u8 = TX_LIGHT;
 pub const ON_CHAIN_OPERATIONS_LIMIT: usize = 1;
 pub const PUBLIC_HEAVY_TX_COUNT: usize = 10;
 pub const PUBLIC_LIGHT_TX_COUNT: usize = 490;
-pub const PROVER_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
+pub const PROVER_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
 
 pub struct Circuits {
     pub heavy_tx_target: BlockTxTarget,
@@ -106,6 +105,12 @@ impl Circuits {
             dummy_heavy_proof: heavy.dummy_proof,
             dummy_light_proof: light.dummy_proof,
         }
+    }
+
+    /// Releases the pre-execution circuit's LDE commitment after both its proof
+    /// and the final block-circuit synthesis have consumed it.
+    pub fn release_pre_execution_extension(&mut self) {
+        self.pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
     }
 
     /// Releases the extended (LDE) constants/sigmas commitment of every circuit
