@@ -151,7 +151,11 @@ impl<F: Field> ReducingFactor<F> {
             .zip(base_powers.par_chunks(PARALLEL_CHUNK))
             .map(|(ps, powers)| accumulate_chunk(ps, powers))
             .collect();
-        let mut acc = vec![F::ZERO; max_len];
+        // The first partial is already an owned, max-length accumulator.
+        // Move it into the final reduction instead of allocating another
+        // degree-sized zero vector and adding the partial back over zeros.
+        let mut partials = partials.into_iter();
+        let mut acc = partials.next().unwrap_or_default();
         for partial in partials {
             for (a, p) in acc.iter_mut().zip(partial) {
                 *a += p;
@@ -480,6 +484,11 @@ mod tests {
             vec![16, 7, 3, 1],
             vec![0, 5, 2, 9],
             vec![0, 0, 6],
+            vec![9; 17],
+            vec![0; 33],
+            (0..33)
+                .map(|i| if i % 6 == 0 { 0 } else { 1 + (7 * i) % 23 })
+                .collect(),
         ];
 
         for lens in &shapes {
