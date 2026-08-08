@@ -14,6 +14,7 @@
 //! (measurement A/B). The `embedded_matches_rebuilt` ignored test is the
 //! value-equality oracle between the two paths.
 
+use circuit::block_constraints::BlockTarget;
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
@@ -28,6 +29,7 @@ static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx
 static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
 static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+static BLOCK_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block.embed"));
 
 fn load_blob<T: serde::de::DeserializeOwned>(
     name: &'static str,
@@ -117,6 +119,22 @@ impl Circuits {
             Err(error) => {
                 log::warn!("embedded circuits unavailable ({error:#}); building from scratch");
                 Self::new()
+            }
+        }
+    }
+
+    /// Loads the final block circuit built in the untimed compile job. Its
+    /// topology depends only on the fixed startup circuits, not on the block
+    /// witness, so deserialization can replace a scored per-worker rebuild.
+    pub fn load_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
+        if std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1") {
+            return self.build_block_circuit();
+        }
+        match load_blob::<BlockTarget>("block", BLOCK_BLOB) {
+            Ok(block) => block,
+            Err(error) => {
+                log::warn!("embedded block circuit unavailable ({error:#}); building from scratch");
+                self.build_block_circuit()
             }
         }
     }
@@ -289,6 +307,26 @@ mod tests {
         });
     }
 
+    /// The final block circuit is also deterministic from the five startup
+    /// circuits and must round-trip value-identically through its embedded
+    /// representation.
+    #[test]
+    #[ignore = "multi-second final block circuit rebuild; run explicitly"]
+    fn embedded_block_matches_rebuilt() {
+        on_big_stack(|| {
+            let circuits = Circuits::from_embedded().expect("embedded startup circuits must load");
+            let rebuilt = circuits.build_block_circuit();
+            let embedded = load_blob::<BlockTarget>("block", BLOCK_BLOB)
+                .expect("embedded block circuit must load");
+
+            assert_circuit_pair_identical(
+                "block",
+                (&rebuilt.0, &rebuilt.1),
+                (&embedded.0, &embedded.1),
+            );
+        });
+    }
+
     /// Manual timing harness: embedded load vs fresh build, both under the
     /// production overlapped layout and per circuit sequentially. Run:
     /// `cargo test --release -p bench --bin prove -- --ignored embedded_load_timing --nocapture`
@@ -364,6 +402,7 @@ mod tests {
             ("heavy_chain", HEAVY_CHAIN_BLOB),
             ("light_tx", LIGHT_TX_BLOB),
             ("light_chain", LIGHT_CHAIN_BLOB),
+            ("block", BLOCK_BLOB),
         ] {
             assert!(
                 !blob.is_empty(),

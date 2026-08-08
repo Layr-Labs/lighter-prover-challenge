@@ -1,8 +1,9 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Builds the five startup circuits at compile time and serializes them into
-//! OUT_DIR blobs that `src/embedded.rs` embeds into the prove binary.
+//! Builds the five startup circuits and the final block circuit at compile
+//! time, then serializes them into OUT_DIR blobs that `src/embedded.rs` embeds
+//! into the prove binary.
 //!
 //! Compilation runs in the benchmark's untimed CI job, so the multi-second
 //! circuit construction here is free; the scored worker process then loads
@@ -20,10 +21,11 @@
 
 use std::path::{Path, PathBuf};
 
+use circuit::block_constraints::{BlockCircuit, Circuit as _};
 use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
-use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, Circuit as _};
+use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, BlockTxChainTarget, Circuit as _};
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _};
-use circuit::embed::serialize_embedded;
+use circuit::embed::{deserialize_embedded, serialize_embedded};
 use circuit::types::config::{C, CIRCUIT_CONFIG};
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
 
@@ -36,12 +38,13 @@ const LIGHT_TX_PER_PROOF: usize = 10;
 const ON_CHAIN_OPERATIONS_LIMIT: usize = 1;
 const PROVER_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
 
-const BLOB_NAMES: [&str; 5] = [
+const BLOB_NAMES: [&str; 6] = [
     "pre.embed",
     "heavy_tx.embed",
     "heavy_chain.embed",
     "light_tx.embed",
     "light_chain.embed",
+    "block.embed",
 ];
 
 fn write_blob(out_dir: &Path, name: &str, bytes: &[u8]) {
@@ -119,11 +122,37 @@ fn main() {
                 },
             );
 
+            // Rehydrate only the three dependencies needed to define the final
+            // block circuit. This work runs in the untimed build job and keeps
+            // the build script independent of a direct plonky2 dependency.
+            let (_, pre_data) = deserialize_embedded::<
+                circuit::block_pre_execution_constraints::BlockPreExecutionTarget,
+            >(&pre_blob)
+            .expect("deserializing embedded pre-execution circuit for block build");
+            let (_, heavy_chain_data) =
+                deserialize_embedded::<BlockTxChainTarget>(&heavy_blobs.1)
+                    .expect("deserializing embedded heavy chain circuit for block build");
+            let (_, light_chain_data) = deserialize_embedded::<BlockTxChainTarget>(&light_blobs.1)
+                .expect("deserializing embedded light chain circuit for block build");
+
+            let block = BlockCircuit::define(
+                CIRCUIT_CONFIG,
+                &pre_data,
+                &light_chain_data,
+                &heavy_chain_data,
+                ON_CHAIN_OPERATIONS_LIMIT,
+            );
+            let block_target = block.target;
+            let block_data = block.builder.build::<C>();
+            let block_blob = serialize_embedded(&block_target, &block_data)
+                .expect("serializing final block circuit for embedding");
+
             write_blob(&out_dir, "pre.embed", &pre_blob);
             write_blob(&out_dir, "heavy_tx.embed", &heavy_blobs.0);
             write_blob(&out_dir, "heavy_chain.embed", &heavy_blobs.1);
             write_blob(&out_dir, "light_tx.embed", &light_blobs.0);
             write_blob(&out_dir, "light_chain.embed", &light_blobs.1);
+            write_blob(&out_dir, "block.embed", &block_blob);
         })
         .expect("circuit build thread must start")
         .join()
