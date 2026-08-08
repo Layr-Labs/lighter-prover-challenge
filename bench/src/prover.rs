@@ -531,6 +531,27 @@ pub(crate) fn prove_block_after_pre(
             // alone is running. The circuit data is leaked to hand the pending
             // witness a 'static borrow across the thread boundary — free, the
             // worker exits via `process::exit`.
+            // Launch the 49-step Light spine first. It controls the final join,
+            // whereas Heavy has only three folds and substantial slack. The old
+            // order gave Heavy the first opportunity to enqueue work on the
+            // serialized GPU stream before the critical path had even started.
+            let light_handle = std::thread::Builder::new()
+                .name("light-tx-chain".into())
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, || {
+                    prove_path(
+                        TxPath::Light,
+                        light_chunks,
+                        circuits,
+                        block.block_number,
+                        block.created_at,
+                        block.old_account_delta_tree_root,
+                        &pre_output,
+                        state_metadata_hash,
+                        active_paths,
+                    )
+                })
+                .expect("light transaction chain thread must start");
             let heavy_handle_outer = std::thread::Builder::new()
                 .name("heavy-tx-chain".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -584,17 +605,9 @@ pub(crate) fn prove_block_after_pre(
                     (block_target, block_data, pending, heavy_chain_proof)
                 })
                 .expect("block circuit build thread must start");
-            let light_chain_proof = prove_path(
-                TxPath::Light,
-                light_chunks,
-                circuits,
-                block.block_number,
-                block.created_at,
-                block.old_account_delta_tree_root,
-                &pre_output,
-                state_metadata_hash,
-                active_paths,
-            );
+            let light_chain_proof = light_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             let (block_target, block_data, block_pending, heavy_chain_proof) =
                 block_circuit_handle
                     .join()
