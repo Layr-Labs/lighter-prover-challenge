@@ -262,6 +262,13 @@ fn reduce_gate_constraints_base_batch<F: Field>(
 /// Results are stored point-major: the challenges for point `k` occupy
 /// `res_out[k * num_challenges..(k + 1) * num_challenges]`. `res_out` must be
 /// zero-initialized by the caller.
+///
+/// With `skip_permutation` set (only valid for the `Cols` permutation layout),
+/// the permutation-argument rows `0..num_challenges * (num_partial_products + 2)`
+/// are neither computed nor folded — a GPU job supplies them separately — but
+/// the gate rows already reduced into `res_out` are still lifted by
+/// `alpha^R`, exactly as folding `R` zero rows would, so every gate constraint
+/// keeps its existing alpha offset.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
@@ -280,6 +287,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     cpu_num_gate_constraints: usize,
     z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
+    skip_permutation: bool,
     scratch: &mut VanishingScratch<F>,
     res_out: &mut [F],
 ) {
@@ -358,6 +366,27 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             !has_lookup,
             "lookup circuits need per-point permutation rows"
         );
+
+        // The GPU permutation job computes and alpha-reduces the
+        // `num_challenges * (num_prods + 2)` permutation rows itself; here
+        // only the alpha^R lift of the already-folded gate rows remains,
+        // which is value-identical to Horner-folding that many zero-valued
+        // permutation rows on top. Checked before the buffer-length asserts:
+        // the caller skips the zs/sigma gathers entirely in this mode.
+        if skip_permutation {
+            let num_rows = num_challenges * (num_prods + 2);
+            let alpha_pow_rows: Vec<F> = alphas
+                .iter()
+                .map(|&alpha| alpha.exp_u64(num_rows as u64))
+                .collect();
+            for res in res_out.chunks_exact_mut(num_challenges) {
+                for (value, &alpha_pow) in res.iter_mut().zip(&alpha_pow_rows) {
+                    *value *= alpha_pow;
+                }
+            }
+            return;
+        }
+
         assert_eq!(
             zs_partial_products_cols.len(),
             (num_prods + 1) * num_challenges * n
@@ -485,6 +514,10 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     else {
         unreachable!("Cols variant returns above")
     };
+    assert!(
+        !skip_permutation,
+        "the GPU permutation job is only started for the Cols layout"
+    );
     vanishing_partial_products_terms.clear();
     assert_eq!(local_zs_batch.len(), n);
     assert_eq!(next_zs_batch.len(), n);

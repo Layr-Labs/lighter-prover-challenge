@@ -27,13 +27,13 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "5a26157063dd5c76cedf06d12681d4f146bacdd236c3613d861ec5bb781597e6";
+    "9b16df1c6690635b250f2c34f7ced06d929021765095464abfe0fad906c66bd6";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
 /// source. This deliberately includes the lazily-built gate-quotient kernels:
 /// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 9] = [
+const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
     "poseidon2_hash_parents",
@@ -43,6 +43,7 @@ const METALLIB_REQUIRED_KERNELS: [&str; 9] = [
     "ifft_finalize",
     "poseidon2_gate_quotient",
     "range_check_gate_quotient",
+    "permutation_quotient",
 ];
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
 /// (6654d43) ranked-validated this raised value inside its composition; my
@@ -153,6 +154,34 @@ impl<F: RichField> RangeCheckGateQuotientJob<F> {
         Ok(unsafe { slice::from_raw_parts(self.output.contents().cast::<F>(), self.len) })
     }
 }
+
+/// An asynchronously submitted permutation-argument quotient evaluation. Its
+/// layout matches [`PoseidonGateQuotientJob`]: two challenge values per
+/// quotient-domain point. The retained `xs`/`l0s` buffers stay alive inside
+/// the command buffer until completion.
+pub(crate) struct PermutationQuotientJob<F> {
+    command_buffer: CommandBuffer,
+    output: Buffer,
+    len: usize,
+    _job: GpuJobGuard,
+    _phantom: PhantomData<F>,
+}
+
+impl<F: RichField> PermutationQuotientJob<F> {
+    pub(crate) fn finish(&self) -> Result<&[F], String> {
+        self.command_buffer.wait_until_completed();
+        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(format!(
+                "permutation quotient command buffer ended with status {:?}",
+                self.command_buffer.status()
+            ));
+        }
+        // SAFETY: construction is restricted to an 8-byte Goldilocks field,
+        // and the completed kernel canonicalized every output word.
+        Ok(unsafe { slice::from_raw_parts(self.output.contents().cast::<F>(), self.len) })
+    }
+}
+
 
 /// One custom range-check gate's selector and base-4 wire layout. All fields
 /// are checked before being flattened into the Metal kernel's u32 metadata.
@@ -429,6 +458,7 @@ impl LazyPipeline {
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
+static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     POSEIDON_GATE_QUOTIENT_PIPELINE.get()
@@ -440,6 +470,10 @@ fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState>
 
 fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.get()
+}
+
+fn permutation_quotient_pipeline() -> Option<&'static ComputePipelineState> {
+    PERMUTATION_QUOTIENT_PIPELINE.get()
 }
 
 /// Starts the two gate-quotient pipeline builds on detached threads.
@@ -459,6 +493,7 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
         ),
         ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
+        ("permutation_quotient", &PERMUTATION_QUOTIENT_PIPELINE),
     ] {
         let device = device.clone();
         let library = library.clone();
@@ -1016,6 +1051,118 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
         }
     }
 }
+
+/// Starts a whole-domain permutation-argument quotient evaluation over three
+/// retained natural-order LDE column stores. For every quotient-domain point
+/// it computes, for both alpha challenges, `sum_r alpha_i^r * row_r` over the
+/// `2 * (num_prods + 2)` permutation rows that precede the gate constraints
+/// in the global alpha reduction, laid out exactly as the CPU
+/// `PermutationBatch::Cols` path orders them. `xs` are the shifted evaluation
+/// points and `l0s` the host-precomputed `L_0(x)` values, both indexed by
+/// quotient-domain row.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_permutation_quotient<F: RichField>(
+    wires: &MetalColumns<F>,
+    constants: &MetalColumns<F>,
+    zs_partial_products: &MetalColumns<F>,
+    quotient_rows: usize,
+    step: usize,
+    next_step: usize,
+    sigma_base: usize,
+    num_routed_wires: usize,
+    chunk_size: usize,
+    num_prods: usize,
+    xs: &[F],
+    l0s: &[F],
+    betas: &[F],
+    gammas: &[F],
+    beta_k_is: &[F],
+    alphas: &[F],
+) -> Option<PermutationQuotientJob<F>> {
+    const MAX_INLINE_BYTES: usize = 4096;
+
+    if F::ORDER != 0xffff_ffff_0000_0001
+        || size_of::<F>() != size_of::<u64>()
+        || alphas.len() != 2
+        || betas.len() != 2
+        || gammas.len() != 2
+        || num_routed_wires == 0
+        || chunk_size == 0
+        || beta_k_is.len() != 2 * num_routed_wires
+        || num_routed_wires.div_ceil(chunk_size) != num_prods + 1
+        || wires.cols < num_routed_wires
+        || wires.rows == 0
+        || wires.rows != constants.rows
+        || wires.rows != zs_partial_products.rows
+        || sigma_base
+            .checked_add(num_routed_wires)
+            .map_or(true, |end| end > constants.cols)
+        || zs_partial_products.cols < 2 * (num_prods + 1)
+        || quotient_rows == 0
+        || step == 0
+        || quotient_rows.checked_mul(step) != Some(wires.rows)
+        || xs.len() != quotient_rows
+        || l0s.len() != quotient_rows
+        || next_step == 0
+        || wires.rows > u32::MAX as usize
+        || step > u32::MAX as usize
+        || quotient_rows
+            .checked_add(next_step)
+            .map_or(true, |sum| sum > u32::MAX as usize)
+        || sigma_base + num_routed_wires > u32::MAX as usize
+        || chunk_size > u32::MAX as usize
+        || 2 * num_routed_wires * size_of::<u64>() > MAX_INLINE_BYTES
+        || 4 * (num_prods + 2) * size_of::<u64>() > MAX_INLINE_BYTES
+    {
+        return None;
+    }
+
+    // alpha_powers[i * R + r] = alpha_i^r for r in 0..R with
+    // R = 2 * (num_prods + 2): the permutation rows occupy the alpha prefix,
+    // so there is no offset.
+    let num_rows = 2 * (num_prods + 2);
+    let mut alpha_powers = Vec::with_capacity(2 * num_rows);
+    for &alpha in alphas {
+        let mut power = F::ONE;
+        for _ in 0..num_rows {
+            alpha_powers.push(power.to_canonical_u64());
+            power *= alpha;
+        }
+    }
+    let betas_gammas = [
+        betas[0].to_canonical_u64(),
+        betas[1].to_canonical_u64(),
+        gammas[0].to_canonical_u64(),
+        gammas[1].to_canonical_u64(),
+    ];
+    let beta_k_is_words: Vec<u64> = beta_k_is.iter().map(|v| v.to_canonical_u64()).collect();
+
+    let context = shared_context()?;
+    match context.start_permutation_quotient(
+        wires,
+        constants,
+        zs_partial_products,
+        quotient_rows,
+        step,
+        next_step,
+        sigma_base,
+        num_routed_wires,
+        chunk_size,
+        num_prods,
+        xs,
+        l0s,
+        &alpha_powers,
+        &betas_gammas,
+        &beta_k_is_words,
+    ) {
+        Ok(job) => Some(job),
+        Err(error) => {
+            log::warn!("Metal permutation quotient unavailable; using CPU path: {error}");
+            None
+        }
+    }
+}
+
 
 /// Allocates the final retained column store before the CPU LDE is computed,
 /// so the same shared buffer can be bound directly as the Metal leaf input.
@@ -1698,6 +1845,108 @@ impl MetalShared {
             _phantom: PhantomData,
         })
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_permutation_quotient<F: RichField>(
+        &self,
+        wires: &MetalColumns<F>,
+        constants: &MetalColumns<F>,
+        zs_partial_products: &MetalColumns<F>,
+        quotient_rows: usize,
+        step: usize,
+        next_step: usize,
+        sigma_base: usize,
+        num_routed_wires: usize,
+        chunk_size: usize,
+        num_prods: usize,
+        xs: &[F],
+        l0s: &[F],
+        alpha_powers: &[u64],
+        betas_gammas: &[u64; 4],
+        beta_k_is: &[u64],
+    ) -> Result<PermutationQuotientJob<F>, String> {
+        let pipeline = permutation_quotient_pipeline()
+            .ok_or("permutation quotient pipeline unavailable")?;
+        if alpha_powers.len() != 4 * (num_prods + 2)
+            || beta_k_is.len() != 2 * num_routed_wires
+            || xs.len() != quotient_rows
+            || l0s.len() != quotient_rows
+        {
+            return Err("invalid permutation quotient parameters".to_string());
+        }
+        let len = quotient_rows
+            .checked_mul(2)
+            .ok_or("permutation quotient output length overflow")?;
+        let bytes = len
+            .checked_mul(size_of::<u64>())
+            .ok_or("permutation quotient output size overflow")?;
+        // The xs/l0s uploads and the output allocation share one autorelease
+        // scope; the command buffer retains every bound buffer until it
+        // completes, so dropping the Rust handles after commit is safe.
+        let (output, xs_buffer, l0s_buffer) = autoreleasepool(|| {
+            (
+                self.device
+                    .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared),
+                self.device.new_buffer_with_data(
+                    xs.as_ptr().cast::<c_void>(),
+                    size_of_val(xs) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                ),
+                self.device.new_buffer_with_data(
+                    l0s.as_ptr().cast::<c_void>(),
+                    size_of_val(l0s) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                ),
+            )
+        });
+        let job_guard = GpuJobGuard::begin();
+        let command_buffer = autoreleasepool(|| -> CommandBuffer {
+            let command_buffer = self.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(&wires.buffer), 0);
+            encoder.set_buffer(1, Some(&constants.buffer), 0);
+            encoder.set_buffer(2, Some(&zs_partial_products.buffer), 0);
+            encoder.set_buffer(3, Some(&xs_buffer), 0);
+            encoder.set_buffer(4, Some(&l0s_buffer), 0);
+            encoder.set_buffer(5, Some(&output), 0);
+            encoder.set_bytes(
+                6,
+                size_of_val(alpha_powers) as NSUInteger,
+                alpha_powers.as_ptr().cast::<c_void>(),
+            );
+            encoder.set_bytes(
+                7,
+                size_of_val(betas_gammas) as NSUInteger,
+                betas_gammas.as_ptr().cast::<c_void>(),
+            );
+            encoder.set_bytes(
+                8,
+                size_of_val(beta_k_is) as NSUInteger,
+                beta_k_is.as_ptr().cast::<c_void>(),
+            );
+            set_u32(encoder, 9, wires.rows as u32);
+            set_u32(encoder, 10, quotient_rows as u32);
+            set_u32(encoder, 11, step as u32);
+            set_u32(encoder, 12, next_step as u32);
+            set_u32(encoder, 13, sigma_base as u32);
+            set_u32(encoder, 14, num_routed_wires as u32);
+            set_u32(encoder, 15, chunk_size as u32);
+            set_u32(encoder, 16, num_prods as u32);
+            dispatch(encoder, pipeline, quotient_rows);
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.to_owned()
+        });
+        Ok(PermutationQuotientJob {
+            command_buffer,
+            output,
+            len,
+            _job: job_guard,
+            _phantom: PhantomData,
+        })
+    }
+
 
     fn acquire_set(&self) -> Result<BufferSet, String> {
         let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
@@ -3186,6 +3435,140 @@ mod tests {
             }
         }
     }
+
+    /// Differential test for the permutation-argument quotient kernel: random
+    /// (invalid) wires/sigmas/Zs/partial products and random challenges on a
+    /// small retained setup, compared point-by-point against a straight CPU
+    /// evaluation of `sum_r alpha_i^r * row_r` with the exact
+    /// `PermutationBatch::Cols` row layout. Shapes cover a quotient row count
+    /// not divisible by the threadgroup width and the rotated next-index
+    /// wraparound; the second shape exercises a short final wire chunk.
+    #[test]
+    fn metal_permutation_quotient_matches_cpu() {
+        type F = GoldilocksField;
+
+        let context = shared_context().expect("Metal context must initialize");
+
+        // (num_routed_wires, chunk_size, quotient_rows, step, next_step, sigma_base)
+        for &(nrw, chunk_size, quotient_rows, step, next_step, sigma_base) in &[
+            // Production column shape (80 routed wires, chunk 8) on a domain
+            // that is not a multiple of the 64-thread groups, with the
+            // next-step rotation wrapping for the last 8 points.
+            (80usize, 8usize, 60usize, 4usize, 8usize, 3usize),
+            // Uneven final chunk (10 = 4 + 4 + 2), step 1, odd row count.
+            (10, 4, 33, 1, 5, 2),
+        ] {
+            let num_chunks = nrw.div_ceil(chunk_size);
+            let num_prods = num_chunks - 1;
+            let num_rows = 2 * (num_chunks + 1);
+            let full_rows = quotient_rows * step;
+            let zs_cols = 2 * (num_prods + 1);
+
+            let mut rng = StdRng::seed_from_u64(0x9e37_0000 + nrw as u64);
+            let mut random_field =
+                |rng: &mut StdRng| F::from_canonical_u64(rng.next_u64() % F::ORDER);
+
+            let mut wires = context
+                .allocate_columns::<F>(full_rows, nrw)
+                .expect("wire columns must allocate");
+            let mut constants = context
+                .allocate_columns::<F>(full_rows, sigma_base + nrw)
+                .expect("constant columns must allocate");
+            let mut zs = context
+                .allocate_columns::<F>(full_rows, zs_cols)
+                .expect("zs columns must allocate");
+            for columns in [&mut wires, &mut constants, &mut zs] {
+                for column in columns.columns_mut().expect("unique columns") {
+                    for value in column {
+                        *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
+                    }
+                }
+            }
+
+            let xs: Vec<F> = (0..quotient_rows).map(|_| random_field(&mut rng)).collect();
+            let l0s: Vec<F> = (0..quotient_rows).map(|_| random_field(&mut rng)).collect();
+            let betas = [random_field(&mut rng), random_field(&mut rng)];
+            let gammas = [random_field(&mut rng), random_field(&mut rng)];
+            let alphas = [random_field(&mut rng), random_field(&mut rng)];
+            let beta_k_is: Vec<F> = (0..2 * nrw).map(|_| random_field(&mut rng)).collect();
+
+            // Straight CPU evaluation of the permutation rows and their alpha
+            // reduction, mirroring vanishing_poly.rs's Cols path.
+            let mut expected = vec![F::ZERO; quotient_rows * 2];
+            for k in 0..quotient_rows {
+                let src = k * step;
+                let nxt = ((k + next_step) % quotient_rows) * step;
+                let acc_col = |i: usize, c: usize| -> F {
+                    if c == 0 {
+                        zs.col(i)[src]
+                    } else if c <= num_prods {
+                        zs.col(2 + i * num_prods + (c - 1))[src]
+                    } else {
+                        zs.col(i)[nxt]
+                    }
+                };
+                let mut rows = Vec::with_capacity(num_rows);
+                for i in 0..2 {
+                    rows.push(l0s[k] * (zs.col(i)[src] - F::ONE));
+                }
+                for i in 0..2 {
+                    for c in 0..num_chunks {
+                        let mut num_prod = F::ONE;
+                        let mut den_prod = F::ONE;
+                        for j in c * chunk_size..((c + 1) * chunk_size).min(nrw) {
+                            let wire = wires.col(j)[src];
+                            let sigma = constants.col(sigma_base + j)[src];
+                            num_prod *= wire + beta_k_is[i * nrw + j] * xs[k] + gammas[i];
+                            den_prod *= wire + betas[i] * sigma + gammas[i];
+                        }
+                        rows.push(acc_col(i, c) * num_prod - acc_col(i, c + 1) * den_prod);
+                    }
+                }
+                assert_eq!(rows.len(), num_rows);
+                for (challenge, &alpha) in alphas.iter().enumerate() {
+                    let mut sum = F::ZERO;
+                    let mut power = F::ONE;
+                    for &row in &rows {
+                        sum += row * power;
+                        power *= alpha;
+                    }
+                    expected[k * 2 + challenge] = sum;
+                }
+            }
+
+            let job = start_permutation_quotient(
+                &wires,
+                &constants,
+                &zs,
+                quotient_rows,
+                step,
+                next_step,
+                sigma_base,
+                nrw,
+                chunk_size,
+                num_prods,
+                &xs,
+                &l0s,
+                &betas,
+                &gammas,
+                &beta_k_is,
+                &alphas,
+            )
+            .expect("Metal permutation quotient job must start");
+            let actual = job
+                .finish()
+                .expect("Metal permutation quotient job must finish");
+            assert_eq!(actual.len(), expected.len());
+            for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    actual.to_canonical_u64(),
+                    expected.to_canonical_u64(),
+                    "permutation quotient mismatch at word {i}, shape nrw={nrw}"
+                );
+            }
+        }
+    }
+
 
     #[test]
     fn metal_u32_gate_quotient_matches_cpu() {
