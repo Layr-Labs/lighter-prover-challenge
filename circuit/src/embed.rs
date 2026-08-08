@@ -33,7 +33,7 @@
 //! building circuits from scratch.
 
 use anyhow::{Context, Result, bail, ensure};
-use plonky2::field::fft::{cached_fft_root_table, cached_two_adic_subgroup};
+use plonky2::field::fft::fft_root_table;
 use plonky2::field::polynomial::PolynomialValues;
 use plonky2::field::types::Field;
 use plonky2::fri::oracle::PolynomialBatch;
@@ -443,18 +443,12 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let num_wires = common.config.num_wires;
     let num_routed = common.config.num_routed_wires;
 
-    // The embedded loads run concurrently and several circuits share a degree
-    // or FFT-domain size, so route these deterministic derivations through the
-    // process-wide caches instead of recomputing the primitive-root power
-    // chains per load. The cached values are value-identical to a fresh
-    // computation (the cache stores exactly what `two_adic_subgroup` /
-    // `fft_root_table` produce), so this is startup-only deduplication.
-    let subgroup = cached_two_adic_subgroup::<F>(degree_bits).as_ref().clone();
+    let subgroup = F::two_adic_subgroup(degree_bits);
 
     // Same table size expression as `try_build_with_options`.
     let max_fft_points =
         1usize << (degree_bits + rate_bits.max(log2_ceil(common.quotient_degree_factor)));
-    let root_table = cached_fft_root_table::<F>(max_fft_points);
+    let root_table = fft_root_table::<F>(max_fft_points);
 
     // Sigma values from the representative map, through the builder's own
     // forest partition code (`sigma_vecs` post-`compress_paths` state).

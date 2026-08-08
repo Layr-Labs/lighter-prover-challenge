@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
@@ -37,11 +36,11 @@ enum TxPath {
     Light,
 }
 
-const LIGHT_TX_PROOF_WINDOW: usize = 3;
+const LIGHT_TX_PROOF_WINDOW: usize = 2;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
-fn chunk_is_light(txs: &[Arc<Tx<F>>]) -> bool {
+fn chunk_is_light(txs: &[Tx<F>]) -> bool {
     txs.first()
         .expect("block transaction chunk must not be empty")
         .tx_circuit_type
@@ -199,7 +198,7 @@ fn jump_from_witness(witness: &impl Witness<F>, target: &JumpStateTarget) -> Jum
 fn generate_tx_witness<'a>(
     path: TxPath,
     chunk_index: usize,
-    txs: Vec<Arc<Tx<F>>>,
+    txs: Vec<Tx<F>>,
     tx_data: &'a CircuitData<F, C, D>,
     tx_target: &BlockTxTarget,
     created_at: i64,
@@ -254,7 +253,7 @@ fn prove_tx_witness(
 #[allow(clippy::too_many_arguments)]
 fn prove_path(
     path: TxPath,
-    chunks: Vec<(usize, Vec<Arc<Tx<F>>>)>,
+    chunks: Vec<(usize, Vec<Tx<F>>)>,
     circuits: &Circuits,
     block_number: u64,
     created_at: i64,
@@ -276,26 +275,14 @@ fn prove_path(
     // circuit construction, which takes its own shared guard.
     let heavy_tx_guard;
     let heavy_chain_guard;
-    let light_tx_guard;
-    let light_chain_guard;
     let (tx_data, tx_target, chain_data, chain_target, dummy_proof) = match path {
-        TxPath::Light => {
-            light_tx_guard = circuits
-                .light_tx_data
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            light_chain_guard = circuits
-                .light_chain_data
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                &*light_tx_guard,
-                &circuits.light_tx_target,
-                &*light_chain_guard,
-                &circuits.light_chain_target,
-                &circuits.dummy_light_proof,
-            )
-        }
+        TxPath::Light => (
+            &circuits.light_tx_data,
+            &circuits.light_tx_target,
+            &circuits.light_chain_data,
+            &circuits.light_chain_target,
+            &circuits.dummy_light_proof,
+        ),
         TxPath::Heavy => {
             heavy_tx_guard = circuits
                 .heavy_tx_data
@@ -553,9 +540,8 @@ pub(crate) fn prove_block_after_pre(
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
     let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
-    let mut heavy_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> = Vec::new();
-    let mut light_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> =
-        Vec::with_capacity(tx_chunks.len());
+    let mut heavy_chunks: Vec<(usize, Vec<Tx<F>>)> = Vec::new();
+    let mut light_chunks: Vec<(usize, Vec<Tx<F>>)> = Vec::with_capacity(tx_chunks.len());
     for (chunk_index, txs) in tx_chunks.drain(..).enumerate() {
         if chunk_is_light(&txs) {
             light_chunks.push((chunk_index, txs));
@@ -660,42 +646,21 @@ pub(crate) fn prove_block_after_pre(
                     (block_target, block_data, pending, heavy_chain_proof)
                 })
                 .expect("block circuit build thread must start");
-            let light_chunks = std::mem::take(&mut light_chunks);
-            let light_handle = std::thread::Builder::new()
-                .name("light-tx-chain".into())
-                .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, || {
-                    mark_spine_thread_latency_critical();
-                    prove_path(
-                        TxPath::Light,
-                        light_chunks,
-                        circuits,
-                        block.block_number,
-                        block.created_at,
-                        block.old_account_delta_tree_root,
-                        &pre_output,
-                        state_metadata_hash,
-                        active_paths,
-                    )
-                })
-                .expect("light transaction chain thread must start");
+            let light_chain_proof = prove_path(
+                TxPath::Light,
+                light_chunks,
+                circuits,
+                block.block_number,
+                block.created_at,
+                block.old_account_delta_tree_root,
+                &pre_output,
+                state_metadata_hash,
+                active_paths,
+            );
             let (block_target, block_data, block_pending, heavy_chain_proof) =
                 block_circuit_handle
                     .join()
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            let light_chain_proof = light_handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            // The light path's thread has exited, so its shared guards on the
-            // light transaction and chain circuits are gone, and the block lane
-            // dropped its own light-chain guard when `build_block_circuit`
-            // returned long ago. Nothing reads the light pair again: the final
-            // block proof uses only `block_data`, the three finished proofs and
-            // the block. Retire their preprocessed extensions here — 438 MiB of
-            // Metal shared buffers whose release returns the pages to the OS
-            // immediately — instead of holding them through the final witness
-            // setup until the backstop below.
-            circuits.release_light_circuit_extensions();
             (
                 light_chain_proof,
                 heavy_chain_proof,
@@ -779,52 +744,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_padding_transactions_share_storage_per_path() {
-        use std::sync::Arc;
-
-        std::thread::Builder::new()
-            .stack_size(PROVER_THREAD_STACK_BYTES)
-            .spawn(|| {
-                let block = Block::<F>::from_json_with_empty_txs(
-                    include_bytes!("../bench_test.json"),
-                    HEAVY_TX_PER_PROOF,
-                    LIGHT_TX_PER_PROOF,
-                    PUBLIC_HEAVY_TX_COUNT,
-                    PUBLIC_LIGHT_TX_COUNT,
-                )
-                .expect("public fixture must parse");
-                let heavy = block
-                    .tx_chunks
-                    .iter()
-                    .flatten()
-                    .find(|tx| tx.tx_circuit_type != TX_LIGHT)
-                    .expect("heavy padding must exist");
-                let light = block
-                    .tx_chunks
-                    .iter()
-                    .flatten()
-                    .find(|tx| tx.tx_circuit_type == TX_LIGHT)
-                    .expect("light padding must exist");
-                assert!(block
-                    .tx_chunks
-                    .iter()
-                    .flatten()
-                    .filter(|tx| tx.tx_circuit_type != TX_LIGHT)
-                    .all(|tx| Arc::ptr_eq(tx, heavy)));
-                assert!(block
-                    .tx_chunks
-                    .iter()
-                    .flatten()
-                    .filter(|tx| tx.tx_circuit_type == TX_LIGHT)
-                    .all(|tx| Arc::ptr_eq(tx, light)));
-                assert!(!Arc::ptr_eq(heavy, light));
-            })
-            .expect("padding sharing test thread must start")
-            .join()
-            .expect("padding sharing test thread must finish");
-    }
-
-    #[test]
     fn exclusive_gpu_phase_is_claimed_only_by_the_last_running_path() {
         // Two paths proving: the one that reaches its drain first (the three-chunk
         // heavy path) must not claim the process-global exclusive phase while the
@@ -893,12 +812,12 @@ mod tests {
         // An all-empty (padding) chunk carries no state transition, so its embedded roots and
         // metadata hash are the only values the tx and chain constraints must agree on.
         // Chain-step cost is independent of tx contents: the chain circuit is fixed-size.
-        let mut empty_tx = (**block
+        let mut empty_tx = block
             .tx_chunks
             .iter()
             .flatten()
             .find(|tx| tx.tx_type == TX_TYPE_EMPTY)
-            .expect("fixture must contain an empty padding tx"))
+            .expect("fixture must contain an empty padding tx")
             .clone();
         empty_tx.tx_circuit_type = TX_LIGHT;
         empty_tx.tx_index = F::NEG_ONE.to_canonical_u64();
@@ -920,7 +839,7 @@ mod tests {
         let state_metadata_hash = new_state_metadata.hash();
         let jump = JumpState::initial(new_state_root, old_delta_root);
 
-        let light_chunk = vec![Arc::new(empty_tx); LIGHT_TX_PER_PROOF];
+        let light_chunk = vec![empty_tx; LIGHT_TX_PER_PROOF];
         let (witness, _) = generate_tx_witness(
             TxPath::Light,
             0,
