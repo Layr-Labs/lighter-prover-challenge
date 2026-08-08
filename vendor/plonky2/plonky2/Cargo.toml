@@ -51,6 +51,12 @@ getrandom = { version = "0.2", default-features = false, features = ["js"] }
 metal = "0.33.0"
 objc = "0.2.7"
 
+# `build.rs` precompiles the Poseidon2 compute pipelines into an MTLBinaryArchive
+# on the build machine's own GPU. Same crate and version as the runtime
+# dependency above, so the lockfile is unchanged.
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.build-dependencies]
+metal = "0.33.0"
+
 [dev-dependencies]
 criterion = { version = "0.5.1", default-features = false }
 env_logger = { version = "0.9.0", default-features = false }

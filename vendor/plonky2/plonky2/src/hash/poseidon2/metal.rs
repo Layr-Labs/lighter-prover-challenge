@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use metal::{
-    Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSUInteger,
+    BinaryArchive, BinaryArchiveDescriptor, BinaryArchiveRef, Buffer, CommandBuffer, CommandQueue,
+    CompileOptions, ComputePipelineDescriptor, ComputePipelineState, Device, FunctionRef,
+    MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSUInteger, URL,
 };
 use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
@@ -18,6 +19,17 @@ use crate::hash::merkle_tree::LevelOrderDigests;
 use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
+/// Binary archive of the eight compute pipelines, lowered by `build.rs` on the
+/// build machine's own GPU (see that file for the full rationale). Empty when
+/// that build could not produce one, which the runtime treats as "no archive".
+///
+/// Embedded rather than referenced by its `OUT_DIR` path because the ranked
+/// workflow stages *only* the `prove` binary out of the build job and runs it
+/// from a freshly created candidate root; the build tree, and with it `OUT_DIR`,
+/// no longer exists by then. Bytes inside the binary are the only transport
+/// that survives that hand-off.
+const PIPELINE_ARCHIVE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/poseidon2_pipelines.metallib"));
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
 /// (6654d43) ranked-validated this raised value inside its composition; my
 /// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
@@ -377,12 +389,23 @@ static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShare
 /// against the startup work that precedes the first GPU use — argument
 /// handling, thread-pool construction, fixture parsing.
 ///
+/// `scratch_dir` is a directory the process may write to, and is where the
+/// embedded pipeline archive is briefly materialized (see [`PipelineArchive`]);
+/// pass the directory of the process's own output file, which is the one place
+/// the benchmark sandbox permits writes. `None` gives up the archive and
+/// compiles the kernels instead — correct, just slower.
+///
 /// Idempotent and safe to call from anywhere: `LazyLock` initializes exactly
 /// once, and a thread that reaches [`shared_context`] while this one is still
 /// compiling blocks until it finishes and then observes the same context.
 /// Callers that never touch the GPU pay only the thread spawn. Nothing here
 /// is observable in a proof — the context holds compiled kernels, not values.
-pub fn prewarm() {
+pub fn prewarm(scratch_dir: Option<&std::path::Path>) {
+    if let Some(scratch_dir) = scratch_dir {
+        // First call wins; a second one cannot move the directory out from
+        // under a context build already in flight.
+        let _ = SCRATCH_DIR.set(scratch_dir.to_owned());
+    }
     std::thread::Builder::new()
         .name("poseidon2-metal-prewarm".to_owned())
         .spawn(|| {
@@ -1056,6 +1079,110 @@ enum LeafSource<'a, F> {
     Shared(&'a MetalColumns<F>),
 }
 
+/// `NSURL URLWithString:` wants a percent-encoded absolute URL; the scratch
+/// directory is an ordinary filesystem path, free to contain characters a URL
+/// reserves.
+fn file_url(path: &str) -> URL {
+    let mut url = String::with_capacity(path.len() + 8);
+    url.push_str("file://");
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                url.push(char::from(byte));
+            }
+            _ => url.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    // `+[NSURL URLWithString:]` hands back an autoreleased (+0) object, but
+    // `metal::URL` is an owning handle that releases on drop. Take a real
+    // reference and forget the borrowed one, otherwise draining the enclosing
+    // autorelease pool over-releases the NSURL and the process dies in
+    // `objc_release`.
+    let borrowed = URL::new_with_string(&url);
+    let owned = borrowed.clone();
+    core::mem::forget(borrowed);
+    owned
+}
+
+/// A directory this process may write to, published by the process entry point
+/// (see [`prewarm`]). Unset means "nowhere", which simply disables the archive.
+static SCRATCH_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// The embedded archive, materialized as a file for as long as pipelines are
+/// being created from it, and unlinked again on drop.
+///
+/// Metal only loads a binary archive from a URL — `newBinaryArchiveWithDescriptor:`
+/// rejects a `data:` URL outright ("Invalid URL") — so the bytes have to reach
+/// the filesystem. The file lives for the few milliseconds `MetalShared::new`
+/// takes and is then removed, so nothing of ours outlives the pipelines.
+struct PipelineArchive {
+    archive: BinaryArchive,
+    path: std::path::PathBuf,
+}
+
+impl Drop for PipelineArchive {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Materializes and opens the build-time pipeline archive.
+///
+/// `None` whenever there is nothing usable — an empty artifact (no GPU on the
+/// build machine, `LIGHTER_SKIP_METAL_ARCHIVE=1`), no scratch directory, a
+/// denied write, or a driver that rejects the archive. Every one of those is an
+/// ordinary condition rather than a failure: the caller then compiles the
+/// kernels the way it did before the archive existed.
+fn pipeline_archive(device: &Device) -> Option<PipelineArchive> {
+    if PIPELINE_ARCHIVE.is_empty() {
+        return None;
+    }
+    // The benchmark sandbox is default-deny for writes and grants exactly one
+    // writable subtree: the directory holding the worker's proof output. The
+    // entry point passes it here; the process id keeps concurrent workers
+    // sharing that directory from colliding.
+    let path = SCRATCH_DIR
+        .get()?
+        .join(format!(".poseidon2-pipelines-{}.metallib", std::process::id()));
+    if let Err(error) = std::fs::write(&path, PIPELINE_ARCHIVE) {
+        log::debug!("cannot materialize Poseidon2 pipeline archive: {error}");
+        return None;
+    }
+    let descriptor = BinaryArchiveDescriptor::new();
+    descriptor.set_url(&file_url(&path.to_string_lossy()));
+    match device.new_binary_archive_with_descriptor(&descriptor) {
+        Ok(archive) => Some(PipelineArchive { archive, path }),
+        Err(error) => {
+            // Nothing owns the file yet, so unlink it here rather than leaving
+            // it behind in the caller's output directory.
+            let _ = std::fs::remove_file(&path);
+            log::debug!("Poseidon2 Metal pipeline archive unusable: {error}");
+            None
+        }
+    }
+}
+
+/// Creates one compute pipeline, served from `archive` when it holds a matching
+/// entry and compiled when it does not.
+///
+/// `MTLPipelineOptionFailOnBinaryArchiveMiss` is deliberately never set, so a
+/// stale, foreign or partial archive can only cost the compile it was meant to
+/// save — it can never turn pipeline creation into an error. With no archive at
+/// all this is exactly the pre-archive call.
+fn compute_pipeline(
+    device: &Device,
+    function: &FunctionRef,
+    archive: Option<&BinaryArchiveRef>,
+) -> Result<ComputePipelineState, String> {
+    let Some(archive) = archive else {
+        return device.new_compute_pipeline_state_with_function(function);
+    };
+    let descriptor = ComputePipelineDescriptor::new();
+    descriptor.set_compute_function(Some(function));
+    descriptor.set_binary_archives(&[archive]);
+    device.new_compute_pipeline_state(&descriptor)
+}
+
 impl MetalShared {
     fn new() -> Result<Self, String> {
         autoreleasepool(|| {
@@ -1064,9 +1191,17 @@ impl MetalShared {
             let library = device
                 .new_library_with_source(SHADER_SOURCE, &options)
                 .map_err(|error| format!("shader compilation failed: {error}"))?;
+            // Kernels already lowered to GPU binaries at build time, when the
+            // compile was untimed and the same GPU was in front of the same
+            // compiler. Each pipeline below is then a lookup rather than a
+            // several-hundred-millisecond MTLCompilerService round trip.
+            let archive = pipeline_archive(&device);
+            let archive_ref = archive.as_ref().map(|archive| &*archive.archive);
             // Build the eight compute pipelines concurrently, one thread each.
+            // This still matters with the archive attached — it is the fallback
+            // whenever the archive is absent or an entry misses.
             //
-            // Every `newComputePipelineStateWithFunction:` lowers that kernel's
+            // Every uncached `newComputePipelineState…` lowers that kernel's
             // AIR to a GPU binary through MTLCompilerService, and the three
             // Poseidon2 permutation kernels plus the two gate-quotient kernels
             // are large enough that each takes hundreds of milliseconds when the
@@ -1091,8 +1226,7 @@ impl MetalShared {
                         let function = library_ref
                             .get_function(name, None)
                             .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
-                        device_ref
-                            .new_compute_pipeline_state_with_function(&function)
+                        compute_pipeline(device_ref, &function, archive_ref)
                             .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
                     })
                 }
@@ -1104,9 +1238,7 @@ impl MetalShared {
                             .get_function(name, None)
                             .ok()
                             .and_then(|function| {
-                                device_ref
-                                    .new_compute_pipeline_state_with_function(&function)
-                                    .ok()
+                                compute_pipeline(device_ref, &function, archive_ref).ok()
                             })
                     })
                 }
@@ -2422,6 +2554,7 @@ mod tests {
     use core::mem::MaybeUninit;
     use std::time::{Duration, Instant};
 
+    use metal::MTLPipelineOption;
     use objc::runtime::Sel;
     use objc::Message;
     use rand::rngs::StdRng;
@@ -2437,6 +2570,58 @@ mod tests {
     use crate::hash::merkle_tree::{capacity_up_to_mut, fill_digests_buf, merkle_tree_prove};
     use crate::hash::poseidon2::hash::Poseidon2Hash;
     use crate::plonk::vars::EvaluationVarsBaseBatch;
+
+    /// The build-time archive must serve *every* pipeline `MetalShared::new`
+    /// asks for.
+    ///
+    /// Archive misses are silent by design — the kernel is simply compiled —
+    /// so a kernel added or renamed on one side of `build.rs` and not the
+    /// other would quietly restore the several-hundred-millisecond compile
+    /// this mechanism exists to remove, with nothing failing anywhere.
+    /// `FailOnBinaryArchiveMiss` is the only way to observe the difference,
+    /// and it is used *here only*: the production path must never fail on a
+    /// miss.
+    #[test]
+    fn binary_archive_serves_every_pipeline() {
+        // The test process has no proof output to borrow a writable directory
+        // from; any writable directory will do to materialize the archive.
+        let _ = SCRATCH_DIR.set(std::env::temp_dir());
+        autoreleasepool(|| {
+            let device = Device::system_default().expect("Metal device");
+            let Some(archive) = pipeline_archive(&device) else {
+                // No artifact — a build machine without a usable GPU, or
+                // `LIGHTER_SKIP_METAL_ARCHIVE=1`. Compiling every pipeline is
+                // the correct behaviour then, so there is nothing to assert.
+                return;
+            };
+            let library = device
+                .new_library_with_source(SHADER_SOURCE, &CompileOptions::new())
+                .expect("shader compilation");
+            for kernel in [
+                "poseidon2_hash_leaves",
+                "poseidon2_hash_leaves_colmajor",
+                "poseidon2_hash_parents",
+                "ntt_prepare",
+                "ntt_stage",
+                "ifft_finalize",
+                "poseidon2_gate_quotient",
+                "range_check_gate_quotient",
+            ] {
+                let function = library.get_function(kernel, None).expect("kernel");
+                let descriptor = ComputePipelineDescriptor::new();
+                descriptor.set_compute_function(Some(&function));
+                descriptor.set_binary_archives(&[&archive.archive]);
+                device
+                    .new_compute_pipeline_state_with_reflection(
+                        &descriptor,
+                        MTLPipelineOption::FailOnBinaryArchiveMiss,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("{kernel} is not in the build-time archive: {error}")
+                    });
+            }
+        });
+    }
 
     #[test]
     fn does_not_detach_output_without_a_waiting_build() {
