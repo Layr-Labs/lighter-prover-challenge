@@ -396,9 +396,90 @@ fn mul_reduce_pair(a0: u64, b0: u64, a1: u64, b1: u64) -> (u64, u64) {
     (result0, result1)
 }
 
+/// Reduce four independent products while keeping four multiply/reduction
+/// dependency chains in flight. The flag-producing instruction pairs remain
+/// adjacent, so the result of every lane is bit-for-bit identical to the
+/// scalar `reduce128` path, including non-canonical representatives.
+#[inline(always)]
+pub(crate) fn mul_reduce_quad(
+    lhs: [GoldilocksField; 4],
+    rhs: [GoldilocksField; 4],
+) -> [GoldilocksField; 4] {
+    let mut result0 = lhs[0].0;
+    let mut result1 = lhs[1].0;
+    let mut result2 = lhs[2].0;
+    let mut result3 = lhs[3].0;
+    let scratch0 = rhs[0].0;
+    let scratch1 = rhs[1].0;
+    let scratch2 = rhs[2].0;
+    let scratch3 = rhs[3].0;
+
+    unsafe {
+        asm!(
+            "umulh {hi0}, {result0}, {scratch0}",
+            "umulh {hi1}, {result1}, {scratch1}",
+            "umulh {hi2}, {result2}, {scratch2}",
+            "umulh {hi3}, {result3}, {scratch3}",
+            "mul   {result0}, {result0}, {scratch0}",
+            "mul   {result1}, {result1}, {scratch1}",
+            "mul   {result2}, {result2}, {scratch2}",
+            "mul   {result3}, {result3}, {scratch3}",
+            "umull {scratch0}, {hi0:w}, {epsilon:w}",
+            "umull {scratch1}, {hi1:w}, {epsilon:w}",
+            "umull {scratch2}, {hi2:w}, {epsilon:w}",
+            "umull {scratch3}, {hi3:w}, {epsilon:w}",
+            "subs  {result0}, {result0}, {hi0}, lsr #32",
+            "csetm {hi0:w}, cc",
+            "subs  {result1}, {result1}, {hi1}, lsr #32",
+            "csetm {hi1:w}, cc",
+            "subs  {result2}, {result2}, {hi2}, lsr #32",
+            "csetm {hi2:w}, cc",
+            "subs  {result3}, {result3}, {hi3}, lsr #32",
+            "csetm {hi3:w}, cc",
+            "sub   {result0}, {result0}, {hi0}",
+            "sub   {result1}, {result1}, {hi1}",
+            "sub   {result2}, {result2}, {hi2}",
+            "sub   {result3}, {result3}, {hi3}",
+            "adds  {result0}, {result0}, {scratch0}",
+            "csetm {scratch0:w}, cs",
+            "adds  {result1}, {result1}, {scratch1}",
+            "csetm {scratch1:w}, cs",
+            "adds  {result2}, {result2}, {scratch2}",
+            "csetm {scratch2:w}, cs",
+            "adds  {result3}, {result3}, {scratch3}",
+            "csetm {scratch3:w}, cs",
+            "add   {result0}, {result0}, {scratch0}",
+            "add   {result1}, {result1}, {scratch1}",
+            "add   {result2}, {result2}, {scratch2}",
+            "add   {result3}, {result3}, {scratch3}",
+            result0 = inout(reg) result0,
+            result1 = inout(reg) result1,
+            result2 = inout(reg) result2,
+            result3 = inout(reg) result3,
+            scratch0 = inout(reg) scratch0 => _,
+            scratch1 = inout(reg) scratch1 => _,
+            scratch2 = inout(reg) scratch2 => _,
+            scratch3 = inout(reg) scratch3 => _,
+            hi0 = out(reg) _,
+            hi1 = out(reg) _,
+            hi2 = out(reg) _,
+            hi3 = out(reg) _,
+            epsilon = in(reg) GoldilocksField::ORDER.wrapping_neg(),
+            options(pure, nomem, nostack),
+        );
+    }
+
+    [
+        GoldilocksField(result0),
+        GoldilocksField(result1),
+        GoldilocksField(result2),
+        GoldilocksField(result3),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
-    use super::NeonGoldilocksField;
+    use super::{mul_reduce_quad, NeonGoldilocksField};
     use crate::goldilocks_field::GoldilocksField;
     use crate::ops::Square;
     use crate::packed::PackedField;
@@ -437,6 +518,40 @@ mod tests {
                 assert_eq!((-a).0, [-a.0[0], -a.0[1]]);
                 assert_eq!(a.square().0, [a.0[0].square(), a.0[1].square()]);
             }
+        }
+    }
+
+    #[test]
+    fn quad_multiplication_matches_scalar_raw_representatives() {
+        let values = values();
+        for i in 0..values.len() {
+            for j in 0..values.len() {
+                let lhs = core::array::from_fn(|lane| values[(i + lane * 3) % values.len()]);
+                let rhs = core::array::from_fn(|lane| values[(j + lane * 5) % values.len()]);
+                let actual = mul_reduce_quad(lhs, rhs);
+                let expected = core::array::from_fn(|lane| lhs[lane] * rhs[lane]);
+
+                assert_eq!(actual.map(|value| value.0), expected.map(|value| value.0));
+            }
+        }
+    }
+
+    #[test]
+    fn quad_multiplication_matches_scalar_on_seeded_full_range_inputs() {
+        let mut state = 0x4c41_4e45_5f49_4c50u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..10_000 {
+            let lhs = core::array::from_fn(|_| GoldilocksField(next()));
+            let rhs = core::array::from_fn(|_| GoldilocksField(next()));
+            let actual = mul_reduce_quad(lhs, rhs);
+            let expected = core::array::from_fn(|lane| lhs[lane] * rhs[lane]);
+
+            assert_eq!(actual.map(|value| value.0), expected.map(|value| value.0));
         }
     }
 
