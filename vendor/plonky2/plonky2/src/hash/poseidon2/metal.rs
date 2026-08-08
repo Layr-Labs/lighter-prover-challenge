@@ -75,6 +75,9 @@ const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
 /// official ranked host (submission 41467098), so concurrent GPU submission is
 /// intentionally disabled.
 const MAX_BUFFER_SETS: usize = 1;
+/// A continuously backlogged serial spine may overtake bulk work, but only for
+/// a bounded burst so wide chunk commitments cannot starve indefinitely.
+const MAX_CONSECUTIVE_SPINE_GRANTS: usize = 8;
 /// Parallel staging copy granularity in u64 elements (4 MiB chunks).
 const STAGING_CHUNK: usize = 1 << 19;
 
@@ -341,12 +344,105 @@ struct BufferSet {
     output: Option<Buffer>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GpuPriority {
+    Spine,
+    Bulk,
+}
+
+#[derive(Default)]
+struct WaitLane {
+    next_ticket: u64,
+    serving_ticket: u64,
+    waiting: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PoolWaiter {
+    priority: GpuPriority,
+    ticket: u64,
+}
+
+#[derive(Default)]
 struct BufferPool {
     free: Vec<BufferSet>,
     created: usize,
+    /// Aggregate waiter count retained for detached output readback admission.
     waiters: usize,
+    spine_waiters: WaitLane,
+    bulk_waiters: WaitLane,
+    consecutive_spine_grants: usize,
     spare_output: Option<Buffer>,
     detached_readback: bool,
+}
+
+impl BufferPool {
+    fn lane(&self, priority: GpuPriority) -> &WaitLane {
+        match priority {
+            GpuPriority::Spine => &self.spine_waiters,
+            GpuPriority::Bulk => &self.bulk_waiters,
+        }
+    }
+
+    fn lane_mut(&mut self, priority: GpuPriority) -> &mut WaitLane {
+        match priority {
+            GpuPriority::Spine => &mut self.spine_waiters,
+            GpuPriority::Bulk => &mut self.bulk_waiters,
+        }
+    }
+
+    fn enqueue_waiter(&mut self, priority: GpuPriority) -> PoolWaiter {
+        let lane = self.lane_mut(priority);
+        let ticket = lane.next_ticket;
+        lane.next_ticket = lane.next_ticket.wrapping_add(1);
+        lane.waiting += 1;
+        self.waiters += 1;
+        PoolWaiter { priority, ticket }
+    }
+
+    fn selected_priority(&self) -> Option<GpuPriority> {
+        match (self.spine_waiters.waiting > 0, self.bulk_waiters.waiting > 0) {
+            (false, false) => None,
+            (true, false) => Some(GpuPriority::Spine),
+            (false, true) => Some(GpuPriority::Bulk),
+            (true, true) if self.consecutive_spine_grants < MAX_CONSECUTIVE_SPINE_GRANTS => {
+                Some(GpuPriority::Spine)
+            }
+            (true, true) => Some(GpuPriority::Bulk),
+        }
+    }
+
+    fn waiter_is_selected(&self, waiter: PoolWaiter) -> bool {
+        self.selected_priority() == Some(waiter.priority)
+            && self.lane(waiter.priority).serving_ticket == waiter.ticket
+    }
+
+    fn finish_waiter(&mut self, waiter: PoolWaiter) {
+        let lane = self.lane_mut(waiter.priority);
+        debug_assert_eq!(lane.serving_ticket, waiter.ticket);
+        debug_assert!(lane.waiting > 0);
+        lane.serving_ticket = lane.serving_ticket.wrapping_add(1);
+        lane.waiting -= 1;
+        debug_assert!(self.waiters > 0);
+        self.waiters -= 1;
+
+        match waiter.priority {
+            GpuPriority::Spine if self.bulk_waiters.waiting > 0 => {
+                self.consecutive_spine_grants += 1;
+            }
+            GpuPriority::Spine | GpuPriority::Bulk => {
+                self.consecutive_spine_grants = 0;
+            }
+        }
+    }
+
+    fn abandon_waiter(&mut self, waiter: PoolWaiter) {
+        let lane = self.lane_mut(waiter.priority);
+        debug_assert!(lane.waiting > 0);
+        lane.waiting -= 1;
+        debug_assert!(self.waiters > 0);
+        self.waiters -= 1;
+    }
 }
 
 struct DetachedOutput<'a> {
@@ -610,6 +706,26 @@ pub fn prewarm() {
 /// which a thread-local would not reach.
 static EXCLUSIVE_GPU_PHASE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+
+fn classify_tree_priority(
+    exclusive: bool,
+    leaf_count: usize,
+    leaf_width: usize,
+) -> GpuPriority {
+    if !exclusive && leaf_count == 1 << 17 && leaf_width > 64 {
+        GpuPriority::Spine
+    } else {
+        GpuPriority::Bulk
+    }
+}
+
+fn tree_priority(leaf_count: usize, leaf_width: usize) -> GpuPriority {
+    classify_tree_priority(
+        EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed),
+        leaf_count,
+        leaf_width,
+    )
+}
 
 /// Marks the start/end of an exclusive serial proving phase during which the
 /// GPU routing cutoff drops to [`EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS`].
@@ -1668,6 +1784,9 @@ impl MetalShared {
                     free: Vec::new(),
                     created: 0,
                     waiters: 0,
+                    spine_waiters: WaitLane::default(),
+                    bulk_waiters: WaitLane::default(),
+                    consecutive_spine_grants: 0,
                     spare_output: None,
                     detached_readback: false,
                 }),
@@ -1826,31 +1945,48 @@ impl MetalShared {
         })
     }
 
-    fn acquire_set(&self) -> Result<BufferSet, String> {
+    fn take_available_set(pool: &mut BufferPool) -> Option<BufferSet> {
+        if let Some(set) = pool.free.pop() {
+            return Some(set);
+        }
+        if pool.created < MAX_BUFFER_SETS {
+            pool.created += 1;
+            return Some(BufferSet {
+                input: None,
+                output: None,
+            });
+        }
+        None
+    }
+
+    fn acquire_set(&self, priority: GpuPriority) -> Result<BufferSet, String> {
         let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
-        loop {
-            if let Some(set) = pool.free.pop() {
+
+        // Preserve the uncontended fast path without allocating a ticket.
+        // Once anyone is queued, every newcomer joins its lane so it cannot
+        // steal a released set from the selected head waiter.
+        if pool.waiters == 0 {
+            if let Some(set) = Self::take_available_set(&mut pool) {
                 return Ok(set);
             }
-            if pool.created < MAX_BUFFER_SETS {
-                pool.created += 1;
-                return Ok(BufferSet {
-                    input: None,
-                    output: None,
-                });
-            }
-            pool.waiters += 1;
-            match self.available.wait(pool) {
-                Ok(mut next) => {
-                    next.waiters -= 1;
-                    pool = next;
+        }
+
+        let waiter = pool.enqueue_waiter(priority);
+        loop {
+            if pool.waiter_is_selected(waiter) {
+                if let Some(set) = Self::take_available_set(&mut pool) {
+                    pool.finish_waiter(waiter);
+                    return Ok(set);
                 }
+            }
+            pool = match self.available.wait(pool) {
+                Ok(pool) => pool,
                 Err(poisoned) => {
-                    let mut next = poisoned.into_inner();
-                    next.waiters -= 1;
+                    let mut pool = poisoned.into_inner();
+                    pool.abandon_waiter(waiter);
                     return Err("buffer pool poisoned".to_string());
                 }
-            }
+            };
         }
     }
 
@@ -1860,7 +1996,10 @@ impl MetalShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.free.push(set);
-        self.available.notify_one();
+        drop(pool);
+        // Both priority classes may be sleeping. Waking one arbitrary class
+        // can strand the selected head indefinitely, so re-check all lanes.
+        self.available.notify_all();
     }
 
     fn try_detach_completed_output(
@@ -2076,7 +2215,7 @@ impl MetalShared {
                 .new_buffer(value_bytes as u64, MTLResourceOptions::StorageModeShared)
         });
 
-        let mut set = self.acquire_set()?;
+        let mut set = self.acquire_set(tree_priority(lde_size, cols))?;
         let result = (|| -> Result<TreeReadback<'_, F>, String> {
             if set
                 .input
@@ -2333,7 +2472,7 @@ impl MetalShared {
                 .new_buffer(column_bytes as u64, MTLResourceOptions::StorageModeShared)
         });
 
-        let mut set = self.acquire_set()?;
+        let mut set = self.acquire_set(tree_priority(lde_size, cols))?;
         let result = self.build_from_coeffs_with_set(
             &mut set,
             coeff_columns,
@@ -2546,7 +2685,7 @@ impl MetalShared {
             .ok_or("Metal Merkle output size overflow")?;
 
         let job = GpuJobGuard::begin();
-        let mut set = self.acquire_set()?;
+        let mut set = self.acquire_set(tree_priority(leaf_count, leaf_width))?;
         let result = self.build_with_set(
             &mut set,
             source,
@@ -2933,9 +3072,120 @@ mod tests {
     use crate::plonk::vars::EvaluationVarsBaseBatch;
 
     #[test]
+    fn scheduler_tree_priority_classifier_is_exact() {
+        assert_eq!(
+            classify_tree_priority(false, 1 << 17, 65),
+            GpuPriority::Spine
+        );
+        assert_eq!(
+            classify_tree_priority(false, 1 << 17, 64),
+            GpuPriority::Bulk
+        );
+        assert_eq!(
+            classify_tree_priority(false, 1 << 16, 65),
+            GpuPriority::Bulk
+        );
+        assert_eq!(
+            classify_tree_priority(true, 1 << 17, 65),
+            GpuPriority::Bulk
+        );
+    }
+
+    #[test]
+    fn scheduler_priority_lanes_are_fifo_and_spine_overtakes_bulk() {
+        let mut pool = BufferPool::default();
+        let bulk = pool.enqueue_waiter(GpuPriority::Bulk);
+        let first_spine = pool.enqueue_waiter(GpuPriority::Spine);
+        let second_spine = pool.enqueue_waiter(GpuPriority::Spine);
+
+        assert!(pool.waiter_is_selected(first_spine));
+        assert!(!pool.waiter_is_selected(second_spine));
+        assert!(!pool.waiter_is_selected(bulk));
+
+        pool.finish_waiter(first_spine);
+        assert!(pool.waiter_is_selected(second_spine));
+        assert!(!pool.waiter_is_selected(bulk));
+    }
+
+    #[test]
+    fn scheduler_bulk_gets_one_grant_after_bounded_spine_burst() {
+        let mut pool = BufferPool::default();
+        let bulk = pool.enqueue_waiter(GpuPriority::Bulk);
+        let spines: Vec<_> = (0..=MAX_CONSECUTIVE_SPINE_GRANTS)
+            .map(|_| pool.enqueue_waiter(GpuPriority::Spine))
+            .collect();
+
+        for spine in &spines[..MAX_CONSECUTIVE_SPINE_GRANTS] {
+            assert!(pool.waiter_is_selected(*spine));
+            pool.finish_waiter(*spine);
+        }
+        assert!(pool.waiter_is_selected(bulk));
+        assert!(!pool.waiter_is_selected(spines[MAX_CONSECUTIVE_SPINE_GRANTS]));
+
+        pool.finish_waiter(bulk);
+        assert!(pool.waiter_is_selected(spines[MAX_CONSECUTIVE_SPINE_GRANTS]));
+    }
+
+    #[test]
+    fn scheduler_condvar_wakes_selected_spine_ahead_of_earlier_bulk_waiter() {
+        use std::sync::mpsc;
+
+        let context = MetalShared::new().expect("Metal context");
+        let owner = context.acquire_set(GpuPriority::Bulk).expect("owner set");
+
+        std::thread::scope(|scope| {
+            let (tx, rx) = mpsc::channel();
+            let context_ref = &context;
+            let bulk_tx = tx.clone();
+            scope.spawn(move || {
+                let set = context_ref
+                    .acquire_set(GpuPriority::Bulk)
+                    .expect("bulk waiter set");
+                bulk_tx.send(GpuPriority::Bulk).expect("bulk order");
+                context_ref.release_set(set);
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while context.pool.lock().unwrap().bulk_waiters.waiting != 1 {
+                assert!(Instant::now() < deadline, "bulk waiter did not block");
+                std::thread::yield_now();
+            }
+
+            let context_ref = &context;
+            scope.spawn(move || {
+                let set = context_ref
+                    .acquire_set(GpuPriority::Spine)
+                    .expect("spine waiter set");
+                tx.send(GpuPriority::Spine).expect("spine order");
+                context_ref.release_set(set);
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while context.pool.lock().unwrap().waiters != 2 {
+                assert!(Instant::now() < deadline, "both waiters did not block");
+                std::thread::yield_now();
+            }
+
+            context.release_set(owner);
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(2))
+                    .expect("first waiter must acquire"),
+                GpuPriority::Spine
+            );
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(2))
+                    .expect("second waiter must acquire"),
+                GpuPriority::Bulk
+            );
+        });
+    }
+
+    #[test]
     fn does_not_detach_output_without_a_waiting_build() {
         let context = MetalShared::new().expect("Metal context");
-        let mut set = context.acquire_set().expect("buffer set");
+        let mut set = context
+            .acquire_set(GpuPriority::Bulk)
+            .expect("buffer set");
         set.output = Some(autoreleasepool(|| {
             context
                 .device
@@ -2957,7 +3207,9 @@ mod tests {
         use std::sync::mpsc;
 
         let context = MetalShared::new().expect("Metal context");
-        let mut set = context.acquire_set().expect("first set");
+        let mut set = context
+            .acquire_set(GpuPriority::Bulk)
+            .expect("first set");
         set.output = Some(autoreleasepool(|| {
             context
                 .device
@@ -2969,7 +3221,9 @@ mod tests {
             let (tx, rx) = mpsc::sync_channel(0);
             let context_ref = &context;
             scope.spawn(move || {
-                let next = context_ref.acquire_set().expect("waiting set");
+                let next = context_ref
+                    .acquire_set(GpuPriority::Bulk)
+                    .expect("waiting set");
                 tx.send(next).expect("return acquired set");
             });
 
@@ -3006,7 +3260,9 @@ mod tests {
         type F = GoldilocksField;
 
         let context = MetalShared::new().expect("Metal context");
-        let mut set = context.acquire_set().expect("buffer set");
+        let mut set = context
+            .acquire_set(GpuPriority::Bulk)
+            .expect("buffer set");
         let limbs: Vec<u64> = (0..28).collect();
         set.output = Some(autoreleasepool(|| {
             context.device.new_buffer_with_data(
