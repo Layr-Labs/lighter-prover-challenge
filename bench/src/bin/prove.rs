@@ -68,7 +68,32 @@ fn main() {
     // the compiled kernels are identical either way.
     plonky2::hash::poseidon2::prewarm_gpu();
     env_logger::init();
+    // The ranked harness runs five worker processes concurrently on one host
+    // and scores the sum of their lifetimes (see the decay comment above), but
+    // the rayon pool defaults to the machine's full core count, so with the
+    // default each worker spawns `nproc` threads and the five together
+    // oversubscribe the machine ~5x. Every CPU-bound leg of the pipeline —
+    // witness generation, the CPU-side Merkle tree recursion the promoted
+    // frontier retunes, and the FRI folding — then contends with four other
+    // workers' pools on the same cores. Cap the pool to this worker's fair
+    // share (`nproc / 5`) so the five pools together roughly tile the machine
+    // instead of thundering on it. Floor of 4 keeps witness generation from
+    // serializing on a small host; the local 24-core single-worker curve
+    // (24t = 133 s, 12t = 147.5 s, 6t = 208.1 s) says the last dozen threads
+    // are worth ~11% total, so the cap gives up almost nothing. Value-exact:
+    // rayon's `join` semantics are unchanged, only how many threads wait on
+    // the work-stealing queues.
+    // `LIGHTER_PROVE_THREADS` overrides for local A/B runs; the ranked
+    // environment is cleared so it can never be smuggled in.
+    let ranked_threads = std::env::var_os("LIGHTER_PROVE_THREADS")
+        .and_then(|v| v.to_str().and_then(|s| s.parse::<usize>().ok()))
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| (n.get() / 5).clamp(4, 24))
+                .unwrap_or(6)
+        });
     rayon::ThreadPoolBuilder::new()
+        .num_threads(ranked_threads)
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
         .expect("cannot configure prover thread pool");
