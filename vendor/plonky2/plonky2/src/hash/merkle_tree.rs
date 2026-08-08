@@ -1,7 +1,10 @@
 #[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
+use core::fmt::{self, Debug, Formatter};
 use core::mem::MaybeUninit;
 use core::slice;
+#[cfg(feature = "std")]
+use std::sync::Arc;
 
 use plonky2_maybe_rayon::*;
 use serde::{Deserialize, Serialize};
@@ -108,18 +111,121 @@ pub enum MerkleLeaves<F> {
 /// digest of the subtree covering leaves `i << l..(i + 1) << l`. The final
 /// level (the last `level_offsets` entry) is the cap, so
 /// `level_offsets.len() - 1` is the number of hashing layers below the cap.
-#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) trait LevelOrderNodeReader<T>: Debug + Send + Sync {
+    fn len(&self) -> usize;
+    fn node(&self, index: usize) -> T;
+}
+
+enum LevelOrderNodeStorage<T> {
+    Owned(Vec<T>),
+    Lazy(Arc<dyn LevelOrderNodeReader<T>>),
+}
+
+impl<T: Clone> Clone for LevelOrderNodeStorage<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Owned(nodes) => Self::Owned(nodes.clone()),
+            Self::Lazy(reader) => Self::Lazy(Arc::clone(reader)),
+        }
+    }
+}
+
+impl<T> Debug for LevelOrderNodeStorage<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Owned(nodes) => f
+                .debug_struct("Owned")
+                .field("len", &nodes.len())
+                .finish(),
+            Self::Lazy(reader) => f
+                .debug_struct("Lazy")
+                .field("len", &reader.len())
+                .finish(),
+        }
+    }
+}
+
 pub struct LevelOrderDigests<T> {
-    /// All tree nodes as one contiguous level-order array, cap level included.
-    pub nodes: Vec<T>,
+    /// All tree nodes as owned memory or a read-only backend-provided store.
+    storage: LevelOrderNodeStorage<T>,
     /// Element offset of each level's first node within `nodes`.
     pub level_offsets: Vec<usize>,
 }
 
+impl<T: Clone> Clone for LevelOrderDigests<T> {
+    fn clone(&self) -> Self {
+        Self {
+            storage: self.storage.clone(),
+            level_offsets: self.level_offsets.clone(),
+        }
+    }
+}
+
+impl<T> Debug for LevelOrderDigests<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LevelOrderDigests")
+            .field("storage", &self.storage)
+            .field("level_offsets", &self.level_offsets)
+            .finish()
+    }
+}
+
+impl<T: Copy + PartialEq> PartialEq for LevelOrderDigests<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.level_offsets == other.level_offsets
+            && self.len() == other.len()
+            && (0..self.len()).all(|index| self.node_at(index) == other.node_at(index))
+    }
+}
+
+impl<T: Copy + Eq> Eq for LevelOrderDigests<T> {}
+
+impl<T> LevelOrderDigests<T> {
+    pub fn owned(nodes: Vec<T>, level_offsets: Vec<usize>) -> Self {
+        Self {
+            storage: LevelOrderNodeStorage::Owned(nodes),
+            level_offsets,
+        }
+    }
+
+    pub(crate) fn lazy(
+        reader: Arc<dyn LevelOrderNodeReader<T>>,
+        level_offsets: Vec<usize>,
+    ) -> Self {
+        Self {
+            storage: LevelOrderNodeStorage::Lazy(reader),
+            level_offsets,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.storage {
+            LevelOrderNodeStorage::Owned(nodes) => nodes.len(),
+            LevelOrderNodeStorage::Lazy(reader) => reader.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_lazy(&self) -> bool {
+        matches!(self.storage, LevelOrderNodeStorage::Lazy(_))
+    }
+}
+
 impl<T: Copy> LevelOrderDigests<T> {
+    pub(crate) fn node_at(&self, index: usize) -> T {
+        match &self.storage {
+            LevelOrderNodeStorage::Owned(nodes) => nodes[index],
+            LevelOrderNodeStorage::Lazy(reader) => reader.node(index),
+        }
+    }
+
     /// Node `index` of level `level`.
     pub fn node(&self, level: usize, index: usize) -> T {
-        self.nodes[self.level_offsets[level] + index]
+        self.node_at(self.level_offsets[level] + index)
     }
 
     /// Merkle path siblings for `leaf_index`: the sibling hashed in at layer
@@ -602,7 +708,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         if let Some((level_digests, cap)) =
             H::try_build_merkle_tree_column_store(&columns, cap_height)
         {
-            debug_assert_eq!(level_digests.nodes.len(), 2 * num_leaves - (1 << cap_height));
+            debug_assert_eq!(level_digests.len(), 2 * num_leaves - (1 << cap_height));
             debug_assert_eq!(cap.len(), 1 << cap_height);
             return Self {
                 leaves: MerkleLeaves::Columns { columns, log_rows },
@@ -650,7 +756,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     ) -> Self {
         let num_leaves = columns.num_rows();
         let log_rows = log2_strict(num_leaves);
-        debug_assert_eq!(level_digests.nodes.len(), 2 * num_leaves - cap.len());
+        debug_assert_eq!(level_digests.len(), 2 * num_leaves - cap.len());
         Self {
             leaves: MerkleLeaves::Columns { columns, log_rows },
             num_leaves,
@@ -709,7 +815,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         if let Some((level_digests, cap)) =
             H::try_build_merkle_tree(&leaves, leaf_width, num_leaves, cap_height)
         {
-            debug_assert_eq!(level_digests.nodes.len(), 2 * num_leaves - (1 << cap_height));
+            debug_assert_eq!(level_digests.len(), 2 * num_leaves - (1 << cap_height));
             debug_assert_eq!(cap.len(), 1 << cap_height);
             return Self {
                 leaves: MerkleLeaves::Rows {
@@ -789,6 +895,9 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use core::fmt::Debug;
+    use std::sync::Arc;
+
     use anyhow::Result;
 
     use super::*;
@@ -798,6 +907,41 @@ pub(crate) mod tests {
 
     pub(crate) fn random_data<F: RichField>(n: usize, k: usize) -> Vec<Vec<F>> {
         (0..n).map(|_| F::rand_vec(k)).collect()
+    }
+
+    #[derive(Debug)]
+    struct FakeNodeReader<T>(Vec<T>);
+
+    impl<T: Copy + Send + Sync + Debug + 'static> LevelOrderNodeReader<T> for FakeNodeReader<T> {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        fn node(&self, index: usize) -> T {
+            self.0[index]
+        }
+    }
+
+    #[test]
+    fn lazy_level_order_storage_matches_owned_for_nodes_paths_clone_and_layout() {
+        let nodes: Vec<u64> = (100..114).collect();
+        let offsets = vec![0, 8, 12];
+        let owned = LevelOrderDigests::owned(nodes.clone(), offsets.clone());
+        let lazy = LevelOrderDigests::lazy(Arc::new(FakeNodeReader(nodes)), offsets);
+
+        assert_eq!(lazy.len(), owned.len());
+        assert!(!lazy.is_empty());
+        for (level, width) in [8, 4, 2].into_iter().enumerate() {
+            for index in 0..width {
+                assert_eq!(lazy.node(level, index), owned.node(level, index));
+            }
+        }
+        for leaf in 0..8 {
+            assert_eq!(lazy.prove_siblings(leaf), owned.prove_siblings(leaf));
+        }
+        assert_eq!(lazy.to_interleaved(), owned.to_interleaved());
+        assert_eq!(lazy, owned);
+        assert_eq!(lazy.clone(), lazy);
     }
 
     fn verify_all_leaves<
@@ -882,13 +1026,7 @@ pub(crate) mod tests {
             level_start = next_start;
         }
         let cap = nodes[level_start..].to_vec();
-        (
-            LevelOrderDigests {
-                nodes,
-                level_offsets,
-            },
-            cap,
-        )
+        (LevelOrderDigests::owned(nodes, level_offsets), cap)
     }
 
     /// Differential test: a tree backed by level-order digests must produce

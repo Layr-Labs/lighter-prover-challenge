@@ -2316,12 +2316,16 @@ impl Read for Buffer<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use anyhow::Result;
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::Field;
     use crate::gates::noop::NoopGate;
+    use crate::hash::hash_types::HashOut;
+    use crate::hash::merkle_tree::{LevelOrderDigests, LevelOrderNodeReader};
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData, ProverOnlyCircuitData};
@@ -2331,6 +2335,86 @@ mod tests {
     const D: usize = 2;
     type F = GoldilocksField;
     type C = PoseidonGoldilocksConfig;
+
+    #[derive(Debug)]
+    struct FakeHashReader(Vec<HashOut<F>>);
+
+    impl LevelOrderNodeReader<HashOut<F>> for FakeHashReader {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        fn node(&self, index: usize) -> HashOut<F> {
+            self.0[index]
+        }
+    }
+
+    #[test]
+    fn lazy_level_order_merkle_serialization_matches_owned_bytes() {
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        let leaf_width = 3;
+        let num_leaves = 8;
+        let leaves: Vec<Vec<F>> = (0..num_leaves)
+            .map(|leaf| {
+                (0..leaf_width)
+                    .map(|column| F::from_canonical_usize(leaf * leaf_width + column + 1))
+                    .collect()
+            })
+            .collect();
+        let flat: Vec<F> = leaves.iter().flatten().copied().collect();
+
+        let mut nodes: Vec<HashOut<F>> = leaves.iter().map(|leaf| H::hash_or_noop(leaf)).collect();
+        let mut level_offsets = vec![0];
+        let mut level_start = 0;
+        for _ in 0..2 {
+            let next_start = nodes.len();
+            for pair in 0..(next_start - level_start) / 2 {
+                nodes.push(H::two_to_one(
+                    nodes[level_start + 2 * pair],
+                    nodes[level_start + 2 * pair + 1],
+                ));
+            }
+            level_offsets.push(next_start);
+            level_start = next_start;
+        }
+        let cap = nodes[level_start..].to_vec();
+        let owned_levels = LevelOrderDigests::owned(nodes.clone(), level_offsets.clone());
+        let lazy_levels = LevelOrderDigests::lazy(Arc::new(FakeHashReader(nodes)), level_offsets);
+
+        let owned_tree = MerkleTree::<F, H> {
+            leaves: MerkleLeaves::Rows {
+                data: flat.clone(),
+                width: leaf_width,
+            },
+            num_leaves,
+            digests: Vec::new(),
+            level_digests: Some(owned_levels.clone()),
+            cap: MerkleCap(cap.clone()),
+        };
+        let lazy_tree = MerkleTree::<F, H> {
+            leaves: MerkleLeaves::Rows {
+                data: flat,
+                width: leaf_width,
+            },
+            num_leaves,
+            digests: Vec::new(),
+            level_digests: Some(lazy_levels),
+            cap: MerkleCap(cap.clone()),
+        };
+
+        let mut owned_bytes = Vec::new();
+        owned_bytes.write_merkle_tree(&owned_tree).unwrap();
+        let mut lazy_bytes = Vec::new();
+        lazy_bytes.write_merkle_tree(&lazy_tree).unwrap();
+        assert_eq!(lazy_bytes, owned_bytes);
+
+        let decoded: MerkleTree<F, H> = Buffer::new(&lazy_bytes).read_merkle_tree().unwrap();
+        assert_eq!(decoded.num_leaves, num_leaves);
+        assert_eq!(decoded.digests, owned_levels.to_interleaved());
+        assert!(decoded.level_digests.is_none());
+        assert_eq!(decoded.cap.0, cap);
+    }
 
     /// The narrowed `u32` codec must produce byte-for-byte the legacy 8-byte-per-entry encoding,
     /// and must round-trip.

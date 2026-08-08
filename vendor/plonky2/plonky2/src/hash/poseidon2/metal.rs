@@ -7,14 +7,14 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use metal::{
     Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSUInteger,
+    MTLCommandBufferStatus, MTLResourceOptions, MTLSize, MTLStorageMode, NSUInteger,
 };
 use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
 
 use crate::field::types::{Field, PrimeField64};
 use crate::hash::hash_types::{HashOut, RichField};
-use crate::hash::merkle_tree::LevelOrderDigests;
+use crate::hash::merkle_tree::{LevelOrderDigests, LevelOrderNodeReader};
 use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
@@ -310,6 +310,60 @@ impl<F> PartialEq for MetalColumns<F> {
 }
 
 impl<F> Eq for MetalColumns<F> {}
+
+/// Read-only level-order digests retained in a completed shared Metal buffer.
+/// The buffer is removed from the reusable set before this reader is created,
+/// so no later command can overwrite it while any reader clone remains alive.
+#[derive(Debug)]
+struct MetalLevelOrderNodes<F> {
+    buffer: Buffer,
+    node_count: usize,
+    marker: PhantomData<fn() -> F>,
+}
+
+impl<F> MetalLevelOrderNodes<F> {
+    fn new(buffer: Buffer, node_count: usize) -> Result<Self, String> {
+        let limb_count = node_count
+            .checked_mul(4)
+            .ok_or("Metal Merkle node limb count overflow")?;
+        let byte_count = limb_count
+            .checked_mul(size_of::<u64>())
+            .ok_or("Metal Merkle node byte count overflow")?;
+        if buffer.length() < byte_count as u64 {
+            return Err(format!(
+                "Metal Merkle output buffer too short: {} < {byte_count}",
+                buffer.length()
+            ));
+        }
+        if buffer.storage_mode() != MTLStorageMode::Shared {
+            return Err("Metal Merkle output buffer is not CPU-visible shared storage".to_string());
+        }
+        Ok(Self {
+            buffer,
+            node_count,
+            marker: PhantomData,
+        })
+    }
+}
+
+impl<F: RichField> LevelOrderNodeReader<HashOut<F>> for MetalLevelOrderNodes<F> {
+    fn len(&self) -> usize {
+        self.node_count
+    }
+
+    fn node(&self, index: usize) -> HashOut<F> {
+        assert!(index < self.node_count, "Metal Merkle node out of bounds");
+        let limbs = unsafe {
+            // SAFETY: `new` checked that the shared buffer covers exactly this
+            // many readable limbs, and ownership prevents subsequent writes.
+            slice::from_raw_parts(self.buffer.contents().cast::<u64>(), self.node_count * 4)
+        };
+        let limbs = &limbs[index * 4..index * 4 + 4];
+        HashOut {
+            elements: core::array::from_fn(|i| F::from_canonical_u64(limbs[i])),
+        }
+    }
+}
 
 struct BufferSet {
     input: Option<Buffer>,
@@ -1049,12 +1103,12 @@ pub(crate) fn allocate_columns<F: RichField>(
 
 /// Hashes retained shared columns without copying them through the pooled
 /// staging buffer.
-/// Retained buffers for the streamed sponge build: the inter-pass state
-/// (12 u64 lanes per leaf, column-major) and the level-order digest output.
-/// One streamed build runs at a time (exclusive proving phases only), so a
-/// single grow-on-demand pair suffices; holding the lock for the whole build
-/// serializes any unexpected second caller onto the classic path.
-static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
+/// Retained inter-pass state for the streamed sponge build (12 u64 lanes per
+/// leaf, column-major). A completed level-order output becomes the returned
+/// tree's immutable backing store, so only the scratch state can be reused.
+/// Holding the lock for the whole build serializes any unexpected second
+/// caller onto the classic path.
+static STREAMED_STATE: Mutex<Option<Buffer>> = Mutex::new(None);
 
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
@@ -1077,17 +1131,29 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     cap_height: usize,
     fill_group: &(dyn Fn(usize, &mut [&mut [F]]) + Sync),
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
+    if !EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    build_merkle_tree_shared_streamed_inner(columns, cap_height, fill_group, 16, 1 << 20)
+}
+
+fn build_merkle_tree_shared_streamed_inner<F: RichField>(
+    columns: &MetalColumns<F>,
+    cap_height: usize,
+    fill_group: &(dyn Fn(usize, &mut [&mut [F]]) + Sync),
+    min_leaf_width: usize,
+    min_leaf_count: usize,
+) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
-        || leaf_width < 16
-        || leaf_count < 1 << 20
+        || leaf_width < min_leaf_width
+        || leaf_count < min_leaf_count
         || !leaf_count.is_power_of_two()
         || leaf_count > u32::MAX as usize
         || leaf_width > u32::MAX as usize
         || cap_height > leaf_count.ilog2() as usize
-        || !EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
     {
         return None;
     }
@@ -1102,25 +1168,25 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let state_bytes = leaf_count.checked_mul(12)?.checked_mul(size_of::<u64>())?;
 
     let job = GpuJobGuard::begin();
-    let mut buffers = STREAMED_BUFFERS.lock().ok()?;
-    let needs_new = buffers.as_ref().map_or(true, |(state, output)| {
-        state.length() < state_bytes as u64 || output.length() < output_bytes as u64
-    });
-    if needs_new {
-        *buffers = Some(autoreleasepool(|| {
-            (
-                context.device.new_buffer(
-                    state_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
-                context.device.new_buffer(
-                    output_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
+    let mut state = STREAMED_STATE.lock().ok()?;
+    if state
+        .as_ref()
+        .map_or(true, |buffer| buffer.length() < state_bytes as u64)
+    {
+        *state = Some(autoreleasepool(|| {
+            context.device.new_buffer(
+                state_bytes as u64,
+                MTLResourceOptions::StorageModeShared,
             )
         }));
     }
-    let (state_buffer, output_buffer) = buffers.as_ref()?;
+    let state_buffer = state.as_ref()?;
+    let output_buffer = autoreleasepool(|| {
+        context.device.new_buffer(
+            output_bytes as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    });
 
     // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
     // absorption of group g: commands on one queue execute in submission
@@ -1151,7 +1217,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&columns.buffer), 0);
             encoder.set_buffer(1, Some(state_buffer), 0);
-            encoder.set_buffer(2, Some(output_buffer), 0);
+            encoder.set_buffer(2, Some(&output_buffer), 0);
             encoder.set_buffer(3, Some(&context.parameters), 0);
             set_u32(encoder, 4, leaf_count as u32);
             set_u32(encoder, 5, leaf_count.ilog2());
@@ -1186,12 +1252,12 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             parent_encoder.set_compute_pipeline_state(&context.parent_pipeline);
             parent_encoder.set_buffer(
                 0,
-                Some(output_buffer),
+                Some(&output_buffer),
                 (child_offset * size_of::<u64>()) as NSUInteger,
             );
             parent_encoder.set_buffer(
                 1,
-                Some(output_buffer),
+                Some(&output_buffer),
                 (level_offset * size_of::<u64>()) as NSUInteger,
             );
             parent_encoder.set_buffer(2, Some(&context.parameters), 0);
@@ -1213,21 +1279,32 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             command_buffer.wait_until_completed();
             command_buffer.status() == MTLCommandBufferStatus::Completed
         });
-    drop(job);
     if !all_ok {
+        drop(state);
+        drop(job);
         log::warn!("streamed Metal sponge build failed; falling back to the classic path");
         return None;
     }
 
-    let nodes = unsafe {
-        slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
+    let reader = match MetalLevelOrderNodes::<F>::new(output_buffer, total_node_count) {
+        Ok(reader) => Arc::new(reader),
+        Err(error) => {
+            drop(state);
+            drop(job);
+            log::warn!(
+                "streamed Metal output retention failed; falling back to the classic path: {error}"
+            );
+            return None;
+        }
     };
-    Some(tree_from_levels::<F>(
-        nodes,
-        &level_offsets,
-        leaf_count,
-        cap_height,
-    ))
+    let digest_offsets: Vec<_> = level_offsets.into_iter().map(|offset| offset / 4).collect();
+    let cap_offset = *digest_offsets.last()?;
+    drop(state);
+    drop(job);
+    let cap = (0..cap_count)
+        .map(|index| reader.node(cap_offset + index))
+        .collect();
+    Some((LevelOrderDigests::lazy(reader, digest_offsets), cap))
 }
 
 pub(crate) fn build_merkle_tree_shared<F: RichField>(
@@ -2744,13 +2821,7 @@ fn tree_from_levels<F: RichField>(
     let level_offsets: Vec<usize> = level_offsets.iter().map(|offset| offset / 4).collect();
     let cap_offset = *level_offsets.last().unwrap();
     let cap = digests[cap_offset..cap_offset + cap_count].to_vec();
-    (
-        LevelOrderDigests {
-            nodes: digests,
-            level_offsets,
-        },
-        cap,
-    )
+    (LevelOrderDigests::owned(digests, level_offsets), cap)
 }
 
 #[cfg(test)]
@@ -2816,6 +2887,43 @@ mod tests {
     use crate::hash::merkle_tree::{capacity_up_to_mut, fill_digests_buf, merkle_tree_prove};
     use crate::hash::poseidon2::hash::Poseidon2Hash;
     use crate::plonk::vars::EvaluationVarsBaseBatch;
+
+    #[test]
+    fn metal_level_order_nodes_match_owned_reference_for_every_limb() {
+        type F = GoldilocksField;
+
+        let context = MetalShared::new().expect("Metal context");
+        let edge_values = [
+            0,
+            1,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            u64::MAX,
+            42,
+        ];
+        let limbs: Vec<u64> = (0..28)
+            .map(|index| edge_values[index % edge_values.len()])
+            .collect();
+        let buffer = autoreleasepool(|| {
+            context.device.new_buffer_with_data(
+                limbs.as_ptr().cast::<c_void>(),
+                size_of_val(limbs.as_slice()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+        let limb_offsets = vec![0, 16, 24];
+        let expected = tree_from_levels::<F>(&limbs, &limb_offsets, 4, 0);
+
+        let reader = Arc::new(
+            MetalLevelOrderNodes::<F>::new(buffer, 7).expect("valid shared digest buffer"),
+        );
+        let actual = LevelOrderDigests::lazy(reader, vec![0, 4, 6]);
+        let actual_cap: Vec<_> = (0..1).map(|index| actual.node(2, index)).collect();
+
+        assert_eq!(actual, expected.0);
+        assert_eq!(actual_cap, expected.1);
+    }
 
     #[test]
     fn does_not_detach_output_without_a_waiting_build() {
@@ -2911,6 +3019,55 @@ mod tests {
         context.release_set(set);
 
         assert_eq!(pending.finish(), expected);
+    }
+
+    #[test]
+    fn streamed_shared_columns_return_lazy_digests() {
+        const LEAF_COUNT: usize = 64;
+        const WIDTH: usize = 16;
+        const CAP_HEIGHT: usize = 2;
+
+        let context = shared_context().expect("Metal context");
+        let columns = context
+            .allocate_columns::<GoldilocksField>(LEAF_COUNT, WIDTH)
+            .expect("shared columns");
+        let fill_group = |group: usize, destinations: &mut [&mut [GoldilocksField]]| {
+            destinations
+                .iter_mut()
+                .enumerate()
+                .for_each(|(within_group, destination)| {
+                    let column = group * 8 + within_group;
+                    for (row, value) in destination.iter_mut().enumerate() {
+                        *value = GoldilocksField::from_canonical_usize(
+                            1 + column * LEAF_COUNT + row,
+                        );
+                    }
+                });
+        };
+
+        let streamed = build_merkle_tree_shared_streamed_inner(
+            &columns,
+            CAP_HEIGHT,
+            &fill_group,
+            WIDTH,
+            LEAF_COUNT,
+        )
+        .expect("streamed GPU tree");
+        assert!(
+            streamed.0.is_lazy(),
+            "streamed commitments must retain the completed Metal output"
+        );
+
+        let classic = context
+            .build(
+                LeafSource::Shared(&columns),
+                WIDTH,
+                LEAF_COUNT,
+                CAP_HEIGHT,
+            )
+            .expect("classic shared-column tree");
+        assert_tree_raw_eq(&streamed, &classic, WIDTH, CAP_HEIGHT);
+        assert_all_paths_raw_eq(&streamed, &classic, LEAF_COUNT, CAP_HEIGHT);
     }
 
     fn gpu_duration(command_buffer: &CommandBuffer, wall: Duration) -> Duration {
@@ -4960,7 +5117,7 @@ kernel void goldilocks_mul_bench_native(
         let gpu = context
             .build(LeafSource::Rows(&flat), WIDTH, leaf_count, cap_height)
             .unwrap();
-        assert_eq!(gpu.0.nodes.len(), node_count);
+        assert_eq!(gpu.0.len(), node_count);
         let cpu = cpu_tree(&leaves, cap_height);
         assert_tree_eq(&gpu, &cpu, WIDTH, cap_height);
     }
@@ -5021,14 +5178,13 @@ kernel void goldilocks_mul_bench_native(
 
     fn assert_tree_raw_eq(actual: &GpuTree, expected: &GpuTree, width: usize, cap_height: usize) {
         assert_eq!(actual.0.level_offsets, expected.0.level_offsets);
-        assert_eq!(actual.0.nodes.len(), expected.0.nodes.len());
+        assert_eq!(actual.0.len(), expected.0.len());
         assert_eq!(actual.1.len(), expected.1.len());
-        for (index, (actual, expected)) in actual
-            .0
-            .nodes
-            .iter()
-            .chain(&actual.1)
-            .zip(expected.0.nodes.iter().chain(&expected.1))
+        let actual_nodes = (0..actual.0.len()).map(|index| actual.0.node_at(index));
+        let expected_nodes = (0..expected.0.len()).map(|index| expected.0.node_at(index));
+        for (index, (actual, expected)) in actual_nodes
+            .chain(actual.1.iter().copied())
+            .zip(expected_nodes.chain(expected.1.iter().copied()))
             .enumerate()
         {
             let actual = actual.elements.map(|value| value.to_noncanonical_u64());
