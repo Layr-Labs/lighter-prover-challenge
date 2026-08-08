@@ -1,3 +1,4 @@
+// Night shot 2: redraw of the four-stack + borrow tree (draw 1: 19.3250, upper mode, sub-bar).
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
