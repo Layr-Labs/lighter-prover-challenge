@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
@@ -40,7 +41,7 @@ const LIGHT_TX_PROOF_WINDOW: usize = 2;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
-fn chunk_is_light(txs: &[Tx<F>]) -> bool {
+fn chunk_is_light(txs: &[Arc<Tx<F>>]) -> bool {
     txs.first()
         .expect("block transaction chunk must not be empty")
         .tx_circuit_type
@@ -129,6 +130,7 @@ impl ChainState<'_> {
 #[allow(clippy::too_many_arguments)]
 fn chain_step_proof(
     path: TxPath,
+    active_paths: &AtomicUsize,
     chain_target: &BlockTxChainTarget,
     chain_data: &CircuitData<F, C, D>,
     chain_step: u64,
@@ -167,7 +169,16 @@ fn chain_step_proof(
                 feeder,
             )
         })?;
-        BlockTxChainCircuit::prove_prepared(pending, chain_data)
+        // Tell the Metal router which serial lane is about to prove. While both
+        // paths are alive, an already-running light fold is deadline work; the
+        // three-step heavy lane has ample slack before the final join. The hint
+        // changes routing only and is scoped to the actual proof, not its
+        // predecessor wait or early witness preparation.
+        plonky2::hash::poseidon2::with_chain_gpu_admission(
+            path == TxPath::Light,
+            active_paths.load(Ordering::Acquire) > 1,
+            || BlockTxChainCircuit::prove_prepared(pending, chain_data),
+        )
     })();
     result.unwrap_or_else(|error| {
         panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")
@@ -198,7 +209,7 @@ fn jump_from_witness(witness: &impl Witness<F>, target: &JumpStateTarget) -> Jum
 fn generate_tx_witness<'a>(
     path: TxPath,
     chunk_index: usize,
-    txs: Vec<Tx<F>>,
+    txs: Vec<Arc<Tx<F>>>,
     tx_data: &'a CircuitData<F, C, D>,
     tx_target: &BlockTxTarget,
     created_at: i64,
@@ -253,7 +264,7 @@ fn prove_tx_witness(
 #[allow(clippy::too_many_arguments)]
 fn prove_path(
     path: TxPath,
-    chunks: Vec<(usize, Vec<Tx<F>>)>,
+    chunks: Vec<(usize, Vec<Arc<Tx<F>>>)>,
     circuits: &Circuits,
     block_number: u64,
     created_at: i64,
@@ -326,6 +337,7 @@ fn prove_path(
                     .spawn_scoped(scope, move || {
                         chain_step_proof(
                             path,
+                            active_paths,
                             chain_target,
                             chain_data,
                             chain_step,
@@ -398,6 +410,7 @@ fn prove_path(
                 .spawn_scoped(scope, move || {
                     chain_step_proof(
                         path,
+                        active_paths,
                         chain_target,
                         chain_data,
                         chain_step,
@@ -427,6 +440,7 @@ fn prove_path(
             let previous = chain.take();
             chain = Some(ChainState::Ready(chain_step_proof(
                 path,
+                active_paths,
                 chain_target,
                 chain_data,
                 chain_step,
@@ -454,27 +468,6 @@ fn prove_path(
 /// Proves the block pre-execution circuit. The startup-overlap path must NOT
 /// set the exclusive GPU phase, because the remaining circuit loads are still
 /// using the GPU normally; the serial path sets it around the call.
-///
-/// Measured, so nobody re-mines this (10 interleaved runs, one binary, the
-/// switch runtime-gated, census taken in `gpu_worthwhile`):
-/// `Circuits::load_remaining_embedded` recomputes each blob's
-/// `constants_sigmas_commitment` through `PolynomialBatch::from_values`, so
-/// four commitment trees — 2 x (2^19 leaves x 88 cols) for the transaction
-/// circuits and 2 x (2^17 x 86) for the chain circuits, all either above the
-/// routing cutoff or wider than 64 and therefore GPU-bound unconditionally —
-/// are hashing on the GPU *inside* the pre-execution window (8 of the window's
-/// routing decisions). With `MAX_BUFFER_SETS == 1` those builds serialize, and
-/// this proof's own narrow trees observe `GPU_JOBS_IN_FLIGHT` at 1-2 for 5-7 of
-/// their 9 routing decisions. So "no other proof runs concurrently" holds here
-/// while "the GPU stream is idle" does not, and only the latter is the switch's
-/// real contract. Enabling it does change routing — the 2^17 width-20
-/// Zs/partial-products tree goes 1/10 -> 10/10 GPU and the width-16 quotient
-/// tree 6/10 -> 10/10 — but each flipped tree then queues FIFO behind a
-/// 2^19-leaf load build, and the phase inflated from a 325 ms median to 425 ms.
-/// It buys nothing even when it wins: this proof finishes a median 187 ms before
-/// the loads it hides behind, so the join waits on the loads, not on it.
-/// Enabling the switch only spends that slack (median 187 ms -> 126 ms) and put
-/// the proof on the critical path in 1 of the 5 runs that had it enabled.
 pub(crate) fn prove_pre_execution_parallel(
     pre_data: &CircuitData<F, C, D>,
     pre_target: &BlockPreExecutionTarget,
@@ -484,18 +477,7 @@ pub(crate) fn prove_pre_execution_parallel(
         .expect("block pre-execution proof failed")
 }
 
-/// The fully serial entry point: pre-execution proof first, then the pipeline.
-///
-/// Test-only. The `prove` binary starts the pre-execution proof on a startup
-/// thread that overlaps the remaining circuit loads and then calls
-/// [`prove_block_after_pre`] directly, so nothing on the scored path routes
-/// through here. It is retained as the reference for what the serial ordering
-/// looked like — in particular that the exclusive-GPU switch below is legitimate
-/// only under that ordering, which no longer exists (see
-/// [`prove_pre_execution_parallel`]). `#[cfg(test)]` because the release build
-/// would otherwise warn it dead.
-#[cfg(test)]
-pub fn prove_block(block: Block<F>, circuits: Circuits) -> Proof {
+pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
     // The pre-execution proof runs strictly before any other proving work, so
     // the serialized GPU stream is otherwise idle: route its mid-size column
     // trees to the GPU for just this phase.
@@ -521,8 +503,9 @@ pub(crate) fn prove_block_after_pre(
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
     let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
-    let mut heavy_chunks: Vec<(usize, Vec<Tx<F>>)> = Vec::new();
-    let mut light_chunks: Vec<(usize, Vec<Tx<F>>)> = Vec::with_capacity(tx_chunks.len());
+    let mut heavy_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> = Vec::new();
+    let mut light_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> =
+        Vec::with_capacity(tx_chunks.len());
     for (chunk_index, txs) in tx_chunks.drain(..).enumerate() {
         if chunk_is_light(&txs) {
             light_chunks.push((chunk_index, txs));
@@ -714,6 +697,52 @@ mod tests {
     }
 
     #[test]
+    fn empty_padding_transactions_share_storage_per_path() {
+        use std::sync::Arc;
+
+        std::thread::Builder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(|| {
+                let block = Block::<F>::from_json_with_empty_txs(
+                    include_bytes!("../bench_test.json"),
+                    HEAVY_TX_PER_PROOF,
+                    LIGHT_TX_PER_PROOF,
+                    PUBLIC_HEAVY_TX_COUNT,
+                    PUBLIC_LIGHT_TX_COUNT,
+                )
+                .expect("public fixture must parse");
+                let heavy = block
+                    .tx_chunks
+                    .iter()
+                    .flatten()
+                    .find(|tx| tx.tx_circuit_type != TX_LIGHT)
+                    .expect("heavy padding must exist");
+                let light = block
+                    .tx_chunks
+                    .iter()
+                    .flatten()
+                    .find(|tx| tx.tx_circuit_type == TX_LIGHT)
+                    .expect("light padding must exist");
+                assert!(block
+                    .tx_chunks
+                    .iter()
+                    .flatten()
+                    .filter(|tx| tx.tx_circuit_type != TX_LIGHT)
+                    .all(|tx| Arc::ptr_eq(tx, heavy)));
+                assert!(block
+                    .tx_chunks
+                    .iter()
+                    .flatten()
+                    .filter(|tx| tx.tx_circuit_type == TX_LIGHT)
+                    .all(|tx| Arc::ptr_eq(tx, light)));
+                assert!(!Arc::ptr_eq(heavy, light));
+            })
+            .expect("padding sharing test thread must start")
+            .join()
+            .expect("padding sharing test thread must finish");
+    }
+
+    #[test]
     fn exclusive_gpu_phase_is_claimed_only_by_the_last_running_path() {
         // Two paths proving: the one that reaches its drain first (the three-chunk
         // heavy path) must not claim the process-global exclusive phase while the
@@ -782,12 +811,12 @@ mod tests {
         // An all-empty (padding) chunk carries no state transition, so its embedded roots and
         // metadata hash are the only values the tx and chain constraints must agree on.
         // Chain-step cost is independent of tx contents: the chain circuit is fixed-size.
-        let mut empty_tx = block
+        let mut empty_tx = (**block
             .tx_chunks
             .iter()
             .flatten()
             .find(|tx| tx.tx_type == TX_TYPE_EMPTY)
-            .expect("fixture must contain an empty padding tx")
+            .expect("fixture must contain an empty padding tx"))
             .clone();
         empty_tx.tx_circuit_type = TX_LIGHT;
         empty_tx.tx_index = F::NEG_ONE.to_canonical_u64();
@@ -809,7 +838,7 @@ mod tests {
         let state_metadata_hash = new_state_metadata.hash();
         let jump = JumpState::initial(new_state_root, old_delta_root);
 
-        let light_chunk = vec![empty_tx; LIGHT_TX_PER_PROOF];
+        let light_chunk = vec![Arc::new(empty_tx); LIGHT_TX_PER_PROOF];
         let (witness, _) = generate_tx_witness(
             TxPath::Light,
             0,
@@ -912,8 +941,10 @@ mod tests {
             // path. The reference above keeps the old PartialWitness map
             // path solely for this manual timing harness.
             let direct_start = Instant::now();
+            let active_paths = AtomicUsize::new(2);
             let direct_proof = chain_step_proof(
                 TxPath::Light,
+                &active_paths,
                 &circuits.chain_target,
                 &circuits.chain_data,
                 chain_step,
