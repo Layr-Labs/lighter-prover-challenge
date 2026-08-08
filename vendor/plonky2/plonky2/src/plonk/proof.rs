@@ -337,39 +337,7 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         let degree = common_data.degree();
         let table = |z: F::Extension| -> Vec<F::Extension> { z.powers().take(degree).collect() };
         let zeta_pows = table(zeta);
-        // `g` is the order-`degree` subgroup generator, so `g^i` is exactly
-        // the process-cached natural-order two-adic subgroup, and
-        // `(g·ζ)^i = g^i · ζ^i` in the exact field. Deriving the shifted
-        // table from the `ζ` table by one elementwise base-field scalar
-        // product deletes the second serial `powers()` chain (a
-        // `degree`-long dependent extension-multiply chain in this serial
-        // opening phase) per proof. Representative-exactness is checkable at
-        // runtime: `LIGHTER_GZETA_TABLE_ASSERT=1` recomputes the old chain
-        // and compares every entry by raw noncanonical limbs.
-        let g_subgroup =
-            crate::plonk::prover::precomputed::two_adic_subgroup::<F>(common_data.degree_bits());
-        let g_zeta_pows: Vec<F::Extension> = zeta_pows
-            .iter()
-            .zip(g_subgroup.iter())
-            .map(|(&zeta_pow, &g_pow)| zeta_pow.scalar_mul(g_pow))
-            .collect();
-        if std::env::var_os("LIGHTER_GZETA_TABLE_ASSERT").is_some() {
-            let reference = table(g * zeta);
-            assert_eq!(reference.len(), g_zeta_pows.len());
-            for (i, (a, b)) in reference.iter().zip(&g_zeta_pows).enumerate() {
-                let a_raw: Vec<u64> = a
-                    .to_basefield_array()
-                    .iter()
-                    .map(|c| c.to_noncanonical_u64())
-                    .collect();
-                let b_raw: Vec<u64> = b
-                    .to_basefield_array()
-                    .iter()
-                    .map(|c| c.to_noncanonical_u64())
-                    .collect();
-                assert_eq!(a_raw, b_raw, "g-zeta table representative mismatch at {i}");
-            }
-        }
+        let g_zeta_pows = table(g * zeta);
         let eval_polynomials = |pows: &[F::Extension], polynomials: &[PolynomialCoeffs<F>]| {
             polynomials
                 .par_iter()
