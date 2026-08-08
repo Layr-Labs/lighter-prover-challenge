@@ -130,15 +130,20 @@ fn read_section<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
     Ok(section)
 }
 
-fn write_compressed_section(out: &mut Vec<u8>, raw: &[u8]) {
-    let compressed = lz4_flex::block::compress_prepend_size(raw);
+pub fn write_compressed_section(out: &mut Vec<u8>, raw: &[u8]) {
+    // zstd level 3: roughly half the bytes of the former fast LZ4 mode for
+    // these circuit blobs, which shrinks the embedded binary (the scored
+    // process pays per-MB code-signature validation and page-in on every
+    // spawn) at a decompression cost comparable to the old path.
+    let compressed =
+        zstd::bulk::compress(raw, 3).expect("embedded circuit blob zstd compression failed");
     write_section(out, &compressed);
 }
 
-fn read_compressed_section(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
+pub fn read_compressed_section(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
     let compressed = read_section(bytes, pos)?;
-    lz4_flex::block::decompress_size_prepended(compressed)
-        .context("embedded circuit blob failed LZ4 decompression")
+    zstd::stream::decode_all(std::io::Cursor::new(compressed))
+        .context("embedded circuit blob failed zstd decompression")
 }
 
 // ---------------------------------------------------------------------------

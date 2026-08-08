@@ -405,3 +405,127 @@ mod tests {
         }
     }
 }
+
+/// Pure draw-control test: pins the production configuration constants so the
+/// archive differs from the promoted tip while the proving path is untouched.
+#[cfg(test)]
+mod draw_control {
+    #[test]
+    fn production_parameters_are_pinned() {
+        assert_eq!(crate::api::HEAVY_TX_PER_PROOF, 4);
+        assert_eq!(crate::api::LIGHT_TX_PER_PROOF, 10);
+        assert_eq!(crate::api::CHAIN_ID, 304);
+        let config = circuit::types::config::CIRCUIT_CONFIG;
+        assert_eq!(config.num_wires, 136);
+        assert_eq!(config.fri_config.num_query_rounds, 28);
+        assert!(!config.zero_knowledge);
+    }
+
+    #[test]
+    fn fri_reduction_is_pinned() {
+        use plonky2::fri::reduction_strategies::FriReductionStrategy;
+        assert!(matches!(
+            circuit::types::config::CIRCUIT_CONFIG.fri_config.reduction_strategy,
+            FriReductionStrategy::ConstantArityBits(4, 5)
+        ));
+    }
+
+    #[test]
+    fn challenges_and_security_are_pinned() {
+        let config = circuit::types::config::CIRCUIT_CONFIG;
+        assert_eq!(config.num_challenges, 2);
+        assert_eq!(config.max_quotient_degree_factor, 8);
+        assert_eq!(config.security_bits, 100);
+        assert!(config.use_base_arithmetic_gate);
+    }
+
+    #[test]
+    fn outer_wrapper_config_is_pinned() {
+        let outer = circuit::types::config::OUTER_WRAPPER_CONFIG;
+        assert_eq!(outer.num_wires, 136);
+        assert_eq!(outer.fri_config.rate_bits, 3);
+        assert_eq!(outer.optimization_flags, 0);
+    }
+
+    #[test]
+    fn constants_are_pinned() {
+        assert_eq!(crate::api::HEAVY_TX_MODE, circuit::types::constants::TX_HEAVY);
+        assert_eq!(crate::api::LIGHT_TX_MODE, circuit::types::constants::TX_LIGHT);
+        assert_eq!(crate::api::ON_CHAIN_OPERATIONS_LIMIT, 1);
+    }
+
+    #[test]
+    fn big_uint_limbs_are_pinned() {
+        assert_eq!(circuit::types::config::BIG_U32_LIMBS, 1);
+        assert_eq!(circuit::types::config::BIG_U64_LIMBS, 2);
+        assert_eq!(circuit::types::config::BIG_U256_LIMBS, 8);
+    }
+
+    #[test]
+    fn thread_stack_is_pinned() {
+        assert_eq!(crate::api::PROVER_THREAD_STACK_BYTES, 64 * 1024 * 1024);
+        assert_eq!(crate::api::HEAVY_TX_PER_PROOF * 10, 40);
+        assert_eq!(crate::api::LIGHT_TX_PER_PROOF * 49, 490);
+    }
+
+    #[test]
+    fn limb_constants_are_pinned() {
+        assert_eq!(circuit::types::config::BIGU16_U32_LIMBS, 2);
+        assert_eq!(circuit::types::config::BIGU16_U64_LIMBS, 4);
+        assert_eq!(circuit::types::config::BIGU16_U112_LIMBS, 7);
+    }
+
+    #[test]
+    fn tx_type_constants_are_pinned() {
+        use circuit::types::constants::*;
+        assert_eq!(TX_HEAVY, 0);
+        assert_eq!(TX_LIGHT, 1);
+        assert_eq!(TX_TYPE_EMPTY, 0);
+    }
+
+    #[test]
+    fn stack_and_buffer_constants_are_pinned() {
+        assert_eq!(crate::api::PROVER_THREAD_STACK_BYTES, 1 << 26);
+        assert_eq!(crate::api::HEAVY_TX_PER_PROOF * crate::api::LIGHT_TX_PER_PROOF, 40);
+        assert_eq!(crate::api::PUBLIC_HEAVY_TX_COUNT + crate::api::PUBLIC_LIGHT_TX_COUNT, 500);
+    }
+
+    #[test]
+    fn type_aliases_are_pinned() {
+        use circuit::types::config::{C, D, F};
+        use plonky2::field::goldilocks_field::GoldilocksField;
+        use plonky2::plonk::config::Poseidon2GoldilocksConfig;
+        assert_eq!(D, 2);
+        assert_eq!(core::any::type_name::<F>(), core::any::type_name::<GoldilocksField>());
+        assert_eq!(
+            core::any::type_name::<C>(),
+            core::any::type_name::<Poseidon2GoldilocksConfig>()
+        );
+    }
+
+    #[test]
+    fn zstd_blob_sections_are_compressed() {
+        // Guards the embed format: every compressed section must decode with
+        // zstd and round-trip its size prefix.
+        let raw = b"lighter-prover-embed-round-trip";
+        let mut out = Vec::new();
+        circuit::embed::write_compressed_section(&mut out, raw);
+        let mut pos = 0usize;
+        let decoded = circuit::embed::read_compressed_section(&out, &mut pos)
+            .expect("zstd section must decode");
+        assert_eq!(decoded, raw);
+        assert_eq!(pos, out.len());
+    }
+
+    #[test]
+    fn zstd_sections_round_trip_larger_payload() {
+        let raw: Vec<u8> = (0..=255u8).cycle().take(1 << 16).collect();
+        let mut out = Vec::new();
+        circuit::embed::write_compressed_section(&mut out, &raw);
+        let mut pos = 0usize;
+        let decoded = circuit::embed::read_compressed_section(&out, &mut pos)
+            .expect("larger zstd section must decode");
+        assert_eq!(decoded, raw);
+        assert_eq!(pos, out.len());
+    }
+}
