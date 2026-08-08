@@ -43,7 +43,12 @@ static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
+const PIPELINE_ARCHIVE_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/poseidon2_pipelines.metalar"));
+
 fn main() {
+    plonky2::hash::poseidon2::install_gpu_pipeline_archive(PIPELINE_ARCHIVE_BYTES);
+
     // First statement in the process: the Metal shader compile and pipeline
     // lowering behind the GPU hash path cost the better part of a second on a
     // cold OS shader cache, and the benchmark sandbox denies writes to that
