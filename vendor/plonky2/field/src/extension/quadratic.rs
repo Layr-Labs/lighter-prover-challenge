@@ -1,5 +1,7 @@
+use alloc::vec::Vec;
 use core::fmt::{self, Debug, Display, Formatter};
 use core::iter::{Product, Sum};
+use core::mem::ManuallyDrop;
 use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
 use num::bigint::BigUint;
@@ -11,6 +13,7 @@ use crate::types::{Field, Sample};
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(bound = "")]
+#[repr(transparent)]
 pub struct QuadraticExtension<F: Extendable<2>>(pub [F; 2]);
 
 impl<F: Extendable<2>> Default for QuadraticExtension<F> {
@@ -31,6 +34,27 @@ impl<F: Extendable<2>> FieldExtension<2> for QuadraticExtension<F> {
 
     fn to_basefield_array(&self) -> [F; 2] {
         self.0
+    }
+
+    fn into_basefield_vec(values: Vec<Self>) -> Vec<F> {
+        let len = values
+            .len()
+            .checked_mul(2)
+            .expect("quadratic vector length overflow");
+        let capacity = values
+            .capacity()
+            .checked_mul(2)
+            .expect("quadratic vector capacity overflow");
+        let mut values = ManuallyDrop::new(values);
+        let ptr = values.as_mut_ptr().cast::<F>();
+
+        // SAFETY: `QuadraticExtension<F>` is transparent over `[F; 2]`.
+        // `[F; 2]` has the same alignment as `F`, and an allocation for
+        // `capacity` extension elements therefore has exactly the layout of
+        // an allocation for `capacity * 2` base-field elements. The consumed
+        // vector is suppressed with `ManuallyDrop`, so the returned vector is
+        // the sole owner of that allocation.
+        unsafe { Vec::from_raw_parts(ptr, len, capacity) }
     }
 
     fn from_basefield_array(arr: [F; 2]) -> Self {
@@ -245,7 +269,40 @@ impl<F: Extendable<2>> DivAssign for QuadraticExtension<F> {
 #[cfg(test)]
 mod tests {
     mod goldilocks {
+        use crate::extension::quadratic::QuadraticExtension;
+        use crate::extension::FieldExtension;
+        use crate::goldilocks_field::GoldilocksField;
+        use crate::types::Field;
         use crate::{test_field_arithmetic, test_field_extension};
+
+        #[test]
+        fn into_basefield_vec_reuses_quadratic_allocation() {
+            type F = GoldilocksField;
+            type E = QuadraticExtension<F>;
+
+            let mut values = Vec::with_capacity(8);
+            values.extend([
+                QuadraticExtension([F::from_canonical_u64(1), F::from_canonical_u64(2)]),
+                QuadraticExtension([F::from_canonical_u64(3), F::from_canonical_u64(4)]),
+                QuadraticExtension([F::from_canonical_u64(5), F::from_canonical_u64(6)]),
+            ]);
+            let allocation = values.as_ptr().cast::<F>();
+            let flattened = <E as FieldExtension<2>>::into_basefield_vec(values);
+
+            assert_eq!(flattened.as_ptr(), allocation);
+            assert_eq!(flattened.capacity(), 16);
+            assert_eq!(
+                flattened,
+                [
+                    F::from_canonical_u64(1),
+                    F::from_canonical_u64(2),
+                    F::from_canonical_u64(3),
+                    F::from_canonical_u64(4),
+                    F::from_canonical_u64(5),
+                    F::from_canonical_u64(6),
+                ]
+            );
+        }
 
         test_field_extension!(crate::goldilocks_field::GoldilocksField, 2);
         test_field_arithmetic!(

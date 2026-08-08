@@ -18,7 +18,9 @@ use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
+use crate::util::reverse_index_bits_in_place;
 use crate::util::timing::TimingTree;
+#[cfg(test)]
 use crate::util::{log2_strict, reverse_bits};
 
 /// Builds a FRI proof.
@@ -95,6 +97,7 @@ pub fn final_poly_coeff_len(mut degree_bits: usize, reduction_arity_bits: &Vec<u
 /// outputs `b * FLATTEN_BLOCK .. (b + 1) * FLATTEN_BLOCK`, a partition of
 /// `0..n`, so every slot is written exactly once and the source is only read —
 /// the result is index-for-index identical to the serial fill.
+#[cfg(test)]
 fn bitrev_flatten<F: RichField + Extendable<D>, const D: usize>(values: &[F::Extension]) -> Vec<F> {
     const FLATTEN_BLOCK: usize = 1 << 10;
 
@@ -122,6 +125,17 @@ fn bitrev_flatten<F: RichField + Extendable<D>, const D: usize>(values: &[F::Ext
     flat
 }
 
+/// Reorders an owned extension-field codeword and reinterprets its canonical
+/// limbs as the flat base-field leaf buffer. The production quadratic
+/// extension reuses the input allocation, avoiding the previous full-size
+/// gather allocation and copy.
+fn bitrev_flatten_owned<F: RichField + Extendable<D>, const D: usize>(
+    mut values: Vec<F::Extension>,
+) -> Vec<F> {
+    reverse_index_bits_in_place(&mut values);
+    <F::Extension as FieldExtension<D>>::into_basefield_vec(values)
+}
+
 fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     mut coeffs: PolynomialCoeffs<F::Extension>,
     mut values: PolynomialValues<F::Extension>,
@@ -137,12 +151,11 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     for (round, arity_bits) in fri_params.reduction_arity_bits.iter().enumerate() {
         let arity = 1 << arity_bits;
 
-        // Fused bit-reversal + flatten: one gather pass writes the flat leaf
-        // buffer directly (leaf `i` is the `arity`-chunk of the bit-reversed
-        // codeword starting at `i * arity`), instead of a random-access
-        // in-place permutation followed by a separate flattening pass with a
-        // heap allocation per element.
-        let flat_values = bitrev_flatten::<F, D>(&values.values);
+        // This is the last consumer of the current codeword. Move its
+        // allocation into the Merkle tree after an in-place bit reversal;
+        // the quadratic extension's canonical limbs require no flatten copy.
+        let flat_values =
+            bitrev_flatten_owned::<F, D>(core::mem::take(&mut values.values));
         let tree = MerkleTree::<F, C::Hasher>::new_flat(
             flat_values,
             arity * D,
@@ -364,7 +377,7 @@ mod tests {
 
         // Sizes on both sides of the `FLATTEN_BLOCK = 1 << 10` grain: below it
         // (a single partial chunk), exactly on it, and several blocks past it.
-        for log_n in [0usize, 1, 5, 10, 11, 13] {
+        for log_n in [0usize, 1, 5, 10, 11, 13, 18] {
             let n = 1usize << log_n;
             let values: Vec<FE> = (0..n).map(|_| FE::rand()).collect();
 
@@ -376,6 +389,25 @@ mod tests {
             }
 
             let actual = bitrev_flatten::<F, D>(&values);
+            assert_eq!(actual.len(), expected.len(), "length for n = {n}");
+            for (k, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(a.0, e.0, "limb {k} of {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn owned_bitrev_flatten_matches_serial_gather() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type FE = <F as Extendable<D>>::Extension;
+
+        for log_n in [0usize, 1, 5, 10, 11, 13] {
+            let n = 1usize << log_n;
+            let values: Vec<FE> = (0..n).map(|_| FE::rand()).collect();
+            let expected = bitrev_flatten::<F, D>(&values);
+            let actual = bitrev_flatten_owned::<F, D>(values);
+
             assert_eq!(actual.len(), expected.len(), "length for n = {n}");
             for (k, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
                 assert_eq!(a.0, e.0, "limb {k} of {n}");
