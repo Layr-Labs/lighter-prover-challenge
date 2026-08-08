@@ -1073,4 +1073,108 @@ mod tests {
             assert_eq!(raw(&actual.coeffs), raw(&expected_in_place.coeffs));
         }
     }
+
+    /// The quotient batch loop reads the constants and sigma columns either
+    /// out of `ProverOnlyCircuitData::constants_sigmas_quotient_cache` (built
+    /// with [`PolynomialBatch::extract_lde_batch_columns`]) or, when that cache
+    /// is absent, straight out of the commitment with
+    /// [`PolynomialBatch::fill_lde_batch`]. At `step == 1` the builder declines
+    /// to materialize the cache, so the two must agree on the raw field words
+    /// for every contiguous batch window the loop can ask for — otherwise
+    /// dropping the cache would change a proof. The negative control at the end
+    /// of each window proves the comparison is live.
+    #[test]
+    fn quotient_gather_matches_extracted_cache_at_step_one() {
+        const D: usize = 2;
+        const RATE_BITS: usize = 3;
+        const CAP_HEIGHT: usize = 2;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let degree = 1usize << 6;
+        let lde_len = degree << RATE_BITS;
+        let step = 1usize;
+        let num_constants = 3usize;
+        let num_sigmas = 5usize;
+        let constants_range = 0..num_constants;
+        let sigmas_range = num_constants..num_constants + num_sigmas;
+
+        let values = (0..num_constants + num_sigmas)
+            .map(|_| PolynomialValues::new(F::rand_vec(degree)))
+            .collect::<Vec<_>>();
+        let batch = PolynomialBatch::<F, C, D>::from_values(
+            values,
+            RATE_BITS,
+            false,
+            CAP_HEIGHT,
+            &mut TimingTree::default(),
+            None,
+        );
+
+        // The cache exactly as the builder would have assembled it.
+        let mut cache = batch
+            .extract_lde_batch_columns(step, constants_range.clone(), lde_len)
+            .expect("column-backed commitment must extract");
+        cache.extend(
+            batch
+                .extract_lde_batch_columns(step, sigmas_range.clone(), lde_len)
+                .expect("column-backed commitment must extract"),
+        );
+        assert_eq!(cache.len(), (num_constants + num_sigmas) * lde_len);
+
+        // Raw representatives: field equality canonicalises and would hide a
+        // divergent-but-congruent word.
+        let raw = |values: &[F]| values.iter().map(|f| f.0).collect::<Vec<u64>>();
+
+        let mut compared = 0usize;
+        for batch_size in [1usize, 7, 32, 64] {
+            let mut start = 0usize;
+            while start < lde_len {
+                let n = batch_size.min(lde_len - start);
+                let indices = (start..start + n).collect::<Vec<_>>();
+
+                let mut gathered_constants = Vec::new();
+                batch.fill_lde_batch(
+                    &indices,
+                    step,
+                    constants_range.clone(),
+                    BatchLayout::PolyMajor,
+                    &mut gathered_constants,
+                );
+                let mut gathered_sigmas = Vec::new();
+                batch.fill_lde_batch(
+                    &indices,
+                    step,
+                    sigmas_range.clone(),
+                    BatchLayout::PolyMajor,
+                    &mut gathered_sigmas,
+                );
+
+                // Cache-shaped reads, exactly as `compute_quotient_polys` does.
+                let mut cached_constants = vec![F::ZERO; num_constants * n];
+                for ci in 0..num_constants {
+                    cached_constants[ci * n..(ci + 1) * n]
+                        .copy_from_slice(&cache[ci * lde_len + start..ci * lde_len + start + n]);
+                }
+                let mut cached_sigmas = vec![F::ZERO; num_sigmas * n];
+                for ci in 0..num_sigmas {
+                    let base = (num_constants + ci) * lde_len + start;
+                    cached_sigmas[ci * n..(ci + 1) * n]
+                        .copy_from_slice(&cache[base..base + n]);
+                }
+
+                assert_eq!(raw(&gathered_constants), raw(&cached_constants));
+                assert_eq!(raw(&gathered_sigmas), raw(&cached_sigmas));
+                compared += gathered_constants.len() + gathered_sigmas.len();
+
+                // Negative control: one flipped raw word must break the match.
+                let mut sabotaged = raw(&cached_sigmas);
+                sabotaged[0] ^= 1;
+                assert_ne!(raw(&gathered_sigmas), sabotaged);
+
+                start += n;
+            }
+        }
+        assert_eq!(compared, 4 * (num_constants + num_sigmas) * lde_len);
+    }
 }

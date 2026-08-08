@@ -49,47 +49,164 @@ impl Circuits {
         load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB)
     }
 
+    /// Loads the four blobs that [`Circuits::load_pre`] does not cover.
+    ///
+    /// Split out so the startup-overlap path can reuse the pre-execution
+    /// circuit it already holds instead of deserializing `pre.embed` twice.
+    fn load_rest() -> anyhow::Result<RestCircuits> {
+        // Same parallel layout as `Circuits::new`; the loads are independent
+        // (unlike builds, the chain loads do not wait on the transaction
+        // circuits).
+        let (heavy, light) = rayon::join(
+            || {
+                rayon::join(
+                    || load_blob::<BlockTxTarget>("heavy_tx", HEAVY_TX_BLOB),
+                    || load_blob::<BlockTxChainTarget>("heavy_chain", HEAVY_CHAIN_BLOB),
+                )
+            },
+            || {
+                rayon::join(
+                    || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
+                    || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
+                )
+            },
+        );
+        Ok(RestCircuits {
+            heavy_tx: heavy.0?,
+            heavy_chain: heavy.1?,
+            light_tx: light.0?,
+            light_chain: light.1?,
+            // Decoded here rather than in `with_pre` so the startup-overlap
+            // caller pays for it on this (concurrent) lane instead of on the
+            // serial hand-off after its pre-execution proof joins.
+            dummy_heavy_proof: bincode::deserialize(include_bytes!(
+                "../dummy-heavy-chain-proof.bin"
+            ))
+            .expect("embedded heavy chain dummy proof is invalid"),
+            dummy_light_proof: bincode::deserialize(include_bytes!(
+                "../dummy-light-chain-proof.bin"
+            ))
+            .expect("embedded light chain dummy proof is invalid"),
+        })
+    }
+
     /// Reconstructs all five startup circuits from the blobs embedded at
     /// compile time. Value-identical to [`Circuits::new`] (oracle:
     /// `embedded_matches_rebuilt`); errors if the blobs are absent, corrupt,
     /// or fail their internal commitment-cap check.
+    ///
+    /// The prove binary takes [`Circuits::load_rest_or_build`] instead (it
+    /// already holds `pre`); this stays as the whole-set reference the
+    /// equality oracles compare against.
+    #[allow(dead_code)]
     pub fn from_embedded() -> anyhow::Result<Self> {
-        // Same parallel layout as `Circuits::new`; the five loads are
-        // independent (unlike builds, the chain loads do not wait on the
-        // transaction circuits).
-        let (pre, (heavy, light)) = rayon::join(
-            || load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB),
-            || {
-                rayon::join(
-                    || {
-                        rayon::join(
-                            || load_blob::<BlockTxTarget>("heavy_tx", HEAVY_TX_BLOB),
-                            || load_blob::<BlockTxChainTarget>("heavy_chain", HEAVY_CHAIN_BLOB),
-                        )
-                    },
-                    || {
-                        rayon::join(
-                            || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
-                            || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
-                        )
-                    },
-                )
-            },
-        );
+        let (pre, rest) = rayon::join(Self::load_pre, Self::load_rest);
         let (pre_target, pre_data) = pre?;
-        let ((heavy_tx, heavy_chain), (light_tx, light_chain)) = (
-            (heavy.0?, heavy.1?),
-            (light.0?, light.1?),
-        );
+        Ok(rest?.with_pre(pre_target, pre_data))
+    }
 
-        let dummy_heavy_proof: Proof =
-            bincode::deserialize(include_bytes!("../dummy-heavy-chain-proof.bin"))
-                .expect("embedded heavy chain dummy proof is invalid");
-        let dummy_light_proof: Proof =
-            bincode::deserialize(include_bytes!("../dummy-light-chain-proof.bin"))
-                .expect("embedded light chain dummy proof is invalid");
+    /// Whole-set loader: embedded circuits when available, otherwise a fresh
+    /// build. `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B runs.
+    /// Kept for callers outside the startup overlap; the prove binary uses
+    /// [`Circuits::load_rest_or_build`].
+    #[allow(dead_code)]
+    pub fn load() -> Self {
+        if std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1") {
+            log::info!("LIGHTER_BUILD_CIRCUITS=1: building startup circuits from scratch");
+            return Self::new();
+        }
+        match Self::from_embedded() {
+            Ok(circuits) => circuits,
+            Err(error) => {
+                log::warn!("embedded circuits unavailable ({error:#}); building from scratch");
+                Self::new()
+            }
+        }
+    }
 
-        Ok(Self {
+    /// Production loader for the startup-overlap path, where the caller
+    /// already holds the pre-execution circuit from [`Circuits::load_pre`].
+    /// Loads only the four remaining blobs, so it can run concurrently with
+    /// the caller's pre-execution proof exactly like [`Circuits::load`] did;
+    /// the caller then supplies its own `pre` through [`StartupRest::finish`].
+    ///
+    /// `Circuits::load` re-read `pre.embed`, which re-derives the sigma
+    /// polynomials and rebuilds a full 2^17-row x 86-column constants/sigmas
+    /// extension plus its 1,572,848-permutation Merkle tree — on the GPU, in
+    /// the startup window, concurrently with the shader prewarm — for a value
+    /// no proof ever reads (the pre-execution proof is produced from the
+    /// caller's copy, and the final block circuit consumes only `common` and
+    /// `verifier_only` of `pre_data`). Reusing the caller's copy deletes that
+    /// work whole; the resulting `Circuits` holds the identical `CircuitData`
+    /// value it did before, since both copies came from the same blob through
+    /// the same loader.
+    ///
+    /// Falls back to a full five-circuit build exactly like [`Circuits::load`]
+    /// (then dropping the caller's `pre`, which the rebuild reproduces).
+    pub fn load_rest_or_build() -> StartupRest {
+        if std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1") {
+            log::info!("LIGHTER_BUILD_CIRCUITS=1: building startup circuits from scratch");
+            return StartupRest::Rebuilt(Box::new(Self::new()));
+        }
+        match Self::load_rest() {
+            Ok(rest) => StartupRest::Embedded(rest),
+            Err(error) => {
+                log::warn!("embedded circuits unavailable ({error:#}); building from scratch");
+                StartupRest::Rebuilt(Box::new(Self::new()))
+            }
+        }
+    }
+}
+
+/// Result of [`Circuits::load_rest_or_build`]: either the four embedded
+/// circuits awaiting the caller's pre-execution circuit, or — on the fallback
+/// path — a complete freshly built set that already contains its own.
+pub enum StartupRest {
+    Embedded(RestCircuits),
+    Rebuilt(Box<Circuits>),
+}
+
+impl StartupRest {
+    pub fn finish(
+        self,
+        pre_target: BlockPreExecutionTarget,
+        pre_data: CircuitData<F, C, D>,
+    ) -> Circuits {
+        match self {
+            Self::Embedded(rest) => rest.with_pre(pre_target, pre_data),
+            // The rebuild produced its own pre-execution circuit (value-equal
+            // to the caller's); drop the caller's rather than mixing sources.
+            Self::Rebuilt(circuits) => *circuits,
+        }
+    }
+}
+
+/// The four embedded circuits that are not the pre-execution circuit.
+pub struct RestCircuits {
+    heavy_tx: (BlockTxTarget, CircuitData<F, C, D>),
+    heavy_chain: (BlockTxChainTarget, CircuitData<F, C, D>),
+    light_tx: (BlockTxTarget, CircuitData<F, C, D>),
+    light_chain: (BlockTxChainTarget, CircuitData<F, C, D>),
+    dummy_heavy_proof: Proof,
+    dummy_light_proof: Proof,
+}
+
+impl RestCircuits {
+    fn with_pre(
+        self,
+        pre_target: BlockPreExecutionTarget,
+        pre_data: CircuitData<F, C, D>,
+    ) -> Circuits {
+        let RestCircuits {
+            heavy_tx,
+            heavy_chain,
+            light_tx,
+            light_chain,
+            dummy_heavy_proof,
+            dummy_light_proof,
+        } = self;
+
+        Circuits {
             heavy_tx_target: heavy_tx.0,
             heavy_tx_data: heavy_tx.1,
             light_tx_target: light_tx.0,
@@ -102,22 +219,6 @@ impl Circuits {
             light_chain_data: light_chain.1,
             dummy_heavy_proof,
             dummy_light_proof,
-        })
-    }
-
-    /// Production loader: embedded circuits when available, otherwise a fresh
-    /// build. `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B runs.
-    pub fn load() -> Self {
-        if std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1") {
-            log::info!("LIGHTER_BUILD_CIRCUITS=1: building startup circuits from scratch");
-            return Self::new();
-        }
-        match Self::from_embedded() {
-            Ok(circuits) => circuits,
-            Err(error) => {
-                log::warn!("embedded circuits unavailable ({error:#}); building from scratch");
-                Self::new()
-            }
         }
     }
 }
@@ -286,6 +387,70 @@ mod tests {
             assert!(!bytes.is_empty());
 
             println!("embedded_matches_rebuilt: all five circuits are value-identical");
+        });
+    }
+
+    /// Oracle for the startup-overlap loader: the set the prove binary
+    /// assembles — the four blobs from `load_rest_or_build` plus the caller's
+    /// own `load_pre` circuit — must be value-identical to the five-blob
+    /// `Circuits::from_embedded`, in particular for `pre_data`, whose second
+    /// deserialization (and second constants/sigmas commitment) is what the
+    /// production path deletes. Run:
+    /// `cargo test --release -p bench --bin prove -- --ignored startup_overlap_matches_from_embedded --nocapture`
+    #[test]
+    #[ignore = "multi-second circuit load; run explicitly"]
+    fn startup_overlap_matches_from_embedded() {
+        on_big_stack(|| {
+            let reference =
+                Circuits::from_embedded().expect("embedded circuits must load");
+            let (pre_target, pre_data) =
+                Circuits::load_pre().expect("embedded pre circuit must load");
+            let production = Circuits::load_rest_or_build().finish(pre_target, pre_data);
+
+            for (name, reference, production) in [
+                (
+                    "pre",
+                    (&reference.pre_data, &reference.pre_target),
+                    (&production.pre_data, &production.pre_target),
+                ),
+            ] {
+                assert_circuit_pair_identical(
+                    name,
+                    (reference.1, reference.0),
+                    (production.1, production.0),
+                );
+            }
+            assert_circuit_pair_identical(
+                "heavy_tx",
+                (&reference.heavy_tx_target, &reference.heavy_tx_data),
+                (&production.heavy_tx_target, &production.heavy_tx_data),
+            );
+            assert_circuit_pair_identical(
+                "heavy_chain",
+                (&reference.heavy_chain_target, &reference.heavy_chain_data),
+                (&production.heavy_chain_target, &production.heavy_chain_data),
+            );
+            assert_circuit_pair_identical(
+                "light_tx",
+                (&reference.light_tx_target, &reference.light_tx_data),
+                (&production.light_tx_target, &production.light_tx_data),
+            );
+            assert_circuit_pair_identical(
+                "light_chain",
+                (&reference.light_chain_target, &reference.light_chain_data),
+                (&production.light_chain_target, &production.light_chain_data),
+            );
+            assert!(
+                bincode::serialize(&reference.dummy_heavy_proof).unwrap()
+                    == bincode::serialize(&production.dummy_heavy_proof).unwrap()
+                    && bincode::serialize(&reference.dummy_light_proof).unwrap()
+                        == bincode::serialize(&production.dummy_light_proof).unwrap(),
+                "dummy chain proofs diverge"
+            );
+            println!(
+                "startup_overlap_matches_from_embedded: the four-blob + own-pre assembly is \
+                 value-identical to the five-blob load"
+            );
         });
     }
 
