@@ -178,6 +178,13 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> PackedEvaluab
                 radix_sum = (radix_sum + radix_sum) + limb;
             }
             radix_sum
+        } else if B == 4 {
+            let mut radix_sum = P::ZEROS;
+            for &limb in limbs.iter().rev() {
+                let twice = radix_sum + radix_sum;
+                radix_sum = (twice + twice) + limb;
+            }
+            radix_sum
         } else {
             reduce_with_powers(limbs, F::from_canonical_usize(B))
         };
@@ -191,6 +198,12 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> PackedEvaluab
         let constraints_iter = limbs.iter().map(|&limb| {
             if B == 2 {
                 limb * (limb - P::ONES)
+            } else if B == 4 {
+                // x(x-1)(x-2)(x-3) = t(t+2), where t = x(x-3).
+                // This is the same degree-four polynomial coefficient for
+                // coefficient, with two packed products instead of four.
+                let t = limb * (limb - F::from_canonical_usize(3));
+                t * (t + F::from_canonical_usize(2))
             } else {
                 (0..B)
                     .map(|i| limb - F::from_canonical_usize(i))
@@ -337,6 +350,7 @@ mod tests {
         }
 
         compare::<2>(11);
+        compare::<4>(11);
         compare::<6>(11);
     }
 
