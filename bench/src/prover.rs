@@ -19,6 +19,7 @@ use circuit::block_tx_constraints::Circuit as _;
 use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
+use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
 use plonky2::iop::generator::{ParallelWitnessGuard, PendingPartitionWitness};
 #[cfg(test)]
@@ -39,6 +40,11 @@ enum TxPath {
 const LIGHT_TX_PROOF_WINDOW: usize = 2;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
+
+#[inline]
+fn clear_finished_tx_commitment(commitment: &mut PolynomialBatch<F, C, D>) {
+    *commitment = PolynomialBatch::default();
+}
 
 fn chunk_is_light(txs: &[Tx<F>]) -> bool {
     txs.first()
@@ -254,7 +260,11 @@ fn prove_tx_witness(
 fn prove_path(
     path: TxPath,
     chunks: Vec<(usize, Vec<Tx<F>>)>,
-    circuits: &Circuits,
+    tx_data: &mut CircuitData<F, C, D>,
+    tx_target: &BlockTxTarget,
+    chain_data: &CircuitData<F, C, D>,
+    chain_target: &BlockTxChainTarget,
+    dummy_proof: &Proof,
     block_number: u64,
     created_at: i64,
     old_account_delta_tree_root: HashOut<F>,
@@ -266,23 +276,11 @@ fn prove_path(
         !chunks.is_empty(),
         "{path:?} transaction path must contain at least one chunk"
     );
-    let (tx_data, tx_target, chain_data, chain_target, dummy_proof) = match path {
-        TxPath::Light => (
-            &circuits.light_tx_data,
-            &circuits.light_tx_target,
-            &circuits.light_chain_data,
-            &circuits.light_chain_target,
-            &circuits.dummy_light_proof,
-        ),
-        TxPath::Heavy => (
-            &circuits.heavy_tx_data,
-            &circuits.heavy_tx_target,
-            &circuits.heavy_chain_data,
-            &circuits.heavy_chain_target,
-            &circuits.dummy_heavy_proof,
-        ),
-    };
-
+    let chain_proof = {
+    // Every proof thread receives only a shared reborrow. The scoped pipeline
+    // joins all of them before this block ends, making the commitment
+    // exclusively mutable again below.
+    let tx_data: &CircuitData<F, C, D> = &*tx_data;
     let base_proof = cyclic_base_witness(
         dummy_proof,
         block_number,
@@ -308,7 +306,7 @@ fn prove_path(
     jump = next_jump;
 
 
-    let chain_proof = std::thread::scope(|scope| {
+    std::thread::scope(|scope| {
         let base = &base_proof;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
@@ -443,11 +441,16 @@ fn prove_path(
             plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
         }
         chain_proof
-    });
+    })
+    };
     // This path has produced its last proof. Retiring it here — after the scope,
     // so every thread it spawned has joined — is what lets the sibling path's
     // drain observe that it is alone and claim the exclusive GPU phase.
     active_paths.fetch_sub(1, Ordering::Release);
+    // No proof of this transaction circuit remains in flight. Return its
+    // Metal-backed constants/sigmas LDE now instead of retaining the completed
+    // heavy path's allocation throughout the much longer light-chain tail.
+    clear_finished_tx_commitment(&mut tx_data.prover_only.constants_sigmas_commitment);
     chain_proof
 }
 
@@ -508,9 +511,19 @@ pub(crate) fn prove_block_after_pre(
     // chain proof is finished, so only the last one standing claims the phase.
     let active_paths = AtomicUsize::new(2);
     let (light_chain_proof, heavy_chain_proof, block_target, block_data, block_pending) = {
-        // The pipeline only ever reads the circuits; the borrow ends with this
-        // block so the finished extensions can be released below.
-        let circuits = &circuits;
+        // Split fields so each path owns the one transaction commitment it
+        // releases. Final-circuit synthesis reads only pre and chain data.
+        let heavy_tx_data = &mut circuits.heavy_tx_data;
+        let light_tx_data = &mut circuits.light_tx_data;
+        let heavy_tx_target = &circuits.heavy_tx_target;
+        let light_tx_target = &circuits.light_tx_target;
+        let heavy_chain_data = &circuits.heavy_chain_data;
+        let light_chain_data = &circuits.light_chain_data;
+        let heavy_chain_target = &circuits.heavy_chain_target;
+        let light_chain_target = &circuits.light_chain_target;
+        let dummy_heavy_proof = &circuits.dummy_heavy_proof;
+        let dummy_light_proof = &circuits.dummy_light_proof;
+        let pre_data = &circuits.pre_data;
         let active_paths = &active_paths;
         std::thread::scope(|scope| {
             // The final block circuit depends only on already-built circuit data
@@ -538,7 +551,11 @@ pub(crate) fn prove_block_after_pre(
                     prove_path(
                         TxPath::Heavy,
                         heavy_chunks,
-                        circuits,
+                        heavy_tx_data,
+                        heavy_tx_target,
+                        heavy_chain_data,
+                        heavy_chain_target,
+                        dummy_heavy_proof,
                         block.block_number,
                         block.created_at,
                         block.old_account_delta_tree_root,
@@ -554,7 +571,11 @@ pub(crate) fn prove_block_after_pre(
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
-                    let (block_target, block_data) = circuits.build_block_circuit();
+                    let (block_target, block_data) = Circuits::build_block_circuit_from_parts(
+                        pre_data,
+                        light_chain_data,
+                        heavy_chain_data,
+                    );
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
                     let early = BlockCircuit::witness_inputs_early(
@@ -587,7 +608,11 @@ pub(crate) fn prove_block_after_pre(
             let light_chain_proof = prove_path(
                 TxPath::Light,
                 light_chunks,
-                circuits,
+                light_tx_data,
+                light_tx_target,
+                light_chain_data,
+                light_chain_target,
+                dummy_light_proof,
                 block.block_number,
                 block.created_at,
                 block.old_account_delta_tree_root,
@@ -704,6 +729,21 @@ mod tests {
         let heavy = "heavy";
 
         assert_eq!(final_chain_inputs(&light, &heavy), (&light, &heavy));
+    }
+
+    #[test]
+    fn finished_tx_commitment_release_is_complete_and_idempotent() {
+        let mut commitment = PolynomialBatch::<F, C, D>::default();
+        commitment.degree_log = 17;
+        commitment.rate_bits = 3;
+        assert_ne!(commitment, PolynomialBatch::default());
+
+        clear_finished_tx_commitment(&mut commitment);
+        assert_eq!(commitment, PolynomialBatch::default());
+
+        // The final bulk release clears the same field again.
+        clear_finished_tx_commitment(&mut commitment);
+        assert_eq!(commitment, PolynomialBatch::default());
     }
 
     /// Manual timing harness for the two-phase chain-step witness split. Run with:

@@ -152,11 +152,26 @@ impl Circuits {
     /// both chain circuits but is only needed for the final proof. Callers run
     /// this concurrently with transaction/chain proving.
     pub fn build_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
-        let block = BlockCircuit::define(
-            CIRCUIT_CONFIG,
+        Self::build_block_circuit_from_parts(
             &self.pre_data,
             &self.light_chain_data,
             &self.heavy_chain_data,
+        )
+    }
+
+    /// Field-split form used while the two transaction circuits are borrowed
+    /// mutably by their proving paths. The final circuit never reads either
+    /// transaction circuit; it depends only on pre-execution and chain data.
+    pub(crate) fn build_block_circuit_from_parts(
+        pre_data: &CircuitData<F, C, D>,
+        light_chain_data: &CircuitData<F, C, D>,
+        heavy_chain_data: &CircuitData<F, C, D>,
+    ) -> (BlockTarget, CircuitData<F, C, D>) {
+        let block = BlockCircuit::define(
+            CIRCUIT_CONFIG,
+            pre_data,
+            light_chain_data,
+            heavy_chain_data,
             ON_CHAIN_OPERATIONS_LIMIT,
         );
         (block.target, block.builder.build::<C>())
