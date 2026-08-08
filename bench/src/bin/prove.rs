@@ -18,8 +18,8 @@ use api::{
     Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
     PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
 };
-use circuit::block_pre_execution_constraints::Circuit as _;
 use circuit::block::Block;
+use circuit::block_pre_execution_constraints::Circuit as _;
 use circuit::types::config::{C, F};
 
 #[cfg(not(target_env = "msvc"))]
@@ -43,6 +43,8 @@ static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+const METAL_PIPELINE_ARCHIVE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/poseidon2-pipelines.metallib"));
 
 fn main() {
     // First statement in the process: the Metal shader compile and pipeline
@@ -52,7 +54,7 @@ fn main() {
     // price. Starting it here overlaps it with the startup work below instead
     // of stalling the first proving step that wants the GPU. Pure scheduling:
     // the compiled kernels are identical either way.
-    plonky2::hash::poseidon2::prewarm_gpu();
+    plonky2::hash::poseidon2::prewarm_gpu_with_archive(METAL_PIPELINE_ARCHIVE);
     env_logger::init();
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
