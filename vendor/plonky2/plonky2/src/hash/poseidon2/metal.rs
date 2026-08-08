@@ -18,6 +18,32 @@ use crate::hash::merkle_tree::LevelOrderDigests;
 use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
+
+/// `poseidon2.metal` precompiled to AIR, so a worker that cannot use the Metal
+/// shader cache does not pay the MSL front end. Regenerate whenever
+/// `poseidon2.metal` changes (see `MetalShared::new`); the
+/// `metallib_matches_shader_source` test enforces it.
+const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
+
+/// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
+const SHADER_SOURCE_SHA256: &str =
+    "5a26157063dd5c76cedf06d12681d4f146bacdd236c3613d861ec5bb781597e6";
+
+/// Every kernel the shader defines. The prebuilt library is trusted only if all
+/// of them resolve, so a stale or truncated artifact falls back to compiling the
+/// source. This deliberately includes the lazily-built gate-quotient kernels:
+/// they are absent from the eager path but must still be present in the AIR.
+const METALLIB_REQUIRED_KERNELS: [&str; 9] = [
+    "poseidon2_hash_leaves",
+    "poseidon2_hash_leaves_colmajor",
+    "poseidon2_hash_parents",
+    "poseidon2_absorb_pass",
+    "ntt_prepare",
+    "ntt_stage",
+    "ifft_finalize",
+    "poseidon2_gate_quotient",
+    "range_check_gate_quotient",
+];
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
 /// (6654d43) ranked-validated this raised value inside its composition; my
 /// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
@@ -1342,10 +1368,46 @@ impl MetalShared {
         autoreleasepool(|| {
             let device = Device::system_default().ok_or("no Metal device")?;
             let options = CompileOptions::new();
+            // Prefer the prebuilt AIR library over compiling the MSL source.
+            //
+            // The ranked sandbox profile grants read but DENIES write on
+            // `com.apple.metal` (see `write-benchmark-sandbox-profile.sh`), so the
+            // shader cache is unusable and every worker process re-runs the full
+            // MSL->AIR compile of the shader. The harness spawns one worker per
+            // fixture and the score is the sum of worker process lifetimes, so
+            // that cost is paid once per fixture and every millisecond is scored.
+            // `newLibraryWithData:` skips the front end; only the AIR->ISA
+            // pipeline lowering below remains.
+            //
+            // This needs no Metal toolchain at build time — the artifact is
+            // committed — which is what makes it viable where a build-time
+            // `MTLBinaryArchive` is not.
+            //
+            // Any failure falls back to compiling the source, so a runtime that
+            // rejects this AIR version behaves exactly as before. The function
+            // probe is what makes the fallback safe against a STALE artifact:
+            // regenerate with
+            //   xcrun -sdk macosx metal -c poseidon2.metal -o poseidon2.air
+            //   xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib
+            // and `metallib_matches_shader_source` fails the test run if you
+            // forget.
             let library = device
-                .new_library_with_source(SHADER_SOURCE, &options)
-                .map_err(|error| format!("shader compilation failed: {error}"))?;
-            // Build the eight compute pipelines concurrently, one thread each.
+                .new_library_with_data(SHADER_METALLIB)
+                .ok()
+                .filter(|library| {
+                    METALLIB_REQUIRED_KERNELS
+                        .iter()
+                        .all(|name| library.get_function(name, None).is_ok())
+                })
+                .map_or_else(
+                    || {
+                        device
+                            .new_library_with_source(SHADER_SOURCE, &options)
+                            .map_err(|error| format!("shader compilation failed: {error}"))
+                    },
+                    Ok,
+                )?;
+            // Build the compute pipelines concurrently, one thread each.
             //
             // Every `newComputePipelineStateWithFunction:` lowers that kernel's
             // AIR to a GPU binary through MTLCompilerService, and the three
@@ -2706,6 +2768,49 @@ mod tests {
     use crate::field::types::{Field64, PrimeField64};
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
+
+    /// The prebuilt AIR library is only sound while it is the compiled form of
+    /// the MSL we ship. Nothing in the type system ties the two together, so
+    /// this pins the source bytes: edit `poseidon2.metal` without regenerating
+    /// `poseidon2.metallib` and this fails loudly instead of silently proving
+    /// with stale kernels.
+    #[test]
+    fn metallib_matches_shader_source() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
+        let output = std::process::Command::new("/usr/bin/shasum")
+            .args(["-a", "256", &format!("{dir}/poseidon2.metal")])
+            .output()
+            .expect("shasum must be available to verify the metallib is current");
+        assert!(output.status.success(), "shasum failed");
+        let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
+        let digest = digest.split_whitespace().next().expect("empty shasum output");
+        assert_eq!(
+            digest, SHADER_SOURCE_SHA256,
+            "poseidon2.metal changed but poseidon2.metallib was not regenerated. Run:\n  \
+             xcrun -sdk macosx metal -c poseidon2.metal -o poseidon2.air\n  \
+             xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib\n\
+             then update SHADER_SOURCE_SHA256 to {digest}."
+        );
+    }
+
+    /// The fallback in `MetalShared::new` hides a broken artifact behind a
+    /// source compile, which would silently give back the cost this exists to
+    /// remove. Assert the fast path is actually live on this machine.
+    #[test]
+    fn metallib_loads_and_exposes_every_kernel() {
+        let Some(device) = Device::system_default() else {
+            return; // no Metal device in this environment
+        };
+        let library = device
+            .new_library_with_data(SHADER_METALLIB)
+            .expect("prebuilt metallib must load");
+        for name in METALLIB_REQUIRED_KERNELS {
+            assert!(
+                library.get_function(name, None).is_ok(),
+                "prebuilt metallib is missing kernel {name}"
+            );
+        }
+    }
     use crate::gates::selectors::UNUSED_SELECTOR;
     use crate::hash::hash_types::HashOut;
     use crate::hash::merkle_tree::{capacity_up_to_mut, fill_digests_buf, merkle_tree_prove};
