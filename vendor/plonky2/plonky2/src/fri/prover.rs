@@ -322,7 +322,7 @@ fn fri_prover_query_round<
     mut x_index: usize,
     fri_params: &FriParams,
 ) -> FriQueryRound<F, C::Hasher, D> {
-    let mut query_steps = Vec::new();
+    let mut query_steps = Vec::with_capacity(trees.len());
     let initial_proof = initial_merkle_trees
         .iter()
         .map(|t| (t.leaf_vec(x_index), t.prove(x_index)))
