@@ -40,7 +40,7 @@ use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::plonk::circuit_data::{
     CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
 };
-use plonky2::plonk::permutation_argument::Forest;
+use plonky2::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
 use plonky2::util::{log2_ceil, transpose_poly_values_ref};
@@ -265,13 +265,7 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     }
     write_compressed_section(&mut out, &buf);
 
-    // Outer entropy-coded wrap: LZ4 sections carry no entropy stage, so the
-    // assembled blob still shrinks ~3x under zstd. Binary bytes are what the
-    // per-spawn signature-validation tax charges for, so the wrap is applied
-    // to the whole blob rather than per section.
-    let wrapped = zstd::stream::encode_all(&out[..], 19)
-        .context("zstd-wrapping embedded circuit blob")?;
-    Ok(wrapped)
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -290,18 +284,6 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
 pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, CircuitData<F, C, D>)> {
     let gate_serializer = BlockGateSerializer;
     let generator_serializer = embed_generator_serializer();
-
-    // Blobs are zstd-wrapped as a whole (frame magic 0x28 B5 2F FD); unwrap
-    // before parsing. Unwrapped blobs still parse directly, so a build with
-    // the wrap disabled degrades to the previous format instead of failing.
-    let unwrapped;
-    let bytes = if bytes.len() >= 4 && bytes[0..4] == [0x28, 0xB5, 0x2F, 0xFD] {
-        unwrapped = zstd::stream::decode_all(bytes)
-            .context("embedded circuit blob failed zstd unwrap")?;
-        &unwrapped[..]
-    } else {
-        bytes
-    };
 
     ensure!(bytes.len() >= 8, "embedded circuit blob too short");
     let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
@@ -480,6 +462,9 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let wire_partition = forest.wire_partition();
     let sigma_vecs = wire_partition.get_sigma_polys(degree_bits, &common.k_is, &subgroup);
     let representative_map = forest.into_parents();
+    let fixed_routed_wires =
+        fixed_routed_wire_mask(&representative_map, num_wires, num_routed, degree)
+            .context("embedded circuit has an invalid compressed representative map")?;
 
     // `prover_only.sigmas` is the transpose of the sigma *values*, and the
     // commitment below consumes those same values. Transposing first reads the
@@ -569,6 +554,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         subgroup,
         public_inputs,
         representative_map,
+        fixed_routed_wires,
         fft_root_table: Some(root_table),
         circuit_digest,
         lookup_rows,
