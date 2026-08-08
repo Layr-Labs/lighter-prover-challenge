@@ -43,7 +43,7 @@ use plonky2::plonk::circuit_data::{
 use plonky2::plonk::permutation_argument::Forest;
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
-use plonky2::util::{log2_ceil, transpose_poly_values};
+use plonky2::util::{log2_ceil, transpose_poly_values_ref};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -457,10 +457,15 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let sigma_vecs = wire_partition.get_sigma_polys(degree_bits, &common.k_is, &subgroup);
     let representative_map = forest.into_parents();
 
+    // Materialize the row-major prover layout while borrowing the sigma
+    // columns, then move those columns into the commitment. This avoids the
+    // previous full-size clone of every sigma polynomial.
+    let sigmas = transpose_poly_values_ref(&sigma_vecs);
+
     // The builder's commitment path: values in, IFFT inside, LDE + Merkle.
     // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).
     let mut constants_sigmas_vecs = constant_values;
-    constants_sigmas_vecs.extend(sigma_vecs.iter().cloned());
+    constants_sigmas_vecs.extend(sigma_vecs);
     let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
         constants_sigmas_vecs,
         rate_bits,
@@ -476,7 +481,6 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         );
     }
 
-    let sigmas = transpose_poly_values(sigma_vecs);
     let circuit_digest = verifier_only.circuit_digest;
 
     // Mirror the builder's quotient-domain constants/sigmas cache (added by the
