@@ -124,64 +124,6 @@ inline ulong gl_canonicalize(ulong value) {
     return value >= GOLDILOCKS_PRIME ? value - GOLDILOCKS_PRIME : value;
 }
 
-// A lazy value is (v, c) representing v + c * 2^64; since 2^64 = EPSILON
-// (mod p), its field value is v + c * EPSILON. Raw u64 adds accumulate the
-// wrap count instead of folding EPSILON back per addition; one materialize
-// per element per layer replaces the per-add reduction chains. Carry counts
-// in the layers below stay < 32, so c * EPSILON < 2^37 and the single
-// materializing gl_add is exact. Every materialized output is an ordinary
-// u64 representative, so downstream arithmetic and gl_canonicalize see the
-// same canonical field values as the strict per-op path.
-struct lazy_t {
-    ulong v;
-    uint c;
-};
-
-inline lazy_t lazy_of(ulong v) {
-    return { v, 0u };
-}
-
-inline lazy_t lazy_add(lazy_t a, lazy_t b) {
-    ulong next = a.v + b.v;
-    return { next, a.c + b.c + (uint)(next < a.v) };
-}
-
-inline ulong lazy_materialize(lazy_t a) {
-    return gl_add(a.v, (ulong)a.c * GOLDILOCKS_EPSILON);
-}
-
-// r = a * b + addend (mod p): the 128-bit product absorbs the addend before
-// one shared reduction, deleting the separate post-multiply gl_add. mulhi is
-// at most 2^64 - 2, so the absorbed carry cannot overflow the high word. The
-// reduction below is byte-identical to gl_mul's.
-inline ulong gl_mul_add(ulong a, ulong b, ulong addend) {
-    ulong low = a * b;
-    ulong high = metal::mulhi(a, b);
-    ulong low2 = low + addend;
-    high += (ulong)(low2 < low);
-    uint l0 = (uint)low2;
-    uint l1 = (uint)(low2 >> 32);
-    uint h0 = (uint)high;
-    uint h1 = (uint)(high >> 32);
-
-    uint r0 = l0 - h0;
-    uint borrow = (uint)(r0 > l0);
-    uint next = r0 - h1;
-    borrow += (uint)(next > r0);
-    r0 = next;
-
-    uint r1 = l1 + h0;
-    uint carry = (uint)(r1 < l1);
-    next = r1 - borrow;
-    uint under = (uint)(next > r1);
-    r1 = next;
-
-    int top = (int)carry - (int)under;
-    add_epsilon_u32(r0, r1, (uint)(top > 0));
-    sub_epsilon_u32(r0, r1, (uint)(top < 0));
-    return ((ulong)r1 << 32) | (ulong)r0;
-}
-
 inline ulong pow7(ulong value) {
     ulong value2 = gl_mul(value, value);
     ulong value4 = gl_mul(value2, value2);
@@ -189,36 +131,32 @@ inline ulong pow7(ulong value) {
     return gl_mul(value3, value4);
 }
 
-inline void mat4(thread lazy_t* values) {
-    lazy_t x0 = values[0];
-    lazy_t x1 = values[1];
-    lazy_t x2 = values[2];
-    lazy_t x3 = values[3];
-    lazy_t t01 = lazy_add(x0, x1);
-    lazy_t t23 = lazy_add(x2, x3);
-    lazy_t total = lazy_add(t01, t23);
+inline void mat4(thread ulong* values) {
+    ulong x0 = values[0];
+    ulong x1 = values[1];
+    ulong x2 = values[2];
+    ulong x3 = values[3];
+    ulong t01 = gl_add(x0, x1);
+    ulong t23 = gl_add(x2, x3);
+    ulong total = gl_add(t01, t23);
 
-    values[0] = lazy_add(lazy_add(total, t01), x1);
-    values[1] = lazy_add(lazy_add(lazy_add(total, x1), x2), x2);
-    values[2] = lazy_add(lazy_add(total, t23), x3);
-    values[3] = lazy_add(lazy_add(lazy_add(total, x3), x0), x0);
+    values[0] = gl_add(gl_add(total, t01), x1);
+    values[1] = gl_add(gl_add(gl_add(total, x1), x2), x2);
+    values[2] = gl_add(gl_add(total, t23), x3);
+    values[3] = gl_add(gl_add(gl_add(total, x3), x0), x0);
 }
 
 inline void external_linear_layer(thread ulong state[12]) {
-    lazy_t lazy[12];
-    for (uint i = 0; i < 12; ++i) {
-        lazy[i] = lazy_of(state[i]);
-    }
-    mat4(lazy);
-    mat4(lazy + 4);
-    mat4(lazy + 8);
+    mat4(state);
+    mat4(state + 4);
+    mat4(state + 8);
 
-    lazy_t sums[4];
+    ulong sums[4];
     for (uint i = 0; i < 4; ++i) {
-        sums[i] = lazy_add(lazy_add(lazy[i], lazy[i + 4]), lazy[i + 8]);
+        sums[i] = gl_add(gl_add(state[i], state[i + 4]), state[i + 8]);
     }
     for (uint i = 0; i < 12; ++i) {
-        state[i] = lazy_materialize(lazy_add(lazy[i], sums[i & 3]));
+        state[i] = gl_add(state[i], sums[i & 3]);
     }
 }
 
@@ -236,7 +174,7 @@ inline ulong sum_state(thread const ulong state[12]) {
 inline void internal_linear_layer(thread ulong state[12], constant ulong* diagonal) {
     ulong sum = sum_state(state);
     for (uint i = 0; i < 12; ++i) {
-        state[i] = gl_mul_add(state[i], diagonal[i], sum);
+        state[i] = gl_add(sum, gl_mul(state[i], diagonal[i]));
     }
 }
 
@@ -282,10 +220,12 @@ inline void poseidon2_gate_emit(
     constant ulong* alpha_powers,
     thread ulong accumulators[2],
     thread uint& constraint_index) {
-    accumulators[0] =
-        gl_mul_add(constraint, alpha_powers[constraint_index], accumulators[0]);
-    accumulators[1] =
-        gl_mul_add(constraint, alpha_powers[123 + constraint_index], accumulators[1]);
+    accumulators[0] = gl_add(
+        accumulators[0],
+        gl_mul(constraint, alpha_powers[constraint_index]));
+    accumulators[1] = gl_add(
+        accumulators[1],
+        gl_mul(constraint, alpha_powers[123 + constraint_index]));
     ++constraint_index;
 }
 
@@ -434,10 +374,12 @@ inline void range_check_gate_emit(
     uint alpha_stride,
     thread ulong accumulators[2],
     uint constraint_index) {
-    accumulators[0] =
-        gl_mul_add(constraint, alpha_powers[constraint_index], accumulators[0]);
-    accumulators[1] = gl_mul_add(
-        constraint, alpha_powers[alpha_stride + constraint_index], accumulators[1]);
+    accumulators[0] = gl_add(
+        accumulators[0],
+        gl_mul(constraint, alpha_powers[constraint_index]));
+    accumulators[1] = gl_add(
+        accumulators[1],
+        gl_mul(constraint, alpha_powers[alpha_stride + constraint_index]));
 }
 
 // Each RangeCheck metadata record is ten uints:
@@ -567,8 +509,8 @@ kernel void range_check_gate_quotient(
             }
         }
 
-        total[0] = gl_mul_add(filter, gate_accumulators[0], total[0]);
-        total[1] = gl_mul_add(filter, gate_accumulators[1], total[1]);
+        total[0] = gl_add(total[0], gl_mul(filter, gate_accumulators[0]));
+        total[1] = gl_add(total[1], gl_mul(filter, gate_accumulators[1]));
     }
 
     constant uint* u32_metadata = metadata + range_count * 10u;
@@ -1159,8 +1101,8 @@ kernel void range_check_gate_quotient(
                 constraint_index++);
         }
 
-        total[0] = gl_mul_add(filter, gate_accumulators[0], total[0]);
-        total[1] = gl_mul_add(filter, gate_accumulators[1], total[1]);
+        total[0] = gl_add(total[0], gl_mul(filter, gate_accumulators[0]));
+        total[1] = gl_add(total[1], gl_mul(filter, gate_accumulators[1]));
     }
 
     output[(ulong)gid * 2] = gl_canonicalize(total[0]);
@@ -1347,53 +1289,5 @@ kernel void poseidon2_hash_parents(
     device ulong* output = parents + (ulong)gid * 4;
     for (uint i = 0; i < 4; ++i) {
         output[i] = gl_canonicalize(state[i]);
-    }
-}
-
-// One sponge absorption pass over a group of at most eight natural-order
-// columns, with the running 12-lane state parked in `state` between passes
-// (column-major: lane i of row gid at state[i * leaf_count + gid]). The
-// final pass writes the four-lane digests to `hashes` at the bit-reversed
-// row, exactly like poseidon2_hash_leaves_colmajor. Splitting the sponge by
-// column group lets the CPU compute group g+1's LDE columns while the GPU
-// absorbs group g; the arithmetic per pass is identical to the fused
-// kernel's corresponding loop iteration.
-kernel void poseidon2_absorb_pass(
-    const device ulong* leaves [[buffer(0)]],
-    device ulong* state [[buffer(1)]],
-    device ulong* hashes [[buffer(2)]],
-    constant ulong* parameters [[buffer(3)]],
-    constant uint& leaf_count [[buffer(4)]],
-    constant uint& log_leaf_count [[buffer(5)]],
-    constant uint& col_start [[buffer(6)]],
-    constant uint& chunk_size [[buffer(7)]],
-    constant uint& first_pass [[buffer(8)]],
-    constant uint& final_pass [[buffer(9)]],
-    uint gid [[thread_position_in_grid]]) {
-    if (gid >= leaf_count) {
-        return;
-    }
-    ulong st[12] = { 0 };
-    if (first_pass == 0u) {
-        for (uint i = 0; i < 12; ++i) {
-            st[i] = state[(ulong)i * leaf_count + gid];
-        }
-    }
-    for (uint i = 0; i < chunk_size; ++i) {
-        st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
-    }
-    poseidon2(st, parameters);
-    if (final_pass != 0u) {
-        uint out_row = log_leaf_count == 0
-            ? gid
-            : (reverse_bits(gid) >> (32 - log_leaf_count));
-        device ulong* output = hashes + (ulong)out_row * 4;
-        for (uint i = 0; i < 4; ++i) {
-            output[i] = gl_canonicalize(st[i]);
-        }
-    } else {
-        for (uint i = 0; i < 12; ++i) {
-            state[(ulong)i * leaf_count + gid] = st[i];
-        }
     }
 }

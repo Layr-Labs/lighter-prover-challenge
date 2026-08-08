@@ -18,9 +18,8 @@ use api::{
     Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
     PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
 };
-use circuit::block_pre_execution_constraints::Circuit as _;
 use circuit::block::Block;
-use circuit::types::config::{C, F};
+use circuit::types::config::F;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -37,103 +36,80 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // (no indirection) or omitting the trailing NUL would make jemalloc read the
 // string bytes as a pointer and crash. This is a default: the environment and
 // /etc/malloc.conf can still override it.
+// Use a moderate per-bin cache depth to reduce allocator arena traffic while
+// bounding retained memory under the three-wide proof pipeline.
 #[cfg(not(target_env = "msvc"))]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
+static MALLOC_CONF: &[u8; 64] =
+    b"dirty_decay_ms:-1,muzzy_decay_ms:-1,tcache_nslots_small_max:256\0";
 
-// Keep the promoted writer path while exercising a second submission from that baseline.
-const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+// The final proof is serialized only after all proving has finished, so spend a
+// little otherwise-dead tail memory to batch substantially more bincode output
+// per write. This keeps allocator/prover peak memory unchanged while reducing
+// filesystem crossings on the scored post-proof tail.
+const PROOF_OUTPUT_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 fn main() {
-    // First statement in the process: the Metal shader compile and pipeline
-    // lowering behind the GPU hash path cost the better part of a second on a
-    // cold OS shader cache, and the benchmark sandbox denies writes to that
-    // cache, which disables it entirely — so every scored worker pays the full
-    // price. Starting it here overlaps it with the startup work below instead
-    // of stalling the first proving step that wants the GPU. Pure scheduling:
-    // the compiled kernels are identical either way.
-    plonky2::hash::poseidon2::prewarm_gpu();
-    env_logger::init();
-    rayon::ThreadPoolBuilder::new()
-        .stack_size(PROVER_THREAD_STACK_BYTES)
-        .build_global()
-        .expect("cannot configure prover thread pool");
-
+    // This scored worker emits no application logs. Skip env_logger's environment
+    // parsing and filter construction on the serial startup path.
     let mut args = env::args().skip(1);
     let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
-    // Fixture parse overlaps the pre-execution circuit load; both are fast.
-    let (block, pre_circuits) = rayon::join(
-        || {
-            let json = fs::read(&fixture).expect("cannot read prover fixture");
-            Block::<F>::from_json_with_empty_txs(
-                &json,
-                HEAVY_TX_PER_PROOF,
-                LIGHT_TX_PER_PROOF,
-                PUBLIC_HEAVY_TX_COUNT,
-                PUBLIC_LIGHT_TX_COUNT,
-            )
-            .expect("invalid prover fixture")
-        },
-        || match Circuits::load_pre() {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                log::warn!("embedded pre circuit unavailable ({error:#}); building from scratch");
-                let pre =
-                    circuit::block_pre_execution_constraints::BlockPreExecutionCircuit::define(
-                        circuit::types::config::CIRCUIT_CONFIG,
-                    );
-                (pre.target, pre.builder.build::<C>())
-            }
-        },
-    );
-    let pre_exec = circuit::block_pre_execution::BlockPreExec::from_block(&block);
-    let pre_handle = std::thread::Builder::new()
-        .name("pre-exec-startup".into())
-        .stack_size(PROVER_THREAD_STACK_BYTES)
-        .spawn(move || {
-            let (pre_target, pre_data) = pre_circuits;
-            let pre_proof = prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec);
-            (pre_target, pre_data, pre_proof)
-        })
-        .expect("pre-execution startup thread must start");
-    // The pre circuit is owned by the startup proof until it completes. Load
-    // only the other four blobs in the meantime: loading all five here would
-    // deserialize the same pre circuit twice on the scored critical path.
-    // Keep the forced-build mode's established behavior unchanged.
-    let remaining = (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1"))
-        .then(Circuits::load_remaining_embedded);
-    let (pre_target, pre_data, pre_proof) = pre_handle
-        .join()
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-    let circuits = match remaining {
-        Some(Ok(remaining)) => remaining.into_circuits((pre_target, pre_data)),
-        Some(Err(error)) => {
-            log::warn!(
-                "embedded remaining circuits unavailable ({error:#}); building from scratch"
-            );
-            Circuits::load()
-        }
-        None => Circuits::load(),
-    };
-    let proof = prover::prove_block_after_pre(block, circuits, pre_proof);
-    let mut writer = BufWriter::with_capacity(
-        PROOF_OUTPUT_BUFFER_BYTES,
-        File::create(output).expect("cannot create proof output"),
-    );
+    // Circuit deserialization, Rayon worker initialization, fixture parsing, and
+    // output creation are independent startup work. Move pool construction onto
+    // the circuit-loader lane so its worker creation and stack setup overlap the
+    // main lane's fixture I/O and parsing instead of extending the serial prefix.
+    let (block, circuits, output_file) = std::thread::scope(|scope| {
+        let startup_handle = std::thread::Builder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, || {
+                // Configure the global pool before circuit loading in case
+                // deserialization ever gains Rayon work.
+                let rayon_threads = std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(1)
+                    .saturating_sub(1)
+                    .max(1);
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(rayon_threads)
+                    .stack_size(PROVER_THREAD_STACK_BYTES)
+                    .breadth_first()
+                    .build_global()
+                    .expect("cannot configure prover thread pool");
+                let output_file = File::create(output).expect("cannot create proof output");
+                (Circuits::load(), output_file)
+            })
+            .expect("startup loader thread must start");
+        let json = fs::read(fixture).expect("cannot read prover fixture");
+        let block = Block::<F>::from_json_with_empty_txs(
+            &json,
+            HEAVY_TX_PER_PROOF,
+            LIGHT_TX_PER_PROOF,
+            PUBLIC_HEAVY_TX_COUNT,
+            PUBLIC_LIGHT_TX_COUNT,
+        )
+        .expect("invalid prover fixture");
+        let (circuits, output_file) = startup_handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (block, circuits, output_file)
+    });
+    let proof = prover::prove_block(block, circuits);
+    let mut writer = BufWriter::with_capacity(PROOF_OUTPUT_BUFFER_BYTES, output_file);
     bincode::serialize_into(&mut writer, &proof).expect("cannot write proof output");
     // Explicit flush instead of relying on `BufWriter`'s `Drop` (which swallows
     // errors): every serialized byte must have reached the file descriptor
     // before the fast exit below, since `process::exit` runs no destructors.
-    // `into_inner` flushes the userspace buffer and surfaces any write error;
-    // dropping the returned `File` closes the descriptor. No `fsync` is needed
-    // — the benchmark verifier reads the file back through the same page cache
-    // on the same machine, so the `write(2)`s are already visible to it, and an
-    // `fsync` would only add durability latency to the scored process lifetime.
-    let file = writer.into_inner().expect("cannot flush proof output");
-    drop(file);
+    // `into_inner` flushes the userspace buffer and surfaces any write error.
+    // Leave the returned descriptor open: `process::exit` closes it below, so an
+    // explicit `drop(File)` would add a scored close syscall with no visibility
+    // benefit after the flush. No `fsync` is needed — the benchmark verifier
+    // reads the file back through the same page cache on the same machine, so
+    // the `write(2)`s are already visible to it, and an `fsync` would only add
+    // durability latency to the scored process lifetime.
+    let _file = writer.into_inner().expect("cannot flush proof output");
 
     // The score is the sum of worker process lifetimes (spawn -> exit), so the
     // destructor teardown after the proof is written is scored dead work: the
@@ -142,27 +118,8 @@ fn main() {
     // every allocation one by one, and none of it is observable — the kernel
     // reclaims the address space wholesale at exit. Every Metal command buffer
     // in the hash path is `commit()`ed and then `wait_until_completed()`ed
-    // before its results are read. The one detached thread this binary spawns
-    // is the GPU pre-warm above, which only populates a cache of compiled
-    // kernels and produces nothing anyone reads back, so there is no in-flight
-    // background work left to lose here.
-    // `std::process::exit` skips Rust destructors but still enters libc
-    // `exit(3)`, which runs every registered `atexit`/`__cxa_atexit` handler and
-    // finalises each loaded image — the Objective-C runtime, Metal and the
-    // driver bundle among them — before it reaches `_exit(2)`. That teardown
-    // releases objects the kernel reclaims at process death anyway, and it runs
-    // after the last proof byte has reached its descriptor, so it is dead work
-    // by the same argument that motivates skipping the destructors above.
-    // Entering `_exit(2)` directly is safe for the same reason the fast exit
-    // already was: the proof was flushed by `into_inner` and its descriptor
-    // closed, so every byte is with the kernel; the only thing additionally
-    // discarded is userspace stdio buffering, and nothing is written to stdout
-    // on the scored path. Declared in an `extern "C"` block rather than through
-    // a new dependency, so the dependency graph and `Cargo.lock` are untouched.
-    unsafe extern "C" {
-        fn _exit(status: i32) -> !;
-    }
-    unsafe { _exit(0) }
+    // before its results are read, and nothing in this binary spawns a detached
+    // thread, so there is no in-flight background work left to lose here.
+    std::process::exit(0);
 }
 
-// p90-fire-174-1786149031

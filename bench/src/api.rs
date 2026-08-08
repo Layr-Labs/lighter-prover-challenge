@@ -1,4 +1,3 @@
-// Redraw marker 45
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
@@ -106,6 +105,12 @@ impl Circuits {
             dummy_heavy_proof: heavy.dummy_proof,
             dummy_light_proof: light.dummy_proof,
         }
+    }
+
+    /// Releases the pre-execution circuit's LDE commitment after both its proof
+    /// and the final block-circuit synthesis have consumed it.
+    pub fn release_pre_execution_extension(&mut self) {
+        self.pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
     }
 
     /// Releases the extended (LDE) constants/sigmas commitment of every circuit

@@ -18,32 +18,6 @@ use crate::hash::merkle_tree::LevelOrderDigests;
 use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
-
-/// `poseidon2.metal` precompiled to AIR, so a worker that cannot use the Metal
-/// shader cache does not pay the MSL front end. Regenerate whenever
-/// `poseidon2.metal` changes (see `MetalShared::new`); the
-/// `metallib_matches_shader_source` test enforces it.
-const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
-
-/// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
-const SHADER_SOURCE_SHA256: &str =
-    "5a26157063dd5c76cedf06d12681d4f146bacdd236c3613d861ec5bb781597e6";
-
-/// Every kernel the shader defines. The prebuilt library is trusted only if all
-/// of them resolve, so a stale or truncated artifact falls back to compiling the
-/// source. This deliberately includes the lazily-built gate-quotient kernels:
-/// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 9] = [
-    "poseidon2_hash_leaves",
-    "poseidon2_hash_leaves_colmajor",
-    "poseidon2_hash_parents",
-    "poseidon2_absorb_pass",
-    "ntt_prepare",
-    "ntt_stage",
-    "ifft_finalize",
-    "poseidon2_gate_quotient",
-    "range_check_gate_quotient",
-];
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
 /// (6654d43) ranked-validated this raised value inside its composition; my
 /// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
@@ -87,6 +61,13 @@ struct MetalShared {
     ntt_prepare_pipeline: ComputePipelineState,
     ntt_stage_pipeline: ComputePipelineState,
     ifft_finalize_pipeline: ComputePipelineState,
+    /// Optional so a quotient-kernel setup failure cannot disable the
+    /// already-proven Metal commitment backend.
+    poseidon_gate_quotient_pipeline: Option<ComputePipelineState>,
+    /// Kept independent from the Poseidon gate pipeline so either optional
+    /// specialization can fail closed without disabling commitments or the
+    /// other quotient kernel.
+    range_check_gate_quotient_pipeline: Option<ComputePipelineState>,
     parameters: Buffer,
     pool: Mutex<BufferPool>,
     available: Condvar,
@@ -385,137 +366,7 @@ impl<F: RichField> TreeReadback<'_, F> {
     }
 }
 
-/// The two gate-quotient pipelines, lowered off the context's blocking path.
-///
-/// Each is `None` until its background build finishes and `Some(None)` if that
-/// build failed. Both readers already treat an absent pipeline as "evaluate
-/// this gate on the CPU", which is the same behaviour a failed build produced
-/// before, so a caller that arrives early simply takes the CPU path it would
-/// have taken had the kernel been unbuildable.
-struct LazyPipeline {
-    built: std::sync::OnceLock<Option<ComputePipelineState>>,
-    builder: Mutex<Option<std::thread::JoinHandle<()>>>,
-}
-
-impl LazyPipeline {
-    const fn new() -> Self {
-        Self {
-            built: std::sync::OnceLock::new(),
-            builder: Mutex::new(None),
-        }
-    }
-
-    /// Waits for the build if it has not finished.
-    ///
-    /// Waiting rather than reporting the kernel absent keeps the worst case at
-    /// exactly today's behaviour — the caller blocks for the same lowering the
-    /// context used to block on — while a caller that arrives after the build
-    /// lands, which is every caller in a real proof, pays nothing. Reporting it
-    /// absent instead would quietly move those gates onto the CPU, which can
-    /// cost more than the startup this saves.
-    fn get(&self) -> Option<&ComputePipelineState> {
-        if self.built.get().is_none() {
-            let handle = self.builder.lock().ok().and_then(|mut slot| slot.take());
-            if let Some(handle) = handle {
-                // A panicked builder leaves `built` unset, which reads as an
-                // unavailable kernel — the same outcome a failed lowering had.
-                let _ = handle.join();
-            }
-        }
-        self.built.get()?.as_ref()
-    }
-}
-
-static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
-static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
-static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
-
-fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
-    POSEIDON_GATE_QUOTIENT_PIPELINE.get()
-}
-
-fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
-    RANGE_CHECK_GATE_QUOTIENT_PIPELINE.get()
-}
-
-fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
-    ABSORB_PASS_PIPELINE.get()
-}
-
-/// Starts the two gate-quotient pipeline builds on detached threads.
-///
-/// One thread each rather than one for both: they are the two slowest kernels
-/// in the shader, so serializing them would keep the GPU quotient path on the
-/// CPU for the sum of their lowerings instead of the larger of the two.
-///
-/// Scheduling only. The pipelines are the same objects the blocking build
-/// produced, lowered from the same library, so nothing they later compute can
-/// differ; only the instant at which they become available does.
-fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
-    for (name, slot) in [
-        ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
-        (
-            "range_check_gate_quotient",
-            &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
-        ),
-        ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
-    ] {
-        let device = device.clone();
-        let library = library.clone();
-        let spawned = std::thread::Builder::new()
-            .name(format!("poseidon2-metal-{name}"))
-            .spawn(move || {
-                let pipeline = autoreleasepool(|| {
-                    library.get_function(name, None).ok().and_then(|function| {
-                        device
-                            .new_compute_pipeline_state_with_function(&function)
-                            .ok()
-                    })
-                });
-                if pipeline.is_none() {
-                    log::debug!("{name} pipeline unavailable; evaluating those gates on the CPU");
-                }
-                let _ = slot.built.set(pipeline);
-            });
-        match spawned {
-            Ok(handle) => {
-                if let Ok(mut builder) = slot.builder.lock() {
-                    *builder = Some(handle);
-                }
-            }
-            // No thread means nothing will ever populate the slot; settle it now
-            // so readers fall back instead of looking for a build in flight.
-            Err(_) => {
-                let _ = slot.built.set(None);
-            }
-        }
-    }
-}
-
 static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShared::new);
-
-/// Starts building the Metal context on a detached background thread.
-///
-/// [`CONTEXT`] is otherwise forced by whichever proving step first wants the
-/// GPU, which puts the shader compile and pipeline lowering (see
-/// [`MetalShared::new`]) squarely on the critical path of a scored worker
-/// process. Kicking it off from the process entry point instead lets it run
-/// against the startup work that precedes the first GPU use — argument
-/// handling, thread-pool construction, fixture parsing.
-///
-/// Idempotent and safe to call from anywhere: `LazyLock` initializes exactly
-/// once, and a thread that reaches [`shared_context`] while this one is still
-/// compiling blocks until it finishes and then observes the same context.
-/// Callers that never touch the GPU pay only the thread spawn. Nothing here
-/// is observable in a proof — the context holds compiled kernels, not values.
-pub fn prewarm() {
-    std::thread::Builder::new()
-        .name("poseidon2-metal-prewarm".to_owned())
-        .spawn(|| {
-            let _ = &*CONTEXT;
-        })
-        .ok();
-}
 
 /// True while the prover is inside an exclusive serial phase (pre-execution
 /// or final block proof) where no concurrent proof can contend for the
@@ -1049,187 +900,6 @@ pub(crate) fn allocate_columns<F: RichField>(
 
 /// Hashes retained shared columns without copying them through the pooled
 /// staging buffer.
-/// Retained buffers for the streamed sponge build: the inter-pass state
-/// (12 u64 lanes per leaf, column-major) and the level-order digest output.
-/// One streamed build runs at a time (exclusive proving phases only), so a
-/// single grow-on-demand pair suffices; holding the lock for the whole build
-/// serializes any unexpected second caller onto the classic path.
-static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
-
-/// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
-/// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
-/// the GPU absorbs each group while the CPU fills the next. Only used inside
-/// exclusive proving phases (nothing else contends for the GPU stream) and
-/// for large wide trees, where the overlap converts the previously serial
-/// CPU-FFT-then-GPU-hash commitment into max(FFT, hash) + one pass.
-///
-/// Value-exact: the fill closure runs the same `batch_multiply_into` +
-/// zero-padded FFT as `fill_lde_column_store`, and each absorb pass performs
-/// exactly the corresponding loop iteration of `poseidon2_hash_leaves_colmajor`
-/// (chunked canonicalized absorption, permute, final bit-reversed digest
-/// write), so both the retained columns and the digests are bit-identical to
-/// the classic path. Any unavailability (pipeline missing, buffers, command
-/// failure) returns `None` and the caller falls back to that classic path;
-/// the fill is idempotent, so a partial fill followed by the fallback''s full
-/// fill is harmless.
-pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
-    columns: &MetalColumns<F>,
-    cap_height: usize,
-    fill_group: &(dyn Fn(usize, &mut [&mut [F]]) + Sync),
-) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
-    let leaf_width = columns.cols;
-    let leaf_count = columns.rows;
-    if F::ORDER != 0xffff_ffff_0000_0001
-        || size_of::<F>() != size_of::<u64>()
-        || leaf_width < 16
-        || leaf_count < 1 << 20
-        || !leaf_count.is_power_of_two()
-        || leaf_count > u32::MAX as usize
-        || leaf_width > u32::MAX as usize
-        || cap_height > leaf_count.ilog2() as usize
-        || !EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
-    {
-        return None;
-    }
-    let context = shared_context()?;
-    let pipeline = absorb_pass_pipeline()?;
-    log::debug!("streamed sponge build: {leaf_width} cols x {leaf_count} leaves");
-
-    let cap_count = 1usize << cap_height;
-    let total_node_count = 2 * leaf_count - cap_count;
-    let output_len = total_node_count.checked_mul(4)?;
-    let output_bytes = output_len.checked_mul(size_of::<u64>())?;
-    let state_bytes = leaf_count.checked_mul(12)?.checked_mul(size_of::<u64>())?;
-
-    let job = GpuJobGuard::begin();
-    let mut buffers = STREAMED_BUFFERS.lock().ok()?;
-    let needs_new = buffers.as_ref().map_or(true, |(state, output)| {
-        state.length() < state_bytes as u64 || output.length() < output_bytes as u64
-    });
-    if needs_new {
-        *buffers = Some(autoreleasepool(|| {
-            (
-                context.device.new_buffer(
-                    state_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
-                context.device.new_buffer(
-                    output_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
-            )
-        }));
-    }
-    let (state_buffer, output_buffer) = buffers.as_ref()?;
-
-    // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
-    // absorption of group g: commands on one queue execute in submission
-    // order, and each pass is committed before the next group''s fill starts.
-    let groups = leaf_width.div_ceil(8);
-    let base = columns.buffer.contents().cast::<F>();
-    let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
-    for group in 0..groups {
-        let col_start = group * 8;
-        let chunk = (leaf_width - col_start).min(8);
-        {
-            // SAFETY: each column slice covers a disjoint `leaf_count` range
-            // of the shared buffer; the GPU only reads columns of groups
-            // whose pass was already committed, after their fill completed.
-            let mut slices: Vec<&mut [F]> = (0..chunk)
-                .map(|k| unsafe {
-                    slice::from_raw_parts_mut(
-                        base.add((col_start + k) * leaf_count).cast::<F>(),
-                        leaf_count,
-                    )
-                })
-                .collect();
-            fill_group(group, &mut slices);
-        }
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = context.queue.new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&columns.buffer), 0);
-            encoder.set_buffer(1, Some(state_buffer), 0);
-            encoder.set_buffer(2, Some(output_buffer), 0);
-            encoder.set_buffer(3, Some(&context.parameters), 0);
-            set_u32(encoder, 4, leaf_count as u32);
-            set_u32(encoder, 5, leaf_count.ilog2());
-            set_u32(encoder, 6, col_start as u32);
-            set_u32(encoder, 7, chunk as u32);
-            set_u32(encoder, 8, (group == 0) as u32);
-            set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
-            encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.to_owned()
-        });
-        absorb_commands.push(command_buffer);
-    }
-
-    // Parent levels over the completed leaf digests, exactly as in the
-    // classic single-command build.
-    let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
-    let parents_command = autoreleasepool(|| -> CommandBuffer {
-        let command_buffer = context.queue.new_command_buffer();
-        let mut level_offset = 0usize;
-        let mut child_count = leaf_count;
-        level_offsets.push(level_offset);
-        while child_count > cap_count {
-            let parent_count = child_count / 2;
-            let child_offset = level_offset;
-            level_offset += child_count * 4;
-            level_offsets.push(level_offset);
-
-            let parent_count_u32 = parent_count as u32;
-            let parent_encoder = command_buffer.new_compute_command_encoder();
-            parent_encoder.set_compute_pipeline_state(&context.parent_pipeline);
-            parent_encoder.set_buffer(
-                0,
-                Some(output_buffer),
-                (child_offset * size_of::<u64>()) as NSUInteger,
-            );
-            parent_encoder.set_buffer(
-                1,
-                Some(output_buffer),
-                (level_offset * size_of::<u64>()) as NSUInteger,
-            );
-            parent_encoder.set_buffer(2, Some(&context.parameters), 0);
-            set_u32(parent_encoder, 3, parent_count_u32);
-            dispatch(parent_encoder, &context.parent_pipeline, parent_count);
-            parent_encoder.end_encoding();
-
-            child_count = parent_count;
-        }
-        command_buffer.commit();
-        command_buffer.to_owned()
-    });
-
-    parents_command.wait_until_completed();
-    let all_ok = absorb_commands
-        .iter()
-        .chain(core::iter::once(&parents_command))
-        .all(|command_buffer| {
-            command_buffer.wait_until_completed();
-            command_buffer.status() == MTLCommandBufferStatus::Completed
-        });
-    drop(job);
-    if !all_ok {
-        log::warn!("streamed Metal sponge build failed; falling back to the classic path");
-        return None;
-    }
-
-    let nodes = unsafe {
-        slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
-    };
-    Some(tree_from_levels::<F>(
-        nodes,
-        &level_offsets,
-        leaf_count,
-        cap_height,
-    ))
-}
-
 pub(crate) fn build_merkle_tree_shared<F: RichField>(
     columns: &MetalColumns<F>,
     cap_height: usize,
@@ -1368,147 +1038,61 @@ impl MetalShared {
         autoreleasepool(|| {
             let device = Device::system_default().ok_or("no Metal device")?;
             let options = CompileOptions::new();
-            // Prefer the prebuilt AIR library over compiling the MSL source.
-            //
-            // The ranked sandbox profile grants read but DENIES write on
-            // `com.apple.metal` (see `write-benchmark-sandbox-profile.sh`), so the
-            // shader cache is unusable and every worker process re-runs the full
-            // MSL->AIR compile of the shader. The harness spawns one worker per
-            // fixture and the score is the sum of worker process lifetimes, so
-            // that cost is paid once per fixture and every millisecond is scored.
-            // `newLibraryWithData:` skips the front end; only the AIR->ISA
-            // pipeline lowering below remains.
-            //
-            // This needs no Metal toolchain at build time — the artifact is
-            // committed — which is what makes it viable where a build-time
-            // `MTLBinaryArchive` is not.
-            //
-            // Any failure falls back to compiling the source, so a runtime that
-            // rejects this AIR version behaves exactly as before. The function
-            // probe is what makes the fallback safe against a STALE artifact:
-            // regenerate with
-            //   xcrun -sdk macosx metal -c poseidon2.metal -o poseidon2.air
-            //   xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib
-            // and `metallib_matches_shader_source` fails the test run if you
-            // forget.
             let library = device
-                .new_library_with_data(SHADER_METALLIB)
+                .new_library_with_source(SHADER_SOURCE, &options)
+                .map_err(|error| format!("shader compilation failed: {error}"))?;
+            let leaf_function = library
+                .get_function("poseidon2_hash_leaves", None)
+                .map_err(|error| format!("leaf kernel unavailable: {error}"))?;
+            let leaf_colmajor_function = library
+                .get_function("poseidon2_hash_leaves_colmajor", None)
+                .map_err(|error| format!("col-major leaf kernel unavailable: {error}"))?;
+            let parent_function = library
+                .get_function("poseidon2_hash_parents", None)
+                .map_err(|error| format!("parent kernel unavailable: {error}"))?;
+            let ntt_prepare_function = library
+                .get_function("ntt_prepare", None)
+                .map_err(|error| format!("ntt prepare kernel unavailable: {error}"))?;
+            let ntt_stage_function = library
+                .get_function("ntt_stage", None)
+                .map_err(|error| format!("ntt stage kernel unavailable: {error}"))?;
+            let leaf_pipeline = device
+                .new_compute_pipeline_state_with_function(&leaf_function)
+                .map_err(|error| format!("leaf pipeline creation failed: {error}"))?;
+            let leaf_colmajor_pipeline = device
+                .new_compute_pipeline_state_with_function(&leaf_colmajor_function)
+                .map_err(|error| format!("col-major leaf pipeline creation failed: {error}"))?;
+            let parent_pipeline = device
+                .new_compute_pipeline_state_with_function(&parent_function)
+                .map_err(|error| format!("parent pipeline creation failed: {error}"))?;
+            let ntt_prepare_pipeline = device
+                .new_compute_pipeline_state_with_function(&ntt_prepare_function)
+                .map_err(|error| format!("ntt prepare pipeline creation failed: {error}"))?;
+            let ntt_stage_pipeline = device
+                .new_compute_pipeline_state_with_function(&ntt_stage_function)
+                .map_err(|error| format!("ntt stage pipeline creation failed: {error}"))?;
+            let ifft_finalize_function = library
+                .get_function("ifft_finalize", None)
+                .map_err(|error| format!("ifft finalize kernel unavailable: {error}"))?;
+            let ifft_finalize_pipeline = device
+                .new_compute_pipeline_state_with_function(&ifft_finalize_function)
+                .map_err(|error| format!("ifft finalize pipeline creation failed: {error}"))?;
+            let poseidon_gate_quotient_pipeline = library
+                .get_function("poseidon2_gate_quotient", None)
                 .ok()
-                .filter(|library| {
-                    METALLIB_REQUIRED_KERNELS
-                        .iter()
-                        .all(|name| library.get_function(name, None).is_ok())
-                })
-                .map_or_else(
-                    || {
-                        device
-                            .new_library_with_source(SHADER_SOURCE, &options)
-                            .map_err(|error| format!("shader compilation failed: {error}"))
-                    },
-                    Ok,
-                )?;
-            // Build the compute pipelines concurrently, one thread each.
-            //
-            // Every `newComputePipelineStateWithFunction:` lowers that kernel's
-            // AIR to a GPU binary through MTLCompilerService, and the three
-            // Poseidon2 permutation kernels plus the two gate-quotient kernels
-            // are large enough that each takes hundreds of milliseconds when the
-            // result is not already in the OS shader cache. The benchmark
-            // sandbox denies writes to that cache, which disables it outright —
-            // reads miss too — so *every* scored worker process pays the full
-            // cold lowering, serialized at ~2.36 s. The compiler service handles
-            // the requests in parallel, so issuing all eight at once collapses
-            // that to the cost of the single slowest kernel (~0.67 s).
-            //
-            // This is a scheduling change only: the pipelines, and therefore
-            // every value the GPU later computes, are identical. `Device`,
-            // `Library` and `ComputePipelineState` are all `Send + Sync`, and
-            // each worker thread gets its own autorelease pool so the temporary
-            // `NSError`s the Metal API autoreleases are drained on the thread
-            // that created them rather than leaking.
-            let device_ref = &device;
-            let library_ref = &library;
-            let required = |name: &'static str, kind: &'static str| {
-                move || -> Result<ComputePipelineState, String> {
-                    autoreleasepool(|| {
-                        let function = library_ref
-                            .get_function(name, None)
-                            .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
-                        device_ref
-                            .new_compute_pipeline_state_with_function(&function)
-                            .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
-                    })
-                }
-            };
-            // The two gate-quotient kernels are the two most expensive to lower
-            // and the only two the context can do without: every caller already
-            // treats an absent pipeline as "run this on the CPU". Lowering them
-            // on the blocking path makes the whole context wait for the slowest
-            // kernel in the shader; measured cold under the benchmark's sandbox
-            // profile, where the OS shader cache is disabled:
-            //
-            //     range_check_gate_quotient   679 ms
-            //     poseidon2_gate_quotient     601 ms
-            //     the six required kernels    491 ms and below
-            //
-            // Lowering all eight in parallel takes 886 ms against 474 ms for the
-            // six required ones, because the two extra kernels both raise the
-            // maximum and add contention on MTLCompilerService. Building them
-            // off the blocking path instead leaves the context ready in 838 ms
-            // rather than 1270 ms, and they land shortly after, long before the
-            // first quotient evaluation of a proof asks for them.
-            //
-            // Started below, once the required six have finished, so they do not
-            // simply move their MTLCompilerService contention onto the path they
-            // are being taken off.
-            let (
-                leaf_pipeline,
-                leaf_colmajor_pipeline,
-                parent_pipeline,
-                ntt_prepare_pipeline,
-                ntt_stage_pipeline,
-                ifft_finalize_pipeline,
-            ) = std::thread::scope(|scope| {
-                let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
-                let leaf_colmajor =
-                    scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
-                let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
-                let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
-                let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
-                let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
-                // A panic inside a pipeline build is a bug, not a runtime
-                // condition; propagate it rather than papering over it.
-                (
-                    leaf.join().expect("leaf pipeline thread panicked"),
-                    leaf_colmajor
-                        .join()
-                        .expect("col-major leaf pipeline thread panicked"),
-                    parent.join().expect("parent pipeline thread panicked"),
-                    ntt_prepare
-                        .join()
-                        .expect("ntt prepare pipeline thread panicked"),
-                    ntt_stage
-                        .join()
-                        .expect("ntt stage pipeline thread panicked"),
-                    ifft_finalize
-                        .join()
-                        .expect("ifft finalize pipeline thread panicked"),
-                )
-            });
-            // Surfaced in kernel order, so a single missing or unbuildable
-            // kernel yields the same error string the sequential construction
-            // produced. Only the tie-break between two simultaneous failures
-            // can differ, and every one of these kernels is present in
-            // `SHADER_SOURCE`; a failure here means the whole library is bad,
-            // which `new_library_with_source` above has already rejected.
-            let leaf_pipeline = leaf_pipeline?;
-            let leaf_colmajor_pipeline = leaf_colmajor_pipeline?;
-            let parent_pipeline = parent_pipeline?;
-            let ntt_prepare_pipeline = ntt_prepare_pipeline?;
-            let ntt_stage_pipeline = ntt_stage_pipeline?;
-            let ifft_finalize_pipeline = ifft_finalize_pipeline?;
-
-            spawn_optional_pipelines(&device, &library);
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
+            let range_check_gate_quotient_pipeline = library
+                .get_function("range_check_gate_quotient", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -1530,6 +1114,8 @@ impl MetalShared {
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
+                poseidon_gate_quotient_pipeline,
+                range_check_gate_quotient_pipeline,
                 parameters,
                 pool: Mutex::new(BufferPool {
                     free: Vec::new(),
@@ -1583,7 +1169,9 @@ impl MetalShared {
         include_unused_selector: bool,
         alpha_powers: &[u64],
     ) -> Result<PoseidonGateQuotientJob<F>, String> {
-        let pipeline = poseidon_gate_quotient_pipeline()
+        let pipeline = self
+            .poseidon_gate_quotient_pipeline
+            .as_ref()
             .ok_or("Poseidon2 gate quotient pipeline unavailable")?;
         let len = quotient_rows
             .checked_mul(2)
@@ -1644,7 +1232,9 @@ impl MetalShared {
         alpha_powers: &[u64],
         alpha_stride: usize,
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
-        let pipeline = range_check_gate_quotient_pipeline()
+        let pipeline = self
+            .range_check_gate_quotient_pipeline
+            .as_ref()
             .ok_or("RangeCheck gate quotient pipeline unavailable")?;
         if metadata.len() != (range_count + u32_count) * 10
             || alpha_powers.len() != alpha_stride * 2
@@ -2768,49 +2358,6 @@ mod tests {
     use crate::field::types::{Field64, PrimeField64};
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
-
-    /// The prebuilt AIR library is only sound while it is the compiled form of
-    /// the MSL we ship. Nothing in the type system ties the two together, so
-    /// this pins the source bytes: edit `poseidon2.metal` without regenerating
-    /// `poseidon2.metallib` and this fails loudly instead of silently proving
-    /// with stale kernels.
-    #[test]
-    fn metallib_matches_shader_source() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
-        let output = std::process::Command::new("/usr/bin/shasum")
-            .args(["-a", "256", &format!("{dir}/poseidon2.metal")])
-            .output()
-            .expect("shasum must be available to verify the metallib is current");
-        assert!(output.status.success(), "shasum failed");
-        let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
-        let digest = digest.split_whitespace().next().expect("empty shasum output");
-        assert_eq!(
-            digest, SHADER_SOURCE_SHA256,
-            "poseidon2.metal changed but poseidon2.metallib was not regenerated. Run:\n  \
-             xcrun -sdk macosx metal -c poseidon2.metal -o poseidon2.air\n  \
-             xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib\n\
-             then update SHADER_SOURCE_SHA256 to {digest}."
-        );
-    }
-
-    /// The fallback in `MetalShared::new` hides a broken artifact behind a
-    /// source compile, which would silently give back the cost this exists to
-    /// remove. Assert the fast path is actually live on this machine.
-    #[test]
-    fn metallib_loads_and_exposes_every_kernel() {
-        let Some(device) = Device::system_default() else {
-            return; // no Metal device in this environment
-        };
-        let library = device
-            .new_library_with_data(SHADER_METALLIB)
-            .expect("prebuilt metallib must load");
-        for name in METALLIB_REQUIRED_KERNELS {
-            assert!(
-                library.get_function(name, None).is_ok(),
-                "prebuilt metallib is missing kernel {name}"
-            );
-        }
-    }
     use crate::gates::selectors::UNUSED_SELECTOR;
     use crate::hash::hash_types::HashOut;
     use crate::hash::merkle_tree::{capacity_up_to_mut, fill_digests_buf, merkle_tree_prove};

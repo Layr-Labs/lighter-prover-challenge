@@ -1657,13 +1657,12 @@ fn compute_quotient_polys<
     // remaining gates, while the permutation argument always needs the routed
     // prefix. Do not gather dead high columns for offloaded Poseidon/Range
     // gates into every 32-point CPU scratch batch.
-    // survivor-list once per proof v4-17.76
-    let cpu_gate_indices = (0..common_data.gates.len())
-        .filter(|gate_index| !excluded_gate_indices.contains(gate_index))
-        .collect::<Vec<_>>();
-    let cpu_num_wires = cpu_gate_indices
+    let cpu_num_wires = common_data
+        .gates
         .iter()
-        .map(|&i| common_data.gates[i].0.num_wires())
+        .enumerate()
+        .filter(|(gate_index, _)| !excluded_gate_indices.contains(gate_index))
+        .map(|(_, gate)| gate.0.num_wires())
         .max()
         .unwrap_or(0)
         .max(num_routed_wires);
@@ -1672,11 +1671,8 @@ fn compute_quotient_polys<
     // gather: an excluded gate's rows stay zero, so the CPU only ever writes
     // the prefix below and the per-batch memset and Horner reduction can stop
     // there. Hoisted out of the batch loop exactly like `cpu_num_wires`.
-    let cpu_num_gate_constraints = cpu_gate_indices
-        .iter()
-        .map(|&i| common_data.gates[i].0.num_constraints())
-        .max()
-        .unwrap_or(0);
+    let cpu_num_gate_constraints =
+        crate::plonk::vanishing_poly::cpu_gate_constraint_rows(common_data, &excluded_gate_indices);
     debug_assert!(cpu_num_gate_constraints <= common_data.num_gate_constraints);
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if gpu_poseidon_quotient_diagnostics_enabled() && !excluded_gate_indices.is_empty() {
@@ -1937,7 +1933,7 @@ fn compute_quotient_polys<
                     beta_k_is,
                     deltas,
                     alphas,
-                    &cpu_gate_indices,
+                    &excluded_gate_indices,
                     cpu_num_gate_constraints,
                     &z_h_on_coset,
                     &lut_re_poly_evals_refs,
@@ -2050,43 +2046,18 @@ fn compute_quotient_polys<
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
-    // Parallel scatter of the interleaved point-major buffer into the
-    // per-challenge columns. The former single streaming pass was serial:
-    // 16 MiB of traffic per d16 proof (32 MiB for the final block proof)
-    // walked by one thread between the parallel quotient evaluation and the
-    // parallel IFFT while every other core sat idle. Each parallel chunk
-    // below owns a disjoint point range, and column position `i` is written
-    // exactly once with the identical value the serial pass stored there.
-    struct ColPtr<T>(*mut T);
-    unsafe impl<T> Send for ColPtr<T> {}
-    unsafe impl<T> Sync for ColPtr<T> {}
+    // One streaming pass splits the interleaved point-major buffer into the
+    // per-challenge columns, instead of `num_challenges` parallel passes each
+    // stride-reading the whole buffer. Same values in the same order; only
+    // which pass writes them changes.
     let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
-        .map(|_| {
-            let mut column = Vec::with_capacity(points.len());
-            // SAFETY: the disjoint parallel scatter below writes every element
-            // exactly once before any read; `F` is plain data. Same idiom as
-            // the zero-tail fast path in `fri/oracle.rs`.
-            unsafe { column.set_len(points.len()) };
-            column
-        })
+        .map(|_| Vec::with_capacity(points.len()))
         .collect();
-    let column_ptrs: Vec<ColPtr<F>> = challenge_columns
-        .iter_mut()
-        .map(|column| ColPtr(column.as_mut_ptr()))
-        .collect();
-    let column_ptrs = &column_ptrs;
-    quotient_values
-        .par_chunks(BATCH_SIZE * num_challenges)
-        .enumerate()
-        .for_each(|(chunk_i, chunk)| {
-            let base = BATCH_SIZE * chunk_i;
-            for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                for (column, &value) in column_ptrs.iter().zip(point_values) {
-                    // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
-                }
-            }
-        });
+    for point_values in quotient_values.chunks_exact(num_challenges) {
+        for (column, &value) in challenge_columns.iter_mut().zip(point_values) {
+            column.push(value);
+        }
+    }
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()

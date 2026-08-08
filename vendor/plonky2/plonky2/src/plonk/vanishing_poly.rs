@@ -170,18 +170,11 @@ pub(crate) fn eval_vanishing_poly<F: RichField + Extendable<D>, const D: usize>(
 pub(crate) struct VanishingScratch<F> {
     pub numerator_values: Vec<F>,
     pub denominator_values: Vec<F>,
-    /// Second challenge's product rows in the specialized two-challenge
-    /// column evaluator. Kept separate so each challenge preserves its exact
-    /// left-to-right multiplication order while sharing column loads.
-    pub numerator_values_second: Vec<F>,
-    pub denominator_values_second: Vec<F>,
     pub vanishing_z_1_terms: Vec<F>,
     pub vanishing_partial_products_terms: Vec<F>,
     pub vanishing_all_lookup_terms: Vec<F>,
     pub lookup_selectors: Vec<F>,
     pub constraint_terms_batch: Vec<F>,
-    /// Reused selector-filter buffer across batches (survivor-list package).
-    pub gate_filters: Vec<F>,
 }
 
 /// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
@@ -281,7 +274,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     beta_k_is: &[F],
     deltas: &[F],
     alphas: &[F],
-    cpu_gate_indices: &[usize],
+    excluded_gate_indices: &[usize],
     cpu_num_gate_constraints: usize,
     z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
@@ -306,12 +299,11 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     let num_gate_constraints = common_data.num_gate_constraints;
 
-    evaluate_gate_constraints_base_batch_into_cpu_gates::<F, D>(
+    evaluate_gate_constraints_base_batch_into_excluding_many::<F, D>(
         common_data,
         vars_batch,
         &mut scratch.constraint_terms_batch,
-        cpu_gate_indices,
-        &mut scratch.gate_filters,
+        excluded_gate_indices,
         cpu_num_gate_constraints,
     );
     let constraint_terms_batch = &scratch.constraint_terms_batch;
@@ -395,8 +387,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
         let num_prod = &mut scratch.numerator_values;
         let den_prod = &mut scratch.denominator_values;
-        let num_prod_second = &mut scratch.numerator_values_second;
-        let den_prod_second = &mut scratch.denominator_values_second;
 
         // The accumulator chain for challenge `i` is the column sequence
         // [Z_i(x) | partials i*num_prods..(i+1)*num_prods | Z_i(gx)], read
@@ -421,111 +411,47 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             for k in 0..n {
                 z1_row[k] = l_0_xs[k] * z_col[k].sub_one();
             }
-        }
 
-        if num_challenges == 2 {
-            // Both production challenges traverse the same routed-wire,
-            // sigma and point columns. Keep their arithmetic chains separate,
-            // but update them side by side so every shared input is loaded
-            // once. Operations within either challenge retain the old exact
-            // j-ascending order and expression association.
-            let beta_0 = betas[0];
-            let beta_1 = betas[1];
-            let gamma_0 = gammas[0];
-            let gamma_1 = gammas[1];
             for c in 0..num_chunks {
                 let j_start = c * chunk_size;
                 let j_end = ((c + 1) * chunk_size).min(num_routed_wires);
+                let beta = betas[i];
+                let gamma = gammas[i];
 
+                // The first factor of each chunk lands by direct assignment:
+                // the reference path multiplies it into `ONE`, and
+                // `ONE * a == a` bitwise for Goldilocks (`reduce128` is the
+                // identity on inputs `< 2^64`), so skipping that multiply —
+                // and the resize-to-ONE memset — changes no value.
                 num_prod.clear();
                 den_prod.clear();
-                num_prod_second.clear();
-                den_prod_second.clear();
                 {
                     let wire_col = &wires[j_start * n..][..n];
                     let sigma_col = &s_sigmas_cols[j_start * n..][..n];
-                    let beta_k_0 = beta_k_is[j_start];
-                    let beta_k_1 = beta_k_is[num_routed_wires + j_start];
+                    let beta_k_i = beta_k_is[i * num_routed_wires + j_start];
                     for k in 0..n {
-                        let wire = wire_col[k];
-                        let sigma = sigma_col[k];
-                        let x = xs_batch[k];
-                        num_prod.push(wire + beta_k_0 * x + gamma_0);
-                        den_prod.push(wire + beta_0 * sigma + gamma_0);
-                        num_prod_second.push(wire + beta_k_1 * x + gamma_1);
-                        den_prod_second.push(wire + beta_1 * sigma + gamma_1);
+                        num_prod.push(wire_col[k] + beta_k_i * xs_batch[k] + gamma);
+                        den_prod.push(wire_col[k] + beta * sigma_col[k] + gamma);
                     }
                 }
                 for j in j_start + 1..j_end {
                     let wire_col = &wires[j * n..][..n];
                     let sigma_col = &s_sigmas_cols[j * n..][..n];
-                    let beta_k_0 = beta_k_is[j];
-                    let beta_k_1 = beta_k_is[num_routed_wires + j];
+                    let beta_k_i = beta_k_is[i * num_routed_wires + j];
                     for k in 0..n {
-                        let wire = wire_col[k];
-                        let sigma = sigma_col[k];
-                        let x = xs_batch[k];
-                        num_prod[k] *= wire + beta_k_0 * x + gamma_0;
-                        den_prod[k] *= wire + beta_0 * sigma + gamma_0;
-                        num_prod_second[k] *= wire + beta_k_1 * x + gamma_1;
-                        den_prod_second[k] *= wire + beta_1 * sigma + gamma_1;
+                        num_prod[k] *= wire_col[k] + beta_k_i * xs_batch[k] + gamma;
+                        den_prod[k] *= wire_col[k] + beta * sigma_col[k] + gamma;
                     }
                 }
 
-                let row_0 = (num_challenges + c) * n;
-                let row_1 = (num_challenges + num_chunks + c) * n;
-                let (rows_before_1, rows_from_1) = term_rows.split_at_mut(row_1);
-                let row_0 = &mut rows_before_1[row_0..row_0 + n];
-                let row_1 = &mut rows_from_1[..n];
-                let prev_0 = acc_col(0, c);
-                let next_0 = acc_col(0, c + 1);
-                let prev_1 = acc_col(1, c);
-                let next_1 = acc_col(1, c + 1);
+                let row =
+                    &mut term_rows[(num_challenges + i * num_chunks + c) * n..][..n];
+                // Chunk c reads accumulator column c as prev and column c+1
+                // as next.
+                let prev_col = acc_col(i, c);
+                let next_col = acc_col(i, c + 1);
                 for k in 0..n {
-                    row_0[k] = prev_0[k] * num_prod[k] - next_0[k] * den_prod[k];
-                    row_1[k] = prev_1[k] * num_prod_second[k]
-                        - next_1[k] * den_prod_second[k];
-                }
-            }
-        } else {
-            for i in 0..num_challenges {
-                for c in 0..num_chunks {
-                    let j_start = c * chunk_size;
-                    let j_end = ((c + 1) * chunk_size).min(num_routed_wires);
-                    let beta = betas[i];
-                    let gamma = gammas[i];
-
-                    // The first factor of each chunk lands by direct
-                    // assignment; multiplying it into `ONE` is a raw-limb
-                    // identity for Goldilocks.
-                    num_prod.clear();
-                    den_prod.clear();
-                    {
-                        let wire_col = &wires[j_start * n..][..n];
-                        let sigma_col = &s_sigmas_cols[j_start * n..][..n];
-                        let beta_k_i = beta_k_is[i * num_routed_wires + j_start];
-                        for k in 0..n {
-                            num_prod.push(wire_col[k] + beta_k_i * xs_batch[k] + gamma);
-                            den_prod.push(wire_col[k] + beta * sigma_col[k] + gamma);
-                        }
-                    }
-                    for j in j_start + 1..j_end {
-                        let wire_col = &wires[j * n..][..n];
-                        let sigma_col = &s_sigmas_cols[j * n..][..n];
-                        let beta_k_i = beta_k_is[i * num_routed_wires + j];
-                        for k in 0..n {
-                            num_prod[k] *= wire_col[k] + beta_k_i * xs_batch[k] + gamma;
-                            den_prod[k] *= wire_col[k] + beta * sigma_col[k] + gamma;
-                        }
-                    }
-
-                    let row =
-                        &mut term_rows[(num_challenges + i * num_chunks + c) * n..][..n];
-                    let prev_col = acc_col(i, c);
-                    let next_col = acc_col(i, c + 1);
-                    for k in 0..n {
-                        row[k] = prev_col[k] * num_prod[k] - next_col[k] * den_prod[k];
-                    }
+                    row[k] = prev_col[k] * num_prod[k] - next_col[k] * den_prod[k];
                 }
             }
         }
@@ -544,8 +470,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         l_0_xs.clear();
         num_prod.clear();
         den_prod.clear();
-        num_prod_second.clear();
-        den_prod_second.clear();
         return;
     }
 
@@ -1135,36 +1059,13 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
         num_constraint_rows,
         cpu_gate_constraint_rows(common_data, excluded_gate_indices)
     );
-    let cpu_gate_indices = (0..common_data.gates.len())
-        .filter(|i| !excluded_gate_indices.contains(i))
-        .collect::<Vec<_>>();
-    let mut filters = Vec::with_capacity(vars_batch.len());
-    evaluate_gate_constraints_base_batch_into_cpu_gates(
-        common_data,
-        vars_batch,
-        constraints_batch,
-        &cpu_gate_indices,
-        &mut filters,
-        num_constraint_rows,
-    );
-}
-
-pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
-    F: RichField + Extendable<D>,
-    const D: usize,
->(
-    common_data: &CommonCircuitData<F, D>,
-    vars_batch: EvaluationVarsBaseBatch<F>,
-    constraints_batch: &mut Vec<F>,
-    cpu_gate_indices: &[usize],
-    filters: &mut Vec<F>,
-    num_constraint_rows: usize,
-) {
-    debug_assert!(num_constraint_rows <= common_data.num_gate_constraints);
     constraints_batch.clear();
     constraints_batch.resize(num_constraint_rows * vars_batch.len(), F::ZERO);
-    for &i in cpu_gate_indices {
-        let gate = &common_data.gates[i];
+    let mut filters = Vec::with_capacity(vars_batch.len());
+    for (i, gate) in common_data.gates.iter().enumerate() {
+        if excluded_gate_indices.contains(&i) {
+            continue;
+        }
         let selector_index = common_data.selectors_info.selector_indices[i];
         gate.0.eval_filtered_base_batch(
             vars_batch,
@@ -1173,7 +1074,7 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
             common_data.selectors_info.groups[selector_index].clone(),
             common_data.selectors_info.num_selectors(),
             common_data.num_lookup_selectors,
-            filters,
+            &mut filters,
             constraints_batch,
         );
     }
