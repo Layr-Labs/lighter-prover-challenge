@@ -600,6 +600,10 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         let diff = u32::MAX as u64 - output_high_u64;
         let inverse = if diff == 0 {
             F::ZERO
+        } else if diff == u32::MAX as u64 && F::ORDER == 0xFFFF_FFFF_0000_0001 {
+            let inv = F::from_canonical_u64(0xFFFF_FFFE_0000_0001);
+            debug_assert_eq!(inv, F::from_canonical_u64(diff).inverse());
+            inv
         } else {
             F::from_canonical_u64(diff).inverse()
         };

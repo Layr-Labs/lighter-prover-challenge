@@ -38,7 +38,8 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // /etc/malloc.conf can still override it.
 #[cfg(not(target_env = "msvc"))]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
+static MALLOC_CONF: &[u8; 57] =
+    b"dirty_decay_ms:-1,muzzy_decay_ms:-1,oversize_threshold:0\0";
 
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
@@ -63,19 +64,22 @@ fn main() {
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
-    let json = fs::read(fixture).expect("cannot read prover fixture");
-    let block = Block::<F>::from_json_with_empty_txs(
-        &json,
-        HEAVY_TX_PER_PROOF,
-        LIGHT_TX_PER_PROOF,
-        PUBLIC_HEAVY_TX_COUNT,
-        PUBLIC_LIGHT_TX_COUNT,
-    )
-    .expect("invalid prover fixture");
-    // Embedded circuits (deserialized from compile-time blobs) by default;
-    // falls back to building from scratch if they are unavailable, and
-    // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B measurement.
-    let proof = prover::prove_block(block, Circuits::load());
+    // Overlap parse/load with Metal prewarm already running.
+    let (block, circuits) = rayon::join(
+        || {
+            let json = fs::read(&fixture).expect("cannot read prover fixture");
+            Block::<F>::from_json_with_empty_txs(
+                &json,
+                HEAVY_TX_PER_PROOF,
+                LIGHT_TX_PER_PROOF,
+                PUBLIC_HEAVY_TX_COUNT,
+                PUBLIC_LIGHT_TX_COUNT,
+            )
+            .expect("invalid prover fixture")
+        },
+        Circuits::load,
+    );
+    let proof = prover::prove_block(block, circuits);
     let mut writer = BufWriter::with_capacity(
         PROOF_OUTPUT_BUFFER_BYTES,
         File::create(output).expect("cannot create proof output"),
