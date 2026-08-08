@@ -368,6 +368,120 @@ impl<F: RichField> TreeReadback<'_, F> {
 
 static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShared::new);
 
+/// Build-time pipeline binary archive bytes offered by the process entry point
+/// (typically via `include_bytes!` of the file `bench/build.rs` wrote into
+/// OUT_DIR). Set once before [`prewarm`]; ignored after the context exists.
+static PIPELINE_ARCHIVE_BYTES: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+
+/// Path of the archive once materialized onto a writable filesystem location
+/// (TMPDIR / temp_dir / next-to-exe). Kept alive for the process lifetime so
+/// Metal can keep the file open while pipelines are created.
+static PIPELINE_ARCHIVE_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Offers a prebuilt pipeline archive (raw `.metalar` bytes) to
+/// [`MetalShared::new`].
+///
+/// Creating a compute pipeline lowers its kernel's AIR to a GPU binary, and
+/// under the benchmark sandbox that costs hundreds of milliseconds per kernel
+/// because the OS shader cache is disabled there. An archive built at compile
+/// time carries those lowerings, so the worker can load them instead.
+///
+/// The bytes are expected to have been embedded into the binary (so the load
+/// path never depends on an absolute host `OUT_DIR`). Empty or tiny slices are
+/// ignored. Purely a source of already-compiled kernels: a pipeline created
+/// from the archive is the same pipeline the runtime compile would have
+/// produced, so no computed value depends on whether this is set.
+pub fn install_pipeline_archive(bytes: &'static [u8]) {
+    // A real archive is ~1 MiB; anything under 64 bytes is the empty stub the
+    // build script writes when it cannot produce one.
+    if bytes.len() < 64 {
+        return;
+    }
+    let _ = PIPELINE_ARCHIVE_BYTES.set(bytes);
+}
+
+/// Materializes the embedded archive bytes onto a path Metal can open.
+///
+/// Order of preference (every candidate is soft):
+/// 1. `$TMPDIR` — writable under the ranked sandbox profile's scratch rules
+/// 2. `std::env::temp_dir()`
+/// 3. Directory of `current_exe()` (binary's own dir is readable/writable for
+///    the worker on the harness layout)
+///
+/// Never hard-fails: any I/O error returns `None` and the caller falls back to
+/// runtime pipeline lowering.
+fn materialize_pipeline_archive() -> Option<&'static std::path::Path> {
+    if let Some(path) = PIPELINE_ARCHIVE_PATH.get() {
+        return Some(path.as_path());
+    }
+    let bytes = *PIPELINE_ARCHIVE_BYTES.get()?;
+    let file_name = format!(
+        "lighter_poseidon2_pipelines_{}.metalar",
+        std::process::id()
+    );
+    let mut dirs: Vec<std::path::PathBuf> = Vec::with_capacity(3);
+    if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+        dirs.push(std::path::PathBuf::from(tmpdir));
+    }
+    dirs.push(std::env::temp_dir());
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    for dir in dirs {
+        let path = dir.join(&file_name);
+        match std::fs::write(&path, bytes) {
+            Ok(()) => {
+                let _ = PIPELINE_ARCHIVE_PATH.set(path);
+                return PIPELINE_ARCHIVE_PATH.get().map(|p| p.as_path());
+            }
+            Err(error) => {
+                log::debug!(
+                    "pipeline archive materialize into {} failed ({error}); trying next location",
+                    dir.display()
+                );
+            }
+        }
+    }
+    log::debug!("pipeline archive could not be materialized; compiling kernels instead");
+    None
+}
+
+/// Loads the materialized archive for `device`, if usable.
+///
+/// Every failure here is non-fatal: a missing, unreadable or device-mismatched
+/// archive leaves the caller on its normal compile path. Never sets
+/// `FailOnBinaryArchiveMiss` — a miss must degrade, not abort.
+fn pipeline_archive(device: &Device) -> Option<metal::BinaryArchive> {
+    let path = materialize_pipeline_archive()?;
+    if !path.is_file() {
+        log::debug!(
+            "pipeline archive {} is missing after materialize; compiling kernels instead",
+            path.display()
+        );
+        return None;
+    }
+    let descriptor = metal::BinaryArchiveDescriptor::new();
+    // `URLWithString:` returns an autoreleased object that the binding wraps as
+    // owned and would release a second time.
+    let url = std::mem::ManuallyDrop::new(metal::URL::new_with_string(&format!(
+        "file://{}",
+        path.display()
+    )));
+    descriptor.set_url(&url);
+    match device.new_binary_archive_with_descriptor(&descriptor) {
+        Ok(archive) => Some(archive),
+        Err(error) => {
+            log::debug!(
+                "pipeline archive {} unusable ({error}); compiling kernels instead",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 /// Starts building the Metal context on a detached background thread.
 ///
 /// [`CONTEXT`] is otherwise forced by whichever proving step first wants the
@@ -382,6 +496,9 @@ static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShare
 /// compiling blocks until it finishes and then observes the same context.
 /// Callers that never touch the GPU pay only the thread spawn. Nothing here
 /// is observable in a proof — the context holds compiled kernels, not values.
+///
+/// Call [`install_pipeline_archive`] first when a build-time archive is
+/// available, so the context build can load pipelines instead of lowering them.
 pub fn prewarm() {
     std::thread::Builder::new()
         .name("poseidon2-metal-prewarm".to_owned())
@@ -1085,15 +1202,37 @@ impl MetalShared {
             // that created them rather than leaking.
             let device_ref = &device;
             let library_ref = &library;
+            // A build-time archive, when present, turns each pipeline creation
+            // below into a lookup instead of a cold lowering. Consulted through
+            // a descriptor so a kernel the archive does not carry still
+            // compiles normally rather than failing. Soft on every miss —
+            // never `FailOnBinaryArchiveMiss`.
+            let archive = pipeline_archive(device_ref);
+            let archive_ref = archive.as_deref();
+            let build = move |function: &metal::FunctionRef| -> Result<ComputePipelineState, String> {
+                if let Some(archive) = archive_ref {
+                    let descriptor = metal::ComputePipelineDescriptor::new();
+                    descriptor.set_compute_function(Some(function));
+                    descriptor.set_binary_archives(&[archive]);
+                    if let Ok(pipeline) = device_ref.new_compute_pipeline_state(&descriptor) {
+                        return Ok(pipeline);
+                    }
+                    // Archive miss / device mismatch / stale entry: fall through
+                    // to the ordinary function-based path for this kernel only.
+                }
+                device_ref
+                    .new_compute_pipeline_state_with_function(function)
+                    .map_err(|error| error.to_string())
+            };
             let required = |name: &'static str, kind: &'static str| {
                 move || -> Result<ComputePipelineState, String> {
                     autoreleasepool(|| {
                         let function = library_ref
                             .get_function(name, None)
                             .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
-                        device_ref
-                            .new_compute_pipeline_state_with_function(&function)
-                            .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
+                        build(&function).map_err(|error| {
+                            format!("{kind} pipeline creation failed: {error}")
+                        })
                     })
                 }
             };
@@ -1103,11 +1242,7 @@ impl MetalShared {
                         library_ref
                             .get_function(name, None)
                             .ok()
-                            .and_then(|function| {
-                                device_ref
-                                    .new_compute_pipeline_state_with_function(&function)
-                                    .ok()
-                            })
+                            .and_then(|function| build(&function).ok())
                     })
                 }
             };

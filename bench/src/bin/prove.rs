@@ -43,14 +43,28 @@ static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
+// Build-time MTLBinaryArchive of the eight Poseidon2 compute pipelines, produced
+// by `bench/build.rs` into OUT_DIR. Embedded into *this* binary so the ranked
+// worker never depends on an absolute host path under `target/release/build/…`
+// (that was the fragile load path that made the first archive attempt fail).
+// An empty stub is written when the archive cannot be built; the installer then
+// no-ops and the worker keeps its runtime-compile path.
+const PIPELINE_ARCHIVE_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/poseidon2_pipelines.metalar"));
+
 fn main() {
-    // First statement in the process: the Metal shader compile and pipeline
+    // Install the embedded pipeline archive *before* prewarm so MetalShared::new
+    // can load already-lowered kernels instead of paying cold pipeline creation.
+    // Soft: empty / unusable bytes are ignored; prewarm still runs either way.
+    plonky2::hash::poseidon2::install_gpu_pipeline_archive(PIPELINE_ARCHIVE_BYTES);
+    // First GPU work in the process: the Metal shader compile and pipeline
     // lowering behind the GPU hash path cost the better part of a second on a
     // cold OS shader cache, and the benchmark sandbox denies writes to that
     // cache, which disables it entirely — so every scored worker pays the full
     // price. Starting it here overlaps it with the startup work below instead
     // of stalling the first proving step that wants the GPU. Pure scheduling:
-    // the compiled kernels are identical either way.
+    // the compiled kernels are identical either way. With a usable archive the
+    // lowering collapses to archive lookups; without one this is unchanged.
     plonky2::hash::poseidon2::prewarm_gpu();
     env_logger::init();
     rayon::ThreadPoolBuilder::new()
