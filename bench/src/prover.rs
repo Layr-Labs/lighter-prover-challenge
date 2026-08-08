@@ -36,7 +36,10 @@ enum TxPath {
     Light,
 }
 
-const LIGHT_TX_PROOF_WINDOW: usize = 2;
+// Keep one extra completed producer ahead of the sequential chain consumer.
+// Four was previously measured to regress from retention pressure; three was
+// the promoted optimum before a later stale-file rebase restored this to two.
+const LIGHT_TX_PROOF_WINDOW: usize = 3;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
@@ -367,6 +370,8 @@ fn prove_path(
             let max_in_flight =
                 if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
                     LIGHT_TX_PROOF_WINDOW
+                } else if path == TxPath::Heavy && current_step >= 1 {
+                    2
                 } else {
                     1
                 };
