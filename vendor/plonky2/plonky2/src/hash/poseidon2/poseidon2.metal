@@ -74,6 +74,18 @@ inline ulong gl_sub(ulong a, ulong b) {
 #endif
 }
 
+// Multiply by four as two doublings.
+//
+// The base-4 limb folds below are the only multiplies here whose operand is a
+// compile-time constant. In this field 4x is x+x+x+x, so the 64x64 product and
+// its 128-bit reduction collapse into two adds -- and they produce the
+// identical 64-bit representative, not merely the same residue, for every
+// input including the noncanonical ones the quotient domain feeds in.
+inline ulong gl_mul4(ulong value) {
+    ulong doubled = gl_add(value, value);
+    return gl_add(doubled, doubled);
+}
+
 // Final step of the 128-bit Goldilocks reduction shared by gl_mul and
 // gl_mul_add. On entry (r0, r1) are the low and high 32-bit limbs of the
 // residue and `top` is its 2^64 weight, one of -1, 0, +1, so the value is
@@ -622,7 +634,7 @@ kernel void range_check_gate_quotient(
             for (uint remaining = num_aux - 1u; remaining > 0u; --remaining) {
                 uint j = remaining - 1u;
                 ulong limb = wires[(aux_base + j) * lde_rows + source_row];
-                computed = gl_add(gl_mul(computed, 4), limb);
+                computed = gl_add(gl_mul4(computed), limb);
             }
             range_check_gate_emit(
                 gl_sub(computed, input),
@@ -728,9 +740,9 @@ kernel void range_check_gate_quotient(
                         gate_accumulators,
                         constraint_index++);
                     if (j < 16u) {
-                        combined_low = gl_add(gl_mul(combined_low, 4), x);
+                        combined_low = gl_add(gl_mul4(combined_low), x);
                     } else {
-                        combined_high = gl_add(gl_mul(combined_high, 4), x);
+                        combined_high = gl_add(gl_mul4(combined_high), x);
                     }
                 }
                 range_check_gate_emit(
@@ -779,7 +791,7 @@ kernel void range_check_gate_quotient(
                         alpha_stride,
                         gate_accumulators,
                         constraint_index++);
-                    recomposed = gl_add(gl_mul(recomposed, 4), x);
+                    recomposed = gl_add(gl_mul4(recomposed), x);
                 }
                 range_check_gate_emit(
                     gl_sub(recomposed, output_result),
@@ -835,9 +847,9 @@ kernel void range_check_gate_quotient(
                         gate_accumulators,
                         constraint_index++);
                     if (j < result_limbs) {
-                        combined_result = gl_add(gl_mul(combined_result, 4), x);
+                        combined_result = gl_add(gl_mul4(combined_result), x);
                     } else {
-                        combined_carry = gl_add(gl_mul(combined_carry, 4), x);
+                        combined_carry = gl_add(gl_mul4(combined_carry), x);
                     }
                 }
                 range_check_gate_emit(
@@ -883,7 +895,7 @@ kernel void range_check_gate_quotient(
                     for (uint remaining = 3u; remaining > 0u; --remaining) {
                         uint k = remaining - 1u;
                         recomposed = gl_add(
-                            gl_mul(recomposed, 4),
+                            gl_mul4(recomposed),
                             wires[(chunk + k) * lde_rows + source_row]);
                     }
                     ulong byte_value =
