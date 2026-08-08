@@ -1,3 +1,4 @@
+use core::cell::Cell;
 use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::mem::{size_of, size_of_val};
@@ -532,6 +533,78 @@ pub fn set_exclusive_gpu_phase(enabled: bool) {
     EXCLUSIVE_GPU_PHASE.store(enabled, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Which recursive chain lane owns the current synchronous proving call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChainGpuLane {
+    Other,
+    HeavyAlone,
+    HeavyWithPeer,
+    LightAlone,
+    LightWithPeer,
+}
+
+thread_local! {
+    static CHAIN_GPU_LANE: Cell<ChainGpuLane> = const { Cell::new(ChainGpuLane::Other) };
+}
+
+/// Number of light-chain proofs currently inside the actual proving phase.
+/// This is only a scheduling hint; stale observations cannot change a proof.
+static LIGHT_CHAIN_PROOFS_ACTIVE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+struct ChainGpuAdmissionGuard {
+    previous: ChainGpuLane,
+    light: bool,
+}
+
+impl Drop for ChainGpuAdmissionGuard {
+    fn drop(&mut self) {
+        if self.light {
+            LIGHT_CHAIN_PROOFS_ACTIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        CHAIN_GPU_LANE.set(self.previous);
+    }
+}
+
+/// Run one recursive-chain proof under a path-aware Metal admission hint.
+pub fn with_chain_gpu_admission<T>(
+    is_light: bool,
+    peer_path_active: bool,
+    f: impl FnOnce() -> T,
+) -> T {
+    let lane = match (is_light, peer_path_active) {
+        (false, false) => ChainGpuLane::HeavyAlone,
+        (false, true) => ChainGpuLane::HeavyWithPeer,
+        (true, false) => ChainGpuLane::LightAlone,
+        (true, true) => ChainGpuLane::LightWithPeer,
+    };
+    let previous = CHAIN_GPU_LANE.replace(lane);
+    if is_light {
+        LIGHT_CHAIN_PROOFS_ACTIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    let _guard = ChainGpuAdmissionGuard {
+        previous,
+        light: is_light,
+    };
+    f()
+}
+
+/// Let one narrow heavy quotient tree yield the serialized GPU stream while
+/// both paths are alive and light-chain proof work is already ready.
+fn heavy_quotient_tree_yields_to_light(
+    lane: ChainGpuLane,
+    light_ready: bool,
+    exclusive: bool,
+    leaf_width: usize,
+    leaf_count: usize,
+) -> bool {
+    !exclusive
+        && lane == ChainGpuLane::HeavyWithPeer
+        && light_ready
+        && leaf_count == 1 << 17
+        && leaf_width == 16
+}
+
 /// Number of Merkle builds currently occupying the serialized GPU stream
 /// (from buffer acquisition through `wait_until_completed`). Routing reads
 /// this to decide whether a small serial-path tree would enqueue behind
@@ -563,6 +636,11 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     };
     let parent_permutations = leaf_count - (1usize << cap_height);
     let exclusive = EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed);
+    let lane = CHAIN_GPU_LANE.get();
+    let light_ready = LIGHT_CHAIN_PROOFS_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) != 0;
+    if heavy_quotient_tree_yields_to_light(lane, light_ready, exclusive, leaf_width, leaf_count) {
+        return false;
+    }
     let min_permutations = if exclusive {
         EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS
     } else {
@@ -2768,6 +2846,68 @@ mod tests {
     use crate::field::types::{Field64, PrimeField64};
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
+
+    #[test]
+    fn heavy_quotient_admission_yields_only_to_ready_light_work() {
+        let narrow_width = 16;
+        let chain_leaves = 1 << 17;
+
+        assert!(heavy_quotient_tree_yields_to_light(
+            ChainGpuLane::HeavyWithPeer,
+            true,
+            false,
+            narrow_width,
+            chain_leaves,
+        ));
+
+        for (lane, light_ready, exclusive, width, leaves) in [
+            (
+                ChainGpuLane::HeavyWithPeer,
+                false,
+                false,
+                narrow_width,
+                chain_leaves,
+            ),
+            (
+                ChainGpuLane::HeavyAlone,
+                true,
+                false,
+                narrow_width,
+                chain_leaves,
+            ),
+            (
+                ChainGpuLane::LightWithPeer,
+                true,
+                false,
+                narrow_width,
+                chain_leaves,
+            ),
+            (
+                ChainGpuLane::HeavyWithPeer,
+                true,
+                true,
+                narrow_width,
+                chain_leaves,
+            ),
+            (ChainGpuLane::HeavyWithPeer, true, false, 24, chain_leaves),
+            (ChainGpuLane::HeavyWithPeer, true, false, 135, chain_leaves),
+            (
+                ChainGpuLane::HeavyWithPeer,
+                true,
+                false,
+                narrow_width,
+                1 << 19,
+            ),
+        ] {
+            assert!(!heavy_quotient_tree_yields_to_light(
+                lane,
+                light_ready,
+                exclusive,
+                width,
+                leaves,
+            ));
+        }
+    }
 
     /// The prebuilt AIR library is only sound while it is the compiled form of
     /// the MSL we ship. Nothing in the type system ties the two together, so
