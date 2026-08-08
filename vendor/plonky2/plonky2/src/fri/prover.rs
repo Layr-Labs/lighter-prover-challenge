@@ -161,9 +161,30 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         let n_chunks = coeffs.coeffs.len() / arity;
         let support = coeffs.coeffs.len() >> fri_params.config.rate_bits;
         let live_chunks = support.div_ceil(arity).min(n_chunks);
+        // Value-exact fold: `reduce_with_powers(chunk, beta)` is the Horner
+        // chain `((c_{r-1})*beta + c_{r-2})*beta + ... + c_0`, i.e. the
+        // polynomial evaluation `sum c_i * beta^i`. Field arithmetic is exact,
+        // so the equivalent dot product with precomputed beta powers yields the
+        // identical canonical value, with independent multiplications (better
+        // ILP) and a shorter serial sum chain than the chained Horner form.
+        let beta_powers: Vec<F::Extension> = {
+            let mut powers = Vec::with_capacity(arity);
+            let mut power = F::Extension::ONE;
+            for _ in 0..arity {
+                powers.push(power);
+                power *= beta;
+            }
+            powers
+        };
         let mut folded = coeffs.coeffs[..live_chunks * arity]
             .par_chunks_exact(arity)
-            .map(|chunk| reduce_with_powers(chunk, beta))
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .zip(&beta_powers)
+                    .map(|(&c, &p)| c * p)
+                    .sum()
+            })
             .collect::<Vec<_>>();
         // The historical `resize(n_chunks, ZERO)` zero-filled the whole dead
         // tail. Zeros are actually *read as values* only where the next
@@ -353,6 +374,38 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
+
+    /// The dot-product fold must produce the identical canonical value to the
+    /// Horner `reduce_with_powers` for every random chunk and beta.
+    #[test]
+    fn dot_product_fold_matches_horner() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type FE = <F as Extendable<D>>::Extension;
+        for arity in [2usize, 4, 8, 16, 32, 64] {
+            for _ in 0..200 {
+                let chunk: Vec<FE> = (0..arity).map(|_| FE::rand()).collect();
+                let beta = FE::rand();
+                let mut beta_powers = Vec::with_capacity(arity);
+                let mut power = FE::ONE;
+                for _ in 0..arity {
+                    beta_powers.push(power);
+                    power *= beta;
+                }
+                let horner = reduce_with_powers(&chunk, beta);
+                let dot: FE = chunk
+                    .iter()
+                    .zip(&beta_powers)
+                    .map(|(&c, &p)| c * p)
+                    .sum();
+                assert_eq!(
+                    <FE as FieldExtension<D>>::to_basefield_array(&dot),
+                    <FE as FieldExtension<D>>::to_basefield_array(&horner),
+                    "dot-product fold diverges from Horner at arity {arity}"
+                );
+            }
+        }
+    }
 
     /// `bitrev_flatten` must be raw-`u64`-identical to the serial
     /// gather-and-extend loop it replaced, for every leaf and every limb.
