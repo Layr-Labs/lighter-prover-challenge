@@ -132,6 +132,8 @@ fn run_generator_worklist<
 
     let parallel_rounds = parallel_rounds_enabled();
     let mut buffer = GeneratedValues::empty();
+    let mut batch_buffers: [GeneratedValues<F>; 4] =
+        core::array::from_fn(|_| GeneratedValues::empty());
 
     // Keep running generators until we fail to make progress.
     while !pending_generator_indices.is_empty() {
@@ -223,9 +225,70 @@ fn run_generator_worklist<
             continue;
         }
 
-        for &generator_idx in &pending_generator_indices {
+        let mut pending_offset = 0;
+        while pending_offset < pending_generator_indices.len() {
+            let generator_idx = pending_generator_indices[pending_offset];
             if generator_is_expired[generator_idx] {
+                pending_offset += 1;
                 continue;
+            }
+
+            if pending_offset + 4 <= pending_generator_indices.len() {
+                let batch_indices: [usize; 4] = pending_generator_indices
+                    [pending_offset..pending_offset + 4]
+                    .try_into()
+                    .unwrap();
+                let mut unique_indices = batch_indices;
+                unique_indices.sort_unstable();
+                if unique_indices.windows(2).all(|pair| pair[0] != pair[1])
+                    && batch_indices
+                        .iter()
+                        .all(|&idx| !generator_is_expired[idx])
+                {
+                    let [out0, out1, out2, out3] = &mut batch_buffers;
+                    let batch_finished = generators[batch_indices[0]].0.run_batch4(
+                        [
+                            generators[batch_indices[1]].0.as_ref(),
+                            generators[batch_indices[2]].0.as_ref(),
+                            generators[batch_indices[3]].0.as_ref(),
+                        ],
+                        witness,
+                        [out0, out1, out2, out3],
+                        batch_indices.map(|idx| unresolved_watches[idx] == 0),
+                    );
+                    if let Some(batch_finished) = batch_finished {
+                        for (lane, (&idx, finished)) in batch_indices
+                            .iter()
+                            .zip(batch_finished)
+                            .enumerate()
+                        {
+                            if finished {
+                                generator_is_expired[idx] = true;
+                                *remaining_generators -= 1;
+                            }
+                            for (t, v) in batch_buffers[lane].target_values.drain(..) {
+                                if let Some(watch) = witness.set_target_returning_rep(t, v)? {
+                                    if let Some(watchers) = generator_indices_by_watches.get(&watch)
+                                    {
+                                        for &watching_generator_idx in watchers {
+                                            if !generator_is_expired[watching_generator_idx] {
+                                                debug_assert_ne!(
+                                                    unresolved_watches[watching_generator_idx],
+                                                    0
+                                                );
+                                                unresolved_watches[watching_generator_idx] -= 1;
+                                                next_pending_generator_indices
+                                                    .push(watching_generator_idx);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        pending_offset += 4;
+                        continue;
+                    }
+                }
             }
 
             let finished = generators[generator_idx].0.run_with_ready_hint(
@@ -258,6 +321,7 @@ fn run_generator_worklist<
                     }
                 }
             }
+            pending_offset += 1;
         }
 
         pending_generator_indices = next_pending_generator_indices;
@@ -630,6 +694,22 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
         self.run(witness, out_buffer)
     }
 
+    /// Attempts to run this generator together with the next three generators.
+    /// Implementations return `None` when the four generators are not a compatible batch.
+    #[doc(hidden)]
+    fn run_batch4(
+        &self,
+        _others: [&dyn WitnessGenerator<F, D>; 3],
+        _witness: &PartitionWitness<F>,
+        _out_buffers: [&mut GeneratedValues<F>; 4],
+        _all_watches_populated: [bool; 4],
+    ) -> Option<[bool; 4]> {
+        None
+    }
+
+    #[doc(hidden)]
+    fn as_any(&self) -> &dyn core::any::Any;
+
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()>;
 
     fn deserialize(src: &mut Buffer, common_data: &CommonCircuitData<F, D>) -> IoResult<Self>
@@ -728,6 +808,17 @@ pub trait SimpleGenerator<F: RichField + Extendable<D>, const D: usize>:
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()>;
 
+    /// Runs four compatible generators in one interleaved owner implementation.
+    /// The default keeps the scheduler on the ordinary scalar path.
+    #[doc(hidden)]
+    fn run_batch4(
+        _generators: [&Self; 4],
+        _witness: &PartitionWitness<F>,
+        _out_buffers: [&mut GeneratedValues<F>; 4],
+    ) -> Option<Result<()>> {
+        None
+    }
+
     fn adapter(self) -> SimpleGeneratorAdapter<F, Self, D>
     where
         Self: Sized,
@@ -781,6 +872,32 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
         all_watches_populated: bool,
     ) -> bool {
         all_watches_populated && self.inner.run_once(witness, out_buffer).is_ok()
+    }
+
+    fn run_batch4(
+        &self,
+        others: [&dyn WitnessGenerator<F, D>; 3],
+        witness: &PartitionWitness<F>,
+        out_buffers: [&mut GeneratedValues<F>; 4],
+        all_watches_populated: [bool; 4],
+    ) -> Option<[bool; 4]> {
+        if !all_watches_populated.into_iter().all(|ready| ready) {
+            return None;
+        }
+        let one = others[0].as_any().downcast_ref::<Self>()?;
+        let two = others[1].as_any().downcast_ref::<Self>()?;
+        let three = others[2].as_any().downcast_ref::<Self>()?;
+        let finished = SG::run_batch4(
+            [&self.inner, &one.inner, &two.inner, &three.inner],
+            witness,
+            out_buffers,
+        )?
+        .is_ok();
+        Some([finished; 4])
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
@@ -1064,6 +1181,10 @@ mod tests {
                     .unwrap();
                 false
             }
+        }
+
+        fn as_any(&self) -> &dyn core::any::Any {
+            self
         }
 
         fn serialize(
