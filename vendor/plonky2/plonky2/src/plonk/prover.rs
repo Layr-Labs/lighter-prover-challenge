@@ -906,6 +906,217 @@ fn gpu_poseidon_quotient_differential_enabled() -> bool {
 pub(crate) static COMPARE_GPU_QUOTIENT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Adaptive CPU/GPU point-domain split for the Metal quotient union jobs.
+///
+/// The quotient domain is embarrassingly parallel over points, so the union
+/// jobs cover only the prefix `[0, split_end)` while the CPU loop evaluates
+/// the offloaded gates itself on `[split_end, lde_size)`. Both sides use the
+/// existing evaluators, so every split produces bit-identical quotient
+/// coefficients; the fraction only moves work between the processors.
+///
+/// A process-global table keyed by `lde_size` (the circuit shape, as far as
+/// this phase is concerned) holds the current fraction, starting at 1.0 —
+/// exactly the historical all-points behavior. After each proof whose union
+/// job ran, the controller compares the CPU loop's wall time against the
+/// union job's submit-to-complete wall time and rescales the fraction toward
+/// the fixed point where both finish together (no idle tail on either side),
+/// with heavy damping and a floor so one noisy sample cannot park the split.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+// Redraw 1 of ticket 15.
+mod quotient_split {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
+
+    use super::BATCH_SIZE;
+
+    /// Fractions are tracked in parts per million.
+    pub(crate) const FRAC_ONE: u64 = 1_000_000;
+    /// The controller never hands the GPU less than a quarter of the domain:
+    /// overlap remains profitable well below the balance point, and the floor
+    /// keeps a degenerate measurement from disabling the union outright.
+    const MIN_FRAC: u64 = 250_000;
+    /// Damping: one proof moves the fraction by at most 15% in either
+    /// direction.
+    const MAX_STEP_UP_NUM: u64 = 115;
+    const MAX_STEP_DOWN_NUM: u64 = 85;
+    const STEP_DEN: u64 = 100;
+    /// Upward probe (5%) applied when the CPU never waited on the GPU: the
+    /// job's true busy span is then unobservable (only bounded above by the
+    /// measured span), so the controller gently retests a larger share
+    /// instead of letting one contention spike ratchet the fraction down for
+    /// the rest of the process.
+    const PROBE_UP_NUM: u64 = 105;
+
+    /// Test-only override: exact GPU point count (aligned down to the CPU
+    /// batch granularity). `usize::MAX` means "not forced".
+    #[cfg(test)]
+    pub(crate) static FORCED_SPLIT_POINTS: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(usize::MAX);
+    /// Test-only override: fraction in parts per million. `u64::MAX` means
+    /// "not forced".
+    #[cfg(test)]
+    pub(crate) static FORCED_SPLIT_PPM: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(u64::MAX);
+
+    /// `PLONKY2_GPU_QUOTIENT_SPLIT=<fraction in [0,1]>` pins the split for
+    /// validation and A/B runs (0 disables the union jobs, 1 is the
+    /// historical behavior) and disables adaptation. Unset or unparsable
+    /// values leave the adaptive controller in charge.
+    fn env_forced_ppm() -> Option<u64> {
+        fn parse() -> Option<u64> {
+            let raw = std::env::var("PLONKY2_GPU_QUOTIENT_SPLIT").ok()?;
+            let fraction: f64 = raw.trim().parse().ok()?;
+            if !(0.0..=1.0).contains(&fraction) {
+                return None;
+            }
+            Some((fraction * FRAC_ONE as f64).round() as u64)
+        }
+        static FORCED: OnceLock<Option<u64>> = OnceLock::new();
+        *FORCED.get_or_init(parse)
+    }
+
+    fn diagnostics_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var_os("PLONKY2_GPU_SPLIT_DIAGNOSTICS")
+                .map(|value| value != "0")
+                .unwrap_or(false)
+        })
+    }
+
+    fn table() -> &'static Mutex<HashMap<usize, u64>> {
+        static TABLE: OnceLock<Mutex<HashMap<usize, u64>>> = OnceLock::new();
+        TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn fraction_is_forced() -> bool {
+        #[cfg(test)]
+        {
+            use core::sync::atomic::Ordering;
+            if FORCED_SPLIT_POINTS.load(Ordering::Relaxed) != usize::MAX
+                || FORCED_SPLIT_PPM.load(Ordering::Relaxed) != u64::MAX
+            {
+                return true;
+            }
+        }
+        env_forced_ppm().is_some()
+    }
+
+    fn align(points: usize, lde_size: usize) -> usize {
+        points.min(lde_size) / BATCH_SIZE * BATCH_SIZE
+    }
+
+    fn end_for_ppm(ppm: u64, lde_size: usize) -> usize {
+        if ppm >= FRAC_ONE {
+            return lde_size;
+        }
+        align(
+            ((lde_size as u128 * ppm as u128) / FRAC_ONE as u128) as usize,
+            lde_size,
+        )
+    }
+
+    /// The GPU point share for this proof: the union jobs cover
+    /// `[0, split_end)`, aligned to the CPU loop's `BATCH_SIZE`-point batch
+    /// granularity so no batch straddles the boundary. `lde_size` reproduces
+    /// the historical all-points job; 0 disables the union jobs entirely
+    /// (the CPU loop then evaluates every gate everywhere, i.e. the existing
+    /// fallback behavior).
+    pub(super) fn split_end(lde_size: usize) -> usize {
+        #[cfg(test)]
+        {
+            use core::sync::atomic::Ordering;
+            let forced = FORCED_SPLIT_POINTS.load(Ordering::Relaxed);
+            if forced != usize::MAX {
+                return align(forced, lde_size);
+            }
+            let ppm = FORCED_SPLIT_PPM.load(Ordering::Relaxed);
+            if ppm != u64::MAX {
+                return end_for_ppm(ppm, lde_size);
+            }
+        }
+        end_for_ppm(current_fraction_ppm(lde_size), lde_size)
+    }
+
+    fn current_fraction_ppm(lde_size: usize) -> u64 {
+        if let Some(forced) = env_forced_ppm() {
+            return forced;
+        }
+        table()
+            .lock()
+            .map(|table| table.get(&lde_size).copied().unwrap_or(FRAC_ONE))
+            .unwrap_or(FRAC_ONE)
+    }
+
+    /// One controller step. `gpu_time` is the union jobs' submit-to-complete
+    /// wall span and `gpu_wait` the slice of it the CPU spent blocked in
+    /// `finish()` after its own loop ended, so `gpu_time >= cpu_time` by
+    /// construction whenever the GPU ran past the CPU. Two regimes:
+    ///
+    /// - `gpu_wait` non-negligible (the GPU is the tail): rescale by
+    ///   `cpu_time / gpu_time`, shrinking the GPU share toward the fixed
+    ///   point where both sides finish together.
+    /// - `gpu_wait` negligible (the GPU finished under the CPU loop): its
+    ///   true busy span is unobservable, so probe 5% upward instead —
+    ///   without this the measured ratio saturates at ~1 and the fraction
+    ///   could only ever ratchet down.
+    ///
+    /// Movement is damped to at most 15% per proof and clamped to
+    /// `[MIN_FRAC, 1.0]`. Forced fractions (env or test override) record
+    /// diagnostics but never adapt.
+    pub(super) fn record(
+        lde_size: usize,
+        split_end: usize,
+        cpu_time: Duration,
+        gpu_time: Duration,
+        gpu_wait: Duration,
+    ) {
+        let cpu_secs = cpu_time.as_secs_f64();
+        let gpu_secs = gpu_time.as_secs_f64().max(1e-6);
+        let wait_secs = gpu_wait.as_secs_f64();
+        if fraction_is_forced() {
+            if diagnostics_enabled() {
+                eprintln!(
+                    "[gpu-quotient-split] lde_size={lde_size} split_end={split_end} \
+                     cpu_ms={:.2} gpu_ms={:.2} wait_ms={:.2} frac=forced",
+                    cpu_secs * 1e3,
+                    gpu_secs * 1e3,
+                    wait_secs * 1e3,
+                );
+            }
+            return;
+        }
+        let Ok(mut table) = table().lock() else {
+            return;
+        };
+        let entry = table.entry(lde_size).or_insert(FRAC_ONE);
+        let old = *entry;
+        let gpu_idle = wait_secs <= (cpu_secs * 0.02).max(1e-3);
+        // `as u64` saturates, so a degenerate ratio is safe; the damping
+        // clamp below bounds the actual movement anyway.
+        let scaled = if gpu_idle {
+            old.saturating_mul(PROBE_UP_NUM) / STEP_DEN
+        } else {
+            (old as f64 * (cpu_secs / gpu_secs)).round() as u64
+        };
+        let floor = old * MAX_STEP_DOWN_NUM / STEP_DEN;
+        let ceiling = old * MAX_STEP_UP_NUM / STEP_DEN;
+        let new = scaled.clamp(floor, ceiling).clamp(MIN_FRAC, FRAC_ONE);
+        *entry = new;
+        drop(table);
+        if diagnostics_enabled() {
+            eprintln!(
+                "[gpu-quotient-split] lde_size={lde_size} split_end={split_end} \
+                 cpu_ms={:.2} gpu_ms={:.2} wait_ms={:.2} frac={old}ppm->{new}ppm",
+                cpu_secs * 1e3,
+                gpu_secs * 1e3,
+                wait_secs * 1e3,
+            );
+        }
+    }
+}
+
 /// Test-only switch: when set, `compute_quotient_polys` evaluates the quotient
 /// values twice — once through the default column-major (`PolyMajor`)
 /// permutation path and once through the per-point (`PointMajor`) reference
@@ -975,6 +1186,7 @@ fn start_gpu_poseidon_gate_quotient<
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     wires_commitment: &PolynomialBatch<F, C, D>,
     quotient_rows: usize,
+    point_count: usize,
     step: usize,
     alphas: &[F],
 ) -> Option<(
@@ -1013,6 +1225,7 @@ fn start_gpu_poseidon_gate_quotient<
         wires,
         constants,
         quotient_rows,
+        point_count,
         step,
         selector_index,
         gate_index,
@@ -1024,16 +1237,16 @@ fn start_gpu_poseidon_gate_quotient<
     let started = GPU_POSEIDON_QUOTIENT_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
     log::info!(
         "Metal Poseidon2 gate quotient active: started={started}, gate={gate_index}, \
-         selector={selector_index}, rows={quotient_rows}, step={step}, challenges={}, \
-         lookups={}, shared_columns=true",
+         selector={selector_index}, rows={quotient_rows}, points={point_count}, step={step}, \
+         challenges={}, lookups={}, shared_columns=true",
         common_data.config.num_challenges,
         common_data.num_lookup_polys,
     );
     if gpu_poseidon_quotient_diagnostics_enabled() {
         eprintln!(
             "[gpu-poseidon-quotient] active started={started} gate={gate_index} \
-             selector={selector_index} rows={quotient_rows} step={step} challenges={} \
-             lookups={} shared_columns=true",
+             selector={selector_index} rows={quotient_rows} points={point_count} step={step} \
+             challenges={} lookups={} shared_columns=true",
             common_data.config.num_challenges, common_data.num_lookup_polys,
         );
     }
@@ -1061,6 +1274,7 @@ fn start_gpu_range_check_gate_quotient<
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     wires_commitment: &PolynomialBatch<F, C, D>,
     quotient_rows: usize,
+    point_count: usize,
     step: usize,
     alphas: &[F],
 ) -> Option<(
@@ -1451,6 +1665,7 @@ fn start_gpu_range_check_gate_quotient<
         wires,
         constants,
         quotient_rows,
+        point_count,
         step,
         &specs,
         &u32_specs,
@@ -1460,7 +1675,8 @@ fn start_gpu_range_check_gate_quotient<
         if gpu_poseidon_quotient_diagnostics_enabled() {
             eprintln!(
                 "[gpu-range-quotient] Metal launch rejected: gates={gate_indices:?} \
-                 wire_shape={}x{} constant_shape={}x{} rows={quotient_rows} step={step}",
+                 wire_shape={}x{} constant_shape={}x{} rows={quotient_rows} \
+                 points={point_count} step={step}",
                 wires.cols(),
                 wires.rows(),
                 constants.cols(),
@@ -1473,12 +1689,12 @@ fn start_gpu_range_check_gate_quotient<
     let started = GPU_RANGE_QUOTIENT_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
     log::info!(
         "Metal RangeCheck quotient active: started={started}, gates={gate_indices:?}, \
-         rows={quotient_rows}, step={step}, shared_columns=true"
+         rows={quotient_rows}, points={point_count}, step={step}, shared_columns=true"
     );
     if gpu_poseidon_quotient_diagnostics_enabled() {
         eprintln!(
             "[gpu-range-quotient] active started={started} gates={gate_indices:?} \
-             rows={quotient_rows} step={step} shared_columns=true"
+             rows={quotient_rows} points={point_count} step={step} shared_columns=true"
         );
     }
     Some((gate_indices, job))
@@ -1541,27 +1757,43 @@ fn compute_quotient_polys<
     let lde_size = points.len();
     debug_assert_eq!(shifted_points.len(), lde_size);
 
+    // GPU point share for this proof (aligned to the CPU loop's BATCH_SIZE
+    // batches): the union jobs cover `[0, gpu_split_end)` and the CPU loop
+    // evaluates the offloaded gates itself on the remaining tail. 0 disables
+    // the union jobs; `lde_size` is the historical all-points behavior.
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_poseidon = allow_gpu_poseidon
+    let gpu_split_end = if allow_gpu_poseidon {
+        quotient_split::split_end(lde_size)
+    } else {
+        0
+    };
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let gpu_split_end = 0usize;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_submitted_at = std::time::Instant::now();
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_poseidon = (gpu_split_end > 0)
         .then(|| {
             start_gpu_poseidon_gate_quotient(
                 common_data,
                 prover_data,
                 wires_commitment,
                 lde_size,
+                gpu_split_end,
                 step,
                 alphas,
             )
         })
         .flatten();
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_range = allow_gpu_poseidon
+    let gpu_range = (gpu_split_end > 0)
         .then(|| {
             start_gpu_range_check_gate_quotient(
                 common_data,
                 prover_data,
                 wires_commitment,
                 lde_size,
+                gpu_split_end,
                 step,
                 alphas,
             )
@@ -1678,11 +1910,32 @@ fn compute_quotient_polys<
         .max()
         .unwrap_or(0);
     debug_assert!(cpu_num_gate_constraints <= common_data.num_gate_constraints);
+    // Tail-range analogues: point batches at or beyond `gpu_split_end` are not
+    // covered by the union jobs, so they evaluate the full gate list with the
+    // full-width gathers and constraint rows. When nothing was offloaded the
+    // two sets coincide and every batch behaves identically.
+    let full_gate_indices = (0..common_data.gates.len()).collect::<Vec<_>>();
+    let full_num_wires = common_data
+        .gates
+        .iter()
+        .map(|gate| gate.0.num_wires())
+        .max()
+        .unwrap_or(0)
+        .max(num_routed_wires);
+    debug_assert!(full_num_wires <= common_data.config.num_wires);
+    let full_num_gate_constraints = common_data
+        .gates
+        .iter()
+        .map(|gate| gate.0.num_constraints())
+        .max()
+        .unwrap_or(0);
+    debug_assert!(full_num_gate_constraints <= common_data.num_gate_constraints);
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if gpu_poseidon_quotient_diagnostics_enabled() && !excluded_gate_indices.is_empty() {
         eprintln!(
             "[gpu-gate-quotient] CPU wire gather width {cpu_num_wires}/{}; \
-             constraint rows {cpu_num_gate_constraints}/{}; excluded={excluded_gate_indices:?}",
+             constraint rows {cpu_num_gate_constraints}/{}; excluded={excluded_gate_indices:?}; \
+             split_end={gpu_split_end}/{lde_size}",
             common_data.config.num_wires,
             common_data.num_gate_constraints,
         );
@@ -1711,6 +1964,8 @@ fn compute_quotient_polys<
     // writes every element before any is read (see above). Same idiom as the
     // promoted zero-tail fast path in `fri/oracle.rs`.
     unsafe { quotient_values.set_len(quotient_len) };
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let cpu_loop_started_at = std::time::Instant::now();
     quotient_values
         .par_chunks_mut(BATCH_SIZE * num_challenges)
         .zip(points_batches)
@@ -1734,6 +1989,17 @@ fn compute_quotient_polys<
                 );
 
                 let n = xs_batch.len();
+                // Batches below `gpu_split_end` rely on the union jobs for
+                // the excluded gates; batches at or beyond it evaluate every
+                // gate here, with the gather width and constraint rows
+                // widened back to full. `gpu_split_end` is BATCH_SIZE-aligned,
+                // so a batch never straddles the boundary.
+                let (batch_gate_indices, batch_num_wires, batch_num_gate_constraints) =
+                    if BATCH_SIZE * batch_i < gpu_split_end {
+                        (&cpu_gate_indices, cpu_num_wires, cpu_num_gate_constraints)
+                    } else {
+                        (&full_gate_indices, full_num_wires, full_num_gate_constraints)
+                    };
                 scratch.indices.clear();
                 scratch
                     .indices
@@ -1825,7 +2091,7 @@ fn compute_quotient_polys<
                 wires_commitment.fill_lde_batch(
                     &scratch.indices,
                     step,
-                    0..cpu_num_wires,
+                    0..batch_num_wires,
                     BatchLayout::PolyMajor,
                     &mut scratch.local_wires,
                 );
@@ -1937,8 +2203,8 @@ fn compute_quotient_polys<
                     beta_k_is,
                     deltas,
                     alphas,
-                    &cpu_gate_indices,
-                    cpu_num_gate_constraints,
+                    batch_gate_indices,
+                    batch_num_gate_constraints,
                     &z_h_on_coset,
                     &lut_re_poly_evals_refs,
                     &mut scratch.vanishing,
@@ -1958,95 +2224,113 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
-            Ok(values) => {
-                GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
-            }
-            Err(error) => {
-                GPU_POSEIDON_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                log::warn!(
-                    "Metal Poseidon2 gate quotient failed; recomputing quotient on CPU: {error}"
-                );
-                if gpu_poseidon_quotient_diagnostics_enabled() {
-                    eprintln!(
-                        "[gpu-poseidon-quotient] runtime failure; falling back to CPU: {error}"
+    {
+        let cpu_loop_time = cpu_loop_started_at.elapsed();
+        let gpu_wait_started_at = std::time::Instant::now();
+        // Wait for both union jobs before merging, so the recorded GPU span
+        // is the jobs' submit-to-complete wall time, uninflated by the merge
+        // passes below. On any failure the CPU already recomputes the full
+        // range with every gate, exactly as before the split existed.
+        let gpu_poseidon_values = match &gpu_poseidon {
+            Some((_, job)) => match job.finish() {
+                Ok(values) => {
+                    GPU_POSEIDON_QUOTIENT_COMPLETED
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    Some(values)
+                }
+                Err(error) => {
+                    GPU_POSEIDON_QUOTIENT_FALLBACKS
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    log::warn!(
+                        "Metal Poseidon2 gate quotient failed; recomputing quotient on CPU: {error}"
+                    );
+                    if gpu_poseidon_quotient_diagnostics_enabled() {
+                        eprintln!(
+                            "[gpu-poseidon-quotient] runtime failure; falling back to CPU: {error}"
+                        );
+                    }
+                    return compute_quotient_polys(
+                        common_data,
+                        prover_data,
+                        public_inputs_hash,
+                        wires_commitment,
+                        zs_partial_products_and_lookup_commitment,
+                        betas,
+                        gammas,
+                        beta_k_is,
+                        deltas,
+                        alphas,
+                        col_major_perm,
+                        false,
                     );
                 }
-                return compute_quotient_polys(
-                    common_data,
-                    prover_data,
-                    public_inputs_hash,
-                    wires_commitment,
-                    zs_partial_products_and_lookup_commitment,
-                    betas,
-                    gammas,
-                    beta_k_is,
-                    deltas,
-                    alphas,
-                    col_major_perm,
-                    false,
-                );
-            }
+            },
+            None => None,
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+        let gpu_range_values = match &gpu_range {
+            Some((_, job)) => match job.finish() {
+                Ok(values) => {
+                    GPU_RANGE_QUOTIENT_COMPLETED
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    Some(values)
                 }
-            });
-    }
+                Err(error) => {
+                    GPU_RANGE_QUOTIENT_FALLBACKS
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    log::warn!(
+                        "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
+                    );
+                    if gpu_poseidon_quotient_diagnostics_enabled() {
+                        eprintln!(
+                            "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
+                        );
+                    }
+                    return compute_quotient_polys(
+                        common_data,
+                        prover_data,
+                        public_inputs_hash,
+                        wires_commitment,
+                        zs_partial_products_and_lookup_commitment,
+                        betas,
+                        gammas,
+                        beta_k_is,
+                        deltas,
+                        alphas,
+                        col_major_perm,
+                        false,
+                    );
+                }
+            },
+            None => None,
+        };
+        let gpu_job_time = gpu_submitted_at.elapsed();
+        let gpu_wait_time = gpu_wait_started_at.elapsed();
 
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
-            Ok(values) => {
-                GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
-            }
-            Err(error) => {
-                GPU_RANGE_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                log::warn!(
-                    "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
-                );
-                if gpu_poseidon_quotient_diagnostics_enabled() {
-                    eprintln!(
-                        "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
-                    );
-                }
-                return compute_quotient_polys(
-                    common_data,
-                    prover_data,
-                    public_inputs_hash,
-                    wires_commitment,
-                    zs_partial_products_and_lookup_commitment,
-                    betas,
-                    gammas,
-                    beta_k_is,
-                    deltas,
-                    alphas,
-                    col_major_perm,
-                    false,
-                );
-            }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        // The union jobs cover only the point prefix `[0, gpu_split_end)`;
+        // the Z_H-inverse multiply-and-add applies to exactly that range.
+        for gpu_values in [gpu_poseidon_values, gpu_range_values].into_iter().flatten() {
+            debug_assert_eq!(gpu_values.len(), gpu_split_end * num_challenges);
+            quotient_values[..gpu_split_end * num_challenges]
+                .par_chunks_exact_mut(num_challenges)
+                .zip(gpu_values.par_chunks_exact(num_challenges))
+                .enumerate()
+                .for_each(|(i, (cpu_values, gpu_values))| {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                        *cpu += gpu * denominator_inv;
+                    }
+                });
+        }
+
+        if gpu_poseidon.is_some() || gpu_range.is_some() {
+            quotient_split::record(
+                lde_size,
+                gpu_split_end,
+                cpu_loop_time,
+                gpu_job_time,
+                gpu_wait_time,
+            );
+        }
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
@@ -2249,6 +2533,12 @@ mod quotient_layout_tests {
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;
 
+    /// Serializes tests that read the process-global GPU quotient counters or
+    /// mutate the split overrides, so a forced split in one test can never
+    /// leak into another's started/completed assertions.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    static GPU_SPLIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn small_circuit() -> (CircuitData<F, C, D>, PartialWitness<F>) {
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<F, D>::new(config);
@@ -2292,6 +2582,9 @@ mod quotient_layout_tests {
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     #[test]
     fn metal_random_access_quotient_matches_cpu_and_verifies() -> Result<()> {
+        let _guard = GPU_SPLIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<F, D>::new(config);
         for (bits, copies) in [(3usize, 8usize), (4, 4), (6, 1)] {
@@ -2344,6 +2637,149 @@ mod quotient_layout_tests {
         assert!(after.range_started > before.range_started);
         assert!(after.range_completed > before.range_completed);
         data.verify(proof)?;
+        Ok(())
+    }
+
+    /// A circuit whose quotient engages both Metal union jobs: the audited
+    /// random-access layouts (RangeCheck union) plus an in-circuit Poseidon2
+    /// hash (Poseidon2 job), padded to a 2^16-point LDE so both shared
+    /// commitments route through Metal, exercising the production seam.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn union_split_circuit() -> CircuitData<F, Poseidon2GoldilocksConfig, D> {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        for (bits, copies) in [(3usize, 8usize), (4, 4), (6, 1)] {
+            let vec_size = 1usize << bits;
+            for copy in 0..copies {
+                let index = copy % vec_size;
+                let index_target = builder.constant(F::from_canonical_usize(index));
+                let items = (0..vec_size)
+                    .map(|i| {
+                        builder.constant(F::from_canonical_usize(
+                            1 + i + copy * vec_size + bits * 10_000,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                let expected = items[index];
+                let selected = builder.random_access(index_target, items);
+                builder.connect(selected, expected);
+                builder.register_public_input(selected);
+            }
+        }
+        let hash_inputs = (0..8)
+            .map(|i| builder.constant(F::from_canonical_usize(100 + i)))
+            .collect::<Vec<_>>();
+        let digest = builder
+            .hash_n_to_hash_no_pad::<<Poseidon2GoldilocksConfig as GenericConfig<D>>::InnerHasher>(
+                hash_inputs,
+            );
+        builder.register_public_inputs(&digest.elements);
+        while builder.num_gates() <= (1 << 12) {
+            builder.add_gate(NoopGate, vec![]);
+        }
+        let data = builder.build::<Poseidon2GoldilocksConfig>();
+        assert!(data.common.luts.is_empty());
+        data
+    }
+
+    /// One split-forced prove with the in-prove full GPU/CPU quotient
+    /// differential armed (`COMPARE_GPU_QUOTIENT` asserts coefficient-exact
+    /// equality against a pure-CPU recompute inside `prove`), followed by
+    /// verification. Returns the delta of the union-job counters.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn prove_with_forced_split(
+        data: &CircuitData<F, Poseidon2GoldilocksConfig, D>,
+    ) -> Result<super::GpuPoseidonQuotientStats> {
+        let before = gpu_poseidon_quotient_stats();
+        COMPARE_GPU_QUOTIENT.store(true, Ordering::SeqCst);
+        let proof = data.prove(PartialWitness::new());
+        COMPARE_GPU_QUOTIENT.store(false, Ordering::SeqCst);
+        data.verify(proof?)?;
+        let after = gpu_poseidon_quotient_stats();
+        assert_eq!(after.fallbacks, before.fallbacks);
+        assert_eq!(after.range_fallbacks, before.range_fallbacks);
+        Ok(super::GpuPoseidonQuotientStats {
+            attempts: after.attempts - before.attempts,
+            started: after.started - before.started,
+            completed: after.completed - before.completed,
+            fallbacks: 0,
+            range_attempts: after.range_attempts - before.range_attempts,
+            range_started: after.range_started - before.range_started,
+            range_completed: after.range_completed - before.range_completed,
+            range_fallbacks: 0,
+        })
+    }
+
+    /// The adaptive point split must be value-invisible at every fraction:
+    /// 1.0 (today's whole-domain job), two interior fractions, and the
+    /// controller's floor. Each prove runs the in-prove GPU/CPU differential
+    /// and must verify; both union jobs must have started and completed.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn metal_union_split_fractions_match_cpu_and_verify() -> Result<()> {
+        use super::quotient_split;
+
+        let _guard = GPU_SPLIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let data = union_split_circuit();
+        for ppm in [quotient_split::FRAC_ONE, 600_000, 300_000, 250_000] {
+            quotient_split::FORCED_SPLIT_PPM.store(ppm, Ordering::SeqCst);
+            let result = prove_with_forced_split(&data);
+            quotient_split::FORCED_SPLIT_PPM.store(u64::MAX, Ordering::SeqCst);
+            let delta = result?;
+            assert!(delta.started >= 1, "poseidon job must start at {ppm}ppm");
+            assert!(delta.completed >= 1, "poseidon job must complete at {ppm}ppm");
+            assert!(delta.range_started >= 1, "range job must start at {ppm}ppm");
+            assert!(
+                delta.range_completed >= 1,
+                "range job must complete at {ppm}ppm"
+            );
+        }
+        Ok(())
+    }
+
+    /// Split boundaries: 0 points (union jobs disabled — must equal the pure
+    /// CPU fallback), exactly one CPU batch, and the whole domain minus one
+    /// batch. Each prove runs the in-prove GPU/CPU differential and must
+    /// verify.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn metal_union_split_boundaries_match_cpu_and_verify() -> Result<()> {
+        use super::{quotient_split, BATCH_SIZE};
+        use crate::util::log2_ceil;
+
+        let _guard = GPU_SPLIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let data = union_split_circuit();
+        let lde_size =
+            data.common.degree() << log2_ceil(data.common.quotient_degree_factor);
+
+        // split_end == 0: no union jobs; the CPU evaluates every gate over the
+        // whole domain, i.e. exactly the existing fallback path.
+        quotient_split::FORCED_SPLIT_POINTS.store(0, Ordering::SeqCst);
+        let result = prove_with_forced_split(&data);
+        quotient_split::FORCED_SPLIT_POINTS.store(usize::MAX, Ordering::SeqCst);
+        let delta = result?;
+        assert_eq!(delta.attempts, 0, "0-point split must not attempt a job");
+        assert_eq!(delta.started, 0);
+        assert_eq!(delta.range_attempts, 0);
+        assert_eq!(delta.range_started, 0);
+
+        for points in [BATCH_SIZE, lde_size - BATCH_SIZE] {
+            quotient_split::FORCED_SPLIT_POINTS.store(points, Ordering::SeqCst);
+            let result = prove_with_forced_split(&data);
+            quotient_split::FORCED_SPLIT_POINTS.store(usize::MAX, Ordering::SeqCst);
+            let delta = result?;
+            assert!(delta.started >= 1, "poseidon job must start at {points} points");
+            assert!(delta.completed >= 1);
+            assert!(
+                delta.range_started >= 1,
+                "range job must start at {points} points"
+            );
+            assert!(delta.range_completed >= 1);
+        }
         Ok(())
     }
 

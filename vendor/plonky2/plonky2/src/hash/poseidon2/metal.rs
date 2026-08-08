@@ -662,14 +662,17 @@ pub(crate) fn build_merkle_tree_columns<F: RichField>(
     }
 }
 
-/// Starts a whole-domain Poseidon2Gate evaluation over retained natural-order
-/// LDE columns. `alpha_offset` is the number of non-gate vanishing terms that
-/// precede the gate constraints in the global alpha reduction.
+/// Starts a Poseidon2Gate evaluation over retained natural-order LDE columns,
+/// covering the quotient-domain point prefix `[0, point_count)`
+/// (`point_count == quotient_rows` is the whole-domain case). `alpha_offset`
+/// is the number of non-gate vanishing terms that precede the gate
+/// constraints in the global alpha reduction.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
     wires: &MetalColumns<F>,
     constants: &MetalColumns<F>,
     quotient_rows: usize,
+    point_count: usize,
     step: usize,
     selector_column: usize,
     gate_index: usize,
@@ -689,6 +692,8 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
         || wires.rows != constants.rows
         || selector_column >= constants.cols
         || quotient_rows == 0
+        || point_count == 0
+        || point_count > quotient_rows
         || step == 0
         || quotient_rows.checked_mul(step) != Some(wires.rows)
         || group.start > gate_index
@@ -716,7 +721,7 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
     match context.start_poseidon2_gate_quotient(
         wires,
         constants,
-        quotient_rows,
+        point_count,
         step,
         selector_column,
         gate_index,
@@ -732,14 +737,17 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
     }
 }
 
-/// Starts one whole-domain kernel which evaluates every advertised RangeCheck,
-/// width-generic integer, byte, quintic, and audited random-access gate, applies
-/// each selector filter, and reduces the shared constraint rows with the same
-/// two alpha challenges as the CPU quotient.
+/// Starts one kernel which evaluates every advertised RangeCheck,
+/// width-generic integer, byte, quintic, and audited random-access gate over
+/// the quotient-domain point prefix `[0, point_count)` (`point_count ==
+/// quotient_rows` is the whole-domain case), applies each selector filter,
+/// and reduces the shared constraint rows with the same two alpha challenges
+/// as the CPU quotient.
 pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     wires: &MetalColumns<F>,
     constants: &MetalColumns<F>,
     quotient_rows: usize,
+    point_count: usize,
     step: usize,
     specs: &[RangeCheckQuotientSpec],
     u32_specs: &[U32QuotientSpec],
@@ -761,6 +769,8 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
         || wires.rows == 0
         || wires.rows != constants.rows
         || quotient_rows == 0
+        || point_count == 0
+        || point_count > quotient_rows
         || step == 0
         || quotient_rows.checked_mul(step) != Some(wires.rows)
         || wires.rows > u32::MAX as usize
@@ -1001,7 +1011,7 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     match context.start_range_check_gate_quotient(
         wires,
         constants,
-        quotient_rows,
+        point_count,
         step,
         &metadata,
         specs.len(),
@@ -1575,7 +1585,7 @@ impl MetalShared {
         &self,
         wires: &MetalColumns<F>,
         constants: &MetalColumns<F>,
-        quotient_rows: usize,
+        point_count: usize,
         step: usize,
         selector_column: usize,
         gate_index: usize,
@@ -1585,7 +1595,7 @@ impl MetalShared {
     ) -> Result<PoseidonGateQuotientJob<F>, String> {
         let pipeline = poseidon_gate_quotient_pipeline()
             .ok_or("Poseidon2 gate quotient pipeline unavailable")?;
-        let len = quotient_rows
+        let len = point_count
             .checked_mul(2)
             .ok_or("Poseidon2 gate quotient output length overflow")?;
         let bytes = len
@@ -1610,14 +1620,17 @@ impl MetalShared {
                 alpha_powers.as_ptr().cast::<c_void>(),
             );
             set_u32(encoder, 5, wires.rows as u32);
-            set_u32(encoder, 6, quotient_rows as u32);
+            // The kernel reads this uniform only as its thread bound, so a
+            // prefix `point_count < quotient_rows` yields a partial job whose
+            // output is the exact prefix of the whole-domain output.
+            set_u32(encoder, 6, point_count as u32);
             set_u32(encoder, 7, step as u32);
             set_u32(encoder, 8, selector_column as u32);
             set_u32(encoder, 9, gate_index as u32);
             set_u32(encoder, 10, group.start as u32);
             set_u32(encoder, 11, group.end as u32);
             set_u32(encoder, 12, include_unused_selector as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            dispatch(encoder, pipeline, point_count);
             encoder.end_encoding();
             command_buffer.commit();
             command_buffer.to_owned()
@@ -1636,7 +1649,7 @@ impl MetalShared {
         &self,
         wires: &MetalColumns<F>,
         constants: &MetalColumns<F>,
-        quotient_rows: usize,
+        point_count: usize,
         step: usize,
         metadata: &[u32],
         range_count: usize,
@@ -1651,7 +1664,7 @@ impl MetalShared {
         {
             return Err("invalid RangeCheck quotient metadata".to_string());
         }
-        let len = quotient_rows
+        let len = point_count
             .checked_mul(2)
             .ok_or("RangeCheck gate quotient output length overflow")?;
         let bytes = len
@@ -1680,12 +1693,15 @@ impl MetalShared {
                 metadata.as_ptr().cast::<c_void>(),
             );
             set_u32(encoder, 5, wires.rows as u32);
-            set_u32(encoder, 6, quotient_rows as u32);
+            // The kernel reads this uniform only as its thread bound, so a
+            // prefix `point_count < quotient_rows` yields a partial job whose
+            // output is the exact prefix of the whole-domain output.
+            set_u32(encoder, 6, point_count as u32);
             set_u32(encoder, 7, step as u32);
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            dispatch(encoder, pipeline, point_count);
             encoder.end_encoding();
             command_buffer.commit();
             command_buffer.to_owned()
@@ -3018,6 +3034,7 @@ mod tests {
                 &wires,
                 &constants,
                 QUOTIENT_ROWS,
+                QUOTIENT_ROWS,
                 step,
                 SELECTOR_COLUMN,
                 GATE_INDEX,
@@ -3034,6 +3051,35 @@ mod tests {
                     actual.to_canonical_u64(),
                     expected.to_canonical_u64(),
                     "Poseidon2 gate quotient mismatch at word {i}, step {step}"
+                );
+            }
+
+            // Adaptive-split seam: a job bounded to a point prefix must
+            // produce exactly the prefix of the whole-domain output.
+            let half = QUOTIENT_ROWS / 2;
+            let partial = start_poseidon2_gate_quotient(
+                &wires,
+                &constants,
+                QUOTIENT_ROWS,
+                half,
+                step,
+                SELECTOR_COLUMN,
+                GATE_INDEX,
+                group.clone(),
+                true,
+                &alphas,
+                ALPHA_OFFSET,
+            )
+            .expect("partial Metal quotient job must start");
+            let partial = partial
+                .finish()
+                .expect("partial Metal quotient job must finish");
+            assert_eq!(partial.len(), 2 * half);
+            for (i, (&actual, &expected)) in partial.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    actual.to_canonical_u64(),
+                    expected.to_canonical_u64(),
+                    "partial Poseidon2 gate quotient mismatch at word {i}, step {step}"
                 );
             }
         }
@@ -3167,6 +3213,7 @@ mod tests {
             let job = start_range_check_gate_quotient(
                 &wires,
                 &constants,
+                QUOTIENT_ROWS,
                 QUOTIENT_ROWS,
                 step,
                 &specs,
@@ -3446,6 +3493,7 @@ mod tests {
             let job = start_range_check_gate_quotient(
                 &wires,
                 &constants,
+                QUOTIENT_ROWS,
                 QUOTIENT_ROWS,
                 step,
                 &[],
@@ -4054,6 +4102,7 @@ mod tests {
                 &wires,
                 &constants,
                 QUOTIENT_ROWS,
+                QUOTIENT_ROWS,
                 step,
                 &range_specs,
                 &u32_specs,
@@ -4070,6 +4119,33 @@ mod tests {
                     actual.to_canonical_u64(),
                     expected.to_canonical_u64(),
                     "byte/quintic gate quotient mismatch at word {i}, step {step}"
+                );
+            }
+
+            // Adaptive-split seam: the union job bounded to a point prefix
+            // must produce exactly the prefix of the whole-domain output.
+            let half = QUOTIENT_ROWS / 2;
+            let partial = start_range_check_gate_quotient(
+                &wires,
+                &constants,
+                QUOTIENT_ROWS,
+                half,
+                step,
+                &range_specs,
+                &u32_specs,
+                &alphas,
+                ALPHA_OFFSET,
+            )
+            .expect("partial Metal byte/quintic quotient job must start");
+            let partial = partial
+                .finish()
+                .expect("partial Metal byte/quintic quotient job must finish");
+            assert_eq!(partial.len(), 2 * half);
+            for (i, (&actual, &expected)) in partial.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    actual.to_canonical_u64(),
+                    expected.to_canonical_u64(),
+                    "partial byte/quintic gate quotient mismatch at word {i}, step {step}"
                 );
             }
         }
