@@ -120,6 +120,51 @@ inline ulong gl_mul(ulong a, ulong b) {
 #endif
 }
 
+// Fused `a * b + addend (mod p)`: the addend is absorbed into the 128-bit
+// product before one shared reduction, deleting the separate post-multiply
+// `gl_add`. Exact for arbitrary u64 operands: `a*b <= (2^64-1)^2` leaves
+// headroom for the addend, so the 128-bit sum cannot overflow, and the
+// low/high reduction identity holds for any 128-bit value.
+inline ulong gl_mul_add(ulong a, ulong b, ulong addend) {
+    ulong low = a * b;
+    ulong high = metal::mulhi(a, b);
+    ulong low2 = low + addend;
+    high += (ulong)(low2 < low);
+#if defined(POSEIDON2_NATIVE_ARITHMETIC_REFERENCE)
+    ulong high_high = high >> 32;
+    ulong high_low = high & GOLDILOCKS_EPSILON;
+    ulong reduced = low2 - high_high;
+    if (reduced > low2) {
+        reduced -= GOLDILOCKS_EPSILON;
+    }
+    ulong extra = high_low * GOLDILOCKS_EPSILON;
+    ulong result = reduced + extra;
+    return result + (result < reduced) * GOLDILOCKS_EPSILON;
+#else
+    uint l0 = (uint)low2;
+    uint l1 = (uint)(low2 >> 32);
+    uint h0 = (uint)high;
+    uint h1 = (uint)(high >> 32);
+
+    uint r0 = l0 - h0;
+    uint borrow = (uint)(r0 > l0);
+    uint next = r0 - h1;
+    borrow += (uint)(next > r0);
+    r0 = next;
+
+    uint r1 = l1 + h0;
+    uint carry = (uint)(r1 < l1);
+    next = r1 - borrow;
+    uint under = (uint)(next > r1);
+    r1 = next;
+
+    int top = (int)carry - (int)under;
+    add_epsilon_u32(r0, r1, (uint)(top > 0));
+    sub_epsilon_u32(r0, r1, (uint)(top < 0));
+    return ((ulong)r1 << 32) | (ulong)r0;
+#endif
+}
+
 inline ulong gl_canonicalize(ulong value) {
     return value >= GOLDILOCKS_PRIME ? value - GOLDILOCKS_PRIME : value;
 }
@@ -160,6 +205,68 @@ inline void external_linear_layer(thread ulong state[12]) {
     }
 }
 
+// Lazy-reduction external layer for the tree-hash kernels. Every addition is
+// a raw 64-bit add whose 2^64 wraps are only counted; since
+// 2^64 ≡ EPSILON (mod p), a pair `(v, c)` represents `v + c·EPSILON` and one
+// `gl_add(v, c·EPSILON)` materialize per element per round replaces the ~34
+// full modular reductions the strict layer performs. The carry chain through
+// mat4 and the column sums stays far below 2^32, and `gl_add` is exact for
+// arbitrary u64 operands, so no intermediate bound is load-bearing.
+
+inline void mat4_lazy(thread ulong* values, thread uint* carries) {
+    ulong x0 = values[0]; uint c0 = carries[0];
+    ulong x1 = values[1]; uint c1 = carries[1];
+    ulong x2 = values[2]; uint c2 = carries[2];
+    ulong x3 = values[3]; uint c3 = carries[3];
+
+    ulong t01 = x0 + x1; uint ct01 = c0 + c1 + (uint)(t01 < x0);
+    ulong t23 = x2 + x3; uint ct23 = c2 + c3 + (uint)(t23 < x2);
+    ulong total = t01 + t23; uint ctotal = ct01 + ct23 + (uint)(total < t01);
+
+    ulong v0 = total + t01; uint cv0 = ctotal + ct01 + (uint)(v0 < total);
+    ulong v0b = v0 + x1; cv0 += c1 + (uint)(v0b < v0);
+
+    ulong v1 = total + x1; uint cv1 = ctotal + c1 + (uint)(v1 < total);
+    ulong v1b = v1 + x2; cv1 += c2 + (uint)(v1b < v1);
+    ulong v1c = v1b + x2; cv1 += c2 + (uint)(v1c < v1b);
+
+    ulong v2 = total + t23; uint cv2 = ctotal + ct23 + (uint)(v2 < total);
+    ulong v2b = v2 + x3; cv2 += c3 + (uint)(v2b < v2);
+
+    ulong v3 = total + x3; uint cv3 = ctotal + c3 + (uint)(v3 < total);
+    ulong v3b = v3 + x0; cv3 += c0 + (uint)(v3b < v3);
+    ulong v3c = v3b + x0; cv3 += c0 + (uint)(v3c < v3b);
+
+    values[0] = v0b; carries[0] = cv0;
+    values[1] = v1c; carries[1] = cv1;
+    values[2] = v2b; carries[2] = cv2;
+    values[3] = v3c; carries[3] = cv3;
+}
+
+inline void external_linear_layer_lazy(
+    thread ulong state[12],
+    thread uint carries[12]) {
+    mat4_lazy(state, carries);
+    mat4_lazy(state + 4, carries + 4);
+    mat4_lazy(state + 8, carries + 8);
+
+    ulong sums[4];
+    uint csums[4];
+    for (uint i = 0; i < 4; ++i) {
+        ulong s = state[i] + state[i + 4];
+        uint c = carries[i] + carries[i + 4] + (uint)(s < state[i]);
+        ulong s2 = s + state[i + 8];
+        c += carries[i + 8] + (uint)(s2 < s);
+        sums[i] = s2;
+        csums[i] = c;
+    }
+    for (uint i = 0; i < 12; ++i) {
+        ulong s = state[i] + sums[i & 3];
+        carries[i] += csums[i & 3] + (uint)(s < state[i]);
+        state[i] = s;
+    }
+}
+
 inline ulong sum_state(thread const ulong state[12]) {
     ulong sum = 0;
     uint carries = 0;
@@ -180,30 +287,57 @@ inline void internal_linear_layer(thread ulong state[12], constant ulong* diagon
 
 // Parameter layout: 8 x 12 external constants, 22 internal constants,
 // then the 12-element internal diagonal.
+//
+// Lazy-reduction core, used only by the tree-hash kernels (the gate-quotient
+// kernels do not call this function). Additions inside the external linear
+// layers are raw 64-bit adds with counted 2^64 wraps; each element is
+// materialized exactly once per round, immediately before the S-box, whose
+// multiplication requires a genuine (possibly noncanonical) representative.
+// The internal rounds fuse the diagonal multiply and the sum addition into
+// one `gl_mul_add` reduction and therefore stay fully materialized. The
+// final canonicalize in each kernel makes the digest bytes independent of
+// intermediate representatives.
 inline void poseidon2(thread ulong state[12], constant ulong* parameters) {
     constant ulong* external_constants = parameters;
     constant ulong* internal_constants = parameters + 96;
     constant ulong* diagonal = parameters + 118;
 
-    external_linear_layer(state);
+    uint carries[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    external_linear_layer_lazy(state, carries);
 
     for (uint round = 0; round < 4; ++round) {
         for (uint i = 0; i < 12; ++i) {
-            state[i] = pow7(gl_add(state[i], external_constants[round * 12 + i]));
+            ulong v = gl_add(state[i], (ulong)carries[i] * GOLDILOCKS_EPSILON);
+            state[i] = pow7(gl_add(v, external_constants[round * 12 + i]));
+            carries[i] = 0;
         }
-        external_linear_layer(state);
+        external_linear_layer_lazy(state, carries);
     }
 
+    // Materialize once before the internal rounds; `gl_mul_add` keeps the
+    // state fully reduced from here on.
+    for (uint i = 0; i < 12; ++i) {
+        state[i] = gl_add(state[i], (ulong)carries[i] * GOLDILOCKS_EPSILON);
+        carries[i] = 0;
+    }
     for (uint round = 0; round < 22; ++round) {
         state[0] = pow7(gl_add(state[0], internal_constants[round]));
-        internal_linear_layer(state, diagonal);
+        ulong sum = sum_state(state);
+        for (uint i = 0; i < 12; ++i) {
+            state[i] = gl_mul_add(state[i], diagonal[i], sum);
+        }
     }
 
     for (uint round = 4; round < 8; ++round) {
         for (uint i = 0; i < 12; ++i) {
-            state[i] = pow7(gl_add(state[i], external_constants[round * 12 + i]));
+            ulong v = gl_add(state[i], (ulong)carries[i] * GOLDILOCKS_EPSILON);
+            state[i] = pow7(gl_add(v, external_constants[round * 12 + i]));
+            carries[i] = 0;
         }
-        external_linear_layer(state);
+        external_linear_layer_lazy(state, carries);
+    }
+    for (uint i = 0; i < 12; ++i) {
+        state[i] = gl_add(state[i], (ulong)carries[i] * GOLDILOCKS_EPSILON);
     }
 }
 
@@ -368,18 +502,27 @@ kernel void poseidon2_gate_quotient(
     output[(ulong)gid * 2 + 1] = gl_canonicalize(gl_mul(filter, accumulators[1]));
 }
 
+// Lazy accumulation: the alpha-weighted constraint terms are raw-added with
+// counted 2^64 wraps (2^64 = EPSILON mod p) and materialized once per gate
+// record, replacing one full modular reduction per constraint per challenge.
+// The wrap count is bounded by the record's constraint count (< 2^13), so
+// the deferred `c * EPSILON` stays below 2^45 and the final `gl_add` is
+// exact.
 inline void range_check_gate_emit(
     ulong constraint,
     constant ulong* alpha_powers,
     uint alpha_stride,
     thread ulong accumulators[2],
+    thread uint accumulator_carries[2],
     uint constraint_index) {
-    accumulators[0] = gl_add(
-        accumulators[0],
-        gl_mul(constraint, alpha_powers[constraint_index]));
-    accumulators[1] = gl_add(
-        accumulators[1],
-        gl_mul(constraint, alpha_powers[alpha_stride + constraint_index]));
+    ulong term0 = gl_mul(constraint, alpha_powers[constraint_index]);
+    ulong sum0 = accumulators[0] + term0;
+    accumulator_carries[0] += (uint)(sum0 < term0);
+    accumulators[0] = sum0;
+    ulong term1 = gl_mul(constraint, alpha_powers[alpha_stride + constraint_index]);
+    ulong sum1 = accumulators[1] + term1;
+    accumulator_carries[1] += (uint)(sum1 < term1);
+    accumulators[1] = sum1;
 }
 
 // Each RangeCheck metadata record is ten uints:
@@ -472,6 +615,7 @@ kernel void range_check_gate_quotient(
         }
 
         ulong gate_accumulators[2] = { 0, 0 };
+        uint gate_accumulator_carries[2] = { 0, 0 };
         uint constraint_index = 0;
         for (uint op = 0; op < num_ops; ++op) {
             ulong input = wires[(ulong)op * lde_rows + source_row];
@@ -487,6 +631,7 @@ kernel void range_check_gate_quotient(
                 alpha_powers,
                 alpha_stride,
                 gate_accumulators,
+                gate_accumulator_carries,
                 constraint_index++);
 
             for (uint j = 0; j < num_aux; ++j) {
@@ -505,12 +650,19 @@ kernel void range_check_gate_quotient(
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
             }
         }
 
-        total[0] = gl_add(total[0], gl_mul(filter, gate_accumulators[0]));
-        total[1] = gl_add(total[1], gl_mul(filter, gate_accumulators[1]));
+        ulong merged0 = gl_add(
+            gate_accumulators[0],
+            (ulong)gate_accumulator_carries[0] * GOLDILOCKS_EPSILON);
+        ulong merged1 = gl_add(
+            gate_accumulators[1],
+            (ulong)gate_accumulator_carries[1] * GOLDILOCKS_EPSILON);
+        total[0] = gl_add(total[0], gl_mul(filter, merged0));
+        total[1] = gl_add(total[1], gl_mul(filter, merged1));
     }
 
     constant uint* u32_metadata = metadata + range_count * 10u;
@@ -541,6 +693,7 @@ kernel void range_check_gate_quotient(
         }
 
         ulong gate_accumulators[2] = { 0, 0 };
+        uint gate_accumulator_carries[2] = { 0, 0 };
         uint constraint_index = 0;
         if (kind == 0u) {
             // U32ArithmeticGate: six routed words followed by 32 base-4
@@ -561,6 +714,7 @@ kernel void range_check_gate_quotient(
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
 
                 ulong computed = gl_add(gl_mul(multiplicand_0, multiplicand_1), addend);
@@ -570,6 +724,7 @@ kernel void range_check_gate_quotient(
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
 
                 ulong limb_base = (ulong)num_ops * 6u + (ulong)op * 32u;
@@ -584,6 +739,7 @@ kernel void range_check_gate_quotient(
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
+                        gate_accumulator_carries,
                         constraint_index++);
                     if (j < 16u) {
                         combined_low = gl_add(gl_mul(combined_low, 4), x);
@@ -596,12 +752,14 @@ kernel void range_check_gate_quotient(
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(combined_high, output_high),
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
             }
         } else if (kind == 1u) {
@@ -623,6 +781,7 @@ kernel void range_check_gate_quotient(
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
 
                 ulong limb_base = (ulong)num_ops * 5u + (ulong)op * result_limbs;
@@ -636,6 +795,7 @@ kernel void range_check_gate_quotient(
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
+                        gate_accumulator_carries,
                         constraint_index++);
                     recomposed = gl_add(gl_mul(recomposed, 4), x);
                 }
@@ -644,12 +804,14 @@ kernel void range_check_gate_quotient(
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_mul(output_borrow, gl_sub(1, output_borrow)),
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
             }
         } else if (kind == 2u) {
@@ -675,6 +837,7 @@ kernel void range_check_gate_quotient(
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
 
                 uint total_limbs = result_limbs + num_carry_limbs;
@@ -691,6 +854,7 @@ kernel void range_check_gate_quotient(
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
+                        gate_accumulator_carries,
                         constraint_index++);
                     if (j < result_limbs) {
                         combined_result = gl_add(gl_mul(combined_result, 4), x);
@@ -703,12 +867,14 @@ kernel void range_check_gate_quotient(
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(combined_carry, output_carry),
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
             }
         } else if (kind == 3u) {
@@ -733,6 +899,7 @@ kernel void range_check_gate_quotient(
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
+                        gate_accumulator_carries,
                         constraint_index++);
                 }
                 for (uint byte_index = 0; byte_index < num_limbs; ++byte_index) {
@@ -751,6 +918,7 @@ kernel void range_check_gate_quotient(
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
+                        gate_accumulator_carries,
                         constraint_index++);
                 }
                 ulong recomposed_sum =
@@ -767,6 +935,7 @@ kernel void range_check_gate_quotient(
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
             }
         } else if (kind == 4u) {
@@ -799,6 +968,7 @@ kernel void range_check_gate_quotient(
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
+                        gate_accumulator_carries,
                         constraint_index++);
                 }
             }
@@ -826,70 +996,85 @@ kernel void range_check_gate_quotient(
                 range_check_gate_emit(
                     gl_sub(gl_mul(a[0], a[0]), extra[0]),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_add(gl_mul(gl_mul(6, a[1]), a[4]), extra[0]), extra[1]),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_add(gl_mul(gl_mul(6, a[2]), a[3]), extra[1]), c[0]),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
 
                 // c[1]
                 range_check_gate_emit(
                     gl_sub(gl_mul(gl_mul(3, a[3]), a[3]), extra[2]),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[1]), extra[2]), extra[3]),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_add(gl_mul(gl_mul(6, a[2]), a[4]), extra[3]), c[1]),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
 
                 // c[2]
                 range_check_gate_emit(
                     gl_sub(gl_mul(a[1], a[1]), extra[4]),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[2]), extra[4]), extra[5]),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_add(gl_mul(gl_mul(6, a[3]), a[4]), extra[5]), c[2]),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
 
                 // c[3]
                 range_check_gate_emit(
                     gl_sub(gl_mul(gl_mul(3, a[4]), a[4]), extra[6]),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[3]), extra[6]), extra[7]),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[1]), a[2]), extra[7]), c[3]),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
 
                 // c[4]
                 range_check_gate_emit(
                     gl_sub(gl_mul(a[2], a[2]), extra[8]),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[4]), extra[8]), extra[9]),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[1]), a[3]), extra[9]), c[4]),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
             }
         } else if (kind == 6u) {
@@ -914,6 +1099,7 @@ kernel void range_check_gate_quotient(
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
+                        gate_accumulator_carries,
                         constraint_index++);
                 }
 
@@ -933,6 +1119,7 @@ kernel void range_check_gate_quotient(
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
 
                 // Fold each eight-item block in ascending pair order, then fold
@@ -961,6 +1148,7 @@ kernel void range_check_gate_quotient(
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
             }
 
@@ -975,6 +1163,7 @@ kernel void range_check_gate_quotient(
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
             }
         } else if (kind == 7u) {
@@ -1003,6 +1192,7 @@ kernel void range_check_gate_quotient(
                 range_check_gate_emit(
                     gl_sub(gl_mul(previous, multiplier), intermediate),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
             }
             ulong output_value = wires[((ulong)1u + num_power_bits) * lde_rows + source_row];
@@ -1011,6 +1201,7 @@ kernel void range_check_gate_quotient(
             range_check_gate_emit(
                 gl_sub(output_value, final_intermediate),
                 alpha_powers, alpha_stride, gate_accumulators,
+                gate_accumulator_carries,
                 constraint_index++);
         } else if (kind == 8u) {
             // EqualityGate: three routed words per operation (x, y, equal)
@@ -1032,18 +1223,22 @@ kernel void range_check_gate_quotient(
                 range_check_gate_emit(
                     gl_sub(gl_sub(x, y), difference),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_mul(difference, inverse), product),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_mul(product, difference), difference),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_sub(const_0, product), equal),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
             }
         } else if (kind == 9u) {
@@ -1084,10 +1279,12 @@ kernel void range_check_gate_quotient(
                 range_check_gate_emit(
                     gl_sub(gl_add(product_0, coeff_0), next_0),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_add(product_1, coeff_1), next_1),
                     alpha_powers, alpha_stride, gate_accumulators,
+                    gate_accumulator_carries,
                     constraint_index++);
 
                 acc_0 = next_0;
@@ -1098,11 +1295,18 @@ kernel void range_check_gate_quotient(
             // record reaches the shader, make its selected row unsatisfiable.
             range_check_gate_emit(
                 1, alpha_powers, alpha_stride, gate_accumulators,
+                gate_accumulator_carries,
                 constraint_index++);
         }
 
-        total[0] = gl_add(total[0], gl_mul(filter, gate_accumulators[0]));
-        total[1] = gl_add(total[1], gl_mul(filter, gate_accumulators[1]));
+        ulong merged0 = gl_add(
+            gate_accumulators[0],
+            (ulong)gate_accumulator_carries[0] * GOLDILOCKS_EPSILON);
+        ulong merged1 = gl_add(
+            gate_accumulators[1],
+            (ulong)gate_accumulator_carries[1] * GOLDILOCKS_EPSILON);
+        total[0] = gl_add(total[0], gl_mul(filter, merged0));
+        total[1] = gl_add(total[1], gl_mul(filter, merged1));
     }
 
     output[(ulong)gid * 2] = gl_canonicalize(total[0]);
