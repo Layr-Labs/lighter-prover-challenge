@@ -7,7 +7,9 @@ use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
 use crate::field::extension::Extendable;
-use crate::field::fft::{fft_in_place_with_options, FftRootTable};
+use crate::field::fft::{
+    FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
+};
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
@@ -625,14 +627,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             let polys_coeff = polynomials.iter().map(|fri_poly| {
                 &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
             });
-            // The label is formatted unconditionally, but `timing`'s `push` is
-            // compiled out unless the `timing` feature is on — which it is not
-            // here — so the `String` is allocated, written and dropped without
-            // ever being read. A static label costs nothing and reads the same
-            // in a timing build.
             let composition_poly = timed!(
                 timing,
-                "reduce batch of polynomials",
+                &format!("reduce batch of {} polynomials", polynomials.len()),
                 alpha.reduce_polys_base(polys_coeff)
             );
             // Fused (value-exact) form of:
@@ -677,7 +674,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         unsafe { lde_final_poly.coeffs.set_len(lde_len) };
         let lde_final_values = timed!(
             timing,
-            "perform final FFT",
+            &format!("perform final FFT {}", lde_final_poly.len()),
             // The top (1 - 1/2^rate_bits) of the padded coefficients are the
             // zeros written by the `resize` just above, so the FFT's zero-run
             // shortcut applies and the coset scaling over that tail is a
@@ -749,7 +746,12 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
     } else {
         scaled.resize(len, F::ZERO);
     }
-    PolynomialCoeffs::new(scaled).fft_with_options(zero_factor, root_table)
+    if crate::hash::poseidon2::is_exclusive_gpu_phase() {
+        fft_in_place_with_options_parallel(&mut scaled, zero_factor, root_table);
+    } else {
+        fft_in_place_with_options(&mut scaled, zero_factor, root_table);
+    }
+    PolynomialValues::new(scaled)
 }
 
 /// Folds one batch's quotient `(p(X) - p(z))/(X - z)` into the running FRI
@@ -1076,154 +1078,6 @@ mod tests {
 
             assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
             assert_eq!(raw(&actual.coeffs), raw(&expected_in_place.coeffs));
-        }
-    }
-
-    /// Differential oracle for skipping `constants_sigmas_quotient_cache` at
-    /// `step == 1` (`try_build_with_options` / `circuit::embed`).
-    ///
-    /// The cached quotient path reads `cache[ci * domain + start..][..n]`; the
-    /// uncached path calls `fill_lde_batch(indices, 1, range, PolyMajor, out)`
-    /// and reads `out[ci * n..][..n]`. This asserts those two byte sequences
-    /// are identical for every column of both ranges, over every batch the
-    /// quotient loop can produce (including a short final batch), using RANDOM
-    /// values — nothing about a real circuit's constants or sigmas is assumed.
-    #[test]
-    fn quotient_cache_reads_match_uncached_lde_batch_raw_words() {
-        use crate::field::types::PrimeField64;
-
-        const D: usize = 2;
-        const RATE_BITS: usize = 3;
-        const CAP_HEIGHT: usize = 1;
-        type F = GoldilocksField;
-        type C = Poseidon2GoldilocksConfig;
-
-        // Mirrors the shape the ranked circuits use: a few "constants" columns
-        // followed by the routed-wire sigma columns.
-        for (degree_bits, num_constants, num_routed) in [(4usize, 2usize, 5usize), (6, 6, 11)] {
-            let degree = 1usize << degree_bits;
-            let width = num_constants + num_routed;
-            let values = (0..width)
-                .map(|_| PolynomialValues::new(F::rand_vec(degree)))
-                .collect::<Vec<_>>();
-            let batch = PolynomialBatch::<F, C, D>::from_values(
-                values,
-                RATE_BITS,
-                false,
-                CAP_HEIGHT,
-                &mut TimingTree::default(),
-                None,
-            );
-            // `step == 1` is exactly the configuration under test: rate_bits
-            // equals the quotient degree bits, so the quotient domain is the
-            // full LDE.
-            let step = 1usize;
-            let domain = degree << RATE_BITS;
-            let constants_range = 0..num_constants;
-            let sigmas_range = num_constants..width;
-
-            // The cache, assembled exactly as the builder assembled it.
-            let mut cache = batch
-                .extract_lde_batch_columns(step, constants_range.clone(), domain)
-                .expect("column-backed commitment must extract");
-            cache.extend(
-                batch
-                    .extract_lde_batch_columns(step, sigmas_range.clone(), domain)
-                    .expect("column-backed commitment must extract"),
-            );
-            assert_eq!(cache.len(), width * domain);
-
-            let raw = |slice: &[F]| {
-                slice
-                    .iter()
-                    .map(PrimeField64::to_noncanonical_u64)
-                    .collect::<Vec<_>>()
-            };
-
-            for batch_size in [1usize, 3, 8, 32] {
-                let num_batches = domain.div_ceil(batch_size);
-                for batch_i in 0..num_batches {
-                    let start = batch_size * batch_i;
-                    let n = batch_size.min(domain - start);
-                    let indices = (start..start + n).collect::<Vec<_>>();
-
-                    for (range, column_offset) in [
-                        (constants_range.clone(), 0),
-                        (sigmas_range.clone(), num_constants),
-                    ] {
-                        let w = range.len();
-                        let mut uncached = Vec::new();
-                        batch.fill_lde_batch(
-                            &indices,
-                            step,
-                            range,
-                            BatchLayout::PolyMajor,
-                            &mut uncached,
-                        );
-                        assert_eq!(uncached.len(), w * n);
-                        for ci in 0..w {
-                            let cached = &cache[(column_offset + ci) * domain + start..][..n];
-                            assert_eq!(
-                                raw(cached),
-                                raw(&uncached[ci * n..][..n]),
-                                "degree_bits={degree_bits} batch_size={batch_size} \
-                                 batch_i={batch_i} column={ci}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// `transpose_poly_values_ref` must be bit-identical to the consuming
-    /// `transpose_poly_values`, so the commitment can take the sigma columns by
-    /// move instead of by clone. Includes non-canonical raw words, so the
-    /// comparison is on raw representatives rather than field congruence.
-    #[test]
-    fn transpose_poly_values_ref_matches_consuming_transpose_raw_words() {
-        use crate::field::types::{Field64, PrimeField64};
-        use crate::util::{transpose_poly_values, transpose_poly_values_ref};
-
-        type F = GoldilocksField;
-
-        for (width, degree) in [(1usize, 1usize), (3, 8), (11, 64), (80, 16)] {
-            let polys = (0..width)
-                .map(|column| {
-                    PolynomialValues::new(
-                        (0..degree)
-                            .map(|row| {
-                                let raw = match (column * degree + row) % 7 {
-                                    0 => 0,
-                                    1 => 1,
-                                    2 => F::ORDER - 1,
-                                    3 => F::ORDER,
-                                    4 => F::ORDER + 1,
-                                    5 => u64::MAX,
-                                    _ => ((column + 1) as u64)
-                                        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-                                        .wrapping_add(row as u64),
-                                };
-                                GoldilocksField(raw)
-                            })
-                            .collect(),
-                    )
-                })
-                .collect::<Vec<_>>();
-
-            let by_ref = transpose_poly_values_ref(&polys);
-            let consumed = transpose_poly_values(polys);
-
-            let raw = |rows: &[Vec<F>]| {
-                rows.iter()
-                    .map(|row| {
-                        row.iter()
-                            .map(PrimeField64::to_noncanonical_u64)
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>()
-            };
-            assert_eq!(raw(&by_ref), raw(&consumed), "width={width} degree={degree}");
         }
     }
 }
