@@ -41,12 +41,84 @@ fn load_blob<T: serde::de::DeserializeOwned>(
         .map_err(|error| error.context(format!("loading embedded circuit {name}")))
 }
 
+/// The four circuit blobs and two dummy proofs that can load while the already-loaded
+/// pre-execution circuit is proving. Keeping this separate lets the startup path reuse the exact
+/// pre-execution allocation after that proof instead of deserializing `PRE_BLOB` a second time.
+pub(crate) struct RemainingCircuits {
+    heavy_tx: (BlockTxTarget, CircuitData<F, C, D>),
+    heavy_chain: (BlockTxChainTarget, CircuitData<F, C, D>),
+    light_tx: (BlockTxTarget, CircuitData<F, C, D>),
+    light_chain: (BlockTxChainTarget, CircuitData<F, C, D>),
+    dummy_heavy_proof: Proof,
+    dummy_light_proof: Proof,
+}
+
 impl Circuits {
     /// Loads only the pre-execution circuit blob. This is the fast path used
     /// by the startup overlap: the pre-execution proof can start (and hide)
     /// behind the remaining circuit loads.
     pub fn load_pre() -> anyhow::Result<(BlockPreExecutionTarget, CircuitData<F, C, D>)> {
         load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB)
+    }
+
+    /// Loads everything except the pre-execution circuit. These four independent blobs retain
+    /// the same nested parallel layout used by [`Self::from_embedded`].
+    pub(crate) fn load_remaining_embedded() -> anyhow::Result<RemainingCircuits> {
+        let (heavy, light) = rayon::join(
+            || {
+                rayon::join(
+                    || load_blob::<BlockTxTarget>("heavy_tx", HEAVY_TX_BLOB),
+                    || load_blob::<BlockTxChainTarget>("heavy_chain", HEAVY_CHAIN_BLOB),
+                )
+            },
+            || {
+                rayon::join(
+                    || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
+                    || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
+                )
+            },
+        );
+        let ((heavy_tx, heavy_chain), (light_tx, light_chain)) =
+            ((heavy.0?, heavy.1?), (light.0?, light.1?));
+
+        Ok(RemainingCircuits {
+            heavy_tx,
+            heavy_chain,
+            light_tx,
+            light_chain,
+            dummy_heavy_proof: bincode::deserialize(include_bytes!(
+                "../dummy-heavy-chain-proof.bin"
+            ))
+            .expect("embedded heavy chain dummy proof is invalid"),
+            dummy_light_proof: bincode::deserialize(include_bytes!(
+                "../dummy-light-chain-proof.bin"
+            ))
+            .expect("embedded light chain dummy proof is invalid"),
+        })
+    }
+
+    /// Joins a pre-execution circuit with the independently loaded remainder. Every field is
+    /// moved into place; in particular, the large pre-execution prover data is neither cloned nor
+    /// deserialized again.
+    pub(crate) fn from_embedded_parts(
+        pre: (BlockPreExecutionTarget, CircuitData<F, C, D>),
+        remaining: RemainingCircuits,
+    ) -> Self {
+        let (pre_target, pre_data) = pre;
+        Self {
+            heavy_tx_target: remaining.heavy_tx.0,
+            heavy_tx_data: remaining.heavy_tx.1,
+            light_tx_target: remaining.light_tx.0,
+            light_tx_data: remaining.light_tx.1,
+            pre_target,
+            pre_data,
+            heavy_chain_target: remaining.heavy_chain.0,
+            heavy_chain_data: remaining.heavy_chain.1,
+            light_chain_target: remaining.light_chain.0,
+            light_chain_data: remaining.light_chain.1,
+            dummy_heavy_proof: remaining.dummy_heavy_proof,
+            dummy_light_proof: remaining.dummy_light_proof,
+        }
     }
 
     /// Reconstructs all five startup circuits from the blobs embedded at
@@ -57,52 +129,8 @@ impl Circuits {
         // Same parallel layout as `Circuits::new`; the five loads are
         // independent (unlike builds, the chain loads do not wait on the
         // transaction circuits).
-        let (pre, (heavy, light)) = rayon::join(
-            || load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB),
-            || {
-                rayon::join(
-                    || {
-                        rayon::join(
-                            || load_blob::<BlockTxTarget>("heavy_tx", HEAVY_TX_BLOB),
-                            || load_blob::<BlockTxChainTarget>("heavy_chain", HEAVY_CHAIN_BLOB),
-                        )
-                    },
-                    || {
-                        rayon::join(
-                            || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
-                            || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
-                        )
-                    },
-                )
-            },
-        );
-        let (pre_target, pre_data) = pre?;
-        let ((heavy_tx, heavy_chain), (light_tx, light_chain)) = (
-            (heavy.0?, heavy.1?),
-            (light.0?, light.1?),
-        );
-
-        let dummy_heavy_proof: Proof =
-            bincode::deserialize(include_bytes!("../dummy-heavy-chain-proof.bin"))
-                .expect("embedded heavy chain dummy proof is invalid");
-        let dummy_light_proof: Proof =
-            bincode::deserialize(include_bytes!("../dummy-light-chain-proof.bin"))
-                .expect("embedded light chain dummy proof is invalid");
-
-        Ok(Self {
-            heavy_tx_target: heavy_tx.0,
-            heavy_tx_data: heavy_tx.1,
-            light_tx_target: light_tx.0,
-            light_tx_data: light_tx.1,
-            pre_target,
-            pre_data,
-            heavy_chain_target: heavy_chain.0,
-            heavy_chain_data: heavy_chain.1,
-            light_chain_target: light_chain.0,
-            light_chain_data: light_chain.1,
-            dummy_heavy_proof,
-            dummy_light_proof,
-        })
+        let (pre, remaining) = rayon::join(Self::load_pre, Self::load_remaining_embedded);
+        Ok(Self::from_embedded_parts(pre?, remaining?))
     }
 
     /// Production loader: embedded circuits when available, otherwise a fresh
@@ -286,6 +314,146 @@ mod tests {
             assert!(!bytes.is_empty());
 
             println!("embedded_matches_rebuilt: all five circuits are value-identical");
+        });
+    }
+
+    fn startup_fingerprint(circuits: &Circuits) -> Vec<u8> {
+        bincode::serialize(&(
+            &circuits.pre_target,
+            &circuits.pre_data.prover_only.circuit_digest,
+            &circuits.heavy_tx_target,
+            &circuits.heavy_tx_data.prover_only.circuit_digest,
+            &circuits.heavy_chain_target,
+            &circuits.heavy_chain_data.prover_only.circuit_digest,
+            &circuits.light_tx_target,
+            &circuits.light_tx_data.prover_only.circuit_digest,
+            &circuits.light_chain_target,
+            &circuits.light_chain_data.prover_only.circuit_digest,
+        ))
+        .expect("startup circuit fingerprint must serialize")
+    }
+
+    fn startup_parts_fingerprint(
+        pre: &(BlockPreExecutionTarget, CircuitData<F, C, D>),
+        remaining: &RemainingCircuits,
+    ) -> Vec<u8> {
+        bincode::serialize(&(
+            &pre.0,
+            &pre.1.prover_only.circuit_digest,
+            &remaining.heavy_tx.0,
+            &remaining.heavy_tx.1.prover_only.circuit_digest,
+            &remaining.heavy_chain.0,
+            &remaining.heavy_chain.1.prover_only.circuit_digest,
+            &remaining.light_tx.0,
+            &remaining.light_tx.1.prover_only.circuit_digest,
+            &remaining.light_chain.0,
+            &remaining.light_chain.1.prover_only.circuit_digest,
+        ))
+        .expect("startup circuit parts fingerprint must serialize")
+    }
+
+    #[test]
+    fn embedded_startup_parts_preserve_loaded_allocations() {
+        on_big_stack(|| {
+            let pre = Circuits::load_pre().expect("embedded pre circuit must load");
+            let remaining =
+                Circuits::load_remaining_embedded().expect("remaining circuits must load");
+            let expected_fingerprint = startup_parts_fingerprint(&pre, &remaining);
+
+            // Heap pointers are stable across a move. Pinning all five sigma allocations and both
+            // dummy-proof input allocations proves assembly takes ownership rather than cloning or
+            // silently reloading any part.
+            let expected_pointers = [
+                pre.1.prover_only.sigmas.as_ptr() as usize,
+                remaining.heavy_tx.1.prover_only.sigmas.as_ptr() as usize,
+                remaining.heavy_chain.1.prover_only.sigmas.as_ptr() as usize,
+                remaining.light_tx.1.prover_only.sigmas.as_ptr() as usize,
+                remaining.light_chain.1.prover_only.sigmas.as_ptr() as usize,
+                remaining.dummy_heavy_proof.public_inputs.as_ptr() as usize,
+                remaining.dummy_light_proof.public_inputs.as_ptr() as usize,
+            ];
+            let circuits = Circuits::from_embedded_parts(pre, remaining);
+            let actual_pointers = [
+                circuits.pre_data.prover_only.sigmas.as_ptr() as usize,
+                circuits.heavy_tx_data.prover_only.sigmas.as_ptr() as usize,
+                circuits.heavy_chain_data.prover_only.sigmas.as_ptr() as usize,
+                circuits.light_tx_data.prover_only.sigmas.as_ptr() as usize,
+                circuits.light_chain_data.prover_only.sigmas.as_ptr() as usize,
+                circuits.dummy_heavy_proof.public_inputs.as_ptr() as usize,
+                circuits.dummy_light_proof.public_inputs.as_ptr() as usize,
+            ];
+            assert_eq!(actual_pointers, expected_pointers);
+            assert_eq!(startup_fingerprint(&circuits), expected_fingerprint);
+        });
+    }
+
+    fn measure_startup_load(reuse_pre: bool) -> (std::time::Duration, Vec<u8>) {
+        use core::hint::black_box;
+
+        let started = std::time::Instant::now();
+        let circuits = if reuse_pre {
+            let pre = Circuits::load_pre().expect("embedded pre circuit must load");
+            let remaining =
+                Circuits::load_remaining_embedded().expect("remaining circuits must load");
+            Circuits::from_embedded_parts(pre, remaining)
+        } else {
+            let duplicate_pre = Circuits::load_pre().expect("embedded pre circuit must load");
+            let circuits = Circuits::from_embedded().expect("all embedded circuits must load");
+            // The old startup path dropped this first allocation when the pre-proof thread
+            // returned. Include that scored recursive drop in the baseline arm.
+            drop(duplicate_pre);
+            circuits
+        };
+        black_box(&circuits);
+        let elapsed = started.elapsed();
+        let fingerprint = startup_fingerprint(&circuits);
+        // The production worker uses `_exit`, so destruction of the retained circuit set is not
+        // scored. Keep its test-only drop outside the measured interval as well.
+        drop(circuits);
+        (elapsed, fingerprint)
+    }
+
+    /// Test-only component harness for the exact startup work deletion. Run:
+    /// `cargo test --release -p bench --bin prove -- --ignored embedded_pre_reuse_component_abba --nocapture`
+    #[test]
+    #[ignore = "manual startup component timing harness"]
+    fn embedded_pre_reuse_component_abba() {
+        on_big_stack(|| {
+            const BLOCKS: usize = 5;
+
+            let _ = measure_startup_load(false);
+            let _ = measure_startup_load(true);
+            let mut duplicate_total = std::time::Duration::ZERO;
+            let mut reused_total = std::time::Duration::ZERO;
+            for block in 0..BLOCKS {
+                let (a1, a1_fingerprint) = measure_startup_load(false);
+                let (b1, b1_fingerprint) = measure_startup_load(true);
+                let (b2, b2_fingerprint) = measure_startup_load(true);
+                let (a2, a2_fingerprint) = measure_startup_load(false);
+                assert_eq!(a1_fingerprint, b1_fingerprint);
+                assert_eq!(a1_fingerprint, b2_fingerprint);
+                assert_eq!(a1_fingerprint, a2_fingerprint);
+
+                let duplicate = a1 + a2;
+                let reused = b1 + b2;
+                duplicate_total += duplicate;
+                reused_total += reused;
+                println!(
+                    "block {block}: duplicate-pre {:.6}s reused-pre {:.6}s speedup {:.3}x saved {:.3}ms/load",
+                    duplicate.as_secs_f64(),
+                    reused.as_secs_f64(),
+                    duplicate.as_secs_f64() / reused.as_secs_f64(),
+                    (duplicate.as_secs_f64() - reused.as_secs_f64()) * 500.0,
+                );
+            }
+            println!(
+                "pre reuse ABBA total: duplicate {:.6}s reused {:.6}s speedup {:.3}x saved {:.3}ms/load",
+                duplicate_total.as_secs_f64(),
+                reused_total.as_secs_f64(),
+                duplicate_total.as_secs_f64() / reused_total.as_secs_f64(),
+                (duplicate_total.as_secs_f64() - reused_total.as_secs_f64()) * 1000.0
+                    / (BLOCKS * 2) as f64,
+            );
         });
     }
 

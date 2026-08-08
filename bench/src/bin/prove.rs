@@ -65,7 +65,7 @@ fn main() {
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
     // Fixture parse overlaps the pre-execution circuit load; both are fast.
-    let (block, pre_circuits) = rayon::join(
+    let (block, (pre_circuits, pre_was_embedded)) = rayon::join(
         || {
             let json = fs::read(&fixture).expect("cannot read prover fixture");
             Block::<F>::from_json_with_empty_txs(
@@ -78,13 +78,14 @@ fn main() {
             .expect("invalid prover fixture")
         },
         || match Circuits::load_pre() {
-            Ok(loaded) => loaded,
+            Ok(loaded) => (loaded, true),
             Err(error) => {
                 log::warn!("embedded pre circuit unavailable ({error:#}); building from scratch");
-                let pre = circuit::block_pre_execution_constraints::BlockPreExecutionCircuit::define(
-                    circuit::types::config::CIRCUIT_CONFIG,
-                );
-                (pre.target, pre.builder.build::<C>())
+                let pre =
+                    circuit::block_pre_execution_constraints::BlockPreExecutionCircuit::define(
+                        circuit::types::config::CIRCUIT_CONFIG,
+                    );
+                ((pre.target, pre.builder.build::<C>()), false)
             }
         },
     );
@@ -94,14 +95,44 @@ fn main() {
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .spawn(move || {
             let (pre_target, pre_data) = pre_circuits;
-            prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec)
+            let pre_proof = prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec);
+            (pre_target, pre_data, pre_proof)
         })
         .expect("pre-execution startup thread must start");
-    // Embedded circuits (deserialized from compile-time blobs) by default;
-    // falls back to building from scratch if they are unavailable, and
-    // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B measurement.
-    let circuits = Circuits::load();
-    let pre_proof = pre_handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    // Load only the other four embedded circuits while the pre-execution proof runs. The proof
+    // thread returns its immutable circuit allocation for the later block circuit instead of
+    // dropping it and making this lane deserialize the same pre blob again. Preserve the old
+    // force/failure fallback exactly: a full rebuild still overlaps the pre proof.
+    let remaining_or_rebuilt =
+        if std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1") {
+            log::info!("LIGHTER_BUILD_CIRCUITS=1: building startup circuits from scratch");
+            Err(Circuits::new())
+        } else if !pre_was_embedded {
+            // Preserve the old error fallback: failure of PRE_BLOB made `Circuits::load()`
+            // rebuild the complete set rather than mixing a rebuilt pre circuit with embedded
+            // transaction circuits.
+            Err(Circuits::new())
+        } else {
+            match Circuits::load_remaining_embedded() {
+                Ok(remaining) => Ok(remaining),
+                Err(error) => {
+                    log::warn!("embedded circuits unavailable ({error:#}); building from scratch");
+                    Err(Circuits::new())
+                }
+            }
+        };
+    let (pre_target, pre_data, pre_proof) = pre_handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let circuits = match remaining_or_rebuilt {
+        Ok(remaining) => Circuits::from_embedded_parts((pre_target, pre_data), remaining),
+        Err(rebuilt) => {
+            // Match the old fallback lifetime: the separate pre-proof allocation is not retained
+            // when a complete replacement set was built.
+            drop((pre_target, pre_data));
+            rebuilt
+        }
+    };
     let proof = prover::prove_block_after_pre(block, circuits, pre_proof);
     let mut writer = BufWriter::with_capacity(
         PROOF_OUTPUT_BUFFER_BYTES,
