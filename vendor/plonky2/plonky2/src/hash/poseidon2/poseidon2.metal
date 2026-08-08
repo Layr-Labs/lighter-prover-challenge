@@ -209,19 +209,36 @@ inline lazy_t lazy_add(lazy_t a, lazy_t b) {
     return { a.lo + b.lo, a.hi + b.hi };
 }
 
-// Collapses (lo, hi) to an ordinary 64-bit representative. With
-//   hi = hh * 2^32 + hl  and  2^64 == EPSILON (mod p),
-//   hi * 2^32 + lo == hl * 2^32 + lo + hh * EPSILON.
-// `a.hi << 32` already discards hh, so s is the first two terms and c1 its
-// 65th bit. hh + c1 < 2^6, so the EPSILON fold is at most 2^38: if s wrapped,
-// s < 2^37 and the fold cannot wrap again; if it did not, one more fold of
-// EPSILON onto a value below 2^38 cannot either. Both correction rounds after
-// the first are therefore unreachable.
+// Collapses (lo, hi) to an ordinary 64-bit representative. Splitting both
+// halves at the 32-bit boundary as
+//   lo = lh * 2^32 + ll,  hi = hh * 2^32 + hl   (lh, hh < 2^5)
+// rewrites the value as
+//   hi * 2^32 + lo == hh * 2^64 + (hl + lh) * 2^32 + ll,
+// so with u = (hl + lh) mod 2^32 and e = hh + carry(hl + lh) <= 32 and
+// 2^64 == EPSILON == 2^32 - 1 (mod p) the residue is exactly
+//   (u + e) * 2^32 + (ll - e).
+// Both coefficients are single 32-bit adds whose carry out and borrow out are
+// the 2^64 weight of the result, which is the shape reduce_top already folds:
+// when that weight is +1 the high limb is at most 32, because u + e >= 2^64
+// forces u >= 2^32 - 32, so the EPSILON add cannot wrap; when it is -1 the high
+// limb is 0xffffffff, so the subtract cannot borrow. Everything above the four
+// limb extractions is 32-bit work, and the wide compares plus the trailing
+// correction round of the 64-bit form are gone.
 inline ulong lazy_materialize(lazy_t a) {
-    ulong s = (a.hi << 32) + a.lo;
-    ulong extra = (a.hi >> 32) + (ulong)(s < a.lo);
-    ulong t = s + ((extra << 32) - extra);
-    return t + (t < s ? GOLDILOCKS_EPSILON : 0UL);
+    uint ll = (uint)a.lo;
+    uint lh = (uint)(a.lo >> 32);
+    uint hl = (uint)a.hi;
+    uint hh = (uint)(a.hi >> 32);
+    uint u = hl + lh;
+    uint e = hh + (uint)(u < hl);
+    uint r0 = ll - e;
+    uint borrow = (uint)(r0 > ll);
+    uint r1 = u + e;
+    uint carry = (uint)(r1 < u);
+    uint next = r1 - borrow;
+    uint under = (uint)(next > r1);
+    r1 = next;
+    return reduce_top(r0, r1, (int)carry - (int)under);
 }
 
 // r = a * b + addend (mod p): the 128-bit product absorbs the addend before
