@@ -2142,7 +2142,7 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
+    let gpu_poseidon_values = if let Some((_, job)) = &gpu_poseidon {
         let gpu_values = match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2175,20 +2175,13 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        Some(gpu_values)
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
+    let gpu_range_values = if let Some((_, job)) = &gpu_range {
         let gpu_values = match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2221,16 +2214,42 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        Some(gpu_values)
+    } else {
+        None
+    };
+
+    // Production no-lookup proofs complete both Metal jobs. Apply those two
+    // contributions during the already-required point-major scatter below,
+    // deleting two whole-domain read/modify/write passes. Keep the old merge
+    // path byte-for-byte for a partial GPU admission so its behavior and
+    // scheduling remain unchanged.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    if gpu_poseidon_values.is_none() || gpu_range_values.is_none() {
+        if let Some(gpu_values) = gpu_poseidon_values {
+            quotient_values
+                .par_chunks_exact_mut(num_challenges)
+                .zip(gpu_values.par_chunks_exact(num_challenges))
+                .enumerate()
+                .for_each(|(i, (cpu_values, gpu_values))| {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                        *cpu += gpu * denominator_inv;
+                    }
+                });
+        }
+        if let Some(gpu_values) = gpu_range_values {
+            quotient_values
+                .par_chunks_exact_mut(num_challenges)
+                .zip(gpu_values.par_chunks_exact(num_challenges))
+                .enumerate()
+                .for_each(|(i, (cpu_values, gpu_values))| {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                        *cpu += gpu * denominator_inv;
+                    }
+                });
+        }
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
@@ -2259,6 +2278,58 @@ fn compute_quotient_polys<
         .map(|column| ColPtr(column.as_mut_ptr()))
         .collect();
     let column_ptrs = &column_ptrs;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    if let (Some(poseidon_values), Some(range_values)) =
+        (gpu_poseidon_values, gpu_range_values)
+    {
+        assert_eq!(poseidon_values.len(), quotient_values.len());
+        assert_eq!(range_values.len(), quotient_values.len());
+        quotient_values
+            .par_chunks(BATCH_SIZE * num_challenges)
+            .zip(poseidon_values.par_chunks(BATCH_SIZE * num_challenges))
+            .zip(range_values.par_chunks(BATCH_SIZE * num_challenges))
+            .enumerate()
+            .for_each(|(chunk_i, ((chunk, poseidon_chunk), range_chunk))| {
+                let base = BATCH_SIZE * chunk_i;
+                for (k, ((point_values, poseidon_point), range_point)) in chunk
+                    .chunks_exact(num_challenges)
+                    .zip(poseidon_chunk.chunks_exact(num_challenges))
+                    .zip(range_chunk.chunks_exact(num_challenges))
+                    .enumerate()
+                {
+                    let point = base + k;
+                    let denominator_inv = z_h_on_coset.eval_inverse(point);
+                    for (((column, &cpu_value), &poseidon_value), &range_value) in column_ptrs
+                        .iter()
+                        .zip(point_values)
+                        .zip(poseidon_point)
+                        .zip(range_point)
+                    {
+                        // Preserve the former raw-field operation order:
+                        // scaled CPU value, then Poseidon, then Range.
+                        let mut value = cpu_value;
+                        value += poseidon_value * denominator_inv;
+                        value += range_value * denominator_inv;
+                        // SAFETY: `point` lies in this chunk's disjoint range.
+                        unsafe { *column.0.add(point) = value };
+                    }
+                }
+            });
+    } else {
+        quotient_values
+            .par_chunks(BATCH_SIZE * num_challenges)
+            .enumerate()
+            .for_each(|(chunk_i, chunk)| {
+                let base = BATCH_SIZE * chunk_i;
+                for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                    for (column, &value) in column_ptrs.iter().zip(point_values) {
+                        // SAFETY: `base + k` lies in this chunk's disjoint range.
+                        unsafe { *column.0.add(base + k) = value };
+                    }
+                }
+            });
+    }
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     quotient_values
         .par_chunks(BATCH_SIZE * num_challenges)
         .enumerate()
@@ -2413,7 +2484,7 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{precomputed, BatchLayout, BATCH_SIZE, COMPARE_QUOTIENT_LAYOUTS};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
@@ -2422,6 +2493,8 @@ mod quotient_layout_tests {
     use crate::gates::gate::U32QuotientGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::noop::NoopGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::hash::poseidon2::hash::Poseidon2Hash;
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
@@ -2450,6 +2523,35 @@ mod quotient_layout_tests {
         (data, pw)
     }
 
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn force_metal_context_for_quotient_test() {
+        struct ExclusivePhaseReset;
+        impl Drop for ExclusivePhaseReset {
+            fn drop(&mut self) {
+                crate::hash::poseidon2::set_exclusive_gpu_phase(false);
+            }
+        }
+
+        // The first small allocation may intentionally spend the startup
+        // probe and fall back. A second request forces the real context, so
+        // the proof below tests retained Metal columns deterministically.
+        crate::hash::poseidon2::set_exclusive_gpu_phase(true);
+        let _reset = ExclusivePhaseReset;
+        let mut columns = crate::hash::poseidon2::metal::allocate_columns::<F>(
+            8,
+            1 << 16,
+            4,
+        );
+        if columns.is_none() {
+            columns = crate::hash::poseidon2::metal::allocate_columns::<F>(
+                8,
+                1 << 16,
+                4,
+            );
+        }
+        assert!(columns.is_some(), "Metal context must initialize");
+    }
+
     /// B1/B2/D1 differential gate: within a single prove call — same witness,
     /// commitments and challenges — the default column-major (`PolyMajor`)
     /// quotient path and the per-point (`PointMajor`) reference path must
@@ -2469,15 +2571,21 @@ mod quotient_layout_tests {
         Ok(())
     }
 
-    /// End-to-end retained-column differential for every audited random-access
-    /// layout. The same prove call compares the combined Metal quotient with a
+    /// End-to-end retained-column differential with both Metal quotient jobs
+    /// active. The same prove call compares the combined Metal quotient with a
     /// full CPU recomputation over identical LDE columns and challenges, then
     /// verifies the resulting proof.
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     #[test]
     fn metal_random_access_quotient_matches_cpu_and_verifies() -> Result<()> {
+        force_metal_context_for_quotient_test();
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<F, D>::new(config);
+        let hash_inputs = (0..12)
+            .map(|i| builder.constant(F::from_canonical_usize(100_000 + i)))
+            .collect();
+        let digest = builder.hash_n_to_hash_no_pad::<Poseidon2Hash>(hash_inputs);
+        builder.register_public_inputs(&digest.elements);
         for (bits, copies) in [(3usize, 8usize), (4, 4), (6, 1)] {
             let vec_size = 1usize << bits;
             for copy in 0..copies {
@@ -2525,10 +2633,106 @@ mod quotient_layout_tests {
         COMPARE_GPU_QUOTIENT.store(false, Ordering::SeqCst);
         let proof = proof?;
         let after = gpu_poseidon_quotient_stats();
+        assert!(after.started > before.started);
+        assert!(after.completed > before.completed);
         assert!(after.range_started > before.range_started);
         assert!(after.range_completed > before.range_completed);
         data.verify(proof)?;
         Ok(())
+    }
+
+    /// Applying the two Metal contributions during the final scatter must be
+    /// raw-word identical to the former staged Poseidon pass, Range pass, and
+    /// scatter. Exercise every job-presence combination and sizes around the
+    /// production Rayon batch boundary with deliberately noncanonical limbs.
+    #[test]
+    fn gpu_quotient_fused_scatter_matches_staged_raw_words() {
+        const CHALLENGES: usize = 2;
+        let order = GoldilocksField::ORDER;
+        let raws = [
+            0,
+            1,
+            order - 1,
+            order,
+            order + 1,
+            0x8000_0000_0000_0001,
+            0xdead_beef_cafe_babe,
+            u64::MAX,
+        ];
+
+        for points in [
+            1usize,
+            BATCH_SIZE - 1,
+            BATCH_SIZE,
+            BATCH_SIZE + 1,
+            2 * BATCH_SIZE + 1,
+        ] {
+            let len = points * CHALLENGES;
+            let values = |offset: usize, len: usize| {
+                (0..len)
+                    .map(|i| GoldilocksField(raws[(i + offset) % raws.len()]))
+                    .collect::<Vec<_>>()
+            };
+            let cpu = values(0, len);
+            let poseidon = values(3, len);
+            let range = values(5, len);
+            let denominator_inverses = values(7, points);
+
+            for (poseidon_active, range_active) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let mut staged = cpu.clone();
+                if poseidon_active {
+                    for point in 0..points {
+                        let d = denominator_inverses[point];
+                        for challenge in 0..CHALLENGES {
+                            let i = point * CHALLENGES + challenge;
+                            staged[i] += poseidon[i] * d;
+                        }
+                    }
+                }
+                if range_active {
+                    for point in 0..points {
+                        let d = denominator_inverses[point];
+                        for challenge in 0..CHALLENGES {
+                            let i = point * CHALLENGES + challenge;
+                            staged[i] += range[i] * d;
+                        }
+                    }
+                }
+                let mut staged_columns = vec![vec![F::ZERO; points]; CHALLENGES];
+                for point in 0..points {
+                    for challenge in 0..CHALLENGES {
+                        staged_columns[challenge][point] =
+                            staged[point * CHALLENGES + challenge];
+                    }
+                }
+
+                let mut fused_columns = vec![vec![F::ZERO; points]; CHALLENGES];
+                for point in 0..points {
+                    let d = denominator_inverses[point];
+                    for challenge in 0..CHALLENGES {
+                        let i = point * CHALLENGES + challenge;
+                        let mut value = cpu[i];
+                        if poseidon_active {
+                            value += poseidon[i] * d;
+                        }
+                        if range_active {
+                            value += range[i] * d;
+                        }
+                        fused_columns[challenge][point] = value;
+                    }
+                }
+
+                for (staged, fused) in staged_columns.iter().zip(&fused_columns) {
+                    assert_eq!(
+                        staged.iter().map(|x| x.0).collect::<Vec<_>>(),
+                        fused.iter().map(|x| x.0).collect::<Vec<_>>(),
+                        "points={points}, poseidon={poseidon_active}, range={range_active}",
+                    );
+                }
+            }
+        }
     }
 
     /// Layout seam: `PolyMajor` output is exactly the transpose of
