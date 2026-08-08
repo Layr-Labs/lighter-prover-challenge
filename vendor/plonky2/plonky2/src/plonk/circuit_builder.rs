@@ -51,6 +51,7 @@ use crate::plonk::config::{AlgebraicHasher, GenericConfig, GenericHashOut, Hashe
 use crate::plonk::copy_constraint::CopyConstraint;
 use crate::plonk::permutation_argument::Forest;
 use crate::plonk::plonk_common::PlonkOracle;
+use crate::plonk::prover::QUOTIENT_BATCH_SIZE;
 use crate::timed;
 use crate::util::context_tree::ContextTree;
 use crate::util::partial_products::num_partial_products;
@@ -1404,7 +1405,8 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // sigma polynomials are circuit-fixed, so every proof's strided LDE
         // gathers read the same values. Extract them once (bounded by 1 GiB so
         // the final block circuit — which is proven once — stays uncached) and
-        // let the quotient batch loop copy instead of re-walking the LDE.
+        // let the quotient batch loop borrow constants or copy sigmas instead
+        // of re-walking the LDE.
         let quotient_degree_bits = log2_ceil(common.quotient_degree_factor);
         let (constants_sigmas_quotient_cache, constants_sigmas_quotient_step, constants_sigmas_quotient_domain) = {
             let step = 1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
@@ -1412,10 +1414,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             let cols = common.constants_range().len() + common.sigmas_range().len();
             if cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
                 match (
-                    constants_sigmas_commitment.extract_lde_batch_columns(
+                    constants_sigmas_commitment.extract_lde_batch_columns_batched(
                         step,
                         common.constants_range(),
                         domain,
+                        QUOTIENT_BATCH_SIZE,
                     ),
                     constants_sigmas_commitment.extract_lde_batch_columns(
                         step,
@@ -1424,6 +1427,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
                     ),
                 ) {
                     (Some(constants), Some(sigmas)) => {
+                        // Constants are consumed in fixed 32-point PolyMajor
+                        // batches, so retain them in that exact layout and let
+                        // every proof borrow each batch directly. Sigmas stay
+                        // column-major for the existing permutation scratch
+                        // path.
                         let mut cache = constants;
                         cache.extend(sigmas);
                         (Some(cache), step, domain)

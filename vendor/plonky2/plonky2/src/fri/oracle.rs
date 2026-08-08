@@ -545,6 +545,50 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         }
     }
 
+    /// Extracts a quotient-domain column range in the exact compact layout
+    /// consumed by each batched gate-evaluation call:
+    ///
+    /// ```text
+    /// batch 0: column 0 points, column 1 points, ...
+    /// batch 1: column 0 points, column 1 points, ...
+    /// ```
+    ///
+    /// Unlike [`Self::extract_lde_batch_columns`], which stores every complete
+    /// column before the next one, this makes each batch one contiguous slice.
+    /// A caller can therefore borrow that slice directly instead of copying
+    /// the same values into per-worker PolyMajor scratch. The final short batch
+    /// is packed tightly; no padding is inserted.
+    pub fn extract_lde_batch_columns_batched(
+        &self,
+        step: usize,
+        col_range: core::ops::Range<usize>,
+        q_domain: usize,
+        batch_size: usize,
+    ) -> Option<Vec<F>> {
+        assert!(batch_size != 0, "quotient cache batch size must be nonzero");
+        let width = col_range.len();
+        match &self.merkle_tree.leaves {
+            MerkleLeaves::Columns { columns, .. } => {
+                let mut out = Vec::with_capacity(width * q_domain);
+                for batch_start in (0..q_domain).step_by(batch_size) {
+                    let batch_end = (batch_start + batch_size).min(q_domain);
+                    for column_index in col_range.clone() {
+                        let column = columns.col(column_index);
+                        if step == 1 {
+                            out.extend_from_slice(&column[batch_start..batch_end]);
+                        } else {
+                            out.extend(
+                                (batch_start..batch_end).map(|index| column[index * step]),
+                            );
+                        }
+                    }
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
     /// Like `get_lde_values`, but fetches LDE values from a batch of `P::WIDTH` points, and returns
     /// packed values.
     pub fn get_lde_values_packed<P>(&self, index_start: usize, step: usize) -> Vec<P>

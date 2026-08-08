@@ -41,6 +41,7 @@ use plonky2::plonk::circuit_data::{
     CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
 };
 use plonky2::plonk::permutation_argument::Forest;
+use plonky2::plonk::prover::QUOTIENT_BATCH_SIZE;
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
 use plonky2::util::{log2_ceil, transpose_poly_values};
@@ -480,10 +481,11 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let circuit_digest = verifier_only.circuit_digest;
 
     // Mirror the builder's quotient-domain constants/sigmas cache (added by the
-    // Metal quotient-gate union frontier). It is a pure derivation from the
-    // freshly recomputed column-backed commitment — the same extraction the
-    // builder performs — and the documented `None` fallback keeps the quotient
-    // path correct if extraction declines.
+    // Metal quotient-gate union frontier), including the batch-major constants
+    // prefix. It is a pure derivation from the freshly recomputed column-backed
+    // commitment — the same extraction the builder performs — and the
+    // documented `None` fallback keeps the quotient path correct if extraction
+    // declines.
     let quotient_degree_bits = plonky2::util::log2_ceil(common.quotient_degree_factor);
     let (constants_sigmas_quotient_cache, constants_sigmas_quotient_step, constants_sigmas_quotient_domain) = {
         let step = 1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
@@ -491,10 +493,11 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         let cols = common.constants_range().len() + common.sigmas_range().len();
         if cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
             match (
-                constants_sigmas_commitment.extract_lde_batch_columns(
+                constants_sigmas_commitment.extract_lde_batch_columns_batched(
                     step,
                     common.constants_range(),
                     domain,
+                    QUOTIENT_BATCH_SIZE,
                 ),
                 constants_sigmas_commitment.extract_lde_batch_columns(
                     step,

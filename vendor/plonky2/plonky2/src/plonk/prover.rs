@@ -795,7 +795,12 @@ fn compute_all_lookup_polys<
     }
 }
 
-const BATCH_SIZE: usize = 32;
+/// Point batch used by the quotient evaluator and its circuit-fixed constants
+/// cache. Public so alternate circuit loaders can construct the same runtime
+/// cache layout without duplicating this value.
+pub const QUOTIENT_BATCH_SIZE: usize = 32;
+
+const BATCH_SIZE: usize = QUOTIENT_BATCH_SIZE;
 
 /// Process-wide counters for the narrow Metal Poseidon2 quotient path. A
 /// successful `started` count proves all of the production guards held: no
@@ -1753,36 +1758,41 @@ fn compute_quotient_polys<
 
                 // The constants and sigma columns are circuit-fixed, so their
                 // quotient-domain values were extracted once at circuit build
-                // time; copy them per batch instead of re-walking the strided
-                // LDE (which amplifies cache-line traffic 8x at step 8).
-                let cache_start = BATCH_SIZE * batch_i;
-                // The cache is column-major (`PolyMajor`); the per-point
-                // (`PointMajor`) path with lookups keeps the original gathers.
+                // time. Constants are already in the consumer's batch layout;
+                // sigmas keep the frontier's scratch-copy path. Both avoid
+                // re-walking a strided LDE (8x cache-line amplification at
+                // step 8).
+                let point_start = BATCH_SIZE * batch_i;
+                // The constants prefix is already packed in quotient-batch
+                // PolyMajor order, so the gate evaluator can borrow its exact
+                // input slice. Sigmas deliberately retain the frontier's
+                // column-major cache and scratch-copy path; unlike constants,
+                // they feed the permutation evaluator and were part of the
+                // rejected direct-LDE-borrow experiments.
                 let constants_cache = if col_major_perm {
                     prover_data.constants_sigmas_quotient_cache.as_ref()
                 } else {
                     None
                 };
-                if let Some(cache) = constants_cache {
+                let local_constants = if let Some(cache) = constants_cache {
                     debug_assert_eq!(
                         prover_data.constants_sigmas_quotient_step, step,
                         "quotient gather step must match the cache extraction step"
                     );
                     let cc = common_data.constants_range().len();
                     let q = prover_data.constants_sigmas_quotient_domain;
-                    scratch.local_constants.resize(cc * n, F::ZERO);
-                    for ci in 0..cc {
-                        scratch.local_constants[ci * n..(ci + 1) * n].copy_from_slice(
-                            &cache[ci * q + cache_start..ci * q + cache_start + n],
-                        );
-                    }
+                    let constants_start = batch_i * cc * BATCH_SIZE;
+                    let constants_end = constants_start + cc * n;
+                    debug_assert!(constants_end <= cc * q);
                     let sc = common_data.sigmas_range().len();
                     scratch.s_sigmas_flat.resize(sc * n, F::ZERO);
                     for ci in 0..sc {
                         scratch.s_sigmas_flat[ci * n..(ci + 1) * n].copy_from_slice(
-                            &cache[(cc + ci) * q + cache_start..(cc + ci) * q + cache_start + n],
+                            &cache[cc * q + ci * q + point_start
+                                ..cc * q + ci * q + point_start + n],
                         );
                     }
+                    &cache[constants_start..constants_end]
                 } else {
                     prover_data.constants_sigmas_commitment.fill_lde_batch(
                         &scratch.indices,
@@ -1808,7 +1818,8 @@ fn compute_quotient_polys<
                         batch_layout,
                         &mut scratch.s_sigmas_flat,
                     );
-                }
+                    &scratch.local_constants
+                };
                 // Layout seam: the no-lookup column evaluator consumes the
                 // PolyMajor gathers as-is (and the "next" gather narrows to
                 // the Z columns, the only ones it reads); the per-point path
@@ -1918,7 +1929,7 @@ fn compute_quotient_polys<
 
                 let vars_batch = EvaluationVarsBaseBatch::new(
                     n,
-                    &scratch.local_constants,
+                    local_constants,
                     &scratch.local_wires,
                     public_inputs_hash,
                 );
@@ -2229,7 +2240,10 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{
+        precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS,
+        QUOTIENT_BATCH_SIZE as BATCH_SIZE,
+    };
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
@@ -2398,6 +2412,79 @@ mod quotient_layout_tests {
         commitment.fill_lde_batch_contiguous(indices[0], indices.len(), range, &mut contiguous);
 
         assert_eq!(contiguous, indexed);
+    }
+
+    /// The runtime constants cache must expose exactly the PolyMajor slice the
+    /// gate evaluator previously copied into worker-local scratch. Exercise a
+    /// deliberately short final batch as well as the production cache layout;
+    /// the sigma suffix must remain in its original global column-major form.
+    #[test]
+    fn quotient_constants_cache_matches_gather_for_full_and_short_batches() {
+        let (data, _) = small_circuit();
+        let prover = &data.prover_only;
+        let commitment = &prover.constants_sigmas_commitment;
+        let constants_range = data.common.constants_range();
+        let cc = constants_range.len();
+        let sc = data.common.sigmas_range().len();
+        let q = prover.constants_sigmas_quotient_domain;
+        let step = prover.constants_sigmas_quotient_step;
+        let cache = prover
+            .constants_sigmas_quotient_cache
+            .as_ref()
+            .expect("column-backed test circuit must retain the quotient cache");
+        assert_eq!(cache.len(), (cc + sc) * q);
+
+        for point_start in (0..q).step_by(BATCH_SIZE) {
+            let n = BATCH_SIZE.min(q - point_start);
+            let indices = (point_start..point_start + n).collect::<Vec<_>>();
+            let mut gathered = Vec::new();
+            commitment.fill_lde_batch(
+                &indices,
+                step,
+                constants_range.clone(),
+                BatchLayout::PolyMajor,
+                &mut gathered,
+            );
+            let batch_index = point_start / BATCH_SIZE;
+            let cache_start = batch_index * cc * BATCH_SIZE;
+            assert_eq!(&cache[cache_start..cache_start + cc * n], &gathered);
+        }
+
+        let short_domain = BATCH_SIZE + 3;
+        assert!(short_domain <= q);
+        let short_cache = commitment
+            .extract_lde_batch_columns_batched(
+                step,
+                constants_range.clone(),
+                short_domain,
+                BATCH_SIZE,
+            )
+            .expect("column-backed constants must support batched extraction");
+        let short_indices = (BATCH_SIZE..short_domain).collect::<Vec<_>>();
+        let mut short_gather = Vec::new();
+        commitment.fill_lde_batch(
+            &short_indices,
+            step,
+            constants_range,
+            BatchLayout::PolyMajor,
+            &mut short_gather,
+        );
+        assert_eq!(&short_cache[cc * BATCH_SIZE..], &short_gather);
+
+        for sigma in [0, sc - 1] {
+            for point in [0, q / 2, q - 1] {
+                let mut gathered = Vec::new();
+                commitment.fill_lde_batch(
+                    &[point],
+                    step,
+                    data.common.sigmas_range().start + sigma
+                        ..data.common.sigmas_range().start + sigma + 1,
+                    BatchLayout::PolyMajor,
+                    &mut gathered,
+                );
+                assert_eq!(cache[cc * q + sigma * q + point], gathered[0]);
+            }
+        }
     }
 
     /// Scratch reuse: `fill_lde_batch` writes every cell of `out` before any
