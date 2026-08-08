@@ -15,7 +15,7 @@ use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
-use plonky2::gates::gate::Gate;
+use plonky2::gates::gate::{Gate, U32QuotientGate};
 use plonky2::gates::packed_util::PackedEvaluableBase;
 use plonky2::gates::util::StridedConstraintConsumer;
 use plonky2::hash::hash_types::RichField;
@@ -403,6 +403,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for UninterleaveTo
         self.num_ops * (Self::NUM_BITS + 1 + 2 + 1)
     }
 
+    fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+        Some(U32QuotientGate::Uninterleave {
+            num_ops: self.num_ops,
+        })
+    }
+
     fn serialize(
         &self,
         _dst: &mut Vec<u8>,
@@ -625,5 +631,17 @@ mod tests {
         for num_ops in [1, 2, 3] {
             assert_accumulate_matches_eval_unfiltered(&UninterleaveToU32Gate { num_ops });
         }
+    }
+
+    #[test]
+    fn advertises_metal_quotient_layout() {
+        assert_eq!(
+            <UninterleaveToU32Gate as Gate<GoldilocksField, 2>>::u32_quotient_gate(
+                &UninterleaveToU32Gate { num_ops: 2 },
+            ),
+            Some(plonky2::gates::gate::U32QuotientGate::Uninterleave {
+                num_ops: 2,
+            })
+        );
     }
 }

@@ -1296,6 +1296,18 @@ fn start_gpu_range_check_gate_quotient<
                         expected_constraints,
                     )
                 }
+                U32QuotientGate::Interleave { num_ops } => (
+                    U32QuotientKind::Interleave,
+                    num_ops,
+                    num_ops.checked_mul(34)?,
+                    num_ops.checked_mul(34)?,
+                ),
+                U32QuotientGate::Uninterleave { num_ops } => (
+                    U32QuotientKind::Uninterleave,
+                    num_ops,
+                    num_ops.checked_mul(68)?,
+                    num_ops.checked_mul(68)?,
+                ),
             };
             if num_ops == 0
                 || gate.0.num_wires() != expected_wires

@@ -15,7 +15,7 @@ use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
-use plonky2::gates::gate::Gate;
+use plonky2::gates::gate::{Gate, U32QuotientGate};
 use plonky2::gates::packed_util::PackedEvaluableBase;
 use plonky2::gates::util::StridedConstraintConsumer;
 use plonky2::hash::hash_types::RichField;
@@ -316,6 +316,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32InterleaveG
     fn extra_constant_wires(&self) -> Vec<(usize, usize)> {
         std::vec![]
     }
+
+    fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+        Some(U32QuotientGate::Interleave {
+            num_ops: self.num_ops,
+        })
+    }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D> for U32InterleaveGate {
@@ -466,5 +472,17 @@ mod tests {
         for num_ops in [1, 2, 3] {
             assert_accumulate_matches_eval_unfiltered(&U32InterleaveGate { num_ops });
         }
+    }
+
+    #[test]
+    fn advertises_metal_quotient_layout() {
+        assert_eq!(
+            <U32InterleaveGate as Gate<GoldilocksField, 2>>::u32_quotient_gate(
+                &U32InterleaveGate { num_ops: 4 },
+            ),
+            Some(plonky2::gates::gate::U32QuotientGate::Interleave {
+                num_ops: 4,
+            })
+        );
     }
 }

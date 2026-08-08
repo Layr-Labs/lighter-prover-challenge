@@ -18,6 +18,7 @@ use crate::hash::merkle_tree::LevelOrderDigests;
 use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
+const INTERLEAVE_QUOTIENT_PATCH_SOURCE: &str = include_str!("interleave_quotient_patch.metal");
 
 /// `poseidon2.metal` precompiled to AIR, so a worker that cannot use the Metal
 /// shader cache does not pay the MSL front end. Regenerate whenever
@@ -214,6 +215,8 @@ pub(crate) enum U32QuotientKind {
     Reducing {
         extension_coeffs: bool,
     },
+    Interleave,
+    Uninterleave,
 }
 
 #[derive(Clone, Debug)]
@@ -428,6 +431,7 @@ impl LazyPipeline {
 
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
+static INTERLEAVE_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
@@ -438,11 +442,15 @@ fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState>
     RANGE_CHECK_GATE_QUOTIENT_PIPELINE.get()
 }
 
+fn interleave_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
+    INTERLEAVE_GATE_QUOTIENT_PIPELINE.get()
+}
+
 fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.get()
 }
 
-/// Starts the two gate-quotient pipeline builds on detached threads.
+/// Starts the optional pipeline builds on detached threads.
 ///
 /// One thread each rather than one for both: they are the two slowest kernels
 /// in the shader, so serializing them would keep the GPU quotient path on the
@@ -488,6 +496,49 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             Err(_) => {
                 let _ = slot.built.set(None);
             }
+        }
+    }
+
+    // The promoted metallib predates the downstream interleave gates. Keep it
+    // for every existing kernel, and compile only this small additive patch
+    // from source. Building it beside the other optional pipelines hides its
+    // front-end cost behind circuit construction without invalidating the
+    // precompiled fast path.
+    let device = device.clone();
+    let spawned = std::thread::Builder::new()
+        .name("poseidon2-metal-interleave-gate-quotient".to_string())
+        .spawn(move || {
+            let pipeline = autoreleasepool(|| {
+                let options = CompileOptions::new();
+                device
+                    .new_library_with_source(INTERLEAVE_QUOTIENT_PATCH_SOURCE, &options)
+                    .ok()
+                    .and_then(|library| {
+                        library
+                            .get_function("interleave_gate_quotient_patch", None)
+                            .ok()
+                    })
+                    .and_then(|function| {
+                        device
+                            .new_compute_pipeline_state_with_function(&function)
+                            .ok()
+                    })
+            });
+            if pipeline.is_none() {
+                log::debug!(
+                    "interleave gate quotient patch unavailable; evaluating those gates on the CPU"
+                );
+            }
+            let _ = INTERLEAVE_GATE_QUOTIENT_PIPELINE.built.set(pipeline);
+        });
+    match spawned {
+        Ok(handle) => {
+            if let Ok(mut builder) = INTERLEAVE_GATE_QUOTIENT_PIPELINE.builder.lock() {
+                *builder = Some(handle);
+            }
+        }
+        Err(_) => {
+            let _ = INTERLEAVE_GATE_QUOTIENT_PIPELINE.built.set(None);
         }
     }
 }
@@ -732,10 +783,10 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
     }
 }
 
-/// Starts one whole-domain kernel which evaluates every advertised RangeCheck,
-/// width-generic integer, byte, quintic, and audited random-access gate, applies
-/// each selector filter, and reduces the shared constraint rows with the same
-/// two alpha challenges as the CPU quotient.
+/// Starts one whole-domain job which evaluates every advertised RangeCheck,
+/// width-generic integer, byte, quintic, audited random-access, and interleave
+/// gate, applies each selector filter, and reduces the shared constraint rows
+/// with the same two alpha challenges as the CPU quotient.
 pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     wires: &MetalColumns<F>,
     constants: &MetalColumns<F>,
@@ -805,10 +856,16 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             0,
         ]);
     }
+    let mut legacy_u32_metadata = Vec::with_capacity(u32_specs.len() * SPEC_WORDS);
+    let mut patch_u32_metadata = Vec::new();
     for spec in u32_specs {
         if spec.num_ops == 0 {
             return None;
         }
+        let patch_kind = matches!(
+            spec.kind,
+            U32QuotientKind::Interleave | U32QuotientKind::Uninterleave
+        );
         let (kind, num_addends, result_limbs, carry_limbs, wire_count, num_constraints) =
             match spec.kind {
                 U32QuotientKind::Arithmetic => (
@@ -950,6 +1007,22 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                         spec.num_ops.checked_mul(2)?,
                     )
                 }
+                U32QuotientKind::Interleave => (
+                    10usize,
+                    0usize,
+                    0usize,
+                    0usize,
+                    spec.num_ops.checked_mul(34)?,
+                    spec.num_ops.checked_mul(34)?,
+                ),
+                U32QuotientKind::Uninterleave => (
+                    11usize,
+                    0usize,
+                    0usize,
+                    0usize,
+                    spec.num_ops.checked_mul(68)?,
+                    spec.num_ops.checked_mul(68)?,
+                ),
             };
         if wire_count > wires.cols
             || spec.selector_column >= constants.cols
@@ -966,7 +1039,7 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             return None;
         }
         alpha_stride = alpha_stride.max(num_constraints);
-        metadata.extend([
+        let encoded = [
             spec.selector_column as u32,
             spec.gate_index as u32,
             spec.group.start as u32,
@@ -977,8 +1050,17 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             num_addends as u32,
             result_limbs as u32,
             carry_limbs as u32,
-        ]);
+        ];
+        if patch_kind {
+            patch_u32_metadata.extend(encoded);
+        } else {
+            legacy_u32_metadata.extend(encoded);
+        }
     }
+    let legacy_u32_count = legacy_u32_metadata.len() / SPEC_WORDS;
+    let patch_u32_count = patch_u32_metadata.len() / SPEC_WORDS;
+    metadata.extend(legacy_u32_metadata);
+    metadata.extend(patch_u32_metadata);
     if alpha_stride == 0
         || alpha_stride > u32::MAX as usize
         || alpha_stride
@@ -1005,7 +1087,8 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
         step,
         &metadata,
         specs.len(),
-        u32_specs.len(),
+        legacy_u32_count,
+        patch_u32_count,
         &alpha_powers,
         alpha_stride,
     ) {
@@ -1641,12 +1724,21 @@ impl MetalShared {
         metadata: &[u32],
         range_count: usize,
         u32_count: usize,
+        patch_u32_count: usize,
         alpha_powers: &[u64],
         alpha_stride: usize,
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
         let pipeline = range_check_gate_quotient_pipeline()
             .ok_or("RangeCheck gate quotient pipeline unavailable")?;
-        if metadata.len() != (range_count + u32_count) * 10
+        let interleave_pipeline = if patch_u32_count == 0 {
+            None
+        } else {
+            Some(
+                interleave_gate_quotient_pipeline()
+                    .ok_or("interleave gate quotient patch pipeline unavailable")?,
+            )
+        };
+        if metadata.len() != (range_count + u32_count + patch_u32_count) * 10
             || alpha_powers.len() != alpha_stride * 2
         {
             return Err("invalid RangeCheck quotient metadata".to_string());
@@ -1687,6 +1779,41 @@ impl MetalShared {
             set_u32(encoder, 10, u32_count as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
+
+            // The promoted union kernel never sees discriminants 10 and 11.
+            // This second encoder runs in-order in the same command buffer,
+            // reads its canonical output, and adds only their partition.
+            if patch_u32_count != 0 {
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(
+                    interleave_pipeline.expect("patch count requires a patch pipeline"),
+                );
+                encoder.set_buffer(0, Some(&wires.buffer), 0);
+                encoder.set_buffer(1, Some(&constants.buffer), 0);
+                encoder.set_buffer(2, Some(&output), 0);
+                encoder.set_bytes(
+                    3,
+                    size_of_val(alpha_powers) as NSUInteger,
+                    alpha_powers.as_ptr().cast::<c_void>(),
+                );
+                encoder.set_bytes(
+                    4,
+                    size_of_val(metadata) as NSUInteger,
+                    metadata.as_ptr().cast::<c_void>(),
+                );
+                set_u32(encoder, 5, wires.rows as u32);
+                set_u32(encoder, 6, quotient_rows as u32);
+                set_u32(encoder, 7, step as u32);
+                set_u32(encoder, 8, alpha_stride as u32);
+                set_u32(encoder, 9, (range_count + u32_count) as u32);
+                set_u32(encoder, 10, patch_u32_count as u32);
+                dispatch(
+                    encoder,
+                    interleave_pipeline.expect("patch count requires a patch pipeline"),
+                    quotient_rows,
+                );
+                encoder.end_encoding();
+            }
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -3466,15 +3593,13 @@ mod tests {
         }
     }
 
-    // Differential coverage for the byte-decomposition and EdDSA quintic
-    // gates evaluated in the same union job as production RangeCheck,
-    // width-generic subtraction and add-many specs. Wire columns mix random
-    // canonical values with a rotating window of the twelve raw boundary
-    // representatives (including noncanonical encodings at and above the
-    // field order) from the packed-field differential suite, so every kernel
-    // operation sees the carry-boundary cases.
+    // Differential coverage for every gate family evaluated by the union job.
+    // Wire columns mix random canonical values with a rotating window of the
+    // twelve raw boundary representatives (including noncanonical encodings
+    // at and above the field order) from the packed-field differential suite,
+    // so every kernel operation sees the carry-boundary cases.
     #[test]
-    fn metal_byte_and_quintic_gate_quotient_matches_cpu() {
+    fn metal_gate_union_quotient_matches_cpu() {
         type F = GoldilocksField;
         const WIRE_COLUMNS: usize = 136;
         const QUOTIENT_ROWS: usize = 64;
@@ -3537,6 +3662,8 @@ mod tests {
                     extension_coeffs: true,
                 }),
             ),
+            (4, UnionShape::U32(U32QuotientKind::Interleave)),
+            (2, UnionShape::U32(U32QuotientKind::Uninterleave)),
         ];
         // Four shapes are appended below: EqualityGate plus three
         // RandomAccess copies. The constants commitment carries the raw
@@ -3955,6 +4082,62 @@ mod tests {
                             }
                             assert_eq!(constraints.len(), spec.num_ops * 2);
                         }
+                        U32QuotientKind::Interleave => {
+                            for op in 0..spec.num_ops {
+                                let routed = 2 * op;
+                                let bit_base = 2 * spec.num_ops + 32 * op;
+                                let mut reconstructed = F::ZERO;
+                                let mut reconstructed_interleaved = F::ZERO;
+                                for j in 0..32 {
+                                    let bit = wire(bit_base + j);
+                                    reconstructed = reconstructed * two + bit;
+                                    reconstructed_interleaved =
+                                        reconstructed_interleaved * four + bit;
+                                }
+                                constraints.push(reconstructed - wire(routed));
+                                constraints.push(reconstructed_interleaved - wire(routed + 1));
+                                for j in 0..32 {
+                                    let bit = wire(bit_base + j);
+                                    constraints.push(bit * (bit - F::ONE));
+                                }
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * 34);
+                        }
+                        U32QuotientKind::Uninterleave => {
+                            for op in 0..spec.num_ops {
+                                let routed = 4 * op;
+                                let bit_base = 4 * spec.num_ops + 64 * op;
+                                let mut high = F::ZERO;
+                                let mut low = F::ZERO;
+                                let mut evens = F::ZERO;
+                                let mut odds = F::ZERO;
+                                for j in 0..64 {
+                                    let bit = wire(bit_base + j);
+                                    if j < 32 {
+                                        high = high * two + bit;
+                                    } else {
+                                        low = low * two + bit;
+                                    }
+                                    if j & 1 == 0 {
+                                        evens = evens * two + bit;
+                                    } else {
+                                        odds = odds * two + bit;
+                                    }
+                                }
+                                let inverse = wire(routed + 3);
+                                constraints.push(
+                                    (inverse * (u32_max - high) - F::ONE) * low,
+                                );
+                                constraints.push(high * base32 + low - wire(routed));
+                                constraints.push(evens - wire(routed + 1));
+                                constraints.push(odds - wire(routed + 2));
+                                for j in 0..64 {
+                                    let bit = wire(bit_base + j);
+                                    constraints.push(bit * (bit - F::ONE));
+                                }
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * 68);
+                        }
                         U32QuotientKind::Arithmetic => {
                             for op in 0..spec.num_ops {
                                 let routed = 6 * op;
@@ -4069,7 +4252,7 @@ mod tests {
                 assert_eq!(
                     actual.to_canonical_u64(),
                     expected.to_canonical_u64(),
-                    "byte/quintic gate quotient mismatch at word {i}, step {step}"
+                    "gate union quotient mismatch at word {i}, step {step}"
                 );
             }
         }
