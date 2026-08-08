@@ -543,10 +543,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
 impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
     for RandomAccessGate<F, D>
 {
-    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>, const ACCUMULATE: bool>(
         &self,
         vars: EvaluationVarsBasePacked<P>,
-        mut yield_constr: StridedConstraintConsumer<P>,
+        mut yield_constr: StridedConstraintConsumer<P, ACCUMULATE>,
     ) {
         for copy in 0..self.num_copies {
             let access_index = vars.local_wires[self.wire_access_index(copy)];

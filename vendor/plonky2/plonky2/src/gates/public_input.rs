@@ -113,10 +113,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for PublicInputGat
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D> for PublicInputGate {
-    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>, const ACCUMULATE: bool>(
         &self,
         vars: EvaluationVarsBasePacked<P>,
-        mut yield_constr: StridedConstraintConsumer<P>,
+        mut yield_constr: StridedConstraintConsumer<P, ACCUMULATE>,
     ) {
         yield_constr.many(
             Self::wires_public_inputs_hash()

@@ -163,10 +163,10 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> Gate<F, D> fo
 impl<F: RichField + Extendable<D>, const D: usize, const B: usize> PackedEvaluableBase<F, D>
     for BaseSumGate<B>
 {
-    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>, const ACCUMULATE: bool>(
         &self,
         vars: EvaluationVarsBasePacked<P>,
-        mut yield_constr: StridedConstraintConsumer<P>,
+        mut yield_constr: StridedConstraintConsumer<P, ACCUMULATE>,
     ) {
         let sum = vars.local_wires[Self::WIRE_SUM];
         let limbs = vars.local_wires.view(self.limbs());

@@ -7,16 +7,17 @@ use crate::field::packed::PackedField;
 /// constraints where every column is an evaluation point and every row is a constraint index, with
 /// the matrix stored in row-contiguous form.
 #[derive(Debug)]
-pub struct StridedConstraintConsumer<'a, P: PackedField> {
+pub struct StridedConstraintConsumer<'a, P: PackedField, const ACCUMULATE: bool = false> {
     // This is a particularly neat way of doing this, more so than a slice. We increase start by
     // stride at every step and terminate when it equals end.
     start: *mut P::Scalar,
     end: *mut P::Scalar,
     stride: usize,
+    accumulate_filter: P,
     _phantom: PhantomData<&'a mut [P::Scalar]>,
 }
 
-impl<'a, P: PackedField> StridedConstraintConsumer<'a, P> {
+impl<'a, P: PackedField> StridedConstraintConsumer<'a, P, false> {
     pub fn new(buffer: &'a mut [P::Scalar], stride: usize, offset: usize) -> Self {
         assert!(stride >= P::WIDTH);
         assert!(offset < stride);
@@ -35,17 +36,52 @@ impl<'a, P: PackedField> StridedConstraintConsumer<'a, P> {
             start,
             end,
             stride,
+            accumulate_filter: P::ZEROS,
             _phantom: PhantomData,
         }
     }
+}
 
+impl<'a, P: PackedField> StridedConstraintConsumer<'a, P, true> {
+    /// Creates a consumer which applies the point filter while emitting each constraint,
+    /// accumulating directly into the destination matrix.
+    pub fn new_accumulating(
+        buffer: &'a mut [P::Scalar],
+        stride: usize,
+        offset: usize,
+        filter: P,
+    ) -> Self {
+        assert!(stride >= P::WIDTH);
+        assert!(offset + P::WIDTH <= stride);
+        assert_eq!(buffer.len() % stride, 0);
+        let ptr_range = buffer.as_mut_ptr_range();
+        let start = ptr_range.start.wrapping_add(offset);
+        let end = ptr_range.end.wrapping_add(offset);
+        Self {
+            start,
+            end,
+            stride,
+            accumulate_filter: filter,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<'a, P: PackedField, const ACCUMULATE: bool>
+    StridedConstraintConsumer<'a, P, ACCUMULATE>
+{
     /// Emit one constraint.
     pub fn one(&mut self, constraint: P) {
         if !core::ptr::eq(self.start, self.end) {
             // # Safety
             // The checks in `new` guarantee that this points to valid space.
             unsafe {
-                *self.start.cast() = constraint;
+                let slot = &mut *self.start.cast::<P>();
+                if ACCUMULATE {
+                    *slot = slot.multiply_accumulate(constraint, self.accumulate_filter);
+                } else {
+                    *slot = constraint;
+                }
             }
             // See the comment in `new`. `wrapping_add` is needed to avoid UB if we've just
             // exhausted our buffer (and hence we're setting `self.start` to point past the end).

@@ -131,10 +131,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ConstantGate {
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D> for ConstantGate {
-    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>, const ACCUMULATE: bool>(
         &self,
         vars: EvaluationVarsBasePacked<P>,
-        mut yield_constr: StridedConstraintConsumer<P>,
+        mut yield_constr: StridedConstraintConsumer<P, ACCUMULATE>,
     ) {
         yield_constr.many((0..self.num_consts).map(|i| {
             vars.local_constants[self.const_input(i)] - vars.local_wires[self.wire_output(i)]

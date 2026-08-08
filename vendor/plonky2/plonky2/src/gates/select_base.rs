@@ -193,10 +193,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for SelectionGate 
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D> for SelectionGate {
-    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>, const ACCUMULATE: bool>(
         &self,
         vars: EvaluationVarsBasePacked<P>,
-        mut yield_constr: StridedConstraintConsumer<P>,
+        mut yield_constr: StridedConstraintConsumer<P, ACCUMULATE>,
     ) {
         for i in 0..self.num_ops {
             let b = vars.local_wires[self.wire_ith_selector(i)];

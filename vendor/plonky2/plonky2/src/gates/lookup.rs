@@ -162,10 +162,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for LookupGate {
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D> for LookupGate {
-    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>, const ACCUMULATE: bool>(
         &self,
         _vars: EvaluationVarsBasePacked<P>,
-        mut _yield_constr: StridedConstraintConsumer<P>,
+        mut _yield_constr: StridedConstraintConsumer<P, ACCUMULATE>,
     ) {
     }
 }

@@ -691,10 +691,10 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> SimpleGenerator<F
 impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> PackedEvaluableBase<F, D>
     for Poseidon2Gate<F, D>
 {
-    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>, const ACCUMULATE: bool>(
         &self,
         vars: EvaluationVarsBasePacked<P>,
-        mut yield_constr: StridedConstraintConsumer<P>,
+        mut yield_constr: StridedConstraintConsumer<P, ACCUMULATE>,
     ) {
         // Assert that `swap` is binary.
         let swap = vars.local_wires[Self::WIRE_SWAP];
