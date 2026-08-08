@@ -1657,12 +1657,13 @@ fn compute_quotient_polys<
     // remaining gates, while the permutation argument always needs the routed
     // prefix. Do not gather dead high columns for offloaded Poseidon/Range
     // gates into every 32-point CPU scratch batch.
-    let cpu_num_wires = common_data
-        .gates
+    // survivor-list once per proof v4-17.76
+    let cpu_gate_indices = (0..common_data.gates.len())
+        .filter(|gate_index| !excluded_gate_indices.contains(gate_index))
+        .collect::<Vec<_>>();
+    let cpu_num_wires = cpu_gate_indices
         .iter()
-        .enumerate()
-        .filter(|(gate_index, _)| !excluded_gate_indices.contains(gate_index))
-        .map(|(_, gate)| gate.0.num_wires())
+        .map(|&i| common_data.gates[i].0.num_wires())
         .max()
         .unwrap_or(0)
         .max(num_routed_wires);
@@ -1671,8 +1672,11 @@ fn compute_quotient_polys<
     // gather: an excluded gate's rows stay zero, so the CPU only ever writes
     // the prefix below and the per-batch memset and Horner reduction can stop
     // there. Hoisted out of the batch loop exactly like `cpu_num_wires`.
-    let cpu_num_gate_constraints =
-        crate::plonk::vanishing_poly::cpu_gate_constraint_rows(common_data, &excluded_gate_indices);
+    let cpu_num_gate_constraints = cpu_gate_indices
+        .iter()
+        .map(|&i| common_data.gates[i].0.num_constraints())
+        .max()
+        .unwrap_or(0);
     debug_assert!(cpu_num_gate_constraints <= common_data.num_gate_constraints);
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if gpu_poseidon_quotient_diagnostics_enabled() && !excluded_gate_indices.is_empty() {
@@ -1933,7 +1937,7 @@ fn compute_quotient_polys<
                     beta_k_is,
                     deltas,
                     alphas,
-                    &excluded_gate_indices,
+                    &cpu_gate_indices,
                     cpu_num_gate_constraints,
                     &z_h_on_coset,
                     &lut_re_poly_evals_refs,
