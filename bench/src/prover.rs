@@ -37,8 +37,35 @@ enum TxPath {
 }
 
 const LIGHT_TX_PROOF_WINDOW: usize = 2;
-// Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
-const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
+
+/// Keeps the global transaction-proof concurrency bounded by the two-proof
+/// window while the heavy path is alive. The heavy path is counted as active
+/// before it is released, so the light path stays at one proof until the
+/// heavy path has finished all of its scoped tx/chain work and retires.
+fn tx_proof_window(path: TxPath, active_paths: &AtomicUsize) -> usize {
+    if path == TxPath::Light && active_paths.load(Ordering::Acquire) == 1 {
+        LIGHT_TX_PROOF_WINDOW
+    } else {
+        1
+    }
+}
+
+/// Releases the heavy path exactly once, after the first light transaction
+/// proof has completed. Sending is best-effort: if the heavy thread has
+/// already unwound there is nothing left to release. Conversely, if the light
+/// path unwinds before this point, dropping the sender disconnects the channel
+/// and releases the receiver rather than deadlocking the scoped join.
+fn release_heavy_after_first_light_proof(
+    path: TxPath,
+    proof_step: u64,
+    heavy_start: &mut Option<std::sync::mpsc::Sender<()>>,
+) {
+    if path == TxPath::Light && proof_step == 0 {
+        if let Some(sender) = heavy_start.take() {
+            let _ = sender.send(());
+        }
+    }
+}
 
 fn chunk_is_light(txs: &[Tx<F>]) -> bool {
     txs.first()
@@ -261,6 +288,7 @@ fn prove_path(
     pre_output: &BlockPreExecWitness<F>,
     state_metadata_hash: HashOut<F>,
     active_paths: &AtomicUsize,
+    mut heavy_start: Option<std::sync::mpsc::Sender<()>>,
 ) -> Proof {
     assert!(
         !chunks.is_empty(),
@@ -364,12 +392,7 @@ fn prove_path(
             });
 
             in_flight.push_back((current_step, proof_handle));
-            let max_in_flight =
-                if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
-                    LIGHT_TX_PROOF_WINDOW
-                } else {
-                    1
-                };
+            let max_in_flight = tx_proof_window(path, active_paths);
             if in_flight.len() >= max_in_flight {
                 let (proof_step, proof_handle) = in_flight
                     .pop_front()
@@ -377,6 +400,11 @@ fn prove_path(
                 let tx_proof = proof_handle
                     .join()
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                release_heavy_after_first_light_proof(
+                    path,
+                    proof_step,
+                    &mut heavy_start,
+                );
                 pending_tx = Some((proof_step, tx_proof));
             }
             current_step += 1;
@@ -531,20 +559,36 @@ pub(crate) fn prove_block_after_pre(
             // alone is running. The circuit data is leaked to hand the pending
             // witness a 'static borrow across the thread boundary — free, the
             // worker exits via `process::exit`.
+            // Give the critical light path one completed transaction proof of
+            // uncontended head start. The heavy path then uses the second slot
+            // until it retires, after which the light path opens its existing
+            // two-proof window. This keeps the global tx-proof ceiling at two
+            // without using a fixed light step as a proxy for heavy work.
+            let (heavy_start, heavy_start_wait) = std::sync::mpsc::channel();
+            let heavy_circuits = circuits;
+            let heavy_block_number = block.block_number;
+            let heavy_created_at = block.created_at;
+            let heavy_old_account_delta_tree_root = block.old_account_delta_tree_root;
+            let heavy_pre_output = &pre_output;
+            let heavy_active_paths = active_paths;
             let heavy_handle_outer = std::thread::Builder::new()
                 .name("heavy-tx-chain".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, || {
+                .spawn_scoped(scope, move || {
+                    heavy_start_wait
+                        .recv()
+                        .expect("light path must release heavy transaction proving");
                     prove_path(
                         TxPath::Heavy,
                         heavy_chunks,
-                        circuits,
-                        block.block_number,
-                        block.created_at,
-                        block.old_account_delta_tree_root,
-                        &pre_output,
+                        heavy_circuits,
+                        heavy_block_number,
+                        heavy_created_at,
+                        heavy_old_account_delta_tree_root,
+                        heavy_pre_output,
                         state_metadata_hash,
-                        active_paths,
+                        heavy_active_paths,
+                        None,
                     )
                 })
                 .expect("heavy transaction chain thread must start");
@@ -594,6 +638,7 @@ pub(crate) fn prove_block_after_pre(
                 &pre_output,
                 state_metadata_hash,
                 active_paths,
+                Some(heavy_start),
             );
             let (block_target, block_data, block_pending, heavy_chain_proof) =
                 block_circuit_handle
@@ -696,6 +741,47 @@ mod tests {
         // Both retired: nothing is proving, so nothing claims the phase either.
         active_paths.fetch_sub(1, Ordering::Release);
         assert!(!claims_exclusive_gpu_phase(&active_paths));
+    }
+
+    #[test]
+    fn light_first_scheduler_window_tracks_heavy_retirement() {
+        let active_paths = AtomicUsize::new(2);
+        assert_eq!(tx_proof_window(TxPath::Light, &active_paths), 1);
+        assert_eq!(tx_proof_window(TxPath::Heavy, &active_paths), 1);
+
+        active_paths.fetch_sub(1, Ordering::Release);
+        assert_eq!(tx_proof_window(TxPath::Light, &active_paths), 2);
+        assert_eq!(tx_proof_window(TxPath::Heavy, &active_paths), 1);
+
+        active_paths.fetch_sub(1, Ordering::Release);
+        assert_eq!(tx_proof_window(TxPath::Light, &active_paths), 1);
+    }
+
+    #[test]
+    fn light_first_scheduler_gate_opens_once_after_first_proof() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut heavy_start = Some(sender);
+
+        release_heavy_after_first_light_proof(TxPath::Heavy, 0, &mut heavy_start);
+        assert_eq!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        release_heavy_after_first_light_proof(TxPath::Light, 1, &mut heavy_start);
+        assert_eq!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+
+        release_heavy_after_first_light_proof(TxPath::Light, 0, &mut heavy_start);
+        assert_eq!(receiver.recv(), Ok(()));
+        assert!(heavy_start.is_none());
+
+        release_heavy_after_first_light_proof(TxPath::Light, 0, &mut heavy_start);
+        assert_eq!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        );
     }
 
     #[test]
