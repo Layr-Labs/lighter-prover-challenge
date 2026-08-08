@@ -421,6 +421,33 @@ unsafe fn gl_sub_neon(
     vsubq_u64(diff2, vandq_u64(under2, eps))
 }
 
+/// Evaluate two adjacent butterflies from one layer. The caller supplies
+/// disjoint low/high halves and a twiddle row whose length is at least `half`
+/// (the caller's loop guarantees `j + 2 <= half`, so this call reads `j` and
+/// `j + 1` within bounds).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fft_butterfly_pair_neon(
+    low: *mut crate::goldilocks_field::GoldilocksField,
+    high: *mut crate::goldilocks_field::GoldilocksField,
+    omega_row: *const crate::goldilocks_field::GoldilocksField,
+    j: usize,
+    eps: core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+
+    unsafe {
+        let v = NeonGoldilocksField([*high.add(j), *high.add(j + 1)]);
+        let w = NeonGoldilocksField([*omega_row.add(j), *omega_row.add(j + 1)]);
+        let t = w * v;
+        let tv = vcombine_u64(vcreate_u64(t.0[0].0), vcreate_u64(t.0[1].0));
+        let u = vld1q_u64(low.add(j).cast::<u64>());
+        vst1q_u64(low.add(j).cast::<u64>(), gl_add_neon(u, tv, eps));
+        vst1q_u64(high.add(j).cast::<u64>(), gl_sub_neon(u, tv, eps));
+    }
+}
+
 /// One butterfly layer over base-field scalars, with the modular reduction in
 /// vector registers.
 ///
@@ -433,6 +460,48 @@ unsafe fn gl_sub_neon(
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn fft_classic_simd_single_layer_neon(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    lg_half_m: usize,
+    omega_row: &[crate::goldilocks_field::GoldilocksField],
+) {
+    use core::arch::aarch64::*;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    let half = 1usize << lg_half_m;
+    let m = half << 1;
+    // This kernel is only valid for the WIDTH-4 base-field packing, where the
+    // dispatch guard requires lg_half_m >= lg_packed_width == 2. An unconditional
+    // check (not debug_assert) turns a wrong-shaped call into a loud panic
+    // instead of an out-of-bounds write through a raw pointer in release.
+    assert!(lg_half_m >= 2, "neon single-layer kernel requires WIDTH-4 packing");
+    assert!(omega_row.len() >= half, "neon single-layer kernel requires full twiddle row");
+    let base = values.as_mut_ptr();
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        let mut k = 0;
+        while k + m <= values.len() {
+            let low = base.add(k);
+            let high = low.add(half);
+            let mut j = 0;
+            // This path is selected only for the width-4 base-field packing,
+            // so `half` is a power of two at least four. Two adjacent pair
+            // kernels per iteration preserve operation order while halving
+            // the hot-loop branch and induction overhead.
+            while j < half {
+                fft_butterfly_pair_neon(low, high, omega_row.as_ptr(), j, eps);
+                fft_butterfly_pair_neon(low, high, omega_row.as_ptr(), j + 2, eps);
+                j += 4;
+            }
+            k += m;
+        }
+    }
+}
+
+/// Pre-unroll implementation retained only for same-binary timing comparisons.
+/// MUST remain byte-identical to the pre-change kernel — it is the A/B baseline.
+#[cfg(all(test, target_arch = "aarch64"))]
+#[inline(never)]
+fn fft_classic_simd_single_layer_neon_reference(
     values: &mut [crate::goldilocks_field::GoldilocksField],
     lg_half_m: usize,
     omega_row: &[crate::goldilocks_field::GoldilocksField],
@@ -460,16 +529,12 @@ fn fft_classic_simd_single_layer_neon(
                     *omega_row.get_unchecked(j + 1),
                 ]);
                 let t = w * v;
-                // The only register-file crossing in the loop: two fmovs.
                 let tv = vcombine_u64(vcreate_u64(t.0[0].0), vcreate_u64(t.0[1].0));
                 let u = vld1q_u64(base.add(k + j));
                 vst1q_u64(base.add(k + j), gl_add_neon(u, tv, eps));
                 vst1q_u64(base.add(k + half + j), gl_sub_neon(u, tv, eps));
                 j += 2;
             }
-            // `half` is a power of two and at least 2 whenever this path is
-            // taken, so this tail never runs; kept so the kernel is correct for
-            // any shape rather than only the ones production uses.
             while j < half {
                 let t = omega_row[j] * values[k + half + j];
                 let u = values[k + j];
@@ -2192,6 +2257,74 @@ mod tests {
                     assert_eq!(a.0[1].to_canonical_u64(), e.0[1].to_canonical_u64());
                 }
             }
+        }
+    }
+
+    /// Same-process A/B harness for the production four-lane unroll against
+    /// the exact pre-change kernel retained under `cfg(test)`.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "manual timing harness"]
+    fn neon_four_lane_unroll_microbenchmark() {
+        use core::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        use crate::fft::{
+            fft_classic_simd_single_layer_neon,
+            fft_classic_simd_single_layer_neon_reference,
+        };
+
+        fn time_kernel(
+            values: &mut [GoldilocksField],
+            lg_half_m: usize,
+            omega_row: &[GoldilocksField],
+            rounds: usize,
+            candidate: bool,
+        ) -> Duration {
+            let start = Instant::now();
+            for _ in 0..rounds {
+                if candidate {
+                    fft_classic_simd_single_layer_neon(values, lg_half_m, omega_row);
+                } else {
+                    fft_classic_simd_single_layer_neon_reference(values, lg_half_m, omega_row);
+                }
+            }
+            black_box(values[0].0);
+            start.elapsed()
+        }
+
+        let lg_n = 17usize;
+        let n = 1usize << lg_n;
+        let roots = fft_root_table::<GoldilocksField>(n);
+        let seed: Vec<_> = (0..n).map(deterministic_value).collect();
+        let rounds = 80usize;
+
+        for lg_half_m in [4usize, 8, 12, 16] {
+            let mut ratios = Vec::new();
+            for sample in 0..7 {
+                let mut reference = seed.clone();
+                let mut candidate = seed.clone();
+                let row = &roots[lg_half_m];
+                let (reference_time, candidate_time) = if sample % 2 == 0 {
+                    let r = time_kernel(&mut reference, lg_half_m, row, rounds, false);
+                    let c = time_kernel(&mut candidate, lg_half_m, row, rounds, true);
+                    (r, c)
+                } else {
+                    let c = time_kernel(&mut candidate, lg_half_m, row, rounds, true);
+                    let r = time_kernel(&mut reference, lg_half_m, row, rounds, false);
+                    (r, c)
+                };
+                assert!(candidate
+                    .iter()
+                    .zip(&reference)
+                    .all(|(candidate, reference)| candidate.0 == reference.0));
+                ratios.push(candidate_time.as_secs_f64() / reference_time.as_secs_f64());
+            }
+            ratios.sort_by(f64::total_cmp);
+            println!(
+                "lg_half_m={lg_half_m} candidate/reference median={:.5} samples={ratios:?}",
+                ratios[ratios.len() / 2]
+            );
         }
     }
 
