@@ -6,9 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
-use circuit::block_pre_execution_constraints::{
-    BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
-};
+use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
 use circuit::block_tx::{BlockTx, JumpState, JumpStateTarget};
 use circuit::block_tx_chain_constraints::{
     BlockTxChainCircuit, BlockTxChainTarget, cyclic_base_witness,
@@ -451,40 +449,18 @@ fn prove_path(
     chain_proof
 }
 
-/// Proves the block pre-execution circuit. The startup-overlap path must NOT
-/// set the exclusive GPU phase, because the remaining circuit loads are still
-/// using the GPU normally; the serial path sets it around the call.
-pub(crate) fn prove_pre_execution_parallel(
-    pre_data: &CircuitData<F, C, D>,
-    pre_target: &BlockPreExecutionTarget,
-    pre_exec: &BlockPreExec<F>,
-) -> Proof {
-    BlockPreExecutionCircuit::prove(pre_data, pre_exec, pre_target)
-        .expect("block pre-execution proof failed")
-}
-
 pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
     // The pre-execution proof runs strictly before any other proving work, so
     // the serialized GPU stream is otherwise idle: route its mid-size column
     // trees to the GPU for just this phase.
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-    let pre_proof = prove_pre_execution_parallel(
+    let pre_proof = BlockPreExecutionCircuit::prove(
         &circuits.pre_data,
-        &circuits.pre_target,
         &BlockPreExec::from_block(&block),
-    );
+        &circuits.pre_target,
+    )
+    .expect("block pre-execution proof failed");
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
-    prove_block_after_pre(block, circuits, pre_proof)
-}
-
-/// The pipeline after the pre-execution proof. The startup-overlap path calls
-/// this once both the pre-execution proof and the remaining circuit loads have
-/// completed.
-pub(crate) fn prove_block_after_pre(
-    mut block: Block<F>,
-    mut circuits: Circuits,
-    pre_proof: Proof,
-) -> Proof {
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
