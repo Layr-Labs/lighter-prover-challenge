@@ -22,25 +22,6 @@ pub fn transpose_poly_values<F: Field>(polys: Vec<PolynomialValues<F>>) -> Vec<V
     transpose(&poly_values)
 }
 
-/// [`transpose_poly_values`] without consuming the input.
-///
-/// Callers that need both the transpose *and* the original columns (the sigma
-/// polynomials are transposed into `prover_only.sigmas` and also committed)
-/// otherwise have to clone every column to keep one copy alive. This reads the
-/// columns in place, so the clone disappears.
-///
-/// Value-identical to `transpose_poly_values(polys.to_vec())`: same output
-/// length (`polys[0].len()`), same row order, and each row gathers
-/// `polys[c].values[i]` for ascending `c` — exactly the gather [`transpose`]
-/// performs. Pure data movement; no arithmetic.
-pub fn transpose_poly_values_ref<F: Field>(polys: &[PolynomialValues<F>]) -> Vec<Vec<F>> {
-    let len = polys[0].len();
-    (0..len)
-        .into_par_iter()
-        .map(|i| polys.iter().map(|p| p.values[i]).collect())
-        .collect()
-}
-
 pub fn transpose<T: Send + Sync + Copy>(matrix: &[Vec<T>]) -> Vec<Vec<T>> {
     let len = matrix[0].len();
     (0..len)

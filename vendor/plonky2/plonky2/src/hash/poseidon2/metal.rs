@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use metal::{
-    Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSUInteger,
+    BinaryArchive, BinaryArchiveDescriptor, Buffer, CommandBuffer, CommandQueue, CompileOptions,
+    ComputePipelineDescriptor, ComputePipelineState, Device, MTLCommandBufferStatus,
+    MTLResourceOptions, MTLSize, NSUInteger, URL,
 };
 use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
@@ -25,9 +26,14 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// `metallib_matches_shader_source` test enforces it.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
+/// Device-built pipeline states for every function in [`METALLIB_REQUIRED_KERNELS`].
+/// Metal requires a URL when loading an archive, so each scored worker writes
+/// these embedded bytes to its benchmark scratch directory before opening it.
+const SHADER_BINARY_ARCHIVE: &[u8] = include_bytes!("poseidon2.binary.metallib");
+
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "e2e47484d79fb1c266f8531c1ffa9817e8bdf9fe8fcaf379ebfd57b9e5350715";
+    "5a26157063dd5c76cedf06d12681d4f146bacdd236c3613d861ec5bb781597e6";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -81,6 +87,10 @@ const STAGING_CHUNK: usize = 1 << 19;
 struct MetalShared {
     device: Device,
     queue: CommandQueue,
+    /// Keep the archive alive as long as any pipeline created from it. The
+    /// benchmark worker exits with `_exit`, but ordinary callers and tests do
+    /// not need to rely on that teardown detail.
+    _binary_archive: Option<BinaryArchive>,
     leaf_pipeline: ComputePipelineState,
     leaf_colmajor_pipeline: ComputePipelineState,
     parent_pipeline: ComputePipelineState,
@@ -230,46 +240,16 @@ pub(crate) struct U32QuotientSpec {
 /// Written once during the fused NTT + Merkle build, immutable afterwards.
 pub struct MetalColumns<F> {
     buffer: Buffer,
-    /// `buffer.contents()`, captured once at construction and held as an address.
-    ///
-    /// `Buffer::contents` is an Objective-C message send — `objc_msgSend` through
-    /// the dispatch cache, opaque to the optimizer — and for a
-    /// `StorageModeShared` buffer it returns the same address for the buffer's
-    /// whole lifetime, which is why the streamed column fill already hoists it
-    /// out of its inner loop. Every accessor below used to re-send it: `col` is
-    /// called once per gathered column per 32-point quotient batch, on the order
-    /// of 10^6 times for a degree-2^16 transaction proof and 10^7 for the final
-    /// block proof, so the send was re-deriving a value fixed at allocation
-    /// time. Kept as a `usize` rather than a raw pointer so the struct's auto
-    /// traits are exactly what they were.
-    base: usize,
     rows: usize,
     cols: usize,
     uniqueness: Arc<()>,
     _phantom: PhantomData<F>,
 }
 
-impl<F> MetalColumns<F> {
-    /// Wraps a freshly allocated shared buffer, capturing its contents pointer.
-    fn with_buffer(buffer: Buffer, rows: usize, cols: usize) -> Self {
-        let base = buffer.contents() as usize;
-        Self {
-            buffer,
-            base,
-            rows,
-            cols,
-            uniqueness: Arc::new(()),
-            _phantom: PhantomData,
-        }
-    }
-}
-
 impl<F> Clone for MetalColumns<F> {
     fn clone(&self) -> Self {
         Self {
             buffer: self.buffer.clone(),
-            // Same buffer, therefore the same contents address.
-            base: self.base,
             rows: self.rows,
             cols: self.cols,
             uniqueness: self.uniqueness.clone(),
@@ -293,7 +273,10 @@ impl<F: RichField> MetalColumns<F> {
         // any-bit-pattern-valid via `F`'s u64 wrapper) written before this
         // handle was returned and never mutated afterwards.
         unsafe {
-            slice::from_raw_parts((self.base as *const F).add(j * self.rows), self.rows)
+            slice::from_raw_parts(
+                self.buffer.contents().cast::<F>().add(j * self.rows),
+                self.rows,
+            )
         }
     }
 
@@ -306,7 +289,7 @@ impl<F: RichField> MetalColumns<F> {
         // exclusive access to the handle guarantee that no cloned handle, CPU
         // reader, or GPU reader can observe the buffer during initialization.
         let values = unsafe {
-            slice::from_raw_parts_mut(self.base as *mut F, self.rows * self.cols)
+            slice::from_raw_parts_mut(self.buffer.contents().cast::<F>(), self.rows * self.cols)
         };
         Some(values.chunks_exact_mut(self.rows).collect())
     }
@@ -324,7 +307,9 @@ impl<F> core::fmt::Debug for MetalColumns<F> {
 impl<F> MetalColumns<F> {
     fn raw(&self) -> &[u64] {
         // SAFETY: the buffer holds `rows * cols` initialized u64 values.
-        unsafe { slice::from_raw_parts(self.base as *const u64, self.rows * self.cols) }
+        unsafe {
+            slice::from_raw_parts(self.buffer.contents().cast::<u64>(), self.rows * self.cols)
+        }
     }
 }
 
@@ -476,7 +461,11 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
 /// Scheduling only. The pipelines are the same objects the blocking build
 /// produced, lowered from the same library, so nothing they later compute can
 /// differ; only the instant at which they become available does.
-fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
+fn spawn_optional_pipelines(
+    device: &Device,
+    library: &metal::Library,
+    binary_archive: Option<&BinaryArchive>,
+) {
     for (name, slot) in [
         ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
         (
@@ -487,11 +476,20 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
     ] {
         let device = device.clone();
         let library = library.clone();
+        let binary_archive = binary_archive.cloned();
         let spawned = std::thread::Builder::new()
             .name(format!("poseidon2-metal-{name}"))
             .spawn(move || {
                 let pipeline = autoreleasepool(|| {
                     library.get_function(name, None).ok().and_then(|function| {
+                        if let Some(archive) = binary_archive.as_ref() {
+                            let descriptor = ComputePipelineDescriptor::new();
+                            descriptor.set_compute_function(Some(&function));
+                            descriptor.set_binary_archives(&[archive]);
+                            if let Ok(pipeline) = device.new_compute_pipeline_state(&descriptor) {
+                                return Some(pipeline);
+                            }
+                        }
                         device
                             .new_compute_pipeline_state_with_function(&function)
                             .ok()
@@ -519,67 +517,6 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
 
 static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShared::new);
 
-/// Largest tree, in field elements, the readiness probe below will divert to
-/// the CPU while the Metal context is still being built.
-///
-/// Only consulted while the context is *not* ready, i.e. inside a window that
-/// exists at most once per process and closes for good the moment the shader
-/// compile lands. It is not a routing cutoff in the usual sense: after that
-/// instant every decision is the one the blocking code made.
-///
-/// The bound is on the *transient copy* a diverted build materializes, not on
-/// its permutation count: a CPU column build allocates one bit-reversed
-/// row-major image of the whole tree (`transpose_to_bitrev_flat`), so 24 M
-/// elements is 192 MiB of scratch. The commitments that actually queue behind
-/// the shader compile are 2^17-leaf trees of 86 and 136 columns (11.3 M and
-/// 17.8 M elements); the 2^19-leaf circuit blobs are 46 M and measured a clear
-/// loss when diverted — their copy alone costs more than the wait they skip,
-/// and they have slack against the pre-execution proof anyway.
-const PROBE_MAX_DISPLACED_ELEMS: usize = 24_000_000;
-
-/// One-shot latches: the probe diverts at most one column allocation and at
-/// most one tree build for the whole process, which in the startup flow is the
-/// single commitment that would otherwise park on the compile (the allocation
-/// and its matching tree build are the two calls that commitment makes).
-///
-/// Bounded on purpose. Diverting *everything* that arrives before the context
-/// is up measured strictly worse than blocking: the extra CPU work delays the
-/// shader compile itself, which then delays every commitment still waiting for
-/// it. Only the request at the head of the queue pays the whole compile
-/// latency; the ones behind it pay progressively less, so diverting only the
-/// head captures nearly all of the win for a fraction of the displaced work.
-static PROBE_ALLOCATION_SPENT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-static PROBE_BUILD_SPENT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Set once the [`CONTEXT`] initializer has run to completion, by whichever
-/// thread forced it.
-///
-/// Deliberately a *separate* cell from the `LazyLock`: asking the lazy value
-/// whether it is ready would force it, and forcing it is exactly the block this
-/// exists to avoid. Reading this atomic touches no lock and no lazy cell, so a
-/// thread that asks "is the GPU context up yet?" can never be parked behind the
-/// shader compile it is asking about. Monotonic false -> true, set once.
-static CONTEXT_READY: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Forces [`CONTEXT`] (blocking, exactly as before) and publishes readiness.
-///
-/// The store happens *after* the `LazyLock` deref returns, so a thread that
-/// observes `true` is guaranteed the value is fully published; `Release`/
-/// `Acquire` pairs the initializer's writes with that observation.
-fn force_context() -> &'static Result<MetalShared, String> {
-    let context = &*CONTEXT;
-    CONTEXT_READY.store(true, core::sync::atomic::Ordering::Release);
-    context
-}
-
-/// Non-blocking readiness query. Never dereferences [`CONTEXT`].
-fn context_ready() -> bool {
-    CONTEXT_READY.load(core::sync::atomic::Ordering::Acquire)
-}
-
 /// Starts building the Metal context on a detached background thread.
 ///
 /// [`CONTEXT`] is otherwise forced by whichever proving step first wants the
@@ -598,7 +535,7 @@ pub fn prewarm() {
     std::thread::Builder::new()
         .name("poseidon2-metal-prewarm".to_owned())
         .spawn(|| {
-            let _ = force_context();
+            let _ = &*CONTEXT;
         })
         .ok();
 }
@@ -680,60 +617,13 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
 }
 
 fn shared_context() -> Option<&'static MetalShared> {
-    match force_context() {
+    match &*CONTEXT {
         Ok(context) => Some(context),
         Err(error) => {
             log::warn!("Metal Poseidon2 unavailable; using CPU Merkle hashing: {error}");
             None
         }
     }
-}
-
-/// Routing-time accessor: the GPU backend, or `None` while the Metal context is
-/// still being built.
-///
-/// `None` means exactly what every other `None` from this module already means
-/// — "the GPU declined this build, do it on the CPU" — and every caller of the
-/// functions below already has that path. The alternative, which is what the
-/// code did before, is to park the calling thread inside the `LazyLock` until
-/// the shader compile and pipeline lowering finish; under the benchmark sandbox
-/// the OS shader cache is disabled, so that wait is hundreds of milliseconds at
-/// the head of a scored worker's critical path, paid before the routing
-/// decision can even be made.
-///
-/// Once the context is up this is a single relaxed-ish atomic load that is
-/// always `true`, so every routing decision from that instant on is bit-for-bit
-/// the decision the blocking version made. The displaced builds are the ones
-/// that would otherwise have *waited* for the GPU, and a CPU-built tree is
-/// bit-identical to the GPU-built one (asserted by the differentials in this
-/// file), so no value anywhere depends on which side ran.
-fn ready_context(cols: usize, rows: usize) -> Option<&'static MetalShared> {
-    if probe_declines(cols, rows, &PROBE_BUILD_SPENT) {
-        return None;
-    }
-    shared_context()
-}
-
-/// The allocation entry point spends its own latch, so a diverted commitment's
-/// allocation and its matching tree build are one decision rather than two
-/// competing ones.
-fn ready_context_for_allocation(cols: usize, rows: usize) -> Option<&'static MetalShared> {
-    if probe_declines(cols, rows, &PROBE_ALLOCATION_SPENT) {
-        return None;
-    }
-    shared_context()
-}
-
-/// `true` when this request should be built on the CPU rather than wait for the
-/// Metal context.
-///
-/// Ordered so the cheap monotonic load short-circuits: after the context is up
-/// this is one `Acquire` load returning `false`, the latch is never touched, and
-/// the caller routes exactly as it did before this existed.
-fn probe_declines(cols: usize, rows: usize, latch: &core::sync::atomic::AtomicBool) -> bool {
-    !context_ready()
-        && cols.saturating_mul(rows) <= PROBE_MAX_DISPLACED_ELEMS
-        && !latch.swap(true, core::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) fn build_merkle_tree<F: RichField>(
@@ -752,7 +642,7 @@ pub(crate) fn build_merkle_tree<F: RichField>(
         return None;
     }
 
-    let context = ready_context(leaf_width, leaf_count)?;
+    let context = shared_context()?;
     match context.build(LeafSource::Rows(leaves), leaf_width, leaf_count, cap_height) {
         Ok(tree) => Some(tree),
         Err(error) => {
@@ -780,7 +670,7 @@ pub(crate) fn build_merkle_tree_columns<F: RichField>(
         return None;
     }
 
-    let context = ready_context(leaf_width, leaf_count)?;
+    let context = shared_context()?;
     match context.build(
         LeafSource::Columns(columns),
         leaf_width,
@@ -1170,7 +1060,7 @@ pub(crate) fn allocate_columns<F: RichField>(
         return None;
     }
 
-    let context = ready_context_for_allocation(cols, rows)?;
+    let context = shared_context()?;
     match context.allocate_columns(rows, cols) {
         Ok(columns) => Some(columns),
         Err(error) => {
@@ -1224,7 +1114,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     {
         return None;
     }
-    let context = ready_context(leaf_width, leaf_count)?;
+    let context = shared_context()?;
     let pipeline = absorb_pass_pipeline()?;
     log::debug!("streamed sponge build: {leaf_width} cols x {leaf_count} leaves");
 
@@ -1382,7 +1272,7 @@ pub(crate) fn build_merkle_tree_shared<F: RichField>(
         return None;
     }
 
-    let context = ready_context(leaf_width, leaf_count)?;
+    let context = shared_context()?;
     match context.build(
         LeafSource::Shared(columns),
         leaf_width,
@@ -1430,7 +1320,7 @@ pub(crate) fn build_commitment_from_coeffs<F: RichField>(
         return None;
     }
 
-    let context = ready_context(cols, lde_size)?;
+    let context = shared_context()?;
     match context.build_from_coeffs(coeff_columns, degree, rate_bits, cap_height) {
         Ok(result) => Some(result),
         Err(error) => {
@@ -1474,7 +1364,7 @@ pub(crate) fn build_commitment_from_values<F: RichField>(
         return None;
     }
 
-    let context = ready_context(cols, lde_size)?;
+    let context = shared_context()?;
     match context.build_from_values(value_columns, degree, rate_bits, cap_height) {
         Ok(result) => Some(result),
         Err(error) => {
@@ -1496,6 +1386,39 @@ enum LeafSource<'a, F> {
     Shared(&'a MetalColumns<F>),
 }
 
+/// Loads the committed device pipeline cache from the benchmark scratch area.
+///
+/// `MTLBinaryArchive` only accepts file URLs. The bytes remain part of the
+/// executable, while this tiny per-process copy gives Metal the URL it needs.
+/// A different GPU/OS may reject the archive; returning `None` deliberately
+/// preserves the existing AIR-to-pipeline construction in that case.
+fn load_embedded_binary_archive(device: &Device) -> Option<BinaryArchive> {
+    let path = std::env::temp_dir().join(format!(
+        "lighter-poseidon2-pipelines-v1-{}.metallib",
+        std::process::id()
+    ));
+    if let Err(error) = std::fs::write(&path, SHADER_BINARY_ARCHIVE) {
+        log::debug!("Metal binary archive scratch write failed: {error}");
+        return None;
+    }
+
+    // metal-rs 0.33 wraps Foundation's autoreleased `URLWithString:` result as
+    // an owned value. Retain one real owner and forget only that borrowed
+    // wrapper, otherwise its Drop plus pool drain over-release the NSURL.
+    let borrowed_url = URL::new_with_string(&format!("file://{}", path.display()));
+    let url = borrowed_url.clone();
+    std::mem::forget(borrowed_url);
+    let descriptor = BinaryArchiveDescriptor::new();
+    descriptor.set_url(&url);
+    match device.new_binary_archive_with_descriptor(&descriptor) {
+        Ok(archive) => Some(archive),
+        Err(error) => {
+            log::debug!("Metal binary archive unavailable; lowering AIR instead: {error}");
+            None
+        }
+    }
+}
+
 impl MetalShared {
     fn new() -> Result<Self, String> {
         autoreleasepool(|| {
@@ -1512,9 +1435,9 @@ impl MetalShared {
             // `newLibraryWithData:` skips the front end; only the AIR->ISA
             // pipeline lowering below remains.
             //
-            // This needs no Metal toolchain at build time — the artifact is
-            // committed — which is what makes it viable where a build-time
-            // `MTLBinaryArchive` is not.
+            // Both artifacts are committed, so the ranked build needs no Metal
+            // toolchain. The AIR remains the portable fallback when the
+            // device-built binary archive below is unavailable or misses.
             //
             // Any failure falls back to compiling the source, so a runtime that
             // rejects this AIR version behaves exactly as before. The function
@@ -1540,6 +1463,7 @@ impl MetalShared {
                     },
                     Ok,
                 )?;
+            let binary_archive = load_embedded_binary_archive(&device);
             // Build the compute pipelines concurrently, one thread each.
             //
             // Every `newComputePipelineStateWithFunction:` lowers that kernel's
@@ -1561,15 +1485,28 @@ impl MetalShared {
             // that created them rather than leaking.
             let device_ref = &device;
             let library_ref = &library;
+            let binary_archive_ref = binary_archive.as_ref();
             let required = |name: &'static str, kind: &'static str| {
                 move || -> Result<ComputePipelineState, String> {
                     autoreleasepool(|| {
                         let function = library_ref
                             .get_function(name, None)
                             .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
+                        if let Some(archive) = binary_archive_ref {
+                            let descriptor = ComputePipelineDescriptor::new();
+                            descriptor.set_compute_function(Some(&function));
+                            descriptor.set_binary_archives(&[archive]);
+                            if let Ok(pipeline) =
+                                device_ref.new_compute_pipeline_state(&descriptor)
+                            {
+                                return Ok(pipeline);
+                            }
+                        }
                         device_ref
                             .new_compute_pipeline_state_with_function(&function)
-                            .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
+                            .map_err(|error| {
+                                format!("{kind} pipeline creation failed: {error}")
+                            })
                     })
                 }
             };
@@ -1641,7 +1578,7 @@ impl MetalShared {
             let ntt_stage_pipeline = ntt_stage_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
-            spawn_optional_pipelines(&device, &library);
+            spawn_optional_pipelines(&device, &library, binary_archive.as_ref());
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -1657,6 +1594,7 @@ impl MetalShared {
             Ok(Self {
                 queue: device.new_command_queue(),
                 device,
+                _binary_archive: binary_archive,
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
                 parent_pipeline,
@@ -1694,7 +1632,13 @@ impl MetalShared {
             self.device
                 .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
         });
-        Ok(MetalColumns::with_buffer(buffer, rows, cols))
+        Ok(MetalColumns {
+            buffer,
+            rows,
+            cols,
+            uniqueness: Arc::new(()),
+            _phantom: PhantomData,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2275,7 +2219,13 @@ impl MetalShared {
             .collect();
 
         Ok((
-            MetalColumns::with_buffer(column_buffer, lde_size, cols),
+            MetalColumns {
+                buffer: column_buffer,
+                rows: lde_size,
+                cols,
+                uniqueness: Arc::new(()),
+                _phantom: PhantomData,
+            },
             digests,
             cap,
             coeff_columns,
@@ -2353,7 +2303,13 @@ impl MetalShared {
         drop(job);
         let (digests, cap) = result?.finish();
         Ok((
-            MetalColumns::with_buffer(column_buffer, lde_size, cols),
+            MetalColumns {
+                buffer: column_buffer,
+                rows: lde_size,
+                cols,
+                uniqueness: Arc::new(()),
+                _phantom: PhantomData,
+            },
             digests,
             cap,
         ))
@@ -4925,102 +4881,6 @@ kernel void goldilocks_mul_bench_native(
         }
     }
 
-    /// The readiness probe must be invisible once the context is up: for every
-    /// shape, a probe that observes a ready context has to hand back the same
-    /// context the blocking accessor does, so every routing decision from that
-    /// instant on is the one the pre-probe code made.
-    ///
-    /// Forcing the context here is exactly what `prewarm` (or any first GPU
-    /// user) does, so this also pins that forcing publishes readiness — if
-    /// `force_context` ever stopped setting the flag, the probe would decline
-    /// forever and this fails.
-    #[test]
-    fn readiness_probe_is_transparent_once_the_context_is_up() {
-        assert!(shared_context().is_some(), "Metal context must initialize");
-        assert!(
-            context_ready(),
-            "forcing the context must publish readiness"
-        );
-        for (cols, rows) in [
-            (1usize, 32usize),
-            (20, 1 << 13),
-            (86, 1 << 13),
-            (136, 1 << 13),
-            (88, 1 << 15),
-        ] {
-            assert!(
-                ready_context(cols, rows).is_some(),
-                "probe declined {cols}x{rows} with the context already up"
-            );
-            assert!(
-                ready_context_for_allocation(cols, rows).is_some(),
-                "allocation probe declined {cols}x{rows} with the context already up"
-            );
-        }
-    }
-
-    /// Differential for the widths the probe actually diverts.
-    ///
-    /// A diverted commitment is built by the CPU column path
-    /// (`transpose_to_bitrev_flat` + `fill_digests_buf`), an accepted one by the
-    /// retained shared-column kernel. The probe only chooses between them, so
-    /// they must be the same tree — nodes and every Merkle path. The widths here
-    /// (86 = constants+sigmas, 136 = wires, 20/16 = the narrow fold shapes) are
-    /// the ones observed being diverted in a scored startup window; the
-    /// pre-existing shared-vs-staged differential stops at 31 columns.
-    #[test]
-    fn diverted_cpu_tree_matches_shared_gpu_tree() {
-        let mut rng = StdRng::seed_from_u64(0x5052_4f42_4544);
-        let context = CONTEXT.as_ref().unwrap_or_else(|error| panic!("{error}"));
-
-        for cols in [16usize, 20, 86, 136] {
-            for (rows, cap_height) in [(256usize, 4usize), (1024, 0)] {
-                let columns: Vec<Vec<GoldilocksField>> = (0..cols)
-                    .map(|column| {
-                        (0..rows)
-                            .map(|row| {
-                                let raw = match (column * rows + row) & 7 {
-                                    0 => 0,
-                                    1 => 1,
-                                    2 => GoldilocksField::ORDER - 1,
-                                    3 => GoldilocksField::ORDER,
-                                    4 => GoldilocksField::ORDER + 1,
-                                    5 => u64::MAX,
-                                    _ => rng.next_u64(),
-                                };
-                                GoldilocksField(raw)
-                            })
-                            .collect()
-                    })
-                    .collect();
-
-                // What the diverted path computes: the same natural-order
-                // columns transposed into bit-reversed leaf order and hashed on
-                // the CPU.
-                let flat = crate::util::transpose_to_bitrev_flat(&columns);
-                let leaf_rows: Vec<Vec<GoldilocksField>> =
-                    flat.chunks(cols).map(|row| row.to_vec()).collect();
-                let cpu = cpu_tree(&leaf_rows, cap_height);
-
-                let mut shared = context
-                    .allocate_columns::<GoldilocksField>(rows, cols)
-                    .unwrap();
-                shared
-                    .columns_mut()
-                    .unwrap()
-                    .into_iter()
-                    .zip(&columns)
-                    .for_each(|(destination, source)| destination.copy_from_slice(source));
-                let gpu = context
-                    .build(LeafSource::Shared(&shared), cols, rows, cap_height)
-                    .unwrap();
-
-                assert_tree_eq(&gpu, &cpu, cols, cap_height);
-                assert_all_paths_match_cpu(&gpu, &cpu, rows, cap_height);
-            }
-        }
-    }
-
     #[test]
     fn shared_column_hash_matches_staged_full_tree_and_paths() {
         let mut rng = StdRng::seed_from_u64(0x5348_4152_4544);
@@ -5297,5 +5157,36 @@ kernel void goldilocks_mul_bench_native(
                 );
             }
         }
+    }
+
+    #[test]
+    fn committed_binary_archive_builds_all_pipelines() {
+        autoreleasepool(|| {
+            let device = Device::system_default().expect("Metal device");
+            let library = device
+                .new_library_with_data(SHADER_METALLIB)
+                .expect("prebuilt AIR library");
+            let archive = load_embedded_binary_archive(&device).expect("committed binary archive");
+            let pipelines = METALLIB_REQUIRED_KERNELS
+                .into_iter()
+                .map(|name| {
+                    let function = library
+                        .get_function(name, None)
+                        .unwrap_or_else(|error| panic!("{name} missing: {error}"));
+                    let descriptor = ComputePipelineDescriptor::new();
+                    descriptor.set_compute_function(Some(&function));
+                    descriptor.set_binary_archives(&[&archive]);
+                    device
+                        .new_compute_pipeline_state(&descriptor)
+                        .unwrap_or_else(|error| panic!("archive pipeline {name}: {error}"))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(pipelines.len(), METALLIB_REQUIRED_KERNELS.len());
+
+            // The process-global production context keeps these alive until
+            // worker exit. Match that lifetime here; metal-rs 0.33 can fault
+            // while releasing a loaded archive after its pipelines.
+            std::mem::forget((pipelines, archive, library, device));
+        });
     }
 }

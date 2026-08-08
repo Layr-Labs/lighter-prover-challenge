@@ -133,22 +133,9 @@ fn run_generator_worklist<
     let parallel_rounds = parallel_rounds_enabled();
     let mut buffer = GeneratedValues::empty();
 
-    // The two round queues are swapped rather than reallocated. Every round used
-    // to start from a fresh `Vec::new()` and end by *moving* it over the old
-    // queue, which freed the old buffer and forced the new one to grow from zero
-    // capacity again — a fresh allocation plus a geometric doubling chain (each
-    // step memcpying everything pushed so far) on every round of every witness
-    // generation, and there is one witness generation per transaction chunk and
-    // per chain step. Swapping keeps both buffers at their high-water capacity,
-    // so after the first few rounds a round costs no allocation and no growth
-    // copies at all. `clear()` only resets the length (`usize` has no `Drop`),
-    // so each round still observes an empty queue and pushes exactly the same
-    // indices in exactly the same order.
-    let mut next_pending_generator_indices = Vec::new();
-
     // Keep running generators until we fail to make progress.
     while !pending_generator_indices.is_empty() {
-        next_pending_generator_indices.clear();
+        let mut next_pending_generator_indices = Vec::new();
 
         if parallel_rounds && pending_generator_indices.len() >= parallel_threshold {
             // A generator can be enqueued once per newly populated watch, and may have expired
@@ -232,10 +219,7 @@ fn run_generator_worklist<
                 }
             }
 
-            core::mem::swap(
-                &mut pending_generator_indices,
-                &mut next_pending_generator_indices,
-            );
+            pending_generator_indices = next_pending_generator_indices;
             continue;
         }
 
@@ -276,10 +260,7 @@ fn run_generator_worklist<
             }
         }
 
-        core::mem::swap(
-            &mut pending_generator_indices,
-            &mut next_pending_generator_indices,
-        );
+        pending_generator_indices = next_pending_generator_indices;
     }
 
     Ok(())
