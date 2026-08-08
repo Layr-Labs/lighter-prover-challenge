@@ -1,3 +1,4 @@
+// Night shot 3: borrowed permutation columns rebased onto the 22.14 frontier.
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
