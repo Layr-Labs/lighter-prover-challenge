@@ -1051,6 +1051,74 @@ fn supported_quotient_result_limbs(base_bits: usize) -> Option<usize> {
     }
 }
 
+/// One entry per branch the combined quotient kernel can take: the ten `kind`
+/// values of the U32-family dispatch plus the RangeCheck record type, which the
+/// kernel handles in its own leading loop. This is the unit the offload
+/// decision is taken over.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum QuotientOffloadFamily {
+    RangeCheck,
+    Arithmetic,
+    Subtraction,
+    AddMany,
+    ByteDecomposition,
+    QuinticMultiplication,
+    QuinticSquaring,
+    RandomAccess,
+    Exponentiation,
+    Equality,
+    Reducing,
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn u32_quotient_offload_family(
+    kind: &crate::hash::poseidon2::metal::U32QuotientKind,
+) -> QuotientOffloadFamily {
+    use crate::hash::poseidon2::metal::U32QuotientKind;
+    match kind {
+        U32QuotientKind::Arithmetic => QuotientOffloadFamily::Arithmetic,
+        U32QuotientKind::Subtraction { .. } => QuotientOffloadFamily::Subtraction,
+        U32QuotientKind::AddMany { .. } => QuotientOffloadFamily::AddMany,
+        U32QuotientKind::ByteDecomposition { .. } => QuotientOffloadFamily::ByteDecomposition,
+        U32QuotientKind::QuinticMultiplication => QuotientOffloadFamily::QuinticMultiplication,
+        U32QuotientKind::QuinticSquaring => QuotientOffloadFamily::QuinticSquaring,
+        U32QuotientKind::RandomAccess { .. } => QuotientOffloadFamily::RandomAccess,
+        U32QuotientKind::Exponentiation => QuotientOffloadFamily::Exponentiation,
+        U32QuotientKind::Equality { .. } => QuotientOffloadFamily::Equality,
+        U32QuotientKind::Reducing { .. } => QuotientOffloadFamily::Reducing,
+    }
+}
+
+/// Split point for per-circuit offload selection. Circuits whose degree is at
+/// or below `1 << GPU_QUOTIENT_SMALL_CIRCUIT_MAX_DEGREE_BITS` offload the
+/// reduced family set; everything larger keeps the full union.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+const GPU_QUOTIENT_SMALL_CIRCUIT_MAX_DEGREE_BITS: usize = 14;
+
+/// Families that stay on the CPU on small circuits.
+///
+/// The kernel runs one thread per quotient row and walks every advertised spec
+/// serially inside that thread, so each offloaded family lengthens the kernel
+/// across the whole domain. Handing one back is free for the CPU pass only
+/// while that pass is already gathering at least as many wire columns, and
+/// already writing at least as many shared constraint rows, for the gates it
+/// keeps regardless.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+const SMALL_CIRCUIT_CPU_FAMILIES: &[QuotientOffloadFamily] =
+    &[QuotientOffloadFamily::RandomAccess];
+
+/// Per-circuit gate selection for the Metal quotient offload.
+///
+/// Semantics are unaffected either way: a family that is not offloaded is
+/// simply left in `cpu_gate_indices` and evaluated by the CPU quotient pass,
+/// exactly as it would be if the Metal job failed to launch.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn gpu_quotient_family_offloaded(family: QuotientOffloadFamily, degree_bits: usize) -> bool {
+    degree_bits > GPU_QUOTIENT_SMALL_CIRCUIT_MAX_DEGREE_BITS
+        || !SMALL_CIRCUIT_CPU_FAMILIES.contains(&family)
+}
+
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn start_gpu_range_check_gate_quotient<
     F: RichField + Extendable<D>,
@@ -1102,6 +1170,10 @@ fn start_gpu_range_check_gate_quotient<
     if raw_constant_base > common_data.num_constants {
         return None;
     }
+    // Per-circuit gate selection: the offload set is a function of the
+    // circuit's shape, not a global constant. See
+    // `GPU_QUOTIENT_SMALL_CIRCUIT_MAX_DEGREE_BITS`.
+    let degree_bits = common_data.degree_bits();
     let mut gate_indices = Vec::new();
     // Random-access gates are excluded from the CPU quotient only after the
     // combined Metal command has accepted and submitted every metadata record.
@@ -1139,16 +1211,18 @@ fn start_gpu_range_check_gate_quotient<
                 }
                 return None;
             }
-            let selector_column = common_data.selectors_info.selector_indices[gate_index];
-            specs.push(RangeCheckQuotientSpec {
-                selector_column,
-                gate_index,
-                group: common_data.selectors_info.groups[selector_column].clone(),
-                include_unused_selector,
-                num_ops: range.num_ops,
-                bit_size: range.bit_size,
-            });
-            gate_indices.push(gate_index);
+            if gpu_quotient_family_offloaded(QuotientOffloadFamily::RangeCheck, degree_bits) {
+                let selector_column = common_data.selectors_info.selector_indices[gate_index];
+                specs.push(RangeCheckQuotientSpec {
+                    selector_column,
+                    gate_index,
+                    group: common_data.selectors_info.groups[selector_column].clone(),
+                    include_unused_selector,
+                    num_ops: range.num_ops,
+                    bit_size: range.bit_size,
+                });
+                gate_indices.push(gate_index);
+            }
         }
         if let Some(u32_gate) = u32_gate {
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
@@ -1312,19 +1386,21 @@ fn start_gpu_range_check_gate_quotient<
                 }
                 return None;
             }
-            let selector_column = common_data.selectors_info.selector_indices[gate_index];
-            u32_specs.push(U32QuotientSpec {
-                selector_column,
-                gate_index,
-                group: common_data.selectors_info.groups[selector_column].clone(),
-                include_unused_selector,
-                num_ops,
-                kind,
-            });
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { .. }) {
-                random_access_gate_indices.push(gate_index);
-            } else {
-                gate_indices.push(gate_index);
+            if gpu_quotient_family_offloaded(u32_quotient_offload_family(&kind), degree_bits) {
+                let selector_column = common_data.selectors_info.selector_indices[gate_index];
+                u32_specs.push(U32QuotientSpec {
+                    selector_column,
+                    gate_index,
+                    group: common_data.selectors_info.groups[selector_column].clone(),
+                    include_unused_selector,
+                    num_ops,
+                    kind,
+                });
+                if matches!(u32_gate, U32QuotientGate::RandomAccess { .. }) {
+                    random_access_gate_indices.push(gate_index);
+                } else {
+                    gate_indices.push(gate_index);
+                }
             }
         }
         // These vendored gates sit at the top of the surviving wire span in
@@ -1409,21 +1485,26 @@ fn start_gpu_range_check_gate_quotient<
                 }
                 return None;
             }
-            let selector_column = common_data.selectors_info.selector_indices[gate_index];
-            u32_specs.push(U32QuotientSpec {
-                selector_column,
-                gate_index,
-                group: common_data.selectors_info.groups[selector_column].clone(),
-                include_unused_selector,
-                num_ops,
-                kind,
-            });
-            gate_indices.push(gate_index);
+            if gpu_quotient_family_offloaded(u32_quotient_offload_family(&kind), degree_bits) {
+                let selector_column = common_data.selectors_info.selector_indices[gate_index];
+                u32_specs.push(U32QuotientSpec {
+                    selector_column,
+                    gate_index,
+                    group: common_data.selectors_info.groups[selector_column].clone(),
+                    include_unused_selector,
+                    num_ops,
+                    kind,
+                });
+                gate_indices.push(gate_index);
+            }
         }
     }
     if specs.is_empty() && u32_specs.is_empty() {
         if gpu_poseidon_quotient_diagnostics_enabled() {
-            eprintln!("[gpu-range-quotient] no advertised RangeCheck/U32 gates");
+            eprintln!(
+                "[gpu-range-quotient] no selected RangeCheck/U32 gates at \
+                 degree_bits={degree_bits}"
+            );
         }
         return None;
     }
@@ -2231,7 +2312,10 @@ mod quotient_layout_tests {
 
     use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
+    use super::{
+        gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT,
+        GPU_QUOTIENT_SMALL_CIRCUIT_MAX_DEGREE_BITS,
+    };
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field, Field64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2312,9 +2396,14 @@ mod quotient_layout_tests {
                 builder.register_public_input(selected);
             }
         }
-        // A 2^16-point LDE retains both wire and constants/sigmas commitments
-        // in shared Metal columns, exercising the production full-domain seam.
-        while builder.num_gates() <= (1 << 12) {
+        // The retained wire and constants/sigmas commitments both need to land
+        // in shared Metal columns for the production full-domain seam, and
+        // per-circuit gate selection only offloads the random-access family
+        // above `GPU_QUOTIENT_SMALL_CIRCUIT_MAX_DEGREE_BITS`. Pad past that
+        // split point so this differential keeps covering the shapes that
+        // actually reach the kernel; sweeping the constant moves the test with
+        // it.
+        while builder.num_gates() <= (1 << GPU_QUOTIENT_SMALL_CIRCUIT_MAX_DEGREE_BITS) {
             builder.add_gate(NoopGate, vec![]);
         }
         let data = builder.build::<Poseidon2GoldilocksConfig>();
@@ -2345,6 +2434,54 @@ mod quotient_layout_tests {
         assert!(after.range_completed > before.range_completed);
         data.verify(proof)?;
         Ok(())
+    }
+
+    /// Per-circuit gate selection: the offload set must be a function of the
+    /// circuit's degree alone, must reduce to exactly `SMALL_CIRCUIT_CPU_FAMILIES`
+    /// at and below the split point, and must be the full union above it. Every
+    /// bound is expressed relative to
+    /// `GPU_QUOTIENT_SMALL_CIRCUIT_MAX_DEGREE_BITS`, so sweeping that constant
+    /// moves the test with it instead of silently inverting an assertion.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn per_circuit_offload_policy_matches_production_shapes() {
+        use super::{
+            gpu_quotient_family_offloaded, QuotientOffloadFamily as Family,
+            SMALL_CIRCUIT_CPU_FAMILIES,
+        };
+
+        const ALL: [Family; 11] = [
+            Family::RangeCheck,
+            Family::Arithmetic,
+            Family::Subtraction,
+            Family::AddMany,
+            Family::ByteDecomposition,
+            Family::QuinticMultiplication,
+            Family::QuinticSquaring,
+            Family::RandomAccess,
+            Family::Exponentiation,
+            Family::Equality,
+            Family::Reducing,
+        ];
+
+        const K: usize = GPU_QUOTIENT_SMALL_CIRCUIT_MAX_DEGREE_BITS;
+
+        for family in ALL {
+            let expected_small = !SMALL_CIRCUIT_CPU_FAMILIES.contains(&family);
+            for degree_bits in [K, K - 1, K - 2] {
+                assert_eq!(
+                    gpu_quotient_family_offloaded(family, degree_bits),
+                    expected_small,
+                    "small shape {family:?} at {degree_bits}"
+                );
+            }
+            for degree_bits in [K + 1, K + 2, K + 4] {
+                assert!(
+                    gpu_quotient_family_offloaded(family, degree_bits),
+                    "large shape {family:?} at {degree_bits}"
+                );
+            }
+        }
     }
 
     /// Layout seam: `PolyMajor` output is exactly the transpose of
