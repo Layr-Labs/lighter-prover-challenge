@@ -1707,6 +1707,13 @@ fn compute_quotient_polys<
     // writes every element before any is read (see above). Same idiom as the
     // promoted zero-tail fast path in `fri/oracle.rs`.
     unsafe { quotient_values.set_len(quotient_len) };
+    // Occupancy probe for the GPU/CPU load-balance question: measures the CPU
+    // constraint pass and then how long each `job.finish()` blocks after it.
+    // A large blocked span means the GPU job is the quotient critical path;
+    // zero means the CPU is. Env-gated with the other diagnostics, so it is
+    // inert in the ranked sandbox.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let occupancy_t0 = std::time::Instant::now();
     quotient_values
         .par_chunks_mut(BATCH_SIZE * num_challenges)
         .zip(points_batches)
@@ -1954,6 +1961,8 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let occupancy_cpu_pass = occupancy_t0.elapsed();
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if let Some((_, job)) = &gpu_poseidon {
         let gpu_values = match job.finish() {
             Ok(values) => {
@@ -2000,6 +2009,8 @@ fn compute_quotient_polys<
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let occupancy_after_poseidon = occupancy_t0.elapsed();
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if let Some((_, job)) = &gpu_range {
         let gpu_values = match job.finish() {
             Ok(values) => {
@@ -2045,6 +2056,18 @@ fn compute_quotient_polys<
             });
     }
 
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    if gpu_poseidon_quotient_diagnostics_enabled() {
+        let total = occupancy_t0.elapsed();
+        eprintln!(
+            "[gpu-occupancy] degree_bits={} cpu_pass={:.1}ms poseidon_wait+merge={:.1}ms \
+             range_wait+merge={:.1}ms",
+            common_data.degree_bits(),
+            occupancy_cpu_pass.as_secs_f64() * 1e3,
+            (occupancy_after_poseidon - occupancy_cpu_pass).as_secs_f64() * 1e3,
+            (total - occupancy_after_poseidon).as_secs_f64() * 1e3,
+        );
+    }
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
     // One streaming pass splits the interleaved point-major buffer into the
     // per-challenge columns, instead of `num_challenges` parallel passes each
