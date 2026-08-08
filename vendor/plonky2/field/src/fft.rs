@@ -350,7 +350,16 @@ fn fft_classic_simd_with<P, M>(
                 // lg_half_m > 0, pairs of adjacent blocks of elements). .interleave does the
                 // appropriate shuffling and is its own inverse.
                 let (u, v) = packed_values[k].interleave(packed_values[k + 1], half_m);
-                let t = M::mul(omega, v);
+                // Layer zero's twiddle is ONE in every lane. The loop is
+                // macro-unrolled, so this choice is compiled away rather than
+                // branching per butterfly; multiplying any raw Goldilocks word
+                // by ONE also returns that exact word, not merely an equivalent
+                // canonical representative.
+                let t = if lg_half_m == 0 {
+                    v
+                } else {
+                    M::mul(omega, v)
+                };
                 (packed_values[k], packed_values[k + 1]) = (u + t).interleave(u - t, half_m);
             }
         }
@@ -2126,7 +2135,7 @@ mod tests {
     use crate::packable::Packable;
     use crate::packed::PackedField;
     use crate::polynomial::{PolynomialCoeffs, PolynomialValues};
-    use crate::types::Field;
+    use crate::types::{Field, Field64};
 
     /// `ifft_borrowed` must be bit-identical to `ifft` of a copy across
     /// sizes straddling the packed width and the small/large bit-reversal
@@ -2540,6 +2549,50 @@ mod tests {
             fft_classic_reference(&mut expected, 0, &roots);
             fft_classic(&mut actual, 0, &roots);
             assert_eq!(actual, expected, "FFT mismatch at 2^{lg_n}");
+        }
+    }
+
+    #[test]
+    fn layer_zero_unit_twiddle_preserves_raw_words() {
+        const RAW_WORDS: [u64; 10] = [
+            0,
+            1,
+            GoldilocksField::ORDER - 1,
+            GoldilocksField::ORDER,
+            GoldilocksField::ORDER + 1,
+            0x8000_0000_0000_0001,
+            0x9e37_79b9_7f4a_7c15,
+            0xdead_beef_cafe_babe,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+
+        for raw in RAW_WORDS {
+            assert_eq!(
+                (GoldilocksField::ONE * GoldilocksField(raw)).0,
+                raw,
+                "unit multiplication changed raw word {raw:#018x}"
+            );
+        }
+
+        for lg_n in [3, 4, 5, 8, 11, 12, 13, 14, 16, 18] {
+            let n = 1 << lg_n;
+            let roots = fft_root_table(n);
+            let mut expected = (0..n)
+                .map(|i| {
+                    let seed = RAW_WORDS[(i + lg_n) % RAW_WORDS.len()];
+                    GoldilocksField(seed ^ (i as u64).wrapping_mul(0xa076_1d64_78bd_642f))
+                })
+                .collect::<Vec<_>>();
+            let mut actual = expected.clone();
+
+            fft_classic_reference(&mut expected, 0, &roots);
+            fft_classic(&mut actual, 0, &roots);
+            assert_eq!(
+                actual.iter().map(|value| value.0).collect::<Vec<_>>(),
+                expected.iter().map(|value| value.0).collect::<Vec<_>>(),
+                "raw FFT mismatch at 2^{lg_n}"
+            );
         }
     }
 
