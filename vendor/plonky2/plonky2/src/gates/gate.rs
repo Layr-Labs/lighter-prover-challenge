@@ -76,6 +76,13 @@ pub enum U32QuotientGate {
         num_ops: usize,
         num_extra_constants: usize,
     },
+    /// Interleaves each 32-bit input with zero bits. Two routed words and 32
+    /// binary decomposition wires produce 34 constraints per operation.
+    Interleave { num_ops: usize },
+    /// Splits a 64-bit interleaved input into its even and odd 32-bit words.
+    /// Four routed words and 64 binary decomposition wires produce 68
+    /// constraints per operation.
+    Uninterleave { num_ops: usize },
 }
 
 /// A custom gate.

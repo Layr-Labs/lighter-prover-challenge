@@ -1068,11 +1068,13 @@ fn start_gpu_range_check_gate_quotient<
     crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
 )> {
     use core::sync::atomic::Ordering;
+    use crate::gates::base_sum::BaseSumGate;
     use crate::gates::equality_base::EqualityGate;
     use crate::gates::exponentiation::ExponentiationGate;
     use crate::gates::gate::U32QuotientGate;
     use crate::gates::reducing::ReducingGate;
     use crate::gates::reducing_extension::ReducingExtensionGate;
+    use crate::gates::select_base::SelectionGate;
     use crate::hash::poseidon2::metal::{
         RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec,
     };
@@ -1296,6 +1298,18 @@ fn start_gpu_range_check_gate_quotient<
                         expected_constraints,
                     )
                 }
+                U32QuotientGate::Interleave { num_ops } => (
+                    U32QuotientKind::Interleave,
+                    num_ops,
+                    num_ops.checked_mul(34)?,
+                    num_ops.checked_mul(34)?,
+                ),
+                U32QuotientGate::Uninterleave { num_ops } => (
+                    U32QuotientKind::Uninterleave,
+                    num_ops,
+                    num_ops.checked_mul(68)?,
+                    num_ops.checked_mul(68)?,
+                ),
             };
             if num_ops == 0
                 || gate.0.num_wires() != expected_wires
@@ -1351,6 +1365,27 @@ fn start_gpu_range_check_gate_quotient<
                 equality.num_ops,
                 equality.num_ops.checked_mul(6)?,
                 equality.num_ops.checked_mul(4)?,
+            ))
+        } else if let Some(selection) = gate.0.as_any().downcast_ref::<SelectionGate>() {
+            Some((
+                U32QuotientKind::Selection,
+                selection.num_ops,
+                selection.num_ops.checked_mul(5)?,
+                selection.num_ops.checked_mul(2)?,
+            ))
+        } else if let Some(base_sum) = gate.0.as_any().downcast_ref::<BaseSumGate<2>>() {
+            Some((
+                U32QuotientKind::BaseSum { base: 2 },
+                base_sum.num_limbs,
+                base_sum.num_limbs.checked_add(1)?,
+                base_sum.num_limbs.checked_add(1)?,
+            ))
+        } else if let Some(base_sum) = gate.0.as_any().downcast_ref::<BaseSumGate<4>>() {
+            Some((
+                U32QuotientKind::BaseSum { base: 4 },
+                base_sum.num_limbs,
+                base_sum.num_limbs.checked_add(1)?,
+                base_sum.num_limbs.checked_add(1)?,
             ))
         } else if let Some(reducing) = gate.0.as_any().downcast_ref::<ReducingGate<D>>() {
             // The kernel's extension arithmetic is specialised to the

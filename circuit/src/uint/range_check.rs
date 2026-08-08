@@ -648,7 +648,11 @@ mod tests {
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::uint::u32::gates::arithmetic_u32::U32ArithmeticGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::uint::u32::gates::interleave_u32::U32InterleaveGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::uint::u32::gates::subtraction_u32::U32SubtractionGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::uint::u32::gates::uninterleave_to_u32::UninterleaveToU32Gate;
 
     use super::*;
 
@@ -703,6 +707,7 @@ mod tests {
         config.security_bits = 0;
         config.fri_config.proof_of_work_bits = 0;
         config.fri_config.num_query_rounds = 1;
+        config.optimization_flags |= 1 << 5; // Enable SelectionGate for this differential.
         let mut builder = CircuitBuilder::<F, D>::new(config.clone());
         let mut inputs = Vec::new();
         for bit_size in [16usize, 32, 48] {
@@ -747,6 +752,31 @@ mod tests {
         let carry = builder.add_virtual_target();
         builder.connect(carry, Target::wire(row, add_many.wire_ith_carry(op)));
         u32_inputs.push((carry, 7));
+
+        let interleave = U32InterleaveGate::new_from_config(&config);
+        let (row, op) = builder.find_slot(interleave, &[], &[]);
+        let input = builder.add_virtual_target();
+        builder.connect(input, Target::wire(row, interleave.wire_ith_x(op)));
+        u32_inputs.push((input, 0x89ab_cdef));
+
+        let uninterleave = UninterleaveToU32Gate::new_from_config(&config);
+        let (row, op) = builder.find_slot(uninterleave, &[], &[]);
+        let input = builder.add_virtual_target();
+        builder.connect(
+            input,
+            Target::wire(row, uninterleave.wire_ith_x_interleaved(op)),
+        );
+        u32_inputs.push((input, 0x1234_5678_9abc_def0));
+
+        let selector = builder.constant_bool(true);
+        let select_x = builder.constant(F::from_canonical_u64(0x1234));
+        let select_y = builder.constant(F::from_canonical_u64(0x5678));
+        let _selected = builder.select(selector, select_x, select_y);
+
+        let binary_sum = builder.constant(F::from_canonical_u64(0x1234_5678));
+        let _binary_limbs = builder.split_le_base::<2>(binary_sum, 63);
+        let quaternary_sum = builder.constant(F::from_canonical_u64(0x9abc_def0));
+        let _quaternary_limbs = builder.split_le_base::<4>(quaternary_sum, 31);
 
         // 4097 rows pad to degree 8192. Its rate-8 constants/sigmas and wire
         // commitments both exceed the retained-Metal routing threshold.
