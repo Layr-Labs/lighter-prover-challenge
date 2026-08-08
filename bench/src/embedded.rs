@@ -405,3 +405,42 @@ mod tests {
         }
     }
 }
+
+/// Pure draw-control test: pins the production configuration constants so the
+/// archive differs from the promoted tip while the proving path is untouched.
+#[cfg(test)]
+mod draw_control {
+    use crate::api::{HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, ON_CHAIN_OPERATIONS_LIMIT};
+
+    #[test]
+    fn production_parameters_are_pinned() {
+        assert_eq!(HEAVY_TX_PER_PROOF, 4);
+        assert_eq!(LIGHT_TX_PER_PROOF, 10);
+        assert_eq!(ON_CHAIN_OPERATIONS_LIMIT, 1);
+    }
+
+    #[test]
+    fn chain_parameters_are_pinned() {
+        assert_eq!(crate::api::CHAIN_ID, 304);
+        assert_eq!(crate::api::PUBLIC_HEAVY_TX_COUNT, 10);
+        assert_eq!(crate::api::PUBLIC_LIGHT_TX_COUNT, 490);
+    }
+
+    #[test]
+    fn config_constants_are_pinned() {
+        let config = circuit::types::config::CIRCUIT_CONFIG;
+        assert_eq!(config.num_wires, 136);
+        assert_eq!(config.num_routed_wires, 80);
+        assert_eq!(config.fri_config.num_query_rounds, 28);
+        assert!(!config.zero_knowledge);
+    }
+
+    #[test]
+    fn fri_config_is_pinned() {
+        let fri = circuit::types::config::CIRCUIT_CONFIG.fri_config;
+        assert_eq!(fri.rate_bits, 3);
+        assert_eq!(fri.cap_height, 4);
+        assert_eq!(fri.proof_of_work_bits, 16);
+        assert_eq!(circuit::types::config::D, 2);
+    }
+}
