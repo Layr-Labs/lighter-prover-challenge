@@ -49,9 +49,31 @@ fn write_blob(out_dir: &Path, name: &str, bytes: &[u8]) {
     std::fs::write(&path, bytes).unwrap_or_else(|error| {
         panic!("cannot write embedded circuit blob {}: {error}", path.display())
     });
+    // The blobs are embedded into the prove binary, and the ranked score is
+    // the sum of per-spawn worker lifetimes: every byte embedded is a byte
+    // the per-spawn code-signature validation and page-in must touch. The
+    // serialized circuits are far from incompressible, so ship them
+    // lz4-compressed and decompress at load time — once per process, on the
+    // four rayon threads that already load the four blobs, in a fraction of
+    // the startup work they hide behind. The empty stub written under
+    // LIGHTER_SKIP_EMBED=1 stays empty: `load_blob` in src/embedded.rs treats
+    // an empty compressed blob exactly as it treated an empty raw one.
+    let lz4_path = out_dir.join(format!("{name}.lz4"));
+    let lz4 = if bytes.is_empty() {
+        Vec::new()
+    } else {
+        lz4_flex::block::compress_prepend_size(bytes)
+    };
+    std::fs::write(&lz4_path, &lz4).unwrap_or_else(|error| {
+        panic!(
+            "cannot write embedded circuit blob {}: {error}",
+            lz4_path.display()
+        )
+    });
     println!(
-        "cargo:warning=embedded circuit blob {name}: {:.2} MiB",
-        bytes.len() as f64 / (1024.0 * 1024.0)
+        "cargo:warning=embedded circuit blob {name}: {:.2} MiB raw, {:.2} MiB lz4",
+        bytes.len() as f64 / (1024.0 * 1024.0),
+        lz4.len() as f64 / (1024.0 * 1024.0)
     );
 }
 

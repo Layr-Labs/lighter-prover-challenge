@@ -38,6 +38,7 @@ bincode = { workspace = true }
 ff = { workspace = true }
 hashbrown = { workspace = true }
 clap = { workspace = true }
+lz4_flex = { version = "0.14.0", default-features = false, features = ["std"] }
 clap_derive = { workspace = true }
 tiny-keccak =  { workspace = true }
 paste = { workspace = true }
@@ -47,6 +48,7 @@ circuit = { path = "../circuit", default-features = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }
 circuit = { path = "../circuit", default-features = true }
+lz4_flex = { version = "0.14.0", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 flate2 = "1.0"

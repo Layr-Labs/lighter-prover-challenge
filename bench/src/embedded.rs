@@ -23,11 +23,16 @@ use plonky2::plonk::circuit_data::CircuitData;
 
 use crate::api::{Circuits, Proof};
 
-static PRE_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pre.embed"));
-static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx.embed"));
-static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
-static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
-static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+// The blobs are embedded lz4-compressed (see bench/build.rs) so the binary is
+// ~2x smaller: the ranked score is the per-spawn worker lifetime, and every
+// embedded byte is a byte the per-spawn code-signature validation and page-in
+// must touch. The one-time decompression below is a few milliseconds of lz4
+// block decode on the four rayon threads that already load the blobs.
+static PRE_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pre.embed.lz4"));
+static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx.embed.lz4"));
+static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed.lz4"));
+static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed.lz4"));
+static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed.lz4"));
 
 /// The four startup circuits that do not participate in pre-execution. Keeping
 /// this separate lets the worker start the pre-execution proof from its already
@@ -76,7 +81,13 @@ fn load_blob<T: serde::de::DeserializeOwned>(
         !blob.is_empty(),
         "embedded circuit blob {name} is an empty stub (compiled with LIGHTER_SKIP_EMBED=1)"
     );
-    deserialize_embedded::<T>(blob)
+    // LIGHTER_SKIP_EMBED stubs are written empty and stay empty through
+    // compression, so the ensure! above still fires for them; real blobs are
+    // size-prepended lz4 blocks. Decompressing before deserializing is the
+    // only change to the load path.
+    let bytes = lz4_flex::block::decompress_size_prepended(blob)
+        .map_err(|error| anyhow::anyhow!("decompressing embedded circuit blob {name}: {error}"))?;
+    deserialize_embedded::<T>(&bytes)
         .map_err(|error| error.context(format!("loading embedded circuit {name}")))
 }
 
