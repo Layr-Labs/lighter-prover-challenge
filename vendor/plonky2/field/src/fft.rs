@@ -14,6 +14,29 @@ use crate::packed::PackedField;
 use crate::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::types::Field;
 
+/// Static butterfly twiddle dispatch. The marker type is chosen once per FFT
+/// transform, so there is no type test or dynamic branch inside a butterfly.
+trait FftTwiddleMul<P: PackedField> {
+    fn mul(twiddle: P, value: P) -> P;
+}
+
+struct GeneralTwiddle;
+struct BaseSubfieldTwiddle;
+
+impl<P: PackedField> FftTwiddleMul<P> for GeneralTwiddle {
+    #[inline(always)]
+    fn mul(twiddle: P, value: P) -> P {
+        twiddle * value
+    }
+}
+
+impl<P: PackedField> FftTwiddleMul<P> for BaseSubfieldTwiddle {
+    #[inline(always)]
+    fn mul(twiddle: P, value: P) -> P {
+        P::mul_fft_base_twiddle(twiddle, value)
+    }
+}
+
 pub type FftRootTable<F> = Vec<Vec<F>>;
 
 pub fn fft_root_table<F: Field>(n: usize) -> FftRootTable<F> {
@@ -290,12 +313,15 @@ pub fn ifft_borrowed<F: Field>(values: &[F]) -> PolynomialCoeffs<F> {
 
 /// Generic FFT implementation that works with both scalar and packed inputs.
 #[unroll_for_loops]
-fn fft_classic_simd<P: PackedField>(
+fn fft_classic_simd_with<P, M>(
     values: &mut [P::Scalar],
     r: usize,
     lg_n: usize,
     root_table: &FftRootTable<P::Scalar>,
-) {
+) where
+    P: PackedField,
+    M: FftTwiddleMul<P>,
+{
     let lg_packed_width = log2_strict(P::WIDTH); // 0 when P is a scalar.
     let packed_values = P::pack_slice_mut(values);
     let packed_n = packed_values.len();
@@ -324,7 +350,7 @@ fn fft_classic_simd<P: PackedField>(
                 // lg_half_m > 0, pairs of adjacent blocks of elements). .interleave does the
                 // appropriate shuffling and is its own inverse.
                 let (u, v) = packed_values[k].interleave(packed_values[k + 1], half_m);
-                let t = omega * v;
+                let t = M::mul(omega, v);
                 (packed_values[k], packed_values[k + 1]) = (u + t).interleave(u - t, half_m);
             }
         }
@@ -332,7 +358,24 @@ fn fft_classic_simd<P: PackedField>(
 
     // We've already done the first lg_packed_width (if they were required) iterations.
     let s = max(r, lg_packed_width);
-    fft_classic_simd_layers(packed_values, s, lg_n, root_table);
+    fft_classic_simd_layers::<P, M>(packed_values, s, lg_n, root_table);
+}
+
+#[inline(always)]
+fn fft_classic_simd<P: PackedField>(
+    values: &mut [P::Scalar],
+    r: usize,
+    lg_n: usize,
+    root_table: &FftRootTable<P::Scalar>,
+) {
+    if lg_n == P::Scalar::TWO_ADICITY {
+        // A quadratic extension's final two-adic level has extension-only
+        // roots. Keep general multiplication for that entire (impractically
+        // large) transform; all smaller transforms use base-subfield dispatch.
+        fft_classic_simd_with::<P, GeneralTwiddle>(values, r, lg_n, root_table);
+    } else {
+        fft_classic_simd_with::<P, BaseSubfieldTwiddle>(values, r, lg_n, root_table);
+    }
 }
 
 /// Goldilocks `x + y` on two lanes, reproducing `impl Add for GoldilocksField`
@@ -440,17 +483,28 @@ fn fft_classic_simd_single_layer_neon(
 }
 
 #[inline(always)]
-fn fft_classic_simd_single_layer<P: PackedField>(
+fn fft_classic_simd_single_layer_with<P, M>(
     packed_values: &mut [P],
     lg_half_m: usize,
     lg_packed_width: usize,
     root_table: &FftRootTable<P::Scalar>,
-) {
+) where
+    P: PackedField,
+    M: FftTwiddleMul<P>,
+{
     // Base-field fast path: the reduction runs in vector registers. Guarded on
     // exact type identity, the same way `fft_zero_padded_cache_blocks` guards
     // its rate-8 specialisation. Every other instantiation -- scalar
     // `GoldilocksField`, and `QuadraticExtension` for FRI, both of which are
     // `WIDTH == 1` -- falls through to the generic body below.
+    //
+    // The twiddle marker `M` is deliberately not referenced by this arm.
+    // Reaching it proves `P::Scalar` is exactly `GoldilocksField`, whose
+    // `mul_fft_base_twiddle` is the default full multiplication, so both
+    // markers denote the same product here. The vector-reduction kernel is
+    // therefore untouched, bit for bit, by the twiddle specialization; only the
+    // generic body dispatches on `M` -- and that is the body every extension
+    // transform takes, since `QuadraticExtension` never matches this `TypeId`.
     #[cfg(target_arch = "aarch64")]
     if lg_half_m >= lg_packed_width
         && core::any::TypeId::of::<P>()
@@ -508,7 +562,7 @@ fn fft_classic_simd_single_layer<P: PackedField>(
     for block in packed_values.chunks_exact_mut(packed_m) {
         let (lows, highs) = block.split_at_mut(half_packed_m);
         for ((u, v), &omega) in lows.iter_mut().zip(highs.iter_mut()).zip(omega_table) {
-            let t = omega * *v;
+            let t = M::mul(omega, *v);
             let u_value = *u;
             *u = u_value + t;
             *v = u_value - t;
@@ -521,12 +575,15 @@ fn fft_classic_simd_single_layer<P: PackedField>(
 /// quarter-block element is loaded and stored once per stage *pair* instead
 /// of once per stage, halving whole-array memory passes for these layers.
 #[inline(always)]
-fn fft_classic_simd_fused_two_layers<P: PackedField>(
+fn fft_classic_simd_fused_two_layers_with<P, M>(
     packed_values: &mut [P],
     lg_half_m: usize,
     lg_packed_width: usize,
     root_table: &FftRootTable<P::Scalar>,
-) {
+) where
+    P: PackedField,
+    M: FftTwiddleMul<P>,
+{
     // Quarter size in vectors for the size-2^(lg_half_m + 2) fused block.
     let q = (1usize << lg_half_m) >> lg_packed_width;
     debug_assert!(q != 0);
@@ -542,16 +599,16 @@ fn fft_classic_simd_fused_two_layers<P: PackedField>(
             let d = packed_values[k + 3 * q + j];
 
             // First stage: butterflies within [a,b] and within [c,d].
-            let t = w1 * b;
+            let t = M::mul(w1, b);
             let (ab0, ab1) = (a + t, a - t);
-            let t = w1 * d;
+            let t = M::mul(w1, d);
             let (cd0, cd1) = (c + t, c - t);
 
             // Second stage: butterflies pairing positions j and j + 2q.
-            let t = stage2_omegas[j] * cd0;
+            let t = M::mul(stage2_omegas[j], cd0);
             packed_values[k + j] = ab0 + t;
             packed_values[k + 2 * q + j] = ab0 - t;
-            let t = stage2_omegas[q + j] * cd1;
+            let t = M::mul(stage2_omegas[q + j], cd1);
             packed_values[k + q + j] = ab1 + t;
             packed_values[k + 3 * q + j] = ab1 - t;
         }
@@ -571,28 +628,44 @@ fn fft_classic_simd_fused_two_layers<P: PackedField>(
 /// minimums, single layers are 3-7% faster at every thread count, and
 /// bit-identical: same butterflies, same twiddles, same per-element order,
 /// same raw `GoldilocksField.0` words.
+///
+/// The twiddle marker `M` rides on this structure: it is chosen once per
+/// transform by the dispatch entry and resolved statically inside each layer,
+/// so it adds no live register and no per-butterfly branch to either the
+/// vector-reduction kernel or the generic body.
 #[inline(always)]
-fn fft_classic_simd_layers<P: PackedField>(
+fn fft_classic_simd_layers<P, M>(
     packed_values: &mut [P],
     start: usize,
     end: usize,
     root_table: &FftRootTable<P::Scalar>,
-) {
+) where
+    P: PackedField,
+    M: FftTwiddleMul<P>,
+{
     let lg_packed_width = log2_strict(P::WIDTH);
     for lg_half_m in start..end {
-        fft_classic_simd_single_layer(packed_values, lg_half_m, lg_packed_width, root_table);
+        fft_classic_simd_single_layer_with::<P, M>(
+            packed_values,
+            lg_half_m,
+            lg_packed_width,
+            root_table,
+        );
     }
 }
 
 #[inline(always)]
-fn fft_zero_padded_first_layer_block<P: PackedField>(
+fn fft_zero_padded_first_layer_block_with<P, M>(
     packed_values: &mut [P],
     source_start: usize,
     nonzero_len: usize,
     destination: usize,
     packed_repeat: usize,
     omega_table: &[P],
-) {
+) where
+    P: PackedField,
+    M: FftTwiddleMul<P>,
+{
     debug_assert!(nonzero_len >= 2);
 
     // Expanding backwards ensures that every source pair is read before an earlier destination
@@ -606,7 +679,7 @@ fn fft_zero_padded_first_layer_block<P: PackedField>(
         let pair_destination = destination + pair * 2 * packed_repeat;
 
         for j in 0..packed_repeat {
-            let t = omega_table[j] * v;
+            let t = M::mul(omega_table[j], v);
             packed_values[pair_destination + j] = u + t;
             packed_values[pair_destination + packed_repeat + j] = u - t;
         }
@@ -643,11 +716,14 @@ fn fft_zero_padded_rate_8_first_layer_block(
 /// Expand a bit-reversed nonzero prefix and perform its first nontrivial FFT layer in one pass.
 ///
 /// This is called only when each repeated run contains at least one packed vector.
-fn fft_zero_padded_first_layer<P: PackedField>(
+fn fft_zero_padded_first_layer<P, M>(
     values: &mut [P::Scalar],
     r: usize,
     root_table: &FftRootTable<P::Scalar>,
-) {
+) where
+    P: PackedField,
+    M: FftTwiddleMul<P>,
+{
     let repeat = 1 << r;
     let nonzero_len = values.len() >> r;
     debug_assert!(repeat >= P::WIDTH);
@@ -655,15 +731,25 @@ fn fft_zero_padded_first_layer<P: PackedField>(
     let packed_repeat = repeat / P::WIDTH;
     let packed_values = P::pack_slice_mut(values);
     let omega_table = P::pack_slice(&root_table[r]);
-    fft_zero_padded_first_layer_block(packed_values, 0, nonzero_len, 0, packed_repeat, omega_table);
+    fft_zero_padded_first_layer_block_with::<P, M>(
+        packed_values,
+        0,
+        nonzero_len,
+        0,
+        packed_repeat,
+        omega_table,
+    );
 }
 
-fn fft_zero_padded_cache_blocks<P: PackedField>(
+fn fft_zero_padded_cache_blocks<P, M>(
     values: &mut [P::Scalar],
     r: usize,
     lg_block_n: usize,
     root_table: &FftRootTable<P::Scalar>,
-) {
+) where
+    P: PackedField,
+    M: FftTwiddleMul<P>,
+{
     let repeat = 1 << r;
     let block_len = 1 << lg_block_n;
     let nonzero_per_block = block_len >> r;
@@ -696,7 +782,7 @@ fn fft_zero_padded_cache_blocks<P: PackedField>(
                 destination,
             );
         } else {
-            fft_zero_padded_first_layer_block(
+            fft_zero_padded_first_layer_block_with::<P, M>(
                 packed_values,
                 source_start,
                 nonzero_per_block,
@@ -706,7 +792,7 @@ fn fft_zero_padded_cache_blocks<P: PackedField>(
             );
         }
         #[cfg(not(target_arch = "aarch64"))]
-        fft_zero_padded_first_layer_block(
+        fft_zero_padded_first_layer_block_with::<P, M>(
             packed_values,
             source_start,
             nonzero_per_block,
@@ -714,7 +800,7 @@ fn fft_zero_padded_cache_blocks<P: PackedField>(
             packed_repeat,
             omega_table,
         );
-        fft_classic_simd_layers(
+        fft_classic_simd_layers::<P, M>(
             &mut packed_values[destination..destination + packed_block_len],
             r + 1,
             lg_block_n,
@@ -724,13 +810,17 @@ fn fft_zero_padded_cache_blocks<P: PackedField>(
 }
 
 #[inline(never)]
-fn prepare_zero_padded_fft<F: Field>(
+fn prepare_zero_padded_fft<F, M>(
     values: &mut [F],
     r: usize,
     lg_n: usize,
     lg_packed_width: usize,
     root_table: &FftRootTable<F>,
-) -> usize {
+) -> usize
+where
+    F: Field,
+    M: FftTwiddleMul<<F as Packable>::Packing>,
+{
     debug_assert!(r > 0 && r <= lg_n);
 
     // A zero-padded input only has n/2^r live coefficients. Bit-reversing the full buffer would
@@ -750,14 +840,14 @@ fn prepare_zero_padded_fft<F: Field>(
             _ => 11,
         };
         if r + 1 < lg_block_n && lg_block_n <= lg_n {
-            fft_zero_padded_cache_blocks::<<F as Packable>::Packing>(
+            fft_zero_padded_cache_blocks::<<F as Packable>::Packing, M>(
                 values, r, lg_block_n, root_table,
             );
             lg_block_n
         } else {
             // Fuse the expansion with the first nontrivial layer, eliminating one full-buffer
             // write/read cycle while retaining the existing skipped-layer semantics.
-            fft_zero_padded_first_layer::<<F as Packable>::Packing>(values, r, root_table);
+            fft_zero_padded_first_layer::<<F as Packable>::Packing, M>(values, r, root_table);
             r + 1
         }
     } else {
@@ -775,10 +865,33 @@ fn prepare_zero_padded_fft<F: Field>(
 /// The parameter r signifies that the first 1/2^r of the entries of
 /// input may be non-zero, but the last 1 - 1/2^r entries are
 /// definitely zero.
-pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &FftRootTable<F>) {
+#[inline(always)]
+fn fft_classic_with<F, M>(values: &mut [F], r: usize, root_table: &FftRootTable<F>)
+where
+    F: Field,
+    M: FftTwiddleMul<F> + FftTwiddleMul<<F as Packable>::Packing>,
+{
     let n = values.len();
     let lg_n = log2_strict(n);
+    let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
+    let first_layer = if r == 0 {
+        reverse_index_bits_in_place(values);
+        0
+    } else {
+        prepare_zero_padded_fft::<F, M>(values, r, lg_n, lg_packed_width, root_table)
+    };
 
+    if lg_n <= lg_packed_width {
+        // Need the slice to be at least the width of two packed vectors for the vectorized version
+        // to work. Do this tiny problem in scalar.
+        fft_classic_simd_with::<F, M>(values, first_layer, lg_n, root_table);
+    } else {
+        fft_classic_simd_with::<<F as Packable>::Packing, M>(values, first_layer, lg_n, root_table);
+    }
+}
+
+pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &FftRootTable<F>) {
+    let lg_n = log2_strict(values.len());
     if root_table.len() != lg_n {
         panic!(
             "Expected root table of length {}, but it was {}.",
@@ -787,20 +900,13 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
         );
     }
 
-    let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
-    let first_layer = if r == 0 {
-        reverse_index_bits_in_place(values);
-        0
+    if lg_n == F::TWO_ADICITY {
+        // The final quadratic-extension root is not in its base field. Keep
+        // the full multiplication fallback for the entire transform. This
+        // branch is once per FFT, never once per butterfly.
+        fft_classic_with::<F, GeneralTwiddle>(values, r, root_table);
     } else {
-        prepare_zero_padded_fft(values, r, lg_n, lg_packed_width, root_table)
-    };
-
-    if lg_n <= lg_packed_width {
-        // Need the slice to be at least the width of two packed vectors for the vectorized version
-        // to work. Do this tiny problem in scalar.
-        fft_classic_simd::<F>(values, first_layer, lg_n, root_table);
-    } else {
-        fft_classic_simd::<<F as Packable>::Packing>(values, first_layer, lg_n, root_table);
+        fft_classic_with::<F, BaseSubfieldTwiddle>(values, r, root_table);
     }
 }
 
@@ -819,10 +925,16 @@ pub mod lab {
     #[cfg(target_arch = "aarch64")]
     use crate::goldilocks_field::mul_16th_root_powers;
 
+    // The lab variants are inactive experiments; they keep the pre-existing
+    // general twiddle multiplication so their behaviour is unchanged by the
+    // base-subfield twiddle specialization used on the production path. Some
+    // of them fold a coset shift into the root table, which is not guaranteed
+    // to stay in a base subfield, so `GeneralTwiddle` is also the only sound
+    // marker for them.
     use super::{
-        FftRootTable, fft_classic, fft_classic_simd, fft_classic_simd_fused_two_layers,
-        fft_classic_simd_layers, fft_classic_simd_single_layer, fft_root_table,
-        fft_zero_padded_first_layer_block,
+        FftRootTable, GeneralTwiddle, fft_classic, fft_classic_simd_fused_two_layers_with,
+        fft_classic_simd_layers, fft_classic_simd_single_layer_with, fft_classic_simd_with,
+        fft_root_table, fft_zero_padded_first_layer_block_with,
     };
     #[cfg(target_arch = "aarch64")]
     use super::fft_zero_padded_rate_8_first_layer_block;
@@ -999,7 +1111,7 @@ pub mod lab {
                     omega_r1,
                 );
             }
-            fft_classic_simd_layers(
+            fft_classic_simd_layers::<_, GeneralTwiddle>(
                 &mut packed_values[destination..destination + packed_block_len],
                 r + 2,
                 lg_block_n,
@@ -1028,7 +1140,12 @@ pub mod lab {
         let nonzero_len = n >> r;
         reverse_index_bits_in_place(&mut values[..nonzero_len]);
         cache_blocks_a1::<<F as Packable>::Packing>(values, r, lg_block_n, root_table);
-        fft_classic_simd::<<F as Packable>::Packing>(values, lg_block_n, lg_n, root_table);
+        fft_classic_simd_with::<<F as Packable>::Packing, GeneralTwiddle>(
+            values,
+            lg_block_n,
+            lg_n,
+            root_table,
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1126,17 +1243,37 @@ pub mod lab {
         let count = end - start;
         match count % 3 {
             1 if count >= 4 => {
-                fft_classic_simd_fused_two_layers(packed_values, l, lg_packed_width, root_table);
+                fft_classic_simd_fused_two_layers_with::<_, GeneralTwiddle>(
+                    packed_values,
+                    l,
+                    lg_packed_width,
+                    root_table,
+                );
                 l += 2;
-                fft_classic_simd_fused_two_layers(packed_values, l, lg_packed_width, root_table);
+                fft_classic_simd_fused_two_layers_with::<_, GeneralTwiddle>(
+                    packed_values,
+                    l,
+                    lg_packed_width,
+                    root_table,
+                );
                 l += 2;
             }
             1 => {
-                fft_classic_simd_single_layer(packed_values, l, lg_packed_width, root_table);
+                fft_classic_simd_single_layer_with::<_, GeneralTwiddle>(
+                    packed_values,
+                    l,
+                    lg_packed_width,
+                    root_table,
+                );
                 l += 1;
             }
             2 => {
-                fft_classic_simd_fused_two_layers(packed_values, l, lg_packed_width, root_table);
+                fft_classic_simd_fused_two_layers_with::<_, GeneralTwiddle>(
+                    packed_values,
+                    l,
+                    lg_packed_width,
+                    root_table,
+                );
                 l += 2;
             }
             _ => {}
@@ -1253,7 +1390,7 @@ pub mod lab {
                         );
                     }
                 } else {
-                    fft_zero_padded_first_layer_block(
+                    fft_zero_padded_first_layer_block_with::<_, GeneralTwiddle>(
                         packed_values,
                         source_start,
                         nonzero_per_block,
@@ -1322,10 +1459,15 @@ pub mod lab {
         }
         let nonzero_len = n >> r;
         reverse_index_bits_in_place(&mut values[..nonzero_len]);
-        super::fft_zero_padded_cache_blocks::<<F as Packable>::Packing>(
+        super::fft_zero_padded_cache_blocks::<<F as Packable>::Packing, GeneralTwiddle>(
             values, r, lg_block_n, root_table,
         );
-        fft_classic_simd::<<F as Packable>::Packing>(values, lg_block_n, lg_n, root_table);
+        fft_classic_simd_with::<<F as Packable>::Packing, GeneralTwiddle>(
+            values,
+            lg_block_n,
+            lg_n,
+            root_table,
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1429,7 +1571,7 @@ pub mod lab {
                     );
                 }
             } else {
-                fft_zero_padded_first_layer_block(
+                fft_zero_padded_first_layer_block_with::<_, GeneralTwiddle>(
                     packed_values,
                     source_start,
                     nonzero_per_block,
@@ -1438,7 +1580,7 @@ pub mod lab {
                     omega_table,
                 );
             }
-            fft_classic_simd_layers(
+            fft_classic_simd_layers::<_, GeneralTwiddle>(
                 &mut packed_values[destination..destination + packed_block_len],
                 r + 1,
                 lg_block_n,
@@ -1473,7 +1615,12 @@ pub mod lab {
         reverse_index_bits_in_place(&mut values[..nonzero_len]);
         let sigma = shift.exp_power_of_2(lg_n - 1 - r);
         cache_blocks_coset::<<F as Packable>::Packing>(values, r, lg_block_n, folded_table, sigma);
-        fft_classic_simd::<<F as Packable>::Packing>(values, lg_block_n, lg_n, folded_table);
+        fft_classic_simd_with::<<F as Packable>::Packing, GeneralTwiddle>(
+            values,
+            lg_block_n,
+            lg_n,
+            folded_table,
+        );
     }
 
     /// Variant B+A12 entry point: coset folding plus the fused kernels.
@@ -1626,7 +1773,7 @@ pub mod lab {
                     omega_r1,
                 );
             }
-            fft_classic_simd_layers(
+            fft_classic_simd_layers::<_, GeneralTwiddle>(
                 &mut packed_values[destination..destination + packed_block_len],
                 r + 2,
                 lg_block_n,
@@ -1659,7 +1806,12 @@ pub mod lab {
         reverse_index_bits_in_place(&mut values[..nonzero_len]);
         let sigma = shift.exp_power_of_2(lg_n - 1 - r);
         cache_blocks_folded_a1::<<F as Packable>::Packing>(values, r, lg_block_n, folded_table, sigma);
-        fft_classic_simd::<<F as Packable>::Packing>(values, lg_block_n, lg_n, folded_table);
+        fft_classic_simd_with::<<F as Packable>::Packing, GeneralTwiddle>(
+            values,
+            lg_block_n,
+            lg_n,
+            folded_table,
+        );
     }
 
     /// Combo: coset folding + A1 fused expansion, production block size.
@@ -1711,7 +1863,12 @@ pub mod lab {
         let nonzero_len = n >> r;
         reverse_index_bits_in_place(&mut values[..nonzero_len]);
         cache_blocks_a1::<<F as Packable>::Packing>(values, r, lg_block_n, root_table);
-        fft_classic_simd::<<F as Packable>::Packing>(values, lg_block_n, lg_n, root_table);
+        fft_classic_simd_with::<<F as Packable>::Packing, GeneralTwiddle>(
+            values,
+            lg_block_n,
+            lg_n,
+            root_table,
+        );
     }
 
     /// Combo: coset folding + production expansion (rate-8 sigma trick),
@@ -1739,7 +1896,12 @@ pub mod lab {
         reverse_index_bits_in_place(&mut values[..nonzero_len]);
         let sigma = shift.exp_power_of_2(lg_n - 1 - r);
         cache_blocks_coset::<<F as Packable>::Packing>(values, r, lg_block_n, folded_table, sigma);
-        fft_classic_simd::<<F as Packable>::Packing>(values, lg_block_n, lg_n, folded_table);
+        fft_classic_simd_with::<<F as Packable>::Packing, GeneralTwiddle>(
+            values,
+            lg_block_n,
+            lg_n,
+            folded_table,
+        );
     }
 
     /// A12-style cache blocks that always use the GENERIC fused expansion
@@ -1790,6 +1952,7 @@ mod tests {
     use plonky2_util::{log2_ceil, log2_strict, reverse_index_bits_in_place};
     use unroll::unroll_for_loops;
 
+    use super::{BaseSubfieldTwiddle, FftTwiddleMul, GeneralTwiddle};
     use crate::extension::quadratic::QuadraticExtension;
     use crate::fft::{FftRootTable, fft, fft_classic, fft_root_table, fft_with_options, ifft};
     use crate::goldilocks_field::GoldilocksField;
@@ -1866,11 +2029,16 @@ mod tests {
     #[test]
     fn single_layer_driver_matches_fused_reference_raw_words() {
         use crate::fft::{
-            fft_classic_simd_fused_two_layers, fft_classic_simd_layers,
-            fft_classic_simd_single_layer,
+            fft_classic_simd_fused_two_layers_with, fft_classic_simd_layers,
+            fft_classic_simd_single_layer_with,
         };
 
-        /// The pre-change driver, verbatim, as the oracle.
+        /// The pre-change driver, verbatim, as the oracle. It is pinned to
+        /// `GeneralTwiddle`, i.e. the plain `twiddle * value` this code used
+        /// before the twiddle specialization, while the arm under test runs the
+        /// marker production selects. The comparison therefore still isolates
+        /// the defusion and additionally pins the base-field marker choice to
+        /// the same raw words.
         fn drive_fused<P: PackedField>(
             packed_values: &mut [P],
             start: usize,
@@ -1880,7 +2048,7 @@ mod tests {
             let lg_packed_width = log2_strict(P::WIDTH);
             let mut lg_half_m = start;
             if (end - start) % 2 == 1 {
-                fft_classic_simd_single_layer(
+                fft_classic_simd_single_layer_with::<P, GeneralTwiddle>(
                     packed_values,
                     lg_half_m,
                     lg_packed_width,
@@ -1889,7 +2057,7 @@ mod tests {
                 lg_half_m += 1;
             }
             while lg_half_m < end {
-                fft_classic_simd_fused_two_layers(
+                fft_classic_simd_fused_two_layers_with::<P, GeneralTwiddle>(
                     packed_values,
                     lg_half_m,
                     lg_packed_width,
@@ -1908,7 +2076,7 @@ mod tests {
                 let mut expected = deterministic_values(n);
                 let mut actual = expected.clone();
                 drive_fused::<P>(P::pack_slice_mut(&mut expected), start, lg_n, &roots);
-                fft_classic_simd_layers::<P>(
+                fft_classic_simd_layers::<P, BaseSubfieldTwiddle>(
                     P::pack_slice_mut(&mut actual),
                     start,
                     lg_n,
@@ -1935,9 +2103,14 @@ mod tests {
     /// The quadratic extension is included deliberately: it is `WIDTH == 1` and
     /// must take the generic fallback, so the fallback being exercised is as
     /// much a correctness requirement as the fast path.
+    ///
+    /// The oracle keeps the plain `twiddle * value` product, while the arm under
+    /// test runs `BaseSubfieldTwiddle`, the marker production selects for these
+    /// sizes. The extension half is therefore simultaneously the fallback
+    /// differential it always was and a twiddle-specialization differential.
     #[test]
     fn neon_single_layer_matches_generic_raw_words() {
-        use crate::fft::fft_classic_simd_single_layer;
+        use crate::fft::fft_classic_simd_single_layer_with;
         use crate::types::{Field64, PrimeField64};
 
         /// Verbatim copy of the generic body, as the oracle.
@@ -1987,7 +2160,7 @@ mod tests {
                 let mut expected = adversarial::<F>(n);
                 let mut actual = expected.clone();
                 generic::<P>(P::pack_slice_mut(&mut expected), lg_half_m, lg_packed_width, &roots);
-                fft_classic_simd_single_layer::<P>(
+                fft_classic_simd_single_layer_with::<P, BaseSubfieldTwiddle>(
                     P::pack_slice_mut(&mut actual),
                     lg_half_m,
                     lg_packed_width,
@@ -2013,7 +2186,7 @@ mod tests {
                     .collect();
                 let mut actual = expected.clone();
                 generic::<FE>(&mut expected, lg_half_m, 0, &roots_ext);
-                fft_classic_simd_single_layer::<FE>(&mut actual, lg_half_m, 0, &roots_ext);
+                fft_classic_simd_single_layer_with::<FE, BaseSubfieldTwiddle>(&mut actual, lg_half_m, 0, &roots_ext);
                 for (a, e) in actual.iter().zip(expected.iter()) {
                     assert_eq!(a.0[0].to_canonical_u64(), e.0[0].to_canonical_u64());
                     assert_eq!(a.0[1].to_canonical_u64(), e.0[1].to_canonical_u64());
@@ -2286,26 +2459,115 @@ mod tests {
     }
 
     #[test]
+    fn quadratic_base_twiddle_mul_matches_general_raw_limbs() {
+        type F = GoldilocksField;
+        type FE = QuadraticExtension<F>;
+
+        let check = |twiddle: FE, value: FE| {
+            assert_eq!(
+                twiddle.0[1].0, 0,
+                "test twiddle is not in the base subfield"
+            );
+            let expected = twiddle * value;
+            let actual = <BaseSubfieldTwiddle as FftTwiddleMul<FE>>::mul(twiddle, value);
+            assert_eq!(
+                [actual.0[0].0, actual.0[1].0],
+                [expected.0[0].0, expected.0[1].0],
+                "raw limb mismatch for twiddle={twiddle:?}, value={value:?}"
+            );
+        };
+
+        // Include canonical boundaries and every useful non-canonical u64
+        // boundary. Equality is deliberately on raw limbs, not field values.
+        let specials = [
+            0,
+            1,
+            2,
+            0xFFFF_FFFE_FFFF_FFFF,
+            0xFFFF_FFFF_0000_0000,
+            0xFFFF_FFFF_0000_0001,
+            0xFFFF_FFFF_0000_0002,
+            u64::MAX,
+        ];
+        for &w in &specials {
+            for &a0 in &specials {
+                for &a1 in &specials {
+                    check(
+                        QuadraticExtension([GoldilocksField(w), F::ZERO]),
+                        QuadraticExtension([GoldilocksField(a0), GoldilocksField(a1)]),
+                    );
+                }
+            }
+        }
+
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..10_000 {
+            check(
+                QuadraticExtension([GoldilocksField(next()), F::ZERO]),
+                QuadraticExtension([GoldilocksField(next()), GoldilocksField(next())]),
+            );
+        }
+
+        // Every usable Goldilocks-extension FFT root row is base-subfield.
+        // The one extra two-adic root is extension-only and must retain the
+        // general marker path.
+        let root_value = QuadraticExtension([GoldilocksField(next()), GoldilocksField(next())]);
+        for lg_n in 1..FE::TWO_ADICITY {
+            let root = FE::primitive_root_of_unity(lg_n);
+            assert_eq!(root.0[1].0, 0, "2^{lg_n} root escaped the base subfield");
+            check(root, root_value);
+        }
+        let extension_root = FE::primitive_root_of_unity(FE::TWO_ADICITY);
+        assert_ne!(extension_root.0[1].0, 0);
+        let expected = extension_root * root_value;
+        let actual = <GeneralTwiddle as FftTwiddleMul<FE>>::mul(extension_root, root_value);
+        assert_eq!(
+            [actual.0[0].0, actual.0[1].0],
+            [expected.0[0].0, expected.0[1].0]
+        );
+    }
+
+    #[test]
     fn zero_padded_extension_fft_matches_reference() {
         type F = GoldilocksField;
         type FE = QuadraticExtension<F>;
 
-        let base_lg_n = 10;
         let r = 3;
-        let n = 1 << (base_lg_n + r);
-        let nonzero_len = 1 << base_lg_n;
-        let roots = fft_root_table(n);
-        let mut actual = (0..nonzero_len)
-            .map(|i| {
-                QuadraticExtension([deterministic_value(i), deterministic_value(i + nonzero_len)])
-            })
-            .chain(core::iter::repeat_n(FE::ZERO, n - nonzero_len))
-            .collect::<Vec<_>>();
-        let mut expected = actual.clone();
+        for lg_n in [9usize, 11, 12, 13, 15, 17] {
+            let n = 1 << lg_n;
+            let nonzero_len = n >> r;
+            let roots = fft_root_table(n);
+            let raw_value = |i: usize, salt: u64| {
+                let mut x = (i as u64).wrapping_add(salt);
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                GoldilocksField(x)
+            };
+            let mut actual = (0..nonzero_len)
+                .map(|i| {
+                    QuadraticExtension([
+                        raw_value(i, 0x9E37_79B9_7F4A_7C15),
+                        raw_value(i, 0xD1B5_4A32_D192_ED03),
+                    ])
+                })
+                .chain(core::iter::repeat_n(FE::ZERO, n - nonzero_len))
+                .collect::<Vec<_>>();
+            let mut expected = actual.clone();
 
-        fft_classic_reference(&mut expected, r, &roots);
-        fft_classic(&mut actual, r, &roots);
-        assert_eq!(actual, expected);
+            fft_classic_reference(&mut expected, r, &roots);
+            fft_classic(&mut actual, r, &roots);
+            assert_eq!(
+                actual, expected,
+                "extension FFT mismatch at 2^{lg_n}, r={r}"
+            );
+        }
     }
 
 }
