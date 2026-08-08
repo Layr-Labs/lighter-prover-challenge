@@ -129,6 +129,7 @@ impl ChainState<'_> {
 #[allow(clippy::too_many_arguments)]
 fn chain_step_proof(
     path: TxPath,
+    active_paths: &AtomicUsize,
     chain_target: &BlockTxChainTarget,
     chain_data: &CircuitData<F, C, D>,
     chain_step: u64,
@@ -167,7 +168,16 @@ fn chain_step_proof(
                 feeder,
             )
         })?;
-        BlockTxChainCircuit::prove_prepared(pending, chain_data)
+        // Tell the Metal router which serial lane is about to prove. While both
+        // paths are alive, an already-running light fold is deadline work; the
+        // three-step heavy lane has ample slack before the final join. The hint
+        // changes routing only and is scoped to the actual proof, not its
+        // predecessor wait or early witness preparation.
+        plonky2::hash::poseidon2::with_chain_gpu_admission(
+            path == TxPath::Light,
+            active_paths.load(Ordering::Acquire) > 1,
+            || BlockTxChainCircuit::prove_prepared(pending, chain_data),
+        )
     })();
     result.unwrap_or_else(|error| {
         panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")
@@ -326,6 +336,7 @@ fn prove_path(
                     .spawn_scoped(scope, move || {
                         chain_step_proof(
                             path,
+                            active_paths,
                             chain_target,
                             chain_data,
                             chain_step,
@@ -398,6 +409,7 @@ fn prove_path(
                 .spawn_scoped(scope, move || {
                     chain_step_proof(
                         path,
+                        active_paths,
                         chain_target,
                         chain_data,
                         chain_step,
@@ -427,6 +439,7 @@ fn prove_path(
             let previous = chain.take();
             chain = Some(ChainState::Ready(chain_step_proof(
                 path,
+                active_paths,
                 chain_target,
                 chain_data,
                 chain_step,
