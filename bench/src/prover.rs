@@ -513,22 +513,23 @@ pub(crate) fn prove_block_after_pre(
         let circuits = &circuits;
         let active_paths = &active_paths;
         std::thread::scope(|scope| {
-            // The final block circuit depends only on already-built circuit data
-            // and is not needed until the final proof, so it builds concurrently
-            // with the entire transaction/chain proving pipeline.
-            // Two-phase final-block witness (H13): this lane also runs the
-            // EARLY witness phase (block data + pre-proof generators) after the
-            // build, then joins the heavy path — which finishes ~30 s before
-            // the light path — and feeds its verify subtree here, mid-pipeline.
+            // The final block circuit depends only on already-built circuit data and is not
+            // needed until the final proof. This candidate waits for the short heavy path before
+            // starting it, avoiding the three-way heavy/light/build contention while retaining
+            // the much longer light path as its overlap window.
+            // Two-phase final-block witness (H13): after joining the heavy path,
+            // this lane builds the final circuit, runs the EARLY witness phase
+            // (block data + pre-proof generators), and feeds the heavy verify
+            // subtree here while the much longer light path is still running.
             // Measured feed split: light 0.018 s vs heavy 0.575 s; the heavy
             // verify subtree (ECDSA/keccak) owns the late witness cost, and
             // moving it here deletes it from the serial tail. Both phases run
             // WITHOUT `ParallelWitnessGuard` (thread-local; parallel rounds
             // here would contend with the pipeline's pool). This is witness
             // WORK MOVED OFF THE TAIL onto an otherwise-idle lane, not new
-            // parallelism: the lane sleeps in `join` until the heavy proof
-            // arrives, then does 0.6 s of serial work while ~the light spine
-            // alone is running. The circuit data is leaked to hand the pending
+            // parallelism: after the heavy proof arrives, it does the serial
+            // build/witness/feed work while the light spine alone is running.
+            // The circuit data is leaked to hand the pending
             // witness a 'static borrow across the thread boundary — free, the
             // worker exits via `process::exit`.
             let heavy_handle_outer = std::thread::Builder::new()
@@ -554,6 +555,9 @@ pub(crate) fn prove_block_after_pre(
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
+                    let heavy_chain_proof = heavy_handle_outer
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                     let (block_target, block_data) = circuits.build_block_circuit();
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
@@ -569,9 +573,6 @@ pub(crate) fn prove_block_after_pre(
                         &block_data.common,
                     )
                     .expect("final block early witness phase failed");
-                    let heavy_chain_proof = heavy_handle_outer
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                     pending
                         .feed(
                             BlockCircuit::witness_inputs_heavy_chain(
