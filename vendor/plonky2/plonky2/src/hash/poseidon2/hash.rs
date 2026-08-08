@@ -467,7 +467,18 @@ fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
 }
 
 impl Poseidon2 for F {
+    /// aarch64 NEON: scalar diagonal muls + vectorised Goldilocks add of sum.
+    /// Non-NEON keeps the packed mul-then-add path.
     #[inline]
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    fn internal_linear_layer(state: &mut [Self; WIDTH]) {
+        unsafe {
+            crate::hash::arch::aarch64::poseidon_goldilocks_neon::internal_linear_layer(state);
+        }
+    }
+
+    #[inline]
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     fn internal_linear_layer(state: &mut [Self; WIDTH]) {
         type Packing = <F as Packable>::Packing;
 
@@ -1143,5 +1154,210 @@ mod pair_hash_tests {
             new_time,
             old_time.as_secs_f64() / new_time.as_secs_f64()
         );
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64", target_feature = "neon"))]
+mod internal_linear_layer_neon_tests {
+    use plonky2_field::types::{Field, Field64, PrimeField64, Sample};
+
+    use super::*;
+    use crate::hash::arch::aarch64::poseidon_goldilocks_neon::{
+        internal_linear_layer as internal_neon,
+        internal_linear_layer_scalar as internal_scalar,
+    };
+
+    /// Prior packed production path: sum_12 + mul-then-add via WideGoldilocks.
+    fn apply_packed_reference(state: &mut [F; WIDTH]) {
+        type Packing = <F as Packable>::Packing;
+        let sum = Packing::from(sum_12(state));
+        let diagonal: [F; WIDTH] =
+            core::array::from_fn(|i| F::from_canonical_u64(MATRIX_DIAG_12_U64[i]));
+        let packed_state = Packing::pack_slice_mut(state);
+        let packed_diagonal = Packing::pack_slice(&diagonal);
+        for (state, &diagonal) in packed_state.iter_mut().zip(packed_diagonal) {
+            *state = sum + *state * diagonal;
+        }
+    }
+
+    /// Default trait path: sum_12 + multiply_accumulate.
+    fn apply_mul_acc_reference(state: &mut [F; WIDTH]) {
+        let sum = sum_12(state);
+        for i in 0..WIDTH {
+            state[i] = plonky2_field::types::Field::multiply_accumulate(&sum, state[i], F::from_canonical_u64(MATRIX_DIAG_12_U64[i]));
+        }
+    }
+
+    fn adversarial_states() -> Vec<[F; WIDTH]> {
+        let mut out = Vec::new();
+        out.push([F::ZERO; WIDTH]);
+        out.push([F::ONE; WIDTH]);
+        let near = F::from_canonical_u64(F::ORDER - 1);
+        out.push([near; WIDTH]);
+        // Non-canonical representatives (raw limb >= ORDER).
+        let nc = F::from_noncanonical_u64(F::ORDER + 5);
+        out.push([nc; WIDTH]);
+        let mut mixed = [F::ZERO; WIDTH];
+        for i in 0..WIDTH {
+            let raw = match i % 4 {
+                0 => F::ORDER.wrapping_add(i as u64),
+                1 => u64::MAX.wrapping_sub(i as u64),
+                2 => (i as u64).wrapping_mul(0x9e3779b97f4a7c15),
+                _ => F::ORDER.wrapping_sub(1).wrapping_sub(i as u64),
+            };
+            mixed[i] = F::from_noncanonical_u64(raw);
+        }
+        out.push(mixed);
+        // Seed values above ORDER and within 97 of 2^64 so rare double-overflow
+        // corrections in Goldilocks Add are exercised.
+        let mut edge = [F::ZERO; WIDTH];
+        for i in 0..WIDTH {
+            edge[i] = F::from_noncanonical_u64(u64::MAX.wrapping_sub(i as u64 * 7));
+        }
+        out.push(edge);
+        for _ in 0..64 {
+            out.push(core::array::from_fn(|_| F::rand()));
+        }
+        for _ in 0..64 {
+            out.push(core::array::from_fn(|_| {
+                F::from_noncanonical_u64(F::rand().0.wrapping_mul(3))
+            }));
+        }
+        out
+    }
+
+    #[test]
+    fn neon_matches_scalar_twin_raw_limbs() {
+        for (case, state0) in adversarial_states().into_iter().enumerate() {
+            let mut a = state0;
+            let mut b = state0;
+            unsafe {
+                internal_neon(&mut a);
+            }
+            internal_scalar(&mut b);
+            for i in 0..WIDTH {
+                assert_eq!(
+                    a[i].0, b[i].0,
+                    "raw limb mismatch case={case} i={i}: neon={:#x} scalar={:#x}",
+                    a[i].0,
+                    b[i].0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn neon_matches_packed_reference_raw_limbs() {
+        // The packed path is what production used before this override. Raw
+        // identity confirms we did not change the algorithm, only the add units.
+        for (case, state0) in adversarial_states().into_iter().enumerate() {
+            let mut neon = state0;
+            let mut packed = state0;
+            unsafe {
+                internal_neon(&mut neon);
+            }
+            apply_packed_reference(&mut packed);
+            for i in 0..WIDTH {
+                assert_eq!(
+                    neon[i].0, packed[i].0,
+                    "packed raw mismatch case={case} i={i}: neon={:#x} packed={:#x}",
+                    neon[i].0,
+                    packed[i].0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn neon_field_equals_mul_acc_path() {
+        // multiply_accumulate may differ in raw limbs from mul-then-add; only
+        // field equality is required against that schedule.
+        for (case, state0) in adversarial_states().into_iter().enumerate() {
+            let mut neon = state0;
+            let mut acc = state0;
+            unsafe {
+                internal_neon(&mut neon);
+            }
+            apply_mul_acc_reference(&mut acc);
+            for i in 0..WIDTH {
+                assert_eq!(
+                    neon[i].to_canonical_u64(),
+                    acc[i].to_canonical_u64(),
+                    "canonical mismatch case={case} i={i}: neon_raw={:#x} acc_raw={:#x}",
+                    neon[i].0,
+                    acc[i].0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn production_internal_is_neon_raw_identical_to_helper() {
+        for (case, state0) in adversarial_states().into_iter().enumerate() {
+            let mut prod = state0;
+            let mut neon = state0;
+            F::internal_linear_layer(&mut prod);
+            unsafe {
+                internal_neon(&mut neon);
+            }
+            for i in 0..WIDTH {
+                assert_eq!(
+                    prod[i].0, neon[i].0,
+                    "production dispatch mismatch case={case} i={i}",
+                );
+            }
+        }
+    }
+
+    /// Mutation check: corrupting a limb must be visible to the raw-limb compare.
+    #[test]
+    fn mutation_is_detected() {
+        let state0: [F; WIDTH] = core::array::from_fn(|_| F::rand());
+        let mut neon = state0;
+        let mut scalar = state0;
+        unsafe {
+            internal_neon(&mut neon);
+        }
+        internal_scalar(&mut scalar);
+        assert_eq!(neon[0].0, scalar[0].0);
+        neon[0] = F::from_noncanonical_u64(neon[0].0 ^ 1);
+        assert_ne!(neon[0].0, scalar[0].0, "mutation must change a limb");
+    }
+
+    /// Full poseidon2 permutation: NEON internal path must match a permutation
+    /// that uses the scalar-twin internal layer for every partial round.
+    #[test]
+    fn poseidon2_with_neon_internal_matches_scalar_internal_perm() {
+        for (case, state0) in adversarial_states().into_iter().take(32).enumerate() {
+            let neon_out = F::poseidon2(state0);
+
+            // Manual perm with scalar internal
+            let mut state = state0;
+            F::external_linear_layer(&mut state);
+            // full rounds first half
+            for r in 0..crate::hash::poseidon2::config::ROUNDS_F_HALF {
+                F::add_rc(&mut state, r);
+                F::sbox(&mut state);
+                F::external_linear_layer(&mut state);
+            }
+            for r in 0..crate::hash::poseidon2::config::ROUNDS_P {
+                state[0] += F::from_canonical_u64(INTERNAL_CONSTANTS[r]);
+                state[0] = F::sbox_p(&state[0]);
+                internal_scalar(&mut state);
+            }
+            for r in crate::hash::poseidon2::config::ROUNDS_F_HALF
+                ..(2 * crate::hash::poseidon2::config::ROUNDS_F_HALF)
+            {
+                F::add_rc(&mut state, r);
+                F::sbox(&mut state);
+                F::external_linear_layer(&mut state);
+            }
+            for i in 0..WIDTH {
+                assert_eq!(
+                    neon_out[i].0, state[i].0,
+                    "full perm raw mismatch case={case} i={i}",
+                );
+            }
+        }
     }
 }
