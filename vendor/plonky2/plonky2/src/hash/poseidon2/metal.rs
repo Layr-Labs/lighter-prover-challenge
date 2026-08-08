@@ -1091,6 +1091,21 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     {
         return None;
     }
+
+    build_merkle_tree_shared_streamed_inner(columns, cap_height, fill_group)
+}
+
+/// Executes the streamed build after the production admission policy accepts
+/// its shape. Kept separate so a small real-Metal differential can exercise
+/// the exact resource placement and command sequence without allocating a
+/// production-sized 2^20-leaf tree.
+fn build_merkle_tree_shared_streamed_inner<F: RichField>(
+    columns: &MetalColumns<F>,
+    cap_height: usize,
+    fill_group: &(dyn Fn(usize, &mut [&mut [F]]) + Sync),
+) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
+    let leaf_width = columns.cols;
+    let leaf_count = columns.rows;
     let context = shared_context()?;
     let pipeline = absorb_pass_pipeline()?;
     log::debug!("streamed sponge build: {leaf_width} cols x {leaf_count} leaves");
@@ -1109,9 +1124,13 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     if needs_new {
         *buffers = Some(autoreleasepool(|| {
             (
+                // The CPU never reads this inter-pass state. Keeping it private
+                // lets Metal choose GPU-optimal storage for the buffer swept
+                // once per absorb pass; only the columns and final digests need
+                // shared CPU visibility.
                 context.device.new_buffer(
                     state_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
+                    MTLResourceOptions::StorageModePrivate,
                 ),
                 context.device.new_buffer(
                     output_bytes as u64,
@@ -4859,6 +4878,65 @@ kernel void goldilocks_mul_bench_native(
                 assert_all_paths_raw_eq(&direct, &staged, rows, cap_height);
             }
         }
+    }
+
+    #[test]
+    fn streamed_private_state_matches_classic_tree_and_paths() {
+        const ROWS: usize = 256;
+        const COLS: usize = 17;
+        const CAP_HEIGHT: usize = 3;
+
+        let context = CONTEXT.as_ref().unwrap_or_else(|error| panic!("{error}"));
+        let mut rng = StdRng::seed_from_u64(0x5052_4956_5354_4154);
+        let columns: Vec<Vec<GoldilocksField>> = (0..COLS)
+            .map(|column| {
+                (0..ROWS)
+                    .map(|row| {
+                        let raw = match (column * ROWS + row) & 7 {
+                            0 => 0,
+                            1 => 1,
+                            2 => GoldilocksField::ORDER - 1,
+                            3 => GoldilocksField::ORDER,
+                            4 => GoldilocksField::ORDER + 1,
+                            5 => u64::MAX,
+                            _ => rng.next_u64(),
+                        };
+                        GoldilocksField(raw)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let shared = context
+            .allocate_columns::<GoldilocksField>(ROWS, COLS)
+            .expect("streamed columns must allocate");
+        let fill_group = |group: usize, destinations: &mut [&mut [GoldilocksField]]| {
+            let first_column = group * 8;
+            for (offset, destination) in destinations.iter_mut().enumerate() {
+                destination.copy_from_slice(&columns[first_column + offset]);
+            }
+        };
+        let streamed =
+            build_merkle_tree_shared_streamed_inner(&shared, CAP_HEIGHT, &fill_group)
+                .expect("streamed private-state build must succeed");
+
+        {
+            let buffers = STREAMED_BUFFERS.lock().expect("streamed buffer lock");
+            let (state, output) = buffers.as_ref().expect("streamed buffers allocated");
+            assert_eq!(state.storage_mode(), metal::MTLStorageMode::Private);
+            assert_eq!(output.storage_mode(), metal::MTLStorageMode::Shared);
+        }
+
+        let classic = context
+            .build(
+                LeafSource::Columns(&columns),
+                COLS,
+                ROWS,
+                CAP_HEIGHT,
+            )
+            .expect("classic column build must succeed");
+        assert_tree_raw_eq(&streamed, &classic, COLS, CAP_HEIGHT);
+        assert_all_paths_raw_eq(&streamed, &classic, ROWS, CAP_HEIGHT);
     }
 
     #[test]
