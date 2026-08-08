@@ -65,7 +65,7 @@ fn main() {
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
     // Fixture parse overlaps the pre-execution circuit load; both are fast.
-    let (block, pre_circuits) = rayon::join(
+    let (mut block, pre_circuits) = rayon::join(
         || {
             let json = fs::read(&fixture).expect("cannot read prover fixture");
             Block::<F>::from_json_with_empty_txs(
@@ -88,7 +88,7 @@ fn main() {
             }
         },
     );
-    let pre_exec = circuit::block_pre_execution::BlockPreExec::from_block(&block);
+    let pre_exec = circuit::block_pre_execution::BlockPreExec::take_from_block(&mut block);
     let pre_handle = std::thread::Builder::new()
         .name("pre-exec-startup".into())
         .stack_size(PROVER_THREAD_STACK_BYTES)

@@ -468,11 +468,9 @@ pub fn prove_block(mut block: Block<F>, mut circuits: Circuits) -> Proof {
     // the serialized GPU stream is otherwise idle: route its mid-size column
     // trees to the GPU for just this phase.
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-    let pre_proof = prove_pre_execution_parallel(
-        &circuits.pre_data,
-        &circuits.pre_target,
-        &BlockPreExec::from_block(&block),
-    );
+    let pre_exec = BlockPreExec::take_from_block(&mut block);
+    let pre_proof =
+        prove_pre_execution_parallel(&circuits.pre_data, &circuits.pre_target, &pre_exec);
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
     prove_block_after_pre(block, circuits, pre_proof)
 }
@@ -679,6 +677,45 @@ mod tests {
             .expect("orchestration test thread must start")
             .join()
             .expect("orchestration test thread must finish");
+    }
+
+    #[test]
+    fn taking_pre_execution_inputs_preserves_the_seeded_witness() {
+        std::thread::Builder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(|| {
+                let mut moved_source = Block::<F>::from_json_with_empty_txs(
+                    include_bytes!("../bench_test.json"),
+                    HEAVY_TX_PER_PROOF,
+                    LIGHT_TX_PER_PROOF,
+                    PUBLIC_HEAVY_TX_COUNT,
+                    PUBLIC_LIGHT_TX_COUNT,
+                )
+                .expect("public fixture must parse");
+                let reference_source = moved_source.clone();
+
+                let reference = BlockPreExec::from_block(&reference_source);
+                let moved = BlockPreExec::take_from_block(&mut moved_source);
+                let (target, _) = Circuits::load_pre().expect("embedded pre circuit must load");
+
+                let reference_witness = <BlockPreExecutionCircuit as circuit::block_pre_execution_constraints::Circuit<C, F, D>>::generate_witness(
+                    &reference,
+                    &target,
+                )
+                .expect("reference pre-execution witness must generate");
+                let moved_witness = <BlockPreExecutionCircuit as circuit::block_pre_execution_constraints::Circuit<C, F, D>>::generate_witness(
+                    &moved,
+                    &target,
+                )
+                .expect("moved pre-execution witness must generate");
+
+                assert_eq!(reference_witness.target_values, moved_witness.target_values);
+                assert_eq!(moved_source.tx_chunks.len(), reference_source.tx_chunks.len());
+                assert_eq!(moved_source.new_state_root, reference_source.new_state_root);
+            })
+            .expect("pre-execution move test thread must start")
+            .join()
+            .expect("pre-execution move test thread must finish");
     }
 
     #[test]
