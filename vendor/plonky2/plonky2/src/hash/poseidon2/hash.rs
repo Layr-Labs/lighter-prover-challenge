@@ -141,10 +141,11 @@ pub trait Poseidon2: PrimeField64 {
             b[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
             c[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
             d[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
-            a[0] = Self::sbox_p(&a[0]);
-            b[0] = Self::sbox_p(&b[0]);
-            c[0] = Self::sbox_p(&c[0]);
-            d[0] = Self::sbox_p(&d[0]);
+            let sboxed = Self::sbox_p_x4([a[0], b[0], c[0], d[0]]);
+            a[0] = sboxed[0];
+            b[0] = sboxed[1];
+            c[0] = sboxed[2];
+            d[0] = sboxed[3];
             Self::internal_linear_layer(a);
             Self::internal_linear_layer(b);
             Self::internal_linear_layer(c);
@@ -261,6 +262,11 @@ pub trait Poseidon2: PrimeField64 {
     }
 
     fn sbox_p(a: &Self) -> Self;
+
+    #[inline]
+    fn sbox_p_x4(input: [Self; 4]) -> [Self; 4] {
+        input.map(|value| Self::sbox_p(&value))
+    }
 
     fn sbox_p_extension<F: FieldExtension<D, BaseField = Self>, const D: usize>(a: &F) -> F;
 
@@ -490,6 +496,20 @@ impl Poseidon2 for F {
         let a4 = a2.square();
         let a3 = *a * a2;
         a3 * a4
+    }
+
+    #[inline]
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    fn sbox_p_x4(input: [Self; 4]) -> [Self; 4] {
+        type Packing = <F as Packable>::Packing;
+
+        debug_assert_eq!(<Packing as PackedField>::WIDTH, 4);
+        let value = *Packing::from_slice(&input);
+        let value2 = value.square();
+        let value4 = value2.square();
+        let value3 = value * value2;
+        let result = value3 * value4;
+        core::array::from_fn(|lane| result.as_slice()[lane])
     }
 
     #[inline]
@@ -1091,10 +1111,51 @@ mod test {
 
 #[cfg(test)]
 mod pair_hash_tests {
-    use plonky2_field::types::Sample;
+    use plonky2_field::types::{Field64, Sample};
 
     use super::*;
     use crate::plonk::config::Hasher;
+
+    #[test]
+    fn four_lane_partial_sbox_matches_scalar_raw_words() {
+        let check = |input: [F; 4]| {
+            let actual = F::sbox_p_x4(input);
+            let expected = input.map(|value| F::sbox_p(&value));
+            assert_eq!(
+                actual.map(|value| value.0),
+                expected.map(|value| value.0),
+                "input={:?}",
+                input.map(|value| value.0),
+            );
+        };
+
+        let boundaries = [
+            0,
+            1,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            u32::MAX as u64,
+            1 << 32,
+            u64::MAX,
+        ];
+        for i in 0..boundaries.len() {
+            check(core::array::from_fn(|lane| {
+                F(boundaries[(i + lane * 3) % boundaries.len()])
+            }));
+        }
+
+        let mut state = 0x504f_5345_4944_4f4eu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..10_000 {
+            check(core::array::from_fn(|_| F(next())));
+        }
+    }
 
     #[test]
     fn pair_hash_matches_individual_across_widths() {

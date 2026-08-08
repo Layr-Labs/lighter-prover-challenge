@@ -132,6 +132,14 @@ pub trait Field:
         twiddle * value
     }
 
+    /// Internal hook for two independent products that can be interleaved by
+    /// fields with a suitable target-specific implementation.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn mul_pair(lhs: [Self; 2], rhs: [Self; 2]) -> [Self; 2] {
+        [lhs[0] * rhs[0], lhs[1] * rhs[1]]
+    }
+
     /// Compute the multiplicative inverse of this field element.
     fn try_inverse(&self) -> Option<Self>;
 

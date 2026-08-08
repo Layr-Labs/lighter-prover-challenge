@@ -95,6 +95,15 @@ impl Field for GoldilocksField {
         Self::order()
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    fn mul_pair(lhs: [Self; 2], rhs: [Self; 2]) -> [Self; 2] {
+        let (product0, product1) = crate::arch::aarch64::neon_goldilocks_field::mul_reduce_pair(
+            lhs[0].0, rhs[0].0, lhs[1].0, rhs[1].0,
+        );
+        [Self(product0), Self(product1)]
+    }
+
     /// Returns the inverse of the field element, computed with a least-absolute-remainder
     /// (centered) extended Euclidean algorithm on 64-bit integers.
     ///
@@ -733,6 +742,65 @@ mod tests {
                     check(e, next(), next());
                     check(next(), next(), e);
                 }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    mod mul_pair_differential {
+        use crate::goldilocks_field::GoldilocksField;
+        use crate::types::{Field, Field64};
+
+        fn check(lhs: [GoldilocksField; 2], rhs: [GoldilocksField; 2]) {
+            let actual = <GoldilocksField as Field>::mul_pair(lhs, rhs);
+            let expected = [lhs[0] * rhs[0], lhs[1] * rhs[1]];
+            assert_eq!(
+                actual.map(|value| value.0),
+                expected.map(|value| value.0),
+                "lhs={:?}, rhs={:?}",
+                lhs.map(|value| value.0),
+                rhs.map(|value| value.0),
+            );
+        }
+
+        #[test]
+        fn matches_scalar_raw_words() {
+            let edges = [
+                0,
+                1,
+                2,
+                GoldilocksField::ORDER - 1,
+                GoldilocksField::ORDER,
+                GoldilocksField::ORDER + 1,
+                u32::MAX as u64,
+                1 << 32,
+                u64::MAX - 1,
+                u64::MAX,
+            ];
+            for i in 0..edges.len() {
+                for j in 0..edges.len() {
+                    check(
+                        [GoldilocksField(edges[i]), GoldilocksField(edges[j])],
+                        [
+                            GoldilocksField(edges[(i + 3) % edges.len()]),
+                            GoldilocksField(edges[(j + 7) % edges.len()]),
+                        ],
+                    );
+                }
+            }
+
+            let mut state = 0x5041_4952_5f4d_554cu64;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            for _ in 0..10_000 {
+                check(
+                    [GoldilocksField(next()), GoldilocksField(next())],
+                    [GoldilocksField(next()), GoldilocksField(next())],
+                );
             }
         }
     }
