@@ -1240,6 +1240,16 @@ fn start_gpu_range_check_gate_quotient<
                     num_ops.checked_mul(20)?,
                     num_ops.checked_mul(15)?,
                 ),
+                U32QuotientGate::Interleave { num_ops } => {
+                    // 2 routed + 32 bits = 34 wires, 2 + 32 = 34 constraints per op.
+                    let per_op = 34usize;
+                    (
+                        U32QuotientKind::Interleave { num_ops },
+                        num_ops,
+                        num_ops.checked_mul(per_op)?,
+                        num_ops.checked_mul(per_op)?,
+                    )
+                }
                 U32QuotientGate::RandomAccess {
                     bits,
                     num_ops,

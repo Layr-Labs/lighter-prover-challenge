@@ -316,6 +316,16 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32InterleaveG
     fn extra_constant_wires(&self) -> Vec<(usize, usize)> {
         std::vec![]
     }
+
+    fn u32_quotient_gate(&self) -> Option<plonky2::gates::gate::U32QuotientGate> {
+        use plonky2::gates::gate::U32QuotientGate;
+        // Wire layout per op: 2 routed (x, x_interleaved) + 32 big-endian bits = 34.
+        // Constraints per op: 2 Horner reductions + 32 bit range checks = 34.
+        // Total wires = num_ops * 34, total constraints = num_ops * 34.
+        Some(U32QuotientGate::Interleave {
+            num_ops: self.num_ops,
+        })
+    }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D> for U32InterleaveGate {

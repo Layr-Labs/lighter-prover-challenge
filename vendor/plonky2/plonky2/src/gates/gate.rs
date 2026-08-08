@@ -76,6 +76,11 @@ pub enum U32QuotientGate {
         num_ops: usize,
         num_extra_constants: usize,
     },
+    /// U32 bit interleave: two routed words (x, x_interleaved) plus 32 big-endian
+    /// bit wires per operation. `2 + 32 = 34` wires and constraints per operation:
+    /// Horner-reduce bits at base 2 minus x, Horner-reduce at base 4 minus
+    /// x_interleaved, then `bit * (bit - 1)` for each of the 32 bits.
+    Interleave { num_ops: usize },
 }
 
 /// A custom gate.

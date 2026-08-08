@@ -1151,6 +1151,49 @@ kernel void range_check_gate_quotient(
                 acc_0 = next_0;
                 acc_1 = next_1;
             }
+
+        } else if (kind == 10u) {
+            // U32InterleaveGate: 2 routed wires (x, x_interleaved) + 32 big-endian
+            // bit wires per op = 34 wires, 34 constraints per op.
+            // Wire layout: wires[2*op]=x, wires[2*op+1]=x_interleaved,
+            //   wires[2*num_ops + 32*op + k]=bit_k (k=0 is MSB).
+            // Constraint order (matches CPU eval_unfiltered_base_batch_accumulate):
+            //   0: Horner_reduce(bits, base=2) - x
+            //   1: Horner_reduce(bits, base=4) - x_interleaved
+            //   2..33: bit_k * (bit_k - 1) for each bit (in bit decomposition order)
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong x = wires[(ulong)(2u * op) * lde_rows + source_row];
+                ulong x_interleaved = wires[(ulong)(2u * op + 1u) * lde_rows + source_row];
+                ulong bit_base = (ulong)(2u * num_ops + 32u * op);
+
+                // Horner reductions: iterate bits forward (bit 0 first).
+                // Matches eval_unfiltered_base_batch_accumulate which iterates
+                // the decomposition in forward order: acc = acc * base + bit.
+                ulong acc_base2 = 0;
+                ulong acc_base4 = 0;
+                for (uint k = 0; k < 32u; ++k) {
+                    ulong bit = gl_canonicalize(wires[(bit_base + k) * lde_rows + source_row]);
+                    acc_base2 = gl_mul_add(acc_base2, 2UL, bit);
+                    acc_base4 = gl_mul_add(acc_base4, 4UL, bit);
+                }
+                // Constraint 0: Horner(bits,2) - x
+                range_check_gate_emit(
+                    gl_sub(acc_base2, x), alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                // Constraint 1: Horner(bits,4) - x_interleaved
+                range_check_gate_emit(
+                    gl_sub(acc_base4, x_interleaved), alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                // Constraints 2..33: bit_k * (bit_k - 1) for each bit
+                for (uint k = 0; k < 32u; ++k) {
+                    ulong bit = gl_canonicalize(wires[(bit_base + k) * lde_rows + source_row]);
+                    ulong rc = gl_mul(bit, gl_sub(bit, 1UL));
+                    range_check_gate_emit(
+                        rc, alpha_powers, alpha_stride, gate_accumulators,
+                        constraint_index++);
+                }
+            }
+
         } else {
             // The Rust encoder rejects unknown discriminants; if a malformed
             // record reaches the shader, make its selected row unsatisfiable.

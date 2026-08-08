@@ -27,7 +27,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "5a26157063dd5c76cedf06d12681d4f146bacdd236c3613d861ec5bb781597e6";
+    "0dfe617a10f3f6483ae975dc4c96b59859db5295b63f5575873667695920e685";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -214,6 +214,10 @@ pub(crate) enum U32QuotientKind {
     Reducing {
         extension_coeffs: bool,
     },
+    /// U32 bit interleave: 2 routed wires + 32 big-endian bits per op.
+    /// Constraints: Horner(bits,2)-x, Horner(bits,4)-x_interleaved, then
+    /// 32 `bit*(bit-1)` range checks = 34 per op.
+    Interleave { num_ops: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -949,6 +953,11 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                             .checked_add(4)?,
                         spec.num_ops.checked_mul(2)?,
                     )
+                }
+                U32QuotientKind::Interleave { num_ops: _ } => {
+                    let per_op = 34usize;
+                    let count = spec.num_ops.checked_mul(per_op)?;
+                    (10usize, 0usize, 0usize, 0usize, count, count)
                 }
             };
         if wire_count > wires.cols
