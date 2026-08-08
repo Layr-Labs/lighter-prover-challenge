@@ -491,19 +491,24 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
         let second_input = vars.local_wires[self.wire_second_input()];
 
         // Get chunks and assert that they match
-        let first_chunks: Vec<_> = (0..self.num_chunks)
-            .map(|i| vars.local_wires[self.wire_first_chunk_val(i)])
-            .collect();
-        let second_chunks: Vec<_> = (0..self.num_chunks)
-            .map(|i| vars.local_wires[self.wire_second_chunk_val(i)])
-            .collect();
+        // Both chunk groups are contiguous in the gate layout. Borrow them
+        // directly instead of allocating and filling two temporary Vecs for
+        // every packed quotient batch.
+        let first_chunk_start = self.wire_first_chunk_val(0);
+        let second_chunk_start = self.wire_second_chunk_val(0);
+        let first_chunks = vars
+            .local_wires
+            .view(first_chunk_start..first_chunk_start + self.num_chunks);
+        let second_chunks = vars
+            .local_wires
+            .view(second_chunk_start..second_chunk_start + self.num_chunks);
 
         let first_chunks_combined = reduce_with_powers(
-            &first_chunks,
+            first_chunks,
             F::from_canonical_usize(1 << self.chunk_bits()),
         );
         let second_chunks_combined = reduce_with_powers(
-            &second_chunks,
+            second_chunks,
             F::from_canonical_usize(1 << self.chunk_bits()),
         );
 
@@ -543,16 +548,24 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
         let most_significant_diff = vars.local_wires[self.wire_most_significant_diff()];
         yield_constr.one(most_significant_diff - most_significant_diff_so_far);
 
-        let most_significant_diff_bits: Vec<_> = (0..self.chunk_bits() + 1)
-            .map(|i| vars.local_wires[self.wire_most_significant_diff_bit(i)])
-            .collect();
+        // The bit wires are contiguous too, so this third temporary allocation
+        // is equally unnecessary.
+        let diff_bit_start = self.wire_most_significant_diff_bit(0);
+        let most_significant_diff_bits = vars
+            .local_wires
+            .view(diff_bit_start..diff_bit_start + self.chunk_bits() + 1);
 
         // Range-check the bits.
-        for &bit in &most_significant_diff_bits {
+        for &bit in most_significant_diff_bits.iter() {
             yield_constr.one(bit * (P::ONES - bit));
         }
-
-        let bits_combined = reduce_with_powers(&most_significant_diff_bits, F::TWO);
+        // This is the same radix-two Horner specialization used by the newly
+        // promoted BaseSumGate<2> path: doubling is cheaper than a general
+        // packed field multiplication by the radix.
+        let mut bits_combined = P::ZEROS;
+        for &bit in most_significant_diff_bits.iter().rev() {
+            bits_combined = (bits_combined + bits_combined) + bit;
+        }
         let two_n = F::from_canonical_u64(1 << self.chunk_bits());
         yield_constr.one((most_significant_diff + two_n) - bits_combined);
 
