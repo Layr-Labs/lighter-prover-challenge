@@ -1151,6 +1151,40 @@ kernel void range_check_gate_quotient(
                 acc_0 = next_0;
                 acc_1 = next_1;
             }
+        } else if (kind == 10u) {
+            // BaseSumGate<B>: one decomposition per gate row (the host
+            // rejects any other op count). Wire 0 is the routed sum, wires
+            // 1..=num_limbs the little-endian base-`base` limbs; the limb
+            // count rides in the addend-count metadata word and the base in
+            // the result-limbs word. Constraint order matches the CPU gate
+            // exactly: the reversed-Horner sum recomposition first, then one
+            // range product (x-0)(x-1)...(x-base+1) per limb in ascending
+            // wire order.
+            uint num_limbs = num_addends;
+            uint base = result_limbs;
+            ulong recomposed = wires[(ulong)num_limbs * lde_rows + source_row];
+            for (uint remaining = num_limbs - 1u; remaining > 0u; --remaining) {
+                uint k = remaining - 1u;
+                recomposed = gl_add(
+                    gl_mul(recomposed, base),
+                    wires[((ulong)1u + k) * lde_rows + source_row]);
+            }
+            ulong expected_sum = wires[source_row];
+            range_check_gate_emit(
+                gl_sub(recomposed, expected_sum),
+                alpha_powers, alpha_stride, gate_accumulators,
+                constraint_index++);
+            for (uint j = 0; j < num_limbs; ++j) {
+                ulong x = wires[((ulong)1u + j) * lde_rows + source_row];
+                ulong product = x;
+                for (uint t = 1; t < base; ++t) {
+                    product = gl_mul(product, gl_sub(x, t));
+                }
+                range_check_gate_emit(
+                    product,
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
         } else {
             // The Rust encoder rejects unknown discriminants; if a malformed
             // record reaches the shader, make its selected row unsatisfiable.
@@ -1166,6 +1200,14 @@ kernel void range_check_gate_quotient(
     output[(ulong)gid * 2] = gl_canonicalize(total[0]);
     output[(ulong)gid * 2 + 1] = gl_canonicalize(total[1]);
 }
+
+// Source-generation marker. The Rust loader requires this exact symbol
+// before it will trust a prebuilt AIR library, so a `poseidon2.metallib`
+// built from an older source (without the BaseSum quotient branch) is
+// rejected and the loader compiles this source instead. Bump the suffix in
+// lockstep with METALLIB_REQUIRED_KERNELS in `metal.rs` whenever kernel
+// semantics change.
+kernel void shader_generation_2() {}
 
 kernel void poseidon2_hash_leaves(
     const device ulong* leaves [[buffer(0)]],

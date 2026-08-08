@@ -23,17 +23,30 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// shader cache does not pay the MSL front end. Regenerate whenever
 /// `poseidon2.metal` changes (see `MetalShared::new`); the
 /// `metallib_matches_shader_source` test enforces it.
+///
+/// INTERIM (shader generation 2, BaseSum quotient branch): this artifact is
+/// one source generation behind — it predates `shader_generation_2` and was
+/// built from source
+/// `5a26157063dd5c76cedf06d12681d4f146bacdd236c3613d861ec5bb781597e6`. The
+/// loader's function probe rejects it (the marker kernel is missing), so
+/// every worker compiles the MSL source instead (+~185 ms measured on an
+/// M4 Pro). Restore the fast path on a machine with the Metal toolchain:
+///   xcrun -sdk macosx metal -c poseidon2.metal -o poseidon2.air
+///   xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
-/// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
+/// SHA-256 of the current `poseidon2.metal` bytes. [`SHADER_METALLIB`] is
+/// current if and only if it was built from this exact source (equivalently,
+/// if it exposes the source's generation-marker kernel).
 const SHADER_SOURCE_SHA256: &str =
-    "5a26157063dd5c76cedf06d12681d4f146bacdd236c3613d861ec5bb781597e6";
+    "dac9fe5ddc731ed00034bf68287143ff455d1ee299f6241bb370c61d144422d8";
 
-/// Every kernel the shader defines. The prebuilt library is trusted only if all
-/// of them resolve, so a stale or truncated artifact falls back to compiling the
-/// source. This deliberately includes the lazily-built gate-quotient kernels:
-/// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 9] = [
+/// Every kernel the shader defines, plus the source-generation marker. The
+/// prebuilt library is trusted only if all of them resolve, so a stale or
+/// truncated artifact falls back to compiling the source. This deliberately
+/// includes the lazily-built gate-quotient kernels: they are absent from the
+/// eager path but must still be present in the AIR.
+const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
     "poseidon2_hash_parents",
@@ -43,6 +56,7 @@ const METALLIB_REQUIRED_KERNELS: [&str; 9] = [
     "ifft_finalize",
     "poseidon2_gate_quotient",
     "range_check_gate_quotient",
+    "shader_generation_2",
 ];
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
 /// (6654d43) ranked-validated this raised value inside its composition; my
@@ -187,6 +201,13 @@ pub(crate) enum U32QuotientKind {
     /// operation.
     ByteDecomposition {
         num_limbs: usize,
+    },
+    /// `BaseSumGate<B>`: one decomposition per gate row, `1 + num_limbs`
+    /// routed words (sum then little-endian base-`base` limbs) and
+    /// `1 + num_limbs` rows.
+    BaseSum {
+        num_limbs: usize,
+        base: usize,
     },
     /// Degree-5 extension multiplication: fifteen routed words per
     /// operation, five rows per operation.
@@ -865,6 +886,20 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                     let per_op = num_limbs.checked_mul(5)?.checked_add(1)?;
                     let count = spec.num_ops.checked_mul(per_op)?;
                     (3usize, num_limbs, 0usize, 0usize, count, count)
+                }
+                // The limb count rides in the addend-count word and the base
+                // in the result-limbs word. `BaseSumGate` is a single-op gate,
+                // so any other op count is a malformed record.
+                U32QuotientKind::BaseSum { num_limbs, base } => {
+                    if !matches!(base, 2 | 4)
+                        || num_limbs == 0
+                        || num_limbs > 63
+                        || spec.num_ops != 1
+                    {
+                        return None;
+                    }
+                    let count = num_limbs.checked_add(1)?;
+                    (10usize, num_limbs, base, 0usize, count, count)
                 }
                 U32QuotientKind::QuinticMultiplication => (
                     4usize,
@@ -2771,9 +2806,11 @@ mod tests {
 
     /// The prebuilt AIR library is only sound while it is the compiled form of
     /// the MSL we ship. Nothing in the type system ties the two together, so
-    /// this pins the source bytes: edit `poseidon2.metal` without regenerating
-    /// `poseidon2.metallib` and this fails loudly instead of silently proving
-    /// with stale kernels.
+    /// two guards layer up: this test pins the source bytes (edit
+    /// `poseidon2.metal` without updating the pin and this fails loudly), and
+    /// the loader's function probe requires the source's generation-marker
+    /// kernel, so an AIR artifact built from an older source can never be
+    /// silently used for proving — it falls back to compiling the source.
     #[test]
     fn metallib_matches_shader_source() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
@@ -2795,7 +2832,11 @@ mod tests {
 
     /// The fallback in `MetalShared::new` hides a broken artifact behind a
     /// source compile, which would silently give back the cost this exists to
-    /// remove. Assert the fast path is actually live on this machine.
+    /// remove. Assert the artifact's actual state on this machine: either the
+    /// fast path is live (every required kernel, including the generation
+    /// marker, resolves), or the artifact predates the current source
+    /// generation — then it must still be a well-formed library of the legacy
+    /// kernels and the loader provably rejects it in favor of the source.
     #[test]
     fn metallib_loads_and_exposes_every_kernel() {
         let Some(device) = Device::system_default() else {
@@ -2804,11 +2845,28 @@ mod tests {
         let library = device
             .new_library_with_data(SHADER_METALLIB)
             .expect("prebuilt metallib must load");
-        for name in METALLIB_REQUIRED_KERNELS {
-            assert!(
-                library.get_function(name, None).is_ok(),
-                "prebuilt metallib is missing kernel {name}"
+        if library.get_function("shader_generation_2", None).is_ok() {
+            for name in METALLIB_REQUIRED_KERNELS {
+                assert!(
+                    library.get_function(name, None).is_ok(),
+                    "prebuilt metallib is missing kernel {name}"
+                );
+            }
+        } else {
+            eprintln!(
+                "prebuilt poseidon2.metallib predates shader generation 2; every worker \
+                 compiles the MSL source (+~185 ms each) until it is regenerated with the \
+                 Metal toolchain (see SHADER_METALLIB docs)"
             );
+            for name in METALLIB_REQUIRED_KERNELS {
+                if name == "shader_generation_2" {
+                    continue;
+                }
+                assert!(
+                    library.get_function(name, None).is_ok(),
+                    "prebuilt metallib is missing legacy kernel {name}"
+                );
+            }
         }
     }
     use crate::gates::selectors::UNUSED_SELECTOR;
@@ -3505,6 +3563,43 @@ mod tests {
                 1,
                 UnionShape::U32(U32QuotientKind::ByteDecomposition { num_limbs: 1 }),
             ),
+            // Production BaseSum shapes (EdDSA scalar bits, tx hex nibbles)
+            // plus edge limb counts; the gate is single-op by construction.
+            (
+                1,
+                UnionShape::U32(U32QuotientKind::BaseSum {
+                    num_limbs: 63,
+                    base: 2,
+                }),
+            ),
+            (
+                1,
+                UnionShape::U32(U32QuotientKind::BaseSum {
+                    num_limbs: 16,
+                    base: 4,
+                }),
+            ),
+            (
+                1,
+                UnionShape::U32(U32QuotientKind::BaseSum {
+                    num_limbs: 32,
+                    base: 4,
+                }),
+            ),
+            (
+                1,
+                UnionShape::U32(U32QuotientKind::BaseSum {
+                    num_limbs: 1,
+                    base: 2,
+                }),
+            ),
+            (
+                1,
+                UnionShape::U32(U32QuotientKind::BaseSum {
+                    num_limbs: 2,
+                    base: 4,
+                }),
+            ),
             (5, UnionShape::U32(U32QuotientKind::QuinticMultiplication)),
             (6, UnionShape::U32(U32QuotientKind::QuinticSquaring)),
             (15, UnionShape::RangeCheck { bit_size: 16 }),
@@ -3831,6 +3926,28 @@ mod tests {
                                 constraints.len(),
                                 spec.num_ops * (1 + 5 * num_limbs)
                             );
+                        }
+                        U32QuotientKind::BaseSum { num_limbs, base } => {
+                            // Literal transcription of `BaseSumGate::
+                            // eval_unfiltered_base_packed`: reversed-Horner
+                            // sum recomposition first, then the ascending
+                            // per-limb products (x-0)(x-1)...(x-base+1).
+                            assert_eq!(spec.num_ops, 1);
+                            let base_f = F::from_canonical_usize(base);
+                            let mut computed_sum = F::ZERO;
+                            for k in (0..num_limbs).rev() {
+                                computed_sum = computed_sum * base_f + wire(1 + k);
+                            }
+                            constraints.push(computed_sum - wire(0));
+                            for j in 0..num_limbs {
+                                let x = wire(1 + j);
+                                constraints.push(
+                                    (0..base)
+                                        .map(|t| x - F::from_canonical_usize(t))
+                                        .product(),
+                                );
+                            }
+                            assert_eq!(constraints.len(), 1 + num_limbs);
                         }
                         U32QuotientKind::QuinticMultiplication => {
                             for op in 0..spec.num_ops {

@@ -1228,6 +1228,27 @@ fn start_gpu_range_check_gate_quotient<
                         expected,
                     )
                 }
+                U32QuotientGate::BaseSum { num_limbs, base } => {
+                    // One decomposition per gate row: the routed sum wire and
+                    // `num_limbs` little-endian limbs. `base` is restricted to
+                    // the differentially tested bases and `num_limbs` to the
+                    // field's base-2 capacity.
+                    if !matches!(base, 2 | 4) || num_limbs == 0 || num_limbs > 63 {
+                        if gpu_poseidon_quotient_diagnostics_enabled() {
+                            eprintln!(
+                                "[gpu-range-quotient] invalid base-sum metadata: {u32_gate:?}"
+                            );
+                        }
+                        return None;
+                    }
+                    let expected = num_limbs.checked_add(1)?;
+                    (
+                        U32QuotientKind::BaseSum { num_limbs, base },
+                        1,
+                        expected,
+                        expected,
+                    )
+                }
                 U32QuotientGate::QuinticMultiplication { num_ops } => (
                     U32QuotientKind::QuinticMultiplication,
                     num_ops,
@@ -2334,6 +2355,53 @@ mod quotient_layout_tests {
             .collect::<Vec<_>>();
         advertised.sort_unstable();
         assert_eq!(advertised, vec![(3, 8, 0), (4, 4, 2), (6, 1, 2)]);
+
+        let before = gpu_poseidon_quotient_stats();
+        COMPARE_GPU_QUOTIENT.store(true, Ordering::SeqCst);
+        let proof = data.prove(PartialWitness::new());
+        COMPARE_GPU_QUOTIENT.store(false, Ordering::SeqCst);
+        let proof = proof?;
+        let after = gpu_poseidon_quotient_stats();
+        assert!(after.range_started > before.range_started);
+        assert!(after.range_completed > before.range_completed);
+        data.verify(proof)?;
+        Ok(())
+    }
+
+    /// End-to-end retained-column differential for both production BaseSum
+    /// shapes (the 63-limb binary EdDSA scalar decomposition and the 16-limb
+    /// base-4 tx decomposition). The same prove call compares the combined
+    /// Metal quotient with a full CPU recomputation over identical LDE
+    /// columns and challenges, then verifies the resulting proof.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn metal_base_sum_quotient_matches_cpu_and_verifies() -> Result<()> {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let x2 = builder.constant(F::from_canonical_u64(0x6b17_d1f2_e12c_4247));
+        let limbs2 = builder.split_le_base::<2>(x2, 63);
+        let x4 = builder.constant(F::from_canonical_u64(0x89ab_cdef));
+        let limbs4 = builder.split_le_base::<4>(x4, 16);
+        builder.register_public_input(limbs2[0]);
+        builder.register_public_input(limbs4[0]);
+        // A 2^16-point LDE retains both wire and constants/sigmas commitments
+        // in shared Metal columns, exercising the production full-domain seam.
+        while builder.num_gates() <= (1 << 12) {
+            builder.add_gate(NoopGate, vec![]);
+        }
+        let data = builder.build::<Poseidon2GoldilocksConfig>();
+        assert!(data.common.luts.is_empty());
+        let mut advertised = data
+            .common
+            .gates
+            .iter()
+            .filter_map(|gate| match gate.0.u32_quotient_gate() {
+                Some(U32QuotientGate::BaseSum { num_limbs, base }) => Some((base, num_limbs)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        advertised.sort_unstable();
+        assert_eq!(advertised, vec![(2, 63), (4, 16)]);
 
         let before = gpu_poseidon_quotient_stats();
         COMPARE_GPU_QUOTIENT.store(true, Ordering::SeqCst);

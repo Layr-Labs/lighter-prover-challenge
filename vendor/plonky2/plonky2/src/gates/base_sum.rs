@@ -7,7 +7,7 @@ use anyhow::Result;
 use crate::field::extension::Extendable;
 use crate::field::packed::PackedField;
 use crate::field::types::{Field, Field64};
-use crate::gates::gate::Gate;
+use crate::gates::gate::{Gate, U32QuotientGate};
 use crate::gates::packed_util::PackedEvaluableBase;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -157,6 +157,20 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> Gate<F, D> fo
     // 1 for checking the sum then `num_limbs` for range-checking the limbs.
     fn num_constraints(&self) -> usize {
         1 + self.num_limbs
+    }
+
+    // Redraw 1 of ticket 13 (discriminating draw: regression vs cold-runner).
+    fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+        // Only the bases the Metal kernel is differentially tested against
+        // are advertised; any other base stays on the CPU without disturbing
+        // the combined job's remaining gates.
+        match B {
+            2 | 4 => Some(U32QuotientGate::BaseSum {
+                num_limbs: self.num_limbs,
+                base: B,
+            }),
+            _ => None,
+        }
     }
 }
 
