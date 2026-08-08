@@ -1292,7 +1292,9 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            // This state-heavy kernel has no threadgroup cooperation. Target
+            // one Apple SIMDgroup; the helper raises the cap on wider hardware.
+            dispatch_capped(encoder, pipeline, leaf_count, 32);
             encoder.end_encoding();
             command_buffer.commit();
             command_buffer.to_owned()
@@ -2774,10 +2776,19 @@ fn dispatch(
     pipeline: &ComputePipelineState,
     thread_count: usize,
 ) {
+    dispatch_capped(encoder, pipeline, thread_count, 64);
+}
+
+fn dispatch_capped(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+    max_group_width: NSUInteger,
+) {
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(64)
+        .min(max_group_width)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
