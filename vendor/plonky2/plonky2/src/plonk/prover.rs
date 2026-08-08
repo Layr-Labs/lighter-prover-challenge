@@ -1540,6 +1540,20 @@ fn compute_quotient_polys<
     );
     let lde_size = points.len();
     debug_assert_eq!(shifted_points.len(), lde_size);
+    // `points` is the two-adic subgroup of size `1 << (degree_bits +
+    // quotient_degree_bits)`, so `lde_size` is a power of two — but it is a
+    // runtime value, so `% lde_size` in the per-point wrap below compiled to a
+    // hardware 64-bit `udiv`, once for every LDE point of every proof (2^19 for a
+    // degree-2^16 transaction proof, 2^21 for the final block proof), and integer
+    // division neither vectorizes nor pipelines. Masking is bit-identical for a
+    // power-of-two modulus and the assertion below makes that a checked fact
+    // rather than an assumption. Same trap, same fix, as `zero_poly_coset`'s
+    // `rate_mask`.
+    assert!(
+        lde_size.is_power_of_two(),
+        "quotient LDE domain must be a power of two"
+    );
+    let lde_mask = lde_size - 1;
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let gpu_poseidon = allow_gpu_poseidon
@@ -1741,7 +1755,7 @@ fn compute_quotient_polys<
                 scratch.indices_next.clear();
                 scratch
                     .indices_next
-                    .extend(scratch.indices.iter().map(|&i| (i + next_step) % lde_size));
+                    .extend(scratch.indices.iter().map(|&i| (i + next_step) & lde_mask));
 
                 let shifted_xs_batch = &shifted_points[BATCH_SIZE * batch_i..][..n];
                 debug_assert!(
@@ -2372,6 +2386,28 @@ mod quotient_layout_tests {
         for k in 0..n {
             for c in 0..w {
                 assert_eq!(point_major[k * w + c].0, poly_major[c * n + k].0);
+            }
+        }
+    }
+
+    /// The quotient loop's "next point" wrap replaced `% lde_size` with
+    /// `& (lde_size - 1)`. Pin the identity over the whole index range the loop
+    /// can produce, for every power-of-two domain size the production circuits
+    /// use, plus the next-step values their `quotient_degree_bits` produce.
+    #[test]
+    fn quotient_next_index_mask_matches_modulo() {
+        for domain_bits in 2..=12u32 {
+            let lde_size = 1usize << domain_bits;
+            let lde_mask = lde_size - 1;
+            for next_step_bits in 0..domain_bits {
+                let next_step = 1usize << next_step_bits;
+                for i in 0..lde_size {
+                    assert_eq!(
+                        (i + next_step) & lde_mask,
+                        (i + next_step) % lde_size,
+                        "domain 2^{domain_bits}, next_step 2^{next_step_bits}, i {i}"
+                    );
+                }
             }
         }
     }
