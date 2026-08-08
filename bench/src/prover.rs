@@ -557,29 +557,30 @@ pub(crate) fn prove_block_after_pre(
                     let (block_target, block_data) = circuits.build_block_circuit();
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
-                    let early = BlockCircuit::witness_inputs_early(
-                        &block_target,
-                        block_ref,
-                        pre_proof_ref,
-                    )
-                    .expect("final block early witness inputs failed");
-                    let mut pending = PendingPartitionWitness::start(
-                        early,
+                    let mut pending = PendingPartitionWitness::start_seeded(
                         &block_data.prover_only,
                         &block_data.common,
+                        |seeder| {
+                            BlockCircuit::seed_witness_early_into(
+                                &block_target,
+                                block_ref,
+                                pre_proof_ref,
+                                seeder,
+                            )
+                        },
                     )
                     .expect("final block early witness phase failed");
                     let heavy_chain_proof = heavy_handle_outer
                         .join()
                         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                     pending
-                        .feed(
-                            BlockCircuit::witness_inputs_heavy_chain(
+                        .feed_seeded(|feeder| {
+                            BlockCircuit::seed_witness_heavy_chain_into(
                                 &block_target,
                                 &heavy_chain_proof,
+                                feeder,
                             )
-                            .expect("final block heavy-chain witness inputs failed"),
-                        )
+                        })
                         .expect("final block heavy-chain witness feed failed");
                     (block_target, block_data, pending, heavy_chain_proof)
                 })
@@ -627,10 +628,13 @@ pub(crate) fn prove_block_after_pre(
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
     let mut block_pending = block_pending;
     block_pending
-        .feed(
-            BlockCircuit::witness_inputs_light_chain(&block_target, light_chain_input)
-                .expect("final block light-chain witness inputs failed"),
-        )
+        .feed_seeded(|feeder| {
+            BlockCircuit::seed_witness_light_chain_into(
+                &block_target,
+                light_chain_input,
+                feeder,
+            )
+        })
         .expect("final block light-chain witness feed failed");
     let _ = heavy_chain_input;
     let final_proof = BlockCircuit::prove_prepared(block_pending, block_data)

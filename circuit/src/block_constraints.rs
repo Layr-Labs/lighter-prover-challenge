@@ -262,8 +262,17 @@ impl BlockCircuit {
         light_tx_chain_proof: &ProofWithPublicInputs<F, C, D>,
     ) -> Result<PartialWitness<F>> {
         let mut pw = PartialWitness::new();
-        pw.set_proof_with_pis_target(&target.light_tx_chain_proof, light_tx_chain_proof)?;
+        Self::seed_witness_light_chain_into(target, light_tx_chain_proof, &mut pw)?;
         Ok(pw)
+    }
+
+    /// Seeded form of [`Self::witness_inputs_light_chain`] without an intermediate map.
+    pub fn seed_witness_light_chain_into<W: WitnessWrite<F>>(
+        target: &BlockTarget,
+        light_tx_chain_proof: &ProofWithPublicInputs<F, C, D>,
+        pw: &mut W,
+    ) -> Result<()> {
+        pw.set_proof_with_pis_target(&target.light_tx_chain_proof, light_tx_chain_proof)
     }
 
     /// The heavy-chain witness inputs, fed once the heavy transaction chain proof is available.
@@ -272,8 +281,17 @@ impl BlockCircuit {
         heavy_tx_chain_proof: &ProofWithPublicInputs<F, C, D>,
     ) -> Result<PartialWitness<F>> {
         let mut pw = PartialWitness::new();
-        pw.set_proof_with_pis_target(&target.heavy_tx_chain_proof, heavy_tx_chain_proof)?;
+        Self::seed_witness_heavy_chain_into(target, heavy_tx_chain_proof, &mut pw)?;
         Ok(pw)
+    }
+
+    /// Seeded form of [`Self::witness_inputs_heavy_chain`] without an intermediate map.
+    pub fn seed_witness_heavy_chain_into<W: WitnessWrite<F>>(
+        target: &BlockTarget,
+        heavy_tx_chain_proof: &ProofWithPublicInputs<F, C, D>,
+        pw: &mut W,
+    ) -> Result<()> {
+        pw.set_proof_with_pis_target(&target.heavy_tx_chain_proof, heavy_tx_chain_proof)
     }
 
     /// Proves the block whose witness inputs were supplied through a [`PendingPartitionWitness`].
