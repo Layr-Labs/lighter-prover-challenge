@@ -36,9 +36,14 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // (no indirection) or omitting the trailing NUL would make jemalloc read the
 // string bytes as a pointer and crash. This is a default: the environment and
 // /etc/malloc.conf can still override it.
+// Keep more objects per small-allocation tcache bin on stable Rayon workers.
+// The prover repeatedly rebuilds short-lived field-element and Merkle containers;
+// increasing bin depth targets allocator lock traffic without extending tcache
+// eligibility to larger allocation classes.
 #[cfg(not(target_env = "msvc"))]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
+static MALLOC_CONF: &[u8; 64] =
+    b"dirty_decay_ms:-1,muzzy_decay_ms:-1,tcache_nslots_small_max:512\0";
 
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;

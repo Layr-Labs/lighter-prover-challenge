@@ -32,9 +32,9 @@ enum TxPath {
     Light,
 }
 
-const LIGHT_TX_PROOF_WINDOW: usize = 2;
+const LIGHT_TX_PROOF_WINDOW: usize = 3;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
-const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
+const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 2;
 
 fn chunk_is_light(txs: &[Tx<F>]) -> bool {
     txs.first()
@@ -332,23 +332,29 @@ fn prove_path(
                 (chunk_index, witness)
             });
 
-            in_flight.push_back((current_step, proof_handle));
-            let max_in_flight =
-                if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
-                    LIGHT_TX_PROOF_WINDOW
-                } else {
-                    1
-                };
-            if in_flight.len() >= max_in_flight {
-                let (proof_step, proof_handle) = in_flight
-                    .pop_front()
-                    .expect("transaction proof window must not be empty");
-                let tx_proof = proof_handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                pending_tx = Some((proof_step, tx_proof));
-            }
-            current_step += 1;
+              in_flight.push_back((current_step, proof_handle));
+              let max_in_flight =
+                  if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
+                      LIGHT_TX_PROOF_WINDOW
+                  } else {
+                      1
+                  };
+              // A completed proof no longer consumes compute capacity, so dispatch it to
+              // the ordered chain immediately instead of waiting for the fixed overlap
+              // window to fill. Running proofs still retain the full light-path window.
+              let front_is_ready = in_flight
+                  .front()
+                  .is_some_and(|(_, proof_handle)| proof_handle.is_finished());
+              if in_flight.len() >= max_in_flight || front_is_ready {
+                  let (proof_step, proof_handle) = in_flight
+                      .pop_front()
+                      .expect("transaction proof window must not be empty");
+                  let tx_proof = proof_handle
+                      .join()
+                      .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                  pending_tx = Some((proof_step, tx_proof));
+              }
+              current_step += 1;
 
             match next_witness {
                 Some((chunk_index, witness)) => {
