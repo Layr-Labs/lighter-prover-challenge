@@ -23,11 +23,14 @@ use plonky2::plonk::circuit_data::CircuitData;
 
 use crate::api::{Circuits, Proof};
 
-static PRE_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pre.embed"));
-static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx.embed"));
-static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
-static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
-static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+// The blobs are embedded in lz4-compressed form (see build.rs): ~41 MiB of
+// raw circuit bytes shrink to ~19 MiB, cutting the mapped size of the scored
+// worker binary that is spawned (and codesign-validated) per fixture.
+static PRE_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pre.embed.lz4"));
+static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx.embed.lz4"));
+static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed.lz4"));
+static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed.lz4"));
+static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed.lz4"));
 
 /// The four startup circuits that do not participate in pre-execution. Keeping
 /// this separate lets the worker start the pre-execution proof from its already
@@ -76,7 +79,9 @@ fn load_blob<T: serde::de::DeserializeOwned>(
         !blob.is_empty(),
         "embedded circuit blob {name} is an empty stub (compiled with LIGHTER_SKIP_EMBED=1)"
     );
-    deserialize_embedded::<T>(blob)
+    let raw = lz4_flex::block::decompress_size_prepended(blob)
+        .map_err(|error| anyhow::anyhow!("cannot decompress embedded circuit blob {name}: {error}"))?;
+    deserialize_embedded::<T>(&raw)
         .map_err(|error| error.context(format!("loading embedded circuit {name}")))
 }
 
