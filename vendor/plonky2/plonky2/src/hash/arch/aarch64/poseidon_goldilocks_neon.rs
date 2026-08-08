@@ -940,3 +940,144 @@ pub unsafe fn vector_add(a: &[u64; WIDTH], b: &[u64; WIDTH]) -> [u64; WIDTH] {
     }
     res
 }
+
+/// Goldilocks `x + y` on two lanes, matching `impl Add for GoldilocksField`
+/// word-for-word (two EPSILON corrections). Same form as the FFT `gl_add_neon`.
+#[inline(always)]
+unsafe fn gl_add2(
+    x: uint64x2_t,
+    y: uint64x2_t,
+    eps: uint64x2_t,
+) -> uint64x2_t {
+    let sum = vaddq_u64(x, y);
+    let over = vcltq_u64(sum, x);
+    let sum2 = vaddq_u64(sum, vandq_u64(over, eps));
+    let over2 = vcltq_u64(sum2, sum);
+    vaddq_u64(sum2, vandq_u64(over2, eps))
+}
+
+/// Apply the external Poseidon2 M_4 matrix to two independent 4-element blocks
+/// in parallel (NEON lane 0 = block at `off_a`, lane 1 = block at `off_b`).
+#[inline(always)]
+unsafe fn mat4_pair(p: *mut u64, off_a: usize, off_b: usize, eps: uint64x2_t) {
+    let x0 = vcombine_u64(vld1_u64(p.add(off_a)), vld1_u64(p.add(off_b)));
+    let x1 = vcombine_u64(vld1_u64(p.add(off_a + 1)), vld1_u64(p.add(off_b + 1)));
+    let x2 = vcombine_u64(vld1_u64(p.add(off_a + 2)), vld1_u64(p.add(off_b + 2)));
+    let x3 = vcombine_u64(vld1_u64(p.add(off_a + 3)), vld1_u64(p.add(off_b + 3)));
+
+    // Matching metal `mat4` / `external_linear_layer_u128` addition schedule:
+    //   t01 = x0+x1; t23 = x2+x3; total = t01+t23
+    //   y0 = total + t01 + x1
+    //   y1 = total + x1 + x2 + x2
+    //   y2 = total + t23 + x3
+    //   y3 = total + x3 + x0 + x0
+    let t01 = gl_add2(x0, x1, eps);
+    let t23 = gl_add2(x2, x3, eps);
+    let total = gl_add2(t01, t23, eps);
+
+    let y0 = gl_add2(gl_add2(total, t01, eps), x1, eps);
+    let y1 = gl_add2(gl_add2(gl_add2(total, x1, eps), x2, eps), x2, eps);
+    let y2 = gl_add2(gl_add2(total, t23, eps), x3, eps);
+    let y3 = gl_add2(gl_add2(gl_add2(total, x3, eps), x0, eps), x0, eps);
+
+    vst1_u64(p.add(off_a), vget_low_u64(y0));
+    vst1_u64(p.add(off_b), vget_high_u64(y0));
+    vst1_u64(p.add(off_a + 1), vget_low_u64(y1));
+    vst1_u64(p.add(off_b + 1), vget_high_u64(y1));
+    vst1_u64(p.add(off_a + 2), vget_low_u64(y2));
+    vst1_u64(p.add(off_b + 2), vget_high_u64(y2));
+    vst1_u64(p.add(off_a + 3), vget_low_u64(y3));
+    vst1_u64(p.add(off_b + 3), vget_high_u64(y3));
+}
+
+/// Apply M_4 to a single 4-element block (used for the third block; WIDTH=12).
+#[inline(always)]
+unsafe fn mat4_one(p: *mut u64, off: usize, eps: uint64x2_t) {
+    // Lane 1 is unused dummy zeros so we can reuse the vector gl_add.
+    let zero = vdup_n_u64(0);
+    let x0 = vcombine_u64(vld1_u64(p.add(off)), zero);
+    let x1 = vcombine_u64(vld1_u64(p.add(off + 1)), zero);
+    let x2 = vcombine_u64(vld1_u64(p.add(off + 2)), zero);
+    let x3 = vcombine_u64(vld1_u64(p.add(off + 3)), zero);
+
+    let t01 = gl_add2(x0, x1, eps);
+    let t23 = gl_add2(x2, x3, eps);
+    let total = gl_add2(t01, t23, eps);
+
+    let y0 = gl_add2(gl_add2(total, t01, eps), x1, eps);
+    let y1 = gl_add2(gl_add2(gl_add2(total, x1, eps), x2, eps), x2, eps);
+    let y2 = gl_add2(gl_add2(total, t23, eps), x3, eps);
+    let y3 = gl_add2(gl_add2(gl_add2(total, x3, eps), x0, eps), x0, eps);
+
+    vst1_u64(p.add(off), vget_low_u64(y0));
+    vst1_u64(p.add(off + 1), vget_low_u64(y1));
+    vst1_u64(p.add(off + 2), vget_low_u64(y2));
+    vst1_u64(p.add(off + 3), vget_low_u64(y3));
+}
+
+/// Poseidon2 external linear layer (MDS) with NEON Goldilocks add/reduce.
+///
+/// Pure add/sub — zero multiplies. Multiplies stay in GPRs elsewhere (sbox);
+/// this path vectorises the 58%-class reduction work, twin to the FFT NEON reduce.
+///
+/// Addition schedule matches the Metal `external_linear_layer` / stepwise
+/// Goldilocks `Add` form. Field-equal to the u128-then-reduce production path;
+/// raw-limb identical to the scalar Goldilocks-add twin (see tests).
+///
+/// `#[inline(never)]` so release `prove` keeps a symbol for the disassembly gate.
+#[inline(never)]
+pub unsafe fn external_linear_layer(state: &mut [GoldilocksField; WIDTH]) {
+    let eps = vdupq_n_u64(EPSILON);
+    let p = state.as_mut_ptr() as *mut u64;
+
+    // Three M_4 blocks; first two in parallel, third alone.
+    mat4_pair(p, 0, 4, eps);
+    mat4_one(p, 8, eps);
+
+    // Outer circulant: sums[k] = s[k] + s[k+4] + s[k+8], then s[i] += sums[i%4].
+    // Process pairs (0,1) and (2,3).
+    let s01 = vld1q_u64(p.add(0));
+    let s45 = vld1q_u64(p.add(4));
+    let s89 = vld1q_u64(p.add(8));
+    let sums01 = gl_add2(gl_add2(s01, s45, eps), s89, eps);
+
+    let s23 = vld1q_u64(p.add(2));
+    let s67 = vld1q_u64(p.add(6));
+    let s1011 = vld1q_u64(p.add(10));
+    let sums23 = gl_add2(gl_add2(s23, s67, eps), s1011, eps);
+
+    vst1q_u64(p.add(0), gl_add2(s01, sums01, eps));
+    vst1q_u64(p.add(2), gl_add2(s23, sums23, eps));
+    vst1q_u64(p.add(4), gl_add2(s45, sums01, eps));
+    vst1q_u64(p.add(6), gl_add2(s67, sums23, eps));
+    vst1q_u64(p.add(8), gl_add2(s89, sums01, eps));
+    vst1q_u64(p.add(10), gl_add2(s1011, sums23, eps));
+}
+
+/// Scalar twin of `external_linear_layer`: same Goldilocks `Add` schedule, no NEON.
+/// Used by the raw-limb differential; not on the production path.
+#[inline(never)]
+pub fn external_linear_layer_scalar_add(state: &mut [GoldilocksField; WIDTH]) {
+    for i in (0..WIDTH).step_by(4) {
+        let x0 = state[i];
+        let x1 = state[i + 1];
+        let x2 = state[i + 2];
+        let x3 = state[i + 3];
+        let t01 = x0 + x1;
+        let t23 = x2 + x3;
+        let total = t01 + t23;
+        state[i] = total + t01 + x1;
+        state[i + 1] = total + x1 + x2 + x2;
+        state[i + 2] = total + t23 + x3;
+        state[i + 3] = total + x3 + x0 + x0;
+    }
+    let sums = [
+        state[0] + state[4] + state[8],
+        state[1] + state[5] + state[9],
+        state[2] + state[6] + state[10],
+        state[3] + state[7] + state[11],
+    ];
+    for i in 0..WIDTH {
+        state[i] = state[i] + sums[i % 4];
+    }
+}
