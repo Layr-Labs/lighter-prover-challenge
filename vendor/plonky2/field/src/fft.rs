@@ -822,15 +822,44 @@ fn fft_zero_padded_rate_8_first_layer_block(
         let u = packed_values[source / 4].as_slice()[source % 4];
         let v = packed_values[(source + 1) / 4].as_slice()[(source + 1) % 4];
         let products = mul_16th_root_powers(v);
-        let low = *WideGoldilocksField::from_slice(&products[..4]);
-        let high = *WideGoldilocksField::from_slice(&products[4..]);
-        let u = WideGoldilocksField::from(u);
         let pair_destination = destination + pair * 4;
 
-        packed_values[pair_destination] = u + low;
-        packed_values[pair_destination + 1] = u + high;
-        packed_values[pair_destination + 2] = u - low;
-        packed_values[pair_destination + 3] = u - high;
+        // `WideGoldilocksField::{Add,Sub}` currently lowers to four scalar
+        // correction chains here. This rate-8 block has no multiplication
+        // between the broadcast `u` and its eight products, so keep those
+        // exact reductions in NEON registers and write each four-lane result
+        // directly. Multiplication remains in the accepted scalar
+        // `mul_16th_root_powers` kernel.
+        unsafe {
+            use core::arch::aarch64::*;
+
+            let eps = vdupq_n_u64((1 << 32) - 1);
+            let u = vdupq_n_u64(u.0);
+            let products_ptr = products.as_ptr().cast::<u64>();
+            let low_0 = vld1q_u64(products_ptr);
+            let low_1 = vld1q_u64(products_ptr.add(2));
+            let high_0 = vld1q_u64(products_ptr.add(4));
+            let high_1 = vld1q_u64(products_ptr.add(6));
+            let output = packed_values
+                .as_mut_ptr()
+                .cast::<u64>()
+                .add(pair_destination * 4);
+
+            // SAFETY: `GoldilocksField`, `NeonGoldilocksField`, and
+            // `WideGoldilocksField` are transparent over their u64 lanes.
+            // This pair owns four consecutive packed destinations. The
+            // reverse traversal reads both scalar sources and computes all
+            // products before these stores, preserving the existing
+            // in-place expansion ordering.
+            vst1q_u64(output, gl_add_neon(u, low_0, eps));
+            vst1q_u64(output.add(2), gl_add_neon(u, low_1, eps));
+            vst1q_u64(output.add(4), gl_add_neon(u, high_0, eps));
+            vst1q_u64(output.add(6), gl_add_neon(u, high_1, eps));
+            vst1q_u64(output.add(8), gl_sub_neon(u, low_0, eps));
+            vst1q_u64(output.add(10), gl_sub_neon(u, low_1, eps));
+            vst1q_u64(output.add(12), gl_sub_neon(u, high_0, eps));
+            vst1q_u64(output.add(14), gl_sub_neon(u, high_1, eps));
+        }
     }
 }
 
@@ -2582,7 +2611,17 @@ mod tests {
         type F = GoldilocksField;
         let shift = F::coset_shift();
 
-        for (base_lg_n, r) in [(3, 1), (8, 2), (10, 3), (12, 3), (13, 3), (15, 3)] {
+        for (base_lg_n, r) in [
+            (3, 1),
+            (8, 2),
+            (10, 3),
+            (12, 3),
+            (13, 3),
+            (14, 3),
+            (15, 3),
+            (16, 3),
+            (18, 3),
+        ] {
             let lg_n = base_lg_n + r;
             let n = 1 << lg_n;
             let nonzero_len = 1 << base_lg_n;
@@ -2622,6 +2661,79 @@ mod tests {
                 actual_coset, expected_coset,
                 "zero-padded coset FFT mismatch for 2^{base_lg_n} -> 2^{lg_n}"
             );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn rate_8_neon_expansion_matches_scalar_raw_words() {
+        use super::{
+            fft_zero_padded_first_layer_block_with,
+            fft_zero_padded_rate_8_first_layer_block, GeneralTwiddle,
+        };
+        use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
+
+        type F = GoldilocksField;
+        const ORDER: u64 = 0xffff_ffff_0000_0001;
+        const EDGES: [u64; 10] = [
+            0,
+            1,
+            (1 << 32) - 1,
+            1 << 32,
+            ORDER - 2,
+            ORDER - 1,
+            ORDER,
+            ORDER + 1,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+
+        let roots = fft_root_table::<F>(16);
+        let omega = WideGoldilocksField::pack_slice(&roots[3]);
+        assert_eq!(omega.len(), 2);
+
+        for nonzero_len in [2usize, 4, 1024] {
+            for source_start in [0usize, 4] {
+                let destination = source_start * 2;
+                let packed_len = destination + nonzero_len * 2;
+                let mut input = vec![F::ZERO; packed_len * WideGoldilocksField::WIDTH];
+                for (i, slot) in input[source_start..source_start + nonzero_len]
+                    .iter_mut()
+                    .enumerate()
+                {
+                    let edge = EDGES[i % EDGES.len()];
+                    let mixed = if i < EDGES.len() {
+                        edge
+                    } else {
+                        edge.rotate_left((i % 64) as u32)
+                            ^ (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    };
+                    *slot = GoldilocksField(mixed);
+                }
+
+                let mut expected = input.clone();
+                let mut actual = input;
+                fft_zero_padded_first_layer_block_with::<WideGoldilocksField, GeneralTwiddle>(
+                    WideGoldilocksField::pack_slice_mut(&mut expected),
+                    source_start,
+                    nonzero_len,
+                    destination,
+                    2,
+                    omega,
+                );
+                fft_zero_padded_rate_8_first_layer_block(
+                    WideGoldilocksField::pack_slice_mut(&mut actual),
+                    source_start,
+                    nonzero_len,
+                    destination,
+                );
+
+                assert_eq!(
+                    actual.iter().map(|value| value.0).collect::<Vec<_>>(),
+                    expected.iter().map(|value| value.0).collect::<Vec<_>>(),
+                    "raw-word mismatch for nonzero_len={nonzero_len} source_start={source_start}"
+                );
+            }
         }
     }
 
