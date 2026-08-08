@@ -515,6 +515,14 @@ pub struct ProverOnlyCircuitData<
     /// zero-extended at every indexing site. The serialized encoding keeps the legacy 8-byte
     /// per-entry format.
     pub representative_map: Vec<u32>,
+    /// Two packed bits per routed `(row, column)` position, in row-major order. Bit zero skips
+    /// the numerator and bit one skips the denominator when a circuit-fixed sigma edge stays
+    /// inside the same permutation partial-product chunk.
+    ///
+    /// Runtime-only: reconstructed from the representative map during deserialization, so the
+    /// serialized format and circuit digest are unchanged.
+    #[doc(hidden)]
+    pub permutation_factor_flags: Vec<u8>,
     /// Pre-computed roots for faster FFT.
     pub fft_root_table: Option<FftRootTable<F>>,
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to

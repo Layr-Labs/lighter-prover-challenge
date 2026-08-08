@@ -204,7 +204,69 @@ pub struct WirePartition {
     sigma: Vec<u32>,
 }
 
+/// The numerator at this routed position is cancelled by an intra-product-chunk sigma edge.
+pub(crate) const SKIP_PERMUTATION_NUMERATOR: u8 = 1;
+/// The denominator at this routed position is cancelled by an intra-product-chunk sigma edge.
+pub(crate) const SKIP_PERMUTATION_DENOMINATOR: u8 = 2;
+
+/// Reads the two packed cancellation bits for a row-major routed position.
+#[inline(always)]
+pub(crate) fn permutation_factor_flags_at(flags: &[u8], index: usize) -> u8 {
+    (flags[index >> 2] >> ((index & 3) << 1)) & 3
+}
+
+#[inline]
+fn add_permutation_factor_flag(flags: &mut [u8], index: usize, flag: u8) {
+    flags[index >> 2] |= flag << ((index & 3) << 1);
+}
+
 impl WirePartition {
+    /// Packs two bits per routed position identifying numerator and denominator factors that can
+    /// be cancelled without evaluating either factor.
+    ///
+    /// A sigma edge `p -> q` makes the denominator at `p` identical to the numerator at `q` by
+    /// the copy constraint. They belong to the same quotient partial-product exactly when their
+    /// row and `column / chunk_size` agree. In that case both endpoints can be omitted
+    /// symbolically, including when the common factor evaluates to zero.
+    pub fn permutation_factor_flags(
+        &self,
+        degree: usize,
+        num_routed_wires: usize,
+        chunk_size: usize,
+    ) -> Vec<u8> {
+        assert!(degree.is_power_of_two());
+        assert!(chunk_size != 0);
+        assert_eq!(self.sigma.len(), degree * num_routed_wires);
+        let degree_mask = degree - 1;
+        let degree_log = degree.trailing_zeros() as usize;
+        let mut flags = vec![0u8; (degree * num_routed_wires).div_ceil(4)];
+
+        for (source, &target) in self.sigma.iter().enumerate() {
+            let target = target as usize;
+            let source_row = source & degree_mask;
+            let target_row = target & degree_mask;
+            let source_column = source >> degree_log;
+            let target_column = target >> degree_log;
+            if source_row == target_row
+                && source_column / chunk_size == target_column / chunk_size
+            {
+                let source_row_major = source_row * num_routed_wires + source_column;
+                let target_row_major = target_row * num_routed_wires + target_column;
+                add_permutation_factor_flag(
+                    &mut flags,
+                    source_row_major,
+                    SKIP_PERMUTATION_DENOMINATOR,
+                );
+                add_permutation_factor_flag(
+                    &mut flags,
+                    target_row_major,
+                    SKIP_PERMUTATION_NUMERATOR,
+                );
+            }
+        }
+        flags
+    }
+
     pub fn get_sigma_polys<F: Field>(
         &self,
         degree_log: usize,
@@ -798,5 +860,51 @@ mod tests {
 
         let actual = partition.get_sigma_polys(degree_log, &k_is, &subgroup);
         assert_eq!(actual, expected);
+    }
+
+    /// An intra-product-chunk sigma edge `p -> q` lets the denominator factor at `p` cancel
+    /// symbolically with the numerator factor at `q`. The two flags are directional: a boundary
+    /// cell can lose only its numerator or only its denominator, while a singleton loses both.
+    #[test]
+    fn permutation_factor_flags_mark_directed_intra_chunk_edges() {
+        let (num_wires, num_routed_wires, degree) = (6usize, 6usize, 2usize);
+        let merges = [
+            // Same row and same two-wire chunk: both cycle edges are internal.
+            (
+                Target::Wire(Wire { row: 0, column: 0 }),
+                Target::Wire(Wire { row: 0, column: 1 }),
+            ),
+            // The scan-order cycle is 2 -> 3 -> 4 -> 2. Only 2 -> 3 is internal.
+            (
+                Target::Wire(Wire { row: 0, column: 2 }),
+                Target::Wire(Wire { row: 0, column: 3 }),
+            ),
+            (
+                Target::Wire(Wire { row: 0, column: 3 }),
+                Target::Wire(Wire { row: 0, column: 4 }),
+            ),
+            // Equal columns in different rows are in different product chunks.
+            (
+                Target::Wire(Wire { row: 1, column: 0 }),
+                Target::Wire(Wire { row: 1, column: 2 }),
+            ),
+        ];
+        let mut forest = build_forest(num_wires, num_routed_wires, degree, 0, &merges);
+        forest.compress_paths();
+        let partition = forest.wire_partition();
+        let flags = partition.permutation_factor_flags(degree, num_routed_wires, 2);
+        let at = |row, column| {
+            permutation_factor_flags_at(&flags, row * num_routed_wires + column)
+        };
+
+        assert_eq!(at(0, 0), 3, "same-block 2-cycle source and target");
+        assert_eq!(at(0, 1), 3, "same-block 2-cycle source and target");
+        assert_eq!(at(0, 2), 2, "source of the sole internal edge");
+        assert_eq!(at(0, 3), 1, "target of the sole internal edge");
+        assert_eq!(at(0, 4), 0, "only boundary edges touch this cell");
+        assert_eq!(at(1, 0), 0, "cross-chunk cycle endpoint");
+        assert_eq!(at(1, 2), 0, "cross-chunk cycle endpoint");
+        assert_eq!(at(1, 5), 3, "unconnected routed singleton");
+        assert_eq!(flags.len(), (degree * num_routed_wires).div_ceil(4));
     }
 }

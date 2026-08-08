@@ -28,6 +28,9 @@ use crate::plonk::circuit_builder::NUM_COINS_LOOKUP;
 use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
 use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::PlonkOracle;
+use crate::plonk::permutation_argument::{
+    permutation_factor_flags_at, SKIP_PERMUTATION_DENOMINATOR, SKIP_PERMUTATION_NUMERATOR,
+};
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{
     eval_vanishing_poly_base_batch, get_lut_poly, PermutationBatch, VanishingScratch,
@@ -618,6 +621,10 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     let num_chunks = num_prods + 1;
     debug_assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
     debug_assert_eq!(beta_k_is.len(), 2 * num_routed_wires);
+    debug_assert_eq!(
+        prover_data.permutation_factor_flags.len(),
+        (subgroup.len() * num_routed_wires).div_ceil(4)
+    );
     let (beta_k_is_0, beta_k_is_1) = beta_k_is.split_at(num_routed_wires);
     let (beta_0, beta_1) = (betas[0], betas[1]);
     let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
@@ -660,6 +667,7 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     for (t, &x) in xs.iter().enumerate() {
                         let i = base + t;
                         let s_sigmas = &prover_data.sigmas[i];
+                        let routed_base = i * num_routed_wires;
                         for chunk in 0..num_chunks {
                             let start = chunk * degree;
                             let end = min(start + degree, num_routed_wires);
@@ -668,12 +676,26 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             let mut denominator_0 = F::ONE;
                             let mut denominator_1 = F::ONE;
                             for j in start..end {
+                                let flags = permutation_factor_flags_at(
+                                    &prover_data.permutation_factor_flags,
+                                    routed_base + j,
+                                );
+                                if flags
+                                    == (SKIP_PERMUTATION_NUMERATOR
+                                        | SKIP_PERMUTATION_DENOMINATOR)
+                                {
+                                    continue;
+                                }
                                 let wire_value = witness.get_wire(i, j);
-                                let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                if flags & SKIP_PERMUTATION_NUMERATOR == 0 {
+                                    numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
+                                    numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
+                                }
+                                if flags & SKIP_PERMUTATION_DENOMINATOR == 0 {
+                                    let sigma = s_sigmas[j];
+                                    denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
+                                    denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                }
                             }
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
@@ -2957,6 +2979,10 @@ mod permutation_pairing_tests {
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
+    use crate::plonk::permutation_argument::{
+        permutation_factor_flags_at, SKIP_PERMUTATION_DENOMINATOR,
+        SKIP_PERMUTATION_NUMERATOR,
+    };
 
     use super::{
         all_wires_permutation_partial_products, paired_permutation_batch_count,
@@ -3061,6 +3087,7 @@ mod permutation_pairing_tests {
         witness: &MatrixWitness<F>,
         subgroup: &[F],
         sigmas: &[Vec<F>],
+        factor_flags: Option<&[u8]>,
         beta: F,
         beta_k_is: &[F],
         gamma: F,
@@ -3076,14 +3103,23 @@ mod permutation_pairing_tests {
             for chunk in 0..num_chunks {
                 let start = chunk * degree;
                 let end = core::cmp::min(start + degree, num_routed_wires);
-                let mut ratio = F::ONE;
+                let mut numerator_product = F::ONE;
+                let mut denominator_product = F::ONE;
                 for j in start..end {
+                    let flags = factor_flags
+                        .map(|flags| {
+                            permutation_factor_flags_at(flags, i * num_routed_wires + j)
+                        })
+                        .unwrap_or(0);
                     let wire_value = witness.get_wire(i, j);
-                    let numerator = wire_value + beta_k_is[j] * x + gamma;
-                    let denominator = wire_value + beta * sigmas[i][j] + gamma;
-                    ratio *= numerator * denominator.inverse();
+                    if flags & SKIP_PERMUTATION_NUMERATOR == 0 {
+                        numerator_product *= wire_value + beta_k_is[j] * x + gamma;
+                    }
+                    if flags & SKIP_PERMUTATION_DENOMINATOR == 0 {
+                        denominator_product *= wire_value + beta * sigmas[i][j] + gamma;
+                    }
                 }
-                acc *= ratio;
+                acc *= numerator_product * denominator_product.inverse();
                 if chunk == num_prods {
                     columns[chunk].push(z_x);
                     z_x = acc;
@@ -3098,6 +3134,10 @@ mod permutation_pairing_tests {
     #[test]
     fn paired_two_challenge_path_is_limb_identical_to_general_loop() {
         let mut data = build_circuit();
+        // This pre-existing fusion oracle intentionally feeds arbitrary matrices that do not
+        // satisfy the circuit's copy constraints. Disable the new algebraic cancellation here;
+        // the dedicated test below supplies a copy-consistent witness and exercises the flags.
+        data.prover_only.permutation_factor_flags.fill(0);
         let num_routed_wires = data.common.config.num_routed_wires;
         let degree = data.common.quotient_degree_factor;
         let num_prods = data.common.num_partial_products;
@@ -3109,10 +3149,9 @@ mod permutation_pairing_tests {
         assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
         assert_eq!(data.common.k_is.len(), num_routed_wires);
 
-        // Point counts spanning: a single point, a short first batch, the
-        // inversion batch boundary (INV_BATCH = 128) exactly, one past it, and
-        // several batches with a short tail.
-        for &n_points in &[1usize, 5, 127, 128, 129, 300] {
+        // `PolynomialValues` requires a power-of-two domain. Cover a single point, a short first
+        // batch, the inversion-batch boundary (INV_BATCH = 128), and several whole batches.
+        for &n_points in &[1usize, 4, 128, 256, 512] {
             let mut rng = Rng::new(0x9e37_79b9_7f4a_7c15 ^ ((n_points as u64) << 8));
 
             let subgroup: Vec<F> = (0..n_points).map(|_| rng.next_field()).collect();
@@ -3147,6 +3186,8 @@ mod permutation_pairing_tests {
 
             data.prover_only.subgroup = subgroup.clone();
             data.prover_only.sigmas = sigmas.clone();
+            data.prover_only.permutation_factor_flags =
+                vec![0; (n_points * num_routed_wires).div_ceil(4)];
 
             // Reference: the general per-challenge loop, two complete passes.
             let general: Vec<Vec<PolynomialValues<F>>> = (0..2)
@@ -3258,6 +3299,7 @@ mod permutation_pairing_tests {
                     &witness,
                     &subgroup,
                     &sigmas,
+                    None,
                     betas[challenge],
                     &beta_k_is[challenge * num_routed_wires..(challenge + 1) * num_routed_wires],
                     gammas[challenge],
@@ -3272,6 +3314,144 @@ mod permutation_pairing_tests {
                          (challenge {challenge}, column {column}, {n_points} points)"
                     );
                 }
+            }
+        }
+    }
+
+    /// Differential for directed symbolic cancellation. The witness obeys every copy component,
+    /// and one intra-chunk edge's shared factor is exactly zero. Computing the original ratio
+    /// would attempt `0 / 0`; removing both directed endpoints before evaluation is well-defined
+    /// and must match the independent symbolic reference for both challenges.
+    #[test]
+    fn paired_intra_chunk_cancellation_matches_reference_with_zero_factor() {
+        use std::collections::HashMap;
+
+        let data = build_circuit();
+        let n = data.prover_only.subgroup.len();
+        let num_wires = data.common.config.num_wires;
+        let num_routed_wires = data.common.config.num_routed_wires;
+        let degree = data.common.quotient_degree_factor;
+        let num_prods = data.common.num_partial_products;
+        let flags = &data.prover_only.permutation_factor_flags;
+        assert_eq!(flags.len(), (n * num_routed_wires).div_ceil(4));
+
+        let betas = [F::from_canonical_u64(17), F::from_canonical_u64(29)];
+        let gammas = [F::from_canonical_u64(41), F::from_canonical_u64(53)];
+        let beta_k_is = betas
+            .iter()
+            .flat_map(|&beta| data.common.k_is.iter().map(move |&k_i| beta * k_i))
+            .collect::<Vec<_>>();
+
+        let mut classes = HashMap::<u32, Vec<(usize, usize)>>::new();
+        for row in 0..n {
+            for column in 0..num_routed_wires {
+                let representative = data.prover_only.representative_map[row * num_wires + column];
+                classes.entry(representative).or_default().push((row, column));
+            }
+        }
+
+        // Pick an internal denominator endpoint whose component remains invertible at every
+        // non-cancelled denominator after making this endpoint zero.
+        let mut zero_edge = None;
+        'components: for (&representative, positions) in &classes {
+            for &(row, column) in positions {
+                let index = row * num_routed_wires + column;
+                if permutation_factor_flags_at(flags, index) & SKIP_PERMUTATION_DENOMINATOR == 0 {
+                    continue;
+                }
+                let value = -(betas[0] * data.prover_only.sigmas[row][column] + gammas[0]);
+                let safe = positions.iter().all(|&(r, c)| {
+                    let position_flags =
+                        permutation_factor_flags_at(flags, r * num_routed_wires + c);
+                    position_flags & SKIP_PERMUTATION_DENOMINATOR != 0
+                        || betas.iter().zip(gammas).all(|(&beta, gamma)| {
+                            !(value + beta * data.prover_only.sigmas[r][c] + gamma).is_zero()
+                        })
+                });
+                if safe {
+                    zero_edge = Some((representative, row, column, value));
+                    break 'components;
+                }
+            }
+        }
+        let (zero_representative, zero_row, zero_column, zero_value) =
+            zero_edge.expect("test circuit has no safe intra-chunk sigma edge");
+
+        let mut rng = Rng::new(0xb0a1_da7e_5eed_0003);
+        let mut representative_values = HashMap::<u32, F>::new();
+        for (&representative, positions) in &classes {
+            if representative == zero_representative {
+                representative_values.insert(representative, zero_value);
+                continue;
+            }
+            let value = loop {
+                let candidate = rng.next_field();
+                if positions.iter().all(|&(row, column)| {
+                    let position_flags =
+                        permutation_factor_flags_at(flags, row * num_routed_wires + column);
+                    position_flags & SKIP_PERMUTATION_DENOMINATOR != 0
+                        || betas.iter().zip(gammas).all(|(&beta, gamma)| {
+                            !(candidate + beta * data.prover_only.sigmas[row][column] + gamma)
+                                .is_zero()
+                        })
+                }) {
+                    break candidate;
+                }
+            };
+            representative_values.insert(representative, value);
+        }
+        let witness = MatrixWitness {
+            wire_values: (0..num_routed_wires)
+                .map(|column| {
+                    (0..n)
+                        .map(|row| {
+                            representative_values
+                                [&data.prover_only.representative_map[row * num_wires + column]]
+                        })
+                        .collect()
+                })
+                .collect(),
+        };
+
+        let shared_zero = witness.get_wire(zero_row, zero_column)
+            + betas[0] * data.prover_only.sigmas[zero_row][zero_column]
+            + gammas[0];
+        assert!(shared_zero.is_zero());
+        let matching_numerator = classes[&zero_representative].iter().any(|&(row, column)| {
+            permutation_factor_flags_at(flags, row * num_routed_wires + column)
+                & SKIP_PERMUTATION_NUMERATOR
+                != 0
+                && (witness.get_wire(row, column)
+                    + beta_k_is[column] * data.prover_only.subgroup[row]
+                    + gammas[0])
+                    .is_zero()
+        });
+        assert!(matching_numerator, "cancelled zero numerator endpoint is missing");
+
+        let paired = two_challenge_wires_permutation_partial_products_and_zs(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            &data.prover_only,
+            &data.common,
+        );
+        for challenge in 0..2 {
+            let reference = naive_reference(
+                &witness,
+                &data.prover_only.subgroup,
+                &data.prover_only.sigmas,
+                Some(flags),
+                betas[challenge],
+                &beta_k_is
+                    [challenge * num_routed_wires..(challenge + 1) * num_routed_wires],
+                gammas[challenge],
+                degree,
+                num_routed_wires,
+                num_prods,
+            );
+            for column in 0..=num_prods {
+                assert_eq!(paired[challenge][column].values, reference[column]);
             }
         }
     }
