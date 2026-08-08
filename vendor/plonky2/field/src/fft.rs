@@ -421,6 +421,92 @@ unsafe fn gl_sub_neon(
     vsubq_u64(diff2, vandq_u64(under2, eps))
 }
 
+/// Four-at-a-time variant of `fft_classic_simd_single_layer_neon`.
+///
+/// Same butterflies, same twiddles, same order, same writes -- only the
+/// iteration width differs. The two-wide body keeps exactly one multiply
+/// dependency chain in flight, so the paired `umulh`/`mul` latency is exposed
+/// between iterations; issuing two independent pairs lets the out-of-order
+/// engine overlap them and halves the loop bookkeeping per element.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_single_layer_neon_x4(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    lg_half_m: usize,
+    omega_row: &[crate::goldilocks_field::GoldilocksField],
+) {
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+    use core::arch::aarch64::*;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    let half = 1usize << lg_half_m;
+    let m = half << 1;
+    debug_assert!(omega_row.len() >= half);
+    let base = values.as_mut_ptr().cast::<u64>();
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        let mut k = 0;
+        while k + m <= values.len() {
+            let mut j = 0;
+            while j + 4 <= half {
+                let v0 = NeonGoldilocksField([
+                    *values.get_unchecked(k + half + j),
+                    *values.get_unchecked(k + half + j + 1),
+                ]);
+                let v1 = NeonGoldilocksField([
+                    *values.get_unchecked(k + half + j + 2),
+                    *values.get_unchecked(k + half + j + 3),
+                ]);
+                let w0 = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j),
+                    *omega_row.get_unchecked(j + 1),
+                ]);
+                let w1 = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j + 2),
+                    *omega_row.get_unchecked(j + 3),
+                ]);
+                // Two independent asm blocks: `options(pure, nomem)` lets the
+                // scheduler interleave them.
+                let t0 = w0 * v0;
+                let t1 = w1 * v1;
+                let tv0 = vcombine_u64(vcreate_u64(t0.0[0].0), vcreate_u64(t0.0[1].0));
+                let tv1 = vcombine_u64(vcreate_u64(t1.0[0].0), vcreate_u64(t1.0[1].0));
+                let u0 = vld1q_u64(base.add(k + j));
+                let u1 = vld1q_u64(base.add(k + j + 2));
+                vst1q_u64(base.add(k + j), gl_add_neon(u0, tv0, eps));
+                vst1q_u64(base.add(k + j + 2), gl_add_neon(u1, tv1, eps));
+                vst1q_u64(base.add(k + half + j), gl_sub_neon(u0, tv0, eps));
+                vst1q_u64(base.add(k + half + j + 2), gl_sub_neon(u1, tv1, eps));
+                j += 4;
+            }
+            while j + 2 <= half {
+                let v = NeonGoldilocksField([
+                    *values.get_unchecked(k + half + j),
+                    *values.get_unchecked(k + half + j + 1),
+                ]);
+                let w = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j),
+                    *omega_row.get_unchecked(j + 1),
+                ]);
+                let t = w * v;
+                let tv = vcombine_u64(vcreate_u64(t.0[0].0), vcreate_u64(t.0[1].0));
+                let u = vld1q_u64(base.add(k + j));
+                vst1q_u64(base.add(k + j), gl_add_neon(u, tv, eps));
+                vst1q_u64(base.add(k + half + j), gl_sub_neon(u, tv, eps));
+                j += 2;
+            }
+            while j < half {
+                let t = omega_row[j] * values[k + half + j];
+                let u = values[k + j];
+                values[k + j] = u + t;
+                values[k + half + j] = u - t;
+                j += 1;
+            }
+            k += m;
+        }
+    }
+}
+
 /// One butterfly layer over base-field scalars, with the modular reduction in
 /// vector registers.
 ///
@@ -482,6 +568,87 @@ fn fft_classic_simd_single_layer_neon(
     }
 }
 
+/// One FRI butterfly layer over quadratic-extension elements, with the
+/// modular reduction in vector registers.
+///
+/// `QuadraticExtension<GoldilocksField>` is `X^2 - 7`, so
+/// `(a0 + a1*u) * (b0 + b1*u) = (a0*b0 + 7*a1*b1) + (a0*b1 + a1*b0)*u`.
+/// Production FRI twiddle rows are almost entirely base-subfield values
+/// `[w, 0]`, for which the product is `[w*a0, w*a1]` — two base multiplications
+/// instead of four. A single row-level scan picks that fast path (one paired
+/// `NeonGoldilocksField` mul hides the scalar latency); otherwise the general
+/// four-product form runs. The butterfly `u + t` / `u - t` reductions always
+/// run as two-lane vector adds/subs reproducing `impl Add/Sub for
+/// GoldilocksField` word for word. Same blocks, same pairing, same twiddles,
+/// same order as the generic body.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_single_layer_neon_ext(
+    values: &mut [crate::extension::quadratic::QuadraticExtension<
+        crate::goldilocks_field::GoldilocksField,
+    >],
+    lg_half_m: usize,
+    omega_row: &[crate::extension::quadratic::QuadraticExtension<
+        crate::goldilocks_field::GoldilocksField,
+    >],
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+    use crate::extension::quadratic::QuadraticExtension;
+    use crate::goldilocks_field::GoldilocksField;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    const W: u64 = 7;
+    let half = 1usize << lg_half_m;
+    let m = half << 1;
+    debug_assert!(omega_row.len() >= half);
+    let base_subfield = omega_row[..half]
+        .iter()
+        .all(|w| w.0[1].0 == 0);
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        let mut k = 0;
+        while k + m <= values.len() {
+            let mut j = 0;
+            while j + 1 <= half {
+                let v = *values.get_unchecked(k + half + j);
+                let w = *omega_row.get_unchecked(j);
+                let (c0, c1) = if base_subfield {
+                    // [w0, 0] * [v0, v1] = [w0*v0, w0*v1]: one paired mul.
+                    let p = NeonGoldilocksField([w.0[0], w.0[0]])
+                        * NeonGoldilocksField([v.0[0], v.0[1]]);
+                    (p.0[0].0, p.0[1].0)
+                } else {
+                    // General extension product with the W = 7 conjugation.
+                    let p = NeonGoldilocksField([w.0[0], w.0[1]])
+                        * NeonGoldilocksField([v.0[0], v.0[1]]);
+                    let q = NeonGoldilocksField([w.0[0], w.0[1]])
+                        * NeonGoldilocksField([v.0[1], v.0[0]]);
+                    let c0 = (p.0[0] + GoldilocksField(W) * p.0[1]).0;
+                    let c1 = (q.0[0] + q.0[1]).0;
+                    (c0, c1)
+                };
+                let tv = vcombine_u64(vcreate_u64(c0), vcreate_u64(c1));
+
+                let u = *values.get_unchecked(k + j);
+                let uv = vcombine_u64(vcreate_u64(u.0[0].0), vcreate_u64(u.0[1].0));
+                let sum = gl_add_neon(uv, tv, eps);
+                let diff = gl_sub_neon(uv, tv, eps);
+                *values.get_unchecked_mut(k + j) = QuadraticExtension([
+                    GoldilocksField(vgetq_lane_u64(sum, 0)),
+                    GoldilocksField(vgetq_lane_u64(sum, 1)),
+                ]);
+                *values.get_unchecked_mut(k + half + j) = QuadraticExtension([
+                    GoldilocksField(vgetq_lane_u64(diff, 0)),
+                    GoldilocksField(vgetq_lane_u64(diff, 1)),
+                ]);
+                j += 1;
+            }
+            k += m;
+        }
+    }
+}
+
 #[inline(always)]
 fn fft_classic_simd_single_layer_with<P, M>(
     packed_values: &mut [P],
@@ -494,17 +661,15 @@ fn fft_classic_simd_single_layer_with<P, M>(
 {
     // Base-field fast path: the reduction runs in vector registers. Guarded on
     // exact type identity, the same way `fft_zero_padded_cache_blocks` guards
-    // its rate-8 specialisation. Every other instantiation -- scalar
-    // `GoldilocksField`, and `QuadraticExtension` for FRI, both of which are
-    // `WIDTH == 1` -- falls through to the generic body below.
+    // its rate-8 specialisation. Scalar `GoldilocksField` (WIDTH == 1) falls
+    // through to the generic body below; quadratic-extension FRI takes its own
+    // vector-reduction arm next.
     //
     // The twiddle marker `M` is deliberately not referenced by this arm.
     // Reaching it proves `P::Scalar` is exactly `GoldilocksField`, whose
     // `mul_fft_base_twiddle` is the default full multiplication, so both
     // markers denote the same product here. The vector-reduction kernel is
-    // therefore untouched, bit for bit, by the twiddle specialization; only the
-    // generic body dispatches on `M` -- and that is the body every extension
-    // transform takes, since `QuadraticExtension` never matches this `TypeId`.
+    // therefore untouched, bit for bit, by the twiddle specialization.
     #[cfg(target_arch = "aarch64")]
     if lg_half_m >= lg_packed_width
         && core::any::TypeId::of::<P>()
@@ -534,7 +699,56 @@ fn fft_classic_simd_single_layer_with<P, M>(
                 row.len(),
             )
         };
-        fft_classic_simd_single_layer_neon(scalars, lg_half_m, omega_row);
+        // The second in-flight multiply chain only pays off once every core is
+        // running these layers at once, which is how the prover uses them: with
+        // all threads busy the win is 6-13% from `lg_half_m == 8` up, while
+        // every smaller shape sits inside run-to-run noise and flips sign.
+        // Both kernels write identical raw words.
+        if lg_half_m >= 8 {
+            fft_classic_simd_single_layer_neon_x4(scalars, lg_half_m, omega_row);
+        } else {
+            fft_classic_simd_single_layer_neon(scalars, lg_half_m, omega_row);
+        }
+        return;
+    }
+    // Quadratic-extension (FRI) fast path: the butterfly add/sub reductions
+    // run as two-lane vectors over each element's Goldilocks components, with
+    // a row-level base-subfield twiddle check (two products instead of four).
+    #[cfg(target_arch = "aarch64")]
+    if lg_half_m >= lg_packed_width
+        && core::any::TypeId::of::<P>()
+            == core::any::TypeId::of::<
+                crate::extension::quadratic::QuadraticExtension<
+                    crate::goldilocks_field::GoldilocksField,
+                >,
+            >()
+    {
+        // SAFETY: the `TypeId` compare proves `P` is exactly
+        // `QuadraticExtension<GoldilocksField>`, whose `PackedField` `WIDTH`
+        // is 1, so `packed_values` is exactly `len` contiguous extension
+        // elements with the same alignment (a single `[GoldilocksField; 2]`
+        // field, no padding). The omega row is already the correct type.
+        let ext_values = unsafe {
+            core::slice::from_raw_parts_mut(
+                packed_values
+                    .as_mut_ptr()
+                    .cast::<crate::extension::quadratic::QuadraticExtension<
+                        crate::goldilocks_field::GoldilocksField,
+                    >>(),
+                packed_values.len() * P::WIDTH,
+            )
+        };
+        let omega_row = unsafe {
+            let row = &root_table[lg_half_m];
+            core::slice::from_raw_parts(
+                row.as_ptr()
+                    .cast::<crate::extension::quadratic::QuadraticExtension<
+                        crate::goldilocks_field::GoldilocksField,
+                    >>(),
+                row.len(),
+            )
+        };
+        fft_classic_simd_single_layer_neon_ext(ext_values, lg_half_m, omega_row);
         return;
     }
 
@@ -1961,6 +2175,52 @@ mod tests {
     use crate::polynomial::{PolynomialCoeffs, PolynomialValues};
     use crate::types::Field;
 
+    /// Portable copy of the general extension-butterfly product used by the
+    /// NEON path: `(a0 + a1*u) * (b0 + b1*u)` with `u^2 = 7`, reduced
+    /// component-wise exactly like the generic `QuadraticExtension` mul.
+    fn ext_product_portable(
+        w: &QuadraticExtension<GoldilocksField>,
+        v: &QuadraticExtension<GoldilocksField>,
+    ) -> [u64; 2] {
+        let a = w.0[0] * v.0[0];
+        let b = w.0[1] * v.0[1];
+        let c = w.0[0] * v.0[1];
+        let d = w.0[1] * v.0[0];
+        let c0 = (a + GoldilocksField(7) * b).0;
+        let c1 = (c + d).0;
+        [c0, c1]
+    }
+
+    #[test]
+    fn extension_neon_products_match_generic_mul() {
+        use crate::types::Sample;
+        for _ in 0..1000 {
+            let w = QuadraticExtension::<GoldilocksField>::rand();
+            let v = QuadraticExtension::<GoldilocksField>::rand();
+            let expected = (w * v).0;
+            let got = ext_product_portable(&w, &v);
+            assert_eq!(
+                [got[0], got[1]],
+                [expected[0].0, expected[1].0],
+                "general extension product formula diverges"
+            );
+
+            // Base-subfield twiddle fast path: [w0, 0] * [v0, v1] = [w0*v0, w0*v1].
+            let ws = QuadraticExtension::<GoldilocksField>([
+                w.0[0],
+                GoldilocksField::ZERO,
+            ]);
+            let expected_s = (ws * v).0;
+            let p0 = (ws.0[0] * v.0[0]).0;
+            let p1 = (ws.0[0] * v.0[1]).0;
+            assert_eq!(
+                [p0, p1],
+                [expected_s[0].0, expected_s[1].0],
+                "base-subfield twiddle product diverges"
+            );
+        }
+    }
+
     /// `ifft_borrowed` must be bit-identical to `ifft` of a copy across
     /// sizes straddling the packed width and the small/large bit-reversal
     /// strategies, for both a cached-table field type and an uncached one.
@@ -2190,6 +2450,47 @@ mod tests {
                 for (a, e) in actual.iter().zip(expected.iter()) {
                     assert_eq!(a.0[0].to_canonical_u64(), e.0[0].to_canonical_u64());
                     assert_eq!(a.0[1].to_canonical_u64(), e.0[1].to_canonical_u64());
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_single_layer_x4_matches_two_wide_raw_words() {
+        use crate::fft::{
+            fft_classic_simd_single_layer_neon, fft_classic_simd_single_layer_neon_x4,
+        };
+        use crate::types::Field64;
+
+        fn adversarial(n: usize) -> Vec<GoldilocksField> {
+            (0..n)
+                .map(|i| {
+                    GoldilocksField::from_noncanonical_u64(match i % 5 {
+                        0 => (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                        1 => GoldilocksField::ORDER.wrapping_add(i as u64 % 1000),
+                        2 => u64::MAX - (i as u64 % 97),
+                        3 => (i as u64).wrapping_mul(0xdead_beef) | (1 << 63),
+                        _ => i as u64,
+                    })
+                })
+                .collect()
+        }
+
+        for lg_n in [6usize, 8, 11, 13, 16] {
+            let n = 1usize << lg_n;
+            let roots = fft_root_table::<GoldilocksField>(n);
+            for lg_half_m in 1..lg_n {
+                let mut expected = adversarial(n);
+                let mut actual = expected.clone();
+                let omega_row = &roots[lg_half_m];
+                fft_classic_simd_single_layer_neon(&mut expected, lg_half_m, omega_row);
+                fft_classic_simd_single_layer_neon_x4(&mut actual, lg_half_m, omega_row);
+                for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                    assert_eq!(
+                        a.0, e.0,
+                        "raw word mismatch at 2^{lg_n} layer {lg_half_m} index {i}"
+                    );
                 }
             }
         }
