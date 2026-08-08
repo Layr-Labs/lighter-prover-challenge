@@ -9,6 +9,8 @@ use unroll::unroll_for_loops;
 
 use crate::field::goldilocks_field::GoldilocksField;
 use crate::hash::poseidon::Poseidon;
+use crate::hash::poseidon2::config::MATRIX_DIAG_12_U64;
+use crate::field::types::Field;
 use crate::util::branch_hint;
 
 // ========================================== CONSTANTS ===========================================
@@ -939,4 +941,85 @@ pub unsafe fn vector_add(a: &[u64; WIDTH], b: &[u64; WIDTH]) -> [u64; WIDTH] {
         vst1q_u64(res[i..].as_mut_ptr(), result);
     }
     res
+}
+
+/// Goldilocks `x + y` on two lanes, matching `impl Add for GoldilocksField`
+/// word-for-word (two EPSILON corrections). Same form as the FFT / external
+/// `gl_add` helpers.
+#[inline(always)]
+unsafe fn gl_add2(x: uint64x2_t, y: uint64x2_t, eps: uint64x2_t) -> uint64x2_t {
+    let sum = vaddq_u64(x, y);
+    let over = vcltq_u64(sum, x);
+    let sum2 = vaddq_u64(sum, vandq_u64(over, eps));
+    let over2 = vcltq_u64(sum2, sum);
+    vaddq_u64(sum2, vandq_u64(over2, eps))
+}
+
+/// Same reduction as `sum_12` in poseidon2/hash.rs: widen all twelve limbs to
+/// u128, then `from_noncanonical_u128_with_96_bits`. Kept here so the NEON
+/// kernel is self-contained and raw-limb-identical to the packed production path.
+#[inline(always)]
+fn sum_12_u128(state: &[GoldilocksField; WIDTH]) -> GoldilocksField {
+    let tmp = state[0].0 as u128
+        + state[1].0 as u128
+        + state[2].0 as u128
+        + state[3].0 as u128
+        + state[4].0 as u128
+        + state[5].0 as u128
+        + state[6].0 as u128
+        + state[7].0 as u128
+        + state[8].0 as u128
+        + state[9].0 as u128
+        + state[10].0 as u128
+        + state[11].0 as u128;
+    GoldilocksField::from_noncanonical_u128_with_96_bits(tmp)
+}
+
+/// Poseidon2 internal linear layer with NEON Goldilocks add/reduce.
+///
+/// Algorithm (identical to the prior packed production path):
+///   sum = sum_12(state)                      // u128 widen, one reduce
+///   state[i] = sum + state[i] * diag[i]      // mul then add
+///
+/// Multiplies stay in scalar GPRs (`GoldilocksField *` → `reduce128`), matching
+/// plonky2's own Poseidon NEON guidance (S-box / mul latency is terrible on
+/// vector pipes). Only the final `sum + product` Goldilocks adds run in NEON
+/// (`gl_add2`), twin to the shipped FFT reduce and the external-layer NEON.
+///
+/// `#[inline(never)]` keeps a named symbol in release `prove` for the
+/// disassembly gate (cfg silent-fallback cannot hide a linked override).
+#[inline(never)]
+pub unsafe fn internal_linear_layer(state: &mut [GoldilocksField; WIDTH]) {
+    let sum = sum_12_u128(state);
+    let eps = vdupq_n_u64(EPSILON);
+    let sum_v = vdupq_n_u64(sum.0);
+    let p = state.as_mut_ptr() as *mut u64;
+
+    // Six independent 2-lane blocks. Diagonal is const; muls are scalar.
+    // Unrolled so GPR multiplies can dual-issue against the prior NEON add.
+    macro_rules! pair {
+        ($i0:expr, $i1:expr) => {{
+            let m0 = GoldilocksField(*p.add($i0)) * GoldilocksField(MATRIX_DIAG_12_U64[$i0]);
+            let m1 = GoldilocksField(*p.add($i1)) * GoldilocksField(MATRIX_DIAG_12_U64[$i1]);
+            let prods = vsetq_lane_u64(m1.0, vdupq_n_u64(m0.0), 1);
+            vst1q_u64(p.add($i0), gl_add2(prods, sum_v, eps));
+        }};
+    }
+    pair!(0, 1);
+    pair!(2, 3);
+    pair!(4, 5);
+    pair!(6, 7);
+    pair!(8, 9);
+    pair!(10, 11);
+}
+
+/// Scalar twin of `internal_linear_layer`: same sum_12 + mul-then-Goldilocks-add
+/// schedule, no NEON. Used by the raw-limb differential; not on the production path.
+#[inline(never)]
+pub fn internal_linear_layer_scalar(state: &mut [GoldilocksField; WIDTH]) {
+    let sum = sum_12_u128(state);
+    for i in 0..WIDTH {
+        let product = state[i] * GoldilocksField(MATRIX_DIAG_12_U64[i]);
+        state[i] = sum + product;
+    }
 }
