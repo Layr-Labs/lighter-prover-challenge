@@ -11,8 +11,47 @@ use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _}
 use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
 use plonky2::fri::oracle::PolynomialBatch;
-use plonky2::plonk::circuit_data::CircuitData;
+use plonky2::plonk::circuit_data::{CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData};
 use plonky2::plonk::proof::ProofWithPublicInputs;
+
+use std::collections::BTreeMap;
+
+/// Releases every prover-only field of a circuit whose proving has finished.
+///
+/// Everything in `ProverOnlyCircuitData` is read only by proofs *of that
+/// circuit*: the preprocessed rate-`2^3` LDE commitment by that circuit's
+/// quotient evaluation and FRI query openings, the sigma polynomials and
+/// permutation machinery by its permutation argument, the generator objects
+/// and their watch index by its witness generation, the subgroup and FFT root
+/// table by its FFTs, and the lookup tables by its lookup argument. The final
+/// block proof reads only `common`, `verifier_only` and the finished proofs,
+/// so once a circuit's last proof has been produced every field below is
+/// unreachable and the storage can be returned. Value-exact: no quantity is
+/// computed differently — storage that no subsequent read can reach is dropped.
+///
+/// This is the flat-payload completion of the `constants_sigmas_commitment`
+/// release the frontier ships: that field is the largest single slab (86–440
+/// MiB per circuit in CPU-visible Metal shared buffers), but the sigma
+/// polynomials (`num_routed_wires x degree` field elements), subgroup,
+/// representative map, generator objects and lookup tables are the remaining
+/// resident prover payload that survives until the process exits. On the
+/// ranked host five workers run concurrently, so every one of these
+/// per-worker gigabytes contends with the other four.
+pub(crate) fn release_prover_only_storage(data: &mut ProverOnlyCircuitData<F, C, D>) {
+    data.generators = Vec::new();
+    data.generator_indices_by_watches = GeneratorWatchIndex::from_map(BTreeMap::new());
+    data.generator_watch_counts = Vec::new();
+    data.constants_sigmas_commitment = PolynomialBatch::default();
+    data.sigmas = Vec::new();
+    data.subgroup = Vec::new();
+    data.public_inputs = Vec::new();
+    data.representative_map = Vec::new();
+    data.fft_root_table = None;
+    data.circuit_digest = Default::default();
+    data.lookup_rows = Vec::new();
+    data.lut_to_lookups = Vec::new();
+    data.constants_sigmas_quotient_cache = None;
+}
 
 pub type Proof = ProofWithPublicInputs<F, C, D>;
 
@@ -141,8 +180,11 @@ impl Circuits {
     /// every retained extension — so releasing these first takes 1.01 GB
     /// straight off the high-water mark.
     ///
-    /// Nothing else is released here. Generators, representative maps and
-    /// witness buffers are CPU-heap objects whose recursive drop is not free.
+    /// Every prover-only field is released here — flat `Vec`/`Option`/index
+    /// payloads whose drop is a bare deallocation, and the generator objects,
+    /// which are small (index lists) and unreachable once a circuit's last
+    /// proof exists. The witness buffers are not part of `ProverOnlyCircuitData`
+    /// and stay with their owners.
     ///
     /// The heavy pair is normally already empty by the time this runs — see
     /// [`Self::release_heavy_circuit_extensions`], which retires them the moment
@@ -159,13 +201,15 @@ impl Circuits {
             &mut self.light_tx_data,
             &mut self.light_chain_data,
         ] {
-            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            release_prover_only_storage(&mut data.prover_only);
         }
         for lock in [&mut self.heavy_tx_data, &mut self.heavy_chain_data] {
-            lock.get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .prover_only
-                .constants_sigmas_commitment = PolynomialBatch::default();
+            release_prover_only_storage(
+                &mut lock
+                    .get_mut()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .prover_only,
+            );
         }
     }
 
@@ -194,10 +238,12 @@ impl Circuits {
     /// added — storage that no subsequent read can reach is returned earlier.
     pub fn release_heavy_circuit_extensions(&self) {
         for lock in [&self.heavy_tx_data, &self.heavy_chain_data] {
-            lock.write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .prover_only
-                .constants_sigmas_commitment = PolynomialBatch::default();
+            release_prover_only_storage(
+                &mut lock
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .prover_only,
+            );
         }
     }
 

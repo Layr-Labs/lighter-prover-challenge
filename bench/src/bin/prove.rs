@@ -131,6 +131,7 @@ fn main() {
             // quantity is computed differently and no work is added — storage
             // that no subsequent read can reach is returned earlier.
             pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            api::release_prover_only_storage(&mut pre_data.prover_only);
             (pre_target, pre_data, pre_proof)
         })
         .expect("pre-execution startup thread must start");
