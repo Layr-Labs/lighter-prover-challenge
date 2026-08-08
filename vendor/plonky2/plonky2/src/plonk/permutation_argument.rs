@@ -205,6 +205,53 @@ pub struct WirePartition {
 }
 
 impl WirePartition {
+    /// Builds the branch-free execution schedule for symbolic permutation-factor cancellation.
+    /// One `u16` is stored per `(row, partial-product chunk)`: the low byte contains live
+    /// numerator lanes and the high byte contains live denominator lanes. A sigma edge `p -> q`
+    /// makes the denominator at `p` identical to the numerator at `q`; when both endpoints are
+    /// in the same chunk, those two bits are cleared before either factor is evaluated.
+    pub fn permutation_live_masks(
+        &self,
+        degree: usize,
+        num_routed_wires: usize,
+        chunk_size: usize,
+    ) -> Vec<u16> {
+        assert!(degree.is_power_of_two());
+        assert!((1..=8).contains(&chunk_size));
+        assert_eq!(self.sigma.len(), degree * num_routed_wires);
+
+        let num_chunks = num_routed_wires.div_ceil(chunk_size);
+        let mut masks = vec![0u16; degree * num_chunks];
+        for row_masks in masks.chunks_exact_mut(num_chunks) {
+            for (chunk, mask) in row_masks.iter_mut().enumerate() {
+                let lanes = (num_routed_wires - chunk * chunk_size).min(chunk_size);
+                let live = if lanes == 8 {
+                    u8::MAX
+                } else {
+                    ((1u16 << lanes) - 1) as u8
+                };
+                *mask = u16::from(live) | (u16::from(live) << 8);
+            }
+        }
+
+        let degree_mask = degree - 1;
+        let degree_log = degree.trailing_zeros() as usize;
+        for (source, &target) in self.sigma.iter().enumerate() {
+            let target = target as usize;
+            let source_row = source & degree_mask;
+            let target_row = target & degree_mask;
+            let source_column = source >> degree_log;
+            let target_column = target >> degree_log;
+            let source_chunk = source_column / chunk_size;
+            if source_row == target_row && source_chunk == target_column / chunk_size {
+                let mask = &mut masks[source_row * num_chunks + source_chunk];
+                *mask &= !(1u16 << (8 + source_column % chunk_size));
+                *mask &= !(1u16 << (target_column % chunk_size));
+            }
+        }
+        masks
+    }
+
     pub fn get_sigma_polys<F: Field>(
         &self,
         degree_log: usize,
@@ -798,5 +845,70 @@ mod tests {
 
         let actual = partition.get_sigma_polys(degree_log, &k_is, &subgroup);
         assert_eq!(actual, expected);
+    }
+
+    /// A compact row/chunk schedule must erase both endpoints of every directed sigma edge that
+    /// stays inside the same partial-product chunk, while retaining boundary endpoints. The low
+    /// byte is the live-numerator lane mask and the high byte is the live-denominator lane mask.
+    #[test]
+    fn permutation_live_masks_encode_directed_intra_chunk_edges() {
+        let (num_wires, num_routed_wires, degree) = (6usize, 6usize, 2usize);
+        let merges = [
+            (
+                Target::Wire(Wire { row: 0, column: 0 }),
+                Target::Wire(Wire { row: 0, column: 1 }),
+            ),
+            (
+                Target::Wire(Wire { row: 0, column: 2 }),
+                Target::Wire(Wire { row: 0, column: 3 }),
+            ),
+            (
+                Target::Wire(Wire { row: 0, column: 3 }),
+                Target::Wire(Wire { row: 0, column: 4 }),
+            ),
+            (
+                Target::Wire(Wire { row: 1, column: 0 }),
+                Target::Wire(Wire { row: 1, column: 2 }),
+            ),
+        ];
+        let mut forest = build_forest(num_wires, num_routed_wires, degree, 0, &merges);
+        forest.compress_paths();
+        let masks = forest
+            .wire_partition()
+            .permutation_live_masks(degree, num_routed_wires, 2);
+
+        // row 0, chunk 0: the two-cycle is completely cancelled.
+        assert_eq!(masks[0], 0);
+        // row 0, chunk 1: edge lane 0 -> lane 1 cancels denominator 0 / numerator 1.
+        assert_eq!(masks[1] & 0xff, 0b01);
+        assert_eq!(masks[1] >> 8, 0b10);
+        // row 0, chunk 2: the cycle boundary endpoint remains live; the singleton is cancelled.
+        assert_eq!(masks[2], 0x0101);
+        // row 1 chunk 0 has one cross-chunk endpoint and one singleton.
+        assert_eq!(masks[3], 0x0101);
+        assert_eq!(masks.len(), degree * num_routed_wires.div_ceil(2));
+    }
+
+    /// Symbolic cancellation is valid even when the erased common factor evaluates to zero. The
+    /// compact schedule chooses the recurrence from the retained factors; restoring the common
+    /// factor makes the original partial-product identity hold on both sides.
+    #[test]
+    fn cancelled_common_factor_preserves_recurrence_including_zero() {
+        type F = GoldilocksField;
+        let previous = F::from_canonical_u64(7);
+        let retained_numerator =
+            F::from_canonical_u64(11) * F::from_canonical_u64(13);
+        let retained_denominator =
+            F::from_canonical_u64(17) * F::from_canonical_u64(19);
+        let next = previous * retained_numerator * retained_denominator.inverse();
+
+        for common in [F::ZERO, F::from_canonical_u64(23)] {
+            let original_numerator = retained_numerator * common;
+            let original_denominator = retained_denominator * common;
+            assert_eq!(
+                previous * original_numerator,
+                next * original_denominator
+            );
+        }
     }
 }

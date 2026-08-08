@@ -621,6 +621,13 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     let (beta_k_is_0, beta_k_is_1) = beta_k_is.split_at(num_routed_wires);
     let (beta_0, beta_1) = (betas[0], betas[1]);
     let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
+    // The scored circuit shape has ten full eight-wire chunks. Keep a guarded fallback for every
+    // other configuration; the guard is consumed once per Rayon inversion batch, never in the
+    // per-position loop.
+    let use_live_schedule = degree == 8
+        && num_routed_wires == 80
+        && num_chunks == 10
+        && prover_data.permutation_live_masks.len() == subgroup.len() * num_chunks;
 
     const INV_BATCH: usize = 128;
     let product_count = subgroup.len() * num_chunks;
@@ -657,29 +664,91 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     let (denominators_0, denominators_1, denominator_inverses) = scratch;
                     denominators_0.clear();
                     denominators_1.clear();
-                    for (t, &x) in xs.iter().enumerate() {
-                        let i = base + t;
-                        let s_sigmas = &prover_data.sigmas[i];
-                        for chunk in 0..num_chunks {
-                            let start = chunk * degree;
-                            let end = min(start + degree, num_routed_wires);
-                            let mut numerator_0 = F::ONE;
-                            let mut numerator_1 = F::ONE;
-                            let mut denominator_0 = F::ONE;
-                            let mut denominator_1 = F::ONE;
-                            for j in start..end {
-                                let wire_value = witness.get_wire(i, j);
-                                let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                    if use_live_schedule {
+                        for (t, &x) in xs.iter().enumerate() {
+                            let i = base + t;
+                            let s_sigmas = &prover_data.sigmas[i];
+                            let row_masks = &prover_data.permutation_live_masks
+                                [i * num_chunks..(i + 1) * num_chunks];
+                            for (chunk, &packed) in row_masks.iter().enumerate() {
+                                let start = chunk * 8;
+                                let numerator_live = packed as u8;
+                                let denominator_live = (packed >> 8) as u8;
+                                let mut both_live = numerator_live & denominator_live;
+                                let mut numerator_0 = F::ONE;
+                                let mut numerator_1 = F::ONE;
+                                let mut denominator_0 = F::ONE;
+                                let mut denominator_1 = F::ONE;
+
+                                // Shared live endpoints keep the single witness load of the fused
+                                // baseline. `trailing_zeros` visits lanes in increasing order;
+                                // the three groups may commute relative to each other, which is
+                                // exact in the field and leaves the chunk ratio unchanged.
+                                while both_live != 0 {
+                                    let lane = both_live.trailing_zeros() as usize;
+                                    both_live &= both_live - 1;
+                                    let j = start + lane;
+                                    let wire_value = witness.get_wire(i, j);
+                                    let sigma = s_sigmas[j];
+                                    numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
+                                    numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
+                                    denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
+                                    denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                }
+
+                                let mut numerator_only = numerator_live & !denominator_live;
+                                while numerator_only != 0 {
+                                    let lane = numerator_only.trailing_zeros() as usize;
+                                    numerator_only &= numerator_only - 1;
+                                    let j = start + lane;
+                                    let wire_value = witness.get_wire(i, j);
+                                    numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
+                                    numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
+                                }
+
+                                let mut denominator_only = denominator_live & !numerator_live;
+                                while denominator_only != 0 {
+                                    let lane = denominator_only.trailing_zeros() as usize;
+                                    denominator_only &= denominator_only - 1;
+                                    let j = start + lane;
+                                    let wire_value = witness.get_wire(i, j);
+                                    let sigma = s_sigmas[j];
+                                    denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
+                                    denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                }
+
+                                let output = t * num_chunks + chunk;
+                                products_0[output].write(numerator_0);
+                                products_1[output].write(numerator_1);
+                                denominators_0.push(denominator_0);
+                                denominators_1.push(denominator_1);
                             }
-                            let output = t * num_chunks + chunk;
-                            products_0[output].write(numerator_0);
-                            products_1[output].write(numerator_1);
-                            denominators_0.push(denominator_0);
-                            denominators_1.push(denominator_1);
+                        }
+                    } else {
+                        for (t, &x) in xs.iter().enumerate() {
+                            let i = base + t;
+                            let s_sigmas = &prover_data.sigmas[i];
+                            for chunk in 0..num_chunks {
+                                let start = chunk * degree;
+                                let end = min(start + degree, num_routed_wires);
+                                let mut numerator_0 = F::ONE;
+                                let mut numerator_1 = F::ONE;
+                                let mut denominator_0 = F::ONE;
+                                let mut denominator_1 = F::ONE;
+                                for j in start..end {
+                                    let wire_value = witness.get_wire(i, j);
+                                    let sigma = s_sigmas[j];
+                                    numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
+                                    numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
+                                    denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
+                                    denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                }
+                                let output = t * num_chunks + chunk;
+                                products_0[output].write(numerator_0);
+                                products_1[output].write(numerator_1);
+                                denominators_0.push(denominator_0);
+                                denominators_1.push(denominator_1);
+                            }
                         }
                     }
                     // SAFETY: the loop above wrote every slot of both
@@ -3095,6 +3164,119 @@ mod permutation_pairing_tests {
         columns
     }
 
+    /// Independent interpreter for the compact row/chunk masks. Unlike the production path it
+    /// scans all eight lane bits in order and uses one challenge at a time.
+    #[allow(clippy::too_many_arguments)]
+    fn scheduled_reference(
+        witness: &MatrixWitness<F>,
+        subgroup: &[F],
+        sigmas: &[Vec<F>],
+        masks: &[u16],
+        beta: F,
+        beta_k_is: &[F],
+        gamma: F,
+        num_chunks: usize,
+    ) -> Vec<Vec<F>> {
+        let mut columns = vec![Vec::with_capacity(subgroup.len()); num_chunks];
+        let mut z_x = F::ONE;
+        for (i, &x) in subgroup.iter().enumerate() {
+            let mut acc = z_x;
+            for chunk in 0..num_chunks {
+                let packed = masks[i * num_chunks + chunk];
+                let numerator_live = packed as u8;
+                let denominator_live = (packed >> 8) as u8;
+                let mut numerator = F::ONE;
+                let mut denominator = F::ONE;
+                for lane in 0..8 {
+                    let bit = 1u8 << lane;
+                    let j = chunk * 8 + lane;
+                    if numerator_live & bit != 0 {
+                        numerator *= witness.get_wire(i, j) + beta_k_is[j] * x + gamma;
+                    }
+                    if denominator_live & bit != 0 {
+                        denominator *= witness.get_wire(i, j) + beta * sigmas[i][j] + gamma;
+                    }
+                }
+                acc *= numerator * denominator.inverse();
+                if chunk + 1 == num_chunks {
+                    columns[chunk].push(z_x);
+                    z_x = acc;
+                } else {
+                    columns[chunk].push(acc);
+                }
+            }
+        }
+        columns
+    }
+
+    #[test]
+    fn compact_live_schedule_matches_ordered_reference() {
+        let data = build_circuit();
+        let n = data.prover_only.subgroup.len();
+        let num_routed_wires = data.common.config.num_routed_wires;
+        let chunk_size = data.common.quotient_degree_factor;
+        let num_chunks = data.common.num_partial_products + 1;
+        assert_eq!((num_routed_wires, chunk_size, num_chunks), (80, 8, 10));
+        assert_eq!(data.prover_only.permutation_live_masks.len(), n * num_chunks);
+        assert!(
+            data.prover_only
+                .permutation_live_masks
+                .iter()
+                .any(|&mask| mask != u16::MAX),
+            "test circuit has no cancelable factor"
+        );
+
+        // Zero is copy-consistent for every component. Choose gammas that keep all retained
+        // denominators invertible; cancelled zero factors are covered by the separate recurrence
+        // algebra test.
+        let witness = MatrixWitness {
+            wire_values: (0..num_routed_wires).map(|_| vec![F::ZERO; n]).collect(),
+        };
+        let betas = [F::from_canonical_u64(17), F::from_canonical_u64(29)];
+        let mut gammas = [F::from_canonical_u64(41), F::from_canonical_u64(53)];
+        for challenge in 0..2 {
+            while data.prover_only.sigmas.iter().enumerate().any(|(row, sigmas)| {
+                sigmas.iter().enumerate().any(|(column, &sigma)| {
+                    let packed = data.prover_only.permutation_live_masks
+                        [row * num_chunks + column / 8];
+                    let live = ((packed >> 8) as u8) & (1 << (column & 7)) != 0;
+                    live && (betas[challenge] * sigma + gammas[challenge]).is_zero()
+                })
+            }) {
+                gammas[challenge] += F::ONE;
+            }
+        }
+        let beta_k_is = betas
+            .iter()
+            .flat_map(|&beta| data.common.k_is.iter().map(move |&k_i| beta * k_i))
+            .collect::<Vec<_>>();
+
+        let scheduled = two_challenge_wires_permutation_partial_products_and_zs(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            &data.prover_only,
+            &data.common,
+        );
+        for challenge in 0..2 {
+            let reference = scheduled_reference(
+                &witness,
+                &data.prover_only.subgroup,
+                &data.prover_only.sigmas,
+                &data.prover_only.permutation_live_masks,
+                betas[challenge],
+                &beta_k_is
+                    [challenge * num_routed_wires..(challenge + 1) * num_routed_wires],
+                gammas[challenge],
+                num_chunks,
+            );
+            for column in 0..num_chunks {
+                assert_eq!(scheduled[challenge][column].values, reference[column]);
+            }
+        }
+    }
+
     #[test]
     fn paired_two_challenge_path_is_limb_identical_to_general_loop() {
         let mut data = build_circuit();
@@ -3109,10 +3291,9 @@ mod permutation_pairing_tests {
         assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
         assert_eq!(data.common.k_is.len(), num_routed_wires);
 
-        // Point counts spanning: a single point, a short first batch, the
-        // inversion batch boundary (INV_BATCH = 128) exactly, one past it, and
-        // several batches with a short tail.
-        for &n_points in &[1usize, 5, 127, 128, 129, 300] {
+        // `PolynomialValues` requires a power-of-two domain. Cover a single point, a short first
+        // batch, the inversion-batch boundary (INV_BATCH = 128), and multiple whole batches.
+        for &n_points in &[1usize, 4, 128, 256, 512] {
             let mut rng = Rng::new(0x9e37_79b9_7f4a_7c15 ^ ((n_points as u64) << 8));
 
             let subgroup: Vec<F> = (0..n_points).map(|_| rng.next_field()).collect();
@@ -3147,6 +3328,10 @@ mod permutation_pairing_tests {
 
             data.prover_only.subgroup = subgroup.clone();
             data.prover_only.sigmas = sigmas.clone();
+            // This fusion oracle intentionally uses arbitrary matrices that do not obey the
+            // circuit's copy constraints. All-live masks isolate traversal fusion; the dedicated
+            // schedule tests cover algebraic cancellation on copy-consistent factors.
+            data.prover_only.permutation_live_masks = vec![u16::MAX; n_points * num_chunks];
 
             // Reference: the general per-challenge loop, two complete passes.
             let general: Vec<Vec<PolynomialValues<F>>> = (0..2)

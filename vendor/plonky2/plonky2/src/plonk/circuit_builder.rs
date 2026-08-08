@@ -1039,7 +1039,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .collect()
     }
 
-    fn sigma_vecs(&self, k_is: &[F], subgroup: &[F]) -> (Vec<PolynomialValues<F>>, Forest) {
+    fn sigma_vecs(
+        &self,
+        k_is: &[F],
+        subgroup: &[F],
+    ) -> (Vec<PolynomialValues<F>>, Forest, Vec<u16>) {
         let degree = self.gate_instances.len();
         let degree_log = log2_strict(degree);
         let config = &self.config;
@@ -1070,9 +1074,15 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         forest.compress_paths();
 
         let wire_partition = forest.wire_partition();
+        let permutation_live_masks = wire_partition.permutation_live_masks(
+            degree,
+            config.num_routed_wires,
+            config.max_quotient_degree_factor,
+        );
         (
             wire_partition.get_sigma_polys(degree_log, k_is, subgroup),
             forest,
+            permutation_live_masks,
         )
     }
 
@@ -1266,7 +1276,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let subgroup = F::two_adic_subgroup(degree_bits);
 
         let k_is = get_unique_coset_shifts(degree, self.config.num_routed_wires);
-        let (sigma_vecs, forest) = timed!(
+        let (sigma_vecs, forest, permutation_live_masks) = timed!(
             timing,
             "generate sigma polynomials",
             self.sigma_vecs(&k_is, &subgroup)
@@ -1465,6 +1475,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             subgroup,
             public_inputs: self.public_inputs,
             representative_map: forest.parents,
+            permutation_live_masks,
             fft_root_table: Some(fft_root_table),
             circuit_digest,
             lookup_rows: self.lookup_rows.clone(),

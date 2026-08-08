@@ -515,6 +515,12 @@ pub struct ProverOnlyCircuitData<
     /// zero-extended at every indexing site. The serialized encoding keeps the legacy 8-byte
     /// per-entry format.
     pub representative_map: Vec<u32>,
+    /// Branch-free permutation cancellation schedule. One `u16` per circuit row and
+    /// quotient-degree chunk stores live numerator lanes in the low byte and live denominator
+    /// lanes in the high byte. Runtime-only: reconstructed from the representative map, so the
+    /// serialized circuit and verifier data remain byte-for-byte unchanged.
+    #[doc(hidden)]
+    pub permutation_live_masks: Vec<u16>,
     /// Pre-computed roots for faster FFT.
     pub fft_root_table: Option<FftRootTable<F>>,
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to

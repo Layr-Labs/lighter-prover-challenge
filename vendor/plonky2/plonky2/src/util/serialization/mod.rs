@@ -907,6 +907,18 @@ pub trait Read {
         let public_inputs = self.read_target_vec()?;
 
         let representative_map = self.read_usize_encoded_u32_vec()?;
+        let mut forest = crate::plonk::permutation_argument::Forest::from_parents(
+            representative_map,
+            common_data.config.num_wires,
+            common_data.config.num_routed_wires,
+            subgroup.len(),
+        );
+        let permutation_live_masks = forest.wire_partition().permutation_live_masks(
+            subgroup.len(),
+            common_data.config.num_routed_wires,
+            common_data.quotient_degree_factor,
+        );
+        let representative_map = forest.into_parents();
 
         let is_some = self.read_bool()?;
         let fft_root_table = match is_some {
@@ -949,6 +961,7 @@ pub trait Read {
             subgroup,
             public_inputs,
             representative_map,
+            permutation_live_masks,
             fft_root_table,
             circuit_digest,
             lookup_rows,
@@ -1931,6 +1944,8 @@ pub trait Write {
             subgroup,
             public_inputs,
             representative_map,
+            // Runtime-only: reconstructed from `representative_map` on read.
+            permutation_live_masks: _,
             fft_root_table,
             circuit_digest,
             lookup_rows,
@@ -2425,6 +2440,11 @@ mod tests {
         assert_eq!(
             decoded.representative_map,
             circuit.prover_only.representative_map
+        );
+        assert_eq!(
+            decoded.permutation_live_masks,
+            circuit.prover_only.permutation_live_masks,
+            "runtime permutation schedule differs after reconstruction"
         );
         assert_eq!(
             decoded.generator_watch_counts,
