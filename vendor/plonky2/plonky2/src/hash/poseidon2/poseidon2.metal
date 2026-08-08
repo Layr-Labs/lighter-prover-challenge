@@ -185,6 +185,13 @@ inline ulong gl_canonicalize(ulong value) {
     return value >= GOLDILOCKS_PRIME ? value - GOLDILOCKS_PRIME : value;
 }
 
+// When the producer already wrote canonical residues (final Metal NTT stage),
+// leaf absorption can take the raw word. Shared/CPU-staged columns may still
+// carry non-canonical Goldilocks representatives and must canonicalize.
+inline ulong leaf_input(ulong value, uint inputs_canonical) {
+    return inputs_canonical != 0u ? value : gl_canonicalize(value);
+}
+
 // A lazy value is (lo, hi) representing hi * 2^32 + lo, with both halves held
 // in full 64-bit registers. Splitting the operand at the 32-bit boundary makes
 // addition carry-free: every accumulator below sums field elements with
@@ -1374,6 +1381,7 @@ kernel void poseidon2_hash_leaves_colmajor(
     constant uint& leaf_width [[buffer(3)]],
     constant uint& leaf_count [[buffer(4)]],
     constant uint& log_leaf_count [[buffer(5)]],
+    constant uint& inputs_canonical [[buffer(6)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= leaf_count) {
         return;
@@ -1390,7 +1398,7 @@ kernel void poseidon2_hash_leaves_colmajor(
     if (leaf_width <= 4) {
         uint i = 0;
         for (; i < leaf_width; ++i) {
-            output[i] = gl_canonicalize(leaves[(ulong)i * leaf_count + gid]);
+            output[i] = leaf_input(leaves[(ulong)i * leaf_count + gid], inputs_canonical);
         }
         for (; i < 4; ++i) {
             output[i] = 0;
@@ -1399,12 +1407,46 @@ kernel void poseidon2_hash_leaves_colmajor(
     }
 
     ulong state[12] = { 0 };
-    for (uint offset = 0; offset < leaf_width; offset += 8) {
-        uint chunk_size = min(8u, leaf_width - offset);
-        for (uint i = 0; i < chunk_size; ++i) {
-            state[i] = gl_canonicalize(leaves[(ulong)(offset + i) * leaf_count + gid]);
+    // Production wires trees are width 135 (= 16×8 + 7) or 136 (= 17×8).
+    // Specialize those shapes so the hot fused LDE→hash path does not pay a
+    // runtime min() / width residual each pass. Every other width keeps the
+    // generic loop below.
+    if (leaf_width == 136u) {
+        for (uint pass = 0; pass < 17u; ++pass) {
+            uint offset = pass * 8u;
+            for (uint i = 0; i < 8u; ++i) {
+                state[i] = leaf_input(
+                    leaves[(ulong)(offset + i) * leaf_count + gid],
+                    inputs_canonical);
+            }
+            poseidon2(state, parameters);
+        }
+    } else if (leaf_width == 135u) {
+        for (uint pass = 0; pass < 16u; ++pass) {
+            uint offset = pass * 8u;
+            for (uint i = 0; i < 8u; ++i) {
+                state[i] = leaf_input(
+                    leaves[(ulong)(offset + i) * leaf_count + gid],
+                    inputs_canonical);
+            }
+            poseidon2(state, parameters);
+        }
+        for (uint i = 0; i < 7u; ++i) {
+            state[i] = leaf_input(
+                leaves[(ulong)(128u + i) * leaf_count + gid],
+                inputs_canonical);
         }
         poseidon2(state, parameters);
+    } else {
+        for (uint offset = 0; offset < leaf_width; offset += 8) {
+            uint chunk_size = min(8u, leaf_width - offset);
+            for (uint i = 0; i < chunk_size; ++i) {
+                state[i] = leaf_input(
+                    leaves[(ulong)(offset + i) * leaf_count + gid],
+                    inputs_canonical);
+            }
+            poseidon2(state, parameters);
+        }
     }
     for (uint i = 0; i < 4; ++i) {
         output[i] = gl_canonicalize(state[i]);

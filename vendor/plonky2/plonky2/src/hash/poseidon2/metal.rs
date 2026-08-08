@@ -27,7 +27,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "cfe4ce031860c4804566a5ff00a2e2bb49349305b132f65f300e68621706a282";
+    "6f05e36d20e7156eb3e0b7e7100722e5efba51a17796196c71598caf1e2f5f4a";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -2208,6 +2208,9 @@ impl MetalShared {
                 set_u32(leaf_encoder, 3, cols_u32);
                 set_u32(leaf_encoder, 4, lde_size_u32);
                 set_u32(leaf_encoder, 5, log_lde);
+                // Final ntt_stage above ran with canonicalize=1, so leaf
+                // absorption can skip a redundant gl_canonicalize per lane.
+                set_u32(leaf_encoder, 6, 1);
                 dispatch(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
                 leaf_encoder.end_encoding();
 
@@ -2468,6 +2471,8 @@ impl MetalShared {
             set_u32(leaf_encoder, 3, cols_u32);
             set_u32(leaf_encoder, 4, lde_size_u32);
             set_u32(leaf_encoder, 5, log_lde);
+            // Final ntt_stage above ran with canonicalize=1.
+            set_u32(leaf_encoder, 6, 1);
             dispatch(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
             leaf_encoder.end_encoding();
 
@@ -2676,6 +2681,8 @@ impl MetalShared {
                     size_of::<u32>() as NSUInteger,
                     (&log_leaf_count_u32 as *const u32).cast::<c_void>(),
                 );
+                // Staged/shared columns may hold non-canonical u64 words.
+                set_u32(leaf_encoder, 6, 0);
             }
             dispatch(leaf_encoder, leaf_pipeline, leaf_count);
             leaf_encoder.end_encoding();
