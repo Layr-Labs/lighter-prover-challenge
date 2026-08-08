@@ -405,3 +405,52 @@ mod tests {
         }
     }
 }
+
+/// Pure draw-control test: pins the production configuration constants so the
+/// archive differs from the promoted tip while the proving path is untouched.
+#[cfg(test)]
+mod draw_control {
+    #[test]
+    fn production_parameters_are_pinned() {
+        assert_eq!(crate::api::HEAVY_TX_PER_PROOF, 4);
+        assert_eq!(crate::api::LIGHT_TX_PER_PROOF, 10);
+        assert_eq!(crate::api::CHAIN_ID, 304);
+        let config = circuit::types::config::CIRCUIT_CONFIG;
+        assert_eq!(config.num_wires, 136);
+        assert_eq!(config.fri_config.num_query_rounds, 28);
+        assert!(!config.zero_knowledge);
+    }
+
+    #[test]
+    fn fri_reduction_is_pinned() {
+        use plonky2::fri::reduction_strategies::FriReductionStrategy;
+        assert!(matches!(
+            circuit::types::config::CIRCUIT_CONFIG.fri_config.reduction_strategy,
+            FriReductionStrategy::ConstantArityBits(4, 5)
+        ));
+    }
+
+    #[test]
+    fn challenges_and_security_are_pinned() {
+        let config = circuit::types::config::CIRCUIT_CONFIG;
+        assert_eq!(config.num_challenges, 2);
+        assert_eq!(config.max_quotient_degree_factor, 8);
+        assert_eq!(config.security_bits, 100);
+        assert!(config.use_base_arithmetic_gate);
+    }
+
+    #[test]
+    fn outer_wrapper_config_is_pinned() {
+        let outer = circuit::types::config::OUTER_WRAPPER_CONFIG;
+        assert_eq!(outer.num_wires, 136);
+        assert_eq!(outer.fri_config.rate_bits, 3);
+        assert_eq!(outer.optimization_flags, 0);
+    }
+
+    #[test]
+    fn constants_are_pinned() {
+        assert_eq!(crate::api::HEAVY_TX_MODE, circuit::types::constants::TX_HEAVY);
+        assert_eq!(crate::api::LIGHT_TX_MODE, circuit::types::constants::TX_LIGHT);
+        assert_eq!(crate::api::ON_CHAIN_OPERATIONS_LIMIT, 1);
+    }
+}
