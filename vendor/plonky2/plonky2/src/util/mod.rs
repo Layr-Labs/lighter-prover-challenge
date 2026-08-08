@@ -41,6 +41,35 @@ impl<T> SendPtr<T> {
     }
 }
 
+/// Bit-reverses an owned buffer with disjoint swaps across the Rayon pool.
+/// Small buffers retain the cache-blocked serial implementation to avoid
+/// parallel scheduling overhead.
+pub fn parallel_reverse_index_bits_in_place<T: Send + Copy>(arr: &mut [T]) {
+    const PARALLEL_THRESHOLD: usize = 1 << 18;
+    const MIN_TASK_LEN: usize = 1 << 10;
+
+    if arr.len() < PARALLEL_THRESHOLD {
+        reverse_index_bits_in_place(arr);
+        return;
+    }
+
+    let n = arr.len();
+    let log_n = log2_strict(n);
+    let base = SendPtr(arr.as_mut_ptr());
+    (0..n)
+        .into_par_iter()
+        .with_min_len(MIN_TASK_LEN)
+        .for_each(|src| {
+            let dst = reverse_bits(src, log_n);
+            if src < dst {
+                // SAFETY: bit reversal is an involution. For every non-fixed
+                // pair `{src, dst}`, only its smaller index performs a swap,
+                // so no two workers read or write the same element.
+                unsafe { core::ptr::swap(base.get().add(src), base.get().add(dst)) };
+            }
+        });
+}
+
 /// Transposes a column-major matrix (`columns[j][i]`) into one flat row-major
 /// buffer whose row order is bit-reversed: output row `reverse_bits(i)` holds
 /// `columns[0][i], columns[1][i], ...`. The column length must be a power of two.
