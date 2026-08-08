@@ -105,9 +105,19 @@ fn main() {
     // Keep the forced-build mode's established behavior unchanged.
     let remaining = (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1"))
         .then(Circuits::load_remaining_embedded);
+    // The remaining circuit loads have now drained the GPU queue (every
+    // committed hash command buffer is waited on before its results are read),
+    // and the pre-execution proof is the only proof still in flight. From here
+    // until it completes the exclusive-GPU contract ("no other proof runs
+    // concurrently") holds, so its later mid-size column trees (Zs/partial
+    // products, quotient) can use the lower GPU routing threshold instead of
+    // hashing on the CPU. The early part of the proof still ran under normal
+    // routing while the loads were live; this just captures the tail.
+    plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
     let (pre_target, pre_data, pre_proof) = pre_handle
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
     let circuits = match remaining {
         Some(Ok(remaining)) => remaining.into_circuits((pre_target, pre_data)),
         Some(Err(error)) => {
