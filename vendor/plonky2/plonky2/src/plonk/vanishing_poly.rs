@@ -531,12 +531,36 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         }
 
         // Same reversed-order Horner reduction as the per-point loop.
-        for t in (0..num_rows).rev() {
-            let row = &term_rows[t * n..][..n];
+        // Point-major scan: each point's accumulator slots stay hot across
+        // the row chain. The two-challenge case is unrolled explicitly so the
+        // two alpha chains issue back-to-back (the generic iterator form also
+        // matches, but the explicit form is branch-free and keeps both
+        // accumulators in registers together). Per-point chain order
+        // (t descending) is unchanged, so results are raw-limb identical.
+        if num_challenges == 2 {
+            let alpha_0 = alphas[0];
+            let alpha_1 = alphas[1];
             for k in 0..n {
                 let res = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
-                for (c, &alpha) in res.iter_mut().zip(alphas) {
-                    *c = row[k].multiply_accumulate(*c, alpha);
+                let mut acc_0 = res[0];
+                let mut acc_1 = res[1];
+                for t in (0..num_rows).rev() {
+                    let term = term_rows[t * n + k];
+                    acc_0 = term.multiply_accumulate(acc_0, alpha_0);
+                    acc_1 = term.multiply_accumulate(acc_1, alpha_1);
+                }
+                res[0] = acc_0;
+                res[1] = acc_1;
+            }
+        } else {
+            for k in 0..n {
+                let res = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
+                for t in (0..num_rows).rev() {
+                    let row = &term_rows[t * n..][..n];
+                    let term = row[k];
+                    for (c, &alpha) in res.iter_mut().zip(alphas) {
+                        *c = term.multiply_accumulate(*c, alpha);
+                    }
                 }
             }
         }

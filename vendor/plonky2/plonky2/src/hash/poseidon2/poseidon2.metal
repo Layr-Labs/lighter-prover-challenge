@@ -74,28 +74,6 @@ inline ulong gl_sub(ulong a, ulong b) {
 #endif
 }
 
-// Final step of the 128-bit Goldilocks reduction shared by gl_mul and
-// gl_mul_add. On entry (r0, r1) are the low and high 32-bit limbs of the
-// residue and `top` is its 2^64 weight, one of -1, 0, +1, so the value is
-// r + top * 2^64, and 2^64 == EPSILON (mod p).
-//
-// Neither fold can leave the 64-bit range, so unlike gl_add this needs no
-// second correction round. Writing the reduced product as
-//     V = low + h0 * EPSILON - h1
-// with low < 2^64 and h0, h1 < 2^32 bounds it by
-//     -(2^32 - 1) <= V <= (2^64 - 1) + (2^32 - 1)^2 = 2^65 - 2^33.
-// When top is +1 the residue is r = V - 2^64 <= 2^64 - 2^33, so r + EPSILON
-// stays below 2^64 and the add cannot overflow. When top is -1 the residue is
-// r = V + 2^64 >= 2^64 - 2^32 + 1 > EPSILON, so the subtract cannot borrow.
-// One unconditional 64-bit add of top * EPSILON therefore replaces both
-// add_epsilon_u32 and sub_epsilon_u32, including their unreachable second
-// correction rounds. gl_add and gl_sub keep theirs: they know nothing about
-// their operands and their second rounds are genuinely reachable.
-inline ulong reduce_top(uint r0, uint r1, int top) {
-    ulong r = ((ulong)r1 << 32) | (ulong)r0;
-    return r + (ulong)(((long)top << 32) - (long)top);
-}
-
 // Goldilocks multiplication with 32-bit reduction after the native product.
 // If low = l0 + l1*B and high = h0 + h1*B for B = 2^32, then
 //   low + high*B^2 = (l0 - h0 - h1) + (l1 + h0)*B  (mod p).
@@ -135,7 +113,10 @@ inline ulong gl_mul(ulong a, ulong b) {
     uint under = (uint)(next > r1);
     r1 = next;
 
-    return reduce_top(r0, r1, (int)carry - (int)under);
+    int top = (int)carry - (int)under;
+    add_epsilon_u32(r0, r1, (uint)(top > 0));
+    sub_epsilon_u32(r0, r1, (uint)(top < 0));
+    return ((ulong)r1 << 32) | (ulong)r0;
 #endif
 }
 
@@ -165,24 +146,8 @@ inline lazy_t lazy_add(lazy_t a, lazy_t b) {
     return { next, a.c + b.c + (uint)(next < a.v) };
 }
 
-// Folds a small wrap count back into an ordinary 64-bit representative: the
-// exact value is v + carries * 2^64 and 2^64 == EPSILON (mod p).
-//
-// This is gl_add(v, carries * EPSILON) with its unreachable half deleted, and
-// it is bit-identical to it rather than merely congruent. gl_add folds the
-// 64-bit carry out of `v + addend` back in as one more +EPSILON and then
-// corrects a *second* time in case that fold itself overflowed. Here
-// addend = carries * EPSILON with carries < 32, so addend < 2^37; if
-// `v + addend` wraps 2^64 the wrapped result is at most addend - 1 < 2^37, and
-// adding EPSILON < 2^32 to that cannot reach 2^64. The compiler cannot delete
-// the second round itself because it has no bound on `carries`.
-inline ulong fold_carries(ulong v, uint carries) {
-    ulong sum = v + (((ulong)carries << 32) - (ulong)carries);
-    return sum + (sum < v ? GOLDILOCKS_EPSILON : 0UL);
-}
-
 inline ulong lazy_materialize(lazy_t a) {
-    return fold_carries(a.v, a.c);
+    return gl_add(a.v, (ulong)a.c * GOLDILOCKS_EPSILON);
 }
 
 // r = a * b + addend (mod p): the 128-bit product absorbs the addend before
@@ -211,7 +176,10 @@ inline ulong gl_mul_add(ulong a, ulong b, ulong addend) {
     uint under = (uint)(next > r1);
     r1 = next;
 
-    return reduce_top(r0, r1, (int)carry - (int)under);
+    int top = (int)carry - (int)under;
+    add_epsilon_u32(r0, r1, (uint)(top > 0));
+    sub_epsilon_u32(r0, r1, (uint)(top < 0));
+    return ((ulong)r1 << 32) | (ulong)r0;
 }
 
 inline ulong pow7(ulong value) {
@@ -262,7 +230,7 @@ inline ulong sum_state(thread const ulong state[12]) {
         carries += next < sum;
         sum = next;
     }
-    return fold_carries(sum, carries);
+    return gl_add(sum, (ulong)carries * GOLDILOCKS_EPSILON);
 }
 
 inline void internal_linear_layer(thread ulong state[12], constant ulong* diagonal) {
