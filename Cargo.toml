@@ -53,6 +53,7 @@ incremental = false
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+strip = true
 
 # bench/build.rs constructs and serializes the five startup circuits at
 # compile time. Build scripts default to opt-level 0, which would turn that
