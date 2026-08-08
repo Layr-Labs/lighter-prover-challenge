@@ -281,7 +281,6 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
 pub fn ifft_borrowed<F: Field>(values: &[F]) -> PolynomialCoeffs<F> {
     let n = values.len();
     let lg_n = log2_strict(n);
-    let n_inv = F::inverse_2exp(lg_n);
 
     let mut buffer = plonky2_util::reverse_index_bits(values);
 
@@ -291,6 +290,46 @@ pub fn ifft_borrowed<F: Field>(values: &[F]) -> PolynomialCoeffs<F> {
     let root_table = fft_root_table::<F>(n);
 
     let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
+
+    // The production routed-wire transforms are Goldilocks IFFTs on AArch64.
+    // Fuse their final butterfly layer with inverse-index placement and
+    // normalization, deleting the separate full-buffer post-pass while
+    // preserving the exact multiply/add/sub/multiply order and raw words.
+    #[cfg(target_arch = "aarch64")]
+    if lg_n >= 14
+        && lg_n > lg_packed_width
+        && core::any::TypeId::of::<F>()
+            == core::any::TypeId::of::<crate::goldilocks_field::GoldilocksField>()
+    {
+        #[cfg(feature = "std")]
+        let root_table_ref: &FftRootTable<F> = root_table.as_ref();
+        #[cfg(not(feature = "std"))]
+        let root_table_ref: &FftRootTable<F> = &root_table;
+        // SAFETY: the exact `TypeId` equality proves that `F` is
+        // `GoldilocksField`. The buffer and root table therefore already have
+        // precisely these element types; only their generic spelling differs.
+        let (goldilocks_buffer, goldilocks_roots) = unsafe {
+            (
+                core::slice::from_raw_parts_mut(
+                    buffer
+                        .as_mut_ptr()
+                        .cast::<crate::goldilocks_field::GoldilocksField>(),
+                    buffer.len(),
+                ),
+                &*(root_table_ref as *const FftRootTable<F>
+                    as *const FftRootTable<crate::goldilocks_field::GoldilocksField>),
+            )
+        };
+        ifft_borrowed_prefix_goldilocks(goldilocks_buffer, lg_n, goldilocks_roots);
+        ifft_borrowed_final_layer_neon(
+            goldilocks_buffer,
+            lg_n,
+            &goldilocks_roots[lg_n - 1],
+        );
+        return PolynomialCoeffs { coeffs: buffer };
+    }
+
+    let n_inv = F::inverse_2exp(lg_n);
     if lg_n <= lg_packed_width {
         fft_classic_simd::<F>(&mut buffer, 0, lg_n, &root_table);
     } else {
@@ -378,6 +417,52 @@ fn fft_classic_simd<P: PackedField>(
     }
 }
 
+/// The unchanged FFT prefix used only by the production AArch64 Goldilocks
+/// borrowed-IFFT specialization. Keeping this separate leaves every existing
+/// forward FFT and ordinary IFFT caller on the original driver and codegen.
+#[cfg(target_arch = "aarch64")]
+#[unroll_for_loops]
+#[inline(always)]
+fn ifft_borrowed_prefix_goldilocks(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    lg_n: usize,
+    root_table: &FftRootTable<crate::goldilocks_field::GoldilocksField>,
+) {
+    use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
+
+    type P = WideGoldilocksField;
+    let lg_packed_width = log2_strict(P::WIDTH);
+    let packed_values = P::pack_slice_mut(values);
+    let packed_n = packed_values.len();
+    debug_assert!(packed_n == 1 << (lg_n - lg_packed_width));
+    let end = lg_n - 1;
+
+    assert!(lg_packed_width <= 4);
+    for lg_half_m in 0..4 {
+        if lg_half_m < min(end, lg_packed_width) {
+            let half_m = 1 << lg_half_m;
+            let mut omega = P::default();
+            for (j, omega_j) in omega.as_slice_mut().iter_mut().enumerate() {
+                *omega_j = root_table[lg_half_m][j % half_m];
+            }
+
+            for k in (0..packed_n).step_by(2) {
+                let (u, v) = packed_values[k].interleave(packed_values[k + 1], half_m);
+                let t = BaseSubfieldTwiddle::mul(omega, v);
+                (packed_values[k], packed_values[k + 1]) =
+                    (u + t).interleave(u - t, half_m);
+            }
+        }
+    }
+
+    fft_classic_simd_layers::<P, BaseSubfieldTwiddle>(
+        packed_values,
+        lg_packed_width,
+        end,
+        root_table,
+    );
+}
+
 /// Goldilocks `x + y` on two lanes, reproducing `impl Add for GoldilocksField`
 /// word for word:
 ///     (sum, over)  = x.overflowing_add(y)
@@ -419,6 +504,102 @@ unsafe fn gl_sub_neon(
     let diff2 = vsubq_u64(diff, adj);
     let under2 = vcltq_u64(diff, adj);
     vsubq_u64(diff2, vandq_u64(under2, eps))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn ifft_borrowed_butterfly_pair_neon(
+    u: crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField,
+    v: crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField,
+    omega: crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField,
+    n_inv: crate::goldilocks_field::GoldilocksField,
+    eps: core::arch::aarch64::uint64x2_t,
+) -> (
+    crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField,
+    crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField,
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+    use crate::goldilocks_field::GoldilocksField;
+
+    unsafe {
+        let t = omega * v;
+        let uv = vcombine_u64(vcreate_u64(u.0[0].0), vcreate_u64(u.0[1].0));
+        let tv = vcombine_u64(vcreate_u64(t.0[0].0), vcreate_u64(t.0[1].0));
+        let sum = gl_add_neon(uv, tv, eps);
+        let diff = gl_sub_neon(uv, tv, eps);
+        let sums = NeonGoldilocksField([
+            GoldilocksField(vgetq_lane_u64(sum, 0)),
+            GoldilocksField(vgetq_lane_u64(sum, 1)),
+        ]) * n_inv;
+        let diffs = NeonGoldilocksField([
+            GoldilocksField(vgetq_lane_u64(diff, 0)),
+            GoldilocksField(vgetq_lane_u64(diff, 1)),
+        ]) * n_inv;
+        (sums, diffs)
+    }
+}
+
+/// Final Goldilocks FFT layer fused with the IFFT's output reversal and
+/// normalization. Each two-lane operation is word-identical to the existing
+/// paired final layer followed by scalar `* n^-1`; only the destinations are
+/// written directly in inverse order, eliminating the intermediate traversal.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn ifft_borrowed_final_layer_neon(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    lg_n: usize,
+    omega_row: &[crate::goldilocks_field::GoldilocksField],
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+    use crate::goldilocks_field::GoldilocksField;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    let n = values.len();
+    debug_assert_eq!(n, 1 << lg_n);
+    debug_assert!(n >= 8);
+    let half = n / 2;
+    let quarter = n / 4;
+    assert!(omega_row.len() >= half);
+    let n_inv = GoldilocksField::inverse_2exp(lg_n);
+    let base = values.as_mut_ptr();
+
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+
+        // The two self-orbits: j=0 maps to {0, half}; j=quarter maps
+        // to {quarter, half+quarter}. Load all four inputs before any store.
+        let u = NeonGoldilocksField([*base, *base.add(quarter)]);
+        let v = NeonGoldilocksField([*base.add(half), *base.add(half + quarter)]);
+        let omega = NeonGoldilocksField([
+            *omega_row.get_unchecked(0),
+            *omega_row.get_unchecked(quarter),
+        ]);
+        let (sums, diffs) = ifft_borrowed_butterfly_pair_neon(u, v, omega, n_inv, eps);
+        *base = sums.0[0];
+        *base.add(half + quarter) = sums.0[1];
+        *base.add(half) = diffs.0[0];
+        *base.add(quarter) = diffs.0[1];
+
+        // Pair j with jp=half-j. Their four butterfly inputs and their four
+        // inverse-ordered destinations are the same disjoint orbit, so loading
+        // both lanes completely before the stores prevents clobbering.
+        for j in 1..quarter {
+            let jp = half - j;
+            let u = NeonGoldilocksField([*base.add(j), *base.add(jp)]);
+            let v = NeonGoldilocksField([*base.add(half + j), *base.add(half + jp)]);
+            let omega = NeonGoldilocksField([
+                *omega_row.get_unchecked(j),
+                *omega_row.get_unchecked(jp),
+            ]);
+            let (sums, diffs) = ifft_borrowed_butterfly_pair_neon(u, v, omega, n_inv, eps);
+            *base.add(n - j) = sums.0[0];
+            *base.add(half + j) = sums.0[1];
+            *base.add(jp) = diffs.0[0];
+            *base.add(j) = diffs.0[1];
+        }
+    }
 }
 
 /// One butterfly layer over base-field scalars, with the modular reduction in
@@ -2126,7 +2307,7 @@ mod tests {
     use crate::packable::Packable;
     use crate::packed::PackedField;
     use crate::polynomial::{PolynomialCoeffs, PolynomialValues};
-    use crate::types::Field;
+    use crate::types::{Field, Field64};
 
     /// `ifft_borrowed` must be bit-identical to `ifft` of a copy across
     /// sizes straddling the packed width and the small/large bit-reversal
@@ -2150,6 +2331,90 @@ mod tests {
         check::<GoldilocksField>();
         check::<QuadraticExtension<GoldilocksField>>();
         check::<QuarticExtension<GoldilocksField>>();
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn adversarial_goldilocks(index: usize) -> GoldilocksField {
+        let raw = match index & 15 {
+            0 => 0,
+            1 => 1,
+            2 => GoldilocksField::ORDER - 1,
+            3 => GoldilocksField::ORDER,
+            4 => GoldilocksField::ORDER + 1,
+            5 => u64::MAX,
+            6 => 0x8000_0000_0000_0000,
+            7 => 0xffff_ffff_0000_0000,
+            _ => (index as u64)
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .rotate_left((index & 63) as u32),
+        };
+        GoldilocksField(raw)
+    }
+
+    /// The fused final layer must reproduce the old final butterfly followed
+    /// by reversal and normalization in every raw `u64` representative, not
+    /// merely as equal field values. Small sizes exercise the special index
+    /// orbits; production sizes exercise the exact ranked kernel shapes.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ifft_borrowed_fused_final_layer_matches_legacy_raw() {
+        use super::{
+            fft_classic_simd_single_layer_neon, ifft_borrowed_final_layer_neon,
+        };
+
+        for lg_n in [3usize, 4, 6, 14, 16, 18] {
+            let n = 1 << lg_n;
+            let roots = fft_root_table::<GoldilocksField>(n);
+            let input: Vec<_> = (0..n).map(adversarial_goldilocks).collect();
+
+            let mut expected = input.clone();
+            fft_classic_simd_single_layer_neon(
+                &mut expected,
+                lg_n - 1,
+                &roots[lg_n - 1],
+            );
+            let n_inv = GoldilocksField::inverse_2exp(lg_n);
+            expected[0] *= n_inv;
+            expected[n / 2] *= n_inv;
+            for i in 1..(n / 2) {
+                let j = n - i;
+                let coeffs_i = expected[j] * n_inv;
+                let coeffs_j = expected[i] * n_inv;
+                expected[i] = coeffs_i;
+                expected[j] = coeffs_j;
+            }
+
+            let mut actual = input;
+            ifft_borrowed_final_layer_neon(&mut actual, lg_n, &roots[lg_n - 1]);
+            for (index, (expected, actual)) in expected.iter().zip(&actual).enumerate() {
+                assert_eq!(
+                    expected.0, actual.0,
+                    "raw final-layer mismatch at lg_n={lg_n}, index={index}"
+                );
+            }
+        }
+    }
+
+    /// End-to-end raw-word differential at every routed-wire production size.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ifft_borrowed_production_sizes_match_ifft_raw() {
+        use crate::fft::ifft_borrowed;
+
+        for lg_n in [14usize, 16, 18] {
+            let n = 1 << lg_n;
+            let values: Vec<_> = (0..n).map(adversarial_goldilocks).collect();
+            let expected = ifft(PolynomialValues::new(values.clone()));
+            let actual = ifft_borrowed(&values);
+            for (index, (expected, actual)) in
+                expected.coeffs.iter().zip(&actual.coeffs).enumerate()
+            {
+                assert_eq!(
+                    expected.0, actual.0,
+                    "raw borrowed-IFFT mismatch at lg_n={lg_n}, index={index}"
+                );
+            }
+        }
     }
 
     /// The cached-table dispatch path (no caller-supplied table) must return
