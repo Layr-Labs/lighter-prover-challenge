@@ -402,6 +402,7 @@ impl LazyPipeline {
 
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
+static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     POSEIDON_GATE_QUOTIENT_PIPELINE.get()
@@ -409,6 +410,10 @@ fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
 
 fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     RANGE_CHECK_GATE_QUOTIENT_PIPELINE.get()
+}
+
+fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
+    ABSORB_PASS_PIPELINE.get()
 }
 
 /// Starts the two gate-quotient pipeline builds on detached threads.
@@ -427,6 +432,7 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             "range_check_gate_quotient",
             &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
         ),
+        ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
     ] {
         let device = device.clone();
         let library = library.clone();
@@ -1017,6 +1023,187 @@ pub(crate) fn allocate_columns<F: RichField>(
 
 /// Hashes retained shared columns without copying them through the pooled
 /// staging buffer.
+/// Retained buffers for the streamed sponge build: the inter-pass state
+/// (12 u64 lanes per leaf, column-major) and the level-order digest output.
+/// One streamed build runs at a time (exclusive proving phases only), so a
+/// single grow-on-demand pair suffices; holding the lock for the whole build
+/// serializes any unexpected second caller onto the classic path.
+static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
+
+/// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
+/// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
+/// the GPU absorbs each group while the CPU fills the next. Only used inside
+/// exclusive proving phases (nothing else contends for the GPU stream) and
+/// for large wide trees, where the overlap converts the previously serial
+/// CPU-FFT-then-GPU-hash commitment into max(FFT, hash) + one pass.
+///
+/// Value-exact: the fill closure runs the same `batch_multiply_into` +
+/// zero-padded FFT as `fill_lde_column_store`, and each absorb pass performs
+/// exactly the corresponding loop iteration of `poseidon2_hash_leaves_colmajor`
+/// (chunked canonicalized absorption, permute, final bit-reversed digest
+/// write), so both the retained columns and the digests are bit-identical to
+/// the classic path. Any unavailability (pipeline missing, buffers, command
+/// failure) returns `None` and the caller falls back to that classic path;
+/// the fill is idempotent, so a partial fill followed by the fallback''s full
+/// fill is harmless.
+pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
+    columns: &MetalColumns<F>,
+    cap_height: usize,
+    fill_group: &(dyn Fn(usize, &mut [&mut [F]]) + Sync),
+) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
+    let leaf_width = columns.cols;
+    let leaf_count = columns.rows;
+    if F::ORDER != 0xffff_ffff_0000_0001
+        || size_of::<F>() != size_of::<u64>()
+        || leaf_width < 16
+        || leaf_count < 1 << 20
+        || !leaf_count.is_power_of_two()
+        || leaf_count > u32::MAX as usize
+        || leaf_width > u32::MAX as usize
+        || cap_height > leaf_count.ilog2() as usize
+        || !EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    let context = shared_context()?;
+    let pipeline = absorb_pass_pipeline()?;
+    log::debug!("streamed sponge build: {leaf_width} cols x {leaf_count} leaves");
+
+    let cap_count = 1usize << cap_height;
+    let total_node_count = 2 * leaf_count - cap_count;
+    let output_len = total_node_count.checked_mul(4)?;
+    let output_bytes = output_len.checked_mul(size_of::<u64>())?;
+    let state_bytes = leaf_count.checked_mul(12)?.checked_mul(size_of::<u64>())?;
+
+    let job = GpuJobGuard::begin();
+    let mut buffers = STREAMED_BUFFERS.lock().ok()?;
+    let needs_new = buffers.as_ref().map_or(true, |(state, output)| {
+        state.length() < state_bytes as u64 || output.length() < output_bytes as u64
+    });
+    if needs_new {
+        *buffers = Some(autoreleasepool(|| {
+            (
+                context.device.new_buffer(
+                    state_bytes as u64,
+                    MTLResourceOptions::StorageModeShared,
+                ),
+                context.device.new_buffer(
+                    output_bytes as u64,
+                    MTLResourceOptions::StorageModeShared,
+                ),
+            )
+        }));
+    }
+    let (state_buffer, output_buffer) = buffers.as_ref()?;
+
+    // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
+    // absorption of group g: commands on one queue execute in submission
+    // order, and each pass is committed before the next group''s fill starts.
+    let groups = leaf_width.div_ceil(8);
+    let base = columns.buffer.contents().cast::<F>();
+    let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
+    for group in 0..groups {
+        let col_start = group * 8;
+        let chunk = (leaf_width - col_start).min(8);
+        {
+            // SAFETY: each column slice covers a disjoint `leaf_count` range
+            // of the shared buffer; the GPU only reads columns of groups
+            // whose pass was already committed, after their fill completed.
+            let mut slices: Vec<&mut [F]> = (0..chunk)
+                .map(|k| unsafe {
+                    slice::from_raw_parts_mut(
+                        base.add((col_start + k) * leaf_count).cast::<F>(),
+                        leaf_count,
+                    )
+                })
+                .collect();
+            fill_group(group, &mut slices);
+        }
+        let command_buffer = autoreleasepool(|| -> CommandBuffer {
+            let command_buffer = context.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(&columns.buffer), 0);
+            encoder.set_buffer(1, Some(state_buffer), 0);
+            encoder.set_buffer(2, Some(output_buffer), 0);
+            encoder.set_buffer(3, Some(&context.parameters), 0);
+            set_u32(encoder, 4, leaf_count as u32);
+            set_u32(encoder, 5, leaf_count.ilog2());
+            set_u32(encoder, 6, col_start as u32);
+            set_u32(encoder, 7, chunk as u32);
+            set_u32(encoder, 8, (group == 0) as u32);
+            set_u32(encoder, 9, (group == groups - 1) as u32);
+            dispatch(encoder, pipeline, leaf_count);
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.to_owned()
+        });
+        absorb_commands.push(command_buffer);
+    }
+
+    // Parent levels over the completed leaf digests, exactly as in the
+    // classic single-command build.
+    let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
+    let parents_command = autoreleasepool(|| -> CommandBuffer {
+        let command_buffer = context.queue.new_command_buffer();
+        let mut level_offset = 0usize;
+        let mut child_count = leaf_count;
+        level_offsets.push(level_offset);
+        while child_count > cap_count {
+            let parent_count = child_count / 2;
+            let child_offset = level_offset;
+            level_offset += child_count * 4;
+            level_offsets.push(level_offset);
+
+            let parent_count_u32 = parent_count as u32;
+            let parent_encoder = command_buffer.new_compute_command_encoder();
+            parent_encoder.set_compute_pipeline_state(&context.parent_pipeline);
+            parent_encoder.set_buffer(
+                0,
+                Some(output_buffer),
+                (child_offset * size_of::<u64>()) as NSUInteger,
+            );
+            parent_encoder.set_buffer(
+                1,
+                Some(output_buffer),
+                (level_offset * size_of::<u64>()) as NSUInteger,
+            );
+            parent_encoder.set_buffer(2, Some(&context.parameters), 0);
+            set_u32(parent_encoder, 3, parent_count_u32);
+            dispatch(parent_encoder, &context.parent_pipeline, parent_count);
+            parent_encoder.end_encoding();
+
+            child_count = parent_count;
+        }
+        command_buffer.commit();
+        command_buffer.to_owned()
+    });
+
+    parents_command.wait_until_completed();
+    let all_ok = absorb_commands
+        .iter()
+        .chain(core::iter::once(&parents_command))
+        .all(|command_buffer| {
+            command_buffer.wait_until_completed();
+            command_buffer.status() == MTLCommandBufferStatus::Completed
+        });
+    drop(job);
+    if !all_ok {
+        log::warn!("streamed Metal sponge build failed; falling back to the classic path");
+        return None;
+    }
+
+    let nodes = unsafe {
+        slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
+    };
+    Some(tree_from_levels::<F>(
+        nodes,
+        &level_offsets,
+        leaf_count,
+        cap_height,
+    ))
+}
+
 pub(crate) fn build_merkle_tree_shared<F: RichField>(
     columns: &MetalColumns<F>,
     cap_height: usize,

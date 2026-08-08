@@ -863,6 +863,23 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn try_build_merkle_tree_column_store_streamed(
+        columns: &crate::hash::merkle_tree::ColumnStore<F>,
+        cap_height: usize,
+        fill_group: &(dyn Fn(usize, &mut [&mut [F]]) + Sync),
+    ) -> Option<(
+        crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
+        Vec<Self::Hash>,
+    )> {
+        match columns {
+            crate::hash::merkle_tree::ColumnStore::Owned(_) => None,
+            crate::hash::merkle_tree::ColumnStore::Shared(columns) => {
+                super::metal::build_merkle_tree_shared_streamed(columns, cap_height, fill_group)
+            }
+        }
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     fn try_build_commitment_from_coeffs(
         coeff_columns: &[&[F]],
         rate_bits: usize,

@@ -1349,3 +1349,51 @@ kernel void poseidon2_hash_parents(
         output[i] = gl_canonicalize(state[i]);
     }
 }
+
+// One sponge absorption pass over a group of at most eight natural-order
+// columns, with the running 12-lane state parked in `state` between passes
+// (column-major: lane i of row gid at state[i * leaf_count + gid]). The
+// final pass writes the four-lane digests to `hashes` at the bit-reversed
+// row, exactly like poseidon2_hash_leaves_colmajor. Splitting the sponge by
+// column group lets the CPU compute group g+1's LDE columns while the GPU
+// absorbs group g; the arithmetic per pass is identical to the fused
+// kernel's corresponding loop iteration.
+kernel void poseidon2_absorb_pass(
+    const device ulong* leaves [[buffer(0)]],
+    device ulong* state [[buffer(1)]],
+    device ulong* hashes [[buffer(2)]],
+    constant ulong* parameters [[buffer(3)]],
+    constant uint& leaf_count [[buffer(4)]],
+    constant uint& log_leaf_count [[buffer(5)]],
+    constant uint& col_start [[buffer(6)]],
+    constant uint& chunk_size [[buffer(7)]],
+    constant uint& first_pass [[buffer(8)]],
+    constant uint& final_pass [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= leaf_count) {
+        return;
+    }
+    ulong st[12] = { 0 };
+    if (first_pass == 0u) {
+        for (uint i = 0; i < 12; ++i) {
+            st[i] = state[(ulong)i * leaf_count + gid];
+        }
+    }
+    for (uint i = 0; i < chunk_size; ++i) {
+        st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
+    }
+    poseidon2(st, parameters);
+    if (final_pass != 0u) {
+        uint out_row = log_leaf_count == 0
+            ? gid
+            : (reverse_bits(gid) >> (32 - log_leaf_count));
+        device ulong* output = hashes + (ulong)out_row * 4;
+        for (uint i = 0; i < 4; ++i) {
+            output[i] = gl_canonicalize(st[i]);
+        }
+    } else {
+        for (uint i = 0; i < 12; ++i) {
+            state[(ulong)i * leaf_count + gid] = st[i];
+        }
+    }
+}
