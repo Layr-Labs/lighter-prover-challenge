@@ -386,10 +386,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32Subtraction
 impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
     for U32SubtractionGate<F, D>
 {
-    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>, const ACCUMULATE: bool>(
         &self,
         vars: EvaluationVarsBasePacked<P>,
-        mut yield_constr: StridedConstraintConsumer<P>,
+        mut yield_constr: StridedConstraintConsumer<P, ACCUMULATE>,
     ) {
         for i in 0..self.num_ops {
             let input_x = vars.local_wires[self.wire_ith_input_x(i)];

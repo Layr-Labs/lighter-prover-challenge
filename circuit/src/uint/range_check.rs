@@ -522,10 +522,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
 impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
     for RangeCheckGate<F, D>
 {
-    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>, const ACCUMULATE: bool>(
         &self,
         vars: EvaluationVarsBasePacked<P>,
-        mut yield_constr: StridedConstraintConsumer<P>,
+        mut yield_constr: StridedConstraintConsumer<P, ACCUMULATE>,
     ) {
         // BASE == 4: multiplying the Horner accumulator by 4 is two doublings,
         // and the degree-4 range product l(l-1)(l-2)(l-3) factors exactly as
