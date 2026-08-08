@@ -1,4 +1,4 @@
-// Redraw marker 137
+// Redraw marker 127
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
@@ -171,10 +171,16 @@ impl Circuits {
             &mut self.heavy_tx_data,
             &mut self.heavy_chain_data,
         ] {
-            lock.get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .prover_only
-                .constants_sigmas_commitment = PolynomialBatch::default();
+            let data = lock
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            // Same unreachability argument as the per-path releases: every
+            // proof of these circuits already exists when the final block
+            // proof starts, so the quotient-domain constants/sigmas cache is
+            // dead storage here too. Clearing it is idempotent for paths that
+            // already released theirs.
+            data.prover_only.constants_sigmas_quotient_cache = None;
         }
     }
 
@@ -203,10 +209,24 @@ impl Circuits {
     /// added — storage that no subsequent read can reach is returned earlier.
     pub fn release_heavy_circuit_extensions(&self) {
         for lock in [&self.heavy_tx_data, &self.heavy_chain_data] {
-            lock.write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .prover_only
-                .constants_sigmas_commitment = PolynomialBatch::default();
+            let mut data = lock
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            // The quotient-domain constants/sigmas cache is a flat
+            // `(constants + sigmas) * quotient_domain` field-element buffer,
+            // extracted once at circuit-build/load time and read only by
+            // proofs *of this circuit* (the quotient fill_lde_batch copy in
+            // `plonk/prover.rs`, which falls back to the uncached gather when
+            // the field is `None` — the state bincode round trips ship in).
+            // The heavy path has produced its last proof and the block lane
+            // has finished `define`, so that copy can never run again: return
+            // this multi-hundred-MiB flat buffer to the OS here instead of
+            // holding it across the whole light phase. Same proof obligation
+            // as the commitment release above (the exclusive guard proves no
+            // reader remains) and value-exact (pure duplicate storage, no
+            // quantity computed differently).
+            data.prover_only.constants_sigmas_quotient_cache = None;
         }
     }
 
@@ -223,10 +243,19 @@ impl Circuits {
     /// [`Self::release_finished_circuit_extensions`] would.
     pub fn release_light_circuit_extensions(&self) {
         for lock in [&self.light_tx_data, &self.light_chain_data] {
-            lock.write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .prover_only
-                .constants_sigmas_commitment = PolynomialBatch::default();
+            let mut data = lock
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            // Same dead-storage argument as the heavy pair: the quotient-domain
+            // constants/sigmas cache (a flat `(constants + sigmas) *
+            // quotient_domain` buffer extracted at load time, read only by this
+            // circuit's own quotient fill) is unreachable once the light path's
+            // last chain proof exists. `None` is the bincode-shipped state and
+            // routes to the documented uncached gather. Return it to the OS
+            // before the final block proof (the peak-RSS moment) stacks its own
+            // extensions.
+            data.prover_only.constants_sigmas_quotient_cache = None;
         }
     }
 
