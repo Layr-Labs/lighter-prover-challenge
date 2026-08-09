@@ -102,51 +102,6 @@ pub enum MerkleLeaves<F> {
     },
 }
 
-/// Storage for level-order digests. Metal-produced nodes can remain in their
-/// immutable shared buffer, avoiding a full-tree copy before sparse queries.
-#[derive(Clone, Debug)]
-pub enum DigestStore<T> {
-    Owned(Vec<T>),
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    Shared(crate::hash::poseidon2::metal::MetalDigests<T>),
-}
-
-impl<T> DigestStore<T> {
-    pub fn is_shared(&self) -> bool {
-        match self {
-            Self::Owned(_) => false,
-            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-            Self::Shared(_) => true,
-        }
-    }
-}
-
-impl<T: PartialEq> PartialEq for DigestStore<T> {
-    fn eq(&self, other: &Self) -> bool {
-        &**self == &**other
-    }
-}
-
-impl<T: Eq> Eq for DigestStore<T> {}
-
-impl<T> From<Vec<T>> for DigestStore<T> {
-    fn from(nodes: Vec<T>) -> Self {
-        Self::Owned(nodes)
-    }
-}
-
-impl<T> core::ops::Deref for DigestStore<T> {
-    type Target = [T];
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Owned(nodes) => nodes,
-            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-            Self::Shared(nodes) => nodes.as_slice(),
-        }
-    }
-}
-
 /// Merkle tree digests stored in level order, exactly as the fused GPU
 /// pipeline writes them: `nodes[level_offsets[l] + i]` is node `i` of level
 /// `l`, where level 0 holds the leaf digests and node `i` of level `l` is the
@@ -156,7 +111,7 @@ impl<T> core::ops::Deref for DigestStore<T> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LevelOrderDigests<T> {
     /// All tree nodes as one contiguous level-order array, cap level included.
-    pub nodes: DigestStore<T>,
+    pub nodes: Vec<T>,
     /// Element offset of each level's first node within `nodes`.
     pub level_offsets: Vec<usize>,
 }
@@ -1218,7 +1173,7 @@ pub(crate) mod tests {
         let cap = nodes[level_start..].to_vec();
         (
             LevelOrderDigests {
-                nodes: nodes.into(),
+                nodes,
                 level_offsets,
             },
             cap,
