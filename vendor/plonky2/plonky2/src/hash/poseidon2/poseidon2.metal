@@ -180,6 +180,86 @@ inline void mul_128(
 // Normalizing those two signed base-B coefficients only needs uint
 // add/subtract/carry operations; the only ulong multiplies left are the
 // product's low and high halves.
+constant ulong GOLDILOCKS_EPSILON_SQUARED = 0xfffffffe00000001UL;
+
+/// Reduces an arbitrary 128-bit value modulo the Goldilocks prime.
+///
+/// Same folding `gl_mul`'s reference path performs, lifted out so the batched
+/// constraint accumulator can share it.
+inline ulong gl_reduce128(ulong low, ulong high) {
+    ulong high_high = high >> 32;
+    ulong high_low = high & GOLDILOCKS_EPSILON;
+    ulong reduced = low - high_high;
+    if (reduced > low) {
+        reduced -= GOLDILOCKS_EPSILON;
+    }
+    ulong addend = high_low * GOLDILOCKS_EPSILON;
+    ulong result = reduced + addend;
+    return result + (result < reduced) * GOLDILOCKS_EPSILON;
+}
+
+/// Exact sum of alpha-weighted constraint products, carried at full width.
+///
+/// A gate emits one product per constraint and the running total is reduced
+/// after every one of them. The products are exact 128-bit values, so they can
+/// be summed without reduction if the sum is carried wide enough: two 64-bit
+/// limbs plus a 2^128 counter. `top` counts carries out of 128 bits, so it is
+/// bounded by the constraint count -- at most a few hundred here, far below
+/// what its 32 bits hold.
+struct wide_product_sum_t {
+    ulong lo;
+    ulong hi;
+    uint top;
+};
+
+inline wide_product_sum_t wide_product_sum_zero() {
+    return { 0UL, 0UL, 0u };
+}
+
+/// Accumulates `a * b`, taking the product from the same 32-bit limb split
+/// `gl_mul` uses rather than a second 64-bit expansion.
+inline wide_product_sum_t wide_product_sum_add(
+    wide_product_sum_t sum,
+    ulong a,
+    ulong b) {
+    uint l0;
+    uint l1;
+    uint h0;
+    uint h1;
+    mul_128(a, b, l0, l1, h0, h1);
+    ulong product_lo = ((ulong)l1 << 32) | (ulong)l0;
+    ulong product_hi = ((ulong)h1 << 32) | (ulong)h0;
+
+    ulong next_lo = sum.lo + product_lo;
+    ulong carry = (ulong)(next_lo < sum.lo);
+    ulong next_hi = sum.hi + product_hi;
+    uint top_carry = (uint)(next_hi < sum.hi);
+    ulong next_hi_carried = next_hi + carry;
+    top_carry += (uint)(next_hi_carried < next_hi);
+
+    return { next_lo, next_hi_carried, sum.top + top_carry };
+}
+
+/// One reduction for the whole gate.
+///
+/// With C = 2^64 and C == EPSILON (mod p), the exact sum lo + hi*C + top*C^2 is
+/// congruent to lo + hi*EPSILON + top*EPSILON^2, which fits two limbs.
+inline ulong wide_product_sum_materialize(wide_product_sum_t sum) {
+    ulong high_term_lo = sum.hi * GOLDILOCKS_EPSILON;
+    ulong high_term_hi = metal::mulhi(sum.hi, GOLDILOCKS_EPSILON);
+    ulong top = (ulong)sum.top;
+    ulong top_term_lo = top * GOLDILOCKS_EPSILON_SQUARED;
+    ulong top_term_hi = metal::mulhi(top, GOLDILOCKS_EPSILON_SQUARED);
+
+    ulong low = sum.lo + high_term_lo;
+    ulong carry = (ulong)(low < sum.lo);
+    ulong high = high_term_hi + carry;
+    ulong next_low = low + top_term_lo;
+    carry = (ulong)(next_low < low);
+    high += top_term_hi + carry;
+    return gl_reduce128(next_low, high);
+}
+
 inline ulong gl_mul(ulong a, ulong b) {
 #if defined(POSEIDON2_NATIVE_ARITHMETIC_REFERENCE)
     ulong low = a * b;
@@ -433,12 +513,12 @@ inline ulong poseidon2_gate_wire(
 inline void poseidon2_gate_emit(
     ulong constraint,
     constant ulong* alpha_powers,
-    thread ulong accumulators[2],
+    thread wide_product_sum_t accumulators[2],
     thread uint& constraint_index) {
-    accumulators[0] =
-        gl_mul_add(constraint, alpha_powers[constraint_index], accumulators[0]);
-    accumulators[1] =
-        gl_mul_add(constraint, alpha_powers[123 + constraint_index], accumulators[1]);
+    accumulators[0] = wide_product_sum_add(
+        accumulators[0], constraint, alpha_powers[constraint_index]);
+    accumulators[1] = wide_product_sum_add(
+        accumulators[1], constraint, alpha_powers[123 + constraint_index]);
     ++constraint_index;
 }
 
@@ -479,7 +559,7 @@ kernel void poseidon2_gate_quotient(
     }
 
     // parameters buffer kept for ABI; RCs from compile-time tables.
-    ulong accumulators[2] = { 0, 0 };
+    wide_product_sum_t accumulators[2] = { wide_product_sum_zero(), wide_product_sum_zero() };
     uint constraint_index = 0;
 
     ulong swap = poseidon2_gate_wire(wires, 24, lde_rows, source_row);
@@ -575,20 +655,22 @@ kernel void poseidon2_gate_quotient(
             constraint_index);
     }
 
-    output[(ulong)gid * 2] = gl_canonicalize(gl_mul(filter, accumulators[0]));
-    output[(ulong)gid * 2 + 1] = gl_canonicalize(gl_mul(filter, accumulators[1]));
+    output[(ulong)gid * 2] = gl_canonicalize(
+        gl_mul(filter, wide_product_sum_materialize(accumulators[0])));
+    output[(ulong)gid * 2 + 1] = gl_canonicalize(
+        gl_mul(filter, wide_product_sum_materialize(accumulators[1])));
 }
 
 inline void range_check_gate_emit(
     ulong constraint,
     constant ulong* alpha_powers,
     uint alpha_stride,
-    thread ulong accumulators[2],
+    thread wide_product_sum_t accumulators[2],
     uint constraint_index) {
-    accumulators[0] =
-        gl_mul_add(constraint, alpha_powers[constraint_index], accumulators[0]);
-    accumulators[1] = gl_mul_add(
-        constraint, alpha_powers[alpha_stride + constraint_index], accumulators[1]);
+    accumulators[0] = wide_product_sum_add(
+        accumulators[0], constraint, alpha_powers[constraint_index]);
+    accumulators[1] = wide_product_sum_add(
+        accumulators[1], constraint, alpha_powers[alpha_stride + constraint_index]);
 }
 
 // Each RangeCheck metadata record is ten uints:
@@ -681,7 +763,7 @@ kernel void range_check_gate_quotient(
             filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
         }
 
-        ulong gate_accumulators[2] = { 0, 0 };
+        wide_product_sum_t gate_accumulators[2] = { wide_product_sum_zero(), wide_product_sum_zero() };
         uint constraint_index = 0;
         for (uint op = 0; op < num_ops; ++op) {
             ulong input = wires[(ulong)op * lde_rows + source_row];
@@ -719,8 +801,10 @@ kernel void range_check_gate_quotient(
             }
         }
 
-        total[0] = gl_mul_add(filter, gate_accumulators[0], total[0]);
-        total[1] = gl_mul_add(filter, gate_accumulators[1], total[1]);
+        total[0] = gl_mul_add(
+            filter, wide_product_sum_materialize(gate_accumulators[0]), total[0]);
+        total[1] = gl_mul_add(
+            filter, wide_product_sum_materialize(gate_accumulators[1]), total[1]);
     }
 
     constant uint* u32_metadata = metadata + range_count * 10u;
@@ -750,7 +834,7 @@ kernel void range_check_gate_quotient(
             filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
         }
 
-        ulong gate_accumulators[2] = { 0, 0 };
+        wide_product_sum_t gate_accumulators[2] = { wide_product_sum_zero(), wide_product_sum_zero() };
         uint constraint_index = 0;
         if (kind == 0u) {
             // U32ArithmeticGate: six routed words followed by 32 base-4
@@ -1379,8 +1463,10 @@ kernel void range_check_gate_quotient(
                 constraint_index++);
         }
 
-        total[0] = gl_mul_add(filter, gate_accumulators[0], total[0]);
-        total[1] = gl_mul_add(filter, gate_accumulators[1], total[1]);
+        total[0] = gl_mul_add(
+            filter, wide_product_sum_materialize(gate_accumulators[0]), total[0]);
+        total[1] = gl_mul_add(
+            filter, wide_product_sum_materialize(gate_accumulators[1]), total[1]);
     }
 
     output[(ulong)gid * 2] = gl_canonicalize(total[0]);
