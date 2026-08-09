@@ -1,10 +1,10 @@
 //! Logic for building plonky2 circuits.
 
 #[cfg(not(feature = "std"))]
-use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 use core::cmp::max;
 #[cfg(feature = "std")]
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use hashbrown::{HashMap, HashSet};
 use itertools::Itertools;
@@ -1325,33 +1325,31 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // Index generator indices by their watched targets.
         //
         // The same pass also records, per generator, how many *distinct* representatives it
-        // watches. Generators are visited in ascending index order, so every list receives its
-        // pushes in nondecreasing generator order and all pushes of a given generator into a
-        // given list are contiguous at that list's tail: a push is a repeat of an already-counted
-        // representative exactly when the list's last entry is already this generator. Deriving
-        // the counts here costs one comparison per watched target and avoids the separate global
-        // traversal of the finished map that the naive variant would need.
+        // watches. Deduplicating each generator's typically short watch list first gives the CSR
+        // builder one flat edge array in ascending generator order. This avoids constructing a
+        // `BTreeMap` node and a separately allocated `Vec` for every watched representative.
         let mut generator_watch_counts = vec![0usize; self.generators.len()];
-        let mut generator_indices_by_watches = BTreeMap::new();
+        let mut generator_watch_representatives = Vec::new();
+        let mut generator_representatives = Vec::new();
         for (i, generator) in self.generators.iter().enumerate() {
-            for watch in generator.0.watch_list() {
+            let watches = generator.0.watch_list();
+            generator_representatives.clear();
+            generator_representatives.extend(watches.into_iter().map(|watch| {
                 let watch_index = forest.target_index(watch);
-                let watch_rep_index = forest.parents[watch_index] as usize;
-                let watchers = generator_indices_by_watches
-                    .entry(watch_rep_index)
-                    .or_insert_with(Vec::new);
-                if watchers.last() != Some(&i) {
-                    generator_watch_counts[i] += 1;
-                }
-                watchers.push(i);
-            }
-        }
-        for indices in generator_indices_by_watches.values_mut() {
-            indices.dedup();
-            indices.shrink_to_fit();
+                forest.parents[watch_index]
+            }));
+            generator_representatives.sort_unstable();
+            generator_representatives.dedup();
+            generator_watch_counts[i] = generator_representatives.len();
+            generator_watch_representatives.extend_from_slice(&generator_representatives);
         }
         let generator_indices_by_watches =
-            GeneratorWatchIndex::from_map(generator_indices_by_watches);
+            GeneratorWatchIndex::from_sorted_generator_representatives(
+                &generator_watch_representatives,
+                &generator_watch_counts,
+            );
+        drop(generator_watch_representatives);
+        drop(generator_representatives);
 
         let num_gate_constraints = gates
             .iter()
