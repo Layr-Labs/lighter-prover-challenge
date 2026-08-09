@@ -6,7 +6,9 @@ pub(crate) mod metal;
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 pub use metal::{
-    is_exclusive_gpu_phase, prewarm as prewarm_gpu, set_exclusive_gpu_phase,
+    generate_pipeline_archive, is_exclusive_gpu_phase, prewarm as prewarm_gpu,
+    verify_pipeline_archive,
+    set_exclusive_gpu_phase,
 };
 
 /// No-op fallback so callers can toggle the exclusive-phase GPU routing hint
