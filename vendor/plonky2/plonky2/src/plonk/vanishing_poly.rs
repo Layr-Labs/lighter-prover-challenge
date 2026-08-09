@@ -471,6 +471,29 @@ fn reduce_gate_constraints_base_batch<F: Field>(
     // This is NOT valid for a caller that passes a nonzero running
     // accumulator, which the general contract permits, so it is opt-in.
     let mut rows = constraint_terms_batch.chunks_exact(batch_size).rev();
+    if alphas.len() == 2 {
+        let alpha_0 = alphas[0];
+        let alpha_1 = alphas[1];
+        if res_out_is_zero_seed {
+            match rows.next() {
+                Some(first_row) => {
+                    for (&term, result) in first_row.iter().zip(res_out.chunks_exact_mut(2)) {
+                        result[0] = term;
+                        result[1] = term;
+                    }
+                }
+                None => res_out.fill(F::ZERO),
+            }
+        }
+        for constraint_row in rows {
+            for (&term, result) in constraint_row.iter().zip(res_out.chunks_exact_mut(2)) {
+                result[0] = term.multiply_accumulate(result[0], alpha_0);
+                result[1] = term.multiply_accumulate(result[1], alpha_1);
+            }
+        }
+        return;
+    }
+
     if res_out_is_zero_seed {
         match rows.next() {
             Some(first_row) => {
@@ -492,6 +515,11 @@ fn reduce_gate_constraints_base_batch<F: Field>(
             }
         }
     }
+}
+
+#[inline(always)]
+fn permutation_factor_fma<F: Field>(wire: F, beta: F, point: F, gamma: F) -> F {
+    wire.multiply_accumulate(beta, point) + gamma
 }
 
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
@@ -684,10 +712,10 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                         let wire = wire_col[k];
                         let sigma = sigma_col[k];
                         let x = xs_batch[k];
-                        num_prod.push(wire + beta_k_0 * x + gamma_0);
-                        den_prod.push(wire + beta_0 * sigma + gamma_0);
-                        num_prod_second.push(wire + beta_k_1 * x + gamma_1);
-                        den_prod_second.push(wire + beta_1 * sigma + gamma_1);
+                        num_prod.push(permutation_factor_fma(wire, beta_k_0, x, gamma_0));
+                        den_prod.push(permutation_factor_fma(wire, beta_0, sigma, gamma_0));
+                        num_prod_second.push(permutation_factor_fma(wire, beta_k_1, x, gamma_1));
+                        den_prod_second.push(permutation_factor_fma(wire, beta_1, sigma, gamma_1));
                     }
                 }
                 for j in j_start + 1..j_end {
@@ -699,10 +727,10 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                         let wire = wire_col[k];
                         let sigma = sigma_col[k];
                         let x = xs_batch[k];
-                        num_prod[k] *= wire + beta_k_0 * x + gamma_0;
-                        den_prod[k] *= wire + beta_0 * sigma + gamma_0;
-                        num_prod_second[k] *= wire + beta_k_1 * x + gamma_1;
-                        den_prod_second[k] *= wire + beta_1 * sigma + gamma_1;
+                        num_prod[k] *= permutation_factor_fma(wire, beta_k_0, x, gamma_0);
+                        den_prod[k] *= permutation_factor_fma(wire, beta_0, sigma, gamma_0);
+                        num_prod_second[k] *= permutation_factor_fma(wire, beta_k_1, x, gamma_1);
+                        den_prod_second[k] *= permutation_factor_fma(wire, beta_1, sigma, gamma_1);
                     }
                 }
 
@@ -739,8 +767,18 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                         let sigma_col = &s_sigmas_cols[j_start * n..][..n];
                         let beta_k_i = beta_k_is[i * num_routed_wires + j_start];
                         for k in 0..n {
-                            num_prod.push(wire_col[k] + beta_k_i * xs_batch[k] + gamma);
-                            den_prod.push(wire_col[k] + beta * sigma_col[k] + gamma);
+                            num_prod.push(permutation_factor_fma(
+                                wire_col[k],
+                                beta_k_i,
+                                xs_batch[k],
+                                gamma,
+                            ));
+                            den_prod.push(permutation_factor_fma(
+                                wire_col[k],
+                                beta,
+                                sigma_col[k],
+                                gamma,
+                            ));
                         }
                     }
                     for j in j_start + 1..j_end {
@@ -748,8 +786,18 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                         let sigma_col = &s_sigmas_cols[j * n..][..n];
                         let beta_k_i = beta_k_is[i * num_routed_wires + j];
                         for k in 0..n {
-                            num_prod[k] *= wire_col[k] + beta_k_i * xs_batch[k] + gamma;
-                            den_prod[k] *= wire_col[k] + beta * sigma_col[k] + gamma;
+                            num_prod[k] *= permutation_factor_fma(
+                                wire_col[k],
+                                beta_k_i,
+                                xs_batch[k],
+                                gamma,
+                            );
+                            den_prod[k] *= permutation_factor_fma(
+                                wire_col[k],
+                                beta,
+                                sigma_col[k],
+                                gamma,
+                            );
                         }
                     }
 
@@ -1659,7 +1707,7 @@ pub(crate) fn eval_vanishing_poly_circuit<F: RichField + Extendable<D>, const D:
 #[cfg(test)]
 mod tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
-    use plonky2_field::types::PrimeField64;
+    use plonky2_field::types::{Field64, PrimeField64};
 
     use super::*;
 
@@ -1709,6 +1757,118 @@ mod tests {
             let mut actual = initial;
             reduce_gate_constraints_base_batch(&terms, batch_size, &alphas, &mut actual, false);
             assert_eq!(actual, expected, "batch size {batch_size}");
+        }
+    }
+
+    #[test]
+    fn two_challenge_reducer_matches_generic_raw_limbs() {
+        type F = GoldilocksField;
+
+        let mut state = 0xbb67_ae85_84ca_a73bu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            GoldilocksField(state)
+        };
+
+        for batch_size in [1usize, 7, 32] {
+            for num_rows in [0usize, 1, 17, 136] {
+                let terms = (0..batch_size * num_rows)
+                    .map(|_| next())
+                    .collect::<Vec<_>>();
+                let alphas = [next(), next()];
+                for zero_seed in [false, true] {
+                    let initial = (0..batch_size * alphas.len())
+                        .map(|_| next())
+                        .collect::<Vec<_>>();
+                    let mut expected = initial.clone();
+                    let mut rows = terms.chunks_exact(batch_size).rev();
+                    if zero_seed {
+                        match rows.next() {
+                            Some(first_row) => {
+                                for (&term, result) in
+                                    first_row.iter().zip(expected.chunks_exact_mut(2))
+                                {
+                                    result[0] = term;
+                                    result[1] = term;
+                                }
+                            }
+                            None => expected.fill(F::ZERO),
+                        }
+                    }
+                    for row in rows {
+                        for (&term, result) in row.iter().zip(expected.chunks_exact_mut(2)) {
+                            result[0] =
+                                Field::multiply_accumulate(&term, result[0], alphas[0]);
+                            result[1] =
+                                Field::multiply_accumulate(&term, result[1], alphas[1]);
+                        }
+                    }
+
+                    let mut actual = initial;
+                    reduce_gate_constraints_base_batch(
+                        &terms,
+                        batch_size,
+                        &alphas,
+                        &mut actual,
+                        zero_seed,
+                    );
+                    for (index, (&actual, &expected)) in
+                        actual.iter().zip(&expected).enumerate()
+                    {
+                        assert_eq!(
+                            actual.0, expected.0,
+                            "raw mismatch at {index}, batch={batch_size}, rows={num_rows}, zero_seed={zero_seed}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn permutation_factor_fma_matches_expression() {
+        type F = GoldilocksField;
+
+        let values = [
+            GoldilocksField(0),
+            GoldilocksField(1),
+            GoldilocksField(2),
+            GoldilocksField(F::ORDER - 1),
+            GoldilocksField(F::ORDER),
+            GoldilocksField(F::ORDER + 1),
+            GoldilocksField(u64::MAX),
+        ];
+        for &wire in &values {
+            for &beta in &values {
+                for &point in &values {
+                    let gamma = GoldilocksField(0xfedc_ba98_7654_3210);
+                    assert_eq!(
+                        permutation_factor_fma(wire, beta, point, gamma)
+                            .to_canonical_u64(),
+                        (wire + beta * point + gamma).to_canonical_u64(),
+                    );
+                }
+            }
+        }
+
+        let mut state = 0x3c6e_f372_fe94_f82bu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            GoldilocksField(state)
+        };
+        for _ in 0..100_000 {
+            let wire = next();
+            let beta = next();
+            let point = next();
+            let gamma = next();
+            assert_eq!(
+                permutation_factor_fma(wire, beta, point, gamma).to_canonical_u64(),
+                (wire + beta * point + gamma).to_canonical_u64(),
+            );
         }
     }
 
