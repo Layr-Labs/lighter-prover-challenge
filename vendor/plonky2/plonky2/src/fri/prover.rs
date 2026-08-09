@@ -13,6 +13,7 @@ use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQuerySt
 use crate::fri::{FriConfig, FriParams};
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
+use crate::hash::merkle_proofs::MerkleProof;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
@@ -319,12 +320,32 @@ fn fri_prover_query_rounds<
     n: usize,
     fri_params: &FriParams,
 ) -> Vec<FriQueryRound<F, C::Hasher, D>> {
-    challenger
+    // Collect all Fiat-Shamir indices before opening any initial tree. Fixed
+    // checkpoint-backed commitments can now hash each distinct fixed block
+    // once for this proof instead of rebuilding it independently in 28 rayon
+    // query tasks. Full/dynamic trees keep their ordinary digest lookups.
+    let x_indices = challenger
         .get_n_challenges(fri_params.config.num_query_rounds)
+        .into_iter()
+        .map(|rand| rand.to_canonical_u64() as usize % n)
+        .collect::<Vec<_>>();
+    let initial_merkle_proofs: Vec<Option<Vec<MerkleProof<F, C::Hasher>>>> = initial_merkle_trees
+        .iter()
+        .map(|tree| tree.is_checkpointed().then(|| tree.prove_batch(&x_indices)))
+        .collect();
+
+    x_indices
         .into_par_iter()
-        .map(|rand| {
-            let x_index = rand.to_canonical_u64() as usize % n;
-            fri_prover_query_round::<F, C, D>(initial_merkle_trees, trees, x_index, fri_params)
+        .enumerate()
+        .map(|(round, x_index)| {
+            fri_prover_query_round::<F, C, D>(
+                initial_merkle_trees,
+                &initial_merkle_proofs,
+                round,
+                trees,
+                x_index,
+                fri_params,
+            )
         })
         .collect()
 }
@@ -335,6 +356,8 @@ fn fri_prover_query_round<
     const D: usize,
 >(
     initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
+    initial_merkle_proofs: &[Option<Vec<MerkleProof<F, C::Hasher>>>],
+    round: usize,
     trees: &[MerkleTree<F, C::Hasher>],
     mut x_index: usize,
     fri_params: &FriParams,
@@ -342,7 +365,13 @@ fn fri_prover_query_round<
     let mut query_steps = Vec::new();
     let initial_proof = initial_merkle_trees
         .iter()
-        .map(|t| (t.leaf_vec(x_index), t.prove(x_index)))
+        .zip(initial_merkle_proofs)
+        .map(|(tree, proofs)| {
+            let proof = proofs
+                .as_ref()
+                .map_or_else(|| tree.prove(x_index), |proofs| proofs[round].clone());
+            (tree.leaf_vec(x_index), proof)
+        })
         .collect::<Vec<_>>();
     for (i, tree) in trees.iter().enumerate() {
         let arity_bits = fri_params.reduction_arity_bits[i];

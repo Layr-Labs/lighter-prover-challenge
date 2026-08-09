@@ -125,6 +125,111 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         )
     }
 
+    /// Build a non-blinded fixed commitment from compile-time Merkle
+    /// checkpoint roots. Polynomial coefficients and every LDE column are
+    /// retained exactly as in [`Self::from_values`], but hashing the complete
+    /// fixed tree is deferred to batched FRI query blocks.
+    pub fn from_values_checkpointed(
+        values: Vec<PolynomialValues<F>>,
+        rate_bits: usize,
+        cap_height: usize,
+        checkpoint_roots: Vec<<C::Hasher as Hasher<F>>::Hash>,
+        checkpoint_block_log: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Option<Self> {
+        let coeffs = timed!(
+            timing,
+            "IFFT",
+            values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
+        );
+        Self::from_coeffs_checkpointed(
+            coeffs,
+            rate_bits,
+            cap_height,
+            checkpoint_roots,
+            checkpoint_block_log,
+            timing,
+            fft_root_table,
+        )
+    }
+
+    fn from_coeffs_checkpointed(
+        polynomials: Vec<PolynomialCoeffs<F>>,
+        rate_bits: usize,
+        cap_height: usize,
+        checkpoint_roots: Vec<<C::Hasher as Hasher<F>>::Hash>,
+        checkpoint_block_log: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Option<Self> {
+        let degree = polynomials.first()?.len();
+        let lde_len = degree << rate_bits;
+
+        // Preserve the frontier's shared Metal column backing so quotient
+        // evaluation keeps its zero-copy path. Only the digest build is
+        // deleted; the IFFT/LDE algebra and polynomial ownership are unchanged.
+        if let Some(mut columns) =
+            C::Hasher::try_allocate_merkle_tree_columns(polynomials.len(), lde_len, cap_height)
+        {
+            let initialized = timed!(
+                timing,
+                "FFT + blinding",
+                Self::fill_lde_column_store(
+                    &mut columns,
+                    &polynomials,
+                    rate_bits,
+                    fft_root_table,
+                )
+            );
+            if initialized {
+                let merkle_tree = timed!(
+                    timing,
+                    "attach Merkle checkpoints",
+                    MerkleTree::from_checkpointed_column_store(
+                        columns,
+                        checkpoint_roots,
+                        checkpoint_block_log,
+                        cap_height,
+                    )?
+                );
+                return Some(Self {
+                    polynomials,
+                    merkle_tree,
+                    degree_log: log2_strict(degree),
+                    rate_bits,
+                    blinding: false,
+                });
+            }
+        }
+
+        // Portable/full-column fallback for platforms without shared Metal
+        // storage. This still skips the full digest tree and therefore keeps
+        // checkpoint semantics identical across targets.
+        let lde_values = timed!(
+            timing,
+            "FFT + blinding",
+            Self::lde_values(&polynomials, rate_bits, false, fft_root_table)
+        );
+        let merkle_tree = timed!(
+            timing,
+            "attach Merkle checkpoints",
+            MerkleTree::from_checkpointed_column_store(
+                ColumnStore::Owned(lde_values),
+                checkpoint_roots,
+                checkpoint_block_log,
+                cap_height,
+            )?
+        );
+        Some(Self {
+            polynomials,
+            merkle_tree,
+            degree_log: log2_strict(degree),
+            rate_bits,
+            blinding: false,
+        })
+    }
+
     /// Creates a list polynomial commitment for the polynomials `polynomials`.
     pub fn from_coeffs(
         polynomials: Vec<PolynomialCoeffs<F>>,

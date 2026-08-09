@@ -365,6 +365,7 @@ pub trait Read {
             num_leaves,
             digests,
             level_digests: None,
+            checkpoint_digests: None,
             cap,
         })
     }
@@ -1492,11 +1493,18 @@ pub trait Write {
             self.write_usize(leaf.len())?;
             self.write_field_vec(&leaf)?;
         }
-        match &tree.level_digests {
-            // GPU-built trees keep their digests in level order; materialize
-            // the interleaved layout the wire format expects (cold path).
-            Some(levels) => self.write_hash_vec::<F, H>(&levels.to_interleaved())?,
-            None => self.write_hash_vec::<F, H>(&tree.digests)?,
+        if tree.checkpoint_digests.is_some() {
+            // Checkpoint-backed trees deliberately omit their lower digests.
+            // Generic serialization is a cold path, so reconstruct the legacy
+            // interleaved representation from the retained leaves here.
+            self.write_hash_vec::<F, H>(&tree.to_interleaved_digests())?;
+        } else {
+            match &tree.level_digests {
+                // GPU-built trees keep their digests in level order; materialize
+                // the interleaved layout the wire format expects (cold path).
+                Some(levels) => self.write_hash_vec::<F, H>(&levels.to_interleaved())?,
+                None => self.write_hash_vec::<F, H>(&tree.digests)?,
+            }
         }
         self.write_usize(tree.cap.height())?;
         self.write_merkle_cap(&tree.cap)?;

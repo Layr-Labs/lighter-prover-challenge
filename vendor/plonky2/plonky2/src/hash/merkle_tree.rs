@@ -1,5 +1,5 @@
 #[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::mem::MaybeUninit;
 use core::slice;
 
@@ -116,6 +116,21 @@ pub struct LevelOrderDigests<T> {
     pub level_offsets: Vec<usize>,
 }
 
+/// Sparse digest backing for a tree whose leaves are retained in full but
+/// whose fixed commitment only needs Merkle paths at proof time.
+///
+/// `roots[i]` is the digest of the `i`-th `1 << block_log`-leaf block.  The
+/// much smaller tree over those roots is materialized eagerly, while the
+/// lower block trees are reconstructed in batches for the query indices of a
+/// proof.  The indirection keeps [`MerkleTree`] finite while preserving its
+/// existing value semantics (`Clone`, `Eq`, and `PartialEq`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointDigests<F: RichField, H: Hasher<F>> {
+    pub block_log: usize,
+    pub roots: Vec<H::Hash>,
+    pub upper_tree: Box<MerkleTree<F, H>>,
+}
+
 impl<T: Copy> LevelOrderDigests<T> {
     /// Node `index` of level `level`.
     pub fn node(&self, level: usize, index: usize) -> T {
@@ -208,6 +223,11 @@ pub struct MerkleTree<F: RichField, H: Hasher<F>> {
     /// and serialization materializes the interleaved layout on demand.
     pub level_digests: Option<LevelOrderDigests<H::Hash>>,
 
+    /// Checkpointed alternative to `digests` / `level_digests`. Exactly one
+    /// digest backing is populated. Used by compile-time embedded fixed
+    /// commitments; dynamic commitments continue to use the full tree.
+    pub checkpoint_digests: Option<Box<CheckpointDigests<F, H>>>,
+
     /// The Merkle cap.
     pub cap: MerkleCap<F, H>,
 }
@@ -222,6 +242,7 @@ impl<F: RichField, H: Hasher<F>> Default for MerkleTree<F, H> {
             num_leaves: 0,
             digests: Vec::new(),
             level_digests: None,
+            checkpoint_digests: None,
             cap: MerkleCap::default(),
         }
     }
@@ -763,6 +784,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
                 num_leaves,
                 digests: Vec::new(),
                 level_digests: Some(level_digests),
+                checkpoint_digests: None,
                 cap: MerkleCap(cap),
             };
         }
@@ -791,6 +813,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
                 num_leaves,
                 digests,
                 level_digests: None,
+                checkpoint_digests: None,
                 cap: MerkleCap(cap),
             };
         }
@@ -817,6 +840,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             num_leaves,
             digests,
             level_digests: None,
+            checkpoint_digests: None,
             cap: MerkleCap(cap),
         }
     }
@@ -836,6 +860,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             num_leaves,
             digests: Vec::new(),
             level_digests: Some(level_digests),
+            checkpoint_digests: None,
             cap: MerkleCap(cap),
         }
     }
@@ -934,6 +959,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
                 num_leaves,
                 digests: Vec::new(),
                 level_digests: Some(level_digests),
+                checkpoint_digests: None,
                 cap: MerkleCap(cap),
             };
         }
@@ -947,16 +973,275 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             num_leaves,
             digests,
             level_digests: None,
+            checkpoint_digests: None,
             cap: MerkleCap(cap),
         }
     }
 
+    /// Extracts the roots of fixed-size leaf blocks from an already complete
+    /// tree. These roots are sufficient to reconstruct the upper tree and can
+    /// therefore be embedded instead of every digest below them.
+    pub fn checkpoint_roots(&self, block_log: usize) -> Option<Vec<H::Hash>> {
+        let tree_log = log2_strict(self.num_leaves);
+        let cap_height = self.cap.height();
+        let path_layers = tree_log.checked_sub(cap_height)?;
+        if block_log == 0 || block_log > path_layers {
+            return None;
+        }
+
+        if let Some(checkpoints) = &self.checkpoint_digests {
+            return (checkpoints.block_log == block_log).then(|| checkpoints.roots.clone());
+        }
+
+        let num_blocks = self.num_leaves >> block_log;
+        if let Some(levels) = &self.level_digests {
+            return Some(
+                (0..num_blocks)
+                    .map(|block| levels.node(block_log, block))
+                    .collect(),
+            );
+        }
+
+        // Portable cold path for CPU/interleaved trees. Re-hashing one leaf
+        // and the first `block_log` siblings per block is deliberately kept on
+        // the build/serialization side; runtime embedded loads never execute
+        // it. The result is exactly the node at level `block_log`.
+        Some(
+            (0..num_blocks)
+                .into_par_iter()
+                .map(|block| {
+                    let leaf_index = block << block_log;
+                    let mut digest = H::hash_or_noop(&self.leaf_vec(leaf_index));
+                    let proof = self.prove(leaf_index);
+                    for (level, &sibling) in proof.siblings[..block_log].iter().enumerate() {
+                        digest = if (leaf_index >> level) & 1 == 0 {
+                            H::two_to_one(digest, sibling)
+                        } else {
+                            H::two_to_one(sibling, digest)
+                        };
+                    }
+                    digest
+                })
+                .collect(),
+        )
+    }
+
+    /// Wrap retained LDE columns with a sparse, checkpoint-backed Merkle tree.
+    /// The upper tree is small enough to build eagerly on the CPU; lower
+    /// blocks are reconstructed by [`Self::prove_batch`] only for queried
+    /// indices.
+    pub(crate) fn from_checkpointed_column_store(
+        columns: ColumnStore<F>,
+        checkpoint_roots: Vec<H::Hash>,
+        block_log: usize,
+        cap_height: usize,
+    ) -> Option<Self> {
+        let num_leaves = columns.num_rows();
+        if num_leaves == 0
+            || !num_leaves.is_power_of_two()
+            || columns.num_cols() == 0
+            || block_log == 0
+        {
+            return None;
+        }
+        let tree_log = log2_strict(num_leaves);
+        let checkpoint_cap_log = block_log.checked_add(cap_height)?;
+        if checkpoint_cap_log > tree_log
+            || checkpoint_roots.len() != num_leaves >> block_log
+        {
+            return None;
+        }
+        if (0..columns.num_cols()).any(|column| columns.col(column).len() != num_leaves) {
+            return None;
+        }
+
+        // The ranked Poseidon `HashOut` is represented by four field elements,
+        // for which `hash_or_noop` is an identity. Do not assume that for the
+        // generic hasher: byte-backed outputs such as truncated Keccak encode
+        // `to_vec` differently. Decline checkpoint mode unless the hasher
+        // itself confirms the representation identity; the caller then
+        // retains its classic full-tree fallback.
+        // Representation is a property of the hash output type, not of an
+        // individual root. One representative check avoids one tiny `to_vec`
+        // allocation per embedded checkpoint root at startup.
+        let first_root = checkpoint_roots.first()?;
+        if H::hash_or_noop(&first_root.to_vec()) != *first_root {
+            return None;
+        }
+        // With that identity established, this is the original fixed tree
+        // starting at checkpoint level `block_log`, not a new commitment.
+        let upper_leaves = checkpoint_roots.iter().map(|root| root.to_vec()).collect();
+        let upper_tree = Self::new(upper_leaves, cap_height);
+        let cap = upper_tree.cap.clone();
+        let log_rows = tree_log;
+        Some(Self {
+            leaves: MerkleLeaves::Columns { columns, log_rows },
+            num_leaves,
+            digests: Vec::new(),
+            level_digests: None,
+            checkpoint_digests: Some(Box::new(CheckpointDigests {
+                block_log,
+                roots: checkpoint_roots,
+                upper_tree: Box::new(upper_tree),
+            })),
+            cap,
+        })
+    }
+
+    /// Create a checkpoint-backed view of an already complete column tree.
+    /// The retained Metal column buffer is reference-counted, so this is a
+    /// cheap way to compare checkpoint granularities without copying the LDE.
+    /// Returns `None` for row-backed trees or incompatible generic hashers.
+    pub fn checkpointed_clone(&self, block_log: usize) -> Option<Self> {
+        let columns = match &self.leaves {
+            MerkleLeaves::Columns { columns, .. } => columns.clone(),
+            MerkleLeaves::Rows { .. } => return None,
+        };
+        let checkpoint_roots = self.checkpoint_roots(block_log)?;
+        let checkpointed = Self::from_checkpointed_column_store(
+            columns,
+            checkpoint_roots,
+            block_log,
+            self.cap.height(),
+        )?;
+        (checkpointed.cap == self.cap).then_some(checkpointed)
+    }
+
+    /// Rebuild the complete digest backing from the retained leaves. This is
+    /// a cold correctness fallback for a stale/corrupt checkpoint section and
+    /// for generic serialization of a checkpoint-backed tree.
+    fn rebuild_full(&self) -> Self {
+        let cap_height = self.cap.height();
+        match &self.leaves {
+            MerkleLeaves::Rows { data, width } => {
+                Self::new_flat(data.clone(), *width, cap_height)
+            }
+            MerkleLeaves::Columns { columns, .. } => {
+                Self::new_column_store(columns.clone(), cap_height)
+            }
+        }
+    }
+
+    /// Materialize the legacy interleaved digest layout used by the generic
+    /// wire serializer. Dynamic/full trees remain zero-copy on their existing
+    /// paths; checkpoint trees pay this only if explicitly serialized.
+    pub(crate) fn to_interleaved_digests(&self) -> Vec<H::Hash> {
+        if let Some(levels) = &self.level_digests {
+            return levels.to_interleaved();
+        }
+        if self.checkpoint_digests.is_some() {
+            return self.rebuild_full().to_interleaved_digests();
+        }
+        self.digests.clone()
+    }
+
+    fn build_checkpoint_block(&self, block: usize, block_log: usize) -> Self {
+        let block_leaves = 1usize << block_log;
+        let first_leaf = block << block_log;
+        let width = self.leaf_width();
+        let mut flat = Vec::with_capacity(block_leaves * width);
+
+        match &self.leaves {
+            MerkleLeaves::Rows { data, width } => {
+                flat.extend_from_slice(
+                    &data[first_leaf * *width..(first_leaf + block_leaves) * *width],
+                );
+            }
+            MerkleLeaves::Columns { columns, log_rows } => {
+                for leaf in first_leaf..first_leaf + block_leaves {
+                    let natural = crate::util::reverse_bits(leaf, *log_rows);
+                    for column in 0..columns.num_cols() {
+                        flat.push(columns.col(column)[natural]);
+                    }
+                }
+            }
+        }
+
+        // At the embedded B=8 (and every swept B<=32) this is far below the
+        // Metal routing threshold, so the lower
+        // block is a synchronous CPU tree and never queues a tiny GPU job.
+        Self::new_flat(flat, width, 0)
+    }
+
+    /// Create proofs for a batch of query indices. Checkpoint-backed trees
+    /// hash each distinct lower block once, then splice its five siblings onto
+    /// the eagerly materialized upper path. Full trees retain the old path.
+    pub fn prove_batch(&self, leaf_indices: &[usize]) -> Vec<MerkleProof<F, H>> {
+        let Some(checkpoints) = &self.checkpoint_digests else {
+            return leaf_indices.par_iter().map(|&index| self.prove(index)).collect();
+        };
+        if leaf_indices.is_empty() {
+            return Vec::new();
+        }
+        assert!(
+            leaf_indices.iter().all(|&index| index < self.num_leaves),
+            "Merkle proof leaf index out of range"
+        );
+
+        let mut block_indices: Vec<usize> = leaf_indices
+            .iter()
+            .map(|&index| index >> checkpoints.block_log)
+            .collect();
+        block_indices.sort_unstable();
+        block_indices.dedup();
+        let block_trees: Vec<(usize, Self)> = block_indices
+            .into_par_iter()
+            .map(|block| {
+                (
+                    block,
+                    self.build_checkpoint_block(block, checkpoints.block_log),
+                )
+            })
+            .collect();
+
+        // Any stale or corrupt checkpoint is correctness-only, never a reason
+        // to emit a bad proof. Rebuild the original full tree from the same
+        // retained columns and use its ordinary paths.
+        if block_trees
+            .iter()
+            .any(|(block, tree)| tree.cap.0[0] != checkpoints.roots[*block])
+        {
+            let full = self.rebuild_full();
+            assert_eq!(
+                full.cap, self.cap,
+                "checkpoint Merkle cap diverges from retained leaves"
+            );
+            return leaf_indices
+                .par_iter()
+                .map(|&index| full.prove(index))
+                .collect();
+        }
+
+        leaf_indices
+            .par_iter()
+            .map(|&leaf_index| {
+                let block = leaf_index >> checkpoints.block_log;
+                let position = block_trees
+                    .binary_search_by_key(&block, |(block, _)| *block)
+                    .expect("queried checkpoint block was prepared");
+                let mut siblings = block_trees[position]
+                    .1
+                    .prove(leaf_index & ((1 << checkpoints.block_log) - 1))
+                    .siblings;
+                siblings.extend(checkpoints.upper_tree.prove(block).siblings);
+                MerkleProof { siblings }
+            })
+            .collect()
+    }
     /// The number of field elements per leaf.
     pub fn leaf_width(&self) -> usize {
         match &self.leaves {
             MerkleLeaves::Rows { width, .. } => *width,
             MerkleLeaves::Columns { columns, .. } => columns.num_cols(),
         }
+    }
+
+    /// Whether this tree needs batched lower-block preparation before query
+    /// rounds. Callers use this to leave ordinary full trees on their original
+    /// per-round proof path.
+    #[inline]
+    pub fn is_checkpointed(&self) -> bool {
+        self.checkpoint_digests.is_some()
     }
 
     /// Borrow leaf `i`. Only available for row-major storage.
@@ -984,6 +1269,12 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
 
     /// Create a Merkle proof from a leaf index.
     pub fn prove(&self, leaf_index: usize) -> MerkleProof<F, H> {
+        if self.checkpoint_digests.is_some() {
+            return self
+                .prove_batch(&[leaf_index])
+                .pop()
+                .expect("single Merkle proof batch is nonempty");
+        }
         let cap_height = log2_strict(self.cap.len());
         let siblings = match &self.level_digests {
             Some(levels) => {
@@ -1012,6 +1303,7 @@ pub(crate) mod tests {
     use crate::field::extension::Extendable;
     use crate::hash::merkle_proofs::verify_merkle_proof_to_cap;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
+    use crate::util::serialization::{Buffer, Read as _, Write as _};
 
     pub(crate) fn random_data<F: RichField>(n: usize, k: usize) -> Vec<Vec<F>> {
         (0..n).map(|_| F::rand_vec(k)).collect()
@@ -1217,6 +1509,7 @@ pub(crate) mod tests {
                     num_leaves: n,
                     digests: Vec::new(),
                     level_digests: Some(levels),
+                    checkpoint_digests: None,
                     cap: MerkleCap(cap),
                 };
 
@@ -1231,6 +1524,128 @@ pub(crate) mod tests {
                     verify_merkle_proof_to_cap(leaf.clone(), i, &level_tree.cap, &actual)?;
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    /// B=32 differential covering duplicate queries and both sides of every
+    /// relevant boundary. The checkpoint-backed batch must be canonically
+    /// identical to ordinary full-tree paths, not merely verifier-acceptable.
+    #[test]
+    fn checkpoint_batch_paths_match_full_tree() -> Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        const LOG_N: usize = 9;
+        const N: usize = 1 << LOG_N;
+        const WIDTH: usize = 17;
+        const BLOCK_LOG: usize = 5;
+        const CAP_HEIGHT: usize = 3;
+
+        let columns: Vec<Vec<F>> = (0..WIDTH).map(|_| F::rand_vec(N)).collect();
+        let full = MerkleTree::<F, H>::new_columns(columns.clone(), CAP_HEIGHT);
+        let roots = full
+            .checkpoint_roots(BLOCK_LOG)
+            .expect("B=32 checkpoints fit below the cap");
+        let checkpointed = MerkleTree::<F, H>::from_checkpointed_column_store(
+            ColumnStore::Owned(columns),
+            roots,
+            BLOCK_LOG,
+            CAP_HEIGHT,
+        )
+        .expect("valid B=32 checkpoint tree");
+
+        assert_eq!(checkpointed.cap, full.cap);
+        assert!(checkpointed.digests.is_empty());
+        assert!(checkpointed.level_digests.is_none());
+        assert!(checkpointed.checkpoint_digests.is_some());
+
+        // First/last leaf, both sides of B=32 boundaries, an upper-tree
+        // boundary, and exact duplicates in non-sorted order.
+        let indices = [
+            0usize,
+            31,
+            32,
+            33,
+            31,
+            255,
+            256,
+            511,
+            0,
+            319,
+            320,
+        ];
+        let batched = checkpointed.prove_batch(&indices);
+        assert_eq!(batched.len(), indices.len());
+        for (&index, actual) in indices.iter().zip(&batched) {
+            let expected = full.prove(index);
+            assert_eq!(
+                actual.siblings, expected.siblings,
+                "checkpoint path differs at leaf {index}"
+            );
+            verify_merkle_proof_to_cap(
+                checkpointed.leaf_vec(index),
+                index,
+                &checkpointed.cap,
+                actual,
+            )?;
+        }
+        assert_eq!(batched[0], batched[8], "duplicate index 0 path");
+        assert_eq!(batched[1], batched[4], "duplicate index 31 path");
+
+        Ok(())
+    }
+
+    /// The generic wire format remains legacy/full: serializing a checkpoint
+    /// tree materializes its omitted lower digests, and deserialization yields
+    /// an ordinary full tree with the exact same leaves, cap, and paths.
+    #[test]
+    fn checkpoint_tree_serialization_materializes_full() -> Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        const N: usize = 256;
+        const WIDTH: usize = 9;
+        const BLOCK_LOG: usize = 3;
+        const CAP_HEIGHT: usize = 2;
+
+        let columns: Vec<Vec<F>> = (0..WIDTH).map(|_| F::rand_vec(N)).collect();
+        let full = MerkleTree::<F, H>::new_columns(columns.clone(), CAP_HEIGHT);
+        let checkpointed = MerkleTree::<F, H>::from_checkpointed_column_store(
+            ColumnStore::Owned(columns),
+            full.checkpoint_roots(BLOCK_LOG).unwrap(),
+            BLOCK_LOG,
+            CAP_HEIGHT,
+        )
+        .unwrap();
+
+        let mut bytes = Vec::new();
+        bytes.write_merkle_tree(&checkpointed).unwrap();
+        let decoded = Buffer::new(&bytes).read_merkle_tree::<F, H>().unwrap();
+
+        assert!(!decoded.is_checkpointed());
+        assert!(decoded.level_digests.is_none());
+        assert_eq!(decoded.cap, full.cap);
+        assert_eq!(decoded.num_leaves, full.num_leaves);
+        assert_eq!(
+            decoded.digests.len(),
+            2 * (N - (1 << CAP_HEIGHT)),
+            "legacy full digest array was not materialized"
+        );
+        for index in [0usize, 7, 8, 31, 32, N - 1] {
+            assert_eq!(decoded.leaf_vec(index), full.leaf_vec(index));
+            assert_eq!(decoded.prove(index), full.prove(index));
+            verify_merkle_proof_to_cap(
+                decoded.leaf_vec(index),
+                index,
+                &decoded.cap,
+                &decoded.prove(index),
+            )?;
         }
 
         Ok(())

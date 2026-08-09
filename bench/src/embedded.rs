@@ -159,6 +159,7 @@ impl Circuits {
 mod tests {
     use circuit::circuit_serializer::BlockGateSerializer;
     use circuit::embed::EmbedGeneratorSerializer;
+    use circuit::types::config::CIRCUIT_CONFIG;
     use plonky2::util::serialization::Write as _;
 
     use super::*;
@@ -262,13 +263,59 @@ mod tests {
             "{name}: common circuit data diverges"
         );
 
-        // Prover-only: full structural equality (commitment polynomials and
-        // Merkle tree, sigmas, subgroup, public inputs, representative map,
-        // watch index + counts, fft root table, lookups; generators by id).
+        // The embedded commitment intentionally uses checkpointed digest
+        // storage while the rebuilt reference owns a full tree. Compare every
+        // semantic component, then compare canonical paths across the B=8
+        // boundary; only the unqueried digest backing is allowed to differ.
+        let rebuilt_commitment = &rebuilt_data.prover_only.constants_sigmas_commitment;
+        let embedded_commitment = &embedded_data.prover_only.constants_sigmas_commitment;
         assert!(
-            rebuilt_data.prover_only == embedded_data.prover_only,
-            "{name}: prover-only circuit data diverges"
+            rebuilt_commitment.polynomials == embedded_commitment.polynomials,
+            "{name}: constants/sigmas polynomials diverge"
         );
+        assert!(
+            rebuilt_commitment.merkle_tree.leaves == embedded_commitment.merkle_tree.leaves,
+            "{name}: constants/sigmas LDE columns diverge"
+        );
+        assert!(
+            rebuilt_commitment.degree_log == embedded_commitment.degree_log
+                && rebuilt_commitment.rate_bits == embedded_commitment.rate_bits
+                && rebuilt_commitment.blinding == embedded_commitment.blinding,
+            "{name}: constants/sigmas commitment metadata diverges"
+        );
+        let last = rebuilt_commitment.merkle_tree.num_leaves - 1;
+        let path_indices = [0usize, 7, 8, 9, 31, 32, last];
+        let checkpoint_paths = embedded_commitment.merkle_tree.prove_batch(&path_indices);
+        for (&index, checkpoint_path) in path_indices.iter().zip(checkpoint_paths) {
+            assert!(
+                rebuilt_commitment.merkle_tree.prove(index) == checkpoint_path,
+                "{name}: checkpoint Merkle path diverges at leaf {index}"
+            );
+        }
+
+        macro_rules! assert_prover_field_equal {
+            ($field:ident) => {
+                assert!(
+                    rebuilt_data.prover_only.$field == embedded_data.prover_only.$field,
+                    "{}: prover-only field {} diverges",
+                    name,
+                    stringify!($field)
+                );
+            };
+        }
+        assert_prover_field_equal!(generator_indices_by_watches);
+        assert_prover_field_equal!(generator_watch_counts);
+        assert_prover_field_equal!(sigmas);
+        assert_prover_field_equal!(subgroup);
+        assert_prover_field_equal!(public_inputs);
+        assert_prover_field_equal!(representative_map);
+        assert_prover_field_equal!(fft_root_table);
+        assert_prover_field_equal!(circuit_digest);
+        assert_prover_field_equal!(lookup_rows);
+        assert_prover_field_equal!(lut_to_lookups);
+        assert_prover_field_equal!(constants_sigmas_quotient_cache);
+        assert_prover_field_equal!(constants_sigmas_quotient_step);
+        assert_prover_field_equal!(constants_sigmas_quotient_domain);
     }
 
     /// Determinism oracle for the embed mechanism: builds all five circuits
@@ -411,6 +458,79 @@ mod tests {
                 "net startup win (cold embedded vs rebuild): {:+.1} ms",
                 (t_rebuild.as_secs_f64() - t_embedded_cold.as_secs_f64()) * 1e3
             );
+        });
+    }
+
+    /// Manual upper-bound sweep for one worker's fixed-tree query workload:
+    /// 49 light proofs per path, three heavy proofs per path, and one pre
+    /// proof, each with the configured 28 FRI queries. This isolates the new
+    /// lower-block CPU work from all other proving phases. Run:
+    /// `cargo test --release -p bench --bin prove -- --ignored embedded_checkpoint_query_timing --nocapture`
+    #[test]
+    #[ignore = "manual checkpoint query timing harness"]
+    fn embedded_checkpoint_query_timing() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        fn query_indices(seed: u64, num_leaves: usize) -> Vec<usize> {
+            let mut state = seed | 1;
+            (0..CIRCUIT_CONFIG.fri_config.num_query_rounds)
+                .map(|_| {
+                    // Deterministic xorshift64: distribution is sufficient for
+                    // selecting representative checkpoint blocks; no proof
+                    // randomness or correctness depends on this harness.
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as usize % num_leaves
+                })
+                .collect()
+        }
+
+        fn time_tree(
+            label: &str,
+            data: &CircuitData<F, C, D>,
+            proof_count: usize,
+            seed: u64,
+            block_log: usize,
+        ) -> Duration {
+            let full_tree = &data.prover_only.constants_sigmas_commitment.merkle_tree;
+            let tree = full_tree
+                .checkpointed_clone(block_log)
+                .unwrap_or_else(|| panic!("{label}: cannot construct B={}", 1 << block_log));
+            let started = Instant::now();
+            for proof in 0..proof_count {
+                let indices = query_indices(seed.wrapping_add(proof as u64), tree.num_leaves);
+                black_box(tree.prove_batch(&indices));
+            }
+            let elapsed = started.elapsed();
+            println!("  {label:<12} {proof_count:>2} proofs  {elapsed:>10.1?}");
+            elapsed
+        }
+
+        on_big_stack(|| {
+            // Build full reference trees once. Their retained Metal columns
+            // are reference-counted into each B=8/16/32 candidate, so candidate
+            // setup does not copy the hundreds of MiB of fixed LDE data.
+            let circuits = Circuits::new();
+            let heavy_tx = circuits.heavy_tx_data.read().unwrap();
+            let heavy_chain = circuits.heavy_chain_data.read().unwrap();
+            let light_tx = circuits.light_tx_data.read().unwrap();
+            let light_chain = circuits.light_chain_data.read().unwrap();
+
+            for block_log in [3usize, 4, 5] {
+                println!("B={}", 1 << block_log);
+                let total = [
+                    time_tree("pre", &circuits.pre_data, 1, 0x1000, block_log),
+                    time_tree("heavy_tx", &heavy_tx, 3, 0x2000, block_log),
+                    time_tree("heavy_chain", &heavy_chain, 3, 0x3000, block_log),
+                    time_tree("light_tx", &light_tx, 49, 0x4000, block_log),
+                    time_tree("light_chain", &light_chain, 49, 0x5000, block_log),
+                ]
+                .into_iter()
+                .sum::<Duration>();
+                println!("  five-tree worker-equivalent total {total:>10.1?}");
+            }
         });
     }
 

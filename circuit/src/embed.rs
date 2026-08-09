@@ -5,7 +5,7 @@
 //!
 //! [`serialize_embedded`] turns a built [`CircuitData`] plus its target struct
 //! into a compact blob at *compile time* (from a build script, where time is
-//! untimed), and [`deserialize_embedded`] reconstitutes the exact same
+//! untimed), and [`deserialize_embedded`] reconstitutes semantically identical
 //! `CircuitData` at runtime far faster than re-running circuit construction.
 //!
 //! The blob deliberately omits everything that is cheap to recompute and
@@ -16,9 +16,9 @@
 //! * the 80 sigma coefficient polynomials (~40 MiB/tx circuit) are **not**
 //!   stored — sigma *values* are re-derived from the representative map with
 //!   the same [`Forest::wire_partition`] + [`WirePartition::get_sigma_polys`]
-//!   code the builder itself uses, and the constants/sigmas commitment is
-//!   recomputed through [`PolynomialBatch::from_values`], the builder's own
-//!   commitment path, guaranteeing a bit-identical Merkle cap;
+//!   code the builder itself uses. Its polynomial coefficients and LDE columns
+//!   follow the builder's path, while embedded B=8 Merkle checkpoint roots
+//!   replace the full fixed digest build and pin the exact verifier cap;
 //! * the representative map is stored as zigzag-varint deltas against the
 //!   identity permutation (mostly zeros) instead of 8-byte usizes;
 //! * the generator watch index is stored in its CSR form (varint-delta
@@ -36,11 +36,11 @@
 use anyhow::{Context, Result, bail, ensure};
 use plonky2::field::fft::{cached_fft_root_table, cached_two_adic_subgroup};
 use plonky2::field::polynomial::PolynomialValues;
-use plonky2::field::types::Field;
 use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::plonk::circuit_data::{
     CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
 };
+use plonky2::plonk::config::{GenericConfig, GenericHashOut, Hasher};
 use plonky2::plonk::permutation_argument::Forest;
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
@@ -66,7 +66,13 @@ fn embed_generator_serializer() -> EmbedGeneratorSerializer {
 }
 
 const EMBED_MAGIC: u32 = 0x4C45_4331; // "LEC1"
-const EMBED_VERSION: u32 = 1;
+const EMBED_VERSION: u32 = 2;
+/// The fixed tree is checkpointed every eight leaves. The five raw checkpoint
+/// sections total roughly 5.5 MiB; an exact worker-equivalent sweep measured
+/// B=8 at 47.8 ms versus B=16 at 73.8 ms and B=32 at 112.3 ms for lower-path
+/// reconstruction. The extra B=8 binary bytes cost at most ~21 ms over B=16
+/// on a fresh inode and are amortized once macOS caches code-sign validation.
+const MERKLE_CHECKPOINT_BLOCK_LOG: usize = 3;
 
 // ---------------------------------------------------------------------------
 // Primitive encoding helpers
@@ -287,6 +293,32 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     }
     write_compressed_section(&mut out, &buf);
 
+    // Constants/sigmas Merkle checkpoint roots. The build-time commitment is
+    // already complete; retaining one digest per eight-leaf block lets runtime
+    // reconstruct and cap-check the small upper tree without hashing every
+    // wide fixed leaf. Hashes are close to incompressible, so store this section
+    // raw rather than spending startup cycles on zstd for negligible savings.
+    let checkpoint_roots = prover
+        .constants_sigmas_commitment
+        .merkle_tree
+        .checkpoint_roots(MERKLE_CHECKPOINT_BLOCK_LOG)
+        .context("extracting constants/sigmas Merkle checkpoint roots")?;
+    let mut buf = Vec::with_capacity(
+        16 + checkpoint_roots.len()
+            * <<C as GenericConfig<D>>::Hasher as Hasher<F>>::HASH_SIZE,
+    );
+    write_uvarint(&mut buf, MERKLE_CHECKPOINT_BLOCK_LOG as u64);
+    write_uvarint(&mut buf, checkpoint_roots.len() as u64);
+    for root in checkpoint_roots {
+        let bytes = root.to_bytes();
+        ensure!(
+            bytes.len() == <<C as GenericConfig<D>>::Hasher as Hasher<F>>::HASH_SIZE,
+            "constants/sigmas checkpoint hash has unexpected byte width"
+        );
+        buf.extend_from_slice(&bytes);
+    }
+    write_section(&mut out, &buf);
+
     Ok(out)
 }
 
@@ -297,12 +329,11 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
 /// Reconstructs the target struct and the full [`CircuitData`] from a blob
 /// produced by [`serialize_embedded`].
 ///
-/// The returned `CircuitData` is value-identical to the freshly built one:
-/// deserialized components are byte round trips, and every recomputed
-/// component (subgroup, FFT root table, sigma values/transpose, watch counts,
-/// constants/sigmas commitment) is derived by the same code paths the builder
-/// itself runs, from the same inputs. The recomputed commitment cap is checked
-/// against the embedded verifier data before returning.
+/// The returned `CircuitData` is proof-semantics-identical to the freshly
+/// built one: deserialized components are byte round trips, every polynomial
+/// and LDE component is derived through the builder's code paths, and the
+/// checkpoint upper tree is checked against the embedded verifier cap before
+/// returning. Only the fixed commitment's digest backing differs structurally.
 pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, CircuitData<F, C, D>)> {
     let gate_serializer = BlockGateSerializer;
     let generator_serializer = embed_generator_serializer();
@@ -468,6 +499,31 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         representative_map
             .push(u32::try_from(parent).context("representative map entry out of range")?);
     }
+    // Constants/sigmas Merkle checkpoint roots.
+    let section = read_section(bytes, &mut pos)?;
+    let mut checkpoint_pos = 0usize;
+    let checkpoint_block_log = usize::try_from(read_uvarint(section, &mut checkpoint_pos)?)
+        .context("embedded Merkle checkpoint block log exceeds usize")?;
+    ensure!(
+        checkpoint_block_log == MERKLE_CHECKPOINT_BLOCK_LOG,
+        "embedded Merkle checkpoint block log {checkpoint_block_log} unsupported"
+    );
+    let checkpoint_count = usize::try_from(read_uvarint(section, &mut checkpoint_pos)?)
+        .context("embedded Merkle checkpoint count exceeds usize")?;
+    let hash_size = <<C as GenericConfig<D>>::Hasher as Hasher<F>>::HASH_SIZE;
+    let checkpoint_bytes = checkpoint_count
+        .checked_mul(hash_size)
+        .context("embedded Merkle checkpoint section length overflow")?;
+    ensure!(
+        section.len() == checkpoint_pos + checkpoint_bytes,
+        "embedded Merkle checkpoint section has invalid length"
+    );
+    let checkpoint_roots = section[checkpoint_pos..]
+        .chunks_exact(hash_size)
+        .map(
+            <<<C as GenericConfig<D>>::Hasher as Hasher<F>>::Hash as GenericHashOut<F>>::from_bytes,
+        )
+        .collect::<Vec<_>>();
     ensure!(pos == bytes.len(), "trailing bytes in embedded circuit blob");
 
     // ---- recompute the derived prover-only components ----
@@ -505,18 +561,22 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // of two independent reads changes — no quantity is computed differently.
     let sigmas = transpose_poly_values_ref(&sigma_vecs);
 
-    // The builder's commitment path: values in, IFFT inside, LDE + Merkle.
-    // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).
+    // The builder's polynomial path: values in, IFFT inside, then the exact
+    // same LDE columns. The full fixed digest tree is replaced by the embedded
+    // B=8 checkpoints; dynamic commitments are untouched.
     let mut constants_sigmas_vecs = constant_values;
     constants_sigmas_vecs.extend(sigma_vecs);
-    let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
-        constants_sigmas_vecs,
-        rate_bits,
-        false,
-        cap_height,
-        &mut TimingTree::default(),
-        Some(&root_table),
-    );
+    let constants_sigmas_commitment =
+        PolynomialBatch::<F, C, D>::from_values_checkpointed(
+            constants_sigmas_vecs,
+            rate_bits,
+            cap_height,
+            checkpoint_roots,
+            checkpoint_block_log,
+            &mut TimingTree::default(),
+            Some(&root_table),
+        )
+        .context("attaching embedded constants/sigmas Merkle checkpoints")?;
     if constants_sigmas_commitment.merkle_tree.cap != verifier_only.constants_sigmas_cap {
         bail!(
             "recomputed constants/sigmas commitment cap diverges from the embedded verifier data \
