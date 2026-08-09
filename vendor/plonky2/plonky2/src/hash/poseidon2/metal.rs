@@ -83,6 +83,94 @@ const STAGING_CHUNK: usize = 1 << 19;
 const MAX_CACHED_QUOTIENT_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
 
+// ---------------------------------------------------------------------------
+// Commit-shape probe. Measurement only; inert unless `LIGHTER_COMMIT_PROBE=1`,
+// which the scored path can never set because the verifier clears the worker's
+// environment.
+//
+// `build_from_values` submits IFFT -> coset LDE -> leaf hash -> parent levels as
+// a SINGLE command buffer, so plonky2's `build Merkle tree` timing span covers
+// all four and no published profile separates the NTT from the hashing. A
+// standalone replay of that sequence on an M4 Pro at the chain fold's wires
+// shape (LDE 2^17 x 136 columns) splits it 48% NTT / 52% Poseidon2, with the
+// fourteen radix-2 LDE stages alone at 33% and running at 219 GB/s — about 80%
+// of this machine's peak, i.e. bandwidth-bound rather than ALU-bound. This
+// records which shapes actually reach the GPU and what each call costs, so that
+// split can be weighted by real call counts instead of assumed ones.
+// ---------------------------------------------------------------------------
+static COMMIT_PROBE: Mutex<Vec<(&'static str, usize, usize, f64)>> = Mutex::new(Vec::new());
+
+fn commit_probe_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("LIGHTER_COMMIT_PROBE").is_some_and(|value| value == "1")
+    });
+    *ENABLED
+}
+
+static COMMIT_PROBE_WAIT: Mutex<(usize, f64)> = Mutex::new((0, 0.0));
+
+/// Time spent blocked in [`MetalShared::acquire_set`], i.e. queued behind
+/// another tree build for the process-wide single buffer set.
+fn commit_probe_wait(seconds: f64) {
+    if !commit_probe_enabled() {
+        return;
+    }
+    if let Ok(mut slot) = COMMIT_PROBE_WAIT.lock() {
+        slot.0 += 1;
+        slot.1 += seconds;
+    }
+}
+
+fn commit_probe_record(path: &'static str, rows: usize, cols: usize, seconds: f64) {
+    if !commit_probe_enabled() {
+        return;
+    }
+    if let Ok(mut log) = COMMIT_PROBE.lock() {
+        log.push((path, rows, cols, seconds));
+    }
+}
+
+/// Aggregated commit-shape table, or an empty string when the probe is off.
+pub fn commit_probe_report() -> String {
+    if !commit_probe_enabled() {
+        return String::new();
+    }
+    let Ok(log) = COMMIT_PROBE.lock() else {
+        return String::new();
+    };
+    let mut by_shape: std::collections::BTreeMap<(&'static str, usize, usize), (usize, f64)> =
+        std::collections::BTreeMap::new();
+    for &(path, rows, cols, seconds) in log.iter() {
+        let entry = by_shape.entry((path, rows, cols)).or_insert((0, 0.0));
+        entry.0 += 1;
+        entry.1 += seconds;
+    }
+    let total: f64 = log.iter().map(|entry| entry.3).sum();
+    let mut out = String::from(
+        "\n=== GPU commit shapes ===\npath             rows    cols   calls    total_ms   mean_ms\n",
+    );
+    for ((path, rows, cols), (calls, seconds)) in &by_shape {
+        out.push_str(&format!(
+            "{path:<14} {rows:>7} {cols:>7} {calls:>7} {:>11.1} {:>9.2}\n",
+            seconds * 1e3,
+            seconds * 1e3 / *calls as f64
+        ));
+    }
+    out.push_str(&format!(
+        "TOTAL GPU commit wall {:.1} ms across {} calls\n",
+        total * 1e3,
+        log.len()
+    ));
+    if let Ok(slot) = COMMIT_PROBE_WAIT.lock() {
+        out.push_str(&format!(
+            "  of which buffer-set queue wait {:.1} ms across {} blocked acquisitions\n",
+            slot.1 * 1e3,
+            slot.0
+        ));
+    }
+    out
+}
+
 struct MetalShared {
     device: Device,
     queue: CommandQueue,
@@ -492,6 +580,9 @@ struct BufferPool {
     free: Vec<BufferSet>,
     created: usize,
     waiters: usize,
+    /// Serial-critical builds currently queued. While this is non-zero a
+    /// pipeline build stands aside rather than taking the freed set.
+    priority_waiters: usize,
     spare_output: Option<Buffer>,
     detached_readback: bool,
 }
@@ -874,13 +965,35 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     // The width-135 wires tree stays on the GPU unconditionally: its CPU
     // build (~17 permutations per leaf) costs about as much as the queue
     // wait and measurably starves the fold's pure-CPU phases.
-    let serial_critical_shape = leaf_count == 1 << 17 && leaf_width > 4;
+    let serial_critical_shape = serial_critical_shape(leaf_width, leaf_count);
     if serial_critical_shape {
         return exclusive
             || leaf_width > 64
             || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
     }
     leaf_permutations + parent_permutations >= min_permutations
+}
+
+/// The shapes the serial chain-fold spine produces.
+///
+/// `gpu_worthwhile` already singles these out to admit them at a lower
+/// threshold, because their latency is the run's latency: the spine is
+/// sequential and everything else has slack behind it. The same predicate
+/// decides the other half of that question in [`MetalShared::acquire_set`] —
+/// not just whether a tree may use the GPU, but who gets it first.
+fn serial_critical_shape(leaf_width: usize, leaf_count: usize) -> bool {
+    leaf_count == 1 << 17 && leaf_width > 4
+}
+
+/// Whether a serial-critical tree may cut ahead of a queued pipeline tree.
+///
+/// On by default; the environment variable is a local A/B switch and cannot
+/// reach a scored worker, whose environment the trusted verifier clears.
+fn spine_priority_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        !std::env::var_os("LIGHTER_NO_SPINE_PRIORITY").is_some_and(|value| value == "1")
+    });
+    *ENABLED
 }
 
 fn shared_context() -> Option<&'static MetalShared> {
@@ -957,7 +1070,10 @@ pub(crate) fn build_merkle_tree<F: RichField>(
     }
 
     let context = ready_context(leaf_width, leaf_count)?;
-    match context.build(LeafSource::Rows(leaves), leaf_width, leaf_count, cap_height) {
+    let probe_started = std::time::Instant::now();
+    let probe_outcome = context.build(LeafSource::Rows(leaves), leaf_width, leaf_count, cap_height);
+    commit_probe_record("rows", leaf_count, leaf_width, probe_started.elapsed().as_secs_f64());
+    match probe_outcome {
         Ok(tree) => Some(tree),
         Err(error) => {
             log::warn!("Metal Poseidon2 failed; using CPU Merkle hashing: {error}");
@@ -1626,12 +1742,15 @@ pub(crate) fn build_merkle_tree_shared<F: RichField>(
     }
 
     let context = ready_context(leaf_width, leaf_count)?;
-    match context.build(
+    let probe_started = std::time::Instant::now();
+    let probe_outcome = context.build(
         LeafSource::Shared(columns),
         leaf_width,
         leaf_count,
         cap_height,
-    ) {
+    );
+    commit_probe_record("shared", leaf_count, leaf_width, probe_started.elapsed().as_secs_f64());
+    match probe_outcome {
         Ok(tree) => Some(tree),
         Err(error) => {
             log::warn!("Metal shared-column hashing failed; using CPU Merkle hashing: {error}");
@@ -1674,7 +1793,10 @@ pub(crate) fn build_commitment_from_coeffs<F: RichField>(
     }
 
     let context = ready_context(cols, lde_size)?;
-    match context.build_from_coeffs(coeff_columns, degree, rate_bits, cap_height) {
+    let probe_started = std::time::Instant::now();
+    let probe_outcome = context.build_from_coeffs(coeff_columns, degree, rate_bits, cap_height);
+    commit_probe_record("coeffs", lde_size, cols, probe_started.elapsed().as_secs_f64());
+    match probe_outcome {
         Ok(result) => Some(result),
         Err(error) => {
             log::warn!("Metal NTT commitment failed; using CPU path: {error}");
@@ -1718,7 +1840,10 @@ pub(crate) fn build_commitment_from_values<F: RichField>(
     }
 
     let context = ready_context(cols, lde_size)?;
-    match context.build_from_values(value_columns, degree, rate_bits, cap_height) {
+    let probe_started = std::time::Instant::now();
+    let probe_outcome = context.build_from_values(value_columns, degree, rate_bits, cap_height);
+    commit_probe_record("values", lde_size, cols, probe_started.elapsed().as_secs_f64());
+    match probe_outcome {
         Ok(result) => Some(result),
         Err(error) => {
             log::warn!("Metal NTT values commitment failed; using CPU path: {error}");
@@ -1911,6 +2036,7 @@ impl MetalShared {
                     free: Vec::new(),
                     created: 0,
                     waiters: 0,
+                    priority_waiters: 0,
                     spare_output: None,
                     detached_readback: false,
                 }),
@@ -2092,28 +2218,65 @@ impl MetalShared {
         })
     }
 
-    fn acquire_set(&self) -> Result<BufferSet, String> {
+    /// Takes the single buffer set, blocking until one is free.
+    ///
+    /// `priority` marks a build on the serial spine. There is one set process
+    /// wide (`MAX_BUFFER_SETS == 1`), so every tree build is already serialized
+    /// against every other; the only thing left to choose is the order. Until
+    /// now that order was whoever happened to arrive first, which lets a
+    /// transaction-pipeline tree — which has slack behind it, its proofs being
+    /// fully hidden by the spine — take the set ahead of a chain fold that the
+    /// whole run is waiting on, and hold it for the length of a 2^19-leaf build.
+    /// A queued spine build now takes precedence, and pipeline builds stand
+    /// aside while one is waiting.
+    ///
+    /// This adds no concurrency, no buffer set and no memory: it reorders a
+    /// queue. Two earlier attempts in this tree's history went the other way —
+    /// three buffer sets, and a dedicated lane for these same shapes — and both
+    /// regressed, which is evidence about *parallelism*, not about ordering.
+    ///
+    /// Value-exact: which tree is hashed first cannot change any digest.
+    ///
+    /// Starvation is bounded by the spine being sequential. At most one spine
+    /// build is ever queued, it is released the moment it acquires, and the
+    /// fold's pure-CPU phases between builds leave gaps in which pipeline trees
+    /// proceed normally.
+    fn acquire_set(&self, priority: bool) -> Result<BufferSet, String> {
         let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
         loop {
-            if let Some(set) = pool.free.pop() {
-                return Ok(set);
-            }
-            if pool.created < MAX_BUFFER_SETS {
-                pool.created += 1;
-                return Ok(BufferSet {
-                    input: None,
-                    output: None,
-                });
+            if priority || pool.priority_waiters == 0 {
+                if let Some(set) = pool.free.pop() {
+                    return Ok(set);
+                }
+                if pool.created < MAX_BUFFER_SETS {
+                    pool.created += 1;
+                    return Ok(BufferSet {
+                        input: None,
+                        output: None,
+                    });
+                }
             }
             pool.waiters += 1;
-            match self.available.wait(pool) {
+            if priority {
+                pool.priority_waiters += 1;
+            }
+            let probe_wait_started = std::time::Instant::now();
+            let probe_wait_outcome = self.available.wait(pool);
+            commit_probe_wait(probe_wait_started.elapsed().as_secs_f64());
+            match probe_wait_outcome {
                 Ok(mut next) => {
                     next.waiters -= 1;
+                    if priority {
+                        next.priority_waiters -= 1;
+                    }
                     pool = next;
                 }
                 Err(poisoned) => {
                     let mut next = poisoned.into_inner();
                     next.waiters -= 1;
+                    if priority {
+                        next.priority_waiters -= 1;
+                    }
                     return Err("buffer pool poisoned".to_string());
                 }
             }
@@ -2126,7 +2289,11 @@ impl MetalShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.free.push(set);
-        self.available.notify_one();
+        // `notify_one` could wake a pipeline thread that must stand aside for a
+        // queued spine build, which would then go back to sleep with nobody
+        // else woken. Every waiter re-checks the predicate, so waking all of
+        // them is what makes the priority rule reachable.
+        self.available.notify_all();
     }
 
     fn try_detach_completed_output(
@@ -2342,7 +2509,8 @@ impl MetalShared {
                 .new_buffer(value_bytes as u64, MTLResourceOptions::StorageModeShared)
         });
 
-        let mut set = self.acquire_set()?;
+        let mut set =
+            self.acquire_set(spine_priority_enabled() && serial_critical_shape(cols, lde_size))?;
         let result = (|| -> Result<TreeReadback<'_, F>, String> {
             if set
                 .input
@@ -2599,7 +2767,8 @@ impl MetalShared {
                 .new_buffer(column_bytes as u64, MTLResourceOptions::StorageModeShared)
         });
 
-        let mut set = self.acquire_set()?;
+        let mut set =
+            self.acquire_set(spine_priority_enabled() && serial_critical_shape(cols, lde_size))?;
         let result = self.build_from_coeffs_with_set(
             &mut set,
             coeff_columns,
@@ -2812,7 +2981,9 @@ impl MetalShared {
             .ok_or("Metal Merkle output size overflow")?;
 
         let job = GpuJobGuard::begin();
-        let mut set = self.acquire_set()?;
+        let mut set = self.acquire_set(
+            spine_priority_enabled() && serial_critical_shape(leaf_width, leaf_count),
+        )?;
         let result = self.build_with_set(
             &mut set,
             source,
@@ -3312,7 +3483,7 @@ mod tests {
     #[test]
     fn does_not_detach_output_without_a_waiting_build() {
         let context = MetalShared::new().expect("Metal context");
-        let mut set = context.acquire_set().expect("buffer set");
+        let mut set = context.acquire_set(false).expect("buffer set");
         set.output = Some(autoreleasepool(|| {
             context
                 .device
@@ -3334,7 +3505,7 @@ mod tests {
         use std::sync::mpsc;
 
         let context = MetalShared::new().expect("Metal context");
-        let mut set = context.acquire_set().expect("first set");
+        let mut set = context.acquire_set(false).expect("first set");
         set.output = Some(autoreleasepool(|| {
             context
                 .device
@@ -3346,7 +3517,7 @@ mod tests {
             let (tx, rx) = mpsc::sync_channel(0);
             let context_ref = &context;
             scope.spawn(move || {
-                let next = context_ref.acquire_set().expect("waiting set");
+                let next = context_ref.acquire_set(false).expect("waiting set");
                 tx.send(next).expect("return acquired set");
             });
 
@@ -3383,7 +3554,7 @@ mod tests {
         type F = GoldilocksField;
 
         let context = MetalShared::new().expect("Metal context");
-        let mut set = context.acquire_set().expect("buffer set");
+        let mut set = context.acquire_set(false).expect("buffer set");
         let limbs: Vec<u64> = (0..28).collect();
         set.output = Some(autoreleasepool(|| {
             context.device.new_buffer_with_data(
