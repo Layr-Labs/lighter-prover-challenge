@@ -215,18 +215,20 @@ pub trait Poseidon2: PrimeField64 {
         }
     }
 
-    /// Apply the internal linear layer to two independent states. Default
-    /// implementation is two sequential calls; Goldilocks overrides with an
-    /// interleaved form that shares the twelve diagonal constants and overlaps
-    /// the independent mul/add chains. Bit-identical to two `internal_linear_layer`
-    /// calls.
+    /// Grouped partial-round linear layer for two independent states.
+    ///
+    /// The per-state arithmetic is identical to [`Self::internal_linear_layer`];
+    /// only the schedule changes, letting the compiler overlap the two
+    /// independent lane chains. Implementations must preserve each state's raw
+    /// word output exactly.
     #[inline]
     fn internal_linear_layer_x2(a: &mut [Self; WIDTH], b: &mut [Self; WIDTH]) {
         Self::internal_linear_layer(a);
         Self::internal_linear_layer(b);
     }
 
-    /// Four-state variant of `internal_linear_layer_x2`.
+    /// Grouped partial-round linear layer for four independent states; see
+    /// [`Self::internal_linear_layer_x2`].
     #[inline]
     fn internal_linear_layer_x4(
         a: &mut [Self; WIDTH],
@@ -234,8 +236,10 @@ pub trait Poseidon2: PrimeField64 {
         c: &mut [Self; WIDTH],
         d: &mut [Self; WIDTH],
     ) {
-        Self::internal_linear_layer_x2(a, b);
-        Self::internal_linear_layer_x2(c, d);
+        Self::internal_linear_layer(a);
+        Self::internal_linear_layer(b);
+        Self::internal_linear_layer(c);
+        Self::internal_linear_layer(d);
     }
 
     #[inline]
@@ -505,43 +509,34 @@ impl Poseidon2 for F {
         state[11] = sum + state[11] * F(0xd27dbb6944917b60);
     }
 
-    /// Grouped x2 internal layer: sum both states first, then interleave the
-    /// 24 independent lane expressions so the twelve diagonal immediates are
-    /// shared and the two dependency chains overlap. Bit-identical to two
-    /// sequential `internal_linear_layer` calls.
     #[inline]
     fn internal_linear_layer_x2(a: &mut [Self; WIDTH], b: &mut [Self; WIDTH]) {
+        // Identical per-state arithmetic to `internal_linear_layer` (sum the
+        // state, then multiply-then-add each lane), with the two states' lane
+        // chains interleaved so the independent scalar mul/add pairs overlap.
+        // Every raw output word matches the individual calls exactly.
         let sum_a = sum_12(a);
         let sum_b = sum_12(b);
-        a[0] = sum_a + a[0] * F(0xc3b6c08e23ba9300);
-        b[0] = sum_b + b[0] * F(0xc3b6c08e23ba9300);
-        a[1] = sum_a + a[1] * F(0xd84b5de94a324fb6);
-        b[1] = sum_b + b[1] * F(0xd84b5de94a324fb6);
-        a[2] = sum_a + a[2] * F(0x0d0c371c5b35b84f);
-        b[2] = sum_b + b[2] * F(0x0d0c371c5b35b84f);
-        a[3] = sum_a + a[3] * F(0x7964f570e7188037);
-        b[3] = sum_b + b[3] * F(0x7964f570e7188037);
-        a[4] = sum_a + a[4] * F(0x5daf18bbd996604b);
-        b[4] = sum_b + b[4] * F(0x5daf18bbd996604b);
-        a[5] = sum_a + a[5] * F(0x6743bc47b9595257);
-        b[5] = sum_b + b[5] * F(0x6743bc47b9595257);
-        a[6] = sum_a + a[6] * F(0x5528b9362c59bb70);
-        b[6] = sum_b + b[6] * F(0x5528b9362c59bb70);
-        a[7] = sum_a + a[7] * F(0xac45e25b7127b68b);
-        b[7] = sum_b + b[7] * F(0xac45e25b7127b68b);
-        a[8] = sum_a + a[8] * F(0xa2077d7dfbb606b5);
-        b[8] = sum_b + b[8] * F(0xa2077d7dfbb606b5);
-        a[9] = sum_a + a[9] * F(0xf3faac6faee378ae);
-        b[9] = sum_b + b[9] * F(0xf3faac6faee378ae);
-        a[10] = sum_a + a[10] * F(0x0c6388b51545e883);
-        b[10] = sum_b + b[10] * F(0x0c6388b51545e883);
-        a[11] = sum_a + a[11] * F(0xd27dbb6944917b60);
-        b[11] = sum_b + b[11] * F(0xd27dbb6944917b60);
+        macro_rules! lane {
+            ($i:literal, $diag:expr) => {
+                a[$i] = sum_a + a[$i] * F($diag);
+                b[$i] = sum_b + b[$i] * F($diag);
+            };
+        }
+        lane!(0, 0xc3b6c08e23ba9300);
+        lane!(1, 0xd84b5de94a324fb6);
+        lane!(2, 0x0d0c371c5b35b84f);
+        lane!(3, 0x7964f570e7188037);
+        lane!(4, 0x5daf18bbd996604b);
+        lane!(5, 0x6743bc47b9595257);
+        lane!(6, 0x5528b9362c59bb70);
+        lane!(7, 0xac45e25b7127b68b);
+        lane!(8, 0xa2077d7dfbb606b5);
+        lane!(9, 0xf3faac6faee378ae);
+        lane!(10, 0x0c6388b51545e883);
+        lane!(11, 0xd27dbb6944917b60);
     }
 
-    /// Grouped x4 internal layer: four independent sums first, then interleaved
-    /// lane updates across the four states. Bit-identical to four sequential
-    /// `internal_linear_layer` calls.
     #[inline]
     fn internal_linear_layer_x4(
         a: &mut [Self; WIDTH],
@@ -553,54 +548,26 @@ impl Poseidon2 for F {
         let sum_b = sum_12(b);
         let sum_c = sum_12(c);
         let sum_d = sum_12(d);
-        a[0] = sum_a + a[0] * F(0xc3b6c08e23ba9300);
-        b[0] = sum_b + b[0] * F(0xc3b6c08e23ba9300);
-        c[0] = sum_c + c[0] * F(0xc3b6c08e23ba9300);
-        d[0] = sum_d + d[0] * F(0xc3b6c08e23ba9300);
-        a[1] = sum_a + a[1] * F(0xd84b5de94a324fb6);
-        b[1] = sum_b + b[1] * F(0xd84b5de94a324fb6);
-        c[1] = sum_c + c[1] * F(0xd84b5de94a324fb6);
-        d[1] = sum_d + d[1] * F(0xd84b5de94a324fb6);
-        a[2] = sum_a + a[2] * F(0x0d0c371c5b35b84f);
-        b[2] = sum_b + b[2] * F(0x0d0c371c5b35b84f);
-        c[2] = sum_c + c[2] * F(0x0d0c371c5b35b84f);
-        d[2] = sum_d + d[2] * F(0x0d0c371c5b35b84f);
-        a[3] = sum_a + a[3] * F(0x7964f570e7188037);
-        b[3] = sum_b + b[3] * F(0x7964f570e7188037);
-        c[3] = sum_c + c[3] * F(0x7964f570e7188037);
-        d[3] = sum_d + d[3] * F(0x7964f570e7188037);
-        a[4] = sum_a + a[4] * F(0x5daf18bbd996604b);
-        b[4] = sum_b + b[4] * F(0x5daf18bbd996604b);
-        c[4] = sum_c + c[4] * F(0x5daf18bbd996604b);
-        d[4] = sum_d + d[4] * F(0x5daf18bbd996604b);
-        a[5] = sum_a + a[5] * F(0x6743bc47b9595257);
-        b[5] = sum_b + b[5] * F(0x6743bc47b9595257);
-        c[5] = sum_c + c[5] * F(0x6743bc47b9595257);
-        d[5] = sum_d + d[5] * F(0x6743bc47b9595257);
-        a[6] = sum_a + a[6] * F(0x5528b9362c59bb70);
-        b[6] = sum_b + b[6] * F(0x5528b9362c59bb70);
-        c[6] = sum_c + c[6] * F(0x5528b9362c59bb70);
-        d[6] = sum_d + d[6] * F(0x5528b9362c59bb70);
-        a[7] = sum_a + a[7] * F(0xac45e25b7127b68b);
-        b[7] = sum_b + b[7] * F(0xac45e25b7127b68b);
-        c[7] = sum_c + c[7] * F(0xac45e25b7127b68b);
-        d[7] = sum_d + d[7] * F(0xac45e25b7127b68b);
-        a[8] = sum_a + a[8] * F(0xa2077d7dfbb606b5);
-        b[8] = sum_b + b[8] * F(0xa2077d7dfbb606b5);
-        c[8] = sum_c + c[8] * F(0xa2077d7dfbb606b5);
-        d[8] = sum_d + d[8] * F(0xa2077d7dfbb606b5);
-        a[9] = sum_a + a[9] * F(0xf3faac6faee378ae);
-        b[9] = sum_b + b[9] * F(0xf3faac6faee378ae);
-        c[9] = sum_c + c[9] * F(0xf3faac6faee378ae);
-        d[9] = sum_d + d[9] * F(0xf3faac6faee378ae);
-        a[10] = sum_a + a[10] * F(0x0c6388b51545e883);
-        b[10] = sum_b + b[10] * F(0x0c6388b51545e883);
-        c[10] = sum_c + c[10] * F(0x0c6388b51545e883);
-        d[10] = sum_d + d[10] * F(0x0c6388b51545e883);
-        a[11] = sum_a + a[11] * F(0xd27dbb6944917b60);
-        b[11] = sum_b + b[11] * F(0xd27dbb6944917b60);
-        c[11] = sum_c + c[11] * F(0xd27dbb6944917b60);
-        d[11] = sum_d + d[11] * F(0xd27dbb6944917b60);
+        macro_rules! lane {
+            ($i:literal, $diag:expr) => {
+                a[$i] = sum_a + a[$i] * F($diag);
+                b[$i] = sum_b + b[$i] * F($diag);
+                c[$i] = sum_c + c[$i] * F($diag);
+                d[$i] = sum_d + d[$i] * F($diag);
+            };
+        }
+        lane!(0, 0xc3b6c08e23ba9300);
+        lane!(1, 0xd84b5de94a324fb6);
+        lane!(2, 0x0d0c371c5b35b84f);
+        lane!(3, 0x7964f570e7188037);
+        lane!(4, 0x5daf18bbd996604b);
+        lane!(5, 0x6743bc47b9595257);
+        lane!(6, 0x5528b9362c59bb70);
+        lane!(7, 0xac45e25b7127b68b);
+        lane!(8, 0xa2077d7dfbb606b5);
+        lane!(9, 0xf3faac6faee378ae);
+        lane!(10, 0x0c6388b51545e883);
+        lane!(11, 0xd27dbb6944917b60);
     }
 
     #[inline]
@@ -1214,6 +1181,244 @@ mod pair_hash_tests {
 
     use super::*;
     use crate::plonk::config::Hasher;
+
+    /// The grouped x2/x4 internal layers must reproduce the per-state scalar
+    /// internal layer exactly, including noncanonical representatives.
+    #[test]
+    fn grouped_internal_layers_match_individual_raw_words() {
+        use plonky2_field::types::Field64;
+        let boundary_raw = [
+            0u64,
+            1,
+            u32::MAX as u64,
+            1u64 << 32,
+            <F as Field64>::ORDER - 1,
+            <F as Field64>::ORDER,
+            <F as Field64>::ORDER + 1,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        for _ in 0..500 {
+            let mut quartets = [[F::rand(); WIDTH]; 4];
+            // Sprinkle boundary representatives into every state occasionally.
+            if (0..100).contains(&(quartets[0][0].to_noncanonical_u64() % 100)) {
+                let raw = boundary_raw[(quartets[0][0].to_noncanonical_u64() as usize)
+                    % boundary_raw.len()];
+                quartets[0][0] = F::from_noncanonical_u64(raw);
+                quartets[1][3] = F::from_noncanonical_u64(raw ^ 0x5555_5555_5555_5555);
+                quartets[2][7] = F::from_noncanonical_u64(raw.wrapping_add(1));
+                quartets[3][11] = F::from_noncanonical_u64(raw.wrapping_sub(1));
+            }
+
+            let (mut ra, mut rb, mut rc, mut rd) =
+                (quartets[0], quartets[1], quartets[2], quartets[3]);
+            F::internal_linear_layer(&mut ra);
+            F::internal_linear_layer(&mut rb);
+            F::internal_linear_layer(&mut rc);
+            F::internal_linear_layer(&mut rd);
+
+            let (mut ga, mut gb) = (quartets[0], quartets[1]);
+            F::internal_linear_layer_x2(&mut ga, &mut gb);
+            let (mut g4a, mut g4b, mut g4c, mut g4d) =
+                (quartets[0], quartets[1], quartets[2], quartets[3]);
+            F::internal_linear_layer_x4(&mut g4a, &mut g4b, &mut g4c, &mut g4d);
+
+            for i in 0..WIDTH {
+                assert_eq!(
+                    ga[i].to_noncanonical_u64(),
+                    ra[i].to_noncanonical_u64(),
+                    "x2 state a lane {i}"
+                );
+                assert_eq!(
+                    gb[i].to_noncanonical_u64(),
+                    rb[i].to_noncanonical_u64(),
+                    "x2 state b lane {i}"
+                );
+                assert_eq!(
+                    g4a[i].to_noncanonical_u64(),
+                    ra[i].to_noncanonical_u64(),
+                    "x4 state a lane {i}"
+                );
+                assert_eq!(
+                    g4b[i].to_noncanonical_u64(),
+                    rb[i].to_noncanonical_u64(),
+                    "x4 state b lane {i}"
+                );
+                assert_eq!(
+                    g4c[i].to_noncanonical_u64(),
+                    rc[i].to_noncanonical_u64(),
+                    "x4 state c lane {i}"
+                );
+                assert_eq!(
+                    g4d[i].to_noncanonical_u64(),
+                    rd[i].to_noncanonical_u64(),
+                    "x4 state d lane {i}"
+                );
+            }
+        }
+    }
+
+    /// The full x2/x4 permutations built on the grouped internal layers must
+    /// match two/four independent permutations in every raw output lane.
+    #[test]
+    fn grouped_permutations_match_individual_raw_words() {
+        let mut quartets = [[F::rand(); WIDTH]; 4];
+        let (ra, rb, rc, rd) = (
+            F::poseidon2(quartets[0]),
+            F::poseidon2(quartets[1]),
+            F::poseidon2(quartets[2]),
+            F::poseidon2(quartets[3]),
+        );
+        let (xa, xb) = F::poseidon2_x2(quartets[0], quartets[1]);
+        let (x4a, x4b, x4c, x4d) =
+            F::poseidon2_x4(quartets[0], quartets[1], quartets[2], quartets[3]);
+        for i in 0..WIDTH {
+            assert_eq!(xa[i].to_noncanonical_u64(), ra[i].to_noncanonical_u64(), "x2 a {i}");
+            assert_eq!(xb[i].to_noncanonical_u64(), rb[i].to_noncanonical_u64(), "x2 b {i}");
+            assert_eq!(x4a[i].to_noncanonical_u64(), ra[i].to_noncanonical_u64(), "x4 a {i}");
+            assert_eq!(x4b[i].to_noncanonical_u64(), rb[i].to_noncanonical_u64(), "x4 b {i}");
+            assert_eq!(x4c[i].to_noncanonical_u64(), rc[i].to_noncanonical_u64(), "x4 c {i}");
+            assert_eq!(x4d[i].to_noncanonical_u64(), rd[i].to_noncanonical_u64(), "x4 d {i}");
+        }
+    }
+
+    // Not a correctness test: times the historical per-state internal layer
+    // against the grouped x2/x4 path with the same surrounding permutation.
+    // Run with --nocapture.
+    #[test]
+    fn time_old_vs_grouped_internal_layers() {
+        use std::hint::black_box;
+
+        fn full_rounds_x2_individual(a: &mut [F; WIDTH], b: &mut [F; WIDTH], start: usize) {
+            for r in start..(start + ROUNDS_F_HALF) {
+                F::add_rc(a, r);
+                F::add_rc(b, r);
+                F::sbox(a);
+                F::sbox(b);
+                F::external_linear_layer(a);
+                F::external_linear_layer(b);
+            }
+        }
+        fn partial_rounds_x2_individual(a: &mut [F; WIDTH], b: &mut [F; WIDTH]) {
+            for r in 0..ROUNDS_P {
+                a[0] += F::from_canonical_u64(INTERNAL_CONSTANTS[r]);
+                b[0] += F::from_canonical_u64(INTERNAL_CONSTANTS[r]);
+                a[0] = F::sbox_p(&a[0]);
+                b[0] = F::sbox_p(&b[0]);
+                F::internal_linear_layer(a);
+                F::internal_linear_layer(b);
+            }
+        }
+        fn poseidon2_x2_individual(
+            input_a: [F; WIDTH],
+            input_b: [F; WIDTH],
+        ) -> ([F; WIDTH], [F; WIDTH]) {
+            let mut a = input_a;
+            let mut b = input_b;
+            F::external_linear_layer(&mut a);
+            F::external_linear_layer(&mut b);
+            full_rounds_x2_individual(&mut a, &mut b, 0);
+            partial_rounds_x2_individual(&mut a, &mut b);
+            full_rounds_x2_individual(&mut a, &mut b, ROUNDS_F_HALF);
+            (a, b)
+        }
+
+        fn full_rounds_x4_individual(
+            a: &mut [F; WIDTH],
+            b: &mut [F; WIDTH],
+            c: &mut [F; WIDTH],
+            d: &mut [F; WIDTH],
+            start: usize,
+        ) {
+            for r in start..(start + ROUNDS_F_HALF) {
+                F::add_rc(a, r);
+                F::add_rc(b, r);
+                F::add_rc(c, r);
+                F::add_rc(d, r);
+                F::sbox(a);
+                F::sbox(b);
+                F::sbox(c);
+                F::sbox(d);
+                F::external_linear_layer(a);
+                F::external_linear_layer(b);
+                F::external_linear_layer(c);
+                F::external_linear_layer(d);
+            }
+        }
+        fn partial_rounds_x4_individual(
+            a: &mut [F; WIDTH],
+            b: &mut [F; WIDTH],
+            c: &mut [F; WIDTH],
+            d: &mut [F; WIDTH],
+        ) {
+            for r in 0..ROUNDS_P {
+                a[0] += F::from_canonical_u64(INTERNAL_CONSTANTS[r]);
+                b[0] += F::from_canonical_u64(INTERNAL_CONSTANTS[r]);
+                c[0] += F::from_canonical_u64(INTERNAL_CONSTANTS[r]);
+                d[0] += F::from_canonical_u64(INTERNAL_CONSTANTS[r]);
+                a[0] = F::sbox_p(&a[0]);
+                b[0] = F::sbox_p(&b[0]);
+                c[0] = F::sbox_p(&c[0]);
+                d[0] = F::sbox_p(&d[0]);
+                F::internal_linear_layer(a);
+                F::internal_linear_layer(b);
+                F::internal_linear_layer(c);
+                F::internal_linear_layer(d);
+            }
+        }
+        fn poseidon2_x4_individual(
+            ia: [F; WIDTH],
+            ib: [F; WIDTH],
+            ic: [F; WIDTH],
+            id: [F; WIDTH],
+        ) -> ([F; WIDTH], [F; WIDTH], [F; WIDTH], [F; WIDTH]) {
+            let (mut a, mut b, mut c, mut d) = (ia, ib, ic, id);
+            F::external_linear_layer(&mut a);
+            F::external_linear_layer(&mut b);
+            F::external_linear_layer(&mut c);
+            F::external_linear_layer(&mut d);
+            full_rounds_x4_individual(&mut a, &mut b, &mut c, &mut d, 0);
+            partial_rounds_x4_individual(&mut a, &mut b, &mut c, &mut d);
+            full_rounds_x4_individual(&mut a, &mut b, &mut c, &mut d, ROUNDS_F_HALF);
+            (a, b, c, d)
+        }
+
+        let (a0, b0, c0, d0) = ([F::rand(); WIDTH], [F::rand(); WIDTH], [F::rand(); WIDTH], [F::rand(); WIDTH]);
+        let iters = 200_000u32;
+        for rep in 0..6 {
+            let mut sink = F::ZERO;
+            let t_old = std::time::Instant::now();
+            for _ in 0..iters {
+                let (a, b) = poseidon2_x2_individual(black_box(a0), black_box(b0));
+                sink += a[0] + b[0];
+            }
+            let old_x2 = t_old.elapsed();
+            let t_new = std::time::Instant::now();
+            for _ in 0..iters {
+                let (a, b) = F::poseidon2_x2(black_box(a0), black_box(b0));
+                sink += a[0] + b[0];
+            }
+            let new_x2 = t_new.elapsed();
+            let t_old4 = std::time::Instant::now();
+            for _ in 0..iters / 2 {
+                let (a, b, c, d) = poseidon2_x4_individual(black_box(a0), black_box(b0), black_box(c0), black_box(d0));
+                sink += a[0] + b[0] + c[0] + d[0];
+            }
+            let old_x4 = t_old4.elapsed();
+            let t_new4 = std::time::Instant::now();
+            for _ in 0..iters / 2 {
+                let (a, b, c, d) = F::poseidon2_x4(black_box(a0), black_box(b0), black_box(c0), black_box(d0));
+                sink += a[0] + b[0] + c[0] + d[0];
+            }
+            let new_x4 = t_new4.elapsed();
+            println!(
+                "rep {rep}: x2 old {old_x2:?} new {new_x2:?} ({:?}x) | x4 old {old_x4:?} new {new_x4:?} ({:?}x) sink {}",
+                old_x2.as_secs_f64() / new_x2.as_secs_f64(),
+                old_x4.as_secs_f64() / new_x4.as_secs_f64(),
+                sink.to_noncanonical_u64() & 0xffff
+            );
+        }
+    }
 
     /// `add_rc` calls `add_canonical_u64`, whose safety and single-correction
     /// argument both require canonical round constants.
