@@ -203,7 +203,6 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
             *value = F::Extension::ZERO;
         }
         coeffs = PolynomialCoeffs::new(folded);
-        shift = shift.exp_u64(arity as u64);
         // Chunk-wise folding preserves the zero tail: the coefficient vector
         // keeps `1/2^rate_bits` support every round (asserted by the
         // truncation below), so the FFT's zero-run shortcut always applies.
@@ -214,8 +213,9 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // `values` is read by exactly one thing: the *next* round's leaf
         // gather at the top of this loop. After the final round it is dropped
         // unread — everything below this loop uses only `coeffs` — so the
-        // last round's transform is entirely dead work. Skip it.
+        // last round's shift update and transform are entirely dead work. Skip both.
         if round + 1 < num_rounds {
+            shift = shift.exp_u64(arity as u64);
             values = coset_fft_zero_tail(
                 &coeffs,
                 shift.into(),

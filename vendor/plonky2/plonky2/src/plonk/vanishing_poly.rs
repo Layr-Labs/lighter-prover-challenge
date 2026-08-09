@@ -268,7 +268,10 @@ fn reduce_gate_constraints_base_batch<F: Field>(
 /// `res_out[k * num_challenges..(k + 1) * num_challenges]`. `res_out` must be
 /// zero-initialized by the caller.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const D: usize>(
+pub(crate) fn eval_vanishing_poly_base_batch<
+    F: RichField + Extendable<D> + plonky2_field::packable::Packable,
+    const D: usize,
+>(
     common_data: &CommonCircuitData<F, D>,
     indices_batch: &[usize],
     xs_batch: &[F],
@@ -287,8 +290,17 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     lut_re_poly_evals: &[&[F]],
     scratch: &mut VanishingScratch<F>,
     res_out: &mut [F],
-) {
+) where
+    <F as plonky2_field::packable::Packable>::Packing: plonky2_field::packed::PackedField<Scalar = F>,
+{
     let has_lookup = common_data.num_lookup_polys != 0;
+
+    // Local trait imports so the two-challenge column evaluator below can use
+    // `Packable::Packing` and its `PackedField` helpers without polluting the
+    // module scope (a top-level `PackedField` import would make the test
+    // module's `Field::multiply_accumulate` calls ambiguous).
+    use plonky2_field::packable::Packable;
+    use plonky2_field::packed::PackedField;
 
     let n = indices_batch.len();
     assert_eq!(xs_batch.len(), n);
@@ -433,6 +445,19 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             let beta_1 = betas[1];
             let gamma_0 = gammas[0];
             let gamma_1 = gammas[1];
+
+            // The four chains below are elementwise multiply-accumulate
+            // pipelines over `n` independent points. On AArch64 the scalar
+            // `GoldilocksField` packs four-wide into `WideGoldilocksField`,
+            // whose add/mul/sub are lane-wise and raw-representative-
+            // identical to the scalar path (differential-tested). We process
+            // `n_full = n - (n % 4)` points four at a time and keep a scalar
+            // tail for the leftover `n % 4` points, preserving value-exactness
+            // for any batch size. Non-AArch64 targets fall back to width-one
+            // packing, which is a no-op, so this remains correct everywhere.
+            let width = <<F as Packable>::Packing as PackedField>::WIDTH;
+            let n_full = n / width * width;
+
             for c in 0..num_chunks {
                 let j_start = c * chunk_size;
                 let j_end = ((c + 1) * chunk_size).min(num_routed_wires);
@@ -446,7 +471,26 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     let sigma_col = &s_sigmas_cols[j_start * n..][..n];
                     let beta_k_0 = beta_k_is[j_start];
                     let beta_k_1 = beta_k_is[num_routed_wires + j_start];
-                    for k in 0..n {
+                    let packed_wires = <F as Packable>::Packing::pack_slice(&wire_col[..n_full]);
+                    let packed_sigmas = <F as Packable>::Packing::pack_slice(&sigma_col[..n_full]);
+                    let packed_xs = <F as Packable>::Packing::pack_slice(&xs_batch[..n_full]);
+                    let b0k = <F as Packable>::Packing::from(beta_k_0);
+                    let g0 = <F as Packable>::Packing::from(gamma_0);
+                    let b0 = <F as Packable>::Packing::from(beta_0);
+                    let b1k = <F as Packable>::Packing::from(beta_k_1);
+                    let g1 = <F as Packable>::Packing::from(gamma_1);
+                    let b1 = <F as Packable>::Packing::from(beta_1);
+                    for ((&wire, &sigma), &x) in packed_wires
+                        .iter()
+                        .zip(packed_sigmas.iter())
+                        .zip(packed_xs.iter())
+                    {
+                        num_prod.extend_from_slice(PackedField::as_slice(&(wire + b0k * x + g0)));
+                        den_prod.extend_from_slice(PackedField::as_slice(&(wire + b0 * sigma + g0)));
+                        num_prod_second.extend_from_slice(PackedField::as_slice(&(wire + b1k * x + g1)));
+                        den_prod_second.extend_from_slice(PackedField::as_slice(&(wire + b1 * sigma + g1)));
+                    }
+                    for k in n_full..n {
                         let wire = wire_col[k];
                         let sigma = sigma_col[k];
                         let x = xs_batch[k];
@@ -461,7 +505,31 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     let sigma_col = &s_sigmas_cols[j * n..][..n];
                     let beta_k_0 = beta_k_is[j];
                     let beta_k_1 = beta_k_is[num_routed_wires + j];
-                    for k in 0..n {
+                    let packed_wires = <F as Packable>::Packing::pack_slice(&wire_col[..n_full]);
+                    let packed_sigmas = <F as Packable>::Packing::pack_slice(&sigma_col[..n_full]);
+                    let packed_xs = <F as Packable>::Packing::pack_slice(&xs_batch[..n_full]);
+                    let packed_num = <F as Packable>::Packing::pack_slice_mut(&mut num_prod[..n_full]);
+                    let packed_den = <F as Packable>::Packing::pack_slice_mut(&mut den_prod[..n_full]);
+                    let packed_num_second =
+                        <F as Packable>::Packing::pack_slice_mut(&mut num_prod_second[..n_full]);
+                    let packed_den_second =
+                        <F as Packable>::Packing::pack_slice_mut(&mut den_prod_second[..n_full]);
+                    let b0k = <F as Packable>::Packing::from(beta_k_0);
+                    let g0 = <F as Packable>::Packing::from(gamma_0);
+                    let b0 = <F as Packable>::Packing::from(beta_0);
+                    let b1k = <F as Packable>::Packing::from(beta_k_1);
+                    let g1 = <F as Packable>::Packing::from(gamma_1);
+                    let b1 = <F as Packable>::Packing::from(beta_1);
+                    for i in 0..(n_full / width) {
+                        let wire = packed_wires[i];
+                        let sigma = packed_sigmas[i];
+                        let x = packed_xs[i];
+                        packed_num[i] *= wire + b0k * x + g0;
+                        packed_den[i] *= wire + b0 * sigma + g0;
+                        packed_num_second[i] *= wire + b1k * x + g1;
+                        packed_den_second[i] *= wire + b1 * sigma + g1;
+                    }
+                    for k in n_full..n {
                         let wire = wire_col[k];
                         let sigma = sigma_col[k];
                         let x = xs_batch[k];
@@ -481,7 +549,23 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 let next_0 = acc_col(0, c + 1);
                 let prev_1 = acc_col(1, c);
                 let next_1 = acc_col(1, c + 1);
-                for k in 0..n {
+                let packed_prev_0 = <F as Packable>::Packing::pack_slice(&prev_0[..n_full]);
+                let packed_next_0 = <F as Packable>::Packing::pack_slice(&next_0[..n_full]);
+                let packed_prev_1 = <F as Packable>::Packing::pack_slice(&prev_1[..n_full]);
+                let packed_next_1 = <F as Packable>::Packing::pack_slice(&next_1[..n_full]);
+                let packed_num = <F as Packable>::Packing::pack_slice(&num_prod[..n_full]);
+                let packed_den = <F as Packable>::Packing::pack_slice(&den_prod[..n_full]);
+                let packed_num_second = <F as Packable>::Packing::pack_slice(&num_prod_second[..n_full]);
+                let packed_den_second = <F as Packable>::Packing::pack_slice(&den_prod_second[..n_full]);
+                let packed_row_0 = <F as Packable>::Packing::pack_slice_mut(&mut row_0[..n_full]);
+                let packed_row_1 = <F as Packable>::Packing::pack_slice_mut(&mut row_1[..n_full]);
+                for i in 0..(n_full / width) {
+                    packed_row_0[i] = packed_prev_0[i] * packed_num[i]
+                        - packed_next_0[i] * packed_den[i];
+                    packed_row_1[i] = packed_prev_1[i] * packed_num_second[i]
+                        - packed_next_1[i] * packed_den_second[i];
+                }
+                for k in n_full..n {
                     row_0[k] = prev_0[k] * num_prod[k] - next_0[k] * den_prod[k];
                     row_1[k] = prev_1[k] * num_prod_second[k]
                         - next_1[k] * den_prod_second[k];
