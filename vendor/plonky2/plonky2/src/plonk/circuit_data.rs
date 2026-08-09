@@ -415,6 +415,88 @@ impl GeneratorWatchIndex {
         }
     }
 
+    /// Builds the CSR directly from consecutive, per-generator groups of sorted, distinct
+    /// representative indices. The groups themselves are ordered by generator index.
+    ///
+    /// This is the circuit builder's trusted construction seam. Keeping the transient edge list
+    /// flat avoids a tree node and a separately allocated `Vec` for every watched representative.
+    pub(crate) fn from_sorted_generator_representatives(
+        representatives: &[u32],
+        generator_watch_counts: &[usize],
+    ) -> Self {
+        debug_assert_eq!(
+            generator_watch_counts.iter().sum::<usize>(),
+            representatives.len()
+        );
+        debug_assert!({
+            let mut end = 0usize;
+            generator_watch_counts.iter().all(|&count| {
+                let start = end;
+                end += count;
+                representatives[start..end]
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1])
+            })
+        });
+
+        let Some(&max_representative) = representatives.iter().max() else {
+            return Self {
+                offsets: vec![0],
+                watchers: Vec::new(),
+                entries: 0,
+            };
+        };
+        let max_representative = max_representative as usize;
+        let offsets_len = max_representative
+            .checked_add(2)
+            .expect("generator watch representative index overflow");
+        assert!(
+            u32::try_from(representatives.len()).is_ok(),
+            "generator watch index exceeds u32 offsets"
+        );
+
+        // First form cumulative end offsets. Counts live in slot `representative + 1`, so the
+        // prefix sum is already the normal CSR layout before it is reused as a fill cursor below.
+        let mut offsets = vec![0u32; offsets_len];
+        let mut entries = 0usize;
+        for &representative in representatives {
+            let count = &mut offsets[representative as usize + 1];
+            entries += usize::from(*count == 0);
+            *count += 1;
+        }
+        let mut total = 0u32;
+        for offset in &mut offsets[1..] {
+            total += *offset;
+            *offset = total;
+        }
+        debug_assert_eq!(total as usize, representatives.len());
+
+        // Fill each representative's slice backwards while visiting generators backwards. This
+        // preserves the old ascending generator order without a second cursor array. Afterwards,
+        // each end cursor has become the next representative's start, so one overlapping shift
+        // restores the original CSR offsets.
+        let mut watchers = vec![0usize; representatives.len()];
+        let mut group_end = representatives.len();
+        for (generator, &count) in generator_watch_counts.iter().enumerate().rev() {
+            let group_start = group_end - count;
+            for &representative in &representatives[group_start..group_end] {
+                let cursor = &mut offsets[representative as usize + 1];
+                *cursor -= 1;
+                watchers[*cursor as usize] = generator;
+            }
+            group_end = group_start;
+        }
+        debug_assert_eq!(group_end, 0);
+        offsets.copy_within(2.., 1);
+        *offsets.last_mut().unwrap() = total;
+
+        Self {
+            offsets,
+            watchers,
+            entries,
+        }
+    }
+
     /// The raw CSR offset table (`representative -> [start, end)` into
     /// [`Self::watchers`]). Exposed for compact serialization of the index.
     pub fn offsets(&self) -> &[u32] {
