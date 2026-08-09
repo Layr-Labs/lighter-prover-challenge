@@ -13,7 +13,7 @@ use super::config::Builder;
 use crate::circuit_logger::CircuitBuilderLogging;
 use crate::utils::CircuitBuilderUtils;
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 #[serde(bound = "", default)]
 pub struct ApprovedIntegrator {
     #[serde(rename = "aiw_iai")]

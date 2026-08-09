@@ -16,7 +16,7 @@ use crate::utils::CircuitBuilderUtils;
 
 pub const SYSTEM_CONFIG_SIZE: usize = 8;
 
-#[derive(Clone, Debug, Deserialize, Copy)]
+#[derive(Clone, Debug, Deserialize, Copy, PartialEq)]
 #[serde(default)]
 pub struct SystemConfig {
     #[serde(rename = "llpai")]

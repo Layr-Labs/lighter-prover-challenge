@@ -23,7 +23,7 @@ use crate::hash_utils::CircuitBuilderHashUtils;
 use crate::poseidon2::Poseidon2Hash;
 use crate::utils::CircuitBuilderUtils;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(bound = "")]
 #[serde(default)]
 pub struct ApiKey<F>

@@ -16,7 +16,7 @@ use crate::circuit_logger::CircuitBuilderLogging;
 use crate::deserializers;
 use crate::types::config::BIG_U96_LIMBS;
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 #[serde(bound = "", default)]
 pub struct PendingUnlock {
     #[serde(rename = "apw_rt")]

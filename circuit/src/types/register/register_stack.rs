@@ -27,7 +27,7 @@ use crate::utils::CircuitBuilderUtils;
 
 pub const REGISTER_INFO_SIZE: usize = 1 + REGISTER_STACK_SIZE * BASE_REGISTER_INFO_SIZE;
 
-#[derive(Clone, Debug, Deserialize, Copy)]
+#[derive(Clone, Debug, Deserialize, Copy, PartialEq)]
 #[serde(default)]
 pub struct RegisterStack {
     pub stack: [BaseRegisterInfo; REGISTER_STACK_SIZE],

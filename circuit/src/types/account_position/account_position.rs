@@ -31,7 +31,7 @@ use crate::types::constants::{
 use crate::types::market_details::MarketRiskDetailsTarget;
 use crate::utils::CircuitBuilderUtils;
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct AccountPosition {
     #[serde(rename = "lfrps")]

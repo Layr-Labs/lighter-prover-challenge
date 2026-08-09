@@ -46,7 +46,7 @@ use crate::types::public_pool::{
 use crate::uint::u32::gadgets::arithmetic_u32::CircuitBuilderU32;
 use crate::utils::CircuitBuilderUtils;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(bound = "", default)]
 pub struct Account<F>
 where

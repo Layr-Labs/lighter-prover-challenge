@@ -16,7 +16,7 @@ use crate::circuit_logger::CircuitBuilderLogging;
 use crate::eddsa::gadgets::curve::PartialWitnessCurve;
 use crate::types::config::BIG_U96_LIMBS;
 
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq)]
 #[serde(bound = "")]
 #[serde(default)]
 pub struct AccountMarginedAsset {

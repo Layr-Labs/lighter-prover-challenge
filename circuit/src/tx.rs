@@ -91,6 +91,11 @@ where
     #[serde(skip)]
     pub tx_index: u64,
 
+    /// Prover-only marker for a rewritten witness whose private old roots are
+    /// derived from its leaves and Merkle paths instead of the stale JSON roots.
+    #[serde(skip)]
+    pub derive_old_private_roots: bool,
+
     #[serde(rename = "1d")]
     #[serde(default)]
     pub l1_deposit_tx: L1DepositTx,

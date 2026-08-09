@@ -25,7 +25,7 @@ use crate::utils::CircuitBuilderUtils;
 
 pub const MARGINED_ASSET_SIZE: usize = 16;
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 #[serde(bound = "")]
 #[serde(default)]
 pub struct MarginedAsset {

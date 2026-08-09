@@ -157,6 +157,44 @@ where
         heavy_empty_tx_count: usize,
         light_empty_tx_count: usize,
     ) -> serde_json::Result<Self> {
+        Self::from_json_inner(
+            data,
+            tx_per_proof,
+            light_tx_per_proof,
+            heavy_empty_tx_count,
+            light_empty_tx_count,
+            false,
+        )
+    }
+
+    /// Parses a prover witness and removes sound, signed skip-nonce runs when
+    /// doing so reduces the number of transaction proof groups.
+    pub fn from_json_with_pruned_nonce_runs(
+        data: &[u8],
+        tx_per_proof: usize,
+        light_tx_per_proof: usize,
+        heavy_empty_tx_count: usize,
+        light_empty_tx_count: usize,
+    ) -> serde_json::Result<Self> {
+        Self::from_json_inner(
+            data,
+            tx_per_proof,
+            light_tx_per_proof,
+            heavy_empty_tx_count,
+            light_empty_tx_count,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_json_inner(
+        data: &[u8],
+        tx_per_proof: usize,
+        light_tx_per_proof: usize,
+        heavy_empty_tx_count: usize,
+        light_empty_tx_count: usize,
+        prune_nonce_runs: bool,
+    ) -> serde_json::Result<Self> {
         let mut block: Self = serde_json::from_slice(data)?;
         let mut txs = std::mem::take(&mut block.txs);
         // The block's witness ends with a single empty tx (older witnesses may carry one
@@ -173,6 +211,9 @@ where
             txs.iter().all(|tx| tx.tx_type != TX_TYPE_EMPTY),
             "empty padding txs must only appear at the end of the block witness"
         );
+        if prune_nonce_runs {
+            Self::prune_skip_nonce_runs(&mut txs, tx_per_proof, light_tx_per_proof);
+        }
         // Empty padding txs repeat the index of the last active tx of their own circuit
         // type, so each chain treats them as padding relative to its own jump state.
         let mut last_heavy_index = F::NEG_ONE.to_canonical_u64();
@@ -208,6 +249,157 @@ where
             )
         };
         Ok(block)
+    }
+
+    fn prune_skip_nonce_runs(
+        txs: &mut Vec<Tx<F>>,
+        tx_per_proof: usize,
+        light_tx_per_proof: usize,
+    ) -> usize {
+        if txs.len() < 2 {
+            return 0;
+        }
+
+        let original_len = txs.len();
+        let mut patches = Vec::<(usize, usize)>::new();
+        let mut segment_start = 0;
+
+        for anchor_index in 1..original_len {
+            let anchor = &txs[anchor_index];
+            if !Self::is_prunable_light_l2(anchor) {
+                segment_start = anchor_index + 1;
+                continue;
+            }
+            if !Self::has_signed_skip_nonce(anchor) {
+                continue;
+            }
+
+            let mut lower_bound = anchor_index;
+            while lower_bound > segment_start {
+                let candidate = &txs[lower_bound - 1];
+                if !Self::is_prunable_light_l2(candidate)
+                    || !Self::same_api_key_owner(candidate, anchor)
+                {
+                    break;
+                }
+                lower_bound -= 1;
+            }
+
+            let matching_start = (lower_bound..anchor_index).find(|&run_start| {
+                Self::same_boundary_except_api_nonce(&txs[run_start], anchor)
+            });
+            if let Some(run_start) = matching_start {
+                patches.push((anchor_index, run_start));
+                segment_start = anchor_index + 1;
+            }
+        }
+
+        if patches.is_empty() {
+            return 0;
+        }
+
+        let mut keep = vec![true; original_len];
+        for &(anchor_index, run_start) in &patches {
+            keep[run_start..anchor_index].fill(false);
+        }
+
+        let proof_groups = |heavy_count: usize, light_count: usize| {
+            heavy_count.div_ceil(tx_per_proof).max(1)
+                + light_count.div_ceil(light_tx_per_proof).max(1)
+        };
+        let (old_heavy_count, old_light_count) = txs.iter().fold((0, 0), |counts, tx| {
+            if tx.tx_circuit_type == TX_LIGHT {
+                (counts.0, counts.1 + 1)
+            } else {
+                (counts.0 + 1, counts.1)
+            }
+        });
+        let (new_heavy_count, new_light_count) =
+            txs.iter()
+                .zip(&keep)
+                .filter(|(_, keep_tx)| **keep_tx)
+                .fold((0, 0), |counts, (tx, _)| {
+                    if tx.tx_circuit_type == TX_LIGHT {
+                        (counts.0, counts.1 + 1)
+                    } else {
+                        (counts.0 + 1, counts.1)
+                    }
+                });
+        if proof_groups(new_heavy_count, new_light_count)
+            >= proof_groups(old_heavy_count, old_light_count)
+        {
+            return 0;
+        }
+
+        for (anchor_index, run_start) in patches {
+            let (before_anchor, anchor_and_after) = txs.split_at_mut(anchor_index);
+            let start = &before_anchor[run_start];
+            let anchor = &mut anchor_and_after[0];
+
+            anchor.api_key_before = start.api_key_before.clone();
+            anchor.accounts_before[OWNER_ACCOUNT_ID] =
+                start.accounts_before[OWNER_ACCOUNT_ID].clone();
+            anchor.api_key_tree_merkle_proof = start.api_key_tree_merkle_proof;
+            anchor.account_tree_merkle_proofs[OWNER_ACCOUNT_ID] =
+                start.account_tree_merkle_proofs[OWNER_ACCOUNT_ID];
+            anchor.derive_old_private_roots = true;
+        }
+
+        let mut keep_iter = keep.into_iter();
+        txs.retain(|_| keep_iter.next().expect("one keep marker per transaction"));
+        original_len - txs.len()
+    }
+
+    fn is_prunable_light_l2(tx: &Tx<F>) -> bool {
+        tx.tx_circuit_type == TX_LIGHT
+            && matches!(
+                tx.tx_type,
+                TX_TYPE_L2_CREATE_ORDER | TX_TYPE_L2_CANCEL_ORDER | TX_TYPE_L2_MODIFY_ORDER
+            )
+    }
+
+    fn has_signed_skip_nonce(tx: &Tx<F>) -> bool {
+        tx.attributes
+            .attribute_types
+            .iter()
+            .zip(tx.attributes.attribute_values.iter())
+            .any(|(&attribute_type, &attribute_value)| {
+                attribute_type as usize == crate::tx_attributes::ATTR_SKIP_TX_NONCE
+                    && attribute_value == 1
+            })
+    }
+
+    fn same_api_key_owner(start: &Tx<F>, anchor: &Tx<F>) -> bool {
+        start.accounts_before[OWNER_ACCOUNT_ID].account_index
+            == anchor.accounts_before[OWNER_ACCOUNT_ID].account_index
+            && start.api_key_before.api_key_index == anchor.api_key_before.api_key_index
+            && start.api_key_before.public_key == anchor.api_key_before.public_key
+    }
+
+    fn same_boundary_except_api_nonce(start: &Tx<F>, anchor: &Tx<F>) -> bool {
+        if !Self::same_api_key_owner(start, anchor)
+            || start.api_key_before.nonce > anchor.api_key_before.nonce
+            || start.old_account_pub_data_tree_root != anchor.old_account_pub_data_tree_root
+            || start.old_account_delta_tree_root != anchor.old_account_delta_tree_root
+            || start.old_market_details_tree_root != anchor.old_market_details_tree_root
+            || start.old_market_tree_root != anchor.old_market_tree_root
+            || start.api_key_tree_merkle_proof != anchor.api_key_tree_merkle_proof
+            || start.account_tree_merkle_proofs[OWNER_ACCOUNT_ID]
+                != anchor.account_tree_merkle_proofs[OWNER_ACCOUNT_ID]
+            || start.register_stack_before != anchor.register_stack_before
+            || start.system_config_before != anchor.system_config_before
+            || start.all_assets_before != anchor.all_assets_before
+            || start.all_margined_assets_before != anchor.all_margined_assets_before
+            || start.all_market_risk_details_before != anchor.all_market_risk_details_before
+        {
+            return false;
+        }
+
+        let mut start_owner = start.accounts_before[OWNER_ACCOUNT_ID].clone();
+        let mut anchor_owner = anchor.accounts_before[OWNER_ACCOUNT_ID].clone();
+        start_owner.api_key_root = HashOut::ZERO;
+        anchor_owner.api_key_root = HashOut::ZERO;
+        start_owner == anchor_owner
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -559,5 +751,164 @@ where
                 .try_into()
                 .unwrap(),
         }
+    }
+}
+
+#[cfg(test)]
+mod nonce_pruning_tests {
+    use plonky2::field::types::Field;
+    use plonky2::hash::hash_types::HashOut;
+    use plonky2::iop::witness::{PartialWitness, Witness};
+
+    use super::*;
+    use crate::tx_attributes::ATTR_SKIP_TX_NONCE;
+    use crate::tx_constraints::{TxTarget, TxTargetWitness};
+    use crate::types::config::{Builder, CIRCUIT_CONFIG};
+
+    fn empty_tx_template() -> Tx<F> {
+        let block: Block<F> =
+            serde_json::from_slice(include_bytes!("../../bench/bench_test.json")).unwrap();
+        block.txs.into_iter().next().unwrap()
+    }
+
+    fn marker_hash(value: u64) -> HashOut<F> {
+        HashOut::from([F::from_canonical_u64(value); 4])
+    }
+
+    fn light_nonce_tx(nonce: i64) -> Tx<F> {
+        let mut tx = empty_tx_template();
+        tx.tx_type = TX_TYPE_L2_CANCEL_ORDER;
+        tx.tx_circuit_type = TX_LIGHT;
+        tx.nonce = nonce;
+        tx.api_key_before.api_key_index = 2;
+        tx.api_key_before.nonce = nonce;
+        tx.accounts_before[OWNER_ACCOUNT_ID].account_index = 17;
+        tx.accounts_before[OWNER_ACCOUNT_ID].api_key_root = marker_hash(100 + nonce as u64);
+        tx.old_account_tree_root = marker_hash(200 + nonce as u64);
+        tx.old_validium_root = marker_hash(300 + nonce as u64);
+        tx.old_state_root = marker_hash(400 + nonce as u64);
+        tx
+    }
+
+    fn add_skip_nonce_attribute(tx: &mut Tx<F>) {
+        tx.attributes.attribute_types[0] = ATTR_SKIP_TX_NONCE as u8;
+        tx.attributes.attribute_values[0] = 1;
+    }
+
+    fn with_large_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .name("nonce-pruning-test".into())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(test)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn prunes_signed_nonce_run_that_removes_a_proof_group() {
+        with_large_stack(|| {
+            let mut txs = (0..=10).map(light_nonce_tx).collect::<Vec<_>>();
+            add_skip_nonce_attribute(txs.last_mut().unwrap());
+            let start_api_root = txs[0].accounts_before[OWNER_ACCOUNT_ID].api_key_root;
+            let signed_anchor_nonce = txs[10].nonce;
+
+            let removed = Block::prune_skip_nonce_runs(&mut txs, 4, 10);
+
+            assert_eq!(removed, 10);
+            assert_eq!(txs.len(), 1);
+            assert_eq!(txs[0].nonce, signed_anchor_nonce);
+            assert_eq!(txs[0].api_key_before.nonce, 0);
+            assert_eq!(
+                txs[0].accounts_before[OWNER_ACCOUNT_ID].api_key_root,
+                start_api_root
+            );
+            assert!(txs[0].derive_old_private_roots);
+            assert!(Block::has_signed_skip_nonce(&txs[0]));
+        });
+    }
+
+    #[test]
+    fn leaves_run_untouched_when_proof_group_count_does_not_drop() {
+        with_large_stack(|| {
+            let mut txs = (0..=1).map(light_nonce_tx).collect::<Vec<_>>();
+            add_skip_nonce_attribute(txs.last_mut().unwrap());
+
+            let removed = Block::prune_skip_nonce_runs(&mut txs, 4, 10);
+
+            assert_eq!(removed, 0);
+            assert_eq!(txs.len(), 2);
+            assert_eq!(txs[1].api_key_before.nonce, 1);
+            assert!(!txs[1].derive_old_private_roots);
+        });
+    }
+
+    #[test]
+    fn rejects_owner_state_change_other_than_api_key_root() {
+        with_large_stack(|| {
+            let mut txs = (0..=10).map(light_nonce_tx).collect::<Vec<_>>();
+            txs.last_mut().unwrap().accounts_before[OWNER_ACCOUNT_ID].cancel_all_time = 1;
+            add_skip_nonce_attribute(txs.last_mut().unwrap());
+
+            let removed = Block::prune_skip_nonce_runs(&mut txs, 4, 10);
+
+            assert_eq!(removed, 0);
+            assert_eq!(txs.len(), 11);
+            assert!(!txs[10].derive_old_private_roots);
+        });
+    }
+
+    #[test]
+    fn rejects_run_without_signed_skip_nonce_attribute() {
+        with_large_stack(|| {
+            let mut txs = (0..=10).map(light_nonce_tx).collect::<Vec<_>>();
+
+            let removed = Block::prune_skip_nonce_runs(&mut txs, 4, 10);
+
+            assert_eq!(removed, 0);
+            assert_eq!(txs.len(), 11);
+        });
+    }
+
+    #[test]
+    fn rewritten_witness_derives_only_private_old_roots() {
+        with_large_stack(|| {
+            let mut tx = light_nonce_tx(10);
+            tx.derive_old_private_roots = true;
+            let mut builder = Builder::new(CIRCUIT_CONFIG);
+            let target = TxTarget::new(&mut builder);
+            let mut witness = PartialWitness::<F>::new();
+
+            witness.set_tx_target(&target, &tx).unwrap();
+
+            assert!(
+                target
+                    .old_account_tree_root
+                    .elements
+                    .iter()
+                    .all(|&element| witness.try_get_target(element).is_none())
+            );
+            assert!(
+                target
+                    .old_validium_root
+                    .elements
+                    .iter()
+                    .all(|&element| witness.try_get_target(element).is_none())
+            );
+            assert!(
+                target
+                    .old_state_root
+                    .elements
+                    .iter()
+                    .all(|&element| witness.try_get_target(element).is_none())
+            );
+            assert!(
+                target
+                    .old_account_pub_data_tree_root
+                    .elements
+                    .iter()
+                    .all(|&element| witness.try_get_target(element).is_some())
+            );
+        });
     }
 }

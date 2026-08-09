@@ -19,7 +19,7 @@ use crate::types::config::BIG_U96_LIMBS;
 use crate::types::constants::NB_STRATEGIES;
 use crate::utils::CircuitBuilderUtils;
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 #[serde(bound = "", default)]
 pub struct PublicPoolShare {
     #[serde(rename = "ppi")]
@@ -35,7 +35,7 @@ pub struct PublicPoolShare {
     pub entry_timestamp: i64,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 #[serde(bound = "")]
 pub struct PublicPoolInfo {
     #[serde(rename = "ppi_s", default)]

@@ -23,7 +23,7 @@ use crate::utils::CircuitBuilderUtils;
 
 pub const ASSET_SIZE: usize = 8;
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 #[serde(bound = "")]
 #[serde(default)]
 pub struct Asset {

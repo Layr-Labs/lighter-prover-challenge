@@ -3710,7 +3710,9 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
             self.set_market_risk_details_target(t, market_risk_details)?;
         }
 
-        self.set_hash_target(a.old_account_tree_root, b.old_account_tree_root)?;
+        if !b.derive_old_private_roots {
+            self.set_hash_target(a.old_account_tree_root, b.old_account_tree_root)?;
+        }
         self.set_hash_target(
             a.old_account_pub_data_tree_root,
             b.old_account_pub_data_tree_root,
@@ -3721,8 +3723,10 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
             b.old_market_details_tree_root,
         )?;
         self.set_hash_target(a.old_market_tree_root, b.old_market_tree_root)?;
-        self.set_hash_target(a.old_validium_root, b.old_validium_root)?;
-        self.set_hash_target(a.old_state_root, b.old_state_root)?;
+        if !b.derive_old_private_roots {
+            self.set_hash_target(a.old_validium_root, b.old_validium_root)?;
+            self.set_hash_target(a.old_state_root, b.old_state_root)?;
+        }
 
         Ok(())
     }

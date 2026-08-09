@@ -16,7 +16,7 @@ use crate::utils::CircuitBuilderUtils;
 
 pub const BASE_REGISTER_INFO_SIZE: usize = 23;
 
-#[derive(Clone, Debug, Deserialize, Copy)]
+#[derive(Clone, Debug, Deserialize, Copy, PartialEq)]
 #[serde(default)]
 pub struct BaseRegisterInfo {
     #[serde(rename = "it")]
