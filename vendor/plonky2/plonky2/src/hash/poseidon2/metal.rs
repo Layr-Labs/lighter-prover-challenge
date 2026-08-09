@@ -27,7 +27,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "6a65119780a2645ce0077ef1da44d2774ca31aa1ef5c511162280d1b2f15213f";
+    "52987d90b4b5b218b215383d298664da6225a675ce14e899139a7927998b5d03";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -2135,7 +2135,13 @@ impl MetalShared {
         output_bytes: usize,
     ) -> Result<Option<DetachedOutput<'_>>, String> {
         let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
-        if pool.waiters == 0 || pool.detached_readback {
+        // Detach unconditionally rather than only when a waiter is already
+        // queued: with MAX_BUFFER_SETS = 1 the copy-out otherwise holds the
+        // only set through tree_from_levels even when the next tree build is
+        // about to arrive, and the spare_output recycling amortizes the
+        // replacement allocation. Scheduling-only: either path reads back the
+        // identical bytes.
+        if pool.detached_readback {
             return Ok(None);
         }
         let replacement = match pool.spare_output.take() {
