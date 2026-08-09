@@ -67,6 +67,7 @@ fn main() {
     // of stalling the first proving step that wants the GPU. Pure scheduling:
     // the compiled kernels are identical either way.
     plonky2::hash::poseidon2::prewarm_gpu();
+    #[cfg(debug_assertions)]
     env_logger::init();
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -216,4 +217,4 @@ fn main() {
     unsafe { _exit(0) }
 }
 
-// p90-fire-808-1786266919
+// horner-fma+logstrip-1786289879 multi-draw best-stack
