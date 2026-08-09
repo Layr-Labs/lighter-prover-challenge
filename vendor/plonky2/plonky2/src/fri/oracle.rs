@@ -34,7 +34,7 @@ pub const SALT_SIZE: usize = 4;
 /// stages extend each tree's exclusive occupancy of the serialized GPU
 /// stream, which is the ranked critical path. Keep off; hashing-only GPU
 /// trees (`new_columns`) remain on.
-const GPU_NTT_COMMITMENTS: bool = false;
+const GPU_NTT_COMMITMENTS: bool = true;
 
 /// Output layout for [`PolynomialBatch::fill_lde_batch`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
