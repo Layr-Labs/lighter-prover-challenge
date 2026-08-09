@@ -1536,13 +1536,17 @@ kernel void poseidon2_hash_parents(
 }
 
 // One sponge absorption pass over a group of at most eight natural-order
-// columns, with the running 12-lane state parked in `state` between passes
-// (column-major: lane i of row gid at state[i * leaf_count + gid]). The
-// final pass writes the four-lane digests to `hashes` at the bit-reversed
-// row, exactly like poseidon2_hash_leaves_colmajor. Splitting the sponge by
-// column group lets the CPU compute group g+1's LDE columns while the GPU
-// absorbs group g; the arithmetic per pass is identical to the fused
-// kernel's corresponding loop iteration.
+// columns. Between passes `state` stores only the tail which the next pass
+// will not overwrite: lanes `next_chunk_size..12`, packed column-major from
+// lane zero of the compact buffer. The following pass expands that tail into
+// lanes `chunk_size..12` before replacing its prefix. This is four persisted
+// lanes between full rate chunks and also preserves every stale rate lane for
+// a partial final chunk. The final pass writes the four-lane digests to
+// `hashes` at the bit-reversed row, exactly like
+// poseidon2_hash_leaves_colmajor. Splitting the sponge by column group lets
+// the CPU compute group g+1's LDE columns while the GPU absorbs group g; the
+// arithmetic per pass is identical to the fused kernel's corresponding loop
+// iteration.
 kernel void poseidon2_absorb_pass(
     const device ulong* leaves [[buffer(0)]],
     device ulong* state [[buffer(1)]],
@@ -1554,14 +1558,22 @@ kernel void poseidon2_absorb_pass(
     constant uint& chunk_size [[buffer(7)]],
     constant uint& first_pass [[buffer(8)]],
     constant uint& final_pass [[buffer(9)]],
+    constant uint& next_chunk_size [[buffer(10)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= leaf_count) {
         return;
     }
     ulong st[12] = { 0 };
     if (first_pass == 0u) {
-        for (uint i = 0; i < 12; ++i) {
-            st[i] = state[(ulong)i * leaf_count + gid];
+        if (chunk_size == 8u) {
+            st[8] = state[gid];
+            st[9] = state[(ulong)leaf_count + gid];
+            st[10] = state[(ulong)2u * leaf_count + gid];
+            st[11] = state[(ulong)3u * leaf_count + gid];
+        } else {
+            for (uint i = chunk_size; i < 12; ++i) {
+                st[i] = state[(ulong)(i - chunk_size) * leaf_count + gid];
+            }
         }
     }
     for (uint i = 0; i < chunk_size; ++i) {
@@ -1576,9 +1588,14 @@ kernel void poseidon2_absorb_pass(
         for (uint i = 0; i < 4; ++i) {
             output[i] = gl_canonicalize(st[i]);
         }
+    } else if (next_chunk_size == 8u) {
+        state[gid] = st[8];
+        state[(ulong)leaf_count + gid] = st[9];
+        state[(ulong)2u * leaf_count + gid] = st[10];
+        state[(ulong)3u * leaf_count + gid] = st[11];
     } else {
-        for (uint i = 0; i < 12; ++i) {
-            state[(ulong)i * leaf_count + gid] = st[i];
+        for (uint i = next_chunk_size; i < 12; ++i) {
+            state[(ulong)(i - next_chunk_size) * leaf_count + gid] = st[i];
         }
     }
 }

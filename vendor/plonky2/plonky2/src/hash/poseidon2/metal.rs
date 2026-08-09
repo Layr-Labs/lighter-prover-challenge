@@ -27,7 +27,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "e9a39d28eaeb2323b164fefec4b533669c05cc17988f9e66387f37e3720a9441";
+    "24cf12b969a4de90f5c6da3f6b02e0ef5707d8f75fa756149205c0451ff755a5";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -1425,10 +1425,13 @@ pub(crate) fn allocate_columns<F: RichField>(
 
 /// Hashes retained shared columns without copying them through the pooled
 /// staging buffer.
-/// Retained buffers for the streamed sponge build: the inter-pass state
-/// (12 u64 lanes per leaf, column-major) and the level-order digest output.
+/// Retained buffers for the streamed sponge build: the compact inter-pass
+/// state tail (4..=11 u64 lanes per leaf, column-major, depending on the final
+/// chunk width) and the level-order digest output.
 /// One streamed build runs at a time (exclusive proving phases only), so a
-/// single grow-on-demand pair suffices; holding the lock for the whole build
+/// single grow-on-demand pair suffices. Each half grows independently: varying
+/// final-chunk widths must not replace an already-large digest allocation (or
+/// shrink a previously grown state tail). Holding the lock for the whole build
 /// serializes any unexpected second caller onto the classic path.
 static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
 
@@ -1475,14 +1478,18 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let total_node_count = 2 * leaf_count - cap_count;
     let output_len = total_node_count.checked_mul(4)?;
     let output_bytes = output_len.checked_mul(size_of::<u64>())?;
-    let state_bytes = leaf_count.checked_mul(12)?.checked_mul(size_of::<u64>())?;
+    // Every intermediate full chunk overwrites lanes 0..7. A partial final
+    // chunk overwrites less, so retain exactly its untouched tail throughout
+    // this build; full-to-full passes only use the first four slots.
+    let final_chunk = (leaf_width - 1) % 8 + 1;
+    let state_lanes = 12 - final_chunk;
+    let state_bytes = leaf_count
+        .checked_mul(state_lanes)?
+        .checked_mul(size_of::<u64>())?;
 
     let job = GpuJobGuard::begin();
     let mut buffers = STREAMED_BUFFERS.lock().ok()?;
-    let needs_new = buffers.as_ref().map_or(true, |(state, output)| {
-        state.length() < state_bytes as u64 || output.length() < output_bytes as u64
-    });
-    if needs_new {
+    if buffers.is_none() {
         *buffers = Some(autoreleasepool(|| {
             (
                 context.device.new_buffer(
@@ -1496,6 +1503,25 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             )
         }));
     }
+    {
+        let (state, output) = buffers.as_mut()?;
+        if state.length() < state_bytes as u64 {
+            *state = autoreleasepool(|| {
+                context.device.new_buffer(
+                    state_bytes as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            });
+        }
+        if output.length() < output_bytes as u64 {
+            *output = autoreleasepool(|| {
+                context.device.new_buffer(
+                    output_bytes as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            });
+        }
+    }
     let (state_buffer, output_buffer) = buffers.as_ref()?;
 
     // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
@@ -1507,6 +1533,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     for group in 0..groups {
         let col_start = group * 8;
         let chunk = (leaf_width - col_start).min(8);
+        let next_chunk = (leaf_width - col_start - chunk).min(8);
         {
             // SAFETY: each column slice covers a disjoint `leaf_count` range
             // of the shared buffer; the GPU only reads columns of groups
@@ -1535,6 +1562,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
+            set_u32(encoder, 10, next_chunk as u32);
             dispatch(encoder, pipeline, leaf_count);
             encoder.end_encoding();
             command_buffer.commit();
@@ -5538,6 +5566,119 @@ kernel void goldilocks_mul_bench_native(
                 assert_tree_raw_eq(&direct, &staged, cols, cap_height);
                 assert_all_paths_raw_eq(&direct, &staged, rows, cap_height);
             }
+        }
+    }
+
+    /// Direct differential for compact inter-pass persistence. Widths 17..=24
+    /// exercise every possible partial-final-chunk size; the wider cases keep
+    /// the compact buffer live across several full passes before that tail.
+    #[test]
+    fn metal_compact_absorb_pass_matches_fused_across_partial_widths() {
+        let context = CONTEXT.as_ref().unwrap_or_else(|error| panic!("{error}"));
+        let absorb = absorb_pass_pipeline().expect("absorb-pass pipeline must initialize");
+        let rows = 64usize;
+        let log_rows = rows.ilog2();
+        let mut rng = StdRng::seed_from_u64(0x434f_4d50_4143_5453);
+
+        for width in [16usize, 17, 18, 19, 20, 21, 22, 23, 24, 31, 32, 33, 64, 137] {
+            let leaves: Vec<u64> = (0..width * rows)
+                .map(|index| match index & 7 {
+                    0 => 0,
+                    1 => 1,
+                    2 => GoldilocksField::ORDER - 1,
+                    3 => GoldilocksField::ORDER,
+                    4 => GoldilocksField::ORDER + 1,
+                    5 => u64::MAX,
+                    _ => rng.next_u64(),
+                })
+                .collect();
+            let input = autoreleasepool(|| {
+                context.device.new_buffer_with_data(
+                    leaves.as_ptr().cast::<c_void>(),
+                    size_of_val(leaves.as_slice()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            });
+            let output_bytes = (rows * 4 * size_of::<u64>()) as u64;
+            let fused = autoreleasepool(|| {
+                context
+                    .device
+                    .new_buffer(output_bytes, MTLResourceOptions::StorageModeShared)
+            });
+            let compact = autoreleasepool(|| {
+                context
+                    .device
+                    .new_buffer(output_bytes, MTLResourceOptions::StorageModeShared)
+            });
+            let final_chunk = (width - 1) % 8 + 1;
+            let state_bytes = (rows * (12 - final_chunk) * size_of::<u64>()) as u64;
+            let state = autoreleasepool(|| {
+                context
+                    .device
+                    .new_buffer(state_bytes, MTLResourceOptions::StorageModeShared)
+            });
+
+            let fused_command = autoreleasepool(|| -> CommandBuffer {
+                let command_buffer = context.queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&context.leaf_colmajor_pipeline);
+                encoder.set_buffer(0, Some(&input), 0);
+                encoder.set_buffer(1, Some(&fused), 0);
+                encoder.set_buffer(2, Some(&context.parameters), 0);
+                set_u32(encoder, 3, width as u32);
+                set_u32(encoder, 4, rows as u32);
+                set_u32(encoder, 5, log_rows);
+                dispatch(encoder, &context.leaf_colmajor_pipeline, rows);
+                encoder.end_encoding();
+                command_buffer.commit();
+                command_buffer.to_owned()
+            });
+
+            let groups = width.div_ceil(8);
+            let mut commands = Vec::with_capacity(groups);
+            for group in 0..groups {
+                let col_start = group * 8;
+                let chunk = (width - col_start).min(8);
+                let next_chunk = (width - col_start - chunk).min(8);
+                let command_buffer = autoreleasepool(|| -> CommandBuffer {
+                    let command_buffer = context.queue.new_command_buffer();
+                    let encoder = command_buffer.new_compute_command_encoder();
+                    encoder.set_compute_pipeline_state(absorb);
+                    encoder.set_buffer(0, Some(&input), 0);
+                    encoder.set_buffer(1, Some(&state), 0);
+                    encoder.set_buffer(2, Some(&compact), 0);
+                    encoder.set_buffer(3, Some(&context.parameters), 0);
+                    set_u32(encoder, 4, rows as u32);
+                    set_u32(encoder, 5, log_rows);
+                    set_u32(encoder, 6, col_start as u32);
+                    set_u32(encoder, 7, chunk as u32);
+                    set_u32(encoder, 8, (group == 0) as u32);
+                    set_u32(encoder, 9, (group == groups - 1) as u32);
+                    set_u32(encoder, 10, next_chunk as u32);
+                    dispatch(encoder, absorb, rows);
+                    encoder.end_encoding();
+                    command_buffer.commit();
+                    command_buffer.to_owned()
+                });
+                commands.push(command_buffer);
+            }
+
+            fused_command.wait_until_completed();
+            assert_eq!(fused_command.status(), MTLCommandBufferStatus::Completed);
+            for command in &commands {
+                command.wait_until_completed();
+                assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+            }
+            let fused_words = unsafe {
+                slice::from_raw_parts(fused.contents().cast::<u64>(), rows * 4)
+            };
+            let compact_words = unsafe {
+                slice::from_raw_parts(compact.contents().cast::<u64>(), rows * 4)
+            };
+            assert_eq!(
+                compact_words, fused_words,
+                "compact absorb mismatch at width {width} (final chunk {final_chunk})"
+            );
         }
     }
 
