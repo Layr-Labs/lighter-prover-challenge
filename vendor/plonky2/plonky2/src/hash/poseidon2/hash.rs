@@ -71,8 +71,7 @@ pub trait Poseidon2: PrimeField64 {
             b[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
             a[0] = Self::sbox_p(&a[0]);
             b[0] = Self::sbox_p(&b[0]);
-            Self::internal_linear_layer(a);
-            Self::internal_linear_layer(b);
+            Self::internal_linear_layer_x2(a, b);
         }
     }
 
@@ -143,10 +142,7 @@ pub trait Poseidon2: PrimeField64 {
             b[0] = Self::sbox_p(&b[0]);
             c[0] = Self::sbox_p(&c[0]);
             d[0] = Self::sbox_p(&d[0]);
-            Self::internal_linear_layer(a);
-            Self::internal_linear_layer(b);
-            Self::internal_linear_layer(c);
-            Self::internal_linear_layer(d);
+            Self::internal_linear_layer_x4(a, b, c, d);
         }
     }
 
@@ -217,6 +213,29 @@ pub trait Poseidon2: PrimeField64 {
             state[i] =
                 sum.multiply_accumulate(state[i], Self::from_canonical_u64(MATRIX_DIAG_12_U64[i]));
         }
+    }
+
+    /// Apply the internal linear layer to two independent states. Default
+    /// implementation is two sequential calls; Goldilocks overrides with an
+    /// interleaved form that shares the twelve diagonal constants and overlaps
+    /// the independent mul/add chains. Bit-identical to two `internal_linear_layer`
+    /// calls.
+    #[inline]
+    fn internal_linear_layer_x2(a: &mut [Self; WIDTH], b: &mut [Self; WIDTH]) {
+        Self::internal_linear_layer(a);
+        Self::internal_linear_layer(b);
+    }
+
+    /// Four-state variant of `internal_linear_layer_x2`.
+    #[inline]
+    fn internal_linear_layer_x4(
+        a: &mut [Self; WIDTH],
+        b: &mut [Self; WIDTH],
+        c: &mut [Self; WIDTH],
+        d: &mut [Self; WIDTH],
+    ) {
+        Self::internal_linear_layer_x2(a, b);
+        Self::internal_linear_layer_x2(c, d);
     }
 
     #[inline]
@@ -484,6 +503,104 @@ impl Poseidon2 for F {
         state[9] = sum + state[9] * F(0xf3faac6faee378ae);
         state[10] = sum + state[10] * F(0x0c6388b51545e883);
         state[11] = sum + state[11] * F(0xd27dbb6944917b60);
+    }
+
+    /// Grouped x2 internal layer: sum both states first, then interleave the
+    /// 24 independent lane expressions so the twelve diagonal immediates are
+    /// shared and the two dependency chains overlap. Bit-identical to two
+    /// sequential `internal_linear_layer` calls.
+    #[inline]
+    fn internal_linear_layer_x2(a: &mut [Self; WIDTH], b: &mut [Self; WIDTH]) {
+        let sum_a = sum_12(a);
+        let sum_b = sum_12(b);
+        a[0] = sum_a + a[0] * F(0xc3b6c08e23ba9300);
+        b[0] = sum_b + b[0] * F(0xc3b6c08e23ba9300);
+        a[1] = sum_a + a[1] * F(0xd84b5de94a324fb6);
+        b[1] = sum_b + b[1] * F(0xd84b5de94a324fb6);
+        a[2] = sum_a + a[2] * F(0x0d0c371c5b35b84f);
+        b[2] = sum_b + b[2] * F(0x0d0c371c5b35b84f);
+        a[3] = sum_a + a[3] * F(0x7964f570e7188037);
+        b[3] = sum_b + b[3] * F(0x7964f570e7188037);
+        a[4] = sum_a + a[4] * F(0x5daf18bbd996604b);
+        b[4] = sum_b + b[4] * F(0x5daf18bbd996604b);
+        a[5] = sum_a + a[5] * F(0x6743bc47b9595257);
+        b[5] = sum_b + b[5] * F(0x6743bc47b9595257);
+        a[6] = sum_a + a[6] * F(0x5528b9362c59bb70);
+        b[6] = sum_b + b[6] * F(0x5528b9362c59bb70);
+        a[7] = sum_a + a[7] * F(0xac45e25b7127b68b);
+        b[7] = sum_b + b[7] * F(0xac45e25b7127b68b);
+        a[8] = sum_a + a[8] * F(0xa2077d7dfbb606b5);
+        b[8] = sum_b + b[8] * F(0xa2077d7dfbb606b5);
+        a[9] = sum_a + a[9] * F(0xf3faac6faee378ae);
+        b[9] = sum_b + b[9] * F(0xf3faac6faee378ae);
+        a[10] = sum_a + a[10] * F(0x0c6388b51545e883);
+        b[10] = sum_b + b[10] * F(0x0c6388b51545e883);
+        a[11] = sum_a + a[11] * F(0xd27dbb6944917b60);
+        b[11] = sum_b + b[11] * F(0xd27dbb6944917b60);
+    }
+
+    /// Grouped x4 internal layer: four independent sums first, then interleaved
+    /// lane updates across the four states. Bit-identical to four sequential
+    /// `internal_linear_layer` calls.
+    #[inline]
+    fn internal_linear_layer_x4(
+        a: &mut [Self; WIDTH],
+        b: &mut [Self; WIDTH],
+        c: &mut [Self; WIDTH],
+        d: &mut [Self; WIDTH],
+    ) {
+        let sum_a = sum_12(a);
+        let sum_b = sum_12(b);
+        let sum_c = sum_12(c);
+        let sum_d = sum_12(d);
+        a[0] = sum_a + a[0] * F(0xc3b6c08e23ba9300);
+        b[0] = sum_b + b[0] * F(0xc3b6c08e23ba9300);
+        c[0] = sum_c + c[0] * F(0xc3b6c08e23ba9300);
+        d[0] = sum_d + d[0] * F(0xc3b6c08e23ba9300);
+        a[1] = sum_a + a[1] * F(0xd84b5de94a324fb6);
+        b[1] = sum_b + b[1] * F(0xd84b5de94a324fb6);
+        c[1] = sum_c + c[1] * F(0xd84b5de94a324fb6);
+        d[1] = sum_d + d[1] * F(0xd84b5de94a324fb6);
+        a[2] = sum_a + a[2] * F(0x0d0c371c5b35b84f);
+        b[2] = sum_b + b[2] * F(0x0d0c371c5b35b84f);
+        c[2] = sum_c + c[2] * F(0x0d0c371c5b35b84f);
+        d[2] = sum_d + d[2] * F(0x0d0c371c5b35b84f);
+        a[3] = sum_a + a[3] * F(0x7964f570e7188037);
+        b[3] = sum_b + b[3] * F(0x7964f570e7188037);
+        c[3] = sum_c + c[3] * F(0x7964f570e7188037);
+        d[3] = sum_d + d[3] * F(0x7964f570e7188037);
+        a[4] = sum_a + a[4] * F(0x5daf18bbd996604b);
+        b[4] = sum_b + b[4] * F(0x5daf18bbd996604b);
+        c[4] = sum_c + c[4] * F(0x5daf18bbd996604b);
+        d[4] = sum_d + d[4] * F(0x5daf18bbd996604b);
+        a[5] = sum_a + a[5] * F(0x6743bc47b9595257);
+        b[5] = sum_b + b[5] * F(0x6743bc47b9595257);
+        c[5] = sum_c + c[5] * F(0x6743bc47b9595257);
+        d[5] = sum_d + d[5] * F(0x6743bc47b9595257);
+        a[6] = sum_a + a[6] * F(0x5528b9362c59bb70);
+        b[6] = sum_b + b[6] * F(0x5528b9362c59bb70);
+        c[6] = sum_c + c[6] * F(0x5528b9362c59bb70);
+        d[6] = sum_d + d[6] * F(0x5528b9362c59bb70);
+        a[7] = sum_a + a[7] * F(0xac45e25b7127b68b);
+        b[7] = sum_b + b[7] * F(0xac45e25b7127b68b);
+        c[7] = sum_c + c[7] * F(0xac45e25b7127b68b);
+        d[7] = sum_d + d[7] * F(0xac45e25b7127b68b);
+        a[8] = sum_a + a[8] * F(0xa2077d7dfbb606b5);
+        b[8] = sum_b + b[8] * F(0xa2077d7dfbb606b5);
+        c[8] = sum_c + c[8] * F(0xa2077d7dfbb606b5);
+        d[8] = sum_d + d[8] * F(0xa2077d7dfbb606b5);
+        a[9] = sum_a + a[9] * F(0xf3faac6faee378ae);
+        b[9] = sum_b + b[9] * F(0xf3faac6faee378ae);
+        c[9] = sum_c + c[9] * F(0xf3faac6faee378ae);
+        d[9] = sum_d + d[9] * F(0xf3faac6faee378ae);
+        a[10] = sum_a + a[10] * F(0x0c6388b51545e883);
+        b[10] = sum_b + b[10] * F(0x0c6388b51545e883);
+        c[10] = sum_c + c[10] * F(0x0c6388b51545e883);
+        d[10] = sum_d + d[10] * F(0x0c6388b51545e883);
+        a[11] = sum_a + a[11] * F(0xd27dbb6944917b60);
+        b[11] = sum_b + b[11] * F(0xd27dbb6944917b60);
+        c[11] = sum_c + c[11] * F(0xd27dbb6944917b60);
+        d[11] = sum_d + d[11] * F(0xd27dbb6944917b60);
     }
 
     #[inline]

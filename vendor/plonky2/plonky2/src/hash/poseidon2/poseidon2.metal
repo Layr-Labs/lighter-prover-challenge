@@ -4,6 +4,25 @@ using namespace metal;
 constant ulong GOLDILOCKS_PRIME = 0xffffffff00000001UL;
 constant ulong GOLDILOCKS_EPSILON = 0xffffffffUL;
 
+// Compile-time Poseidon2 round constants (same values as config.rs).
+// File-scope constant arrays keep the round loops compact so register
+// pressure stays near the tip kernels, while still removing device-buffer
+// loads of the parameters table for every RC add.
+constant ulong POSEIDON2_EXTERNAL_RC[8][12] = {
+    { 0xd70193d17ab3b7d6UL, 0xa2c3662a78a9162bUL, 0x7a9fda827556ad44UL, 0xe8d5501818c99643UL, 0x4c7a8fced4d5fd38UL, 0x55ab38985c0c513dUL, 0x28a17bd016210b0bUL, 0x8f8277679ec32fa8UL, 0x768b3c3d68a460e9UL, 0x872a022eb559d941UL, 0xd1316dd4b3b97973UL, 0xa7b608e578321000UL },
+    { 0x3fa02c87b0bee026UL, 0x7a38f0022e13c31eUL, 0x00c054f3c5e8d20dUL, 0x439f50f4bca7242fUL, 0x4d0938aa57cd517fUL, 0xb2e03ac5fb6b9a7dUL, 0xe29d1f4237bedca8UL, 0x05b7c844bc99b848UL, 0x91cc0b73f34e17edUL, 0x876e4427694bd755UL, 0x67002ae0725c612dUL, 0x05351f20e0b6315fUL },
+    { 0x2e3b9ef5457eb60bUL, 0xd9ac17618c3783ddUL, 0x0807528ad8874bcfUL, 0xc78d546a455d2a0eUL, 0xf8b930c81e2481f0UL, 0x712707d8dff3b041UL, 0xdcb8c0aa0b9d34c3UL, 0x9baddbdf2ee3a468UL, 0x2dd16d50c5176c78UL, 0x89eac5cfbc075cd3UL, 0x2a741dea181587f3UL, 0x1a4d6aa85a113d84UL },
+    { 0x4d736286a2387e34UL, 0x8bad5dfc4fcb3ee3UL, 0x84fbd03adb77c56aUL, 0x8d5cdd1a23ec53a2UL, 0x036f08f08fff28ecUL, 0xb717a3f4dbdfb443UL, 0x58a074b5509d645cUL, 0xf92bf834e4b87718UL, 0x1541c3a0baa5ac4bUL, 0x22149e6783e67692UL, 0x9be8b5d9e112476fUL, 0x41e0969f62babb76UL },
+    { 0xbc585ad3b9443dbbUL, 0xf28dd3206975cbb1UL, 0xdd8815e53ca045e0UL, 0xde82c416b9e701baUL, 0xc5cb875233afa025UL, 0x7212697cd897ffa9UL, 0x67844790aa63cfd7UL, 0xdc0b9cfa97fe65c3UL, 0xe8fe091869a82070UL, 0x62902bb2e413c6d1UL, 0x29f9f5001fb84f57UL, 0xbe1014796ef5f8beUL },
+    { 0x71feb53e9bdba19cUL, 0x251054f592ebb71cUL, 0xe1a57643a4bb284bUL, 0xa4ba6f87a45b739bUL, 0x2c1fcade0b958c49UL, 0xbbb424cda9a3e360UL, 0x2ca647354c5f3f54UL, 0xc9277b64d152e084UL, 0xdbc9ac97445eff17UL, 0x6f6cdf3198969f70UL, 0x1de29d14fa76d8f1UL, 0x73337458a8cc1d19UL },
+    { 0xb87e775e2fb3ab23UL, 0xf166a1c7a565c80bUL, 0xb24be06f426c747fUL, 0xc281e8c49482ce00UL, 0x51974c3b3b726c2dUL, 0x87444cf8caf7d619UL, 0x7c362f827a580cedUL, 0x9567af14667647a0UL, 0xcbf0473cbec54e37UL, 0xe3209dedeff4f620UL, 0xd43ad94e45a4c4eeUL, 0x976981ee73f41768UL },
+    { 0xef707a224e207258UL, 0x2fc779e10e6362eeUL, 0x29b5ee60ad8c891fUL, 0x96b37b39d8bfd667UL, 0x877df68a8b22e733UL, 0x5c41746f562c8d9fUL, 0x0c9d76751052b71aUL, 0xfb3465341bf1c087UL, 0xa0d14dc614d15eb1UL, 0xdc27d17136906fa6UL, 0x482e163b05ec397fUL, 0x0273a462992366efUL },
+};
+constant ulong POSEIDON2_INTERNAL_RC[22] = {
+    0xa571418d95897b60UL, 0x8f32676574fcf6d3UL, 0x731102d4e3fb1bbeUL, 0x0330f08328a82d2bUL, 0x7f0449b6557f785dUL, 0x62f06210658dcbcbUL, 0xd5a98af9f89c458bUL, 0x77ec69083a346385UL, 0xef7ca48bbc27f890UL, 0x53e9652f61eac532UL, 0xa71c634abff4f0ccUL, 0xb16f5f0d7e28ea29UL, 0xc9dde31d0a003ab2UL, 0x2ddadf9775902533UL, 0xe4fa73fb16408b47UL, 0x90242ebc00d2ee59UL, 0xbb02dffd9f381982UL, 0xdea328364c50907cUL, 0x1395d3b924857cf8UL, 0x7d3ead0d5aec04e6UL, 0xc2f12be3fed74668UL, 0x0ba3c338f8c3d285UL,
+};
+
+
 inline void add_epsilon_u32(thread uint& lo, thread uint& hi, uint active) {
     uint old0 = lo;
     lo -= active;
@@ -356,7 +375,7 @@ inline ulong sum_state(thread const ulong state[12]) {
     return lazy_materialize(sum);
 }
 
-inline void internal_linear_layer(thread ulong state[12], constant ulong* diagonal) {
+inline void internal_linear_layer(thread ulong state[12]) {
     ulong sum = sum_state(state);
     // Poseidon2's internal diagonal is fixed by the hash configuration. Spell
     // it as immediates so the Metal compiler can specialize the constant
@@ -377,28 +396,27 @@ inline void internal_linear_layer(thread ulong state[12], constant ulong* diagon
 
 // Parameter layout: 8 x 12 external constants, 22 internal constants,
 // then the 12-element internal diagonal.
-inline void poseidon2(thread ulong state[12], constant ulong* parameters) {
-    constant ulong* external_constants = parameters;
-    constant ulong* internal_constants = parameters + 96;
-    constant ulong* diagonal = parameters + 118;
-
+// Parameter buffer remains in the ABI for host binding; sponge arithmetic uses
+// compile-time constant tables so RC adds do not depend on device buffer loads.
+// Round loops stay compact (unlike full unroll) to preserve occupancy.
+inline void poseidon2(thread ulong state[12], constant ulong* /*parameters*/) {
     external_linear_layer(state);
 
     for (uint round = 0; round < 4; ++round) {
         for (uint i = 0; i < 12; ++i) {
-            state[i] = pow7(gl_add(state[i], external_constants[round * 12 + i]));
+            state[i] = pow7(gl_add(state[i], POSEIDON2_EXTERNAL_RC[round][i]));
         }
         external_linear_layer(state);
     }
 
     for (uint round = 0; round < 22; ++round) {
-        state[0] = pow7(gl_add(state[0], internal_constants[round]));
-        internal_linear_layer(state, diagonal);
+        state[0] = pow7(gl_add(state[0], POSEIDON2_INTERNAL_RC[round]));
+        internal_linear_layer(state);
     }
 
     for (uint round = 4; round < 8; ++round) {
         for (uint i = 0; i < 12; ++i) {
-            state[i] = pow7(gl_add(state[i], external_constants[round * 12 + i]));
+            state[i] = pow7(gl_add(state[i], POSEIDON2_EXTERNAL_RC[round][i]));
         }
         external_linear_layer(state);
     }
@@ -460,9 +478,7 @@ kernel void poseidon2_gate_quotient(
         filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
     }
 
-    constant ulong* external_constants = parameters;
-    constant ulong* internal_constants = parameters + 96;
-    constant ulong* diagonal = parameters + 118;
+    // parameters buffer kept for ABI; RCs from compile-time tables.
     ulong accumulators[2] = { 0, 0 };
     uint constraint_index = 0;
 
@@ -494,7 +510,7 @@ kernel void poseidon2_gate_quotient(
 
     for (uint round = 0; round < 4; ++round) {
         for (uint i = 0; i < 12; ++i) {
-            state[i] = gl_add(state[i], external_constants[round * 12 + i]);
+            state[i] = gl_add(state[i], POSEIDON2_EXTERNAL_RC[round][i]);
         }
         if (round != 0) {
             uint saved_start = 29 + (round - 1) * 12;
@@ -521,17 +537,17 @@ kernel void poseidon2_gate_quotient(
     for (uint round = 0; round < 22; ++round) {
         ulong saved = poseidon2_gate_wire(wires, 65 + round, lde_rows, source_row);
         poseidon2_gate_emit(
-            gl_sub(gl_add(state[0], internal_constants[round]), saved),
+            gl_sub(gl_add(state[0], POSEIDON2_INTERNAL_RC[round]), saved),
             alpha_powers,
             accumulators,
             constraint_index);
         state[0] = pow7(saved);
-        internal_linear_layer(state, diagonal);
+        internal_linear_layer(state);
     }
 
     for (uint round = 4; round < 8; ++round) {
         for (uint i = 0; i < 12; ++i) {
-            state[i] = gl_add(state[i], external_constants[round * 12 + i]);
+            state[i] = gl_add(state[i], POSEIDON2_EXTERNAL_RC[round][i]);
         }
         uint saved_start = 87 + (round - 4) * 12;
         for (uint i = 0; i < 12; ++i) {
