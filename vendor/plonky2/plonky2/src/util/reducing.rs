@@ -146,32 +146,17 @@ impl<F: Field> ReducingFactor<F> {
             return PolynomialCoeffs::new(accumulate_chunk(&polys, &base_powers));
         }
 
-        // Coefficient slots are independent. Partition the result so each
-        // worker visits all polynomials for one cache-sized output range,
-        // deleting the full-degree partial vector per polynomial chunk and
-        // the serial merge of those vectors. Each slot receives powers in
-        // ascending polynomial order; this is field-equal to the previous
-        // regrouped sum, while proof serialization canonicalizes every limb.
-        const SLOT_BLOCK: usize = 2048;
+        let partials: Vec<Vec<F>> = polys
+            .par_chunks(PARALLEL_CHUNK)
+            .zip(base_powers.par_chunks(PARALLEL_CHUNK))
+            .map(|(ps, powers)| accumulate_chunk(ps, powers))
+            .collect();
         let mut acc = vec![F::ZERO; max_len];
-        acc.par_chunks_mut(SLOT_BLOCK)
-            .enumerate()
-            .for_each(|(block, out)| {
-                let start = block * SLOT_BLOCK;
-                for (base_power, poly) in base_powers.iter().zip(&polys) {
-                    let coeffs: &PolynomialCoeffs<BF> = Borrow::borrow(poly);
-                    if coeffs.coeffs.len() <= start {
-                        continue;
-                    }
-                    let live = (coeffs.coeffs.len() - start).min(out.len());
-                    for (a, &c) in out[..live]
-                        .iter_mut()
-                        .zip(&coeffs.coeffs[start..start + live])
-                    {
-                        *a += <F as FieldExtension<D>>::scalar_mul(base_power, c);
-                    }
-                }
-            });
+        for partial in partials {
+            for (a, p) in acc.iter_mut().zip(partial) {
+                *a += p;
+            }
+        }
         PolynomialCoeffs::new(acc)
     }
 
