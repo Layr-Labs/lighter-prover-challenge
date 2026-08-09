@@ -27,7 +27,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "6a65119780a2645ce0077ef1da44d2774ca31aa1ef5c511162280d1b2f15213f";
+    "9c5067f41cf10051f562dd5434fc604f85e68f1d35b1955a40def3aea13b5a2e";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -5179,6 +5179,88 @@ kernel void goldilocks_mul_bench_native(
              speedup={:.3}x",
             native_median.as_secs_f64() / limb_median.as_secs_f64()
         );
+    }
+
+    /// The squaring specialization in `pow7` must be value-exact, not merely
+    /// congruent: these digests are hashed and compared as raw words. `gl_sqr`
+    /// forms the same 128-bit product as `gl_mul(a, a)` with one fewer 32x32
+    /// multiply (the two cross terms of a square are the same product), so the
+    /// reduction below it sees identical limbs. This pins that claim against
+    /// the reference build, over whole trees at the production leaf widths and
+    /// with deliberately non-canonical inputs present.
+    #[test]
+    fn metal_squaring_matches_general_multiply() {
+        let harness = PoseidonBenchmarkHarness::new();
+        let ref_source =
+            ["#define POSEIDON2_NO_SQUARING_SPECIALIZATION 1\n", SHADER_SOURCE].concat();
+        let pipelines = |source: &str| {
+            autoreleasepool(|| {
+                let options = CompileOptions::new();
+                let library = harness
+                    .device
+                    .new_library_with_source(source, &options)
+                    .unwrap_or_else(|e| panic!("squaring differential shader failed: {e}"));
+                let pipeline = |name| {
+                    let function = library
+                        .get_function(name, None)
+                        .unwrap_or_else(|e| panic!("{name} unavailable: {e}"));
+                    harness
+                        .device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .unwrap_or_else(|e| panic!("{name} pipeline failed: {e}"))
+                };
+                (pipeline("poseidon2_hash_leaves"), pipeline("poseidon2_hash_parents"))
+            })
+        };
+        let (ref_leaf, ref_parent) = pipelines(&ref_source);
+        let (sqr_leaf, sqr_parent) = pipelines(SHADER_SOURCE);
+
+        for (leaf_width, log_leaves) in [(136usize, 12usize), (88, 12), (8, 12), (4, 10)] {
+            let leaf_count = 1usize << log_leaves;
+            let cap_height = 4usize;
+            let total_node_count = 2 * leaf_count - (1usize << cap_height);
+            let mut rng = StdRng::seed_from_u64(0x5351_5541_5245_0001 ^ leaf_width as u64);
+            let inputs: Vec<u64> = (0..leaf_count * leaf_width)
+                .map(|i| {
+                    if i % 97 == 0 {
+                        // Raw non-canonical representative in [p, 2^64).
+                        GoldilocksField::ORDER + (rng.next_u64() >> 33)
+                    } else {
+                        rng.next_u64() % GoldilocksField::ORDER
+                    }
+                })
+                .collect();
+            let input = autoreleasepool(|| {
+                harness.device.new_buffer_with_data(
+                    inputs.as_ptr().cast::<c_void>(),
+                    size_of_val(inputs.as_slice()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            });
+            let bytes = (total_node_count * 4 * size_of::<u64>()) as u64;
+            let out_ref = autoreleasepool(|| {
+                harness.device.new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+            });
+            let out_sqr = autoreleasepool(|| {
+                harness.device.new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+            });
+            harness.run_merkle(
+                &ref_leaf, &ref_parent, &input, &out_ref, leaf_width, leaf_count, cap_height,
+            );
+            harness.run_merkle(
+                &sqr_leaf, &sqr_parent, &input, &out_sqr, leaf_width, leaf_count, cap_height,
+            );
+            let words = total_node_count * 4;
+            let a = unsafe { core::slice::from_raw_parts(out_ref.contents().cast::<u64>(), words) };
+            let b = unsafe { core::slice::from_raw_parts(out_sqr.contents().cast::<u64>(), words) };
+            let mismatches = a.iter().zip(b).filter(|(x, y)| x != y).count();
+            assert_eq!(
+                mismatches, 0,
+                "squaring path diverges from general multiply at leaf width {leaf_width}: \
+                 {mismatches}/{words} raw words"
+            );
+            assert!(a.iter().any(|&w| w != 0), "degenerate all-zero tree at width {leaf_width}");
+        }
     }
 
     #[test]
