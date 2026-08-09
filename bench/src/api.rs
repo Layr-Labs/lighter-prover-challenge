@@ -1,4 +1,4 @@
-// Redraw marker 250
+// horner-fma+logstrip-redraw-1786288302 fire4 lottery
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
