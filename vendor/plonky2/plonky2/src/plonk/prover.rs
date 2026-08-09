@@ -30,7 +30,8 @@ use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{
-    eval_vanishing_poly_base_batch, get_lut_poly, PermutationBatch, VanishingScratch,
+    eval_vanishing_poly_base_batch, get_lut_poly, interleave_pair_plan, PermutationBatch,
+    VanishingScratch,
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
@@ -1872,6 +1873,10 @@ fn compute_quotient_polys<
     let cpu_gate_indices = (0..common_data.gates.len())
         .filter(|gate_index| !excluded_gate_indices.contains(gate_index))
         .collect::<Vec<_>>();
+    // Detect the exact pair only after GPU ownership is fixed. If either gate
+    // has been offloaded, the plan is absent and the remaining CPU gate keeps
+    // its ordinary evaluator.
+    let interleave_pair = interleave_pair_plan(common_data, &cpu_gate_indices);
     let cpu_num_wires = cpu_gate_indices
         .iter()
         .map(|&i| common_data.gates[i].0.num_wires())
@@ -2150,6 +2155,7 @@ fn compute_quotient_polys<
                     alphas,
                     &cpu_gate_indices,
                     cpu_num_gate_constraints,
+                    interleave_pair.as_ref(),
                     &z_h_on_coset,
                     &lut_re_poly_evals_refs,
                     &mut scratch.vanishing,
