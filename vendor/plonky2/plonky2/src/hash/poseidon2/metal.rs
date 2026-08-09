@@ -68,7 +68,7 @@ const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
 // measured GPU/CPU 0.88 warm with zero contention. 1 << 16 admits them while
 // still keeping the genuinely CPU-favored tiny shapes (2^15 width-8 measured
 // 1.37) on the CPU.
-const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
+const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 15;
 /// Upper bound on concurrently in-flight GPU tree builds. One set serializes
 /// GPU tree builds exactly like the promoted base's global context mutex: a
 /// 3-set experiment measured 13-18% faster locally but scored -21.6% on the
@@ -3025,7 +3025,7 @@ fn dispatch2d(
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(64)
+        .min(128)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
@@ -3049,7 +3049,7 @@ fn dispatch(
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(128)
+        .min(256)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
