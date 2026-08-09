@@ -30,9 +30,18 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // Return freed pages to the OS as soon as they are unused instead of retaining
 // them for the process lifetime.
 //
-// The benchmark runs five of these workers concurrently and the score is the
-// sum of their lifetimes, so every resident page one worker holds is a page the
-// other four contend for. With decay disabled the allocator never madvises a
+// The score is the sum of worker process lifetimes, and the trusted harness
+// spawns those workers *sequentially*, one per private fixture: see
+// `run_private_sequence` in `benchmark-tools/harness/src/main.rs`, whose
+// `for (index, fixture) in fixtures.iter().enumerate()` loop calls
+// `spawn_and_time_worker` and pushes each duration before it advances, so no
+// two workers are ever alive at once. The previous wording here claimed five
+// workers run concurrently and contend for pages; that is not what the harness
+// does, and the claim is worth correcting because it invites optimisations
+// aimed at cross-worker memory pressure that cannot exist.
+//
+// The setting is kept because its single-process rationale stands on its own.
+// With decay disabled the allocator never madvises a
 // freed extent away, so this process's resident set is the *high-water mark* of
 // its heap rather than its live set: the transaction/chain pipeline allocates
 // and frees the same shapes of multi-hundred-megabyte witness, coefficient and
@@ -139,8 +148,9 @@ fn main() {
                 //
                 // Without this the buffer stays resident from the first second of
                 // the process until the pipeline joins, i.e. across the entire
-                // transaction/chain phase, which is where five concurrent workers
-                // contend for the machine's memory. Value-exact and free: no
+                // transaction/chain phase, which is this worker's own peak
+                // residency (the harness runs the five fixtures one worker at a
+                // time; see the allocator note above). Value-exact and free: no
                 // quantity is computed differently and no work is added — storage
                 // that no subsequent read can reach is returned earlier.
                 pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();

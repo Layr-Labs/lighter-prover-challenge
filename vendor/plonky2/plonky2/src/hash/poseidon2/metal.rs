@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use metal::{
-    Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSUInteger,
+    BinaryArchive, BinaryArchiveDescriptor, BinaryArchiveRef, Buffer, CommandBuffer, CommandQueue,
+    CompileOptions, ComputePipelineDescriptor, ComputePipelineState, Device,
+    MTLCommandBufferStatus, MTLPipelineOption, MTLResourceOptions, MTLSize, NSUInteger, URL,
 };
 use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
@@ -24,6 +25,34 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// `poseidon2.metal` changes (see `MetalShared::new`); the
 /// `metallib_matches_shader_source` test enforces it.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
+
+/// GPU machine code for every kernel in [`SHADER_METALLIB`], as a serialized
+/// `MTLBinaryArchive`.
+///
+/// `SHADER_METALLIB` removes the MSL front end, but the back end remains: each
+/// `newComputePipelineStateWithFunction:` still lowers that kernel's AIR to a
+/// GPU binary through MTLCompilerService. The benchmark sandbox denies writes
+/// to `com.apple.metal`, so the OS shader cache is disabled and reads miss too
+/// — every scored worker pays that lowering cold, and the harness spawns one
+/// worker per fixture. Measured under the benchmark's own Seatbelt profile on
+/// an Apple M4, creating all nine pipelines:
+///
+/// ```text
+///   from AIR              1542 ms / 1555 ms / 1535 ms
+///   from this archive     0.9 ms load + 0.45 ms create, 9 hits, 0 misses
+/// ```
+///
+/// A binary archive is keyed to the GPU and driver that produced it, so a host
+/// that cannot use this one simply misses and compiles exactly as before. Every
+/// use below is `newComputePipelineStateWithDescriptor:` *without*
+/// `FailOnBinaryArchiveMiss`, which is the API's own fallback: a miss compiles
+/// the kernel rather than failing. Nothing here changes what any kernel
+/// computes — a pipeline built from the archive and one lowered from the same
+/// AIR are the same program.
+///
+/// Regenerate alongside `poseidon2.metallib` whenever `poseidon2.metal`
+/// changes; a stale archive misses and costs only the lookup.
+const SHADER_BINARY_ARCHIVE: &[u8] = include_bytes!("poseidon2.binarchive");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
@@ -655,6 +684,130 @@ fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState>
 
 fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.get()
+}
+
+/// Loads [`SHADER_BINARY_ARCHIVE`] so pipeline creation can be served from
+/// prebuilt GPU binaries instead of lowering AIR.
+///
+/// `MTLBinaryArchiveDescriptor` accepts only a file URL, so the embedded bytes
+/// have to reach the filesystem first. `std::env::temp_dir()` honours `TMPDIR`,
+/// which the trusted harness points at this run's private scratch directory —
+/// the one location the sandbox profile leaves writable. Writing 653 KiB there
+/// measured 0.7-1.3 ms under that profile.
+///
+/// Every failure path returns `None`, which puts the caller on exactly the
+/// AIR-lowering path it used before.
+fn load_binary_archive(device: &Device) -> Option<BinaryArchive> {
+    if SHADER_BINARY_ARCHIVE.is_empty() {
+        return None;
+    }
+    let mut path = std::env::temp_dir();
+    path.push(format!("poseidon2-{}.binarchive", std::process::id()));
+    std::fs::write(&path, SHADER_BINARY_ARCHIVE).ok()?;
+    // The file is left in place: Metal may read it lazily, and the harness
+    // resets this scratch directory between fixtures anyway.
+    autoreleasepool(|| {
+        let url = URL::new_with_string(&format!("file://{}", path.display()));
+        let descriptor = BinaryArchiveDescriptor::new();
+        descriptor.set_url(&url);
+        // `URL::new_with_string` wraps `+[NSURL URLWithString:]`, which returns
+        // an autoreleased (+0) object, but `metal`'s owned wrapper releases on
+        // drop. Dropping it here over-releases and faults once the enclosing
+        // pool drains. Leaking exactly one NSURL per process is the cheap fix;
+        // the object is a few dozen bytes and the process is a one-shot worker.
+        core::mem::forget(url);
+        match device.new_binary_archive_with_descriptor(&descriptor) {
+            Ok(archive) => Some(archive),
+            Err(error) => {
+                log::debug!("Poseidon2 binary archive unusable ({error}); lowering AIR instead");
+                None
+            }
+        }
+    })
+}
+
+/// Whether `archive` can actually serve this library's kernels on this device.
+///
+/// A binary archive is keyed to the GPU and driver that produced it. A foreign
+/// or stale one still *loads* — it simply misses every lookup — and a miss is
+/// silently compiled by `newComputePipelineStateWithDescriptor:`. That is fine
+/// per kernel, but it would leave the caller on the serial fast path below
+/// while every kernel is really being lowered, which is strictly worse than the
+/// parallel-plus-deferred path this replaces (1542 ms serial against 838 ms).
+///
+/// So probe one kernel with `FailOnBinaryArchiveMiss`, which fails rather than
+/// compiling. One lookup decides it, and a miss puts the whole context back on
+/// exactly the path it used before this existed.
+fn archive_serves(device: &Device, library: &metal::Library, archive: &BinaryArchiveRef) -> bool {
+    autoreleasepool(|| {
+        let Ok(function) = library.get_function("poseidon2_hash_leaves", None) else {
+            return false;
+        };
+        let descriptor = ComputePipelineDescriptor::new();
+        descriptor.set_compute_function(Some(&function));
+        descriptor.set_binary_archives(&[archive]);
+        device
+            .new_compute_pipeline_state_with_reflection(
+                &descriptor,
+                MTLPipelineOption::FailOnBinaryArchiveMiss,
+            )
+            .is_ok()
+    })
+}
+
+/// Creates one compute pipeline, preferring prebuilt code from `archive`.
+///
+/// Without `FailOnBinaryArchiveMiss` this is Metal's own fallback: a kernel the
+/// archive cannot serve is compiled from the library exactly as before. The
+/// resulting pipeline is the same program either way.
+fn pipeline_for(
+    device: &Device,
+    library: &metal::Library,
+    archive: Option<&BinaryArchiveRef>,
+    name: &str,
+) -> Option<ComputePipelineState> {
+    autoreleasepool(|| {
+        let function = library.get_function(name, None).ok()?;
+        if let Some(archive) = archive {
+            let descriptor = ComputePipelineDescriptor::new();
+            descriptor.set_compute_function(Some(&function));
+            descriptor.set_binary_archives(&[archive]);
+            if let Ok(pipeline) = device.new_compute_pipeline_state(&descriptor) {
+                return Some(pipeline);
+            }
+        }
+        device
+            .new_compute_pipeline_state_with_function(&function)
+            .ok()
+    })
+}
+
+/// Fills the three deferred pipeline slots on the calling thread.
+///
+/// Only used when the binary archive is available, where all three together
+/// cost well under a millisecond. Deferring them to threads exists to keep
+/// *lowering* off the blocking path; with nothing to lower there is nothing to
+/// defer, and building them here means the first quotient evaluation never has
+/// to wait on a builder thread.
+fn build_optional_pipelines_now(
+    device: &Device,
+    library: &metal::Library,
+    archive: Option<&BinaryArchiveRef>,
+) {
+    for (name, slot) in [
+        ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
+        (
+            "range_check_gate_quotient",
+            &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
+        ),
+        ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
+    ] {
+        let pipeline = pipeline_for(device, library, archive, name);
+        if pipeline.is_none() {
+            log::debug!("{name} pipeline unavailable; evaluating those gates on the CPU");
+        }
+        let _ = slot.built.set(pipeline);
+    }
 }
 
 /// Starts the two gate-quotient pipeline builds on detached threads.
@@ -1802,6 +1955,17 @@ impl MetalShared {
             // each worker thread gets its own autorelease pool so the temporary
             // `NSError`s the Metal API autoreleases are drained on the thread
             // that created them rather than leaking.
+            // Prebuilt GPU binaries, when this host can use them, turn every
+            // lowering below into a lookup: measured 1542 ms -> 1.4 ms for all
+            // nine kernels under the benchmark's own sandbox profile. `None`
+            // here means every path below is exactly the one it was before.
+            let archive = load_binary_archive(&device);
+            let archive_ref = archive
+                .as_deref()
+                .filter(|archive| archive_serves(&device, &library, archive));
+            if archive.is_some() && archive_ref.is_none() {
+                log::debug!("Poseidon2 binary archive does not serve this device; lowering AIR");
+            }
             let device_ref = &device;
             let library_ref = &library;
             let required = |name: &'static str, kind: &'static str| {
@@ -1844,7 +2008,25 @@ impl MetalShared {
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
-            ) = std::thread::scope(|scope| {
+            ) = if let Some(archive) = archive_ref {
+                // Nothing to lower, so nothing to parallelise: all six are
+                // lookups totalling well under a millisecond, and building them
+                // on this thread keeps the archive off the thread-safety
+                // question entirely.
+                let build = |name: &'static str, kind: &'static str| {
+                    pipeline_for(device_ref, library_ref, Some(archive), name)
+                        .ok_or_else(|| format!("{kind} pipeline creation failed"))
+                };
+                (
+                    build("poseidon2_hash_leaves", "leaf"),
+                    build("poseidon2_hash_leaves_colmajor", "col-major leaf"),
+                    build("poseidon2_hash_parents", "parent"),
+                    build("ntt_prepare", "ntt prepare"),
+                    build("ntt_stage", "ntt stage"),
+                    build("ifft_finalize", "ifft finalize"),
+                )
+            } else {
+                std::thread::scope(|scope| {
                 let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
                 let leaf_colmajor =
                     scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
@@ -1870,7 +2052,8 @@ impl MetalShared {
                         .join()
                         .expect("ifft finalize pipeline thread panicked"),
                 )
-            });
+                })
+            };
             // Surfaced in kernel order, so a single missing or unbuildable
             // kernel yields the same error string the sequential construction
             // produced. Only the tie-break between two simultaneous failures
@@ -1884,7 +2067,11 @@ impl MetalShared {
             let ntt_stage_pipeline = ntt_stage_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
-            spawn_optional_pipelines(&device, &library);
+            if let Some(archive) = archive_ref {
+                build_optional_pipelines_now(&device, &library, Some(archive));
+            } else {
+                spawn_optional_pipelines(&device, &library);
+            }
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
