@@ -582,6 +582,12 @@ pub struct ProverOnlyCircuitData<
     /// start of every proof. Runtime-only: it is a pure function of `generator_indices_by_watches`
     /// and is reconstructed on deserialization, so the serialized format is unchanged.
     pub generator_watch_counts: Vec<usize>,
+    /// Whether every generator is known to require all of its watched representatives before it
+    /// can make progress.
+    ///
+    /// Runtime-only: this is derived from the generator trait objects at build/deserialization
+    /// time, so it changes neither circuit serialization nor proof bytes.
+    pub all_generators_require_all_watches: bool,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.

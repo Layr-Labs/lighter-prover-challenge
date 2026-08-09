@@ -1328,10 +1328,14 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // watches. Deduplicating each generator's typically short watch list first gives the CSR
         // builder one flat edge array in ascending generator order. This avoids constructing a
         // `BTreeMap` node and a separately allocated `Vec` for every watched representative.
+        let mut all_generators_require_all_watches = true;
         let mut generator_watch_counts = vec![0usize; self.generators.len()];
         let mut generator_watch_representatives = Vec::new();
         let mut generator_representatives = Vec::new();
         for (i, generator) in self.generators.iter().enumerate() {
+            if all_generators_require_all_watches {
+                all_generators_require_all_watches = generator.0.requires_all_watches();
+            }
             let watches = generator.0.watch_list();
             generator_representatives.clear();
             generator_representatives.extend(watches.into_iter().map(|watch| {
@@ -1458,6 +1462,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             generators: self.generators,
             generator_indices_by_watches,
             generator_watch_counts,
+            all_generators_require_all_watches,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
