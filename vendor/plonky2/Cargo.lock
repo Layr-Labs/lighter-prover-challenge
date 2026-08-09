@@ -824,6 +824,7 @@ version = "1.1.0"
 dependencies = [
  "ahash",
  "anyhow",
+ "block",
  "criterion",
  "env_logger",
  "getrandom",

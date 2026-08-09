@@ -27,7 +27,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "f5bdc674cf23ea03f8fb86be86fb12a00876f8e04fd44f8904bd443109fd347e";
+    "ae31bfae0c973fe2fdabccb654efa32c6c0b51aba7f58812ae8dfdb019b91311";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -120,6 +120,7 @@ pub(crate) struct PoseidonGateQuotientJob<F> {
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
     len: usize,
+    _job: GpuJobGuard,
     _phantom: PhantomData<F>,
 }
 
@@ -133,6 +134,7 @@ pub(crate) struct RangeCheckGateQuotientJob<F> {
     len: usize,
     #[cfg(test)]
     failure_observer: Option<Arc<RangeQuotientFailureObserver>>,
+    _job: GpuJobGuard,
     _phantom: PhantomData<F>,
 }
 
@@ -834,48 +836,6 @@ impl GpuJobGuard {
     fn begin() -> Self {
         GPU_JOBS_IN_FLIGHT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         GpuJobGuard
-    }
-}
-
-impl GpuJobGuard {
-    /// Promises this guard's decrement to a command buffer's completion handler
-    /// instead of to `Drop`, so the count measures how long the GPU is busy
-    /// rather than how long a host object lives.
-    ///
-    /// Only the asynchronous quotient jobs need this. Their guard is a field of
-    /// the job struct, which the prover holds from launch until it has
-    /// evaluated every remaining CPU gate and comes back to combine the GPU
-    /// contribution — far longer than the command buffer runs. While it is
-    /// held, `GPU_JOBS_IN_FLIGHT` is nonzero, and `gpu_worthwhile` reads
-    /// exactly that to decide the serialized stream is occupied for the 2^17
-    /// serial-path trees. A chain fold's narrow commitment trees were therefore
-    /// taking the ~15 ms CPU build through most of the quotient phase — on the
-    /// strictly sequential critical path of every block — against the ~8 ms GPU
-    /// build the rule was written to prefer whenever the stream is genuinely
-    /// free.
-    ///
-    /// Every synchronous Merkle build keeps its ordinary guard: those already
-    /// span exactly their `wait_until_completed`, which is the occupancy the
-    /// counter's own comment describes.
-    fn into_gpu_scoped(self) -> GpuJobHandle {
-        // The decrement belongs to the completion handler from here on.
-        core::mem::forget(self);
-        GpuJobHandle
-    }
-}
-
-/// A [`GpuJobGuard`] whose decrement has been promised to a command buffer.
-struct GpuJobHandle;
-
-impl GpuJobHandle {
-    /// Metal rejects completion handlers added after `commit`, so this runs
-    /// while the buffer is still being encoded.
-    fn attach(self, command_buffer: &metal::CommandBufferRef) {
-        let handler = block::ConcreteBlock::new(|_: &metal::CommandBufferRef| {
-            GPU_JOBS_IN_FLIGHT.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-        })
-        .copy();
-        command_buffer.add_completed_handler(&handler);
     }
 }
 
@@ -2017,7 +1977,7 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("Poseidon2 gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin().into_gpu_scoped();
+        let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
@@ -2041,7 +2001,6 @@ impl MetalShared {
             set_u32(encoder, 12, include_unused_selector as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
-            job_guard.attach(command_buffer);
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -2050,6 +2009,7 @@ impl MetalShared {
             output: Some(output),
             output_pool: Arc::clone(&self.quotient_output_pool),
             len,
+            _job: job_guard,
             _phantom: PhantomData,
         })
     }
@@ -2081,7 +2041,7 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("RangeCheck gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin().into_gpu_scoped();
+        let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
@@ -2107,7 +2067,6 @@ impl MetalShared {
             set_u32(encoder, 10, u32_count as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
-            job_guard.attach(command_buffer);
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -2128,6 +2087,7 @@ impl MetalShared {
             len,
             #[cfg(test)]
             failure_observer,
+            _job: job_guard,
             _phantom: PhantomData,
         })
     }
@@ -3288,6 +3248,7 @@ mod tests {
             output: Some(output()),
             output_pool: Arc::clone(&pool),
             len: 8,
+            _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
         assert!(pool.lock().unwrap().free.is_empty());
@@ -3306,6 +3267,7 @@ mod tests {
             output: Some(completed_output),
             output_pool: Arc::clone(&pool),
             len: 8,
+            _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
         let reused = pool
@@ -3330,6 +3292,7 @@ mod tests {
             output_pool: Arc::clone(&pool),
             len: 8,
             failure_observer: None,
+            _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
         let reused = pool
