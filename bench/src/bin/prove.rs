@@ -27,17 +27,25 @@ use plonky2::fri::oracle::PolynomialBatch;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// Return freed pages to the OS as soon as they are unused instead of retaining
-// them for the process lifetime.
+// Retain freed extents for the lifetime of this short-lived process instead of
+// madvising each one back to the kernel the moment it goes unused.
 //
-// The benchmark runs five of these workers concurrently and the score is the
-// sum of their lifetimes, so every resident page one worker holds is a page the
-// other four contend for. With decay disabled the allocator never madvises a
-// freed extent away, so this process's resident set is the *high-water mark* of
-// its heap rather than its live set: the transaction/chain pipeline allocates
-// and frees the same shapes of multi-hundred-megabyte witness, coefficient and
-// digest buffers 50+ times, and the retained slack accumulates monotonically.
-// Setting both decay periods to zero makes residency track the live set.
+// This reverses an earlier `0,0`, whose stated justification was that "the
+// benchmark runs five of these workers concurrently ... so every resident page
+// one worker holds is a page the other four contend for". The harness does not
+// do that. `run_private_sequence` (harness/src/main.rs:470) is a plain
+// sequential loop: reset scratch, spawn ONE worker, wait for it, verify its
+// proof, only then advance to the next fixture. No second proving worker is ever
+// alive while this one holds pages, so the contention the setting was tuned
+// against does not exist.
+//
+// What immediate decay costs instead: the pipeline allocates and frees the same
+// shapes of witness, coefficient and digest buffers 50+ times, so each freed
+// extent is purged and then faulted back in and zero-filled when the next
+// same-sized buffer reuses it — work this process then throws away, because it
+// ends in a direct `_exit` that lets the kernel reclaim the address space
+// wholesale. Retention deletes the purge/refault cycle without moving the
+// high-water mark, which is set by the live set at peak rather than by slack.
 //
 // This changes no computed value: `malloc_conf` only tunes when the allocator
 // hands unused pages back to the kernel. Every allocation still returns
@@ -46,14 +54,18 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 //
 // ABI note: jemalloc reads `const char *malloc_conf` (prefixed `_rjem_` in
 // tikv-jemalloc-sys), i.e. a pointer-sized slot holding the address of a
-// NUL-terminated string. `&[u8; 34]` is a thin pointer to the NUL-terminated
+// NUL-terminated string. `&[u8; 36]` is a thin pointer to the NUL-terminated
 // bytes, which matches that ABI exactly. Exporting the bare byte array itself
 // (no indirection) or omitting the trailing NUL would make jemalloc read the
 // string bytes as a pointer and crash. This is a default: the environment and
 // /etc/malloc.conf can still override it.
+//
+// jemalloc defines a decay period of `-1` as decay DISABLED (retain until exit),
+// which is not the same as `0` (purge immediately). The sized array type must
+// track the string: 35 bytes plus the trailing NUL.
 #[cfg(not(target_env = "msvc"))]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-static MALLOC_CONF: &[u8; 34] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
+static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
