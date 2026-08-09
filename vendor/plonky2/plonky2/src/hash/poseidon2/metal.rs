@@ -2065,7 +2065,7 @@ impl MetalShared {
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            dispatch_capped(encoder, pipeline, quotient_rows, 64);
             encoder.end_encoding();
             command_buffer.commit();
             command_buffer.to_owned()
@@ -3046,10 +3046,19 @@ fn dispatch(
     pipeline: &ComputePipelineState,
     thread_count: usize,
 ) {
+    dispatch_capped(encoder, pipeline, thread_count, 128);
+}
+
+fn dispatch_capped(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+    cap: NSUInteger,
+) {
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(128)
+        .min(cap)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
