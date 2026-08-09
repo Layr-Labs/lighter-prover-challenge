@@ -1371,6 +1371,180 @@ kernel void range_check_gate_quotient(
                     alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
+        } else if (kind == 13u) {
+            // U32InterleaveGate: two routed words per operation (x and its
+            // zero-interleaved image), followed by 32 big-endian bit wires.
+            // The reductions and boolean rows match the CPU gate's order;
+            // rows may be accumulated out of execution order because each is
+            // multiplied by its explicit alpha power.
+            for (uint op = 0; op < num_ops; ++op) {
+                uint row_base = constraint_index;
+                ulong routed_base = (ulong)op * 2u;
+                ulong bit_base = (ulong)num_ops * 2u + (ulong)op * 32u;
+                ulong recomposed = 0;
+                ulong interleaved = 0;
+                for (uint j = 0; j < 32u; ++j) {
+                    ulong bit = wires[(bit_base + j) * lde_rows + source_row];
+                    recomposed = gl_add(gl_add(recomposed, recomposed), bit);
+                    interleaved = gl_add(gl_quadruple(interleaved), bit);
+                    range_check_gate_emit(
+                        gl_mul(bit, gl_sub(bit, 1)),
+                        alpha_powers, alpha_stride, gate_accumulators,
+                        row_base + 2u + j);
+                }
+                ulong x = wires[routed_base * lde_rows + source_row];
+                ulong x_interleaved =
+                    wires[(routed_base + 1u) * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(recomposed, x),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    row_base);
+                range_check_gate_emit(
+                    gl_sub(interleaved, x_interleaved),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    row_base + 1u);
+                constraint_index = row_base + 34u;
+            }
+        } else if (kind == 14u) {
+            // UninterleaveToU32Gate: four routed words per operation
+            // (interleaved input, even half, odd half, inverse), followed by
+            // its 64 big-endian bits. The first four rows are the Goldilocks
+            // canonicity, full recomposition, even and odd recompositions;
+            // the remaining rows enforce bitness.
+            for (uint op = 0; op < num_ops; ++op) {
+                uint row_base = constraint_index;
+                ulong routed_base = (ulong)op * 4u;
+                ulong bit_base = (ulong)num_ops * 4u + (ulong)op * 64u;
+                ulong high = 0;
+                ulong low = 0;
+                ulong evens = 0;
+                ulong odds = 0;
+                for (uint j = 0; j < 64u; ++j) {
+                    ulong bit = wires[(bit_base + j) * lde_rows + source_row];
+                    if (j < 32u) {
+                        high = gl_add(gl_add(high, high), bit);
+                    } else {
+                        low = gl_add(gl_add(low, low), bit);
+                    }
+                    if ((j & 1u) == 0u) {
+                        evens = gl_add(gl_add(evens, evens), bit);
+                    } else {
+                        odds = gl_add(gl_add(odds, odds), bit);
+                    }
+                    range_check_gate_emit(
+                        gl_mul(bit, gl_sub(bit, 1)),
+                        alpha_powers, alpha_stride, gate_accumulators,
+                        row_base + 4u + j);
+                }
+
+                ulong x_interleaved = wires[routed_base * lde_rows + source_row];
+                ulong x_evens = wires[(routed_base + 1u) * lde_rows + source_row];
+                ulong x_odds = wires[(routed_base + 2u) * lde_rows + source_row];
+                ulong inverse = wires[(routed_base + 3u) * lde_rows + source_row];
+                ulong high_not_max = gl_sub(
+                    gl_mul(inverse, gl_sub(0xffffffffUL, high)), 1);
+                range_check_gate_emit(
+                    gl_mul(high_not_max, low),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    row_base);
+                range_check_gate_emit(
+                    gl_sub(gl_add(gl_mul(high, 4294967296UL), low), x_interleaved),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    row_base + 1u);
+                range_check_gate_emit(
+                    gl_sub(evens, x_evens),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    row_base + 2u);
+                range_check_gate_emit(
+                    gl_sub(odds, x_odds),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    row_base + 3u);
+                constraint_index = row_base + 68u;
+            }
+        } else if (kind == 15u) {
+            // ArithmeticGate: (x * y) * c0 + addend * c1 = output.
+            uint constant_base = num_addends;
+            ulong const_0 = constants[(ulong)constant_base * lde_rows + source_row];
+            ulong const_1 = constants[((ulong)constant_base + 1u) * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong wire_base = (ulong)op * 4u;
+                ulong x = wires[(wire_base + 0u) * lde_rows + source_row];
+                ulong y = wires[(wire_base + 1u) * lde_rows + source_row];
+                ulong addend = wires[(wire_base + 2u) * lde_rows + source_row];
+                ulong output_value = wires[(wire_base + 3u) * lde_rows + source_row];
+                ulong computed = gl_add(
+                    gl_mul(gl_mul(x, y), const_0),
+                    gl_mul(addend, const_1));
+                range_check_gate_emit(
+                    gl_sub(output_value, computed),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 16u) {
+            // ArithmeticExtensionGate<2>. Quadratic extension multiplication
+            // uses u^2 = 7, matching Goldilocks' Extension<2> implementation.
+            uint constant_base = num_addends;
+            ulong const_0 = constants[(ulong)constant_base * lde_rows + source_row];
+            ulong const_1 = constants[((ulong)constant_base + 1u) * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong wire_base = (ulong)op * 8u;
+                ulong x_0 = wires[(wire_base + 0u) * lde_rows + source_row];
+                ulong x_1 = wires[(wire_base + 1u) * lde_rows + source_row];
+                ulong y_0 = wires[(wire_base + 2u) * lde_rows + source_row];
+                ulong y_1 = wires[(wire_base + 3u) * lde_rows + source_row];
+                ulong addend_0 = wires[(wire_base + 4u) * lde_rows + source_row];
+                ulong addend_1 = wires[(wire_base + 5u) * lde_rows + source_row];
+                ulong output_0 = wires[(wire_base + 6u) * lde_rows + source_row];
+                ulong output_1 = wires[(wire_base + 7u) * lde_rows + source_row];
+                ulong product_0 = gl_add(
+                    gl_mul(x_0, y_0),
+                    gl_mul(7, gl_mul(x_1, y_1)));
+                ulong product_1 = gl_add(
+                    gl_mul(x_0, y_1),
+                    gl_mul(x_1, y_0));
+                ulong computed_0 = gl_add(
+                    gl_mul(product_0, const_0),
+                    gl_mul(addend_0, const_1));
+                ulong computed_1 = gl_add(
+                    gl_mul(product_1, const_0),
+                    gl_mul(addend_1, const_1));
+                range_check_gate_emit(
+                    gl_sub(output_0, computed_0),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(output_1, computed_1),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 17u) {
+            // MulExtensionGate<2>: c0 * x * y = output in the same quadratic
+            // extension basis as ArithmeticExtensionGate<2>.
+            uint constant_column = num_addends;
+            ulong const_0 = constants[(ulong)constant_column * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong wire_base = (ulong)op * 6u;
+                ulong x_0 = wires[(wire_base + 0u) * lde_rows + source_row];
+                ulong x_1 = wires[(wire_base + 1u) * lde_rows + source_row];
+                ulong y_0 = wires[(wire_base + 2u) * lde_rows + source_row];
+                ulong y_1 = wires[(wire_base + 3u) * lde_rows + source_row];
+                ulong output_0 = wires[(wire_base + 4u) * lde_rows + source_row];
+                ulong output_1 = wires[(wire_base + 5u) * lde_rows + source_row];
+                ulong product_0 = gl_add(
+                    gl_mul(x_0, y_0),
+                    gl_mul(7, gl_mul(x_1, y_1)));
+                ulong product_1 = gl_add(
+                    gl_mul(x_0, y_1),
+                    gl_mul(x_1, y_0));
+                range_check_gate_emit(
+                    gl_sub(output_0, gl_mul(product_0, const_0)),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(output_1, gl_mul(product_1, const_0)),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
         } else {
             // The Rust encoder rejects unknown discriminants; if a malformed
             // record reaches the shader, make its selected row unsatisfiable.

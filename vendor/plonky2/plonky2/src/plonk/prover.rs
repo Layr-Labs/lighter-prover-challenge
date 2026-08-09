@@ -1238,9 +1238,12 @@ fn start_gpu_range_check_gate_quotient<
     crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
 )> {
     use core::sync::atomic::Ordering;
+    use crate::gates::arithmetic_base::ArithmeticGate;
+    use crate::gates::arithmetic_extension::ArithmeticExtensionGate;
     use crate::gates::equality_base::EqualityGate;
     use crate::gates::exponentiation::ExponentiationGate;
     use crate::gates::gate::U32QuotientGate;
+    use crate::gates::multiplication_extension::MulExtensionGate;
     use crate::gates::reducing::ReducingGate;
     use crate::gates::reducing_extension::ReducingExtensionGate;
     use crate::hash::poseidon2::metal::{
@@ -1493,6 +1496,18 @@ fn start_gpu_range_check_gate_quotient<
                     num_ops.checked_mul(5)?,
                     num_ops.checked_mul(2)?,
                 ),
+                U32QuotientGate::Interleave { num_ops } => (
+                    U32QuotientKind::Interleave,
+                    num_ops,
+                    num_ops.checked_mul(34)?,
+                    num_ops.checked_mul(34)?,
+                ),
+                U32QuotientGate::Uninterleave { num_ops } => (
+                    U32QuotientKind::Uninterleave,
+                    num_ops,
+                    num_ops.checked_mul(68)?,
+                    num_ops.checked_mul(68)?,
+                ),
             };
             if num_ops == 0
                 || gate.0.num_wires() != expected_wires
@@ -1528,7 +1543,60 @@ fn start_gpu_range_check_gate_quotient<
         // the production circuits and are pure arithmetic, so they are matched
         // by type here instead of through the downstream-crate trait hooks
         // (those hooks exist only to avoid a `plonky2` -> circuit-crate dep).
-        let native = if let Some(exponentiation) =
+        let native = if let Some(arithmetic) = gate.0.as_any().downcast_ref::<ArithmeticGate>() {
+            if gate.0.num_constants() != 2
+                || raw_constant_base.checked_add(2)? > common_data.num_constants
+            {
+                None
+            } else {
+                Some((
+                    U32QuotientKind::BaseArithmetic {
+                        constant_base: raw_constant_base,
+                    },
+                    arithmetic.num_ops,
+                    arithmetic.num_ops.checked_mul(4)?,
+                    arithmetic.num_ops,
+                ))
+            }
+        } else if let Some(arithmetic) = gate
+            .0
+            .as_any()
+            .downcast_ref::<ArithmeticExtensionGate<D>>()
+        {
+            if D != 2
+                || gate.0.num_constants() != 2
+                || raw_constant_base.checked_add(2)? > common_data.num_constants
+            {
+                None
+            } else {
+                Some((
+                    U32QuotientKind::ExtensionArithmetic {
+                        constant_base: raw_constant_base,
+                    },
+                    arithmetic.num_ops,
+                    arithmetic.num_ops.checked_mul(4)?.checked_mul(D)?,
+                    arithmetic.num_ops.checked_mul(D)?,
+                ))
+            }
+        } else if let Some(multiplication) =
+            gate.0.as_any().downcast_ref::<MulExtensionGate<D>>()
+        {
+            if D != 2
+                || gate.0.num_constants() != 1
+                || raw_constant_base >= common_data.num_constants
+            {
+                None
+            } else {
+                Some((
+                    U32QuotientKind::ExtensionMultiplication {
+                        constant_column: raw_constant_base,
+                    },
+                    multiplication.num_ops,
+                    multiplication.num_ops.checked_mul(3)?.checked_mul(D)?,
+                    multiplication.num_ops.checked_mul(D)?,
+                ))
+            }
+        } else if let Some(exponentiation) =
             gate.0.as_any().downcast_ref::<ExponentiationGate<F, D>>()
         {
             let num_power_bits = exponentiation.num_power_bits;
