@@ -70,7 +70,18 @@ fn main() {
     // `log` is statically disabled in release builds: the ranked worker has no
     // log consumer, and diagnostics remain available in debug/test builds.
     // Do not link and initialize an unused logger in every scored process.
+    // Cap the worker pool below the logical-core count: the harness runs five
+    // fixture workers concurrently on one machine, so the default sizing puts
+    // 5 x 14 = 70 compute threads on 14 cores and the score (the sum of all
+    // five lifetimes) pays the context-switch and cache churn five times over.
+    // Eight threads keeps 5 x 8 = 40 runnable at full overlap while leaving a
+    // worker enough width to burst when the others sit in their serial chain
+    // tails. The old "capped pools 22% slower" result predates concurrent
+    // workers and was measured with this process alone on the box; it does not
+    // constrain this regime. Scheduling-only: thread count changes no value
+    // any proof depends on.
     rayon::ThreadPoolBuilder::new()
+        .num_threads(8)
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
         .expect("cannot configure prover thread pool");
