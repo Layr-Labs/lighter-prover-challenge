@@ -59,7 +59,19 @@ static MALLOC_CONF: &[u8; 34] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
-    // First statement in the process: the Metal shader compile and pipeline
+    // Arguments first, because the GPU context needs one thing out of them
+    // before it starts: a directory it may write to. `MTLBinaryArchiveDescriptor`
+    // takes a file URL and nothing else, and the only path a sandboxed worker can
+    // create a file under is the scratch directory holding its proof output.
+    let mut args = env::args().skip(1);
+    let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
+    let output = args.next().expect("usage: prove FIXTURE OUTPUT");
+    assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
+    if let Some(scratch) = std::path::Path::new(&output).parent() {
+        plonky2::hash::poseidon2::set_binary_archive_dir(scratch.to_path_buf());
+    }
+
+    // Second statement in the process: the Metal shader compile and pipeline
     // lowering behind the GPU hash path cost the better part of a second on a
     // cold OS shader cache, and the benchmark sandbox denies writes to that
     // cache, which disables it entirely — so every scored worker pays the full
@@ -72,11 +84,6 @@ fn main() {
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
         .expect("cannot configure prover thread pool");
-
-    let mut args = env::args().skip(1);
-    let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
-    let output = args.next().expect("usage: prove FIXTURE OUTPUT");
-    assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
     // Fixture parse overlaps the pre-execution circuit load; both are fast.
     let (block, pre_circuits) = rayon::join(
