@@ -27,17 +27,12 @@ use plonky2::fri::oracle::PolynomialBatch;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// Return freed pages to the OS as soon as they are unused instead of retaining
-// them for the process lifetime.
-//
-// The benchmark runs five of these workers concurrently and the score is the
-// sum of their lifetimes, so every resident page one worker holds is a page the
-// other four contend for. With decay disabled the allocator never madvises a
-// freed extent away, so this process's resident set is the *high-water mark* of
-// its heap rather than its live set: the transaction/chain pipeline allocates
-// and frees the same shapes of multi-hundred-megabyte witness, coefficient and
-// digest buffers 50+ times, and the retained slack accumulates monotonically.
-// Setting both decay periods to zero makes residency track the live set.
+// The trusted harness runs each fresh worker to completion before starting the
+// next. Retain freed extents for this process's short lifetime so repeated
+// witness, coefficient, and digest shapes can reuse their physical pages rather
+// than synchronously discarding and faulting them back in. The process exits
+// immediately after writing its proof, so retained extents are then reclaimed
+// wholesale by the kernel.
 //
 // This changes no computed value: `malloc_conf` only tunes when the allocator
 // hands unused pages back to the kernel. Every allocation still returns
@@ -53,7 +48,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // /etc/malloc.conf can still override it.
 #[cfg(not(target_env = "msvc"))]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-static MALLOC_CONF: &[u8; 34] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
+static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
@@ -217,3 +212,16 @@ fn main() {
 }
 
 // p90-fire-748-1786260141
+
+#[cfg(test)]
+mod tests {
+    use super::MALLOC_CONF;
+
+    #[test]
+    fn worker_retains_freed_extents_until_exit() {
+        assert_eq!(
+            MALLOC_CONF.as_slice(),
+            b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0",
+        );
+    }
+}
