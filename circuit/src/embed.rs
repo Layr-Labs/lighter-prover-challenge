@@ -392,12 +392,15 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         .read_usize()
         .map_err(|e| anyhow::anyhow!("deserializing generators: {e:?}"))?;
     let mut generators = Vec::with_capacity(generator_count);
+    let mut all_generators_require_all_watches = true;
     for _ in 0..generator_count {
-        generators.push(
-            reader
-                .read_generator::<F, D>(&generator_serializer, &common)
-                .map_err(|e| anyhow::anyhow!("deserializing generator: {e:?}"))?,
-        );
+        let generator = reader
+            .read_generator::<F, D>(&generator_serializer, &common)
+            .map_err(|e| anyhow::anyhow!("deserializing generator: {e:?}"))?;
+        if all_generators_require_all_watches {
+            all_generators_require_all_watches = generator.0.requires_all_watches();
+        }
+        generators.push(generator);
     }
 
     // watch index
@@ -580,6 +583,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         generators,
         generator_indices_by_watches,
         generator_watch_counts,
+        all_generators_require_all_watches,
         constants_sigmas_commitment,
         sigmas,
         subgroup,
