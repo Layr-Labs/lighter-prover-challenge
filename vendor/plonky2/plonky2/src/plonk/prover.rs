@@ -1870,7 +1870,13 @@ fn compute_quotient_polys<
     // gates into every 32-point CPU scratch batch.
     // survivor-list once per proof v4-17.76
     let cpu_gate_indices = (0..common_data.gates.len())
-        .filter(|gate_index| !excluded_gate_indices.contains(gate_index))
+        .filter(|gate_index| {
+            !excluded_gate_indices.contains(gate_index)
+                // A zero-row gate has no quotient contribution, but the
+                // generic wrapper would still compute its full selector
+                // filter for every point before accumulating an empty slice.
+                && common_data.gates[*gate_index].0.num_constraints() != 0
+        })
         .collect::<Vec<_>>();
     let cpu_num_wires = cpu_gate_indices
         .iter()
