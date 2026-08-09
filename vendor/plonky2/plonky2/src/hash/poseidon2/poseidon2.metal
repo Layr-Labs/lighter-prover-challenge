@@ -319,6 +319,73 @@ inline ulong gl_mul_add(ulong a, ulong b, ulong addend) {
     return reduce_top(r0, r1, (int)carry - (int)under);
 }
 
+// Fixed-RHS multiplication-add for Poseidon2's literal internal diagonal.
+//
+// With B = 2^32 and p = B^2 - B + 1, write
+//   a = a0 + a1*B, b = b0 + b1*B,
+//   z0 = a0*b0 = u0 + u1*B,
+//   z2 = a1*b1 = v0 + v1*B,
+//   zd = |a0-a1|*|b0-b1| = w0 + w1*B.
+// Karatsuba gives the cross coefficient from z0, z2 and signed zd. Folding it
+// immediately with B^2 == B-1 and B^3 == -1 (mod p) avoids reconstructing the
+// 128-bit product. This keeps the optimized path at three 32x32 products while
+// the generic gl_mul_add and all non-diagonal callers remain unchanged.
+//
+// c0 is in [-5(B-1), 3(B-1)] and the normalized c1 has top in [-3, 8]. Thus
+// every signed long below is in range, top*EPSILON cannot overflow signed long,
+// and the final 64-bit fold can cross either boundary at most once.
+inline ulong gl_mul_const_add(ulong a, ulong b, ulong addend) {
+    uint2 av = as_type<uint2>(a);
+    uint2 bv = as_type<uint2>(b);
+    uint2 z0 = as_type<uint2>((ulong)av.x * (ulong)bv.x);
+    uint2 z2 = as_type<uint2>((ulong)av.y * (ulong)bv.y);
+
+    uint a_negative = (uint)(av.x < av.y);
+    uint b_negative = (uint)(bv.x < bv.y);
+    uint a_diff = ((av.x - av.y) ^ (0u - a_negative)) + a_negative;
+    uint b_diff = ((bv.x - bv.y) ^ (0u - b_negative)) + b_negative;
+    uint2 zd = as_type<uint2>((ulong)a_diff * (ulong)b_diff);
+
+    // subtract == 1 means the two limb differences have the same sign, so the
+    // signed Karatsuba difference is subtracted. The mask selects +/- zd with
+    // no control flow; b_negative and b_diff fold at every literal call site.
+    uint subtract = 1u ^ a_negative ^ b_negative;
+    long mask = -(long)subtract;
+    long signed_w0 = ((long)zd.x ^ mask) + (long)subtract;
+    long signed_w1 = ((long)zd.y ^ mask) + (long)subtract;
+    uint2 dv = as_type<uint2>(addend);
+
+    long c0 = (long)z0.x + (long)dv.x
+        - (long)z0.y
+        - (long)z2.x
+        - (long)z2.y
+        - (long)z2.y
+        - signed_w1;
+    uint r0 = (uint)c0;
+
+    long c1 = (long)z0.x
+        + (long)z0.y
+        + (long)z0.y
+        + (long)z2.x
+        + (long)z2.x
+        + (long)z2.y
+        + signed_w0
+        + signed_w1
+        + (long)dv.y
+        + (c0 >> 32);
+    uint r1 = (uint)c1;
+    int top = (int)(c1 >> 32);
+
+    ulong r = ((ulong)r1 << 32) | (ulong)r0;
+    long delta = (long)top * (long)GOLDILOCKS_EPSILON;
+    ulong folded = r + (ulong)delta;
+    uint overflow = (uint)(top > 0) & (uint)(folded < r);
+    uint underflow = (uint)(top < 0) & (uint)(folded > r);
+    folded += (0UL - (ulong)overflow) & GOLDILOCKS_EPSILON;
+    folded -= (0UL - (ulong)underflow) & GOLDILOCKS_EPSILON;
+    return folded;
+}
+
 // x^7 by the addition chain 1 -> 2 -> 3 -> 6 -> 7. Every length-four chain for
 // x^7 costs the same four multiplies, but this one keeps only `value` and one
 // running power live at a time, and three of the four multiplies take `value`
@@ -380,18 +447,18 @@ inline void internal_linear_layer(thread ulong state[12]) {
     // Poseidon2's internal diagonal is fixed by the hash configuration. Spell
     // it as immediates so the Metal compiler can specialize the constant
     // operand of all 264 internal-round multiplications per permutation.
-    state[0] = gl_mul_add(state[0], 0xc3b6c08e23ba9300UL, sum);
-    state[1] = gl_mul_add(state[1], 0xd84b5de94a324fb6UL, sum);
-    state[2] = gl_mul_add(state[2], 0x0d0c371c5b35b84fUL, sum);
-    state[3] = gl_mul_add(state[3], 0x7964f570e7188037UL, sum);
-    state[4] = gl_mul_add(state[4], 0x5daf18bbd996604bUL, sum);
-    state[5] = gl_mul_add(state[5], 0x6743bc47b9595257UL, sum);
-    state[6] = gl_mul_add(state[6], 0x5528b9362c59bb70UL, sum);
-    state[7] = gl_mul_add(state[7], 0xac45e25b7127b68bUL, sum);
-    state[8] = gl_mul_add(state[8], 0xa2077d7dfbb606b5UL, sum);
-    state[9] = gl_mul_add(state[9], 0xf3faac6faee378aeUL, sum);
-    state[10] = gl_mul_add(state[10], 0x0c6388b51545e883UL, sum);
-    state[11] = gl_mul_add(state[11], 0xd27dbb6944917b60UL, sum);
+    state[0] = gl_mul_const_add(state[0], 0xc3b6c08e23ba9300UL, sum);
+    state[1] = gl_mul_const_add(state[1], 0xd84b5de94a324fb6UL, sum);
+    state[2] = gl_mul_const_add(state[2], 0x0d0c371c5b35b84fUL, sum);
+    state[3] = gl_mul_const_add(state[3], 0x7964f570e7188037UL, sum);
+    state[4] = gl_mul_const_add(state[4], 0x5daf18bbd996604bUL, sum);
+    state[5] = gl_mul_const_add(state[5], 0x6743bc47b9595257UL, sum);
+    state[6] = gl_mul_const_add(state[6], 0x5528b9362c59bb70UL, sum);
+    state[7] = gl_mul_const_add(state[7], 0xac45e25b7127b68bUL, sum);
+    state[8] = gl_mul_const_add(state[8], 0xa2077d7dfbb606b5UL, sum);
+    state[9] = gl_mul_const_add(state[9], 0xf3faac6faee378aeUL, sum);
+    state[10] = gl_mul_const_add(state[10], 0x0c6388b51545e883UL, sum);
+    state[11] = gl_mul_const_add(state[11], 0xd27dbb6944917b60UL, sum);
 }
 
 // Parameter layout: 8 x 12 external constants, 22 internal constants,
