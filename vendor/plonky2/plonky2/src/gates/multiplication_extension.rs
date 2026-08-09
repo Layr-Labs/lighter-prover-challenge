@@ -11,7 +11,9 @@ use anyhow::Result;
 
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::packed::PackedField;
 use crate::gates::gate::Gate;
+use crate::gates::packed_util::PackedEvaluableBase;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
 use crate::iop::ext_target::ExtensionTarget;
@@ -22,6 +24,7 @@ use crate::plonk::circuit_builder::CircuitBuilder;
 use crate::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
 use crate::plonk::vars::{
     EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch,
+    EvaluationVarsBasePacked,
 };
 use crate::util::serialization::{Buffer, IoResult, Read, Write};
 
@@ -55,60 +58,11 @@ impl<const D: usize> MulExtensionGate<D> {
     pub(crate) const fn wires_ith_output(i: usize) -> Range<usize> {
         3 * D * i + 2 * D..3 * D * i + 3 * D
     }
-}
 
-impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for MulExtensionGate<D> {
-    fn id(&self) -> String {
-        format!("{self:?}")
-    }
-
-    fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
-        dst.write_usize(self.num_ops)
-    }
-
-    fn deserialize(src: &mut Buffer, _common_data: &CommonCircuitData<F, D>) -> IoResult<Self> {
-        let num_ops = src.read_usize()?;
-        Ok(Self { num_ops })
-    }
-
-    fn eval_unfiltered(&self, vars: EvaluationVars<F, D>) -> Vec<F::Extension> {
-        let const_0 = vars.local_constants[0];
-
-        let mut constraints = Vec::with_capacity(self.num_ops * D);
-        for i in 0..self.num_ops {
-            let multiplicand_0 = vars.get_local_ext_algebra(Self::wires_ith_multiplicand_0(i));
-            let multiplicand_1 = vars.get_local_ext_algebra(Self::wires_ith_multiplicand_1(i));
-            let output = vars.get_local_ext_algebra(Self::wires_ith_output(i));
-            let computed_output = (multiplicand_0 * multiplicand_1).scalar_mul(const_0);
-
-            constraints.extend((output - computed_output).to_basefield_array());
-        }
-
-        constraints
-    }
-
-    fn eval_unfiltered_base_one(
-        &self,
-        vars: EvaluationVarsBase<F>,
-        mut yield_constr: StridedConstraintConsumer<F>,
-    ) {
-        let const_0 = vars.local_constants[0];
-
-        for i in 0..self.num_ops {
-            let multiplicand_0 = vars.get_local_ext(Self::wires_ith_multiplicand_0(i));
-            let multiplicand_1 = vars.get_local_ext(Self::wires_ith_multiplicand_1(i));
-            let output = vars.get_local_ext(Self::wires_ith_output(i));
-            let computed_output = (multiplicand_0 * multiplicand_1).scalar_mul(const_0);
-
-            yield_constr.many((output - computed_output).to_basefield_array());
-        }
-    }
-
-    /// Contiguous-column fused evaluation: reads each wire as a contiguous
-    /// `n`-point column and multiply-adds the filtered constraint rows
-    /// straight into the shared buffer, avoiding the per-point strided writes
-    /// of the default path.
-    fn eval_unfiltered_base_batch_accumulate(
+    /// Scalar contiguous-column fused evaluation, kept for extension degrees
+    /// other than 2 (the packed path only implements the D=2 quadratic case).
+    #[allow(clippy::too_many_arguments)]
+    fn eval_unfiltered_base_batch_accumulate_scalar<F: RichField + Extendable<D>>(
         &self,
         vars_base: EvaluationVarsBaseBatch<F>,
         filters: &[F],
@@ -181,6 +135,81 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for MulExtensionGa
             }
         }
     }
+}
+
+impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for MulExtensionGate<D> {
+    fn id(&self) -> String {
+        format!("{self:?}")
+    }
+
+    fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
+        dst.write_usize(self.num_ops)
+    }
+
+    fn deserialize(src: &mut Buffer, _common_data: &CommonCircuitData<F, D>) -> IoResult<Self> {
+        let num_ops = src.read_usize()?;
+        Ok(Self { num_ops })
+    }
+
+    fn eval_unfiltered(&self, vars: EvaluationVars<F, D>) -> Vec<F::Extension> {
+        let const_0 = vars.local_constants[0];
+
+        let mut constraints = Vec::with_capacity(self.num_ops * D);
+        for i in 0..self.num_ops {
+            let multiplicand_0 = vars.get_local_ext_algebra(Self::wires_ith_multiplicand_0(i));
+            let multiplicand_1 = vars.get_local_ext_algebra(Self::wires_ith_multiplicand_1(i));
+            let output = vars.get_local_ext_algebra(Self::wires_ith_output(i));
+            let computed_output = (multiplicand_0 * multiplicand_1).scalar_mul(const_0);
+
+            constraints.extend((output - computed_output).to_basefield_array());
+        }
+
+        constraints
+    }
+
+    fn eval_unfiltered_base_one(
+        &self,
+        vars: EvaluationVarsBase<F>,
+        mut yield_constr: StridedConstraintConsumer<F>,
+    ) {
+        let const_0 = vars.local_constants[0];
+
+        for i in 0..self.num_ops {
+            let multiplicand_0 = vars.get_local_ext(Self::wires_ith_multiplicand_0(i));
+            let multiplicand_1 = vars.get_local_ext(Self::wires_ith_multiplicand_1(i));
+            let output = vars.get_local_ext(Self::wires_ith_output(i));
+            let computed_output = (multiplicand_0 * multiplicand_1).scalar_mul(const_0);
+
+            yield_constr.many((output - computed_output).to_basefield_array());
+        }
+    }
+
+    /// Contiguous-column fused evaluation: reads each wire as a contiguous
+    /// `n`-point column and multiply-adds the filtered constraint rows
+    /// straight into the shared buffer, avoiding the per-point strided writes
+    /// of the default path. For the quadratic extension (D=2, the only degree
+    /// the ranked circuits instantiate) this routes to the 4-lane packed
+    /// implementation in [`PackedEvaluableBase`].
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        if D == 2 {
+            self.eval_unfiltered_base_batch_accumulate_packed(
+                vars_base,
+                filters,
+                combined_gate_constraints,
+            );
+        } else {
+            self.eval_unfiltered_base_batch_accumulate_scalar(
+                vars_base,
+                filters,
+                combined_gate_constraints,
+            );
+        }
+    }
 
     fn eval_unfiltered_circuit(
         &self,
@@ -235,6 +264,46 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for MulExtensionGa
 
     fn num_constraints(&self) -> usize {
         self.num_ops * D
+    }
+}
+
+impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
+    for MulExtensionGate<D>
+{
+    /// 4-lane packed evaluation for the quadratic extension (D=2, W=7), the only
+    /// degree the ranked circuits instantiate. The dispatch in
+    /// `eval_unfiltered_base_batch_accumulate` routes D != 2 to the scalar
+    /// contiguous-column path, so this is only ever called with D == 2.
+    ///
+    /// Constraint value per op, matching `eval_unfiltered` exactly:
+    ///   computed = (multiplicand_0 * multiplicand_1).scalar_mul(const_0)
+    /// with ext2_mul formula c0 = a0*b0 + W*a1*b1, c1 = a0*b1 + a1*b0 (W = 7),
+    /// yielded as (output - computed).to_basefield_array() = [c0, c1] per op.
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+        &self,
+        vars: EvaluationVarsBasePacked<P>,
+        mut yield_constr: StridedConstraintConsumer<P>,
+    ) {
+        debug_assert_eq!(D, 2);
+        let const_0 = vars.local_constants[0];
+        let seven = P::from(F::from_canonical_u64(7));
+        for i in 0..self.num_ops {
+            let m0 = Self::wires_ith_multiplicand_0(i).start;
+            let m1 = Self::wires_ith_multiplicand_1(i).start;
+            let out = Self::wires_ith_output(i).start;
+            let a0 = vars.local_wires[m0];
+            let a1 = vars.local_wires[m0 + 1];
+            let b0 = vars.local_wires[m1];
+            let b1 = vars.local_wires[m1 + 1];
+            let o0 = vars.local_wires[out];
+            let o1 = vars.local_wires[out + 1];
+            let c0 = a0 * b0 + (a1 * b1) * seven;
+            let c1 = a0 * b1 + a1 * b0;
+            let s0 = c0 * const_0;
+            let s1 = c1 * const_0;
+            yield_constr.one(o0 - s0);
+            yield_constr.one(o1 - s1);
+        }
     }
 }
 
