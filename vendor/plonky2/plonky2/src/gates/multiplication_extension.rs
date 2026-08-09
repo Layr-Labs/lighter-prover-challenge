@@ -11,6 +11,8 @@ use anyhow::Result;
 
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::packable::Packable;
+use crate::field::packed::PackedField;
 use crate::gates::gate::Gate;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -54,6 +56,75 @@ impl<const D: usize> MulExtensionGate<D> {
     }
     pub(crate) const fn wires_ith_output(i: usize) -> Range<usize> {
         3 * D * i + 2 * D..3 * D * i + 3 * D
+    }
+}
+
+/// The production quadratic-extension shape has a 32-point batch. Compute the
+/// extension products with the exact scalar implementation, but fold each
+/// completed packed lane group straight into the shared constraint rows. This
+/// retains the scalar extension's raw representatives and the existing packed
+/// multiply-accumulate while deleting the fully overwritten `D * n` scratch
+/// write/read pass.
+#[inline]
+fn accumulate_quadratic_scratch_free<F: RichField + Extendable<D>, const D: usize>(
+    num_ops: usize,
+    vars_base: EvaluationVarsBaseBatch<F>,
+    filters: &[F],
+    combined_gate_constraints: &mut [F],
+) {
+    debug_assert_eq!(D, 2);
+    let n = vars_base.len();
+    let wires = vars_base.local_wires;
+    let const_0 = &vars_base.local_constants[..n];
+    let ext = |start: usize, p: usize| {
+        let mut arr = [F::ZERO; D];
+        for (d, a) in arr.iter_mut().enumerate() {
+            *a = wires[(start + d) * n + p];
+        }
+        F::Extension::from_basefield_array(arr)
+    };
+
+    type Packing<F> = <F as Packable>::Packing;
+    let width = Packing::<F>::WIDTH;
+    let packed_len = n - n % width;
+
+    for i in 0..num_ops {
+        let m0_start = MulExtensionGate::<D>::wires_ith_multiplicand_0(i).start;
+        let m1_start = MulExtensionGate::<D>::wires_ith_multiplicand_1(i).start;
+        let output_start = MulExtensionGate::<D>::wires_ith_output(i).start;
+        let rows = &mut combined_gate_constraints[i * 2 * n..(i * 2 + 2) * n];
+        let (row_0, row_1) = rows.split_at_mut(n);
+
+        for p in (0..packed_len).step_by(width) {
+            let mut term_0 = Packing::<F>::ZEROS;
+            let mut term_1 = Packing::<F>::ZEROS;
+            for lane in 0..width {
+                let point = p + lane;
+                let multiplicand_0 = ext(m0_start, point);
+                let multiplicand_1 = ext(m1_start, point);
+                let output = ext(output_start, point);
+                let computed_output = (multiplicand_0 * multiplicand_1).scalar_mul(const_0[point]);
+                let arr = (output - computed_output).to_basefield_array();
+                term_0.as_slice_mut()[lane] = arr[0];
+                term_1.as_slice_mut()[lane] = arr[1];
+            }
+
+            let filter = *Packing::<F>::from_slice(&filters[p..p + width]);
+            let acc_0 = Packing::<F>::from_slice_mut(&mut row_0[p..p + width]);
+            *acc_0 = acc_0.multiply_accumulate(term_0, filter);
+            let acc_1 = Packing::<F>::from_slice_mut(&mut row_1[p..p + width]);
+            *acc_1 = acc_1.multiply_accumulate(term_1, filter);
+        }
+
+        for p in packed_len..n {
+            let multiplicand_0 = ext(m0_start, p);
+            let multiplicand_1 = ext(m1_start, p);
+            let output = ext(output_start, p);
+            let computed_output = (multiplicand_0 * multiplicand_1).scalar_mul(const_0[p]);
+            let arr = (output - computed_output).to_basefield_array();
+            row_0[p] += arr[0] * filters[p];
+            row_1[p] += arr[1] * filters[p];
+        }
     }
 }
 
@@ -117,6 +188,16 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for MulExtensionGa
         let n = vars_base.len();
         assert_eq!(filters.len(), n);
         assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
+
+        if D == 2 {
+            accumulate_quadratic_scratch_free::<F, D>(
+                self.num_ops,
+                vars_base,
+                filters,
+                combined_gate_constraints,
+            );
+            return;
+        }
 
         let wires = vars_base.local_wires;
         let const_0 = &vars_base.local_constants[..n];
