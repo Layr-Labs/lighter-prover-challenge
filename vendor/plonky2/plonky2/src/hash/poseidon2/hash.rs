@@ -500,8 +500,25 @@ impl Poseidon2 for F {
         a3 * a4
     }
 
+    /// Adds one external round's constants, each with a single wraparound
+    /// correction.
+    ///
+    /// `add_canonical_u64` is the whole operation: `x + m` wrapped to 64 bits
+    /// plus `EPSILON` on carry. Its precondition is that `m` is canonical,
+    /// which holds for every entry of `EXTERNAL_CONSTANTS` — asserted by
+    /// `external_constants_are_canonical` — and is what bounds `x + m` below
+    /// `2^64 + ORDER` for any `x`, canonical or not, so one correction always
+    /// suffices.
+    ///
+    /// This ran through a vector helper on AArch64 before. The helper is
+    /// value-identical, but it reaches the state through `transmute` and
+    /// `vld1q_u64`/`vst1q_u64`, so the twelve lanes have to be resident in
+    /// memory across it: the copy in, the vector loads, the vector stores and
+    /// the copy back are all traffic the scalar form does not have, and the
+    /// permutation's other layers keep the same lanes in registers on either
+    /// side of it. Twelve independent three-instruction wraparound adds have
+    /// no dependency chain to hide behind vectorisation in the first place.
     #[inline]
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     fn add_rc(state: &mut [Self; WIDTH], external_round: usize) {
         use plonky2_field::types::Field64;
         debug_assert!(external_round < EXTERNAL_CONSTANTS.len());
@@ -509,26 +526,9 @@ impl Poseidon2 for F {
             .iter_mut()
             .zip(EXTERNAL_CONSTANTS[external_round].iter())
             .for_each(|(x, &m)| {
+                // SAFETY: `m < Self::ORDER` for every external constant.
                 *x = unsafe { x.add_canonical_u64(m) };
             });
-    }
-
-    #[inline]
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    fn add_rc(state: &mut [Self; WIDTH], external_round: usize) {
-        debug_assert!(external_round < EXTERNAL_CONSTANTS.len());
-
-        unsafe {
-            use core::mem::transmute;
-
-            use crate::hash::arch::aarch64::poseidon_goldilocks_neon::vector_add;
-
-            let state_u64 = transmute::<[Self; WIDTH], [u64; WIDTH]>(*state);
-            let round_constants = &EXTERNAL_CONSTANTS[external_round];
-
-            let res = vector_add(&state_u64, round_constants);
-            *state = transmute::<[u64; WIDTH], [Self; WIDTH]>(res);
-        }
     }
 
     #[inline]
@@ -1095,6 +1095,21 @@ mod pair_hash_tests {
 
     use super::*;
     use crate::plonk::config::Hasher;
+
+    /// `add_rc` calls `add_canonical_u64`, whose safety and single-correction
+    /// argument both require canonical round constants.
+    #[test]
+    fn external_constants_are_canonical() {
+        use plonky2_field::types::Field64;
+        for (round, constants) in EXTERNAL_CONSTANTS.iter().enumerate() {
+            for (i, &c) in constants.iter().enumerate() {
+                assert!(
+                    c < <F as Field64>::ORDER,
+                    "EXTERNAL_CONSTANTS[{round}][{i}] is not canonical"
+                );
+            }
+        }
+    }
 
     #[test]
     fn pair_hash_matches_individual_across_widths() {
