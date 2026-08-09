@@ -471,32 +471,6 @@ fn reduce_gate_constraints_base_batch<F: Field>(
     // This is NOT valid for a caller that passes a nonzero running
     // accumulator, which the general contract permits, so it is opt-in.
     let mut rows = constraint_terms_batch.chunks_exact(batch_size).rev();
-    if alphas.len() == 2 {
-        // Production always uses two challenges: load alphas once and walk
-        // point-major output in exact pairs instead of rediscovering the
-        // runtime slice length for every row and point.
-        let alpha_0 = alphas[0];
-        let alpha_1 = alphas[1];
-        if res_out_is_zero_seed {
-            match rows.next() {
-                Some(first_row) => {
-                    for (&term, result) in first_row.iter().zip(res_out.chunks_exact_mut(2)) {
-                        result[0] = term;
-                        result[1] = term;
-                    }
-                }
-                None => res_out.fill(F::ZERO),
-            }
-        }
-        for constraint_row in rows {
-            for (&term, result) in constraint_row.iter().zip(res_out.chunks_exact_mut(2)) {
-                result[0] = term.multiply_accumulate(result[0], alpha_0);
-                result[1] = term.multiply_accumulate(result[1], alpha_1);
-            }
-        }
-        return;
-    }
-
     if res_out_is_zero_seed {
         match rows.next() {
             Some(first_row) => {
@@ -518,11 +492,6 @@ fn reduce_gate_constraints_base_batch<F: Field>(
             }
         }
     }
-}
-
-#[inline(always)]
-fn permutation_factor_fma<F: Field>(wire: F, beta: F, point: F, gamma: F) -> F {
-    wire.multiply_accumulate(beta, point) + gamma
 }
 
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
@@ -715,10 +684,10 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                         let wire = wire_col[k];
                         let sigma = sigma_col[k];
                         let x = xs_batch[k];
-                        num_prod.push(permutation_factor_fma(wire, beta_k_0, x, gamma_0));
-                        den_prod.push(permutation_factor_fma(wire, beta_0, sigma, gamma_0));
-                        num_prod_second.push(permutation_factor_fma(wire, beta_k_1, x, gamma_1));
-                        den_prod_second.push(permutation_factor_fma(wire, beta_1, sigma, gamma_1));
+                        num_prod.push(wire + beta_k_0 * x + gamma_0);
+                        den_prod.push(wire + beta_0 * sigma + gamma_0);
+                        num_prod_second.push(wire + beta_k_1 * x + gamma_1);
+                        den_prod_second.push(wire + beta_1 * sigma + gamma_1);
                     }
                 }
                 for j in j_start + 1..j_end {
@@ -730,10 +699,10 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                         let wire = wire_col[k];
                         let sigma = sigma_col[k];
                         let x = xs_batch[k];
-                        num_prod[k] *= permutation_factor_fma(wire, beta_k_0, x, gamma_0);
-                        den_prod[k] *= permutation_factor_fma(wire, beta_0, sigma, gamma_0);
-                        num_prod_second[k] *= permutation_factor_fma(wire, beta_k_1, x, gamma_1);
-                        den_prod_second[k] *= permutation_factor_fma(wire, beta_1, sigma, gamma_1);
+                        num_prod[k] *= wire + beta_k_0 * x + gamma_0;
+                        den_prod[k] *= wire + beta_0 * sigma + gamma_0;
+                        num_prod_second[k] *= wire + beta_k_1 * x + gamma_1;
+                        den_prod_second[k] *= wire + beta_1 * sigma + gamma_1;
                     }
                 }
 
