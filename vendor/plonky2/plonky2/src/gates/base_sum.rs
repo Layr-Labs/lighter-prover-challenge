@@ -170,12 +170,19 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> PackedEvaluab
     ) {
         let sum = vars.local_wires[Self::WIRE_SUM];
         let limbs = vars.local_wires.view(self.limbs());
-        // B=2 folds radix powers by doubling, which is cheaper than the generic
-        // multiply-by-radix Horner fold and value-identical to it.
+        // Power-of-two radices fold by additions, which is cheaper than the
+        // generic multiply-by-radix Horner fold and value-identical to it.
         let computed_sum = if B == 2 {
             let mut radix_sum = P::ZEROS;
             for &limb in limbs.iter().rev() {
                 radix_sum = (radix_sum + radix_sum) + limb;
+            }
+            radix_sum
+        } else if B == 4 {
+            let mut radix_sum = P::ZEROS;
+            for &limb in limbs.iter().rev() {
+                let twice = radix_sum + radix_sum;
+                radix_sum = (twice + twice) + limb;
             }
             radix_sum
         } else {
@@ -184,13 +191,15 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> PackedEvaluab
 
         yield_constr.one(computed_sum - sum);
 
-        // B=2's only roots are 0 and 1, so the range-constraint product
-        // `limb * (limb - 1)` is one fewer packed subtraction and one fewer
-        // iterator step than the generic `(0..B)` product, and value-identical
-        // to it.
+        // Specialize the production power-of-two radices without changing the
+        // constraint polynomial. For B=4, setting t=x(x-3) gives
+        // (x-1)(x-2)=t+2, reducing the four-factor product to t(t+2).
         let constraints_iter = limbs.iter().map(|&limb| {
             if B == 2 {
                 limb * (limb - P::ONES)
+            } else if B == 4 {
+                let t = limb * (limb - F::from_canonical_usize(3));
+                t * (t + F::TWO)
             } else {
                 (0..B)
                     .map(|i| limb - F::from_canonical_usize(i))
@@ -310,7 +319,7 @@ mod tests {
             // constraint 0 is `reduce_with_powers(limbs, B) - sum`, then one
             // range constraint per limb. `eval_unfiltered_base_one` panics for
             // this gate (it only implements the packed path), so this reference
-            // is the oracle for the packed evaluator's B=2 specializations.
+        // is the oracle for the packed evaluator's power-of-two specializations.
             let mut scalar =
                 vec![F::ZERO; n * <BaseSumGate<B> as Gate<F, 2>>::num_constraints(&gate)];
             for (i, vars_one) in vars_batch.iter().enumerate() {
@@ -337,6 +346,7 @@ mod tests {
         }
 
         compare::<2>(11);
+        compare::<4>(11);
         compare::<6>(11);
     }
 

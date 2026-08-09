@@ -165,16 +165,18 @@ impl Circuits {
     /// subsequent read can reach is returned early.
     pub fn release_finished_circuit_extensions(&mut self) {
         self.pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+        self.pre_data.prover_only.constants_sigmas_quotient_cache = None;
         for lock in [
             &mut self.light_tx_data,
             &mut self.light_chain_data,
             &mut self.heavy_tx_data,
             &mut self.heavy_chain_data,
         ] {
-            lock.get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .prover_only
-                .constants_sigmas_commitment = PolynomialBatch::default();
+            let data = lock
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            data.prover_only.constants_sigmas_quotient_cache = None;
         }
     }
 
@@ -203,10 +205,11 @@ impl Circuits {
     /// added — storage that no subsequent read can reach is returned earlier.
     pub fn release_heavy_circuit_extensions(&self) {
         for lock in [&self.heavy_tx_data, &self.heavy_chain_data] {
-            lock.write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .prover_only
-                .constants_sigmas_commitment = PolynomialBatch::default();
+            let mut data = lock
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            data.prover_only.constants_sigmas_quotient_cache = None;
         }
     }
 
@@ -223,10 +226,11 @@ impl Circuits {
     /// [`Self::release_finished_circuit_extensions`] would.
     pub fn release_light_circuit_extensions(&self) {
         for lock in [&self.light_tx_data, &self.light_chain_data] {
-            lock.write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .prover_only
-                .constants_sigmas_commitment = PolynomialBatch::default();
+            let mut data = lock
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            data.prover_only.constants_sigmas_quotient_cache = None;
         }
     }
 
