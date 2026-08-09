@@ -538,21 +538,32 @@ fn fft_classic_simd_single_layer_neon(
         let mut k = 0;
         while k + m <= values.len() {
             let mut j = 0;
+            macro_rules! butterfly_pair {
+                ($pair:expr) => {{
+                    let pair = $pair;
+                    let v = NeonGoldilocksField([
+                        *values.get_unchecked(k + half + pair),
+                        *values.get_unchecked(k + half + pair + 1),
+                    ]);
+                    let w = NeonGoldilocksField([
+                        *omega_row.get_unchecked(pair),
+                        *omega_row.get_unchecked(pair + 1),
+                    ]);
+                    let t = w * v;
+                    // The only register-file crossing in the loop: two fmovs.
+                    let tv = vcombine_u64(vcreate_u64(t.0[0].0), vcreate_u64(t.0[1].0));
+                    let u = vld1q_u64(base.add(k + pair));
+                    vst1q_u64(base.add(k + pair), gl_add_neon(u, tv, eps));
+                    vst1q_u64(base.add(k + half + pair), gl_sub_neon(u, tv, eps));
+                }};
+            }
+            while j + 4 <= half {
+                butterfly_pair!(j);
+                butterfly_pair!(j + 2);
+                j += 4;
+            }
             while j + 2 <= half {
-                let v = NeonGoldilocksField([
-                    *values.get_unchecked(k + half + j),
-                    *values.get_unchecked(k + half + j + 1),
-                ]);
-                let w = NeonGoldilocksField([
-                    *omega_row.get_unchecked(j),
-                    *omega_row.get_unchecked(j + 1),
-                ]);
-                let t = w * v;
-                // The only register-file crossing in the loop: two fmovs.
-                let tv = vcombine_u64(vcreate_u64(t.0[0].0), vcreate_u64(t.0[1].0));
-                let u = vld1q_u64(base.add(k + j));
-                vst1q_u64(base.add(k + j), gl_add_neon(u, tv, eps));
-                vst1q_u64(base.add(k + half + j), gl_sub_neon(u, tv, eps));
+                butterfly_pair!(j);
                 j += 2;
             }
             // `half` is a power of two and at least 2 whenever this path is
