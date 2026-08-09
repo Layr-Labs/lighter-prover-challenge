@@ -27,6 +27,7 @@ use crate::iop::witness::{MatrixWitness, PartialWitness, PartitionWitness, Witne
 use crate::plonk::circuit_builder::NUM_COINS_LOOKUP;
 use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
 use crate::plonk::config::{GenericConfig, Hasher};
+use crate::plonk::permutation_argument::fixed_routed_wire;
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{
@@ -660,6 +661,7 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     for (t, &x) in xs.iter().enumerate() {
                         let i = base + t;
                         let s_sigmas = &prover_data.sigmas[i];
+                        let routed_base = i * num_routed_wires;
                         for chunk in 0..num_chunks {
                             let start = chunk * degree;
                             let end = min(start + degree, num_routed_wires);
@@ -668,6 +670,12 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             let mut denominator_0 = F::ONE;
                             let mut denominator_1 = F::ONE;
                             for j in start..end {
+                                if fixed_routed_wire(
+                                    &prover_data.fixed_routed_wires,
+                                    routed_base + j,
+                                ) {
+                                    continue;
+                                }
                                 let wire_value = witness.get_wire(i, j);
                                 let sigma = s_sigmas[j];
                                 numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
@@ -2215,7 +2223,7 @@ fn compute_quotient_polys<
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
+    let gpu_range_values = if let Some((_, job)) = &gpu_range {
         let gpu_values = match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2250,18 +2258,11 @@ fn compute_quotient_polys<
                 return result;
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        assert_eq!(gpu_values.len(), quotient_values.len());
+        Some(gpu_values)
+    } else {
+        None
+    };
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
     // Parallel scatter of the interleaved point-major buffer into the
@@ -2289,6 +2290,44 @@ fn compute_quotient_polys<
         .map(|column| ColPtr(column.as_mut_ptr()))
         .collect();
     let column_ptrs = &column_ptrs;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    if let Some(range_values) = gpu_range_values {
+        quotient_values
+            .par_chunks(BATCH_SIZE * num_challenges)
+            .zip(range_values.par_chunks(BATCH_SIZE * num_challenges))
+            .enumerate()
+            .for_each(|(chunk_i, (chunk, range_chunk))| {
+                let base = BATCH_SIZE * chunk_i;
+                for (k, (point_values, range_point)) in chunk
+                    .chunks_exact(num_challenges)
+                    .zip(range_chunk.chunks_exact(num_challenges))
+                    .enumerate()
+                {
+                    let point = base + k;
+                    let denominator_inv = z_h_on_coset.eval_inverse(point);
+                    for ((column, &cpu_value), &range_value) in
+                        column_ptrs.iter().zip(point_values).zip(range_point)
+                    {
+                        let mut value = cpu_value;
+                        value += range_value * denominator_inv;
+                        unsafe { *column.0.add(point) = value };
+                    }
+                }
+            });
+    } else {
+        quotient_values
+            .par_chunks(BATCH_SIZE * num_challenges)
+            .enumerate()
+            .for_each(|(chunk_i, chunk)| {
+                let base = BATCH_SIZE * chunk_i;
+                for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                    for (column, &value) in column_ptrs.iter().zip(point_values) {
+                        unsafe { *column.0.add(base + k) = value };
+                    }
+                }
+            });
+    }
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     quotient_values
         .par_chunks(BATCH_SIZE * num_challenges)
         .enumerate()
@@ -2296,7 +2335,6 @@ fn compute_quotient_polys<
             let base = BATCH_SIZE * chunk_i;
             for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
                 for (column, &value) in column_ptrs.iter().zip(point_values) {
-                    // SAFETY: `base + k` lies in this chunk's disjoint range.
                     unsafe { *column.0.add(base + k) = value };
                 }
             }

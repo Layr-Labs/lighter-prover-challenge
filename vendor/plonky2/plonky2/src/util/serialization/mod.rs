@@ -907,6 +907,13 @@ pub trait Read {
         let public_inputs = self.read_target_vec()?;
 
         let representative_map = self.read_usize_encoded_u32_vec()?;
+        let fixed_routed_wires = crate::plonk::permutation_argument::fixed_routed_wire_mask(
+            &representative_map,
+            common_data.config.num_wires,
+            common_data.config.num_routed_wires,
+            subgroup.len(),
+        )
+        .ok_or(IoError)?;
 
         let is_some = self.read_bool()?;
         let fft_root_table = match is_some {
@@ -949,6 +956,7 @@ pub trait Read {
             subgroup,
             public_inputs,
             representative_map,
+            fixed_routed_wires,
             fft_root_table,
             circuit_digest,
             lookup_rows,
@@ -1931,6 +1939,7 @@ pub trait Write {
             subgroup,
             public_inputs,
             representative_map,
+            fixed_routed_wires: _,
             fft_root_table,
             circuit_digest,
             lookup_rows,

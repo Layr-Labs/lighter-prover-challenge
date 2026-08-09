@@ -15,6 +15,63 @@ use crate::iop::wire::Wire;
 /// placement moves. Flip to `false` to restore the previous sequential-outer schedule exactly.
 const OUTER_PARALLEL_SIGMA_COLUMNS: bool = false;
 
+/// Sole-routed-member mask for symbolic cancel of permutation factors.
+pub fn fixed_routed_wire_mask(
+    representative_map: &[u32],
+    num_wires: usize,
+    num_routed_wires: usize,
+    degree: usize,
+) -> Option<Vec<u8>> {
+    if num_routed_wires > num_wires {
+        return None;
+    }
+    let wire_targets = degree.checked_mul(num_wires)?;
+    if wire_targets > representative_map.len() {
+        return None;
+    }
+    let routed_positions = degree.checked_mul(num_routed_wires)?;
+    let mut cardinalities = vec![0u8; representative_map.len().div_ceil(4)];
+    for row in 0..degree {
+        let target_base = row * num_wires;
+        for column in 0..num_routed_wires {
+            let representative = representative_map[target_base + column] as usize;
+            if representative >= representative_map.len()
+                || representative_map[representative] as usize != representative
+            {
+                return None;
+            }
+            let byte = representative >> 2;
+            let shift = (representative & 3) << 1;
+            let state = (cardinalities[byte] >> shift) & 3;
+            if state < 2 {
+                cardinalities[byte] =
+                    (cardinalities[byte] & !(3 << shift)) | ((state + 1) << shift);
+            }
+        }
+    }
+    let mut fixed = vec![0u8; routed_positions.div_ceil(8)];
+    for row in 0..degree {
+        let target_base = row * num_wires;
+        let routed_base = row * num_routed_wires;
+        for column in 0..num_routed_wires {
+            let representative = representative_map[target_base + column] as usize;
+            let state = (cardinalities[representative >> 2] >> ((representative & 3) << 1)) & 3;
+            if state == 1 {
+                let routed_index = routed_base + column;
+                fixed[routed_index >> 3] |= 1 << (routed_index & 7);
+            }
+        }
+    }
+    Some(fixed)
+}
+
+#[inline(always)]
+pub(crate) fn fixed_routed_wire(mask: &[u8], routed_index: usize) -> bool {
+    mask.get(routed_index >> 3)
+        .is_some_and(|byte| byte & (1 << (routed_index & 7)) != 0)
+}
+
+
 /// Disjoint Set Forest data-structure following <https://en.wikipedia.org/wiki/Disjoint-set_data_structure>.
 #[derive(Debug)]
 pub struct Forest {

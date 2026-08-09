@@ -515,6 +515,8 @@ pub struct ProverOnlyCircuitData<
     /// zero-extended at every indexing site. The serialized encoding keeps the legacy 8-byte
     /// per-entry format.
     pub representative_map: Vec<u32>,
+    /// Runtime-only sole-routed-member mask for permutation cancel.
+    pub fixed_routed_wires: Vec<u8>,
     /// Pre-computed roots for faster FFT.
     pub fft_root_table: Option<FftRootTable<F>>,
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to
