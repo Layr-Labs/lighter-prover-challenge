@@ -217,6 +217,18 @@ impl<F: RichField> PoseidonGateQuotientJob<F> {
         let output = self.output.as_ref().expect("quotient output present");
         Ok(unsafe { slice::from_raw_parts(output.contents().cast::<F>(), self.len) })
     }
+
+    /// Returns the completed output to the small quotient cache as soon as
+    /// its synchronous CPU merge has finished. The job (and therefore its
+    /// GPU admission guard) deliberately remains alive until its original
+    /// lexical drop point.
+    pub(crate) fn recycle_completed_output(&mut self) {
+        recycle_completed_quotient_output(
+            &self.command_buffer,
+            &mut self.output,
+            &self.output_pool,
+        );
+    }
 }
 
 impl<F: RichField> RangeCheckGateQuotientJob<F> {
@@ -241,6 +253,15 @@ impl<F: RichField> RangeCheckGateQuotientJob<F> {
         Ok(unsafe { slice::from_raw_parts(output.contents().cast::<F>(), self.len) })
     }
 
+    /// See [`PoseidonGateQuotientJob::recycle_completed_output`].
+    pub(crate) fn recycle_completed_output(&mut self) {
+        recycle_completed_quotient_output(
+            &self.command_buffer,
+            &mut self.output,
+            &self.output_pool,
+        );
+    }
+
     #[cfg(test)]
     pub(crate) fn mark_cpu_recompute_completed_for_tests(&self) {
         if let Some(observer) = &self.failure_observer {
@@ -256,19 +277,29 @@ fn recycle_completed_quotient_output(
     output: &mut Option<Buffer>,
     pool: &Arc<Mutex<QuotientOutputPool>>,
 ) {
+    // A successful early recycle makes the later custom Drop a cheap no-op.
+    if output.is_none() {
+        return;
+    }
     // Never wait from Drop and never make an in-flight or failed resource
     // visible to another command. Default retained references keep an early-
     // dropped output alive for its original command buffer.
     if command_buffer.status() != MTLCommandBufferStatus::Completed {
         return;
     }
-    let Some(buffer) = output.take() else {
-        return;
-    };
+
     // Allocation/recycling is an opportunistic micro-optimization. On lock
-    // contention or poisoning, drop normally instead of delaying a proof.
+    // contention, keep ownership in the job so its later Drop gets another
+    // nonblocking opportunity. The final block's one-off oversized outputs
+    // are still released immediately to lower the following CPU IFFT peak.
     if let Ok(mut pool) = pool.try_lock() {
+        let buffer = output.take().expect("quotient output present");
         pool.recycle(buffer);
+    } else if output
+        .as_ref()
+        .is_some_and(|buffer| buffer.length() > MAX_CACHED_QUOTIENT_OUTPUT_BYTES)
+    {
+        drop(output.take());
     }
 }
 
@@ -3231,7 +3262,7 @@ mod tests {
     }
 
     #[test]
-    fn quotient_output_recycles_only_after_completion() {
+    fn quotient_output_recycles_only_after_completion_and_can_release_early() {
         type F = GoldilocksField;
         let Some(device) = Device::system_default() else {
             return;
@@ -3243,14 +3274,17 @@ mod tests {
         };
 
         let not_enqueued = queue.new_command_buffer().to_owned();
-        drop(PoseidonGateQuotientJob::<F> {
+        let mut not_enqueued_job = PoseidonGateQuotientJob::<F> {
             command_buffer: not_enqueued,
             output: Some(output()),
             output_pool: Arc::clone(&pool),
             len: 8,
             _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
-        });
+        };
+        not_enqueued_job.recycle_completed_output();
+        assert!(not_enqueued_job.output.is_some());
+        drop(not_enqueued_job);
         assert!(pool.lock().unwrap().free.is_empty());
 
         let completed = autoreleasepool(|| {
@@ -3262,14 +3296,24 @@ mod tests {
         });
         let completed_output = output();
         let completed_output_ptr = completed_output.contents();
-        drop(PoseidonGateQuotientJob::<F> {
+        let mut completed_job = PoseidonGateQuotientJob::<F> {
             command_buffer: completed,
             output: Some(completed_output),
             output_pool: Arc::clone(&pool),
             len: 8,
             _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
-        });
+        };
+        let held_pool = pool.lock().unwrap();
+        completed_job.recycle_completed_output();
+        assert!(
+            completed_job.output.is_some(),
+            "lock contention must preserve the output for a later retry"
+        );
+        drop(held_pool);
+        completed_job.recycle_completed_output();
+        assert!(completed_job.output.is_none());
+        completed_job.recycle_completed_output();
         let reused = pool
             .lock()
             .unwrap()
@@ -3277,6 +3321,7 @@ mod tests {
             .expect("completed output must be reusable");
         assert_eq!(reused.contents(), completed_output_ptr);
         assert!(pool.lock().unwrap().free.is_empty());
+        drop(completed_job);
 
         let completed = autoreleasepool(|| {
             let command_buffer = queue.new_command_buffer();
@@ -3286,7 +3331,7 @@ mod tests {
         });
         let completed_output = output();
         let completed_output_ptr = completed_output.contents();
-        drop(RangeCheckGateQuotientJob::<F> {
+        let mut range_job = RangeCheckGateQuotientJob::<F> {
             command_buffer: completed,
             output: Some(completed_output),
             output_pool: Arc::clone(&pool),
@@ -3294,13 +3339,44 @@ mod tests {
             failure_observer: None,
             _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
-        });
+        };
+        assert_eq!(range_job.finish().unwrap().len(), 8);
+        range_job.recycle_completed_output();
+        assert!(range_job.output.is_none());
         let reused = pool
             .lock()
             .unwrap()
             .take_best_fit(64)
             .expect("completed RangeCheck output must be reusable");
         assert_eq!(reused.contents(), completed_output_ptr);
+        assert!(pool.lock().unwrap().free.is_empty());
+        drop(range_job);
+
+        let completed = autoreleasepool(|| {
+            let command_buffer = queue.new_command_buffer();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            command_buffer.to_owned()
+        });
+        let oversized = autoreleasepool(|| {
+            device.new_buffer(
+                MAX_CACHED_QUOTIENT_OUTPUT_BYTES + 1,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+        let mut oversized_job = PoseidonGateQuotientJob::<F> {
+            command_buffer: completed,
+            output: Some(oversized),
+            output_pool: Arc::clone(&pool),
+            len: 8,
+            _job: GpuJobGuard::begin(),
+            _phantom: PhantomData,
+        };
+        oversized_job.recycle_completed_output();
+        assert!(
+            oversized_job.output.is_none(),
+            "one-off final-proof outputs must be released early"
+        );
         assert!(pool.lock().unwrap().free.is_empty());
     }
     use crate::gates::selectors::UNUSED_SELECTOR;

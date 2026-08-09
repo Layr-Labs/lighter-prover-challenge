@@ -1754,7 +1754,7 @@ fn compute_quotient_polys<
     let lde_mask = lde_size - 1;
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_poseidon = allow_gpu_poseidon
+    let mut gpu_poseidon = allow_gpu_poseidon
         .then(|| {
             start_gpu_poseidon_gate_quotient(
                 common_data,
@@ -1767,7 +1767,7 @@ fn compute_quotient_polys<
         })
         .flatten();
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_range = allow_gpu_poseidon
+    let mut gpu_range = allow_gpu_poseidon
         .then(|| {
             start_gpu_range_check_gate_quotient(
                 common_data,
@@ -2175,7 +2175,7 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
+    if let Some((_, job)) = &mut gpu_poseidon {
         let gpu_values = match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2218,10 +2218,11 @@ fn compute_quotient_polys<
                     *cpu += gpu * denominator_inv;
                 }
             });
+        job.recycle_completed_output();
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
+    if let Some((_, job)) = &mut gpu_range {
         let gpu_values = match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2267,6 +2268,7 @@ fn compute_quotient_polys<
                     *cpu += gpu * denominator_inv;
                 }
             });
+        job.recycle_completed_output();
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
