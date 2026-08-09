@@ -907,13 +907,22 @@ pub trait Read {
         let public_inputs = self.read_target_vec()?;
 
         let representative_map = self.read_usize_encoded_u32_vec()?;
-        let fixed_routed_wires = crate::plonk::permutation_argument::fixed_routed_wire_mask(
-            &representative_map,
+        let mut forest = crate::plonk::permutation_argument::Forest::from_compressed_parents(
+            representative_map,
             common_data.config.num_wires,
             common_data.config.num_routed_wires,
             subgroup.len(),
         )
         .ok_or(IoError)?;
+        let wire_partition = forest.wire_partition();
+        let permutation_factor_skips = wire_partition
+            .permutation_factor_skip_mask(
+                subgroup.len(),
+                common_data.config.num_routed_wires,
+                common_data.quotient_degree_factor,
+            )
+            .ok_or(IoError)?;
+        let representative_map = forest.into_parents();
 
         let is_some = self.read_bool()?;
         let fft_root_table = match is_some {
@@ -956,7 +965,7 @@ pub trait Read {
             subgroup,
             public_inputs,
             representative_map,
-            fixed_routed_wires,
+            permutation_factor_skips,
             fft_root_table,
             circuit_digest,
             lookup_rows,
@@ -1941,7 +1950,7 @@ pub trait Write {
             representative_map,
             // Runtime-only: reconstructed from `representative_map` on read, so it contributes
             // no bytes and the serialized format is unchanged.
-            fixed_routed_wires: _,
+            permutation_factor_skips: _,
             fft_root_table,
             circuit_digest,
             lookup_rows,
@@ -2438,8 +2447,9 @@ mod tests {
             circuit.prover_only.representative_map
         );
         assert_eq!(
-            decoded.fixed_routed_wires, circuit.prover_only.fixed_routed_wires,
-            "runtime fixed-factor mask was not reconstructed from the representative map"
+            decoded.permutation_factor_skips,
+            circuit.prover_only.permutation_factor_skips,
+            "runtime permutation-factor mask was not reconstructed from the representative map"
         );
         assert_eq!(
             decoded.generator_watch_counts,

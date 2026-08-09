@@ -49,7 +49,7 @@ use crate::plonk::circuit_data::{
 };
 use crate::plonk::config::{AlgebraicHasher, GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::copy_constraint::CopyConstraint;
-use crate::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
+use crate::plonk::permutation_argument::Forest;
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::timed;
 use crate::util::context_tree::ContextTree;
@@ -1039,7 +1039,12 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .collect()
     }
 
-    fn sigma_vecs(&self, k_is: &[F], subgroup: &[F]) -> (Vec<PolynomialValues<F>>, Forest) {
+    fn sigma_vecs(
+        &self,
+        k_is: &[F],
+        subgroup: &[F],
+        quotient_degree_factor: usize,
+    ) -> (Vec<PolynomialValues<F>>, Forest, Vec<u8>) {
         let degree = self.gate_instances.len();
         let degree_log = log2_strict(degree);
         let config = &self.config;
@@ -1070,9 +1075,17 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         forest.compress_paths();
 
         let wire_partition = forest.wire_partition();
+        let permutation_factor_skips = wire_partition
+            .permutation_factor_skip_mask(
+                degree,
+                config.num_routed_wires,
+                quotient_degree_factor,
+            )
+            .expect("builder produced an invalid sigma permutation");
         (
             wire_partition.get_sigma_polys(degree_log, k_is, subgroup),
             forest,
+            permutation_factor_skips,
         )
     }
 
@@ -1266,10 +1279,10 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let subgroup = F::two_adic_subgroup(degree_bits);
 
         let k_is = get_unique_coset_shifts(degree, self.config.num_routed_wires);
-        let (sigma_vecs, forest) = timed!(
+        let (sigma_vecs, forest, permutation_factor_skips) = timed!(
             timing,
             "generate sigma polynomials",
-            self.sigma_vecs(&k_is, &subgroup)
+            self.sigma_vecs(&k_is, &subgroup, quotient_degree_factor)
         );
 
         // Precompute FFT roots.
@@ -1454,14 +1467,6 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             }
         };
 
-        let fixed_routed_wires = fixed_routed_wire_mask(
-            &forest.parents,
-            common.config.num_wires,
-            common.config.num_routed_wires,
-            subgroup.len(),
-        )
-        .expect("builder produced an invalid compressed representative map");
-
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,
             generator_indices_by_watches,
@@ -1471,7 +1476,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             subgroup,
             public_inputs: self.public_inputs,
             representative_map: forest.parents,
-            fixed_routed_wires,
+            permutation_factor_skips,
             fft_root_table: Some(fft_root_table),
             circuit_digest,
             lookup_rows: self.lookup_rows.clone(),

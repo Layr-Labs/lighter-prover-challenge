@@ -28,7 +28,10 @@ use crate::plonk::circuit_builder::NUM_COINS_LOOKUP;
 use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
 use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::PlonkOracle;
-use crate::plonk::permutation_argument::fixed_routed_wire;
+use crate::plonk::permutation_argument::{
+    permutation_factor_skips, PERMUTATION_SKIP_BOTH, PERMUTATION_SKIP_DENOMINATOR,
+    PERMUTATION_SKIP_NUMERATOR,
+};
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{
     eval_vanishing_poly_base_batch, get_lut_poly, interleave_pair_plan, PermutationBatch,
@@ -633,11 +636,12 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
 /// Fusing collapses two full traversals of the witness and sigma matrices, and
 /// two Rayon fork/joins over the subgroup, into one.
 ///
-/// Value-exactness: each challenge keeps its own accumulators, its own
-/// numerator/denominator multiplication order (`for j in start..end`), its own
-/// inversion batch in the same push order, and its own Z chain. Only the
-/// memory traversal and the Rayon scheduling are shared, so every output limb
-/// is bit-identical to running the per-challenge path twice.
+/// With an empty cancellation mask, each challenge keeps the general path's
+/// accumulator order, inversion order, and Z chain, so the differential test
+/// below requires raw-limb identity. With deleted internal-edge factors, the
+/// contract is field equality of the same partial-product relations (including
+/// when a canceled common factor is zero); a different multiplication and
+/// inversion expression need not preserve noncanonical output limbs.
 fn two_challenge_wires_permutation_partial_products_and_zs<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -710,23 +714,44 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             let mut denominator_0 = F::ONE;
                             let mut denominator_1 = F::ONE;
                             for j in start..end {
-                                // A singleton routed copy component maps this position to itself:
-                                // sigma(i,j) = k_j * x. Its numerator and denominator factors are
-                                // therefore identical for both challenges and cancel symbolically,
-                                // including when that common factor evaluates to zero. Check the
-                                // circuit-fixed bit before touching witness, sigma, x, or shifts.
-                                if fixed_routed_wire(
-                                    &prover_data.fixed_routed_wires,
+                                // For every sigma edge whose endpoints lie in this same base row
+                                // and quotient chunk, the denominator factor at its source equals
+                                // the numerator factor at its target: both witnesses read the same
+                                // representative and both shifts name the target. Delete the pair
+                                // symbolically. The two packed bits distinguish path endpoints
+                                // (one-sided) from internal positions and singleton self-edges
+                                // (two-sided), before loading any input used only by a skipped side.
+                                let skips = permutation_factor_skips(
+                                    &prover_data.permutation_factor_skips,
                                     routed_base + j,
-                                ) {
-                                    continue;
+                                );
+                                match skips {
+                                    0 => {
+                                        let wire_value = witness.get_wire(i, j);
+                                        let sigma = s_sigmas[j];
+                                        numerator_0 *=
+                                            wire_value + beta_k_is_0[j] * x + gamma_0;
+                                        numerator_1 *=
+                                            wire_value + beta_k_is_1[j] * x + gamma_1;
+                                        denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
+                                        denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                    }
+                                    PERMUTATION_SKIP_NUMERATOR => {
+                                        let wire_value = witness.get_wire(i, j);
+                                        let sigma = s_sigmas[j];
+                                        denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
+                                        denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                    }
+                                    PERMUTATION_SKIP_DENOMINATOR => {
+                                        let wire_value = witness.get_wire(i, j);
+                                        numerator_0 *=
+                                            wire_value + beta_k_is_0[j] * x + gamma_0;
+                                        numerator_1 *=
+                                            wire_value + beta_k_is_1[j] * x + gamma_1;
+                                    }
+                                    PERMUTATION_SKIP_BOTH => {}
+                                    _ => unreachable!("packed permutation skip state is two bits"),
                                 }
-                                let wire_value = witness.get_wire(i, j);
-                                let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
                             }
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
@@ -3303,7 +3328,10 @@ mod permutation_pairing_tests {
         two_challenge_wires_permutation_partial_products_and_zs,
         wires_permutation_partial_products_and_zs,
     };
-    use crate::plonk::permutation_argument::fixed_routed_wire;
+    use crate::plonk::permutation_argument::{
+        permutation_factor_skips, PERMUTATION_SKIP_BOTH, PERMUTATION_SKIP_DENOMINATOR,
+        PERMUTATION_SKIP_NUMERATOR,
+    };
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
@@ -3391,7 +3419,7 @@ mod permutation_pairing_tests {
     }
 
     /// Independent, deliberately naive reference: per-point chunk ratios with a
-    /// *per-element* inverse (not Montgomery batch inversion) and the Z chain
+    /// *per-chunk* inverse (not Montgomery batch inversion) and the Z chain
     /// written out longhand. Compared by field value rather than by limb —
     /// `try_inverse` and the batch trick return different representatives of
     /// the same residue — so it catches an error the two shipping paths would
@@ -3402,7 +3430,7 @@ mod permutation_pairing_tests {
         witness: &MatrixWitness<F>,
         subgroup: &[F],
         sigmas: &[Vec<F>],
-        fixed_mask: Option<&[u8]>,
+        skip_mask: Option<&[u8]>,
         beta: F,
         beta_k_is: &[F],
         gamma: F,
@@ -3418,19 +3446,24 @@ mod permutation_pairing_tests {
             for chunk in 0..num_chunks {
                 let start = chunk * degree;
                 let end = core::cmp::min(start + degree, num_routed_wires);
-                let mut ratio = F::ONE;
+                let mut numerator_product = F::ONE;
+                let mut denominator_product = F::ONE;
                 for j in start..end {
-                    if fixed_mask
-                        .is_some_and(|mask| fixed_routed_wire(mask, i * num_routed_wires + j))
-                    {
+                    let skips = skip_mask.map_or(0, |mask| {
+                        permutation_factor_skips(mask, i * num_routed_wires + j)
+                    });
+                    if skips == PERMUTATION_SKIP_BOTH {
                         continue;
                     }
                     let wire_value = witness.get_wire(i, j);
-                    let numerator = wire_value + beta_k_is[j] * x + gamma;
-                    let denominator = wire_value + beta * sigmas[i][j] + gamma;
-                    ratio *= numerator * denominator.inverse();
+                    if skips & PERMUTATION_SKIP_NUMERATOR == 0 {
+                        numerator_product *= wire_value + beta_k_is[j] * x + gamma;
+                    }
+                    if skips & PERMUTATION_SKIP_DENOMINATOR == 0 {
+                        denominator_product *= wire_value + beta * sigmas[i][j] + gamma;
+                    }
                 }
-                acc *= ratio;
+                acc *= numerator_product * denominator_product.inverse();
                 if chunk == num_prods {
                     columns[chunk].push(z_x);
                     z_x = acc;
@@ -3449,7 +3482,7 @@ mod permutation_pairing_tests {
         // so its builder-derived fixed mask no longer describes those injected sigma rows. Keep
         // this test focused on its original unmasked fused-vs-general limb-identity contract;
         // dedicated fixed-mask tests exercise the mask/sigma invariant and cancellation path.
-        data.prover_only.fixed_routed_wires.fill(0);
+        data.prover_only.permutation_factor_skips.fill(0);
         let num_routed_wires = data.common.config.num_routed_wires;
         let degree = data.common.quotient_degree_factor;
         let num_prods = data.common.num_partial_products;
@@ -3550,9 +3583,8 @@ mod permutation_pairing_tests {
                 &data.common,
             );
             let after = paired_permutation_batch_count();
-            assert_eq!(
-                after,
-                before + 1,
+            assert!(
+                after > before,
                 "dispatcher did not take the fused path at num_challenges = 2"
             );
             assert_eq!(
@@ -3561,8 +3593,10 @@ mod permutation_pairing_tests {
                 "dispatcher output differs from the fused path"
             );
 
-            // ... and the guard must be real: three challenges still go through
-            // the general loop, leaving the counter untouched.
+            // ... and the guard must be real: three challenges still reproduce
+            // three independent general-loop calls. The process-wide counter
+            // cannot prove a negative here because other tests prove circuits
+            // concurrently and may increment it between two reads.
             let mut three = data.common.clone();
             three.config.num_challenges = 3;
             let betas3: Vec<F> = betas
@@ -3579,7 +3613,6 @@ mod permutation_pairing_tests {
                 .iter()
                 .flat_map(|&beta| three.k_is.iter().map(move |&k_i| beta * k_i))
                 .collect();
-            let before = paired_permutation_batch_count();
             let general3 = all_wires_permutation_partial_products(
                 &witness,
                 &betas3,
@@ -3588,12 +3621,25 @@ mod permutation_pairing_tests {
                 &data.prover_only,
                 &three,
             );
-            assert_eq!(
-                paired_permutation_batch_count(),
-                before,
-                "fused path fired for num_challenges = 3"
-            );
             assert_eq!(general3.len(), 3);
+            let direct3 = (0..3)
+                .map(|challenge| {
+                    wires_permutation_partial_products_and_zs(
+                        &witness,
+                        betas3[challenge],
+                        &beta_k_is3[challenge * num_routed_wires
+                            ..(challenge + 1) * num_routed_wires],
+                        gammas3[challenge],
+                        &data.prover_only,
+                        &three,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                raw_limbs(&general3),
+                raw_limbs(&direct3),
+                "three-challenge dispatcher output differs from the general loop"
+            );
             // The first two challenges of the 3-challenge general run use the
             // same betas/gammas, so they must still match the fused output.
             assert_eq!(
@@ -3629,33 +3675,66 @@ mod permutation_pairing_tests {
         }
     }
 
-    /// Differential for the actual runtime mask seam. It uses the circuit's real sigma oracle,
-    /// changes the first subgroup limb to a noncanonical representative of the same value, and
-    /// makes one fixed factor exactly zero. The symbolic cancellation reference remains defined
-    /// and must match the fused path for both challenges; an equality-at-runtime implementation
-    /// would still perform all four shift multiplications and witness/sigma loads before skipping.
+    /// Differential for a non-singleton edge in the actual runtime mask. The witness is populated
+    /// by representative so every copy equality holds, then the common factor on one same-row,
+    /// same-chunk edge is made exactly zero. The old numeric quotient is undefined there, while
+    /// symbolic paired deletion remains defined and must match the independent masked reference.
     #[test]
-    fn paired_fixed_mask_matches_symbolic_reference_with_zero_factor() {
-        let mut data = build_circuit();
+    fn paired_internal_edge_mask_matches_symbolic_reference_with_zero_factor() {
+        let data = build_circuit();
         let num_routed_wires = data.common.config.num_routed_wires;
+        let num_wires = data.common.config.num_wires;
         let degree = data.common.quotient_degree_factor;
         let num_prods = data.common.num_partial_products;
         let n = data.prover_only.subgroup.len();
-
-        let fixed_positions = (0..n * num_routed_wires)
-            .filter(|&index| fixed_routed_wire(&data.prover_only.fixed_routed_wires, index))
-            .collect::<Vec<_>>();
-        assert!(!fixed_positions.is_empty(), "test circuit has no fixed routed positions");
         assert_eq!(
-            data.prover_only.fixed_routed_wires.len(),
-            (n * num_routed_wires).div_ceil(8)
+            data.prover_only.permutation_factor_skips.len(),
+            (n * num_routed_wires).div_ceil(4)
         );
 
-        // Same field value as subgroup[0] = 1, deliberately different raw Goldilocks limb.
-        assert_eq!(data.prover_only.subgroup[0], F::ONE);
-        data.prover_only.subgroup[0] = F::from_noncanonical_u64(F::ORDER + 1);
-        assert_eq!(data.prover_only.subgroup[0], F::ONE);
-        assert_eq!(data.prover_only.subgroup[0].to_noncanonical_u64(), F::ORDER + 1);
+        // Independently reconstruct the row-major class cycles and find an internal non-self
+        // edge. This does not trust the skip mask to tell the test which pair it should contain.
+        let mut classes = std::collections::HashMap::<u32, Vec<(usize, usize)>>::new();
+        for row in 0..n {
+            for column in 0..num_routed_wires {
+                let representative =
+                    data.prover_only.representative_map[row * num_wires + column];
+                classes.entry(representative).or_default().push((row, column));
+            }
+        }
+        let (source, target) = classes
+            .values()
+            .filter(|class| class.len() > 1)
+            .flat_map(|class| {
+                class
+                    .iter()
+                    .copied()
+                    .zip(class.iter().copied().cycle().skip(1))
+                    .take(class.len())
+            })
+            .find(|&(source, target)| {
+                source.0 == target.0
+                    && source.1 / degree == target.1 / degree
+                    && source != target
+            })
+            .expect("test circuit has no non-singleton internal sigma edge");
+        let source_index = source.0 * num_routed_wires + source.1;
+        let target_index = target.0 * num_routed_wires + target.1;
+        assert_ne!(source_index, target_index);
+        assert_ne!(
+            permutation_factor_skips(
+                &data.prover_only.permutation_factor_skips,
+                source_index
+            ) & PERMUTATION_SKIP_DENOMINATOR,
+            0
+        );
+        assert_ne!(
+            permutation_factor_skips(
+                &data.prover_only.permutation_factor_skips,
+                target_index
+            ) & PERMUTATION_SKIP_NUMERATOR,
+            0
+        );
 
         let betas = [F::from_canonical_u64(17), F::from_canonical_u64(29)];
         let gammas = [F::from_canonical_u64(41), F::from_canonical_u64(53)];
@@ -3664,41 +3743,61 @@ mod permutation_pairing_tests {
             .flat_map(|&beta| data.common.k_is.iter().map(move |&k_i| beta * k_i))
             .collect::<Vec<_>>();
         let mut rng = Rng::new(0xf17e_dca7_5eed_0001);
-        let mut witness = MatrixWitness {
+        let mut representative_values = (0..data.prover_only.representative_map.len())
+            .map(|_| rng.next_field())
+            .collect::<Vec<_>>();
+        let source_representative =
+            data.prover_only.representative_map[source.0 * num_wires + source.1] as usize;
+        assert_eq!(
+            source_representative,
+            data.prover_only.representative_map[target.0 * num_wires + target.1] as usize
+        );
+        representative_values[source_representative] =
+            -(betas[0] * data.prover_only.sigmas[source.0][source.1] + gammas[0]);
+        let witness = MatrixWitness {
             wire_values: (0..num_routed_wires)
-                .map(|_| (0..n).map(|_| rng.next_field()).collect())
+                .map(|column| {
+                    (0..n)
+                        .map(|row| {
+                            representative_values[data.prover_only.representative_map
+                                [row * num_wires + column]
+                                as usize]
+                        })
+                        .collect()
+                })
                 .collect(),
         };
 
-        // Keep every non-cancelled denominator invertible for the independent reference.
-        for i in 0..n {
-            for j in 0..num_routed_wires {
-                if fixed_routed_wire(&data.prover_only.fixed_routed_wires, i * num_routed_wires + j)
-                {
-                    continue;
-                }
-                while betas.iter().zip(gammas).any(|(&beta, gamma)| {
-                    (witness.get_wire(i, j) + beta * data.prover_only.sigmas[i][j] + gamma)
-                        .is_zero()
-                }) {
-                    witness.wire_values[j][i] += F::ONE;
+        let target_identity =
+            data.common.k_is[target.1] * data.prover_only.subgroup[target.0];
+        assert_eq!(data.prover_only.sigmas[source.0][source.1], target_identity);
+        let numerator = witness.get_wire(target.0, target.1)
+            + beta_k_is[target.1] * data.prover_only.subgroup[target.0]
+            + gammas[0];
+        let denominator = witness.get_wire(source.0, source.1)
+            + betas[0] * data.prover_only.sigmas[source.0][source.1]
+            + gammas[0];
+        assert!(numerator.is_zero() && denominator.is_zero());
+
+        for row in 0..n {
+            for column in 0..num_routed_wires {
+                let skips = permutation_factor_skips(
+                    &data.prover_only.permutation_factor_skips,
+                    row * num_routed_wires + column,
+                );
+                if skips & PERMUTATION_SKIP_DENOMINATOR == 0 {
+                    for (&beta, &gamma) in betas.iter().zip(&gammas) {
+                        assert!(
+                            !(witness.get_wire(row, column)
+                                + beta * data.prover_only.sigmas[row][column]
+                                + gamma)
+                                .is_zero(),
+                            "unexpected surviving zero denominator at ({row}, {column})"
+                        );
+                    }
                 }
             }
         }
-
-        let zero_index = fixed_positions[0];
-        let zero_row = zero_index / num_routed_wires;
-        let zero_column = zero_index % num_routed_wires;
-        witness.wire_values[zero_column][zero_row] =
-            -(betas[0] * data.prover_only.sigmas[zero_row][zero_column] + gammas[0]);
-        let x = data.prover_only.subgroup[zero_row];
-        let numerator = witness.get_wire(zero_row, zero_column)
-            + beta_k_is[zero_column] * x
-            + gammas[0];
-        let denominator = witness.get_wire(zero_row, zero_column)
-            + betas[0] * data.prover_only.sigmas[zero_row][zero_column]
-            + gammas[0];
-        assert!(numerator.is_zero() && denominator.is_zero());
 
         let paired = two_challenge_wires_permutation_partial_products_and_zs(
             &witness,
@@ -3713,7 +3812,7 @@ mod permutation_pairing_tests {
                 &witness,
                 &data.prover_only.subgroup,
                 &data.prover_only.sigmas,
-                Some(&data.prover_only.fixed_routed_wires),
+                Some(&data.prover_only.permutation_factor_skips),
                 betas[challenge],
                 &beta_k_is
                     [challenge * num_routed_wires..(challenge + 1) * num_routed_wires],
