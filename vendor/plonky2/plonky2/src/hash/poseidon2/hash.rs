@@ -1,6 +1,8 @@
 use core::fmt::Debug;
 
 use plonky2_field::ops::Square;
+use plonky2_field::packable::Packable;
+use plonky2_field::packed::PackedField;
 
 use super::config::*;
 use crate::field::extension::{Extendable, FieldExtension};
@@ -467,23 +469,19 @@ fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
 impl Poseidon2 for F {
     #[inline]
     fn internal_linear_layer(state: &mut [Self; WIDTH]) {
-        // AArch64 NEON has no native widening 64x64 multiply. The packed
-        // Goldilocks path therefore expands each four-lane product, while the
-        // scalar backend lowers each fixed product directly to `mul`/`umulh`.
-        // Keep the exact historical multiply-then-add order in every lane.
-        let sum = sum_12(state);
-        state[0] = sum + state[0] * F(0xc3b6c08e23ba9300);
-        state[1] = sum + state[1] * F(0xd84b5de94a324fb6);
-        state[2] = sum + state[2] * F(0x0d0c371c5b35b84f);
-        state[3] = sum + state[3] * F(0x7964f570e7188037);
-        state[4] = sum + state[4] * F(0x5daf18bbd996604b);
-        state[5] = sum + state[5] * F(0x6743bc47b9595257);
-        state[6] = sum + state[6] * F(0x5528b9362c59bb70);
-        state[7] = sum + state[7] * F(0xac45e25b7127b68b);
-        state[8] = sum + state[8] * F(0xa2077d7dfbb606b5);
-        state[9] = sum + state[9] * F(0xf3faac6faee378ae);
-        state[10] = sum + state[10] * F(0x0c6388b51545e883);
-        state[11] = sum + state[11] * F(0xd27dbb6944917b60);
+        type Packing = <F as Packable>::Packing;
+
+        // The 12-lane state is three contiguous four-lane AArch64 vectors.
+        // Multiplying before adding preserves the scalar fused result exactly.
+        debug_assert_eq!(<Packing as PackedField>::WIDTH, 4);
+        let sum = Packing::from(sum_12(state));
+        let diagonal: [F; WIDTH] =
+            core::array::from_fn(|i| F::from_canonical_u64(MATRIX_DIAG_12_U64[i]));
+        let packed_state = Packing::pack_slice_mut(state);
+        let packed_diagonal = Packing::pack_slice(&diagonal);
+        for (state, &diagonal) in packed_state.iter_mut().zip(packed_diagonal) {
+            *state = sum + *state * diagonal;
+        }
     }
 
     #[inline]
