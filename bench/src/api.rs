@@ -1,4 +1,4 @@
-// Redraw marker 250
+// horner-fma+logstrip-1786285197 two-challenge reducer + perm FMA + release log off
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
