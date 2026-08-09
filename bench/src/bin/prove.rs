@@ -67,9 +67,7 @@ fn main() {
     // of stalling the first proving step that wants the GPU. Pure scheduling:
     // the compiled kernels are identical either way.
     plonky2::hash::poseidon2::prewarm_gpu();
-    // `log` is statically disabled in release builds: the ranked worker has no
-    // log consumer, and diagnostics remain available in debug/test builds.
-    // Do not link and initialize an unused logger in every scored process.
+    env_logger::init();
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
@@ -219,3 +217,4 @@ fn main() {
 }
 
 // p90-fire-808-1786266919
+// iamgoatedaf-tip-redraw-316
