@@ -493,8 +493,61 @@ kernel void poseidon2_gate_quotient(
     external_linear_layer(state);
 
     for (uint round = 0; round < 4; ++round) {
-        for (uint i = 0; i < 12; ++i) {
-            state[i] = gl_add(state[i], external_constants[round * 12 + i]);
+        if (round == 0) {
+            state[0] = gl_add(state[0], 0xd70193d17ab3b7d6UL);
+            state[1] = gl_add(state[1], 0xa2c3662a78a9162bUL);
+            state[2] = gl_add(state[2], 0x7a9fda827556ad44UL);
+            state[3] = gl_add(state[3], 0xe8d5501818c99643UL);
+            state[4] = gl_add(state[4], 0x4c7a8fced4d5fd38UL);
+            state[5] = gl_add(state[5], 0x55ab38985c0c513dUL);
+            state[6] = gl_add(state[6], 0x28a17bd016210b0bUL);
+            state[7] = gl_add(state[7], 0x8f8277679ec32fa8UL);
+            state[8] = gl_add(state[8], 0x768b3c3d68a460e9UL);
+            state[9] = gl_add(state[9], 0x872a022eb559d941UL);
+            state[10] = gl_add(state[10], 0xd1316dd4b3b97973UL);
+            state[11] = gl_add(state[11], 0xa7b608e578321000UL);
+        }
+        if (round == 1) {
+            state[0] = gl_add(state[0], 0x3fa02c87b0bee026UL);
+            state[1] = gl_add(state[1], 0x7a38f0022e13c31eUL);
+            state[2] = gl_add(state[2], 0x00c054f3c5e8d20dUL);
+            state[3] = gl_add(state[3], 0x439f50f4bca7242fUL);
+            state[4] = gl_add(state[4], 0x4d0938aa57cd517fUL);
+            state[5] = gl_add(state[5], 0xb2e03ac5fb6b9a7dUL);
+            state[6] = gl_add(state[6], 0xe29d1f4237bedca8UL);
+            state[7] = gl_add(state[7], 0x05b7c844bc99b848UL);
+            state[8] = gl_add(state[8], 0x91cc0b73f34e17edUL);
+            state[9] = gl_add(state[9], 0x876e4427694bd755UL);
+            state[10] = gl_add(state[10], 0x67002ae0725c612dUL);
+            state[11] = gl_add(state[11], 0x05351f20e0b6315fUL);
+        }
+        if (round == 2) {
+            state[0] = gl_add(state[0], 0x2e3b9ef5457eb60bUL);
+            state[1] = gl_add(state[1], 0xd9ac17618c3783ddUL);
+            state[2] = gl_add(state[2], 0x0807528ad8874bcfUL);
+            state[3] = gl_add(state[3], 0xc78d546a455d2a0eUL);
+            state[4] = gl_add(state[4], 0xf8b930c81e2481f0UL);
+            state[5] = gl_add(state[5], 0x712707d8dff3b041UL);
+            state[6] = gl_add(state[6], 0xdcb8c0aa0b9d34c3UL);
+            state[7] = gl_add(state[7], 0x9baddbdf2ee3a468UL);
+            state[8] = gl_add(state[8], 0x2dd16d50c5176c78UL);
+            state[9] = gl_add(state[9], 0x89eac5cfbc075cd3UL);
+            state[10] = gl_add(state[10], 0x2a741dea181587f3UL);
+            state[11] = gl_add(state[11], 0x1a4d6aa85a113d84UL);
+        }
+        if (round == 3) {
+            state[0] = gl_add(state[0], 0x4d736286a2387e34UL);
+            state[1] = gl_add(state[1], 0x8bad5dfc4fcb3ee3UL);
+            state[2] = gl_add(state[2], 0x84fbd03adb77c56aUL);
+            state[3] = gl_add(state[3], 0x8d5cdd1a23ec53a2UL);
+            state[4] = gl_add(state[4], 0x036f08f08fff28ecUL);
+            state[5] = gl_add(state[5], 0xb717a3f4dbdfb443UL);
+            state[6] = gl_add(state[6], 0x58a074b5509d645cUL);
+            state[7] = gl_add(state[7], 0xf92bf834e4b87718UL);
+            state[8] = gl_add(state[8], 0x1541c3a0baa5ac4bUL);
+            state[9] = gl_add(state[9], 0x22149e6783e67692UL);
+            state[10] = gl_add(state[10], 0x9be8b5d9e112476fUL);
+            state[11] = gl_add(state[11], 0x41e0969f62babb76UL);
         }
         if (round != 0) {
             uint saved_start = 29 + (round - 1) * 12;
@@ -520,8 +573,34 @@ kernel void poseidon2_gate_quotient(
 
     for (uint round = 0; round < 22; ++round) {
         ulong saved = poseidon2_gate_wire(wires, 65 + round, lde_rows, source_row);
+        ulong rc;
+        switch (round) {
+            case 0: rc = 0xa571418d95897b60UL; break;
+            case 1: rc = 0x8f32676574fcf6d3UL; break;
+            case 2: rc = 0x731102d4e3fb1bbeUL; break;
+            case 3: rc = 0x0330f08328a82d2bUL; break;
+            case 4: rc = 0x7f0449b6557f785dUL; break;
+            case 5: rc = 0x62f06210658dcbcbUL; break;
+            case 6: rc = 0xd5a98af9f89c458bUL; break;
+            case 7: rc = 0x77ec69083a346385UL; break;
+            case 8: rc = 0xef7ca48bbc27f890UL; break;
+            case 9: rc = 0x53e9652f61eac532UL; break;
+            case 10: rc = 0xa71c634abff4f0ccUL; break;
+            case 11: rc = 0xb16f5f0d7e28ea29UL; break;
+            case 12: rc = 0xc9dde31d0a003ab2UL; break;
+            case 13: rc = 0x2ddadf9775902533UL; break;
+            case 14: rc = 0xe4fa73fb16408b47UL; break;
+            case 15: rc = 0x90242ebc00d2ee59UL; break;
+            case 16: rc = 0xbb02dffd9f381982UL; break;
+            case 17: rc = 0xdea328364c50907cUL; break;
+            case 18: rc = 0x1395d3b924857cf8UL; break;
+            case 19: rc = 0x7d3ead0d5aec04e6UL; break;
+            case 20: rc = 0xc2f12be3fed74668UL; break;
+            case 21: rc = 0x0ba3c338f8c3d285UL; break;
+            default: rc = 0; break;
+        }
         poseidon2_gate_emit(
-            gl_sub(gl_add(state[0], internal_constants[round]), saved),
+            gl_sub(gl_add(state[0], rc), saved),
             alpha_powers,
             accumulators,
             constraint_index);
@@ -530,8 +609,61 @@ kernel void poseidon2_gate_quotient(
     }
 
     for (uint round = 4; round < 8; ++round) {
-        for (uint i = 0; i < 12; ++i) {
-            state[i] = gl_add(state[i], external_constants[round * 12 + i]);
+        if (round == 4) {
+            state[0] = gl_add(state[0], 0xbc585ad3b9443dbbUL);
+            state[1] = gl_add(state[1], 0xf28dd3206975cbb1UL);
+            state[2] = gl_add(state[2], 0xdd8815e53ca045e0UL);
+            state[3] = gl_add(state[3], 0xde82c416b9e701baUL);
+            state[4] = gl_add(state[4], 0xc5cb875233afa025UL);
+            state[5] = gl_add(state[5], 0x7212697cd897ffa9UL);
+            state[6] = gl_add(state[6], 0x67844790aa63cfd7UL);
+            state[7] = gl_add(state[7], 0xdc0b9cfa97fe65c3UL);
+            state[8] = gl_add(state[8], 0xe8fe091869a82070UL);
+            state[9] = gl_add(state[9], 0x62902bb2e413c6d1UL);
+            state[10] = gl_add(state[10], 0x29f9f5001fb84f57UL);
+            state[11] = gl_add(state[11], 0xbe1014796ef5f8beUL);
+        }
+        if (round == 5) {
+            state[0] = gl_add(state[0], 0x71feb53e9bdba19cUL);
+            state[1] = gl_add(state[1], 0x251054f592ebb71cUL);
+            state[2] = gl_add(state[2], 0xe1a57643a4bb284bUL);
+            state[3] = gl_add(state[3], 0xa4ba6f87a45b739bUL);
+            state[4] = gl_add(state[4], 0x2c1fcade0b958c49UL);
+            state[5] = gl_add(state[5], 0xbbb424cda9a3e360UL);
+            state[6] = gl_add(state[6], 0x2ca647354c5f3f54UL);
+            state[7] = gl_add(state[7], 0xc9277b64d152e084UL);
+            state[8] = gl_add(state[8], 0xdbc9ac97445eff17UL);
+            state[9] = gl_add(state[9], 0x6f6cdf3198969f70UL);
+            state[10] = gl_add(state[10], 0x1de29d14fa76d8f1UL);
+            state[11] = gl_add(state[11], 0x73337458a8cc1d19UL);
+        }
+        if (round == 6) {
+            state[0] = gl_add(state[0], 0xb87e775e2fb3ab23UL);
+            state[1] = gl_add(state[1], 0xf166a1c7a565c80bUL);
+            state[2] = gl_add(state[2], 0xb24be06f426c747fUL);
+            state[3] = gl_add(state[3], 0xc281e8c49482ce00UL);
+            state[4] = gl_add(state[4], 0x51974c3b3b726c2dUL);
+            state[5] = gl_add(state[5], 0x87444cf8caf7d619UL);
+            state[6] = gl_add(state[6], 0x7c362f827a580cedUL);
+            state[7] = gl_add(state[7], 0x9567af14667647a0UL);
+            state[8] = gl_add(state[8], 0xcbf0473cbec54e37UL);
+            state[9] = gl_add(state[9], 0xe3209dedeff4f620UL);
+            state[10] = gl_add(state[10], 0xd43ad94e45a4c4eeUL);
+            state[11] = gl_add(state[11], 0x976981ee73f41768UL);
+        }
+        if (round == 7) {
+            state[0] = gl_add(state[0], 0xef707a224e207258UL);
+            state[1] = gl_add(state[1], 0x2fc779e10e6362eeUL);
+            state[2] = gl_add(state[2], 0x29b5ee60ad8c891fUL);
+            state[3] = gl_add(state[3], 0x96b37b39d8bfd667UL);
+            state[4] = gl_add(state[4], 0x877df68a8b22e733UL);
+            state[5] = gl_add(state[5], 0x5c41746f562c8d9fUL);
+            state[6] = gl_add(state[6], 0x0c9d76751052b71aUL);
+            state[7] = gl_add(state[7], 0xfb3465341bf1c087UL);
+            state[8] = gl_add(state[8], 0xa0d14dc614d15eb1UL);
+            state[9] = gl_add(state[9], 0xdc27d17136906fa6UL);
+            state[10] = gl_add(state[10], 0x482e163b05ec397fUL);
+            state[11] = gl_add(state[11], 0x0273a462992366efUL);
         }
         uint saved_start = 87 + (round - 4) * 12;
         for (uint i = 0; i < 12; ++i) {

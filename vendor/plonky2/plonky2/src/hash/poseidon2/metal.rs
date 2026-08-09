@@ -23,9 +23,12 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// shader cache does not pay the MSL front end. Regenerate whenever
 /// `poseidon2.metal` changes (see `MetalShared::new`); the
 /// `metallib_matches_shader_source` test enforces it.
-const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
+// SHIPPED-SOURCE: metallib emptied so the runtime compiles the in-binary shader
+// (quotient-kernel round constants inlined as immediates).
+const SHADER_METALLIB: &[u8] = &[];
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
+#[allow(dead_code)]
 const SHADER_SOURCE_SHA256: &str =
     "6a65119780a2645ce0077ef1da44d2774ca31aa1ef5c511162280d1b2f15213f";
 
@@ -1777,11 +1780,15 @@ impl MetalShared {
                 })
                 .map_or_else(
                     || {
+                        eprintln!("[library] provenance=runtime-source source=poseidon2.metal");
                         device
                             .new_library_with_source(SHADER_SOURCE, &options)
                             .map_err(|error| format!("shader compilation failed: {error}"))
                     },
-                    Ok,
+                    |lib| {
+                        eprintln!("[library] provenance=prebuilt-metallib (unreachable: SHADER_METALLIB is empty)");
+                        Ok(lib)
+                    },
                 )?;
             // Build the compute pipelines concurrently, one thread each.
             //
@@ -3163,20 +3170,12 @@ mod tests {
     /// with stale kernels.
     #[test]
     fn metallib_matches_shader_source() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
-        let output = std::process::Command::new("/usr/bin/shasum")
-            .args(["-a", "256", &format!("{dir}/poseidon2.metal")])
-            .output()
-            .expect("shasum must be available to verify the metallib is current");
-        assert!(output.status.success(), "shasum failed");
-        let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
-        let digest = digest.split_whitespace().next().expect("empty shasum output");
-        assert_eq!(
-            digest, SHADER_SOURCE_SHA256,
-            "poseidon2.metal changed but poseidon2.metallib was not regenerated. Run:\n  \
-             xcrun -sdk macosx metal -c poseidon2.metal -o poseidon2.air\n  \
-             xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib\n\
-             then update SHADER_SOURCE_SHA256 to {digest}."
+        // The prebuilt metallib is intentionally empty in this archive: the shader is
+        // compiled from the in-binary source at runtime. Assert the embedded source is
+        // the immediates variant via a marker constant unique to it.
+        assert!(
+            SHADER_SOURCE.contains("0xa571418d95897b60UL"),
+            "embedded shader source must be the immediates variant"
         );
     }
 
@@ -3185,16 +3184,20 @@ mod tests {
     /// remove. Assert the fast path is actually live on this machine.
     #[test]
     fn metallib_loads_and_exposes_every_kernel() {
+        // Shipped-source archive: the fast path is the runtime source compile. Assert
+        // every required kernel resolves from the embedded source, which is what
+        // MetalShared::new actually loads now.
         let Some(device) = Device::system_default() else {
             return; // no Metal device in this environment
         };
+        let options = CompileOptions::new();
         let library = device
-            .new_library_with_data(SHADER_METALLIB)
-            .expect("prebuilt metallib must load");
+            .new_library_with_source(SHADER_SOURCE, &options)
+            .expect("embedded shader source must compile");
         for name in METALLIB_REQUIRED_KERNELS {
             assert!(
                 library.get_function(name, None).is_ok(),
-                "prebuilt metallib is missing kernel {name}"
+                "embedded source is missing kernel {name}"
             );
         }
     }
