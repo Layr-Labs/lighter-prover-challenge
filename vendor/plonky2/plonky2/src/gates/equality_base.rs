@@ -127,10 +127,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EqualityGate {
         let n = vars_base.len();
         assert_eq!(filters.len(), n);
         assert!(combined_gate_constraints.len() >= self.num_ops * 4 * n);
-        let wires = vars_base.local_wires;
-        let col = |w: usize| &wires[w * n..][..n];
+        let col = |w: usize| vars_base.local_wires_column(w);
         // First (and only) constant column: the "one" value.
-        let const_0 = &vars_base.local_constants[..n];
+        let const_0 = vars_base.local_constants_column(0);
 
         // Batches are 32 points in this prover; keep the scratch row on the
         // stack and fall back to the heap only for oversized batches.

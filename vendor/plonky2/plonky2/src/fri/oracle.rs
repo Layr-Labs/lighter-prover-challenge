@@ -8,7 +8,8 @@ use plonky2_maybe_rayon::*;
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
 use crate::field::extension::Extendable;
 use crate::field::fft::{
-    FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
+    FftRootTable, fft_columns_in_place_with_options, fft_in_place_with_options,
+    fft_in_place_with_options_parallel,
 };
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
@@ -200,12 +201,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                     if rate_bits == 0 || degree < 2 {
                                         destination[degree..].fill(F::ZERO);
                                     }
-                                    fft_in_place_with_options(
-                                        destination,
-                                        Some(rate_bits),
-                                        fft_root_table,
-                                    );
                                 },
+                            );
+                            fft_columns_in_place_with_options(
+                                destinations,
+                                Some(rate_bits),
+                                fft_root_table,
                             );
                         },
                     )

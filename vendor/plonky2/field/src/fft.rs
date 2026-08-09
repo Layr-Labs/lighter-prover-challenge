@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::cmp::{max, min};
 
-use plonky2_maybe_rayon::MaybeParChunksMut;
+use plonky2_maybe_rayon::{MaybeParChunksMut, MaybeParIterMut};
 #[cfg(feature = "parallel")]
 use plonky2_maybe_rayon::ParallelIterator;
 use plonky2_util::{log2_strict, reverse_index_bits_in_place};
@@ -241,6 +241,36 @@ pub fn fft_in_place_with_options_parallel<F: Field>(
     root_table: Option<&FftRootTable<F>>,
 ) {
     fft_dispatch_parallel(buffer, zero_factor, root_table);
+}
+
+/// Computes several independent, equal-sized FFTs through one shared worker
+/// pool. The columns remain the outer tasks; when there are fewer columns than
+/// workers, large transforms also publish their independent stage blocks so
+/// otherwise idle workers can steal them.
+#[doc(hidden)]
+pub fn fft_columns_in_place_with_options<F: Field>(
+    columns: &mut [&mut [F]],
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+) {
+    let Some(first) = columns.first() else {
+        return;
+    };
+    let len = first.len();
+    assert!(columns.iter().all(|column| column.len() == len));
+    #[cfg(feature = "parallel")]
+    let publish_stage_blocks = len >= PARALLEL_FFT_MIN_SCALARS
+        && columns.len() < plonky2_maybe_rayon::rayon::current_num_threads();
+    #[cfg(not(feature = "parallel"))]
+    let publish_stage_blocks = false;
+
+    columns.par_iter_mut().for_each(|column| {
+        if publish_stage_blocks {
+            fft_dispatch_parallel(column, zero_factor, root_table);
+        } else {
+            fft_dispatch(column, zero_factor, root_table);
+        }
+    });
 }
 
 #[inline]
@@ -2423,7 +2453,8 @@ mod tests {
     use super::{BaseSubfieldTwiddle, FftTwiddleMul, GeneralTwiddle};
     use crate::extension::quadratic::QuadraticExtension;
     use crate::fft::{
-        FftRootTable, fft, fft_classic, fft_classic_parallel, fft_in_place_with_options,
+        FftRootTable, fft, fft_classic, fft_classic_parallel,
+        fft_columns_in_place_with_options, fft_in_place_with_options,
         fft_in_place_with_options_parallel, fft_root_table, fft_with_options, ifft,
     };
     use crate::goldilocks_field::GoldilocksField;
@@ -3161,6 +3192,46 @@ mod tests {
         fft_in_place_with_options(&mut serial, Some(3), None);
         fft_in_place_with_options_parallel(&mut parallel, Some(3), None);
         assert_eq!(parallel, serial, "packed base-field public entry diverged");
+    }
+
+    #[test]
+    fn batched_zero_padded_fft_matches_independent_serial_raw_words() {
+        type F = GoldilocksField;
+        const COLUMNS: usize = 5;
+        const LG_N: usize = 18;
+        const RATE_BITS: usize = 3;
+        let n = 1 << LG_N;
+        let live = n >> RATE_BITS;
+        let roots = fft_root_table(n);
+        let input = (0..COLUMNS)
+            .map(|column| {
+                (0..live)
+                    .map(|i| {
+                        GoldilocksField((i as u64)
+                            .wrapping_mul(0xD1B5_4A32_D192_ED03)
+                            .wrapping_add(
+                                (column as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                            ))
+                    })
+                    .chain(core::iter::repeat_n(F::ZERO, n - live))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut expected = input.clone();
+        expected.iter_mut().for_each(|column| {
+            fft_in_place_with_options(column, Some(RATE_BITS), Some(&roots));
+        });
+        let mut actual = input;
+        let mut columns = actual
+            .iter_mut()
+            .map(Vec::as_mut_slice)
+            .collect::<Vec<_>>();
+        fft_columns_in_place_with_options(&mut columns, Some(RATE_BITS), Some(&roots));
+        for (column, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            for (row, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+                assert_eq!(actual.0, expected.0, "raw mismatch at ({column}, {row})");
+            }
+        }
     }
 
 }

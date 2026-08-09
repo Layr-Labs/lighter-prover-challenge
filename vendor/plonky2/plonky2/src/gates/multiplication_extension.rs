@@ -118,12 +118,11 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for MulExtensionGa
         assert_eq!(filters.len(), n);
         assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
 
-        let wires = vars_base.local_wires;
-        let const_0 = &vars_base.local_constants[..n];
+        let const_0 = vars_base.local_constants_column(0);
         let ext = |start: usize, p: usize| {
             let mut arr = [F::ZERO; D];
             for (d, a) in arr.iter_mut().enumerate() {
-                *a = wires[(start + d) * n + p];
+                *a = vars_base.local_wires_column(start + d)[p];
             }
             F::Extension::from_basefield_array(arr)
         };

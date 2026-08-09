@@ -23,6 +23,10 @@ pub struct EvaluationVars<'a, F: RichField + Extendable<D>, const D: usize> {
 #[derive(Debug, Copy, Clone)]
 pub struct EvaluationVarsBaseBatch<'a, F: Field> {
     batch_size: usize,
+    constants_stride: usize,
+    wires_stride: usize,
+    constants_offset: usize,
+    wires_offset: usize,
     pub local_constants: &'a [F],
     pub local_wires: &'a [F],
     pub public_inputs_hash: &'a HashOut<F>,
@@ -72,6 +76,42 @@ impl<'a, F: Field> EvaluationVarsBaseBatch<'a, F> {
         assert_eq!(local_wires.len() % batch_size, 0);
         Self {
             batch_size,
+            constants_stride: batch_size,
+            wires_stride: batch_size,
+            constants_offset: 0,
+            wires_offset: 0,
+            local_constants,
+            local_wires,
+            public_inputs_hash,
+        }
+    }
+
+    /// Constructs a logical batch backed by wider column-major storage.
+    /// Each exposed column contains `batch_size` values, while adjacent source
+    /// columns begin `column_stride` values apart.
+    pub(crate) fn new_strided(
+        batch_size: usize,
+        column_stride: usize,
+        row_offset: usize,
+        local_constants: &'a [F],
+        local_wires: &'a [F],
+        public_inputs_hash: &'a HashOut<F>,
+    ) -> Self {
+        assert!(batch_size > 0);
+        assert!(column_stride >= batch_size);
+        assert!(
+            row_offset
+                .checked_add(batch_size)
+                .is_some_and(|end| end <= column_stride)
+        );
+        assert_eq!(local_constants.len() % column_stride, 0);
+        assert_eq!(local_wires.len() % column_stride, 0);
+        Self {
+            batch_size,
+            constants_stride: column_stride,
+            wires_stride: column_stride,
+            constants_offset: row_offset,
+            wires_offset: row_offset,
             local_constants,
             local_wires,
             public_inputs_hash,
@@ -79,7 +119,16 @@ impl<'a, F: Field> EvaluationVarsBaseBatch<'a, F> {
     }
 
     pub fn remove_prefix(&mut self, num_selectors: usize) {
-        self.local_constants = &self.local_constants[num_selectors * self.len()..];
+        self.local_constants = &self.local_constants[num_selectors * self.constants_stride..];
+    }
+
+    pub(crate) fn local_constants_column(&self, column: usize) -> &'a [F] {
+        &self.local_constants[column * self.constants_stride + self.constants_offset..]
+            [..self.batch_size]
+    }
+
+    pub(crate) fn local_wires_column(&self, column: usize) -> &'a [F] {
+        &self.local_wires[column * self.wires_stride + self.wires_offset..][..self.batch_size]
     }
 
     pub const fn len(&self) -> usize {
@@ -93,8 +142,16 @@ impl<'a, F: Field> EvaluationVarsBaseBatch<'a, F> {
     pub fn view(&self, index: usize) -> EvaluationVarsBase<'a, F> {
         // We cannot implement `Index` as `EvaluationVarsBase` is a struct, not a reference.
         assert!(index < self.len());
-        let local_constants = PackedStridedView::new(self.local_constants, self.len(), index);
-        let local_wires = PackedStridedView::new(self.local_wires, self.len(), index);
+        let local_constants = PackedStridedView::new(
+            self.local_constants,
+            self.constants_stride,
+            self.constants_offset + index,
+        );
+        let local_wires = PackedStridedView::new(
+            self.local_wires,
+            self.wires_stride,
+            self.wires_offset + index,
+        );
         EvaluationVarsBase {
             local_constants,
             local_wires,
@@ -187,11 +244,14 @@ impl<'a, P: PackedField> Iterator for EvaluationVarsBaseBatchIterPacked<'a, P> {
         if self.i + P::WIDTH <= self.vars_batch.len() {
             let local_constants = PackedStridedView::new(
                 self.vars_batch.local_constants,
-                self.vars_batch.len(),
-                self.i,
+                self.vars_batch.constants_stride,
+                self.vars_batch.constants_offset + self.i,
             );
-            let local_wires =
-                PackedStridedView::new(self.vars_batch.local_wires, self.vars_batch.len(), self.i);
+            let local_wires = PackedStridedView::new(
+                self.vars_batch.local_wires,
+                self.vars_batch.wires_stride,
+                self.vars_batch.wires_offset + self.i,
+            );
             let res = EvaluationVarsBasePacked {
                 local_constants,
                 local_wires,
@@ -218,6 +278,65 @@ impl<P: PackedField> ExactSizeIterator for EvaluationVarsBaseBatchIterPacked<'_,
 impl<const D: usize> EvaluationTargets<'_, D> {
     pub fn remove_prefix(&mut self, num_selectors: usize) {
         self.local_constants = &self.local_constants[num_selectors..];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use plonky2_field::goldilocks_field::GoldilocksField;
+    use plonky2_field::types::Field;
+
+    use super::EvaluationVarsBaseBatch;
+    use crate::hash::hash_types::HashOut;
+
+    #[test]
+    fn strided_batch_views_match_packed_columns() {
+        type F = GoldilocksField;
+        const ROWS: usize = 11;
+        const START: usize = 3;
+        const BATCH: usize = 5;
+        const CONSTANTS: usize = 3;
+        const WIRES: usize = 7;
+
+        let constant_columns = (0..CONSTANTS * ROWS)
+            .map(F::from_canonical_usize)
+            .collect::<Vec<_>>();
+        let wire_columns = (100..100 + WIRES * ROWS)
+            .map(F::from_canonical_usize)
+            .collect::<Vec<_>>();
+        let hash = HashOut::ZERO;
+        let vars = EvaluationVarsBaseBatch::new_strided(
+            BATCH,
+            ROWS,
+            START,
+            &constant_columns,
+            &wire_columns,
+            &hash,
+        );
+
+        assert_eq!(
+            vars.local_constants_column(2),
+            &constant_columns[2 * ROWS + START..][..BATCH]
+        );
+        assert_eq!(
+            vars.local_wires_column(6),
+            &wire_columns[6 * ROWS + START..][..BATCH]
+        );
+        for point in 0..BATCH {
+            let view = vars.view(point);
+            for column in 0..CONSTANTS {
+                assert_eq!(
+                    view.local_constants[column],
+                    constant_columns[column * ROWS + START + point]
+                );
+            }
+            for column in 0..WIRES {
+                assert_eq!(
+                    view.local_wires[column],
+                    wire_columns[column * ROWS + START + point]
+                );
+            }
+        }
     }
 }
 
