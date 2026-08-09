@@ -356,7 +356,7 @@ inline ulong sum_state(thread const ulong state[12]) {
     return lazy_materialize(sum);
 }
 
-inline void internal_linear_layer(thread ulong state[12], constant ulong* diagonal) {
+inline void internal_linear_layer(thread ulong state[12]) {
     ulong sum = sum_state(state);
     // Poseidon2's internal diagonal is fixed by the hash configuration. Spell
     // it as immediates so the Metal compiler can specialize the constant
@@ -375,33 +375,174 @@ inline void internal_linear_layer(thread ulong state[12], constant ulong* diagon
     state[11] = gl_mul_add(state[11], 0xd27dbb6944917b60UL, sum);
 }
 
-// Parameter layout: 8 x 12 external constants, 22 internal constants,
-// then the 12-element internal diagonal.
-inline void poseidon2(thread ulong state[12], constant ulong* parameters) {
-    constant ulong* external_constants = parameters;
-    constant ulong* internal_constants = parameters + 96;
-    constant ulong* diagonal = parameters + 118;
-
+// Parameter layout (host still packs parameters for gate kernels): 8 x 12
+// external constants, 22 internal constants, then the 12-element diagonal.
+// The sponge path below does not load any of them: every round constant is a
+// compile-time immediate, extending the internal-diagonal specialization to
+// all 96 external + 22 internal adds. That is 118 extra constant operands per
+// permutation on top of the 264 diagonal multiplies already specialized.
+inline void poseidon2(thread ulong state[12], constant ulong* /*parameters*/) {
     external_linear_layer(state);
 
-    for (uint round = 0; round < 4; ++round) {
-        for (uint i = 0; i < 12; ++i) {
-            state[i] = pow7(gl_add(state[i], external_constants[round * 12 + i]));
-        }
-        external_linear_layer(state);
-    }
+    // External rounds 0..3
+    state[0] = pow7(gl_add(state[0], 0xd70193d17ab3b7d6UL));
+    state[1] = pow7(gl_add(state[1], 0xa2c3662a78a9162bUL));
+    state[2] = pow7(gl_add(state[2], 0x7a9fda827556ad44UL));
+    state[3] = pow7(gl_add(state[3], 0xe8d5501818c99643UL));
+    state[4] = pow7(gl_add(state[4], 0x4c7a8fced4d5fd38UL));
+    state[5] = pow7(gl_add(state[5], 0x55ab38985c0c513dUL));
+    state[6] = pow7(gl_add(state[6], 0x28a17bd016210b0bUL));
+    state[7] = pow7(gl_add(state[7], 0x8f8277679ec32fa8UL));
+    state[8] = pow7(gl_add(state[8], 0x768b3c3d68a460e9UL));
+    state[9] = pow7(gl_add(state[9], 0x872a022eb559d941UL));
+    state[10] = pow7(gl_add(state[10], 0xd1316dd4b3b97973UL));
+    state[11] = pow7(gl_add(state[11], 0xa7b608e578321000UL));
+    external_linear_layer(state);
 
-    for (uint round = 0; round < 22; ++round) {
-        state[0] = pow7(gl_add(state[0], internal_constants[round]));
-        internal_linear_layer(state, diagonal);
-    }
+    state[0] = pow7(gl_add(state[0], 0x3fa02c87b0bee026UL));
+    state[1] = pow7(gl_add(state[1], 0x7a38f0022e13c31eUL));
+    state[2] = pow7(gl_add(state[2], 0x00c054f3c5e8d20dUL));
+    state[3] = pow7(gl_add(state[3], 0x439f50f4bca7242fUL));
+    state[4] = pow7(gl_add(state[4], 0x4d0938aa57cd517fUL));
+    state[5] = pow7(gl_add(state[5], 0xb2e03ac5fb6b9a7dUL));
+    state[6] = pow7(gl_add(state[6], 0xe29d1f4237bedca8UL));
+    state[7] = pow7(gl_add(state[7], 0x05b7c844bc99b848UL));
+    state[8] = pow7(gl_add(state[8], 0x91cc0b73f34e17edUL));
+    state[9] = pow7(gl_add(state[9], 0x876e4427694bd755UL));
+    state[10] = pow7(gl_add(state[10], 0x67002ae0725c612dUL));
+    state[11] = pow7(gl_add(state[11], 0x05351f20e0b6315fUL));
+    external_linear_layer(state);
 
-    for (uint round = 4; round < 8; ++round) {
-        for (uint i = 0; i < 12; ++i) {
-            state[i] = pow7(gl_add(state[i], external_constants[round * 12 + i]));
-        }
-        external_linear_layer(state);
-    }
+    state[0] = pow7(gl_add(state[0], 0x2e3b9ef5457eb60bUL));
+    state[1] = pow7(gl_add(state[1], 0xd9ac17618c3783ddUL));
+    state[2] = pow7(gl_add(state[2], 0x0807528ad8874bcfUL));
+    state[3] = pow7(gl_add(state[3], 0xc78d546a455d2a0eUL));
+    state[4] = pow7(gl_add(state[4], 0xf8b930c81e2481f0UL));
+    state[5] = pow7(gl_add(state[5], 0x712707d8dff3b041UL));
+    state[6] = pow7(gl_add(state[6], 0xdcb8c0aa0b9d34c3UL));
+    state[7] = pow7(gl_add(state[7], 0x9baddbdf2ee3a468UL));
+    state[8] = pow7(gl_add(state[8], 0x2dd16d50c5176c78UL));
+    state[9] = pow7(gl_add(state[9], 0x89eac5cfbc075cd3UL));
+    state[10] = pow7(gl_add(state[10], 0x2a741dea181587f3UL));
+    state[11] = pow7(gl_add(state[11], 0x1a4d6aa85a113d84UL));
+    external_linear_layer(state);
+
+    state[0] = pow7(gl_add(state[0], 0x4d736286a2387e34UL));
+    state[1] = pow7(gl_add(state[1], 0x8bad5dfc4fcb3ee3UL));
+    state[2] = pow7(gl_add(state[2], 0x84fbd03adb77c56aUL));
+    state[3] = pow7(gl_add(state[3], 0x8d5cdd1a23ec53a2UL));
+    state[4] = pow7(gl_add(state[4], 0x036f08f08fff28ecUL));
+    state[5] = pow7(gl_add(state[5], 0xb717a3f4dbdfb443UL));
+    state[6] = pow7(gl_add(state[6], 0x58a074b5509d645cUL));
+    state[7] = pow7(gl_add(state[7], 0xf92bf834e4b87718UL));
+    state[8] = pow7(gl_add(state[8], 0x1541c3a0baa5ac4bUL));
+    state[9] = pow7(gl_add(state[9], 0x22149e6783e67692UL));
+    state[10] = pow7(gl_add(state[10], 0x9be8b5d9e112476fUL));
+    state[11] = pow7(gl_add(state[11], 0x41e0969f62babb76UL));
+    external_linear_layer(state);
+
+    // 22 partial rounds: only lane 0 takes the round constant.
+    state[0] = pow7(gl_add(state[0], 0xa571418d95897b60UL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0x8f32676574fcf6d3UL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0x731102d4e3fb1bbeUL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0x0330f08328a82d2bUL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0x7f0449b6557f785dUL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0x62f06210658dcbcbUL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0xd5a98af9f89c458bUL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0x77ec69083a346385UL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0xef7ca48bbc27f890UL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0x53e9652f61eac532UL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0xa71c634abff4f0ccUL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0xb16f5f0d7e28ea29UL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0xc9dde31d0a003ab2UL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0x2ddadf9775902533UL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0xe4fa73fb16408b47UL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0x90242ebc00d2ee59UL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0xbb02dffd9f381982UL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0xdea328364c50907cUL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0x1395d3b924857cf8UL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0x7d3ead0d5aec04e6UL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0xc2f12be3fed74668UL));
+    internal_linear_layer(state);
+    state[0] = pow7(gl_add(state[0], 0x0ba3c338f8c3d285UL));
+    internal_linear_layer(state);
+
+    // External rounds 4..7
+    state[0] = pow7(gl_add(state[0], 0xbc585ad3b9443dbbUL));
+    state[1] = pow7(gl_add(state[1], 0xf28dd3206975cbb1UL));
+    state[2] = pow7(gl_add(state[2], 0xdd8815e53ca045e0UL));
+    state[3] = pow7(gl_add(state[3], 0xde82c416b9e701baUL));
+    state[4] = pow7(gl_add(state[4], 0xc5cb875233afa025UL));
+    state[5] = pow7(gl_add(state[5], 0x7212697cd897ffa9UL));
+    state[6] = pow7(gl_add(state[6], 0x67844790aa63cfd7UL));
+    state[7] = pow7(gl_add(state[7], 0xdc0b9cfa97fe65c3UL));
+    state[8] = pow7(gl_add(state[8], 0xe8fe091869a82070UL));
+    state[9] = pow7(gl_add(state[9], 0x62902bb2e413c6d1UL));
+    state[10] = pow7(gl_add(state[10], 0x29f9f5001fb84f57UL));
+    state[11] = pow7(gl_add(state[11], 0xbe1014796ef5f8beUL));
+    external_linear_layer(state);
+
+    state[0] = pow7(gl_add(state[0], 0x71feb53e9bdba19cUL));
+    state[1] = pow7(gl_add(state[1], 0x251054f592ebb71cUL));
+    state[2] = pow7(gl_add(state[2], 0xe1a57643a4bb284bUL));
+    state[3] = pow7(gl_add(state[3], 0xa4ba6f87a45b739bUL));
+    state[4] = pow7(gl_add(state[4], 0x2c1fcade0b958c49UL));
+    state[5] = pow7(gl_add(state[5], 0xbbb424cda9a3e360UL));
+    state[6] = pow7(gl_add(state[6], 0x2ca647354c5f3f54UL));
+    state[7] = pow7(gl_add(state[7], 0xc9277b64d152e084UL));
+    state[8] = pow7(gl_add(state[8], 0xdbc9ac97445eff17UL));
+    state[9] = pow7(gl_add(state[9], 0x6f6cdf3198969f70UL));
+    state[10] = pow7(gl_add(state[10], 0x1de29d14fa76d8f1UL));
+    state[11] = pow7(gl_add(state[11], 0x73337458a8cc1d19UL));
+    external_linear_layer(state);
+
+    state[0] = pow7(gl_add(state[0], 0xb87e775e2fb3ab23UL));
+    state[1] = pow7(gl_add(state[1], 0xf166a1c7a565c80bUL));
+    state[2] = pow7(gl_add(state[2], 0xb24be06f426c747fUL));
+    state[3] = pow7(gl_add(state[3], 0xc281e8c49482ce00UL));
+    state[4] = pow7(gl_add(state[4], 0x51974c3b3b726c2dUL));
+    state[5] = pow7(gl_add(state[5], 0x87444cf8caf7d619UL));
+    state[6] = pow7(gl_add(state[6], 0x7c362f827a580cedUL));
+    state[7] = pow7(gl_add(state[7], 0x9567af14667647a0UL));
+    state[8] = pow7(gl_add(state[8], 0xcbf0473cbec54e37UL));
+    state[9] = pow7(gl_add(state[9], 0xe3209dedeff4f620UL));
+    state[10] = pow7(gl_add(state[10], 0xd43ad94e45a4c4eeUL));
+    state[11] = pow7(gl_add(state[11], 0x976981ee73f41768UL));
+    external_linear_layer(state);
+
+    state[0] = pow7(gl_add(state[0], 0xef707a224e207258UL));
+    state[1] = pow7(gl_add(state[1], 0x2fc779e10e6362eeUL));
+    state[2] = pow7(gl_add(state[2], 0x29b5ee60ad8c891fUL));
+    state[3] = pow7(gl_add(state[3], 0x96b37b39d8bfd667UL));
+    state[4] = pow7(gl_add(state[4], 0x877df68a8b22e733UL));
+    state[5] = pow7(gl_add(state[5], 0x5c41746f562c8d9fUL));
+    state[6] = pow7(gl_add(state[6], 0x0c9d76751052b71aUL));
+    state[7] = pow7(gl_add(state[7], 0xfb3465341bf1c087UL));
+    state[8] = pow7(gl_add(state[8], 0xa0d14dc614d15eb1UL));
+    state[9] = pow7(gl_add(state[9], 0xdc27d17136906fa6UL));
+    state[10] = pow7(gl_add(state[10], 0x482e163b05ec397fUL));
+    state[11] = pow7(gl_add(state[11], 0x0273a462992366efUL));
+    external_linear_layer(state);
 }
 
 inline ulong poseidon2_gate_wire(
@@ -460,9 +601,11 @@ kernel void poseidon2_gate_quotient(
         filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
     }
 
-    constant ulong* external_constants = parameters;
-    constant ulong* internal_constants = parameters + 96;
-    constant ulong* diagonal = parameters + 118;
+    // Round constants are compile-time immediates (same as sponge path).
+    // Host still binds a parameters buffer for ABI compatibility; the
+    // gate kernel never loads it. Diagonal multiplies already use
+    // immediates inside internal_linear_layer.
+    (void)parameters;
     ulong accumulators[2] = { 0, 0 };
     uint constraint_index = 0;
 
@@ -492,48 +635,363 @@ kernel void poseidon2_gate_quotient(
 
     external_linear_layer(state);
 
-    for (uint round = 0; round < 4; ++round) {
-        for (uint i = 0; i < 12; ++i) {
-            state[i] = gl_add(state[i], external_constants[round * 12 + i]);
-        }
-        if (round != 0) {
-            uint saved_start = 29 + (round - 1) * 12;
-            for (uint i = 0; i < 12; ++i) {
-                ulong saved = poseidon2_gate_wire(
-                    wires,
-                    saved_start + i,
-                    lde_rows,
-                    source_row);
-                poseidon2_gate_emit(
-                    gl_sub(state[i], saved),
-                    alpha_powers,
-                    accumulators,
-                    constraint_index);
-                state[i] = saved;
-            }
-        }
-        for (uint i = 0; i < 12; ++i) {
-            state[i] = pow7(state[i]);
-        }
-        external_linear_layer(state);
+    // External round 0: RC as immediates
+    state[0] = gl_add(state[0], 0xd70193d17ab3b7d6UL);
+    state[1] = gl_add(state[1], 0xa2c3662a78a9162bUL);
+    state[2] = gl_add(state[2], 0x7a9fda827556ad44UL);
+    state[3] = gl_add(state[3], 0xe8d5501818c99643UL);
+    state[4] = gl_add(state[4], 0x4c7a8fced4d5fd38UL);
+    state[5] = gl_add(state[5], 0x55ab38985c0c513dUL);
+    state[6] = gl_add(state[6], 0x28a17bd016210b0bUL);
+    state[7] = gl_add(state[7], 0x8f8277679ec32fa8UL);
+    state[8] = gl_add(state[8], 0x768b3c3d68a460e9UL);
+    state[9] = gl_add(state[9], 0x872a022eb559d941UL);
+    state[10] = gl_add(state[10], 0xd1316dd4b3b97973UL);
+    state[11] = gl_add(state[11], 0xa7b608e578321000UL);
+    for (uint i = 0; i < 12; ++i) {
+        state[i] = pow7(state[i]);
     }
+    external_linear_layer(state);
 
-    for (uint round = 0; round < 22; ++round) {
-        ulong saved = poseidon2_gate_wire(wires, 65 + round, lde_rows, source_row);
+    // External round 1: RC as immediates
+    state[0] = gl_add(state[0], 0x3fa02c87b0bee026UL);
+    state[1] = gl_add(state[1], 0x7a38f0022e13c31eUL);
+    state[2] = gl_add(state[2], 0x00c054f3c5e8d20dUL);
+    state[3] = gl_add(state[3], 0x439f50f4bca7242fUL);
+    state[4] = gl_add(state[4], 0x4d0938aa57cd517fUL);
+    state[5] = gl_add(state[5], 0xb2e03ac5fb6b9a7dUL);
+    state[6] = gl_add(state[6], 0xe29d1f4237bedca8UL);
+    state[7] = gl_add(state[7], 0x05b7c844bc99b848UL);
+    state[8] = gl_add(state[8], 0x91cc0b73f34e17edUL);
+    state[9] = gl_add(state[9], 0x876e4427694bd755UL);
+    state[10] = gl_add(state[10], 0x67002ae0725c612dUL);
+    state[11] = gl_add(state[11], 0x05351f20e0b6315fUL);
+    {
+        uint saved_start = 29;
+        for (uint i = 0; i < 12; ++i) {
+            ulong saved = poseidon2_gate_wire(
+                wires,
+                saved_start + i,
+                lde_rows,
+                source_row);
+            poseidon2_gate_emit(
+                gl_sub(state[i], saved),
+                alpha_powers,
+                accumulators,
+                constraint_index);
+            state[i] = saved;
+        }
+    }
+    for (uint i = 0; i < 12; ++i) {
+        state[i] = pow7(state[i]);
+    }
+    external_linear_layer(state);
+
+    // External round 2: RC as immediates
+    state[0] = gl_add(state[0], 0x2e3b9ef5457eb60bUL);
+    state[1] = gl_add(state[1], 0xd9ac17618c3783ddUL);
+    state[2] = gl_add(state[2], 0x0807528ad8874bcfUL);
+    state[3] = gl_add(state[3], 0xc78d546a455d2a0eUL);
+    state[4] = gl_add(state[4], 0xf8b930c81e2481f0UL);
+    state[5] = gl_add(state[5], 0x712707d8dff3b041UL);
+    state[6] = gl_add(state[6], 0xdcb8c0aa0b9d34c3UL);
+    state[7] = gl_add(state[7], 0x9baddbdf2ee3a468UL);
+    state[8] = gl_add(state[8], 0x2dd16d50c5176c78UL);
+    state[9] = gl_add(state[9], 0x89eac5cfbc075cd3UL);
+    state[10] = gl_add(state[10], 0x2a741dea181587f3UL);
+    state[11] = gl_add(state[11], 0x1a4d6aa85a113d84UL);
+    {
+        uint saved_start = 41;
+        for (uint i = 0; i < 12; ++i) {
+            ulong saved = poseidon2_gate_wire(
+                wires,
+                saved_start + i,
+                lde_rows,
+                source_row);
+            poseidon2_gate_emit(
+                gl_sub(state[i], saved),
+                alpha_powers,
+                accumulators,
+                constraint_index);
+            state[i] = saved;
+        }
+    }
+    for (uint i = 0; i < 12; ++i) {
+        state[i] = pow7(state[i]);
+    }
+    external_linear_layer(state);
+
+    // External round 3: RC as immediates
+    state[0] = gl_add(state[0], 0x4d736286a2387e34UL);
+    state[1] = gl_add(state[1], 0x8bad5dfc4fcb3ee3UL);
+    state[2] = gl_add(state[2], 0x84fbd03adb77c56aUL);
+    state[3] = gl_add(state[3], 0x8d5cdd1a23ec53a2UL);
+    state[4] = gl_add(state[4], 0x036f08f08fff28ecUL);
+    state[5] = gl_add(state[5], 0xb717a3f4dbdfb443UL);
+    state[6] = gl_add(state[6], 0x58a074b5509d645cUL);
+    state[7] = gl_add(state[7], 0xf92bf834e4b87718UL);
+    state[8] = gl_add(state[8], 0x1541c3a0baa5ac4bUL);
+    state[9] = gl_add(state[9], 0x22149e6783e67692UL);
+    state[10] = gl_add(state[10], 0x9be8b5d9e112476fUL);
+    state[11] = gl_add(state[11], 0x41e0969f62babb76UL);
+    {
+        uint saved_start = 53;
+        for (uint i = 0; i < 12; ++i) {
+            ulong saved = poseidon2_gate_wire(
+                wires,
+                saved_start + i,
+                lde_rows,
+                source_row);
+            poseidon2_gate_emit(
+                gl_sub(state[i], saved),
+                alpha_powers,
+                accumulators,
+                constraint_index);
+            state[i] = saved;
+        }
+    }
+    for (uint i = 0; i < 12; ++i) {
+        state[i] = pow7(state[i]);
+    }
+    external_linear_layer(state);
+
+    // 22 partial rounds: RC on lane 0 as immediates
+    {
+        ulong saved = poseidon2_gate_wire(wires, 65, lde_rows, source_row);
         poseidon2_gate_emit(
-            gl_sub(gl_add(state[0], internal_constants[round]), saved),
+            gl_sub(gl_add(state[0], 0xa571418d95897b60UL), saved),
             alpha_powers,
             accumulators,
             constraint_index);
         state[0] = pow7(saved);
-        internal_linear_layer(state, diagonal);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 66, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0x8f32676574fcf6d3UL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 67, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0x731102d4e3fb1bbeUL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 68, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0x0330f08328a82d2bUL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 69, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0x7f0449b6557f785dUL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 70, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0x62f06210658dcbcbUL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 71, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0xd5a98af9f89c458bUL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 72, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0x77ec69083a346385UL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 73, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0xef7ca48bbc27f890UL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 74, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0x53e9652f61eac532UL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 75, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0xa71c634abff4f0ccUL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 76, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0xb16f5f0d7e28ea29UL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 77, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0xc9dde31d0a003ab2UL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 78, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0x2ddadf9775902533UL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 79, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0xe4fa73fb16408b47UL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 80, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0x90242ebc00d2ee59UL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 81, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0xbb02dffd9f381982UL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 82, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0xdea328364c50907cUL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 83, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0x1395d3b924857cf8UL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 84, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0x7d3ead0d5aec04e6UL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 85, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0xc2f12be3fed74668UL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
+    }
+    {
+        ulong saved = poseidon2_gate_wire(wires, 86, lde_rows, source_row);
+        poseidon2_gate_emit(
+            gl_sub(gl_add(state[0], 0x0ba3c338f8c3d285UL), saved),
+            alpha_powers,
+            accumulators,
+            constraint_index);
+        state[0] = pow7(saved);
+        internal_linear_layer(state);
     }
 
-    for (uint round = 4; round < 8; ++round) {
-        for (uint i = 0; i < 12; ++i) {
-            state[i] = gl_add(state[i], external_constants[round * 12 + i]);
-        }
-        uint saved_start = 87 + (round - 4) * 12;
+    // External round 4: RC as immediates
+    state[0] = gl_add(state[0], 0xbc585ad3b9443dbbUL);
+    state[1] = gl_add(state[1], 0xf28dd3206975cbb1UL);
+    state[2] = gl_add(state[2], 0xdd8815e53ca045e0UL);
+    state[3] = gl_add(state[3], 0xde82c416b9e701baUL);
+    state[4] = gl_add(state[4], 0xc5cb875233afa025UL);
+    state[5] = gl_add(state[5], 0x7212697cd897ffa9UL);
+    state[6] = gl_add(state[6], 0x67844790aa63cfd7UL);
+    state[7] = gl_add(state[7], 0xdc0b9cfa97fe65c3UL);
+    state[8] = gl_add(state[8], 0xe8fe091869a82070UL);
+    state[9] = gl_add(state[9], 0x62902bb2e413c6d1UL);
+    state[10] = gl_add(state[10], 0x29f9f5001fb84f57UL);
+    state[11] = gl_add(state[11], 0xbe1014796ef5f8beUL);
+    {
+        uint saved_start = 87;
         for (uint i = 0; i < 12; ++i) {
             ulong saved = poseidon2_gate_wire(
                 wires,
@@ -547,8 +1005,101 @@ kernel void poseidon2_gate_quotient(
                 constraint_index);
             state[i] = pow7(saved);
         }
-        external_linear_layer(state);
     }
+    external_linear_layer(state);
+
+    // External round 5: RC as immediates
+    state[0] = gl_add(state[0], 0x71feb53e9bdba19cUL);
+    state[1] = gl_add(state[1], 0x251054f592ebb71cUL);
+    state[2] = gl_add(state[2], 0xe1a57643a4bb284bUL);
+    state[3] = gl_add(state[3], 0xa4ba6f87a45b739bUL);
+    state[4] = gl_add(state[4], 0x2c1fcade0b958c49UL);
+    state[5] = gl_add(state[5], 0xbbb424cda9a3e360UL);
+    state[6] = gl_add(state[6], 0x2ca647354c5f3f54UL);
+    state[7] = gl_add(state[7], 0xc9277b64d152e084UL);
+    state[8] = gl_add(state[8], 0xdbc9ac97445eff17UL);
+    state[9] = gl_add(state[9], 0x6f6cdf3198969f70UL);
+    state[10] = gl_add(state[10], 0x1de29d14fa76d8f1UL);
+    state[11] = gl_add(state[11], 0x73337458a8cc1d19UL);
+    {
+        uint saved_start = 99;
+        for (uint i = 0; i < 12; ++i) {
+            ulong saved = poseidon2_gate_wire(
+                wires,
+                saved_start + i,
+                lde_rows,
+                source_row);
+            poseidon2_gate_emit(
+                gl_sub(state[i], saved),
+                alpha_powers,
+                accumulators,
+                constraint_index);
+            state[i] = pow7(saved);
+        }
+    }
+    external_linear_layer(state);
+
+    // External round 6: RC as immediates
+    state[0] = gl_add(state[0], 0xb87e775e2fb3ab23UL);
+    state[1] = gl_add(state[1], 0xf166a1c7a565c80bUL);
+    state[2] = gl_add(state[2], 0xb24be06f426c747fUL);
+    state[3] = gl_add(state[3], 0xc281e8c49482ce00UL);
+    state[4] = gl_add(state[4], 0x51974c3b3b726c2dUL);
+    state[5] = gl_add(state[5], 0x87444cf8caf7d619UL);
+    state[6] = gl_add(state[6], 0x7c362f827a580cedUL);
+    state[7] = gl_add(state[7], 0x9567af14667647a0UL);
+    state[8] = gl_add(state[8], 0xcbf0473cbec54e37UL);
+    state[9] = gl_add(state[9], 0xe3209dedeff4f620UL);
+    state[10] = gl_add(state[10], 0xd43ad94e45a4c4eeUL);
+    state[11] = gl_add(state[11], 0x976981ee73f41768UL);
+    {
+        uint saved_start = 111;
+        for (uint i = 0; i < 12; ++i) {
+            ulong saved = poseidon2_gate_wire(
+                wires,
+                saved_start + i,
+                lde_rows,
+                source_row);
+            poseidon2_gate_emit(
+                gl_sub(state[i], saved),
+                alpha_powers,
+                accumulators,
+                constraint_index);
+            state[i] = pow7(saved);
+        }
+    }
+    external_linear_layer(state);
+
+    // External round 7: RC as immediates
+    state[0] = gl_add(state[0], 0xef707a224e207258UL);
+    state[1] = gl_add(state[1], 0x2fc779e10e6362eeUL);
+    state[2] = gl_add(state[2], 0x29b5ee60ad8c891fUL);
+    state[3] = gl_add(state[3], 0x96b37b39d8bfd667UL);
+    state[4] = gl_add(state[4], 0x877df68a8b22e733UL);
+    state[5] = gl_add(state[5], 0x5c41746f562c8d9fUL);
+    state[6] = gl_add(state[6], 0x0c9d76751052b71aUL);
+    state[7] = gl_add(state[7], 0xfb3465341bf1c087UL);
+    state[8] = gl_add(state[8], 0xa0d14dc614d15eb1UL);
+    state[9] = gl_add(state[9], 0xdc27d17136906fa6UL);
+    state[10] = gl_add(state[10], 0x482e163b05ec397fUL);
+    state[11] = gl_add(state[11], 0x0273a462992366efUL);
+    {
+        uint saved_start = 123;
+        for (uint i = 0; i < 12; ++i) {
+            ulong saved = poseidon2_gate_wire(
+                wires,
+                saved_start + i,
+                lde_rows,
+                source_row);
+            poseidon2_gate_emit(
+                gl_sub(state[i], saved),
+                alpha_powers,
+                accumulators,
+                constraint_index);
+            state[i] = pow7(saved);
+        }
+    }
+    external_linear_layer(state);
 
     for (uint i = 0; i < 12; ++i) {
         ulong expected = poseidon2_gate_wire(wires, 12 + i, lde_rows, source_row);
