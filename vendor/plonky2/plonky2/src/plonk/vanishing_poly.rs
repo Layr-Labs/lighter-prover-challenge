@@ -215,6 +215,15 @@ pub(crate) enum PermutationBatch<'a, F> {
         /// Sigma columns (`sigmas_range` of the constants-sigmas commitment).
         s_sigmas_cols: &'a [F],
     },
+    /// The routed-wire product checks are evaluated asynchronously on Metal.
+    /// The CPU retains only the local Z columns needed by the two L_0 boundary
+    /// terms and shifts its gate accumulator past the full permutation prefix.
+    GpuProducts {
+        local_zs_cols: &'a [F],
+        local_zs_stride: usize,
+        local_zs_offset: usize,
+        gate_alpha_shifts: &'a [F],
+    },
 }
 
 const INTERLEAVE_PAIR_WIRES: usize = 136;
@@ -291,7 +300,7 @@ fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
     let batch_size = vars_batch.len();
     debug_assert_eq!(output.len(), batch_size);
     let selector_index = common_data.selectors_info.selector_indices[gate_index];
-    let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
+    let selector_col = vars_batch.local_constants_column(selector_index);
     let mut factors = common_data.selectors_info.groups[selector_index]
         .clone()
         .filter(|&index| index != gate_index)
@@ -322,17 +331,17 @@ fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
 /// MACs. The second half lands on the same row and uses one packed MAC with the
 /// pre-summed filters. No range column survives past the current bit.
 fn eval_interleave_pair_dense_fused<F: Field>(
-    wires: &[F],
-    batch_size: usize,
+    vars_batch: EvaluationVarsBaseBatch<'_, F>,
     interleave_filter: &[F],
     uninterleave_filter: &[F],
     summed_filter: &[F],
     combined: &mut [F],
 ) {
+    let batch_size = vars_batch.len();
     debug_assert_eq!(interleave_filter.len(), batch_size);
     debug_assert_eq!(uninterleave_filter.len(), batch_size);
     debug_assert_eq!(summed_filter.len(), batch_size);
-    debug_assert!(wires.len() >= INTERLEAVE_PAIR_WIRES * batch_size);
+    debug_assert!(vars_batch.local_wires.len() >= batch_size);
     debug_assert!(combined.len() >= INTERLEAVE_PAIR_CONSTRAINTS * batch_size);
 
     const STACK_COLS: usize = 10;
@@ -362,7 +371,7 @@ fn eval_interleave_pair_dense_fused<F: Field>(
 
         for bit_index in 0..32 {
             let bit_number = bit_offset + bit_index;
-            let bit_col = &wires[(8 + bit_number) * batch_size..][..batch_size];
+            let bit_col = vars_batch.local_wires_column(8 + bit_number);
             let parity_index = 2 * (operation / 2) + bit_index % 2;
             let parity = &mut parity_accumulators
                 [parity_index * batch_size..(parity_index + 1) * batch_size];
@@ -387,7 +396,7 @@ fn eval_interleave_pair_dense_fused<F: Field>(
             }
         }
 
-        let x_col = &wires[(2 * operation) * batch_size..][..batch_size];
+        let x_col = vars_batch.local_wires_column(2 * operation);
         for point in 0..batch_size {
             range[point] = x[point] - x_col[point];
         }
@@ -395,7 +404,7 @@ fn eval_interleave_pair_dense_fused<F: Field>(
             [interleave_row * batch_size..(interleave_row + 1) * batch_size];
         batch_multiply_add_inplace(output, range, interleave_filter);
 
-        let spread_col = &wires[(2 * operation + 1) * batch_size..][..batch_size];
+        let spread_col = vars_batch.local_wires_column(2 * operation + 1);
         for point in 0..batch_size {
             range[point] = base4_accumulator[point] - spread_col[point];
         }
@@ -415,10 +424,10 @@ fn eval_interleave_pair_dense_fused<F: Field>(
             &parity_accumulators[(2 * operation) * batch_size..(2 * operation + 1) * batch_size];
         let odds = &parity_accumulators
             [(2 * operation + 1) * batch_size..(2 * operation + 2) * batch_size];
-        let interleaved = &wires[(4 * operation) * batch_size..][..batch_size];
-        let x_evens = &wires[(4 * operation + 1) * batch_size..][..batch_size];
-        let x_odds = &wires[(4 * operation + 2) * batch_size..][..batch_size];
-        let inverse = &wires[(4 * operation + 3) * batch_size..][..batch_size];
+        let interleaved = vars_batch.local_wires_column(4 * operation);
+        let x_evens = vars_batch.local_wires_column(4 * operation + 1);
+        let x_odds = vars_batch.local_wires_column(4 * operation + 2);
+        let inverse = vars_batch.local_wires_column(4 * operation + 3);
 
         for point in 0..batch_size {
             range[point] =
@@ -494,6 +503,43 @@ fn reduce_gate_constraints_base_batch<F: Field>(
     }
 }
 
+fn fold_gpu_permutation_boundary_terms<F: Field>(
+    local_zs_cols: &[F],
+    local_zs_stride: usize,
+    local_zs_offset: usize,
+    l_0_xs: &[F],
+    alphas: &[F],
+    gate_alpha_shifts: &[F],
+    batch_size: usize,
+    res_out: &mut [F],
+) {
+    let num_challenges = alphas.len();
+    debug_assert_eq!(gate_alpha_shifts.len(), num_challenges);
+    debug_assert!(local_zs_offset + batch_size <= local_zs_stride);
+    debug_assert!(
+        local_zs_cols.len()
+            >= (num_challenges - 1) * local_zs_stride + local_zs_offset + batch_size
+    );
+    debug_assert_eq!(l_0_xs.len(), batch_size);
+    debug_assert_eq!(res_out.len(), batch_size * num_challenges);
+
+    for point in 0..batch_size {
+        let result = &mut res_out
+            [point * num_challenges..(point + 1) * num_challenges];
+        for (output_challenge, value) in result.iter_mut().enumerate() {
+            let alpha = alphas[output_challenge];
+            *value *= gate_alpha_shifts[output_challenge];
+            let mut power = F::ONE;
+            for permutation_challenge in 0..num_challenges {
+                let z = local_zs_cols
+                    [permutation_challenge * local_zs_stride + local_zs_offset + point];
+                *value += l_0_xs[point] * (z - F::ONE) * power;
+                power *= alpha;
+            }
+        }
+    }
+}
+
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
 ///
 /// Results are stored point-major: the challenges for point `k` occupy
@@ -561,6 +607,45 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
     reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out, true);
+
+    if let PermutationBatch::GpuProducts {
+        local_zs_cols,
+        local_zs_stride,
+        local_zs_offset,
+        gate_alpha_shifts,
+    } = perm
+    {
+        assert!(
+            !has_lookup,
+            "lookup circuits cannot offload permutation products"
+        );
+        assert!(local_zs_offset + n <= local_zs_stride);
+        assert!(
+            local_zs_cols.len()
+                >= (num_challenges - 1) * local_zs_stride + local_zs_offset + n
+        );
+        assert_eq!(gate_alpha_shifts.len(), num_challenges);
+        let l_0_xs = &mut scratch.vanishing_z_1_terms;
+        l_0_xs.clear();
+        l_0_xs.extend(
+            indices_batch
+                .iter()
+                .zip(xs_batch)
+                .map(|(&index, &x)| z_h_on_coset.eval_l_0(index, x)),
+        );
+        fold_gpu_permutation_boundary_terms(
+            local_zs_cols,
+            local_zs_stride,
+            local_zs_offset,
+            l_0_xs,
+            alphas,
+            gate_alpha_shifts,
+            n,
+            res_out,
+        );
+        l_0_xs.clear();
+        return;
+    }
 
     let numerator_values = &mut scratch.numerator_values;
     let denominator_values = &mut scratch.denominator_values;
@@ -1422,8 +1507,7 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
                     summed_filter[point] = interleave_filter[point] + uninterleave_filter[point];
                 }
                 eval_interleave_pair_dense_fused(
-                    vars_batch.local_wires,
-                    vars_batch.len(),
+                    vars_batch,
                     interleave_filter,
                     uninterleave_filter,
                     summed_filter,
@@ -1659,9 +1743,10 @@ pub(crate) fn eval_vanishing_poly_circuit<F: RichField + Extendable<D>, const D:
 #[cfg(test)]
 mod tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
-    use plonky2_field::types::PrimeField64;
+    use plonky2_field::types::{Field64, PrimeField64};
 
     use super::*;
+    use crate::hash::hash_types::HashOut;
 
     #[test]
     fn constraint_major_reduction_preserves_pointwise_horner_order() {
@@ -1801,15 +1886,46 @@ mod tests {
                 }
             }
 
-            let mut actual_rows = initial_rows;
-            eval_interleave_pair_dense_fused(
-                &wires,
+            let mut actual_rows = initial_rows.clone();
+            let public_inputs_hash = HashOut::ZERO;
+            let vars_batch = EvaluationVarsBaseBatch::new(
                 batch_size,
+                &[],
+                &wires,
+                &public_inputs_hash,
+            );
+            eval_interleave_pair_dense_fused(
+                vars_batch,
                 &interleave_filter,
                 &uninterleave_filter,
                 &summed_filter,
                 &mut actual_rows,
             );
+
+            let stride = batch_size + 5;
+            let offset = 2;
+            let mut strided_wires = vec![F::ZERO; INTERLEAVE_PAIR_WIRES * stride];
+            for column in 0..INTERLEAVE_PAIR_WIRES {
+                strided_wires[column * stride + offset..][..batch_size]
+                    .copy_from_slice(&wires[column * batch_size..][..batch_size]);
+            }
+            let strided_vars = EvaluationVarsBaseBatch::new_strided(
+                batch_size,
+                stride,
+                offset,
+                &[],
+                &strided_wires,
+                &public_inputs_hash,
+            );
+            let mut strided_rows = initial_rows.clone();
+            eval_interleave_pair_dense_fused(
+                strided_vars,
+                &interleave_filter,
+                &uninterleave_filter,
+                &summed_filter,
+                &mut strided_rows,
+            );
+            assert_eq!(strided_rows, actual_rows, "strided view mismatch");
 
             for (index, (&actual, &expected)) in
                 actual_rows.iter().zip(&expected_rows).enumerate()
@@ -1852,6 +1968,60 @@ mod tests {
                     "alpha reduction mismatch at {index}, batch={batch_size}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn gpu_permutation_boundary_fold_preserves_global_alpha_order() {
+        type F = GoldilocksField;
+        const BATCH: usize = 7;
+        const CHALLENGES: usize = 2;
+        const PERMUTATION_ROWS: usize = 8;
+
+        let alphas = [F::from_canonical_u64(3), F::from_canonical_u64(5)];
+        let gate_alpha_shifts = alphas.map(|alpha| alpha.exp_u64(PERMUTATION_ROWS as u64));
+        let local_zs_cols = (0..BATCH * CHALLENGES)
+            .map(|i| F::from_canonical_usize(11 + i))
+            .collect::<Vec<_>>();
+        let l_0_xs = (0..BATCH)
+            .map(|i| F::from_canonical_usize(37 + i))
+            .collect::<Vec<_>>();
+        let mut actual = (0..BATCH * CHALLENGES)
+            .map(|i| F::from_canonical_usize(53 + i))
+            .collect::<Vec<_>>();
+        let mut expected = actual.clone();
+
+        for point in 0..BATCH {
+            for output_challenge in 0..CHALLENGES {
+                let alpha = alphas[output_challenge];
+                let mut power = F::ONE;
+                expected[point * CHALLENGES + output_challenge] *=
+                    gate_alpha_shifts[output_challenge];
+                for permutation_challenge in 0..CHALLENGES {
+                    let term = l_0_xs[point]
+                        * local_zs_cols[permutation_challenge * BATCH + point].sub_one();
+                    expected[point * CHALLENGES + output_challenge] += term * power;
+                    power *= alpha;
+                }
+            }
+        }
+
+        fold_gpu_permutation_boundary_terms(
+            &local_zs_cols,
+            BATCH,
+            0,
+            &l_0_xs,
+            &alphas,
+            &gate_alpha_shifts,
+            BATCH,
+            &mut actual,
+        );
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                actual.to_canonical_u64(),
+                expected.to_canonical_u64(),
+                "boundary fold mismatch at word {index}"
+            );
         }
     }
 

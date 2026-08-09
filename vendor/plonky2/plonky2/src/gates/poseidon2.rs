@@ -214,8 +214,7 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
         let n = vars_base.len();
         assert_eq!(filters.len(), n);
         assert!(combined_gate_constraints.len() >= self.num_constraints() * n);
-        let wires = vars_base.local_wires;
-        let col = |w: usize| &wires[w * n..][..n];
+        let col = |w: usize| vars_base.local_wires_column(w);
 
         // Batches are 32 points in this prover; keep the scratch row on the
         // stack and fall back to the heap only for oversized batches.
@@ -1026,8 +1025,7 @@ mod tests {
     let n = vars_base.len();
     assert_eq!(filters.len(), n);
     assert!(combined_gate_constraints.len() >= gate.num_constraints() * n);
-    let wires = vars_base.local_wires;
-    let col = |w: usize| &wires[w * n..][..n];
+    let col = |w: usize| vars_base.local_wires_column(w);
 
     // Batches are 32 points in this prover; keep the scratch row on the
     // stack and fall back to the heap only for oversized batches.
