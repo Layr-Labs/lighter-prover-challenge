@@ -368,11 +368,24 @@ inline void internal_linear_layer(thread ulong state[12], constant ulong* diagon
     state[11] = gl_mul_add(state[11], 0xd27dbb6944917b60UL, sum);
 }
 
+// Fixed INTERNAL_CONSTANTS from config.rs. Program-scope constant memory lets
+// the compiler treat RC operands as immediates without unrolling the 22-round
+// body (full unroll duplicated internal_linear_layer and blew I-cache).
+constant ulong POSEIDON2_INTERNAL_RC[22] = {
+    0xa571418d95897b60UL, 0x8f32676574fcf6d3UL, 0x731102d4e3fb1bbeUL, 0x0330f08328a82d2bUL,
+    0x7f0449b6557f785dUL, 0x62f06210658dcbcbUL, 0xd5a98af9f89c458bUL, 0x77ec69083a346385UL,
+    0xef7ca48bbc27f890UL, 0x53e9652f61eac532UL, 0xa71c634abff4f0ccUL, 0xb16f5f0d7e28ea29UL,
+    0xc9dde31d0a003ab2UL, 0x2ddadf9775902533UL, 0xe4fa73fb16408b47UL, 0x90242ebc00d2ee59UL,
+    0xbb02dffd9f381982UL, 0xdea328364c50907cUL, 0x1395d3b924857cf8UL, 0x7d3ead0d5aec04e6UL,
+    0xc2f12be3fed74668UL, 0x0ba3c338f8c3d285UL
+};
+
 // Parameter layout: 8 x 12 external constants, 22 internal constants,
 // then the 12-element internal diagonal.
 inline void poseidon2(thread ulong state[12], constant ulong* parameters) {
     constant ulong* external_constants = parameters;
-    constant ulong* internal_constants = parameters + 96;
+    // Parameter-buffer layout unchanged (internal RC + diagonal still uploaded).
+    // Hash-path internal rounds read POSEIDON2_INTERNAL_RC instead of parameters+96.
     constant ulong* diagonal = parameters + 118;
 
     external_linear_layer(state);
@@ -385,7 +398,7 @@ inline void poseidon2(thread ulong state[12], constant ulong* parameters) {
     }
 
     for (uint round = 0; round < 22; ++round) {
-        state[0] = pow7(gl_add(state[0], internal_constants[round]));
+        state[0] = pow7(gl_add(state[0], POSEIDON2_INTERNAL_RC[round]));
         internal_linear_layer(state, diagonal);
     }
 
