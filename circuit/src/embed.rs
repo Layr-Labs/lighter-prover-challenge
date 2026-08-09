@@ -21,6 +21,9 @@
 //!   commitment path, guaranteeing a bit-identical Merkle cap;
 //! * the representative map is stored as zigzag-varint deltas against the
 //!   identity permutation (mostly zeros) instead of 8-byte usizes;
+//! * the runtime permutation-factor deletion plan is generated once by the
+//!   untimed build and loaded as a compressed section instead of being
+//!   re-derived from every sigma edge during scored startup;
 //! * the generator watch index is stored in its CSR form (varint-delta
 //!   offsets + `u32` watcher ids);
 //! * constant polynomials are stored as *values* (step-function selectors,
@@ -41,7 +44,7 @@ use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::plonk::circuit_data::{
     CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
 };
-use plonky2::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
+use plonky2::plonk::permutation_argument::{permutation_factor_skip_mask_len, Forest};
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
 use plonky2::util::{log2_ceil, transpose_poly_values_ref};
@@ -66,7 +69,7 @@ fn embed_generator_serializer() -> EmbedGeneratorSerializer {
 }
 
 const EMBED_MAGIC: u32 = 0x4C45_4331; // "LEC1"
-const EMBED_VERSION: u32 = 1;
+const EMBED_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Primitive encoding helpers
@@ -287,6 +290,22 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     }
     write_compressed_section(&mut out, &buf);
 
+    // The directed-cancellation plan is pure circuit metadata. Persist the build-time result in
+    // this trusted compact format so the scored worker does not re-walk every sigma edge solely
+    // to reconstruct it. The surrounding zstd section compresses the long all-zero/all-one runs.
+    let expected_skip_len = permutation_factor_skip_mask_len(
+        degree,
+        num_routed,
+        common.quotient_degree_factor,
+    )
+    .context("embedded circuit has an invalid permutation skip layout")?;
+    ensure!(
+        prover.permutation_factor_skips.len() == expected_skip_len,
+        "permutation skip plan holds {} bytes, expected {expected_skip_len}",
+        prover.permutation_factor_skips.len(),
+    );
+    write_compressed_section(&mut out, &prover.permutation_factor_skips);
+
     Ok(out)
 }
 
@@ -468,6 +487,29 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         representative_map
             .push(u32::try_from(parent).context("representative map entry out of range")?);
     }
+
+    // Runtime-only directed-cancellation plan, precomputed by the untimed build script. Exact
+    // length validation keeps every prover-side decoder in bounds without another sigma scan.
+    let expected_skip_len = permutation_factor_skip_mask_len(
+        degree,
+        common.config.num_routed_wires,
+        common.quotient_degree_factor,
+    )
+    .context("embedded circuit has an invalid permutation skip layout")?;
+    ensure!(
+        bytes.len() >= pos + 8,
+        "embedded circuit blob truncated at permutation skip section header"
+    );
+    let encoded_skip_len = usize::try_from(u64::from_le_bytes(
+        bytes[pos..pos + 8].try_into().unwrap(),
+    ))
+    .context("embedded permutation skip section length exceeds usize")?;
+    ensure!(
+        encoded_skip_len == expected_skip_len,
+        "embedded permutation skip plan holds {} bytes, expected {expected_skip_len}",
+        encoded_skip_len,
+    );
+    let permutation_factor_skips = read_compressed_section(bytes, &mut pos)?;
     ensure!(pos == bytes.len(), "trailing bytes in embedded circuit blob");
 
     // ---- recompute the derived prover-only components ----
@@ -492,13 +534,20 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
 
     // Sigma values from the representative map, through the builder's own
     // forest partition code (`sigma_vecs` post-`compress_paths` state).
-    let mut forest = Forest::from_parents(representative_map, num_wires, num_routed, degree);
-    let wire_partition = forest.wire_partition();
+    // This blob was produced from a built circuit by this crate's build script and compiled into
+    // the executable. Generic/untrusted circuit deserialization still validates every parent;
+    // rescanning tens of millions of trusted parents here would duplicate build-time work.
+    let mut forest = Forest::from_trusted_compressed_parents(
+        representative_map,
+        num_wires,
+        num_routed,
+        degree,
+    );
+    let wire_partition = forest
+        .try_wire_partition()
+        .context("embedded circuit has an invalid representative map")?;
     let sigma_vecs = wire_partition.get_sigma_polys(degree_bits, &common.k_is, &subgroup);
     let representative_map = forest.into_parents();
-    let fixed_routed_wires =
-        fixed_routed_wire_mask(&representative_map, num_wires, num_routed, degree)
-            .context("embedded circuit has an invalid compressed representative map")?;
 
     // `prover_only.sigmas` is the transpose of the sigma *values*, and the
     // commitment below consumes those same values. Transposing first reads the
@@ -588,7 +637,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         subgroup,
         public_inputs,
         representative_map,
-        fixed_routed_wires,
+        permutation_factor_skips,
         fft_root_table: Some(root_table),
         circuit_digest,
         lookup_rows,
@@ -608,6 +657,10 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plonky2::iop::witness::{PartialWitness, WitnessWrite};
+    use plonky2::plonk::circuit_builder::CircuitBuilder;
+
+    use crate::types::config::CIRCUIT_CONFIG;
 
     #[test]
     fn varint_round_trips() {
@@ -655,5 +708,35 @@ mod tests {
         let decoded = read_compressed_section(&framed, &mut pos).unwrap();
         assert_eq!(decoded, input);
         assert_eq!(pos, framed.len());
+    }
+
+    #[test]
+    fn compact_round_trip_loads_build_time_skip_plan_and_proves() {
+        let mut builder = CircuitBuilder::<F, D>::new(CIRCUIT_CONFIG);
+        let public = builder.add_virtual_target();
+        let alias = builder.add_virtual_target();
+        builder.connect(public, alias);
+        builder.register_public_input(public);
+        let data = builder.build::<C>();
+
+        let blob = serialize_embedded(&(public, alias), &data).unwrap();
+        let ((loaded_public, loaded_alias), loaded) =
+            deserialize_embedded::<(plonky2::iop::target::Target, plonky2::iop::target::Target)>(
+                &blob,
+            )
+            .unwrap();
+        assert_eq!((loaded_public, loaded_alias), (public, alias));
+        assert_eq!(
+            loaded.prover_only.permutation_factor_skips,
+            data.prover_only.permutation_factor_skips
+        );
+        assert_eq!(loaded.verifier_only, data.verifier_only);
+
+        let mut witness = PartialWitness::new();
+        witness
+            .set_target(loaded_public, F::from_canonical_u64(7))
+            .unwrap();
+        let proof = loaded.prove(witness).unwrap();
+        loaded.verify(proof).unwrap();
     }
 }

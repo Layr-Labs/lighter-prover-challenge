@@ -15,78 +15,89 @@ use crate::iop::wire::Wire;
 /// placement moves. Flip to `false` to restore the previous sequential-outer schedule exactly.
 const OUTER_PARALLEL_SIGMA_COLUMNS: bool = false;
 
-/// Derive one bit per routed `(row, column)` position, in row-major order, that is set exactly
-/// when the position is the only routed member of its copy-constraint component.
-///
-/// `wire_partition` cycles only routed members of each component. Consequently a component with
-/// one routed member maps that member to itself in sigma, even when the component also contains
-/// virtual or advice-wire aliases; a component with two or more routed members has no fixed point.
-/// The compressed representative map therefore contains all the information needed to identify
-/// factors that cancel from the permutation numerator and denominator for every proof.
-///
-/// Cardinalities are saturated at two and packed into two temporary bits per representative. The
-/// retained mask costs one bit per routed position (640 KiB at 80 x 2^16), while peak derivation
-/// scratch is bounded by `representative_map.len() / 4` rather than a `usize` count per target.
-pub fn fixed_routed_wire_mask(
-    representative_map: &[u32],
-    num_wires: usize,
+/// Skip the numerator factor at a routed position. The matching denominator factor belongs to
+/// its unique sigma predecessor in the same base-domain row and quotient-degree chunk.
+pub(crate) const PERMUTATION_SKIP_NUMERATOR: u8 = 1;
+/// Skip the denominator factor at a routed position. Its sigma successor supplies the identical
+/// numerator factor in the same base-domain row and quotient-degree chunk.
+pub(crate) const PERMUTATION_SKIP_DENOMINATOR: u8 = 2;
+pub(crate) const PERMUTATION_SKIP_BOTH: u8 =
+    PERMUTATION_SKIP_NUMERATOR | PERMUTATION_SKIP_DENOMINATOR;
+
+/// The skip mask is stored as paired numerator/denominator bitplanes per base-row quotient
+/// chunk. Within each side plane, the least-significant bit is the chunk's first routed column.
+/// Zero therefore always means "skip nothing", including for malformed or truncated runtime data.
+fn permutation_factor_skip_layout(
     num_routed_wires: usize,
-    degree: usize,
-) -> Option<Vec<u8>> {
-    if num_routed_wires > num_wires {
+    quotient_degree_factor: usize,
+) -> Option<(usize, usize, usize)> {
+    if num_routed_wires == 0 || quotient_degree_factor == 0 {
         return None;
     }
-    let wire_targets = degree.checked_mul(num_wires)?;
-    if wire_targets > representative_map.len() {
-        return None;
-    }
-    let routed_positions = degree.checked_mul(num_routed_wires)?;
-
-    // Two-bit states: 0 = unseen, 1 = exactly one routed member, 2 = at least two.
-    let mut cardinalities = vec![0u8; representative_map.len().div_ceil(4)];
-    for row in 0..degree {
-        let target_base = row * num_wires;
-        for column in 0..num_routed_wires {
-            let representative = representative_map[target_base + column] as usize;
-            // Stored maps have had every path compressed. Besides rejecting a malformed index,
-            // requiring the representative to be a root prevents an uncompressed map from
-            // splitting one component into several apparent singleton components.
-            if representative >= representative_map.len()
-                || representative_map[representative] as usize != representative
-            {
-                return None;
-            }
-            let byte = representative >> 2;
-            let shift = (representative & 3) << 1;
-            let state = (cardinalities[byte] >> shift) & 3;
-            if state < 2 {
-                cardinalities[byte] =
-                    (cardinalities[byte] & !(3 << shift)) | ((state + 1) << shift);
-            }
-        }
-    }
-
-    let mut fixed = vec![0u8; routed_positions.div_ceil(8)];
-    for row in 0..degree {
-        let target_base = row * num_wires;
-        let routed_base = row * num_routed_wires;
-        for column in 0..num_routed_wires {
-            let representative = representative_map[target_base + column] as usize;
-            let state = (cardinalities[representative >> 2] >> ((representative & 3) << 1)) & 3;
-            if state == 1 {
-                let routed_index = routed_base + column;
-                fixed[routed_index >> 3] |= 1 << (routed_index & 7);
-            }
-        }
-    }
-    Some(fixed)
+    let num_chunks = num_routed_wires.div_ceil(quotient_degree_factor);
+    let bytes_per_side = quotient_degree_factor.div_ceil(8);
+    let chunk_stride = bytes_per_side.checked_mul(2)?;
+    let row_stride = num_chunks.checked_mul(chunk_stride)?;
+    Some((num_chunks, bytes_per_side, row_stride))
 }
 
-/// Test a row-major routed-position bit. Out-of-range indices conservatively return `false`.
+/// Exact byte length of the paired permutation-factor skip bitplanes.
+///
+/// This is public so compact, trusted circuit embeddings can validate and load a plan generated
+/// at build time without re-walking the entire sigma permutation during prover startup.
+pub fn permutation_factor_skip_mask_len(
+    degree: usize,
+    num_routed_wires: usize,
+    quotient_degree_factor: usize,
+) -> Option<usize> {
+    let (_, _, row_stride) =
+        permutation_factor_skip_layout(num_routed_wires, quotient_degree_factor)?;
+    degree.checked_mul(row_stride)
+}
+
+/// Read the two skip bits for one row-major routed position from the chunk bitplanes.
+/// Out-of-range indices conservatively return zero (skip nothing).
 #[inline(always)]
-pub(crate) fn fixed_routed_wire(mask: &[u8], routed_index: usize) -> bool {
-    mask.get(routed_index >> 3)
-        .is_some_and(|byte| byte & (1 << (routed_index & 7)) != 0)
+pub(crate) fn permutation_factor_skips(
+    mask: &[u8],
+    routed_index: usize,
+    num_routed_wires: usize,
+    quotient_degree_factor: usize,
+) -> u8 {
+    let Some((num_chunks, bytes_per_side, row_stride)) =
+        permutation_factor_skip_layout(num_routed_wires, quotient_degree_factor)
+    else {
+        return 0;
+    };
+    let row = routed_index / num_routed_wires;
+    let column = routed_index % num_routed_wires;
+    let chunk = column / quotient_degree_factor;
+    let lane = column % quotient_degree_factor;
+    let chunk_base = row
+        .checked_mul(row_stride)
+        .and_then(|base| base.checked_add(chunk * bytes_per_side * 2));
+    let Some(chunk_base) = chunk_base else {
+        return 0;
+    };
+    debug_assert!(chunk < num_chunks);
+    let byte_in_side = lane >> 3;
+    let bit = 1 << (lane & 7);
+    let numerator = mask
+        .get(chunk_base + byte_in_side)
+        .is_some_and(|byte| byte & bit != 0) as u8;
+    let denominator = mask
+        .get(chunk_base + bytes_per_side + byte_in_side)
+        .is_some_and(|byte| byte & bit != 0) as u8;
+    numerator * PERMUTATION_SKIP_NUMERATOR + denominator * PERMUTATION_SKIP_DENOMINATOR
+}
+
+#[inline]
+fn set_permutation_factor_skip(mask: &mut [u8], byte: usize, bit: u8) -> bool {
+    if mask[byte] & bit != 0 {
+        return false;
+    }
+    mask[byte] |= bit;
+    true
 }
 
 /// Disjoint Set Forest data-structure following <https://en.wikipedia.org/wiki/Disjoint-set_data_structure>.
@@ -127,14 +138,46 @@ impl Forest {
         }
     }
 
-    /// Reconstructs a forest from a stored representative map (the `parents`
-    /// vector of a forest whose paths have already been compressed, i.e.
-    /// `ProverOnlyCircuitData::representative_map`). Intended for loaders that
-    /// re-derive the sigma polynomials without re-running circuit
-    /// construction; the returned forest is exactly the state `sigma_vecs`
-    /// leaves behind after `compress_paths`, so `wire_partition` and
-    /// `get_sigma_polys` produce identical output to the original build.
-    pub fn from_parents(
+    /// Reconstructs a forest from a stored, fully compressed representative
+    /// map (`ProverOnlyCircuitData::representative_map`). Intended for loaders
+    /// that re-derive the sigma polynomials without re-running circuit
+    /// construction.
+    ///
+    /// A malformed map must be rejected before [`Self::wire_partition`], which
+    /// deliberately has no bounds checks in its production-sized scan. Every
+    /// stored parent must therefore be an in-range root, and the map must cover
+    /// all physical wires. Valid maps satisfy these conditions because the
+    /// builder calls `compress_paths` over the entire forest before storing it.
+    pub fn from_compressed_parents(
+        parents: Vec<u32>,
+        num_wires: usize,
+        num_routed_wires: usize,
+        degree: usize,
+    ) -> Option<Self> {
+        if num_routed_wires > num_wires
+            || num_wires.checked_mul(degree)? > parents.len()
+            || parents.iter().any(|&parent| {
+                let parent = parent as usize;
+                parent >= parents.len() || parents[parent] as usize != parent
+            })
+        {
+            return None;
+        }
+        Some(Self {
+            parents,
+            num_wires,
+            num_routed_wires,
+            degree,
+        })
+    }
+
+    /// Reconstructs a forest from a trusted, fully compressed representative map without a
+    /// validation scan.
+    ///
+    /// This is intended only for compile-time-generated circuit blobs which are embedded in the
+    /// prover executable. Unlike [`Self::from_compressed_parents`], malformed input can panic in
+    /// [`Self::wire_partition`]; untrusted deserializers must use the validated constructor.
+    pub fn from_trusted_compressed_parents(
         parents: Vec<u32>,
         num_wires: usize,
         num_routed_wires: usize,
@@ -149,7 +192,7 @@ impl Forest {
     }
 
     /// Consumes the forest and returns its parent map, undoing
-    /// [`Self::from_parents`] without copying.
+    /// [`Self::from_compressed_parents`] without copying.
     pub fn into_parents(self) -> Vec<u32> {
         self.parents
     }
@@ -271,6 +314,47 @@ impl Forest {
 
         WirePartition { sigma }
     }
+
+    /// Fallible [`Self::wire_partition`] for compact embedded data.
+    ///
+    /// Parent bounds are checked inside the mandatory routed-wire scan, so a corrupt embedded
+    /// representative map returns `None` without paying a separate whole-map validation pass.
+    /// The commitment-cap check performed by the embedded loader then authenticates the derived
+    /// sigma polynomials. Generic deserialization still validates global compression first.
+    pub fn try_wire_partition(&mut self) -> Option<WirePartition> {
+        if self.num_routed_wires > self.num_wires
+            || self.num_wires.checked_mul(self.degree)? > self.parents.len()
+        {
+            return None;
+        }
+        let routed_positions = self.degree.checked_mul(self.num_routed_wires)?;
+        if routed_positions > u32::MAX as usize {
+            return None;
+        }
+        let mut sigma = vec![0u32; routed_positions];
+        let mut last = vec![u32::MAX; self.parents.len()];
+
+        for row in 0..self.degree {
+            let target_base = row * self.num_wires;
+            for column in 0..self.num_routed_wires {
+                let parent = self.parents[target_base + column] as usize;
+                if parent >= last.len() {
+                    return None;
+                }
+                let index = (column * self.degree + row) as u32;
+                let old_tail = last[parent];
+                if old_tail == u32::MAX {
+                    sigma[index as usize] = index;
+                } else {
+                    sigma[index as usize] = sigma[old_tail as usize];
+                    sigma[old_tail as usize] = index;
+                }
+                last[parent] = index;
+            }
+        }
+
+        Some(WirePartition { sigma })
+    }
 }
 
 #[derive(Debug)]
@@ -279,6 +363,98 @@ pub struct WirePartition {
 }
 
 impl WirePartition {
+    /// Derive paired numerator/denominator skip bitplanes per base-row quotient chunk.
+    ///
+    /// For a sigma edge `p -> q`, the denominator factor at `p` is
+    /// `w(p) + beta * id(q) + gamma`, while the numerator factor at `q` is
+    /// `w(q) + beta * id(q) + gamma`. Copy constraints make `w(p) == w(q)`. If both endpoints
+    /// lie in the same base-domain row and quotient-degree chunk, those identical factors occur
+    /// in the same committed partial-product relation and cancel symbolically. We mark the
+    /// denominator at `p` and numerator at `q` independently; an internal run can therefore make
+    /// an endpoint one-sided and an interior position two-sided. Singleton self-edges naturally
+    /// receive both bits, subsuming the old fixed-position mask.
+    ///
+    /// `WirePartition` is only constructible by [`Forest::wire_partition`], which creates a
+    /// routed-wire permutation from a validated forest. The mask builder relies on that invariant
+    /// instead of allocating and filling a second production-sized bijection bitmap.
+    pub fn permutation_factor_skip_mask(
+        &self,
+        degree: usize,
+        num_routed_wires: usize,
+        quotient_degree_factor: usize,
+    ) -> Option<Vec<u8>> {
+        if !degree.is_power_of_two()
+            || num_routed_wires == 0
+            || quotient_degree_factor == 0
+        {
+            return None;
+        }
+        let routed_positions = degree.checked_mul(num_routed_wires)?;
+        if self.sigma.len() != routed_positions {
+            return None;
+        }
+
+        let (_, bytes_per_side, row_stride) =
+            permutation_factor_skip_layout(num_routed_wires, quotient_degree_factor)?;
+        let chunk_stride = bytes_per_side * 2;
+        let mut skips = vec![
+            0u8;
+            permutation_factor_skip_mask_len(
+                degree,
+                num_routed_wires,
+                quotient_degree_factor,
+            )?
+        ];
+        let degree_bits = degree.trailing_zeros() as usize;
+        let degree_mask = degree - 1;
+        // Division by the quotient width depends only on the routed column. Precompute the tiny
+        // (80-entry in production) address table once rather than repeating it for every row.
+        let skip_columns = (0..num_routed_wires)
+            .map(|column| {
+                let chunk = column / quotient_degree_factor;
+                let lane = column % quotient_degree_factor;
+                let byte_in_side = lane >> 3;
+                let chunk_base = chunk * chunk_stride;
+                (
+                    chunk,
+                    chunk_base + byte_in_side,
+                    chunk_base + bytes_per_side + byte_in_side,
+                    1u8 << (lane & 7),
+                )
+            })
+            .collect::<Vec<_>>();
+        for source_column in 0..num_routed_wires {
+            let (source_chunk, _, source_denominator_byte, source_lane_bit) =
+                skip_columns[source_column];
+            for source_row in 0..degree {
+                let source_column_major = source_column * degree + source_row;
+                let target_column_major = self.sigma[source_column_major] as usize;
+                debug_assert!(target_column_major < routed_positions);
+                let target_column = target_column_major >> degree_bits;
+                let target_row = target_column_major & degree_mask;
+                let (target_chunk, target_numerator_byte, _, target_lane_bit) =
+                    skip_columns[target_column];
+                if source_row == target_row && source_chunk == target_chunk {
+                    let row_base = source_row * row_stride;
+                    let source_skip_byte = row_base + source_denominator_byte;
+                    let target_skip_byte = row_base + target_numerator_byte;
+                    if !set_permutation_factor_skip(
+                        &mut skips,
+                        source_skip_byte,
+                        source_lane_bit,
+                    ) || !set_permutation_factor_skip(
+                        &mut skips,
+                        target_skip_byte,
+                        target_lane_bit,
+                    ) {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(skips)
+    }
+
     pub fn get_sigma_polys<F: Field>(
         &self,
         degree_log: usize,
@@ -827,6 +1003,51 @@ mod tests {
         let _ = Forest::new(135, 80, 1 << 26, 0);
     }
 
+    #[test]
+    fn compressed_forest_loader_rejects_malformed_maps() {
+        let valid = vec![0, 0, 2, 2];
+        let forest = Forest::from_compressed_parents(valid.clone(), 2, 2, 1)
+            .expect("fully compressed in-range map");
+        assert_eq!(forest.into_parents(), valid);
+
+        assert!(Forest::from_compressed_parents(vec![0], 2, 2, 1).is_none());
+        assert!(Forest::from_compressed_parents(vec![0, 1], 1, 2, 1).is_none());
+        assert!(Forest::from_compressed_parents(vec![0, 2], 2, 2, 1).is_none());
+        assert!(Forest::from_compressed_parents(vec![0, 0, 1], 2, 2, 1).is_none());
+        assert!(Forest::from_compressed_parents(vec![], 2, 2, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn trusted_forest_fallible_partition_checks_bounds_in_its_required_scan() {
+        let valid = vec![0, 0, 2, 2];
+        let mut checked = Forest::from_compressed_parents(valid.clone(), 2, 2, 1).unwrap();
+        let expected = checked.wire_partition().sigma;
+        let mut trusted = Forest::from_trusted_compressed_parents(valid, 2, 2, 1);
+        assert_eq!(trusted.try_wire_partition().unwrap().sigma, expected);
+
+        let mut short = Forest::from_trusted_compressed_parents(vec![0], 2, 2, 1);
+        assert!(short.try_wire_partition().is_none());
+        let mut out_of_range = Forest::from_trusted_compressed_parents(vec![0, 2], 2, 2, 1);
+        assert!(out_of_range.try_wire_partition().is_none());
+        let mut too_many_routed =
+            Forest::from_trusted_compressed_parents(vec![0, 1], 1, 2, 1);
+        assert!(too_many_routed.try_wire_partition().is_none());
+    }
+
+    #[test]
+    fn permutation_factor_skip_mask_lengths_cover_chunk_padding() {
+        assert_eq!(permutation_factor_skip_mask_len(4, 80, 8), Some(80));
+        assert_eq!(permutation_factor_skip_mask_len(3, 10, 4), Some(18));
+        assert_eq!(permutation_factor_skip_mask_len(2, 10, 9), Some(16));
+        assert_eq!(permutation_factor_skip_mask_len(1, 1, 1), Some(2));
+        assert_eq!(permutation_factor_skip_mask_len(1, 0, 8), None);
+        assert_eq!(permutation_factor_skip_mask_len(1, 80, 0), None);
+        assert_eq!(
+            permutation_factor_skip_mask_len(usize::MAX, 80, 8),
+            None
+        );
+    }
+
     /// `get_sigma_polys` (shift/mask decode, outer-parallel columns) against the promoted
     /// tree's sequential division/remainder arithmetic.
     #[test]
@@ -874,13 +1095,13 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    /// The runtime cancellation mask is derived from copy-component cardinality, not from a
-    /// target being its own representative. A component may contain virtual/advice aliases and
-    /// still have exactly one routed member; conversely, every routed member of a multi-routed
-    /// component participates in a nontrivial sigma cycle.
+    /// The runtime cancellation mask follows directed sigma edges, not representative identity.
+    /// Virtual/advice aliases do not enter sigma; singleton routed components still self-cancel,
+    /// and nontrivial edges cancel only when both endpoints occupy one row and quotient chunk.
     #[test]
-    fn fixed_routed_mask_is_exactly_sigma_identity_with_aliases() {
+    fn permutation_factor_skip_mask_matches_sigma_edges_with_aliases() {
         let (num_wires, num_routed_wires, degree, num_virtual_targets) = (5, 3, 4, 2);
+        let quotient_degree_factor = 2;
         let merges = [
             // Singleton routed component with a virtual alias.
             (
@@ -905,6 +1126,11 @@ mod tests {
                 Target::Wire(Wire { row: 1, column: 2 }),
                 Target::VirtualTarget { index: 1 },
             ),
+            // A non-singleton two-cycle wholly inside row 2, quotient chunk 0.
+            (
+                Target::Wire(Wire { row: 2, column: 0 }),
+                Target::Wire(Wire { row: 2, column: 1 }),
+            ),
         ];
         let mut forest = build_forest(
             num_wires,
@@ -914,32 +1140,81 @@ mod tests {
             &merges,
         );
         forest.compress_paths();
-        let representative_map = forest.parents.clone();
-        let sigma = forest.wire_partition().sigma;
+        let partition = forest.wire_partition();
+        let mask = partition
+            .permutation_factor_skip_mask(
+                degree,
+                num_routed_wires,
+                quotient_degree_factor,
+            )
+            .expect("valid sigma permutation");
+        assert_eq!(
+            mask.len(),
+            degree
+                * num_routed_wires.div_ceil(quotient_degree_factor)
+                * quotient_degree_factor.div_ceil(8)
+                * 2
+        );
 
-        let mask = fixed_routed_wire_mask(
-            &representative_map,
-            num_wires,
-            num_routed_wires,
-            degree,
-        )
-        .expect("valid compressed representative map");
-        assert_eq!(mask.len(), (degree * num_routed_wires).div_ceil(8));
-
-        for row in 0..degree {
-            for column in 0..num_routed_wires {
-                let row_major = row * num_routed_wires + column;
-                let column_major = column * degree + row;
-                assert_eq!(
-                    fixed_routed_wire(&mask, row_major),
-                    sigma[column_major] as usize == column_major,
-                    "mask/sigma identity mismatch at ({row}, {column})"
-                );
+        let mut expected = vec![0u8; degree * num_routed_wires];
+        for source_column in 0..num_routed_wires {
+            for source_row in 0..degree {
+                let source_column_major = source_column * degree + source_row;
+                let target_column_major = partition.sigma[source_column_major] as usize;
+                let target_column = target_column_major / degree;
+                let target_row = target_column_major % degree;
+                if source_row == target_row
+                    && source_column / quotient_degree_factor
+                        == target_column / quotient_degree_factor
+                {
+                    expected[source_row * num_routed_wires + source_column] |=
+                        PERMUTATION_SKIP_DENOMINATOR;
+                    expected[target_row * num_routed_wires + target_column] |=
+                        PERMUTATION_SKIP_NUMERATOR;
+                }
             }
         }
-        assert!(fixed_routed_wire(&mask, 0));
-        assert!(fixed_routed_wire(&mask, 1));
-        assert!(!fixed_routed_wire(&mask, 2));
-        assert!(!fixed_routed_wire(&mask, num_routed_wires));
+        for (index, &expected_state) in expected.iter().enumerate() {
+            assert_eq!(
+                permutation_factor_skips(
+                    &mask,
+                    index,
+                    num_routed_wires,
+                    quotient_degree_factor,
+                ),
+                expected_state,
+                "mask/sigma edge mismatch at row-major position {index}"
+            );
+        }
+        assert_eq!(
+            permutation_factor_skips(&mask, 0, num_routed_wires, quotient_degree_factor),
+            PERMUTATION_SKIP_BOTH
+        );
+        assert_eq!(
+            permutation_factor_skips(&mask, 1, num_routed_wires, quotient_degree_factor),
+            PERMUTATION_SKIP_BOTH
+        );
+        assert_eq!(
+            permutation_factor_skips(&mask, 2, num_routed_wires, quotient_degree_factor),
+            0
+        );
+        assert_eq!(
+            permutation_factor_skips(
+                &mask,
+                2 * num_routed_wires,
+                num_routed_wires,
+                quotient_degree_factor,
+            ),
+            PERMUTATION_SKIP_BOTH
+        );
+        assert_eq!(
+            permutation_factor_skips(
+                &mask,
+                2 * num_routed_wires + 1,
+                num_routed_wires,
+                quotient_degree_factor,
+            ),
+            PERMUTATION_SKIP_BOTH
+        );
     }
 }

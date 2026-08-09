@@ -597,14 +597,17 @@ pub struct ProverOnlyCircuitData<
     /// zero-extended at every indexing site. The serialized encoding keeps the legacy 8-byte
     /// per-entry format.
     pub representative_map: Vec<u32>,
-    /// One bit per routed `(row, column)` position, in row-major order. A set bit means that the
-    /// position is the sole routed member of its copy-constraint component, hence its sigma
-    /// permutation target is itself and its permutation factor cancels for every proof.
+    /// Two packed bits per routed `(row, column)` position, in row-major order. Bit zero skips the
+    /// position's numerator factor when its sigma predecessor is in the same row and quotient
+    /// chunk; bit one skips its denominator factor when its sigma successor is in that same row
+    /// and chunk. Every skipped factor is paired with an identical opposite-side factor inside
+    /// one committed partial-product relation. Singleton self-edges have both bits set.
     ///
     /// Runtime-only: this is derived from [`Self::representative_map`] during circuit construction
-    /// and reconstructed during deserialization, so it changes neither the serialized format nor
-    /// the circuit digest.
-    pub fixed_routed_wires: Vec<u8>,
+    /// and reconstructed during generic deserialization. Trusted compact executable embeddings
+    /// persist the derived bytes to remove that reconstruction from scored startup. It remains
+    /// outside the standard serialized format and the circuit digest.
+    pub permutation_factor_skips: Vec<u8>,
     /// Pre-computed roots for faster FFT.
     pub fft_root_table: Option<FftRootTable<F>>,
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to
