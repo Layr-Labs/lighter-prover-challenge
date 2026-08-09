@@ -1681,6 +1681,52 @@ fn start_gpu_range_check_gate_quotient<
     Some((gate_indices, job))
 }
 
+/// Adds one or two completed Metal gate-quotient outputs to the CPU remainder.
+///
+/// Both GPU kernels produce contributions before division by `Z_H`. When both
+/// jobs are active, distributivity lets us add their values before the shared
+/// denominator multiply. This keeps the result field-identical while replacing
+/// two full-domain Rayon passes and two multiplications per challenge with one.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn add_gpu_gate_quotient_contributions<F: RichField>(
+    quotient_values: &mut [F],
+    first: &[F],
+    second: Option<&[F]>,
+    num_challenges: usize,
+    z_h_on_coset: &ZeroPolyOnCoset<F>,
+) {
+    debug_assert_eq!(first.len(), quotient_values.len());
+    if let Some(second) = second {
+        debug_assert_eq!(second.len(), quotient_values.len());
+        quotient_values
+            .par_chunks_exact_mut(num_challenges)
+            .zip(first.par_chunks_exact(num_challenges))
+            .zip(second.par_chunks_exact(num_challenges))
+            .enumerate()
+            .for_each(|(i, ((cpu_values, first_values), second_values))| {
+                let denominator_inv = z_h_on_coset.eval_inverse(i);
+                for ((cpu, &first), &second) in cpu_values
+                    .iter_mut()
+                    .zip(first_values)
+                    .zip(second_values)
+                {
+                    *cpu += (first + second) * denominator_inv;
+                }
+            });
+    } else {
+        quotient_values
+            .par_chunks_exact_mut(num_challenges)
+            .zip(first.par_chunks_exact(num_challenges))
+            .enumerate()
+            .for_each(|(i, (cpu_values, first_values))| {
+                let denominator_inv = z_h_on_coset.eval_inverse(i);
+                for (cpu, &first) in cpu_values.iter_mut().zip(first_values) {
+                    *cpu += first * denominator_inv;
+                }
+            });
+    }
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2169,8 +2215,8 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
+    let gpu_poseidon_values = if let Some((_, job)) = &gpu_poseidon {
+        Some(match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2200,23 +2246,14 @@ fn compute_quotient_polys<
                     false,
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        })
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
+    let gpu_range_values = if let Some((_, job)) = &gpu_range {
+        Some(match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2249,18 +2286,28 @@ fn compute_quotient_polys<
                 job.mark_cpu_recompute_completed_for_tests();
                 return result;
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        })
+    } else {
+        None
+    };
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    match (gpu_poseidon_values, gpu_range_values) {
+        (Some(poseidon), range) => add_gpu_gate_quotient_contributions(
+            &mut quotient_values,
+            poseidon,
+            range,
+            num_challenges,
+            &z_h_on_coset,
+        ),
+        (None, Some(range)) => add_gpu_gate_quotient_contributions(
+            &mut quotient_values,
+            range,
+            None,
+            num_challenges,
+            &z_h_on_coset,
+        ),
+        (None, None) => {}
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
@@ -2445,7 +2492,10 @@ mod quotient_layout_tests {
 
     use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
+    use super::{
+        add_gpu_gate_quotient_contributions, gpu_poseidon_quotient_stats,
+        COMPARE_GPU_QUOTIENT,
+    };
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field, Field64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2460,6 +2510,8 @@ mod quotient_layout_tests {
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use plonky2_field::zero_poly_coset::ZeroPolyOnCoset;
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
@@ -2480,6 +2532,96 @@ mod quotient_layout_tests {
         let mut pw = PartialWitness::new();
         pw.set_target(x, F::from_canonical_u64(3)).unwrap();
         (data, pw)
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn fused_gpu_gate_contributions_match_two_pass_reference() {
+        let degree_bits = 6;
+        let quotient_degree_bits = 3;
+        let rows = 1usize << (degree_bits + quotient_degree_bits);
+        let len = rows * 2;
+        let z_h = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits);
+        let initial = (0..len)
+            .map(|i| F::from_canonical_usize(17 * i + 3))
+            .collect::<Vec<_>>();
+        let poseidon = (0..len)
+            .map(|i| F::from_canonical_usize(29 * i + 5))
+            .collect::<Vec<_>>();
+        let range = (0..len)
+            .map(|i| F::from_canonical_usize(43 * i + 7))
+            .collect::<Vec<_>>();
+
+        let mut expected = initial.clone();
+        for (i, ((cpu, poseidon), range)) in expected
+            .chunks_exact_mut(2)
+            .zip(poseidon.chunks_exact(2))
+            .zip(range.chunks_exact(2))
+            .enumerate()
+        {
+            let denominator_inv = z_h.eval_inverse(i);
+            for ((cpu, &poseidon), &range) in cpu.iter_mut().zip(poseidon).zip(range) {
+                *cpu += poseidon * denominator_inv;
+                *cpu += range * denominator_inv;
+            }
+        }
+
+        let mut actual = initial;
+        add_gpu_gate_quotient_contributions(
+            &mut actual,
+            &poseidon,
+            Some(&range),
+            2,
+            &z_h,
+        );
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn fused_gpu_gate_reassociation_preserves_noncanonical_field_values() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for case in 0..1_000_000 {
+            let mut next = || {
+                state = state
+                    .wrapping_mul(0xd134_2543_de82_ef95)
+                    .wrapping_add(0xa409_3822_299f_31d0);
+                GoldilocksField(state)
+            };
+            let initial = next();
+            let poseidon = next();
+            let range = next();
+            let denominator_inv = next();
+
+            let mut separate = initial;
+            separate += poseidon * denominator_inv;
+            separate += range * denominator_inv;
+            let mut fused = initial;
+            fused += (poseidon + range) * denominator_inv;
+
+            assert_eq!(
+                fused, separate,
+                "field reassociation mismatch at case {case}"
+            );
+        }
+
+        // Field equality does not imply an identical internal representative.
+        // Pin a boundary case where the fused expression yields raw zero while
+        // the two-pass expression yields the non-canonical representative p.
+        let p = F::ORDER;
+        let initial = GoldilocksField(0);
+        let poseidon = GoldilocksField(1);
+        let range = GoldilocksField(p - 1);
+        let denominator_inv = GoldilocksField(0x7fff_ffff_7fff_ffff);
+        let mut separate = initial;
+        separate += poseidon * denominator_inv;
+        separate += range * denominator_inv;
+        let mut fused = initial;
+        fused += (poseidon + range) * denominator_inv;
+
+        assert_eq!(fused, separate);
+        assert_eq!(fused.0, 0);
+        assert_eq!(separate.0, p);
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
