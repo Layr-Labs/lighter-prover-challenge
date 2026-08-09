@@ -5,7 +5,9 @@
 //! The latter can be directly passed to a verifier to assert its correctness.
 
 #[cfg(not(feature = "std"))]
-use alloc::{vec, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
+#[cfg(feature = "std")]
+use std::sync::Arc;
 
 use anyhow::ensure;
 use plonky2_maybe_rayon::*;
@@ -17,6 +19,7 @@ use crate::field::types::Field;
 use crate::fri::oracle::PolynomialBatch;
 use crate::fri::proof::{
     CompressedFriProof, FriChallenges, FriChallengesTarget, FriProof, FriProofTarget,
+    FriQueryRound,
 };
 use crate::fri::structure::{
     FriOpeningBatch, FriOpeningBatchTarget, FriOpenings, FriOpeningsTarget,
@@ -45,6 +48,38 @@ pub struct Proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
     /// A batch FRI argument for all openings.
     pub opening_proof: FriProof<F, C::Hasher, D>,
 }
+
+/// Values of a PLONK proof exposed in transcript order while the proof is still being built.
+///
+/// Recursive-chain callers can copy each value into the next step's pending witness as soon as
+/// it exists, instead of waiting for the final [`Proof`] assembly. Query rounds share their
+/// allocation with the proof caller until the consumer has copied them into its witness.
+///
+/// This is an internal prover-pipeline API. A sink may transfer a query-round event to the paired
+/// receiver, but it must not create extra [`Arc`] clones or retain an event indefinitely. After all
+/// Rayon query workers have completed, the proof caller waits for the paired consumer to release
+/// each event in index order before recovering the allocation for the final [`Proof`].
+#[derive(Debug)]
+pub enum ProofProgress<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> {
+    PublicInputs(Vec<F>),
+    WiresCap(MerkleCap<F, H>),
+    ZsPartialProductsCap(MerkleCap<F, H>),
+    QuotientPolysCap(MerkleCap<F, H>),
+    Openings(OpeningSet<F, D>),
+    FriCommitPhaseCap {
+        index: usize,
+        cap: MerkleCap<F, H>,
+    },
+    FriFinalPoly(PolynomialCoeffs<F::Extension>),
+    FriPowWitness(F),
+    FriQueryRound {
+        index: usize,
+        round: Arc<FriQueryRound<F, H, D>>,
+    },
+}
+
+pub type ProofProgressSink<F, H, const D: usize> =
+    Arc<dyn Fn(ProofProgress<F, H, D>) + Send + Sync>;
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProofTarget<const D: usize> {

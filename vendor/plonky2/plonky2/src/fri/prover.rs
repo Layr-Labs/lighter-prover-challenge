@@ -2,7 +2,10 @@
 use alloc::vec;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
-
+#[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
+#[cfg(feature = "std")]
+use std::sync::Arc;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
@@ -17,6 +20,7 @@ use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
 use crate::plonk::plonk_common::reduce_with_powers;
+use crate::plonk::proof::{ProofProgress, ProofProgressSink};
 use crate::timed;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_strict, reverse_bits};
@@ -34,6 +38,37 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
     max_num_query_steps: Option<usize>,
     timing: &mut TimingTree,
 ) -> FriProof<F, C::Hasher, D> {
+    fri_proof_with_progress::<F, C, D>(
+        initial_merkle_trees,
+        lde_polynomial_coeffs,
+        lde_polynomial_values,
+        challenger,
+        fri_params,
+        final_poly_coeff_len,
+        max_num_query_steps,
+        timing,
+        None,
+    )
+}
+
+/// [`fri_proof`] with an optional transcript-ordered progress sink for recursive-chain witness
+/// pipelining. The `None` path is the original implementation and does not allocate shared query
+/// rounds or invoke dynamic callbacks.
+pub fn fri_proof_with_progress<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
+    lde_polynomial_coeffs: PolynomialCoeffs<F::Extension>,
+    lde_polynomial_values: PolynomialValues<F::Extension>,
+    challenger: &mut Challenger<F, C::Hasher>,
+    fri_params: &FriParams,
+    final_poly_coeff_len: Option<usize>,
+    max_num_query_steps: Option<usize>,
+    timing: &mut TimingTree,
+    progress: Option<&ProofProgressSink<F, C::Hasher, D>>,
+) -> FriProof<F, C::Hasher, D> {
     let n = lde_polynomial_values.len();
     assert_eq!(lde_polynomial_coeffs.len(), n);
 
@@ -48,8 +83,13 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
             fri_params,
             final_poly_coeff_len,
             max_num_query_steps,
+            progress,
         )
     );
+
+    if let Some(sink) = progress {
+        sink(ProofProgress::FriFinalPoly(final_coeffs.clone()));
+    }
 
     // PoW phase
     let pow_witness = timed!(
@@ -57,10 +97,19 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
         "find proof-of-work witness",
         fri_proof_of_work::<F, C, D>(challenger, &fri_params.config)
     );
+    if let Some(sink) = progress {
+        sink(ProofProgress::FriPowWitness(pow_witness));
+    }
 
     // Query phase
-    let query_round_proofs =
-        fri_prover_query_rounds::<F, C, D>(initial_merkle_trees, &trees, challenger, n, fri_params);
+    let query_round_proofs = fri_prover_query_rounds::<F, C, D>(
+        initial_merkle_trees,
+        &trees,
+        challenger,
+        n,
+        fri_params,
+        progress,
+    );
 
     FriProof {
         commit_phase_merkle_caps: trees.iter().map(|t| t.cap.clone()).collect(),
@@ -129,6 +178,7 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     fri_params: &FriParams,
     final_poly_coeff_len: Option<usize>,
     max_num_query_steps: Option<usize>,
+    progress: Option<&ProofProgressSink<F, C::Hasher, D>>,
 ) -> FriCommitedTrees<F, C, D> {
     let mut trees = Vec::with_capacity(fri_params.reduction_arity_bits.len());
 
@@ -150,6 +200,12 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         );
 
         challenger.observe_cap(&tree.cap);
+        if let Some(sink) = progress {
+            sink(ProofProgress::FriCommitPhaseCap {
+                index: round,
+                cap: tree.cap.clone(),
+            });
+        }
         trees.push(tree);
 
         let beta = challenger.get_extension_challenge::<D>();
@@ -318,13 +374,59 @@ fn fri_prover_query_rounds<
     challenger: &mut Challenger<F, C::Hasher>,
     n: usize,
     fri_params: &FriParams,
+    progress: Option<&ProofProgressSink<F, C::Hasher, D>>,
 ) -> Vec<FriQueryRound<F, C::Hasher, D>> {
-    challenger
-        .get_n_challenges(fri_params.config.num_query_rounds)
+    let query_challenges = challenger.get_n_challenges(fri_params.config.num_query_rounds);
+    let Some(sink) = progress else {
+        return query_challenges
+            .into_par_iter()
+            .map(|rand| {
+                let x_index = rand.to_canonical_u64() as usize % n;
+                fri_prover_query_round::<F, C, D>(
+                    initial_merkle_trees,
+                    trees,
+                    x_index,
+                    fri_params,
+                )
+            })
+            .collect();
+    };
+
+    let shared_rounds: Vec<Arc<FriQueryRound<F, C::Hasher, D>>> = query_challenges
         .into_par_iter()
-        .map(|rand| {
+        .enumerate()
+        .map(|(index, rand)| {
             let x_index = rand.to_canonical_u64() as usize % n;
-            fri_prover_query_round::<F, C, D>(initial_merkle_trees, trees, x_index, fri_params)
+            let round = Arc::new(fri_prover_query_round::<F, C, D>(
+                initial_merkle_trees,
+                trees,
+                x_index,
+                fri_params,
+            ));
+            sink(ProofProgress::FriQueryRound {
+                index,
+                round: Arc::clone(&round),
+            });
+            round
+        })
+        .collect();
+
+    // All Rayon workers have returned before ownership recovery starts, so a consumer can never
+    // starve the query pool. The paired receiver feeds and releases rounds in this same index
+    // order. Receiver error/drop releases its queue and buffer, which also unblocks this loop.
+    shared_rounds
+        .into_iter()
+        .map(|mut round| loop {
+            match Arc::try_unwrap(round) {
+                Ok(round) => break round,
+                Err(shared) => {
+                    round = shared;
+                    #[cfg(feature = "std")]
+                    std::thread::yield_now();
+                    #[cfg(not(feature = "std"))]
+                    core::hint::spin_loop();
+                }
+            }
         })
         .collect()
 }

@@ -17,8 +17,12 @@ use plonky2::plonk::circuit_data::{
     CircuitConfig, CircuitData, CommonCircuitData, VerifierCircuitTarget,
 };
 use plonky2::plonk::config::GenericConfig;
-use plonky2::plonk::proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget};
-use plonky2::plonk::prover::prove_with_partition_witness;
+use plonky2::plonk::proof::{
+    ProofProgressSink, ProofWithPublicInputs, ProofWithPublicInputsTarget,
+};
+use plonky2::plonk::prover::{
+    prove_with_partition_witness, prove_with_partition_witness_streaming,
+};
 use plonky2::timed;
 use plonky2::util::timing::TimingTree;
 
@@ -332,6 +336,31 @@ impl BlockTxChainCircuit {
             proof
         };
         // Recursive parents validate this proof in release builds; keep the eager check for tests.
+        #[cfg(debug_assertions)]
+        circuit_data.verify(proof.clone())?;
+
+        Ok(proof)
+    }
+
+    /// [`Self::prove_prepared`] with proof-component delivery to a successor chain witness.
+    pub fn prove_prepared_streaming(
+        pending: PendingPartitionWitness<'_, F, C, D>,
+        circuit_data: &CircuitData<F, C, D>,
+        progress: &ProofProgressSink<F, <C as GenericConfig<D>>::Hasher, D>,
+    ) -> Result<ProofWithPublicInputs<F, C, D>> {
+        let partition_witness = pending.finish()?;
+        let proof = {
+            let mut prove_timing = TimingTree::new("BlockTxChainProve", Level::Debug);
+            let proof = prove_with_partition_witness_streaming(
+                &circuit_data.prover_only,
+                &circuit_data.common,
+                partition_witness,
+                &mut prove_timing,
+                progress,
+            )?;
+            prove_timing.print();
+            proof
+        };
         #[cfg(debug_assertions)]
         circuit_data.verify(proof.clone())?;
 

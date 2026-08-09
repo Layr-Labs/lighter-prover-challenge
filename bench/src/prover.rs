@@ -1,7 +1,9 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
 use circuit::block::Block;
@@ -20,12 +22,17 @@ use circuit::block_tx_constraints::Circuit as _;
 use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
+use plonky2::field::extension::Extendable;
+use plonky2::field::types::Field;
+use plonky2::fri::proof::FriQueryRound;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
 use plonky2::iop::generator::{ParallelWitnessGuard, PendingPartitionWitness};
 #[cfg(test)]
 use plonky2::iop::generator::generate_partial_witness;
-use plonky2::iop::witness::{PartitionWitness, Witness};
+use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_data::CircuitData;
+use plonky2::plonk::config::GenericConfig;
+use plonky2::plonk::proof::{ProofProgress, ProofProgressSink, ProofWithPublicInputsTarget};
 use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::util::timing::TimingTree;
 
@@ -36,6 +43,12 @@ enum TxPath {
     Heavy,
     Light,
 }
+
+type ChainHasher = <C as GenericConfig<D>>::Hasher;
+type ChainProgress = ProofProgress<F, ChainHasher, D>;
+type ChainProgressSink = ProofProgressSink<F, ChainHasher, D>;
+type ChainQueryRound = FriQueryRound<F, ChainHasher, D>;
+type ChainExtension = <F as Extendable<D>>::Extension;
 
 const LIGHT_TX_PROOF_WINDOW: usize = 4;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
@@ -113,16 +126,281 @@ fn mark_spine_thread_latency_critical() {}
 
 enum ChainState<'scope> {
     Ready(Proof),
-    InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
+    InFlight {
+        handle: std::thread::ScopedJoinHandle<'scope, Proof>,
+        progress: Receiver<ChainProgress>,
+    },
 }
 
 impl ChainState<'_> {
     fn wait(self) -> Proof {
         match self {
             ChainState::Ready(proof) => proof,
-            ChainState::InFlight(handle) => handle
+            ChainState::InFlight { handle, progress } => {
+                // The final chain proof has no successor. Closing the receiver makes every
+                // remaining callback a cheap failed send while the self-contained proof finishes.
+                drop(progress);
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            }
+        }
+    }
+}
+
+fn chain_progress_channel() -> (ChainProgressSink, Receiver<ChainProgress>) {
+    let (sender, receiver) = mpsc::channel();
+    let sink: ChainProgressSink = Arc::new(move |event| {
+        // A dropped receiver means there is no successor. The proof remains fully self-contained;
+        // dropping the event is the safe fallback.
+        let _ = sender.send(event);
+    });
+    (sink, receiver)
+}
+
+fn feed_non_query_progress(
+    pending: &mut PendingPartitionWitness<'_, F, C, D>,
+    target: &ProofWithPublicInputsTarget<D>,
+    event: ChainProgress,
+) -> anyhow::Result<()> {
+    pending.feed_seeded(|feeder| {
+        match event {
+            ProofProgress::PublicInputs(values) => {
+                anyhow::ensure!(
+                    target.public_inputs.len() == values.len(),
+                    "streamed public-input length mismatch: target {}, proof {}",
+                    target.public_inputs.len(),
+                    values.len(),
+                );
+                for (&target, &value) in target.public_inputs.iter().zip(&values) {
+                    feeder.set_target(target, value)?;
+                }
+            }
+            ProofProgress::WiresCap(cap) => {
+                feeder.set_cap_target(&target.proof.wires_cap, &cap)?;
+            }
+            ProofProgress::ZsPartialProductsCap(cap) => {
+                feeder.set_cap_target(&target.proof.plonk_zs_partial_products_cap, &cap)?;
+            }
+            ProofProgress::QuotientPolysCap(cap) => {
+                feeder.set_cap_target(&target.proof.quotient_polys_cap, &cap)?;
+            }
+            ProofProgress::Openings(openings) => {
+                let target = &target.proof.openings;
+                for (name, target_len, proof_len) in [
+                    ("constants", target.constants.len(), openings.constants.len()),
+                    ("plonk_sigmas", target.plonk_sigmas.len(), openings.plonk_sigmas.len()),
+                    ("wires", target.wires.len(), openings.wires.len()),
+                    ("plonk_zs", target.plonk_zs.len(), openings.plonk_zs.len()),
+                    (
+                        "plonk_zs_next",
+                        target.plonk_zs_next.len(),
+                        openings.plonk_zs_next.len(),
+                    ),
+                    ("lookup_zs", target.lookup_zs.len(), openings.lookup_zs.len()),
+                    (
+                        "lookup_zs_next",
+                        target.next_lookup_zs.len(),
+                        openings.lookup_zs_next.len(),
+                    ),
+                    (
+                        "partial_products",
+                        target.partial_products.len(),
+                        openings.partial_products.len(),
+                    ),
+                    (
+                        "quotient_polys",
+                        target.quotient_polys.len(),
+                        openings.quotient_polys.len(),
+                    ),
+                ] {
+                    anyhow::ensure!(
+                        target_len == proof_len,
+                        "streamed {name} opening length mismatch: target {target_len}, proof {proof_len}",
+                    );
+                }
+                feeder.set_extension_targets(&target.constants, &openings.constants)?;
+                feeder.set_extension_targets(&target.plonk_sigmas, &openings.plonk_sigmas)?;
+                feeder.set_extension_targets(&target.wires, &openings.wires)?;
+                feeder.set_extension_targets(&target.plonk_zs, &openings.plonk_zs)?;
+                feeder.set_extension_targets(&target.plonk_zs_next, &openings.plonk_zs_next)?;
+                feeder.set_extension_targets(&target.lookup_zs, &openings.lookup_zs)?;
+                feeder.set_extension_targets(&target.next_lookup_zs, &openings.lookup_zs_next)?;
+                feeder.set_extension_targets(&target.partial_products, &openings.partial_products)?;
+                feeder.set_extension_targets(&target.quotient_polys, &openings.quotient_polys)?;
+            }
+            ProofProgress::FriCommitPhaseCap { index, cap } => {
+                let cap_target = target
+                    .proof
+                    .opening_proof
+                    .commit_phase_merkle_caps
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("streamed FRI cap index {index} is out of bounds"))?;
+                feeder.set_cap_target(cap_target, &cap)?;
+            }
+            ProofProgress::FriFinalPoly(final_poly) => {
+                let final_poly_target = &target.proof.opening_proof.final_poly.0;
+                anyhow::ensure!(final_poly_target.len() >= final_poly.coeffs.len());
+                for (&target, &value) in final_poly_target.iter().zip(&final_poly.coeffs) {
+                    feeder.set_extension_target(target, value)?;
+                }
+                for &target in final_poly_target.iter().skip(final_poly.coeffs.len()) {
+                    feeder.set_extension_target(target, ChainExtension::ZERO)?;
+                }
+            }
+            ProofProgress::FriPowWitness(value) => {
+                feeder.set_target(target.proof.opening_proof.pow_witness, value)?;
+            }
+            ProofProgress::FriQueryRound { .. } => {
+                unreachable!("query rounds are ordered before being fed")
+            }
+        }
+        Ok(())
+    })
+}
+
+fn feed_query_round_progress(
+    pending: &mut PendingPartitionWitness<'_, F, C, D>,
+    target: &ProofWithPublicInputsTarget<D>,
+    index: usize,
+    round: &ChainQueryRound,
+) -> anyhow::Result<()> {
+    let query_target = target
+        .proof
+        .opening_proof
+        .query_round_proofs
+        .get(index)
+        .ok_or_else(|| anyhow::anyhow!("streamed FRI query index {index} is out of bounds"))?;
+    pending.feed_seeded(|feeder| {
+        anyhow::ensure!(
+            query_target.initial_trees_proof.evals_proofs.len()
+                == round.initial_trees_proof.evals_proofs.len()
+        );
+        for (target, value) in query_target
+            .initial_trees_proof
+            .evals_proofs
+            .iter()
+            .zip(&round.initial_trees_proof.evals_proofs)
+        {
+            anyhow::ensure!(target.0.len() == value.0.len());
+            for (&target, &value) in target.0.iter().zip(&value.0) {
+                feeder.set_target(target, value)?;
+            }
+            anyhow::ensure!(target.1.siblings.len() >= value.1.siblings.len());
+            for (&target, &value) in target.1.siblings.iter().zip(&value.1.siblings) {
+                feeder.set_hash_target(target, value)?;
+            }
+            for &target in target.1.siblings.iter().skip(value.1.siblings.len()) {
+                feeder.set_hash_target(target, HashOut::ZERO)?;
+            }
+        }
+
+        anyhow::ensure!(query_target.steps.len() >= round.steps.len());
+        for (target, value) in query_target.steps.iter().zip(&round.steps) {
+            anyhow::ensure!(target.evals.len() == value.evals.len());
+            for (&target, &value) in target.evals.iter().zip(&value.evals) {
+                feeder.set_extension_target(target, value)?;
+            }
+            anyhow::ensure!(target.merkle_proof.siblings.len() >= value.merkle_proof.siblings.len());
+            for (&target, &value) in target
+                .merkle_proof
+                .siblings
+                .iter()
+                .zip(&value.merkle_proof.siblings)
+            {
+                feeder.set_hash_target(target, value)?;
+            }
+            for &target in target
+                .merkle_proof
+                .siblings
+                .iter()
+                .skip(value.merkle_proof.siblings.len())
+            {
+                feeder.set_hash_target(target, HashOut::ZERO)?;
+            }
+        }
+        for target in query_target.steps.iter().skip(round.steps.len()) {
+            for &target in &target.evals {
+                feeder.set_extension_target(target, ChainExtension::ZERO)?;
+            }
+            for &target in &target.merkle_proof.siblings {
+                feeder.set_hash_target(target, HashOut::ZERO)?;
+            }
+        }
+        Ok(())
+    })
+}
+
+fn feed_previous_chain_state(
+    state: ChainState<'_>,
+    pending: &mut PendingPartitionWitness<'_, F, C, D>,
+    target: &ProofWithPublicInputsTarget<D>,
+) -> anyhow::Result<()> {
+    match state {
+        ChainState::Ready(proof) => {
+            pending.feed_seeded(|feeder| feeder.set_proof_with_pis_target(target, &proof))?;
+            Ok(())
+        }
+        ChainState::InFlight { handle, progress } => {
+            let mut next_query_index = 0usize;
+            let mut buffered_queries = BTreeMap::<usize, Arc<ChainQueryRound>>::new();
+            #[cfg(test)]
+            let receive_start = std::time::Instant::now();
+            #[cfg(test)]
+            let mut feed_work = std::time::Duration::ZERO;
+            #[cfg(test)]
+            let mut last_query_feed_at = None;
+            for event in progress {
+                #[cfg(test)]
+                let event_start = std::time::Instant::now();
+                match event {
+                    ProofProgress::FriQueryRound { index, round } => {
+                        anyhow::ensure!(
+                            buffered_queries.insert(index, round).is_none(),
+                            "duplicate streamed FRI query round {index}"
+                        );
+                        while let Some(round) = buffered_queries.remove(&next_query_index) {
+                            feed_query_round_progress(pending, target, next_query_index, &round)?;
+                            next_query_index += 1;
+                            #[cfg(test)]
+                            if next_query_index
+                                == target.proof.opening_proof.query_round_proofs.len()
+                            {
+                                last_query_feed_at = Some(std::time::Instant::now());
+                            }
+                        }
+                    }
+                    event => feed_non_query_progress(pending, target, event)?,
+                }
+                #[cfg(test)]
+                {
+                    feed_work += event_start.elapsed();
+                }
+            }
+
+            #[cfg(test)]
+            let sender_closed_at = std::time::Instant::now();
+            #[cfg(test)]
+            let join_start = std::time::Instant::now();
+            let proof = handle
                 .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            #[cfg(test)]
+            println!(
+                "CHAIN_STREAM_CORRECTED channel_wall={:?} feed_work={feed_work:?} last_query_to_sender_close={:?} join_tail={:?}",
+                receive_start.elapsed(),
+                sender_closed_at.duration_since(
+                    last_query_feed_at.expect("all streamed query rounds must be fed")
+                ),
+                join_start.elapsed(),
+            );
+            anyhow::ensure!(
+                next_query_index == target.proof.opening_proof.query_round_proofs.len(),
+                "stream ended after {next_query_index} FRI query rounds"
+            );
+            anyhow::ensure!(buffered_queries.is_empty());
+            drop(proof);
+            Ok(())
         }
     }
 }
@@ -137,6 +415,7 @@ fn chain_step_proof(
     base_proof: &Proof,
     dummy_proof: &Proof,
     tx_proof: &Proof,
+    progress: Option<ChainProgressSink>,
 ) -> Proof {
     mark_spine_thread_latency_critical();
     let result = (|| {
@@ -159,16 +438,25 @@ fn chain_step_proof(
             },
         )?;
 
-        // Phase 2: wait for the previous chain proof, feed it directly, and prove.
-        let previous_proof = previous.map(ChainState::wait);
-        pending.feed_seeded(|feeder| {
-            BlockTxChainCircuit::witness_inputs_cyclic_into(
-                chain_target,
-                previous_proof.as_ref().unwrap_or(base_proof),
-                feeder,
-            )
-        })?;
-        BlockTxChainCircuit::prove_prepared(pending, chain_data)
+        // Phase 2: stream an in-flight predecessor into this pending witness. A predecessor that
+        // is already complete (the cyclic base or the final synchronous drain) keeps the exact
+        // one-shot direct feed as a fallback.
+        if let Some(previous) = previous {
+            feed_previous_chain_state(previous, &mut pending, &chain_target.cyclic_proof)?;
+        } else {
+            pending.feed_seeded(|feeder| {
+                BlockTxChainCircuit::witness_inputs_cyclic_into(
+                    chain_target,
+                    base_proof,
+                    feeder,
+                )
+            })?;
+        }
+        if let Some(progress) = progress.as_ref() {
+            BlockTxChainCircuit::prove_prepared_streaming(pending, chain_data, progress)
+        } else {
+            BlockTxChainCircuit::prove_prepared(pending, chain_data)
+        }
     })();
     result.unwrap_or_else(|error| {
         panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")
@@ -352,6 +640,7 @@ fn prove_path(
                 // The predecessor handle moves into the chain thread, which waits for it only
                 // after its tx-proof-side witness generation: the path thread never blocks here.
                 let previous = chain.take();
+                let (progress_sink, progress) = chain_progress_channel();
                 let handle = std::thread::Builder::new()
                     .name(format!("{path:?}-chain-step-{chain_step}"))
                     .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -365,10 +654,11 @@ fn prove_path(
                             base,
                             dummy_proof,
                             &tx_proof,
+                            Some(progress_sink),
                         )
                     })
                     .expect("chain step pipeline thread must start");
-                chain = Some(ChainState::InFlight(handle));
+                chain = Some(ChainState::InFlight { handle, progress });
             }
 
             let witness = current_witness;
@@ -424,6 +714,7 @@ fn prove_path(
 
         if let Some((chain_step, tx_proof)) = pending_tx.take() {
             let previous = chain.take();
+            let (progress_sink, progress) = chain_progress_channel();
             let handle = std::thread::Builder::new()
                 .name(format!("{path:?}-chain-step-{chain_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -437,10 +728,11 @@ fn prove_path(
                         base,
                         dummy_proof,
                         &tx_proof,
+                        Some(progress_sink),
                     )
                 })
                 .expect("chain step pipeline thread must start");
-            chain = Some(ChainState::InFlight(handle));
+            chain = Some(ChainState::InFlight { handle, progress });
         }
         // Past this point the pipeline spawns no new chunk work: the drain
         // below is the strictly sequential chain tail, so its mid-size
@@ -466,6 +758,7 @@ fn prove_path(
                 base,
                 dummy_proof,
                 &tx_proof,
+                None,
             )));
         }
         let chain_proof = chain
@@ -1032,6 +1325,7 @@ mod tests {
                 &base_proof,
                 &circuits.dummy_proof,
                 &tx_proof,
+                None,
             );
             let direct_elapsed = direct_start.elapsed();
             assert_eq!(proof.public_inputs, direct_proof.public_inputs);
@@ -1048,5 +1342,131 @@ mod tests {
             .chain_data
             .verify(previous.expect("chain must produce proofs"))
             .expect("final chain step proof must verify");
+
+        // Corrected A/B: both variants start step 0 and step 1's independent witness phase
+        // concurrently. The only difference is waiting for a bulk predecessor feed versus
+        // consuming predecessor proof components as they become available.
+        let (streaming_final, streaming_total) = std::thread::scope(|scope| {
+            let started = Instant::now();
+            let (progress_sink, progress) = chain_progress_channel();
+            let step_zero = std::thread::Builder::new()
+                .name("corrected-stream-step-0".into())
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, || {
+                    chain_step_proof(
+                        TxPath::Light,
+                        &circuits.chain_target,
+                        &circuits.chain_data,
+                        0,
+                        None,
+                        &base_proof,
+                        &circuits.dummy_proof,
+                        &tx_proof,
+                        Some(progress_sink),
+                    )
+                })
+                .expect("streaming predecessor must start");
+            let mut pending = PendingPartitionWitness::start_seeded(
+                &circuits.chain_data.prover_only,
+                &circuits.chain_data.common,
+                |seeder| {
+                    BlockTxChainCircuit::witness_inputs_early_into(
+                        &circuits.chain_target,
+                        &circuits.chain_data,
+                        1,
+                        &circuits.dummy_proof,
+                        &tx_proof,
+                        seeder,
+                    )
+                },
+            )
+            .expect("streaming successor early witness must start");
+            feed_previous_chain_state(
+                ChainState::InFlight {
+                    handle: step_zero,
+                    progress,
+                },
+                &mut pending,
+                &circuits.chain_target.cyclic_proof,
+            )
+            .expect("streaming predecessor feed must complete");
+            let proof = BlockTxChainCircuit::prove_prepared(pending, &circuits.chain_data)
+                .expect("streaming successor proof must complete");
+            (proof, started.elapsed())
+        });
+
+        let (control_final, control_total) = std::thread::scope(|scope| {
+            let started = Instant::now();
+            let step_zero = std::thread::Builder::new()
+                .name("corrected-control-step-0".into())
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, || {
+                    chain_step_proof(
+                        TxPath::Light,
+                        &circuits.chain_target,
+                        &circuits.chain_data,
+                        0,
+                        None,
+                        &base_proof,
+                        &circuits.dummy_proof,
+                        &tx_proof,
+                        None,
+                    )
+                })
+                .expect("control predecessor must start");
+            let mut pending = PendingPartitionWitness::start_seeded(
+                &circuits.chain_data.prover_only,
+                &circuits.chain_data.common,
+                |seeder| {
+                    BlockTxChainCircuit::witness_inputs_early_into(
+                        &circuits.chain_target,
+                        &circuits.chain_data,
+                        1,
+                        &circuits.dummy_proof,
+                        &tx_proof,
+                        seeder,
+                    )
+                },
+            )
+            .expect("control successor early witness must start");
+            let predecessor = step_zero
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            pending
+                .feed_seeded(|feeder| {
+                    BlockTxChainCircuit::witness_inputs_cyclic_into(
+                        &circuits.chain_target,
+                        &predecessor,
+                        feeder,
+                    )
+                })
+                .expect("control bulk predecessor feed must complete");
+            let proof = BlockTxChainCircuit::prove_prepared(pending, &circuits.chain_data)
+                .expect("control successor proof must complete");
+            (proof, started.elapsed())
+        });
+
+        assert_eq!(control_final.public_inputs, streaming_final.public_inputs);
+        circuits
+            .chain_data
+            .verify(streaming_final)
+            .expect("streaming final proof must verify");
+        circuits
+            .chain_data
+            .verify(control_final)
+            .expect("control final proof must verify");
+        if control_total >= streaming_total {
+            println!(
+                "CHAIN_STREAM_CORRECTED_AB control={control_total:?} streaming={streaming_total:?} signed_delta=+{:?}",
+                control_total - streaming_total,
+            );
+        } else {
+            println!(
+                "CHAIN_STREAM_CORRECTED_AB control={control_total:?} streaming={streaming_total:?} signed_delta=-{:?}",
+                streaming_total - control_total,
+            );
+        }
+
+
     }
 }

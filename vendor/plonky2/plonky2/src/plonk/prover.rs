@@ -29,7 +29,9 @@ use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
 use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::permutation_argument::fixed_routed_wire;
-use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
+use crate::plonk::proof::{
+    OpeningSet, Proof, ProofProgress, ProofProgressSink, ProofWithPublicInputs,
+};
 use crate::plonk::vanishing_poly::{
     eval_vanishing_poly_base_batch, get_lut_poly, interleave_pair_plan, PermutationBatch,
     VanishingScratch,
@@ -140,8 +142,57 @@ pub fn prove_with_partition_witness<
 >(
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
+    partition_witness: PartitionWitness<F>,
+    timing: &mut TimingTree,
+) -> Result<ProofWithPublicInputs<F, C, D>>
+where
+    C::Hasher: Hasher<F>,
+    C::InnerHasher: Hasher<F>,
+{
+    prove_with_partition_witness_progress(
+        prover_data,
+        common_data,
+        partition_witness,
+        timing,
+        None,
+    )
+}
+
+/// [`prove_with_partition_witness`] while exposing proof components in transcript order.
+pub fn prove_with_partition_witness_streaming<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+    partition_witness: PartitionWitness<F>,
+    timing: &mut TimingTree,
+    progress: &ProofProgressSink<F, C::Hasher, D>,
+) -> Result<ProofWithPublicInputs<F, C, D>>
+where
+    C::Hasher: Hasher<F>,
+    C::InnerHasher: Hasher<F>,
+{
+    prove_with_partition_witness_progress(
+        prover_data,
+        common_data,
+        partition_witness,
+        timing,
+        Some(progress),
+    )
+}
+
+fn prove_with_partition_witness_progress<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
     mut partition_witness: PartitionWitness<F>,
     timing: &mut TimingTree,
+    progress: Option<&ProofProgressSink<F, C::Hasher, D>>,
 ) -> Result<ProofWithPublicInputs<F, C, D>>
 where
     C::Hasher: Hasher<F>,
@@ -157,6 +208,9 @@ where
 
     let public_inputs = partition_witness.get_targets(&prover_data.public_inputs);
     let public_inputs_hash = C::InnerHasher::hash_no_pad(&public_inputs);
+    if let Some(sink) = progress {
+        sink(ProofProgress::PublicInputs(public_inputs.clone()));
+    }
 
     let mut witness = timed!(
         timing,
@@ -200,6 +254,11 @@ where
             prover_data.fft_root_table.as_ref(),
         )
     );
+    if let Some(sink) = progress {
+        sink(ProofProgress::WiresCap(
+            wires_commitment.merkle_tree.cap.clone(),
+        ));
+    }
 
     let mut challenger = Challenger::<F, C::Hasher>::new();
 
@@ -292,6 +351,14 @@ where
             prover_data.fft_root_table.as_ref(),
         )
     );
+    if let Some(sink) = progress {
+        sink(ProofProgress::ZsPartialProductsCap(
+            partial_products_zs_and_lookup_commitment
+                .merkle_tree
+                .cap
+                .clone(),
+        ));
+    }
 
     challenger.observe_cap::<C::Hasher>(&partial_products_zs_and_lookup_commitment.merkle_tree.cap);
 
@@ -416,6 +483,11 @@ where
             prover_data.fft_root_table.as_ref(),
         )
     );
+    if let Some(sink) = progress {
+        sink(ProofProgress::QuotientPolysCap(
+            quotient_polys_commitment.merkle_tree.cap.clone(),
+        ));
+    }
 
     challenger.observe_cap::<C::Hasher>(&quotient_polys_commitment.merkle_tree.cap);
 
@@ -443,26 +515,41 @@ where
         )
     );
     challenger.observe_openings(&openings.to_fri_openings());
+    if let Some(sink) = progress {
+        sink(ProofProgress::Openings(openings.clone()));
+    }
     let instance = common_data.get_fri_instance(zeta);
 
-    let opening_proof = timed!(
-        timing,
-        "compute opening proofs",
-        PolynomialBatch::<F, C, D>::prove_openings(
-            &instance,
-            &[
-                &prover_data.constants_sigmas_commitment,
-                &wires_commitment,
-                &partial_products_zs_and_lookup_commitment,
-                &quotient_polys_commitment,
-            ],
-            &mut challenger,
-            &common_data.fri_params,
-            None,
-            None,
-            timing,
-        )
-    );
+    let opening_proof = timed!(timing, "compute opening proofs", {
+        let oracles = [
+            &prover_data.constants_sigmas_commitment,
+            &wires_commitment,
+            &partial_products_zs_and_lookup_commitment,
+            &quotient_polys_commitment,
+        ];
+        if progress.is_some() {
+            PolynomialBatch::<F, C, D>::prove_openings_with_progress(
+                &instance,
+                &oracles,
+                &mut challenger,
+                &common_data.fri_params,
+                None,
+                None,
+                timing,
+                progress,
+            )
+        } else {
+            PolynomialBatch::<F, C, D>::prove_openings(
+                &instance,
+                &oracles,
+                &mut challenger,
+                &common_data.fri_params,
+                None,
+                None,
+                timing,
+            )
+        }
+    });
 
     let proof = Proof::<F, C, D> {
         wires_cap: wires_commitment.merkle_tree.cap,

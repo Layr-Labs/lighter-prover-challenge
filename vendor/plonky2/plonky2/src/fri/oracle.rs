@@ -14,12 +14,13 @@ use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
 use crate::fri::proof::FriProof;
-use crate::fri::prover::fri_proof;
+use crate::fri::prover::{fri_proof, fri_proof_with_progress};
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::{ColumnStore, MerkleLeaves, MerkleTree};
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::{GenericConfig, Hasher};
+use crate::plonk::proof::ProofProgressSink;
 use crate::timed;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
@@ -608,6 +609,29 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         max_num_query_steps: Option<usize>,
         timing: &mut TimingTree,
     ) -> FriProof<F, C::Hasher, D> {
+        Self::prove_openings_with_progress(
+            instance,
+            oracles,
+            challenger,
+            fri_params,
+            final_poly_coeff_len,
+            max_num_query_steps,
+            timing,
+            None,
+        )
+    }
+
+    /// [`Self::prove_openings`] with an optional recursive-proof progress sink.
+    pub fn prove_openings_with_progress(
+        instance: &FriInstanceInfo<F, D>,
+        oracles: &[&Self],
+        challenger: &mut Challenger<F, C::Hasher>,
+        fri_params: &FriParams,
+        final_poly_coeff_len: Option<usize>,
+        max_num_query_steps: Option<usize>,
+        timing: &mut TimingTree,
+        progress: Option<&ProofProgressSink<F, C::Hasher, D>>,
+    ) -> FriProof<F, C::Hasher, D> {
         assert!(D > 1, "Not implemented for D=1.");
         let alpha = challenger.get_extension_challenge::<D>();
         let mut alpha = ReducingFactor::new(alpha);
@@ -693,7 +717,23 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             )
         );
 
-        let fri_proof = fri_proof::<F, C, D>(
+        let fri_proof = if progress.is_some() {
+            fri_proof_with_progress::<F, C, D>(
+                &oracles
+                    .par_iter()
+                    .map(|c| &c.merkle_tree)
+                    .collect::<Vec<_>>(),
+                lde_final_poly,
+                lde_final_values,
+                challenger,
+                fri_params,
+                final_poly_coeff_len,
+                max_num_query_steps,
+                timing,
+                progress,
+            )
+        } else {
+            fri_proof::<F, C, D>(
             &oracles
                 .par_iter()
                 .map(|c| &c.merkle_tree)
@@ -705,7 +745,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             final_poly_coeff_len,
             max_num_query_steps,
             timing,
-        );
+            )
+        };
 
         fri_proof
     }
