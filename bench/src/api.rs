@@ -1,4 +1,4 @@
-// Redraw marker 250
+// Compose marker 320: 5c24f9d singleton fixed-routed perm skip + Horner/FMA
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
@@ -61,6 +61,10 @@ pub struct Circuits {
     pub dummy_heavy_proof: Proof,
     pub dummy_light_proof: Proof,
 }
+
+// Compose: tip + beaulowo 5c24f9d fixed-routed singleton perm skip + release log-off
+// + iamgoatedaf-style two-challenge Horner reducer and permutation_factor_fma.
+// No Interleave dense fusion; no always-detach uncontended reopen.
 
 pub(crate) struct PathCircuits {
     pub(crate) tx_target: BlockTxTarget,

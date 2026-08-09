@@ -55,7 +55,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 #[unsafe(export_name = "_rjem_malloc_conf")]
 static MALLOC_CONF: &[u8; 34] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 
-// Keep the promoted writer path while exercising a second submission from that baseline.
+// Identity: tip+5c24f9d-singleton-perm-skip+log-off+horner-fma-320
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
@@ -67,7 +67,9 @@ fn main() {
     // of stalling the first proving step that wants the GPU. Pure scheduling:
     // the compiled kernels are identical either way.
     plonky2::hash::poseidon2::prewarm_gpu();
-    env_logger::init();
+    // `log` is statically disabled in release builds: the ranked worker has no
+    // log consumer, and diagnostics remain available in debug/test builds.
+    // Do not link and initialize an unused logger in every scored process.
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
