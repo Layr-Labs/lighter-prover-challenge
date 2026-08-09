@@ -372,6 +372,162 @@ pub struct PartitionFeeder<'a, 'b, F: Field> {
     generator_indices_by_watches: &'b GeneratorWatchIndex,
 }
 
+/// One immutable lookup record for a repeatedly seeded target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct SeedPlanEntry {
+    target: Target,
+    representative: u32,
+    watcher_start: u32,
+    watcher_end: u32,
+}
+
+/// Circuit-specific lookup plan for a fixed sequence of witness targets.
+///
+/// Recursive chain circuits seed the same proof target structures on every
+/// fold. Their values change, but the target-to-representative mapping and the
+/// watcher CSR ranges do not. Keeping those immutable lookups here removes two
+/// dependent table reads from every repeated proof-field write while retaining
+/// the ordinary bitmap, contradiction and watcher-counter semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SeedPlan {
+    entries: Vec<SeedPlanEntry>,
+}
+
+impl SeedPlan {
+    pub fn from_targets<
+        F: RichField + Extendable<D>,
+        C: GenericConfig<D, F = F>,
+        const D: usize,
+    >(
+        targets: Vec<Target>,
+        prover_data: &ProverOnlyCircuitData<F, C, D>,
+        common_data: &CommonCircuitData<F, D>,
+    ) -> Result<Self> {
+        let num_wires = common_data.config.num_wires;
+        let degree = common_data.degree();
+        let representative_map = &prover_data.representative_map;
+        let offsets = prover_data.generator_indices_by_watches.offsets();
+        let mut entries = Vec::with_capacity(targets.len());
+
+        for target in targets {
+            let target_index = target.index(num_wires, degree);
+            let representative = *representative_map.get(target_index).ok_or_else(|| {
+                anyhow!("seed-plan target {target:?} is outside the circuit target map")
+            })?;
+            let representative_index = representative as usize;
+            let watcher_start = *offsets.get(representative_index).ok_or_else(|| {
+                anyhow!("seed-plan representative {representative_index} has no CSR offset")
+            })?;
+            let watcher_end = *offsets.get(representative_index + 1).ok_or_else(|| {
+                anyhow!("seed-plan representative {representative_index} has no CSR end offset")
+            })?;
+            entries.push(SeedPlanEntry {
+                target,
+                representative,
+                watcher_start,
+                watcher_end,
+            });
+        }
+
+        Ok(Self { entries })
+    }
+
+    pub const fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Records the target order emitted by an existing typed witness-input writer.
+/// Values are deliberately ignored; the resulting order is compiled into a
+/// [`SeedPlan`] once and reused for every fixed-shape chain fold.
+#[derive(Debug, Default)]
+pub struct SeedPlanBuilder {
+    targets: Vec<Target>,
+}
+
+impl SeedPlanBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn build<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+        self,
+        prover_data: &ProverOnlyCircuitData<F, C, D>,
+        common_data: &CommonCircuitData<F, D>,
+    ) -> Result<SeedPlan> {
+        SeedPlan::from_targets(self.targets, prover_data, common_data)
+    }
+}
+
+impl<F: Field> WitnessWrite<F> for SeedPlanBuilder {
+    fn set_target(&mut self, target: Target, _value: F) -> Result<()> {
+        self.targets.push(target);
+        Ok(())
+    }
+}
+
+impl<F: Field> Witness<F> for SeedPlanBuilder {
+    fn try_get_target(&self, _target: Target) -> Option<F> {
+        None
+    }
+}
+
+#[doc(hidden)]
+pub trait PlannedSeedBackend<F: Field> {
+    fn set_planned_target(&mut self, entry: SeedPlanEntry, value: F) -> Result<()>;
+}
+
+/// `WitnessWrite` adapter that consumes values in a precomputed target order.
+#[derive(Debug)]
+pub struct PlannedSeedWriter<'a, W> {
+    backend: &'a mut W,
+    plan: &'a SeedPlan,
+    cursor: usize,
+}
+
+impl<W> PlannedSeedWriter<'_, W> {
+    /// Require the typed writer to have emitted every planned target exactly
+    /// once. This also catches accidental changes to proof-target traversal.
+    pub fn finish(self) -> Result<()> {
+        if self.cursor != self.plan.entries.len() {
+            return Err(anyhow!(
+                "planned seed wrote {} targets, expected {}",
+                self.cursor,
+                self.plan.entries.len()
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<F: Field, W: PlannedSeedBackend<F>> WitnessWrite<F> for PlannedSeedWriter<'_, W> {
+    fn set_target(&mut self, target: Target, value: F) -> Result<()> {
+        let entry = self.plan.entries.get(self.cursor).copied().ok_or_else(|| {
+            anyhow!(
+                "planned seed emitted more than {} targets",
+                self.plan.entries.len()
+            )
+        })?;
+        if entry.target != target {
+            return Err(anyhow!(
+                "planned seed target #{} changed: {:?} != {:?}",
+                self.cursor,
+                target,
+                entry.target
+            ));
+        }
+        self.cursor += 1;
+        self.backend.set_planned_target(entry, value)
+    }
+}
+
+impl<F: Field, W: PlannedSeedBackend<F>> Witness<F> for PlannedSeedWriter<'_, W> {
+    fn try_get_target(&self, _target: Target) -> Option<F> {
+        None
+    }
+}
+
 impl<F: Field> Debug for PartitionFeeder<'_, '_, F> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PartitionFeeder").finish_non_exhaustive()
@@ -398,6 +554,71 @@ impl<F: Field> WitnessWrite<F> for PartitionFeeder<'_, '_, F> {
 impl<F: Field> Witness<F> for PartitionFeeder<'_, '_, F> {
     fn try_get_target(&self, target: Target) -> Option<F> {
         self.witness.try_get_target(target)
+    }
+}
+
+impl<'a, 'b, F: Field> PartitionSeeder<'a, 'b, F> {
+    pub fn planned<'c>(
+        &'c mut self,
+        plan: &'c SeedPlan,
+    ) -> PlannedSeedWriter<'c, PartitionSeeder<'a, 'b, F>> {
+        PlannedSeedWriter {
+            backend: self,
+            plan,
+            cursor: 0,
+        }
+    }
+}
+
+impl<F: Field> PlannedSeedBackend<F> for PartitionSeeder<'_, '_, F> {
+    fn set_planned_target(&mut self, entry: SeedPlanEntry, value: F) -> Result<()> {
+        if self
+            .witness
+            .set_target_with_rep_returning(entry.target, entry.representative as usize, value)?
+            .is_some()
+        {
+            let watchers = &self.generator_indices_by_watches.watchers()
+                [entry.watcher_start as usize..entry.watcher_end as usize];
+            for &generator_idx in watchers {
+                debug_assert_ne!(self.unresolved_watches[generator_idx], 0);
+                self.unresolved_watches[generator_idx] -= 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'a, 'b, F: Field> PartitionFeeder<'a, 'b, F> {
+    pub fn planned<'c>(
+        &'c mut self,
+        plan: &'c SeedPlan,
+    ) -> PlannedSeedWriter<'c, PartitionFeeder<'a, 'b, F>> {
+        PlannedSeedWriter {
+            backend: self,
+            plan,
+            cursor: 0,
+        }
+    }
+}
+
+impl<F: Field> PlannedSeedBackend<F> for PartitionFeeder<'_, '_, F> {
+    fn set_planned_target(&mut self, entry: SeedPlanEntry, value: F) -> Result<()> {
+        if self
+            .witness
+            .set_target_with_rep_returning(entry.target, entry.representative as usize, value)?
+            .is_some()
+        {
+            let watchers = &self.generator_indices_by_watches.watchers()
+                [entry.watcher_start as usize..entry.watcher_end as usize];
+            for &watching_generator_idx in watchers {
+                if !self.generator_is_expired[watching_generator_idx] {
+                    debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
+                    self.unresolved_watches[watching_generator_idx] -= 1;
+                    self.pending_generator_indices.push(watching_generator_idx);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1447,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_seeded_pending_witness_matches_map_seeded_recursive_circuit() -> Result<()> {
+    fn planned_and_direct_seeded_witness_match_map_seeded_recursive_circuit() -> Result<()> {
         let (outer, early_inputs, late_inputs) = two_inner_proof_fixture()?;
 
         let mut map_seeded =
@@ -1481,15 +1702,44 @@ mod tests {
         })?;
         let direct_seeded = direct_seeded.finish()?;
 
+        let early_plan = SeedPlan::from_targets(
+            early_inputs.target_values.keys().copied().collect(),
+            &outer.prover_only,
+            &outer.common,
+        )?;
+        let late_plan = SeedPlan::from_targets(
+            late_inputs.target_values.keys().copied().collect(),
+            &outer.prover_only,
+            &outer.common,
+        )?;
+        let mut planned_seeded =
+            PendingPartitionWitness::start_seeded(&outer.prover_only, &outer.common, |seeder| {
+                let mut planned = seeder.planned(&early_plan);
+                for (&target, &value) in &early_inputs.target_values {
+                    planned.set_target(target, value)?;
+                }
+                planned.finish()
+            })?;
+        planned_seeded.feed_seeded(|feeder| {
+            let mut planned = feeder.planned(&late_plan);
+            for (&target, &value) in &late_inputs.target_values {
+                planned.set_target(target, value)?;
+            }
+            planned.finish()
+        })?;
+        let planned_seeded = planned_seeded.finish()?;
+
         let mut nondeterministic_positions = 0usize;
-        for ((map, map_repeat), direct) in map_seeded
+        for (((map, map_repeat), direct), planned) in map_seeded
             .values
             .iter()
             .zip(&map_seeded_repeat.values)
             .zip(&direct_seeded.values)
+            .zip(&planned_seeded.values)
         {
             if map == map_repeat {
                 assert_eq!(map, direct);
+                assert_eq!(map, planned);
             } else {
                 nondeterministic_positions += 1;
             }
@@ -1513,7 +1763,15 @@ mod tests {
             direct_seeded,
             &mut crate::util::timing::TimingTree::default(),
         )?;
-        outer.verify(proof)
+        outer.verify(proof)?;
+
+        let planned_proof = crate::plonk::prover::prove_with_partition_witness(
+            &outer.prover_only,
+            &outer.common,
+            planned_seeded,
+            &mut crate::util::timing::TimingTree::default(),
+        )?;
+        outer.verify(planned_proof)
     }
 
     #[test]

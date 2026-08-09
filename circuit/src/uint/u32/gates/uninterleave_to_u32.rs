@@ -15,7 +15,7 @@ use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::Field;
-use plonky2::gates::gate::Gate;
+use plonky2::gates::gate::{Gate, InterleavePairGate};
 use plonky2::gates::packed_util::PackedEvaluableBase;
 use plonky2::gates::util::StridedConstraintConsumer;
 use plonky2::hash::hash_types::RichField;
@@ -401,6 +401,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for UninterleaveTo
 
     fn num_constraints(&self) -> usize {
         self.num_ops * (Self::NUM_BITS + 1 + 2 + 1)
+    }
+
+    fn interleave_pair_gate(&self) -> Option<InterleavePairGate> {
+        Some(InterleavePairGate::UninterleaveToU32 {
+            num_ops: self.num_ops,
+        })
     }
 
     fn serialize(

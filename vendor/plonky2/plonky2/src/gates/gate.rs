@@ -85,6 +85,16 @@ pub enum U32QuotientGate {
     Selection { num_ops: usize },
 }
 
+/// Exact layout tag for the two bit-interleave gates whose final-block
+/// quotient work can share the same 128 boolean wire constraints. This is a
+/// CPU evaluation hint only; it does not change gate serialization or the
+/// constraint system.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterleavePairGate {
+    Interleave { num_ops: usize },
+    UninterleaveToU32 { num_ops: usize },
+}
+
 /// A custom gate.
 ///
 /// Vanilla Plonk arithmetization only supports basic fan-in 2 / fan-out 1 arithmetic gates,
@@ -340,6 +350,13 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
     /// Advertises one of the exact promoted gate layouts to optional quotient
     /// backends. The default leaves unrelated gates on the CPU.
     fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+        None
+    }
+
+    /// Advertises one of the exact layouts accepted by the joint CPU
+    /// interleave evaluator. Unsupported or unpaired layouts stay on the
+    /// ordinary per-gate path.
+    fn interleave_pair_gate(&self) -> Option<InterleavePairGate> {
         None
     }
 

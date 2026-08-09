@@ -373,6 +373,28 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     /// target was already set, returns `None`.
     pub fn set_target_returning_rep(&mut self, target: Target, value: F) -> Result<Option<usize>> {
         let rep_index = self.representative_map[self.target_index(target)] as usize;
+        self.set_target_with_rep_returning(target, rep_index, value)
+    }
+
+    /// Set a target through a representative index computed once from this
+    /// circuit's immutable representative map.
+    ///
+    /// Repeated fixed-shape inputs (notably recursive proof targets) can keep
+    /// that index in a seed plan instead of re-running `Target::index` and the
+    /// representative-map lookup for every proof. The bitmap, duplicate-value
+    /// check and first-population result are exactly the ordinary setter's.
+    #[inline]
+    pub fn set_target_with_rep_returning(
+        &mut self,
+        target: Target,
+        rep_index: usize,
+        value: F,
+    ) -> Result<Option<usize>> {
+        debug_assert_eq!(
+            self.representative_map[self.target_index(target)] as usize,
+            rep_index,
+            "seed plan was built for different circuit data"
+        );
         if self.is_set_by_rep_index(rep_index) {
             let old_value = self.values[rep_index];
             if value != old_value {

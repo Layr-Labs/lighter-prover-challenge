@@ -6,12 +6,14 @@ use plonky2_field::polynomial::PolynomialCoeffs;
 
 use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
+use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
+use crate::gates::gate::InterleavePairGate;
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
-use crate::gates::selectors::LookupSelectors;
+use crate::gates::selectors::{LookupSelectors, UNUSED_SELECTOR};
 use crate::hash::hash_types::RichField;
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::Target;
@@ -182,6 +184,10 @@ pub(crate) struct VanishingScratch<F> {
     pub constraint_terms_batch: Vec<F>,
     /// Reused selector-filter buffer across batches (survivor-list package).
     pub gate_filters: Vec<F>,
+    /// Shared base-2/range intermediates for the exact final-block
+    /// interleave/uninterleave pair. The buffer is inert for every other
+    /// circuit shape.
+    pub interleave_pair_scratch: Vec<F>,
 }
 
 /// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
@@ -312,6 +318,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         &mut scratch.constraint_terms_batch,
         cpu_gate_indices,
         &mut scratch.gate_filters,
+        &mut scratch.interleave_pair_scratch,
         cpu_num_gate_constraints,
     );
     let constraint_terms_batch = &scratch.constraint_terms_batch;
@@ -1139,14 +1146,238 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
         .filter(|i| !excluded_gate_indices.contains(i))
         .collect::<Vec<_>>();
     let mut filters = Vec::with_capacity(vars_batch.len());
+    let mut interleave_pair_scratch = Vec::new();
     evaluate_gate_constraints_base_batch_into_cpu_gates(
         common_data,
         vars_batch,
         constraints_batch,
         &cpu_gate_indices,
         &mut filters,
+        &mut interleave_pair_scratch,
         num_constraint_rows,
     );
+}
+
+const INTERLEAVE_PAIR_BITS: usize = 128;
+const INTERLEAVE_PAIR_WIRES: usize = 136;
+const INTERLEAVE_PAIR_CONSTRAINTS: usize = 136;
+const INTERLEAVE_OPS: usize = 4;
+const UNINTERLEAVE_OPS: usize = 2;
+
+/// Finds only the exact pair used by the ranked final-block circuit. Any
+/// absent, duplicated, reordered, or differently-sized tag falls back to the
+/// ordinary independent gate evaluators.
+fn exact_interleave_pair<F: RichField + Extendable<D>, const D: usize>(
+    common_data: &CommonCircuitData<F, D>,
+    cpu_gate_indices: &[usize],
+) -> Option<(usize, usize)> {
+    let mut tagged = cpu_gate_indices.iter().filter_map(|&index| {
+        common_data.gates[index]
+            .0
+            .interleave_pair_gate()
+            .map(|kind| (index, kind))
+    });
+    let first = tagged.next()?;
+    let second = tagged.next()?;
+    if tagged.next().is_some() {
+        return None;
+    }
+    let (interleave_index, uninterleave_index) = match (first, second) {
+        (
+            (interleave_index, InterleavePairGate::Interleave { num_ops: INTERLEAVE_OPS }),
+            (
+                uninterleave_index,
+                InterleavePairGate::UninterleaveToU32 {
+                    num_ops: UNINTERLEAVE_OPS,
+                },
+            ),
+        ) if interleave_index < uninterleave_index => (interleave_index, uninterleave_index),
+        _ => return None,
+    };
+    let valid_shape = [interleave_index, uninterleave_index].into_iter().all(|index| {
+        let gate = &common_data.gates[index].0;
+        gate.num_wires() == INTERLEAVE_PAIR_WIRES
+            && gate.num_constraints() == INTERLEAVE_PAIR_CONSTRAINTS
+    });
+    valid_shape.then_some((interleave_index, uninterleave_index))
+}
+
+/// Reproduces `Gate::eval_filtered_base_batch`'s selector product in exactly
+/// the same factor order, but leaves the wire prefix intact for the joint
+/// evaluator below.
+fn fill_gate_filter<F: RichField + Extendable<D>, const D: usize>(
+    common_data: &CommonCircuitData<F, D>,
+    vars_batch: EvaluationVarsBaseBatch<F>,
+    gate_index: usize,
+    filters: &mut Vec<F>,
+) {
+    let batch_size = vars_batch.len();
+    let selector_index = common_data.selectors_info.selector_indices[gate_index];
+    let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
+    let mut factors = common_data.selectors_info.groups[selector_index]
+        .clone()
+        .filter(|&index| index != gate_index)
+        .chain(
+            (common_data.selectors_info.num_selectors() > 1).then_some(UNUSED_SELECTOR),
+        );
+    filters.clear();
+    if let Some(index) = factors.next() {
+        let constant = F::from_canonical_usize(index);
+        filters.extend(selector_col.iter().map(|&selector| constant - selector));
+    } else {
+        filters.resize(batch_size, F::ONE);
+    }
+    for index in factors {
+        let constant = F::from_canonical_usize(index);
+        for (filter, &selector) in filters.iter_mut().zip(selector_col) {
+            *filter *= constant - selector;
+        }
+    }
+}
+
+/// Evaluates the interleave half of the exact pair and retains the 128 bit
+/// range products plus four base-2 reductions for the later uninterleave
+/// half. Constraint rows and per-row accumulation stay identical to the
+/// ordinary gate implementation.
+fn eval_interleave_pair_begin<F: Field>(
+    wires: &[F],
+    batch_size: usize,
+    filters: &[F],
+    combined: &mut [F],
+    scratch: &mut Vec<F>,
+) {
+    const SCRATCH_COLS: usize = INTERLEAVE_OPS + INTERLEAVE_PAIR_BITS + 4 + 1;
+    let required = SCRATCH_COLS * batch_size;
+    if scratch.len() < required {
+        scratch.resize(required, F::ZERO);
+    } else {
+        scratch.truncate(required);
+    }
+    debug_assert!(wires.len() >= INTERLEAVE_PAIR_WIRES * batch_size);
+    debug_assert!(combined.len() >= INTERLEAVE_PAIR_CONSTRAINTS * batch_size);
+    debug_assert_eq!(filters.len(), batch_size);
+
+    let (x_accumulators, rest) = scratch.split_at_mut(INTERLEAVE_OPS * batch_size);
+    let (ranges, extras) = rest.split_at_mut(INTERLEAVE_PAIR_BITS * batch_size);
+    let (parity_accumulators, temp) = extras.split_at_mut(4 * batch_size);
+    parity_accumulators.fill(F::ZERO);
+    let base = F::from_canonical_usize(2);
+    let base_squared = F::from_canonical_usize(4);
+
+    for operation in 0..INTERLEAVE_OPS {
+        let row = operation * 34;
+        let bit_offset = operation * 32;
+        let x_accumulator =
+            &mut x_accumulators[operation * batch_size..(operation + 1) * batch_size];
+        x_accumulator.fill(F::ZERO);
+        temp.fill(F::ZERO);
+
+        for bit_index in 0..32 {
+            let bit_number = bit_offset + bit_index;
+            let bit_col = &wires[(8 + bit_number) * batch_size..][..batch_size];
+            let range = &mut ranges[bit_number * batch_size..(bit_number + 1) * batch_size];
+            let parity_index = 2 * (bit_number / 64) + bit_number % 2;
+            let parity = &mut parity_accumulators
+                [parity_index * batch_size..(parity_index + 1) * batch_size];
+            for point in 0..batch_size {
+                let bit = bit_col[point];
+                x_accumulator[point] = x_accumulator[point] * base + bit;
+                temp[point] = temp[point] * base_squared + bit;
+                range[point] = bit * (bit - F::ONE);
+                parity[point] = parity[point] * base + bit;
+            }
+            let output = &mut combined
+                [(row + 2 + bit_index) * batch_size..(row + 3 + bit_index) * batch_size];
+            batch_multiply_add_inplace(output, range, filters);
+        }
+
+        let interleaved_col = &wires[(2 * operation + 1) * batch_size..][..batch_size];
+        for point in 0..batch_size {
+            temp[point] -= interleaved_col[point];
+        }
+        let output = &mut combined[(row + 1) * batch_size..(row + 2) * batch_size];
+        batch_multiply_add_inplace(output, temp, filters);
+
+        let x_col = &wires[(2 * operation) * batch_size..][..batch_size];
+        for point in 0..batch_size {
+            temp[point] = x_accumulator[point] - x_col[point];
+        }
+        let output = &mut combined[row * batch_size..(row + 1) * batch_size];
+        batch_multiply_add_inplace(output, temp, filters);
+    }
+}
+
+/// Completes the uninterleave half using the first half's exact shared
+/// intermediates. It is invoked at the uninterleave gate's original position
+/// in gate order, so unrelated gate additions retain their original order.
+fn eval_interleave_pair_finish<F: Field>(
+    wires: &[F],
+    batch_size: usize,
+    filters: &[F],
+    combined: &mut [F],
+    scratch: &mut [F],
+) {
+    const SCRATCH_COLS: usize = INTERLEAVE_OPS + INTERLEAVE_PAIR_BITS + 4 + 1;
+    debug_assert_eq!(scratch.len(), SCRATCH_COLS * batch_size);
+    debug_assert!(wires.len() >= INTERLEAVE_PAIR_WIRES * batch_size);
+    debug_assert!(combined.len() >= INTERLEAVE_PAIR_CONSTRAINTS * batch_size);
+    debug_assert_eq!(filters.len(), batch_size);
+
+    let (x_accumulators, rest) = scratch.split_at_mut(INTERLEAVE_OPS * batch_size);
+    let (ranges, extras) = rest.split_at_mut(INTERLEAVE_PAIR_BITS * batch_size);
+    let (parity_accumulators, temp) = extras.split_at_mut(4 * batch_size);
+    let split = F::from_canonical_u64(1 << 32u64);
+    let u32_max = F::from_canonical_u32(u32::MAX);
+
+    for operation in 0..UNINTERLEAVE_OPS {
+        let row = operation * 68;
+        let bit_offset = operation * 64;
+        let (before_odds, after_evens) = parity_accumulators.split_at_mut(
+            (2 * operation + 1) * batch_size,
+        );
+        let evens = &mut before_odds[2 * operation * batch_size..];
+        let odds = &mut after_evens[..batch_size];
+
+        for bit_index in 0..64 {
+            let bit_number = bit_offset + bit_index;
+            let range = &ranges[bit_number * batch_size..(bit_number + 1) * batch_size];
+            let output = &mut combined
+                [(row + 4 + bit_index) * batch_size..(row + 5 + bit_index) * batch_size];
+            batch_multiply_add_inplace(output, range, filters);
+        }
+
+        let high = &x_accumulators[(2 * operation) * batch_size..(2 * operation + 1) * batch_size];
+        let low =
+            &x_accumulators[(2 * operation + 1) * batch_size..(2 * operation + 2) * batch_size];
+        let inverse = &wires[(4 * operation + 3) * batch_size..][..batch_size];
+        for point in 0..batch_size {
+            temp[point] =
+                (inverse[point] * (u32_max - high[point]) - F::ONE) * low[point];
+        }
+        let output = &mut combined[row * batch_size..(row + 1) * batch_size];
+        batch_multiply_add_inplace(output, temp, filters);
+
+        let interleaved = &wires[(4 * operation) * batch_size..][..batch_size];
+        for point in 0..batch_size {
+            temp[point] = high[point] * split + low[point] - interleaved[point];
+        }
+        let output = &mut combined[(row + 1) * batch_size..(row + 2) * batch_size];
+        batch_multiply_add_inplace(output, temp, filters);
+
+        let x_evens = &wires[(4 * operation + 1) * batch_size..][..batch_size];
+        for point in 0..batch_size {
+            evens[point] -= x_evens[point];
+        }
+        let output = &mut combined[(row + 2) * batch_size..(row + 3) * batch_size];
+        batch_multiply_add_inplace(output, evens, filters);
+
+        let x_odds = &wires[(4 * operation + 2) * batch_size..][..batch_size];
+        for point in 0..batch_size {
+            odds[point] -= x_odds[point];
+        }
+        let output = &mut combined[(row + 3) * batch_size..(row + 4) * batch_size];
+        batch_multiply_add_inplace(output, odds, filters);
+    }
 }
 
 pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
@@ -1158,12 +1389,48 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
     constraints_batch: &mut Vec<F>,
     cpu_gate_indices: &[usize],
     filters: &mut Vec<F>,
+    interleave_pair_scratch: &mut Vec<F>,
     num_constraint_rows: usize,
 ) {
     debug_assert!(num_constraint_rows <= common_data.num_gate_constraints);
     constraints_batch.clear();
     constraints_batch.resize(num_constraint_rows * vars_batch.len(), F::ZERO);
+    let interleave_pair = exact_interleave_pair(common_data, cpu_gate_indices);
     for &i in cpu_gate_indices {
+        if let Some((interleave_index, uninterleave_index)) = interleave_pair {
+            if i == interleave_index {
+                fill_gate_filter(common_data, vars_batch, i, filters);
+                let mut gate_vars = vars_batch;
+                gate_vars.remove_prefix(
+                    common_data.selectors_info.num_selectors()
+                        + common_data.num_lookup_selectors,
+                );
+                eval_interleave_pair_begin(
+                    gate_vars.local_wires,
+                    vars_batch.len(),
+                    filters,
+                    constraints_batch,
+                    interleave_pair_scratch,
+                );
+                continue;
+            }
+            if i == uninterleave_index {
+                fill_gate_filter(common_data, vars_batch, i, filters);
+                let mut gate_vars = vars_batch;
+                gate_vars.remove_prefix(
+                    common_data.selectors_info.num_selectors()
+                        + common_data.num_lookup_selectors,
+                );
+                eval_interleave_pair_finish(
+                    gate_vars.local_wires,
+                    vars_batch.len(),
+                    filters,
+                    constraints_batch,
+                    interleave_pair_scratch,
+                );
+                continue;
+            }
+        }
         let gate = &common_data.gates[i];
         let selector_index = common_data.selectors_info.selector_indices[i];
         gate.0.eval_filtered_base_batch(
@@ -1505,6 +1772,132 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn joint_interleave_pair_matches_independent_dense_rows_in_raw_limbs() {
+        type F = GoldilocksField;
+
+        let mut state = 0x6a09_e667_f3bc_c909u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            F::from_canonical_u64(state >> 1)
+        };
+
+        for batch_size in [1usize, 7, 32] {
+            let wires = (0..INTERLEAVE_PAIR_WIRES * batch_size)
+                .map(|_| next())
+                .collect::<Vec<_>>();
+            let interleave_filter = (0..batch_size).map(|_| next()).collect::<Vec<_>>();
+            let uninterleave_filter = (0..batch_size).map(|_| next()).collect::<Vec<_>>();
+            let initial = (0..INTERLEAVE_PAIR_CONSTRAINTS * batch_size)
+                .map(|_| next())
+                .collect::<Vec<_>>();
+
+            let mut interleave_rows =
+                vec![F::ZERO; INTERLEAVE_PAIR_CONSTRAINTS * batch_size];
+            let mut uninterleave_rows =
+                vec![F::ZERO; INTERLEAVE_PAIR_CONSTRAINTS * batch_size];
+            let base = F::from_canonical_usize(2);
+            let base_squared = F::from_canonical_usize(4);
+            let split = F::from_canonical_u64(1 << 32u64);
+            let u32_max = F::from_canonical_u32(u32::MAX);
+
+            // Independent pointwise formulas in the exact constraint-row
+            // order of each gate's ordinary evaluator.
+            for point in 0..batch_size {
+                for operation in 0..INTERLEAVE_OPS {
+                    let row = operation * 34;
+                    let mut x = F::ZERO;
+                    let mut interleaved = F::ZERO;
+                    for bit_index in 0..32 {
+                        let bit_number = operation * 32 + bit_index;
+                        let bit = wires[(8 + bit_number) * batch_size + point];
+                        x = x * base + bit;
+                        interleaved = interleaved * base_squared + bit;
+                        interleave_rows[(row + 2 + bit_index) * batch_size + point] =
+                            bit * (bit - F::ONE);
+                    }
+                    interleave_rows[row * batch_size + point] =
+                        x - wires[(2 * operation) * batch_size + point];
+                    interleave_rows[(row + 1) * batch_size + point] =
+                        interleaved - wires[(2 * operation + 1) * batch_size + point];
+                }
+
+                for operation in 0..UNINTERLEAVE_OPS {
+                    let row = operation * 68;
+                    let mut high = F::ZERO;
+                    let mut low = F::ZERO;
+                    let mut evens = F::ZERO;
+                    let mut odds = F::ZERO;
+                    for bit_index in 0..64 {
+                        let bit_number = operation * 64 + bit_index;
+                        let bit = wires[(8 + bit_number) * batch_size + point];
+                        if bit_index < 32 {
+                            high = high * base + bit;
+                        } else {
+                            low = low * base + bit;
+                        }
+                        if bit_index % 2 == 0 {
+                            evens = evens * base + bit;
+                        } else {
+                            odds = odds * base + bit;
+                        }
+                        uninterleave_rows[(row + 4 + bit_index) * batch_size + point] =
+                            bit * (bit - F::ONE);
+                    }
+                    let inverse = wires[(4 * operation + 3) * batch_size + point];
+                    uninterleave_rows[row * batch_size + point] =
+                        (inverse * (u32_max - high) - F::ONE) * low;
+                    uninterleave_rows[(row + 1) * batch_size + point] = high * split + low
+                        - wires[(4 * operation) * batch_size + point];
+                    uninterleave_rows[(row + 2) * batch_size + point] =
+                        evens - wires[(4 * operation + 1) * batch_size + point];
+                    uninterleave_rows[(row + 3) * batch_size + point] =
+                        odds - wires[(4 * operation + 2) * batch_size + point];
+                }
+            }
+
+            let mut expected = initial.clone();
+            for (output, row) in expected
+                .chunks_exact_mut(batch_size)
+                .zip(interleave_rows.chunks_exact(batch_size))
+            {
+                batch_multiply_add_inplace(output, row, &interleave_filter);
+            }
+            for (output, row) in expected
+                .chunks_exact_mut(batch_size)
+                .zip(uninterleave_rows.chunks_exact(batch_size))
+            {
+                batch_multiply_add_inplace(output, row, &uninterleave_filter);
+            }
+
+            let mut actual = initial;
+            let mut scratch = Vec::new();
+            eval_interleave_pair_begin(
+                &wires,
+                batch_size,
+                &interleave_filter,
+                &mut actual,
+                &mut scratch,
+            );
+            eval_interleave_pair_finish(
+                &wires,
+                batch_size,
+                &uninterleave_filter,
+                &mut actual,
+                &mut scratch,
+            );
+
+            for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    actual.0, expected.0,
+                    "raw limb mismatch at {index}, batch={batch_size}"
+                );
             }
         }
     }
