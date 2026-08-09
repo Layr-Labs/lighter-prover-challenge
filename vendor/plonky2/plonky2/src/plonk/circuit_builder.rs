@@ -49,7 +49,7 @@ use crate::plonk::circuit_data::{
 };
 use crate::plonk::config::{AlgebraicHasher, GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::copy_constraint::CopyConstraint;
-use crate::plonk::permutation_argument::Forest;
+use crate::plonk::permutation_argument::{Forest, PermutationSingletons};
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::timed;
 use crate::util::context_tree::ContextTree;
@@ -1039,7 +1039,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .collect()
     }
 
-    fn sigma_vecs(&self, k_is: &[F], subgroup: &[F]) -> (Vec<PolynomialValues<F>>, Forest) {
+    fn sigma_vecs(
+        &self,
+        k_is: &[F],
+        subgroup: &[F],
+    ) -> (Vec<PolynomialValues<F>>, Forest, PermutationSingletons) {
         let degree = self.gate_instances.len();
         let degree_log = log2_strict(degree);
         let config = &self.config;
@@ -1070,9 +1074,12 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         forest.compress_paths();
 
         let wire_partition = forest.wire_partition();
+        let permutation_singletons =
+            wire_partition.permutation_singletons(degree, config.num_routed_wires);
         (
             wire_partition.get_sigma_polys(degree_log, k_is, subgroup),
             forest,
+            permutation_singletons,
         )
     }
 
@@ -1266,7 +1273,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let subgroup = F::two_adic_subgroup(degree_bits);
 
         let k_is = get_unique_coset_shifts(degree, self.config.num_routed_wires);
-        let (sigma_vecs, forest) = timed!(
+        let (sigma_vecs, forest, permutation_singletons) = timed!(
             timing,
             "generate sigma polynomials",
             self.sigma_vecs(&k_is, &subgroup)
@@ -1463,6 +1470,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             subgroup,
             public_inputs: self.public_inputs,
             representative_map: forest.parents,
+            permutation_singletons,
             fft_root_table: Some(fft_root_table),
             circuit_digest,
             lookup_rows: self.lookup_rows.clone(),

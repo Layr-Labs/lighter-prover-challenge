@@ -46,6 +46,7 @@ use crate::plonk::circuit_data::{
     ProverOnlyCircuitData, VerifierCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
 };
 use crate::plonk::config::{GenericConfig, GenericHashOut, Hasher};
+use crate::plonk::permutation_argument::PermutationSingletons;
 use crate::plonk::plonk_common::salt_size;
 use crate::plonk::proof::{
     CompressedProof, CompressedProofWithPublicInputs, OpeningSet, OpeningSetTarget, Proof,
@@ -907,6 +908,8 @@ pub trait Read {
         let public_inputs = self.read_target_vec()?;
 
         let representative_map = self.read_usize_encoded_u32_vec()?;
+        let permutation_singletons =
+            PermutationSingletons::from_sigma_values(&sigmas, &subgroup, &common_data.k_is);
 
         let is_some = self.read_bool()?;
         let fft_root_table = match is_some {
@@ -949,6 +952,7 @@ pub trait Read {
             subgroup,
             public_inputs,
             representative_map,
+            permutation_singletons,
             fft_root_table,
             circuit_digest,
             lookup_rows,
@@ -1931,6 +1935,9 @@ pub trait Write {
             subgroup,
             public_inputs,
             representative_map,
+            // Runtime-only: reconstructed from the sigma values on read, so it contributes no
+            // bytes and the serialized format is unchanged.
+            permutation_singletons: _,
             fft_root_table,
             circuit_digest,
             lookup_rows,
@@ -2425,6 +2432,11 @@ mod tests {
         assert_eq!(
             decoded.representative_map,
             circuit.prover_only.representative_map
+        );
+        assert_eq!(
+            decoded.permutation_singletons,
+            circuit.prover_only.permutation_singletons,
+            "reconstructed permutation-singleton mask differs from the builder-derived mask"
         );
         assert_eq!(
             decoded.generator_watch_counts,

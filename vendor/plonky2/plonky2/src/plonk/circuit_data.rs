@@ -44,6 +44,7 @@ use crate::iop::target::Target;
 use crate::iop::witness::{PartialWitness, PartitionWitness};
 use crate::plonk::circuit_builder::CircuitBuilder;
 use crate::plonk::config::{GenericConfig, Hasher};
+use crate::plonk::permutation_argument::PermutationSingletons;
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::proof::{CompressedProofWithPublicInputs, ProofWithPublicInputs};
 use crate::plonk::prover::prove;
@@ -597,6 +598,10 @@ pub struct ProverOnlyCircuitData<
     /// zero-extended at every indexing site. The serialized encoding keeps the legacy 8-byte
     /// per-entry format.
     pub representative_map: Vec<u32>,
+    /// Row-major bitset of routed positions whose sigma cycle is a fixed point. These positions
+    /// contribute the same factor to both sides of the permutation identity and can be cancelled
+    /// symbolically by the prover. Runtime-only and reconstructed during deserialization.
+    pub permutation_singletons: PermutationSingletons,
     /// Pre-computed roots for faster FFT.
     pub fft_root_table: Option<FftRootTable<F>>,
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to

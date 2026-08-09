@@ -494,6 +494,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // forest partition code (`sigma_vecs` post-`compress_paths` state).
     let mut forest = Forest::from_parents(representative_map, num_wires, num_routed, degree);
     let wire_partition = forest.wire_partition();
+    let permutation_singletons = wire_partition.permutation_singletons(degree, num_routed);
     let sigma_vecs = wire_partition.get_sigma_polys(degree_bits, &common.k_is, &subgroup);
     let representative_map = forest.into_parents();
 
@@ -585,6 +586,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         subgroup,
         public_inputs,
         representative_map,
+        permutation_singletons,
         fft_root_table: Some(root_table),
         circuit_digest,
         lookup_rows,

@@ -659,6 +659,7 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     denominators_1.clear();
                     for (t, &x) in xs.iter().enumerate() {
                         let i = base + t;
+                        let singleton_row = i * num_routed_wires;
                         let s_sigmas = &prover_data.sigmas[i];
                         for chunk in 0..num_chunks {
                             let start = chunk * degree;
@@ -668,6 +669,12 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             let mut denominator_0 = F::ONE;
                             let mut denominator_1 = F::ONE;
                             for j in start..end {
+                                if prover_data
+                                    .permutation_singletons
+                                    .contains_position(singleton_row + j)
+                                {
+                                    continue;
+                                }
                                 let wire_value = witness.get_wire(i, j);
                                 let sigma = s_sigmas[j];
                                 numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
@@ -770,6 +777,7 @@ fn wires_permutation_partial_products_and_zs<
                 denominator_products.clear();
                 for (t, &x) in xs.iter().enumerate() {
                     let i = base + t;
+                    let singleton_row = i * num_routed_wires;
                     let s_sigmas = &prover_data.sigmas[i];
                     for chunk in 0..num_chunks {
                         let start = chunk * degree;
@@ -777,6 +785,12 @@ fn wires_permutation_partial_products_and_zs<
                         let mut numerator_product = F::ONE;
                         let mut denominator_product = F::ONE;
                         for j in start..end {
+                            if prover_data
+                                .permutation_singletons
+                                .contains_position(singleton_row + j)
+                            {
+                                continue;
+                            }
                             let wire_value = witness.get_wire(i, j);
                             numerator_product *= wire_value + beta_k_is[j] * x + gamma;
                             denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
@@ -3281,6 +3295,11 @@ mod permutation_pairing_tests {
 
             data.prover_only.subgroup = subgroup.clone();
             data.prover_only.sigmas = sigmas.clone();
+            // This differential intentionally replaces the circuit-fixed sigmas with random
+            // values. Disable the corresponding circuit-fixed mask so both paths continue to
+            // exercise every synthetic factor.
+            data.prover_only.permutation_singletons =
+                crate::plonk::permutation_argument::PermutationSingletons::empty();
 
             // Reference: the general per-challenge loop, two complete passes.
             let general: Vec<Vec<PolynomialValues<F>>> = (0..2)

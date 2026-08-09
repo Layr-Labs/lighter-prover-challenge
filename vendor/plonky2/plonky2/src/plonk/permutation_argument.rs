@@ -15,6 +15,74 @@ use crate::iop::wire::Wire;
 /// placement moves. Flip to `false` to restore the previous sequential-outer schedule exactly.
 const OUTER_PARALLEL_SIGMA_COLUMNS: bool = false;
 
+/// Circuit-fixed routed positions whose permutation cycle contains exactly one routed wire.
+///
+/// The mask is row-major because the prover consumes one sigma row at a time. It is runtime-only:
+/// builders derive it from the integer wire partition, while deserializers reproduce it from the
+/// already serialized sigma values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PermutationSingletons {
+    bits: Vec<u64>,
+    len: usize,
+}
+
+impl PermutationSingletons {
+    pub const fn empty() -> Self {
+        Self {
+            bits: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn with_len(len: usize) -> Self {
+        Self {
+            bits: vec![0; len.div_ceil(u64::BITS as usize)],
+            len,
+        }
+    }
+
+    fn set(&mut self, position: usize) {
+        debug_assert!(position < self.len);
+        self.bits[position / u64::BITS as usize] |=
+            1u64 << (position % u64::BITS as usize);
+    }
+
+    /// Returns false for a malformed or absent mask, preserving the full-factor fallback.
+    #[inline(always)]
+    pub fn contains_position(&self, position: usize) -> bool {
+        self.bits
+            .get(position / u64::BITS as usize)
+            .is_some_and(|word| word & (1u64 << (position % u64::BITS as usize)) != 0)
+    }
+
+    #[inline(always)]
+    pub fn contains(&self, row: usize, column: usize, num_routed_wires: usize) -> bool {
+        row.checked_mul(num_routed_wires)
+            .and_then(|base| base.checked_add(column))
+            .is_some_and(|position| self.contains_position(position))
+    }
+
+    /// Reconstructs the runtime-only mask from serialized row-major sigma values.
+    pub fn from_sigma_values<F: Field>(sigmas: &[Vec<F>], subgroup: &[F], k_is: &[F]) -> Self {
+        let Some(len) = sigmas.len().checked_mul(k_is.len()) else {
+            return Self::empty();
+        };
+        let mut mask = Self::with_len(len);
+        if sigmas.len() != subgroup.len() || sigmas.iter().any(|row| row.len() < k_is.len()) {
+            return mask;
+        }
+
+        for (row, (&x, sigma_row)) in subgroup.iter().zip(sigmas).enumerate() {
+            for (column, &k_i) in k_is.iter().enumerate() {
+                if sigma_row[column] == k_i * x {
+                    mask.set(row * k_is.len() + column);
+                }
+            }
+        }
+        mask
+    }
+}
+
 /// Disjoint Set Forest data-structure following <https://en.wikipedia.org/wiki/Disjoint-set_data_structure>.
 #[derive(Debug)]
 pub struct Forest {
@@ -205,6 +273,29 @@ pub struct WirePartition {
 }
 
 impl WirePartition {
+    /// Builds a row-major bitset for sigma fixed points. A fixed point is exactly a copy class
+    /// with one routed member, even when virtual or non-routed targets alias that class.
+    pub fn permutation_singletons(
+        &self,
+        degree: usize,
+        num_routed_wires: usize,
+    ) -> PermutationSingletons {
+        let len = degree
+            .checked_mul(num_routed_wires)
+            .expect("routed permutation size overflow");
+        assert_eq!(self.sigma.len(), len);
+        let mut mask = PermutationSingletons::with_len(len);
+        for row in 0..degree {
+            for column in 0..num_routed_wires {
+                let sigma_index = column * degree + row;
+                if self.sigma[sigma_index] as usize == sigma_index {
+                    mask.set(row * num_routed_wires + column);
+                }
+            }
+        }
+        mask
+    }
+
     pub fn get_sigma_polys<F: Field>(
         &self,
         degree_log: usize,
@@ -610,8 +701,20 @@ mod tests {
 
             let compressed = parents_as_usize(&forest);
             let expected = class_cycle_sigma(&compressed, num_wires, num_routed_wires, degree);
-            let sigma = forest.wire_partition().sigma;
+            let wire_partition = forest.wire_partition();
+            let singletons = wire_partition.permutation_singletons(degree, num_routed_wires);
+            let sigma = wire_partition.sigma;
             assert_eq!(sigma, expected, "sigma mismatch at degree {degree}");
+            for row in 0..degree {
+                for column in 0..num_routed_wires {
+                    let cell = column * degree + row;
+                    assert_eq!(
+                        singletons.contains(row, column, num_routed_wires),
+                        expected[cell] as usize == cell,
+                        "singleton-mask mismatch at row {row}, column {column}, degree {degree}"
+                    );
+                }
+            }
         }
     }
 
