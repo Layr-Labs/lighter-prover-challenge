@@ -153,6 +153,45 @@ where
     let quotient_degree = common_data.quotient_degree();
     let degree = common_data.degree();
 
+    #[cfg(feature = "diagnostic_profile")]
+    let _profile_context = {
+        let digest_bytes =
+            crate::plonk::config::GenericHashOut::to_bytes(&prover_data.circuit_digest);
+        let mut digest_prefix = [0u8; 8];
+        let prefix_len = digest_bytes.len().min(digest_prefix.len());
+        digest_prefix[..prefix_len].copy_from_slice(&digest_bytes[..prefix_len]);
+        crate::util::profile::enter_proof(
+            u64::from_le_bytes(digest_prefix),
+            common_data.degree_bits(),
+            config.num_wires,
+            config.num_routed_wires,
+            common_data.quotient_degree_factor,
+            num_challenges,
+            common_data.num_gate_constraints,
+            common_data.num_lookup_polys,
+        )
+    };
+    #[cfg(feature = "diagnostic_profile")]
+    let _profile_proof = crate::util::profile::span("proof", "prove_with_partition_witness");
+    #[cfg(feature = "diagnostic_profile")]
+    {
+        let count = |name, value: usize| {
+            crate::util::profile::counter("shape", name, value as u64);
+        };
+        count("degree_rows", degree);
+        count("lde_rows", common_data.lde_size());
+        count("wire_values", degree * config.num_wires);
+        count(
+            "routed_wire_values",
+            degree * config.num_routed_wires,
+        );
+        count(
+            "quotient_domain_points",
+            degree * common_data.quotient_degree_factor,
+        );
+        count("fri_query_rounds", config.fri_config.num_query_rounds);
+    }
+
     set_lookup_wires(prover_data, common_data, &mut partition_witness)?;
 
     let public_inputs = partition_witness.get_targets(&prover_data.public_inputs);
@@ -1695,6 +1734,64 @@ fn start_gpu_range_check_gate_quotient<
     Some((gate_indices, job))
 }
 
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn start_gpu_permutation_quotient<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    wires_commitment: &PolynomialBatch<F, C, D>,
+    zs_partial_products_commitment: &PolynomialBatch<F, C, D>,
+    shifted_points: &[F],
+    quotient_rows: usize,
+    step: usize,
+    next_step: usize,
+    betas: &[F],
+    gammas: &[F],
+    beta_k_is: &[F],
+    alphas: &[F],
+) -> Option<crate::hash::poseidon2::metal::PermutationQuotientJob<F>> {
+    if common_data.num_lookup_polys != 0 || common_data.config.num_challenges != 2 {
+        return None;
+    }
+    let wires = wires_commitment.merkle_tree.shared_columns()?;
+    let constants_sigmas = prover_data
+        .constants_sigmas_commitment
+        .merkle_tree
+        .shared_columns()?;
+    let zs_partial_products = zs_partial_products_commitment
+        .merkle_tree
+        .shared_columns()?;
+    let job = crate::hash::poseidon2::metal::start_permutation_quotient(
+        wires,
+        constants_sigmas,
+        zs_partial_products,
+        shifted_points,
+        quotient_rows,
+        step,
+        next_step,
+        common_data.sigmas_range().start,
+        common_data.config.num_routed_wires,
+        common_data.num_partial_products,
+        common_data.quotient_degree_factor,
+        betas,
+        gammas,
+        beta_k_is,
+        alphas,
+    )?;
+    if gpu_poseidon_quotient_diagnostics_enabled() {
+        eprintln!(
+            "[gpu-permutation-quotient] active rows={quotient_rows} step={step} \
+             routed={} partials={} shared_columns=true",
+            common_data.config.num_routed_wires,
+            common_data.num_partial_products,
+        );
+    }
+    Some(job)
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -1792,6 +1889,40 @@ fn compute_quotient_polys<
             )
         })
         .flatten();
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_permutation = (allow_gpu_poseidon && col_major_perm)
+        .then(|| {
+            start_gpu_permutation_quotient(
+                common_data,
+                prover_data,
+                wires_commitment,
+                zs_partial_products_and_lookup_commitment,
+                &shifted_points,
+                lde_size,
+                step,
+                next_step,
+                betas,
+                gammas,
+                beta_k_is,
+                alphas,
+            )
+        })
+        .flatten();
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let permutation_products_offloaded = gpu_permutation.is_some();
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let permutation_products_offloaded = false;
+
+    let permutation_gate_scales = if permutation_products_offloaded {
+        let prefix_len = num_challenges * (common_data.num_partial_products + 2);
+        alphas
+            .iter()
+            .map(|alpha| alpha.exp_u64(prefix_len as u64))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let excluded_gate_indices = gpu_poseidon
         .as_ref()
@@ -1895,7 +2026,11 @@ fn compute_quotient_polys<
         .map(|&i| common_data.gates[i].0.num_wires())
         .max()
         .unwrap_or(0)
-        .max(num_routed_wires);
+        .max(if permutation_products_offloaded {
+            0
+        } else {
+            num_routed_wires
+        });
     debug_assert!(cpu_num_wires <= common_data.config.num_wires);
     // Same argument, applied to the shared constraint rows instead of the wire
     // gather: an excluded gate's rows stay zero, so the CPU only ever writes
@@ -2005,12 +2140,17 @@ fn compute_quotient_polys<
                             &cache[ci * q + cache_start..ci * q + cache_start + n],
                         );
                     }
-                    let sc = common_data.sigmas_range().len();
-                    scratch.s_sigmas_flat.resize(sc * n, F::ZERO);
-                    for ci in 0..sc {
-                        scratch.s_sigmas_flat[ci * n..(ci + 1) * n].copy_from_slice(
-                            &cache[(cc + ci) * q + cache_start..(cc + ci) * q + cache_start + n],
-                        );
+                    if permutation_products_offloaded {
+                        scratch.s_sigmas_flat.clear();
+                    } else {
+                        let sc = common_data.sigmas_range().len();
+                        scratch.s_sigmas_flat.resize(sc * n, F::ZERO);
+                        for ci in 0..sc {
+                            scratch.s_sigmas_flat[ci * n..(ci + 1) * n].copy_from_slice(
+                                &cache[(cc + ci) * q + cache_start
+                                    ..(cc + ci) * q + cache_start + n],
+                            );
+                        }
                     }
                 } else {
                     prover_data.constants_sigmas_commitment.fill_lde_batch(
@@ -2030,24 +2170,32 @@ fn compute_quotient_polys<
                         (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
                     };
 
-                    prover_data.constants_sigmas_commitment.fill_lde_batch(
-                        &scratch.indices,
-                        step,
-                        common_data.sigmas_range(),
-                        batch_layout,
-                        &mut scratch.s_sigmas_flat,
-                    );
+                    if permutation_products_offloaded {
+                        scratch.s_sigmas_flat.clear();
+                    } else {
+                        prover_data.constants_sigmas_commitment.fill_lde_batch(
+                            &scratch.indices,
+                            step,
+                            common_data.sigmas_range(),
+                            batch_layout,
+                            &mut scratch.s_sigmas_flat,
+                        );
+                    }
                 }
                 // Layout seam: the no-lookup column evaluator consumes the
                 // PolyMajor gathers as-is (and the "next" gather narrows to
                 // the Z columns, the only ones it reads); the per-point path
                 // keeps the full-width PointMajor gathers and row views.
                 let (batch_layout, zs_local_range, zs_next_range) = if col_major_perm {
-                    (
-                        BatchLayout::PolyMajor,
-                        0..common_data.partial_products_range().end,
-                        common_data.zs_range(),
-                    )
+                    if permutation_products_offloaded {
+                        (BatchLayout::PolyMajor, common_data.zs_range(), 0..0)
+                    } else {
+                        (
+                            BatchLayout::PolyMajor,
+                            0..common_data.partial_products_range().end,
+                            common_data.zs_range(),
+                        )
+                    }
                 } else {
                     (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
                 };
@@ -2169,6 +2317,8 @@ fn compute_quotient_polys<
                     &cpu_gate_indices,
                     cpu_num_gate_constraints,
                     interleave_pair.as_ref(),
+                    permutation_products_offloaded,
+                    &permutation_gate_scales,
                     &z_h_on_coset,
                     &lut_re_poly_evals_refs,
                     &mut scratch.vanishing,
@@ -2267,6 +2417,43 @@ fn compute_quotient_polys<
                 #[cfg(test)]
                 job.mark_cpu_recompute_completed_for_tests();
                 return result;
+            }
+        };
+        debug_assert_eq!(gpu_values.len(), quotient_values.len());
+        quotient_values
+            .par_chunks_exact_mut(num_challenges)
+            .zip(gpu_values.par_chunks_exact(num_challenges))
+            .enumerate()
+            .for_each(|(i, (cpu_values, gpu_values))| {
+                let denominator_inv = z_h_on_coset.eval_inverse(i);
+                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                    *cpu += gpu * denominator_inv;
+                }
+            });
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    if let Some(job) = &gpu_permutation {
+        let gpu_values = match job.finish() {
+            Ok(values) => values,
+            Err(error) => {
+                log::warn!(
+                    "Metal permutation quotient failed; recomputing quotient on CPU: {error}"
+                );
+                return compute_quotient_polys(
+                    common_data,
+                    prover_data,
+                    public_inputs_hash,
+                    wires_commitment,
+                    zs_partial_products_and_lookup_commitment,
+                    betas,
+                    gammas,
+                    beta_k_is,
+                    deltas,
+                    alphas,
+                    col_major_perm,
+                    false,
+                );
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
