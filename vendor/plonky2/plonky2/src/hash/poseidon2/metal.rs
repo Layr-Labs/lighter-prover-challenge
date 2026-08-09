@@ -666,22 +666,49 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
 /// Scheduling only. The pipelines are the same objects the blocking build
 /// produced, lowered from the same library, so nothing they later compute can
 /// differ; only the instant at which they become available does.
+/// Immediates variant of the shader, source-compiled ONLY for the two gate-quotient
+/// kernels — each on its own detached thread, mirroring the stock deferral contract.
+/// The prebuilt metallib still serves the six critical-path kernels and the absorb
+/// pass, and is the per-thread fallback if a compile fails, so a failure reproduces
+/// the status quo (metallib, or CPU) rather than a hard error. The front-end cost is
+/// paid on these background threads, never on the blocking startup path.
+const QUOTIENT_IMMEDIATES_SOURCE: &str = include_str!("quotient_override.metal");
+
 fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
-    for (name, slot) in [
-        ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
+    for (name, slot, use_immediates) in [
+        ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE, true),
         (
             "range_check_gate_quotient",
             &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
+            true,
         ),
-        ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
+        ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE, false),
     ] {
         let device = device.clone();
         let library = library.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("poseidon2-metal-{name}"))
             .spawn(move || {
+                // Quotient kernels: compile the immediates source on this background
+                // thread and lower from it, falling back to the prebuilt library on
+                // any failure. The absorb pass keeps the prebuilt library.
+                let chosen: metal::Library = if use_immediates {
+                    let options = CompileOptions::new();
+                    match device.new_library_with_source(QUOTIENT_IMMEDIATES_SOURCE, &options) {
+                        Ok(lib) => {
+                            eprintln!("[library] provenance=runtime-source scope=quotient-immediates kernel={name}");
+                            lib
+                        }
+                        Err(e) => {
+                            eprintln!("[library] quotient-immediates compile failed for {name} ({e:?}); using prebuilt");
+                            library
+                        }
+                    }
+                } else {
+                    library
+                };
                 let pipeline = autoreleasepool(|| {
-                    library.get_function(name, None).ok().and_then(|function| {
+                    chosen.get_function(name, None).ok().and_then(|function| {
                         device
                             .new_compute_pipeline_state_with_function(&function)
                             .ok()
