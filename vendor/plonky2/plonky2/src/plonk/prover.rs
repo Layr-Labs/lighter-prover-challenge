@@ -2075,6 +2075,60 @@ fn compute_quotient_polys<
     // writes every element before any is read (see above). Same idiom as the
     // promoted zero-tail fast path in `fri/oracle.rs`.
     unsafe { quotient_values.set_len(quotient_len) };
+
+    // When Metal owns partial-product rows, precompute the two L_0*(Z_i-1)
+    // contributions once over the whole quotient domain by striding the
+    // retained shared Z LDE columns. The batch loop then only evaluates
+    // surviving gates — no per-batch Z gather into scratch. Values are
+    // fused with gate terms and Z_H^-1 after each batch (bit-identical to
+    // the previous in-batch L_0 evaluation).
+    let permutation_l0_terms: Option<Vec<F>> = if permutation_products_offloaded {
+        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+        {
+            zs_partial_products_and_lookup_commitment
+                .merkle_tree
+                .shared_columns()
+                .map(|zs| {
+                    debug_assert!(zs.cols() >= num_challenges);
+                    debug_assert_eq!(zs.rows(), points.len() * step);
+                    let z0 = zs.col(0);
+                    let z1 = zs.col(1);
+                    let mut terms = Vec::with_capacity(quotient_len);
+                    // SAFETY: every slot is written below before any read.
+                    unsafe { terms.set_len(quotient_len) };
+                    terms
+                        .par_chunks_mut(num_challenges)
+                        .enumerate()
+                        .for_each(|(i, out)| {
+                            let source = i * step;
+                            let l_0_x = z_h_on_coset.eval_l_0(i, shifted_points[i]);
+                            let z1_0 = l_0_x * z0[source].sub_one();
+                            let z1_1 = l_0_x * z1[source].sub_one();
+                            for (slot, &alpha) in out.iter_mut().zip(alphas.iter()) {
+                                *slot = z1_0 + z1_1 * alpha;
+                            }
+                        });
+                    terms
+                })
+        }
+        #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+        {
+            None
+        }
+    } else {
+        None
+    };
+    // If shared columns were unavailable we must not claim the offload path's
+    // Z-gather deletion — the vanishing offloaded branch still scales gates
+    // only, so without precomputed L_0 the result would be wrong. Fall back
+    // by disabling the products-offloaded CPU assumptions is not possible
+    // here (Metal job already launched); shared columns are required for the
+    // Metal job itself, so this Option is always Some whenever offloaded.
+    debug_assert_eq!(
+        permutation_products_offloaded,
+        permutation_l0_terms.is_some()
+    );
+
     quotient_values
         .par_chunks_mut(BATCH_SIZE * num_challenges)
         .zip(points_batches)
@@ -2188,7 +2242,10 @@ fn compute_quotient_polys<
                 // keeps the full-width PointMajor gathers and row views.
                 let (batch_layout, zs_local_range, zs_next_range) = if col_major_perm {
                     if permutation_products_offloaded {
-                        (BatchLayout::PolyMajor, common_data.zs_range(), 0..0)
+                        // L_0 rows come from a whole-domain precompute over
+                        // retained shared Z columns; Metal owns partials.
+                        // No Z/partial gather into per-batch scratch.
+                        (BatchLayout::PolyMajor, 0..0, 0..0)
                     } else {
                         (
                             BatchLayout::PolyMajor,
@@ -2206,20 +2263,28 @@ fn compute_quotient_polys<
                     BatchLayout::PolyMajor,
                     &mut scratch.local_wires,
                 );
-                zs_partial_products_and_lookup_commitment.fill_lde_batch(
-                    &scratch.indices,
-                    step,
-                    zs_local_range,
-                    batch_layout,
-                    &mut scratch.zs_local_flat,
-                );
-                zs_partial_products_and_lookup_commitment.fill_lde_batch(
-                    &scratch.indices_next,
-                    step,
-                    zs_next_range,
-                    batch_layout,
-                    &mut scratch.zs_next_flat,
-                );
+                if zs_local_range.end > zs_local_range.start {
+                    zs_partial_products_and_lookup_commitment.fill_lde_batch(
+                        &scratch.indices,
+                        step,
+                        zs_local_range,
+                        batch_layout,
+                        &mut scratch.zs_local_flat,
+                    );
+                } else {
+                    scratch.zs_local_flat.clear();
+                }
+                if zs_next_range.end > zs_next_range.start {
+                    zs_partial_products_and_lookup_commitment.fill_lde_batch(
+                        &scratch.indices_next,
+                        step,
+                        zs_next_range,
+                        batch_layout,
+                        &mut scratch.zs_next_flat,
+                    );
+                } else {
+                    scratch.zs_next_flat.clear();
+                }
 
                 let indices_batch = &scratch.indices;
                 // Per-point row views over the PointMajor gathers, built only
@@ -2330,9 +2395,18 @@ fn compute_quotient_polys<
                     .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
                 {
                     let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
+                    if let Some(l0_terms) = permutation_l0_terms.as_ref() {
+                        // gates*alpha^P + L_0*(Z-1) terms, then Z_H^-1 — same
+                        // algebra as the previous in-batch L_0 evaluation.
+                        let l0 = &l0_terms[i * num_challenges..(i + 1) * num_challenges];
+                        for (value, &l0_term) in quotient_values.iter_mut().zip(l0.iter()) {
+                            *value = (*value + l0_term) * denominator_inv;
+                        }
+                    } else {
+                        quotient_values
+                            .iter_mut()
+                            .for_each(|v| *v *= denominator_inv);
+                    }
                 }
             },
         );

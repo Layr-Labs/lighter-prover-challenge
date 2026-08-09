@@ -597,34 +597,22 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     if permutation_products_offloaded {
         assert!(!has_lookup, "lookup permutation products stay on the CPU");
-        let PermutationBatch::Cols {
-            zs_partial_products_cols,
-            ..
-        } = perm
-        else {
+        let PermutationBatch::Cols { .. } = perm else {
             unreachable!("Metal permutation offload requires column-major inputs")
         };
-        assert!(zs_partial_products_cols.len() >= num_challenges * n);
         // Global constraint order is
         //   [z1_0, z1_1, partial(0,0..chunks), partial(1,0..chunks), gates...].
-        // The Metal job emits only the partial rows at their powers 2..P-1.
-        // Shift the CPU gate-only Horner polynomial by P, then add the two
-        // inexpensive L_0 rows here. This deletes every routed-wire/sigma/
-        // partial-product traversal from the CPU without moving a transcript
-        // barrier or changing an alpha exponent.
+        // Metal emits partial rows at powers 2..P-1. The two L_0 rows are
+        // precomputed once over the whole quotient domain from retained shared
+        // Z columns (see `compute_quotient_polys`) and fused after this gate
+        // Horner — so the batch path only scales surviving gate terms by
+        // alpha^P and never gathers Z/sigma/partial columns into scratch.
         assert_eq!(permutation_gate_scales.len(), num_challenges);
+        let _ = (z_h_on_coset, indices_batch, xs_batch, alphas);
         for k in 0..n {
-            let l_0_x = z_h_on_coset.eval_l_0(indices_batch[k], xs_batch[k]);
-            let z1_0 = l_0_x * zs_partial_products_cols[k].sub_one();
-            let z1_1 = l_0_x * zs_partial_products_cols[n + k].sub_one();
             let point = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
-            for ((&alpha, &gate_scale), value) in alphas
-                .iter()
-                .zip(permutation_gate_scales)
-                .zip(point.iter_mut())
-            {
-                let gate_terms = *value * gate_scale;
-                *value = z1_0 + z1_1 * alpha + gate_terms;
+            for (&gate_scale, value) in permutation_gate_scales.iter().zip(point.iter_mut()) {
+                *value *= gate_scale;
             }
         }
         return;
