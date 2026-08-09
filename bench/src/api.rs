@@ -1,4 +1,4 @@
-// Redraw marker 250
+// OWN-TECH full FMA package 1786295385: gate Horner + Z construct FMA + Cols Horner
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 

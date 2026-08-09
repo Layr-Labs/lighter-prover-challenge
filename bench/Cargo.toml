@@ -32,7 +32,7 @@ serde_with = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
-log = { workspace = true }
+log = { workspace = true, features = ["release_max_level_off"] }
 env_logger = { workspace = true }
 bincode = { workspace = true }
 ff = { workspace = true }
