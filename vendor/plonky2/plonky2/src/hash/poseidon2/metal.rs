@@ -27,7 +27,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "994bf3336e993b8f0a9299f405fea772ae3a76135670d3603648a56b999dc21d";
+    "170057ff3ddf55e0d0029a8ed9952aa79e5844d0ad6ef5604a910c6f9cc2f583";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -361,6 +361,10 @@ pub(crate) enum U32QuotientKind {
         base: usize,
     },
     Selection,
+    /// Weighted multiplication in the quadratic Goldilocks extension.
+    MulExtension {
+        constant_column: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1323,6 +1327,19 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                         0usize,
                         0usize,
                         spec.num_ops.checked_mul(5)?,
+                        spec.num_ops.checked_mul(2)?,
+                    )
+                }
+                U32QuotientKind::MulExtension { constant_column } => {
+                    if spec.num_ops != 13 || constant_column >= constants.cols {
+                        return None;
+                    }
+                    (
+                        13usize,
+                        constant_column,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_mul(6)?,
                         spec.num_ops.checked_mul(2)?,
                     )
                 }
@@ -4113,11 +4130,11 @@ mod tests {
                 }),
             ),
         ];
-        // Four shapes are appended below: EqualityGate plus three
-        // RandomAccess copies. The constants commitment carries the raw
+        // Five shapes are appended below: EqualityGate, three RandomAccess
+        // copies and MulExtensionGate. The constants commitment carries the raw
         // RandomAccess constants at `raw_constant_base ..+2` and the
         // EqualityGate "one" immediately after them.
-        let raw_constant_base = shapes.len() + 4;
+        let raw_constant_base = shapes.len() + 5;
         let equality_constant_column = raw_constant_base + 2;
         shapes.push((
             WIRE_COLUMNS / 6,
@@ -4137,6 +4154,12 @@ mod tests {
                 }),
             ));
         }
+        shapes.push((
+            13,
+            UnionShape::U32(U32QuotientKind::MulExtension {
+                constant_column: raw_constant_base,
+            }),
+        ));
         assert_eq!(shapes.len(), raw_constant_base);
 
         let mut range_specs = Vec::new();
@@ -4611,6 +4634,26 @@ mod tests {
                                 spec.num_ops * (bits + 2) + num_extra_constants
                             );
                         }
+                        U32QuotientKind::MulExtension { constant_column } => {
+                            assert_eq!(spec.num_ops, 13);
+                            assert_eq!(
+                                <F as crate::field::extension::Extendable<2>>::W,
+                                F::from_canonical_u64(7),
+                                "the kernel hard-codes the quadratic extension modulus"
+                            );
+                            let w = F::from_canonical_u64(7);
+                            let const_0 = constants.col(constant_column)[source_row];
+                            for op in 0..spec.num_ops {
+                                let base = 6 * op;
+                                let product_0 =
+                                    wire(base) * wire(base + 2) + w * wire(base + 1) * wire(base + 3);
+                                let product_1 =
+                                    wire(base) * wire(base + 3) + wire(base + 1) * wire(base + 2);
+                                constraints.push(wire(base + 4) - const_0 * product_0);
+                                constraints.push(wire(base + 5) - const_0 * product_1);
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * 2);
+                        }
                         U32QuotientKind::BaseAddition { .. } => {
                             unreachable!("covered by metal_u32_gate_quotient_matches_cpu")
                         }
@@ -4657,6 +4700,11 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mul_extension_uses_combined_quotient_kind() {
+        assert!(SHADER_SOURCE.contains("else if (kind == 13u)"));
     }
 
     const ARITHMETIC_TEST_KERNELS: &str = r#"

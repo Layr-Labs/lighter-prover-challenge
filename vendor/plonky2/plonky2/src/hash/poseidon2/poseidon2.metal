@@ -576,7 +576,7 @@ inline void range_check_gate_emit(
 // then kind (arithmetic=0, subtraction=1, add-many=2, byte-decomposition=3,
 // quintic-multiplication=4, quintic-squaring=5, random-access=6,
 // exponentiation=7, equality=8, reducing=9, base-addition=10, base-sum=11,
-// selection=12), operation or copy count, and
+// selection=12, mul-extension=13), operation or copy count, and
 // three explicit kind words. Random access uses the final words for index
 // bits, extra constants, and the raw constant-column base; equality carries
 // its constants column and reducing its extension-coefficient flag in the
@@ -1345,6 +1345,35 @@ kernel void range_check_gate_quotient(
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_sub(gl_mul(b, x), temp), result),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 13u) {
+            // MulExtensionGate<2>: two quadratic-extension inputs and one
+            // output per operation. The addend-count slot carries local
+            // constant column zero, and Goldilocks uses x^2 = 7.
+            uint constant_column = num_addends;
+            ulong const_0 = constants[(ulong)constant_column * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong wire_base = (ulong)op * 6u;
+                ulong a_0 = wires[(wire_base + 0u) * lde_rows + source_row];
+                ulong a_1 = wires[(wire_base + 1u) * lde_rows + source_row];
+                ulong b_0 = wires[(wire_base + 2u) * lde_rows + source_row];
+                ulong b_1 = wires[(wire_base + 3u) * lde_rows + source_row];
+                ulong output_0 = wires[(wire_base + 4u) * lde_rows + source_row];
+                ulong output_1 = wires[(wire_base + 5u) * lde_rows + source_row];
+                ulong product_0 = gl_add(
+                    gl_mul(a_0, b_0),
+                    gl_mul(7, gl_mul(a_1, b_1)));
+                ulong product_1 = gl_add(
+                    gl_mul(a_0, b_1),
+                    gl_mul(a_1, b_0));
+                range_check_gate_emit(
+                    gl_sub(output_0, gl_mul(const_0, product_0)),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(output_1, gl_mul(const_0, product_1)),
                     alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }

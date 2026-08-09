@@ -1241,6 +1241,7 @@ fn start_gpu_range_check_gate_quotient<
     use crate::gates::equality_base::EqualityGate;
     use crate::gates::exponentiation::ExponentiationGate;
     use crate::gates::gate::U32QuotientGate;
+    use crate::gates::multiplication_extension::MulExtensionGate;
     use crate::gates::reducing::ReducingGate;
     use crate::gates::reducing_extension::ReducingExtensionGate;
     use crate::hash::poseidon2::metal::{
@@ -1549,6 +1550,26 @@ fn start_gpu_range_check_gate_quotient<
                 equality.num_ops.checked_mul(6)?,
                 equality.num_ops.checked_mul(4)?,
             ))
+        } else if let Some(multiplication) =
+            gate.0.as_any().downcast_ref::<MulExtensionGate<D>>()
+        {
+            if D != 2
+                || <F as Extendable<D>>::W != F::from_canonical_u64(7)
+                || multiplication.num_ops != 13
+                || gate.0.num_constants() != 1
+                || raw_constant_base >= common_data.num_constants
+            {
+                None
+            } else {
+                Some((
+                    U32QuotientKind::MulExtension {
+                        constant_column: raw_constant_base,
+                    },
+                    multiplication.num_ops,
+                    multiplication.num_ops.checked_mul(6)?,
+                    multiplication.num_ops.checked_mul(2)?,
+                ))
+            }
         } else if let Some(reducing) = gate.0.as_any().downcast_ref::<ReducingGate<D>>() {
             // The kernel's extension arithmetic is specialised to the
             // quadratic Goldilocks extension.
@@ -2465,6 +2486,9 @@ mod quotient_layout_tests {
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;
 
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    static GPU_QUOTIENT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn small_circuit() -> (CircuitData<F, C, D>, PartialWitness<F>) {
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<F, D>::new(config);
@@ -2496,6 +2520,24 @@ mod quotient_layout_tests {
         builder.connect(sum, Target::wire(row, 0));
     }
 
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn add_mul_extension(builder: &mut CircuitBuilder<F, D>) {
+        use crate::gates::multiplication_extension::MulExtensionGate;
+
+        let gate = MulExtensionGate::<D>::new_from_config(&builder.config);
+        assert_eq!(gate.num_ops, 13);
+        let row = builder.add_gate(gate.clone(), vec![F::from_canonical_u64(11)]);
+        for op in 0..gate.num_ops {
+            for (wire, value) in MulExtensionGate::<D>::wires_ith_multiplicand_0(op)
+                .chain(MulExtensionGate::<D>::wires_ith_multiplicand_1(op))
+                .zip(1 + 4 * op..=4 + 4 * op)
+            {
+                let value = builder.constant(F::from_canonical_usize(value));
+                builder.connect(value, Target::wire(row, wire));
+            }
+        }
+    }
+
     /// B1/B2/D1 differential gate: within a single prove call — same witness,
     /// commitments and challenges — the default column-major (`PolyMajor`)
     /// quotient path and the per-point (`PointMajor`) reference path must
@@ -2504,6 +2546,10 @@ mod quotient_layout_tests {
     /// the proof must also verify.
     #[test]
     fn quotient_layout_paths_agree() -> Result<()> {
+        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+        let _guard = GPU_QUOTIENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (data, pw) = small_circuit();
         assert!(data.common.luts.is_empty());
 
@@ -2515,6 +2561,49 @@ mod quotient_layout_tests {
         Ok(())
     }
 
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn metal_mul_extension_gate_quotient_matches_cpu_and_verifies() -> Result<()> {
+        use crate::gates::multiplication_extension::MulExtensionGate;
+
+        let _guard = GPU_QUOTIENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::hash::poseidon2::metal::force_context_for_tests();
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        add_mul_extension(&mut builder);
+        while builder.num_gates() <= (1 << 12) {
+            builder.add_gate(NoopGate, vec![]);
+        }
+        let data = builder.build::<Poseidon2GoldilocksConfig>();
+        assert!(data.common.luts.is_empty());
+        assert!(data.common.gates.iter().any(|gate| {
+            gate.0
+                .as_any()
+                .downcast_ref::<MulExtensionGate<D>>()
+                .is_some_and(|gate| gate.num_ops == 13)
+        }));
+
+        let before = gpu_poseidon_quotient_stats();
+        COMPARE_GPU_QUOTIENT.store(true, Ordering::SeqCst);
+        let proof = data.prove(PartialWitness::new());
+        COMPARE_GPU_QUOTIENT.store(false, Ordering::SeqCst);
+        let proof = proof?;
+        let after = gpu_poseidon_quotient_stats();
+        assert!(after.range_started > before.range_started);
+        assert!(after.range_completed > before.range_completed);
+        data.verify(proof)?;
+
+        let fault = crate::hash::poseidon2::metal::force_range_quotient_finish_failure_for_tests();
+        let fallback_proof = data.prove(PartialWitness::new())?;
+        assert!(fault.captured());
+        assert!(fault.forced());
+        assert!(fault.cpu_recompute_completed());
+        drop(fault);
+        data.verify(fallback_proof)?;
+        Ok(())
+    }
+
     /// End-to-end retained-column differential for every audited combined-gate
     /// layout. The same prove call compares the Metal quotient with a full CPU
     /// recomputation over identical LDE columns and challenges, then verifies
@@ -2522,6 +2611,9 @@ mod quotient_layout_tests {
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     #[test]
     fn metal_combined_gate_quotient_matches_cpu_and_verifies() -> Result<()> {
+        let _guard = GPU_QUOTIENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::hash::poseidon2::metal::force_context_for_tests();
         let config = CircuitConfig::standard_recursion_config();
         let addition_gate = crate::gates::addition_base::AdditionGate::new_from_config(&config);
@@ -2545,6 +2637,7 @@ mod quotient_layout_tests {
                 builder.register_public_input(selected);
             }
         }
+        add_mul_extension(&mut builder);
         let addition_row = builder.add_gate(
             addition_gate.clone(),
             vec![F::from_canonical_u64(3), F::from_canonical_u64(5)],
