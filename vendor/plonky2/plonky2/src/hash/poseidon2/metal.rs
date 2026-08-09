@@ -120,7 +120,6 @@ pub(crate) struct PoseidonGateQuotientJob<F> {
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
     len: usize,
-    _job: GpuJobGuard,
     _phantom: PhantomData<F>,
 }
 
@@ -134,7 +133,6 @@ pub(crate) struct RangeCheckGateQuotientJob<F> {
     len: usize,
     #[cfg(test)]
     failure_observer: Option<Arc<RangeQuotientFailureObserver>>,
-    _job: GpuJobGuard,
     _phantom: PhantomData<F>,
 }
 
@@ -836,6 +834,30 @@ impl GpuJobGuard {
     fn begin() -> Self {
         GPU_JOBS_IN_FLIGHT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         GpuJobGuard
+    }
+
+    /// Promises this guard's decrement to a command buffer's completion handler
+    /// instead of to `Drop`, so the count measures GPU stream occupancy rather
+    /// than host job-object lifetime. Only async quotient jobs use this;
+    /// synchronous Merkle builds keep the ordinary Drop guard.
+    fn into_gpu_scoped(self) -> GpuJobHandle {
+        core::mem::forget(self);
+        GpuJobHandle
+    }
+}
+
+/// A [`GpuJobGuard`] whose decrement has been promised to a command buffer.
+struct GpuJobHandle;
+
+impl GpuJobHandle {
+    /// Metal rejects completion handlers added after `commit`, so this runs
+    /// while the buffer is still being encoded.
+    fn attach(self, command_buffer: &metal::CommandBufferRef) {
+        let handler = block::ConcreteBlock::new(|_: &metal::CommandBufferRef| {
+            GPU_JOBS_IN_FLIGHT.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        })
+        .copy();
+        command_buffer.add_completed_handler(&handler);
     }
 }
 
@@ -1977,7 +1999,7 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("Poseidon2 gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
+        let job_guard = GpuJobGuard::begin().into_gpu_scoped();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
@@ -2001,6 +2023,7 @@ impl MetalShared {
             set_u32(encoder, 12, include_unused_selector as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
+            job_guard.attach(command_buffer);
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -2009,7 +2032,6 @@ impl MetalShared {
             output: Some(output),
             output_pool: Arc::clone(&self.quotient_output_pool),
             len,
-            _job: job_guard,
             _phantom: PhantomData,
         })
     }
@@ -2041,7 +2063,7 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("RangeCheck gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
+        let job_guard = GpuJobGuard::begin().into_gpu_scoped();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
@@ -2067,6 +2089,7 @@ impl MetalShared {
             set_u32(encoder, 10, u32_count as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
+            job_guard.attach(command_buffer);
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -2087,7 +2110,6 @@ impl MetalShared {
             len,
             #[cfg(test)]
             failure_observer,
-            _job: job_guard,
             _phantom: PhantomData,
         })
     }
@@ -3248,7 +3270,6 @@ mod tests {
             output: Some(output()),
             output_pool: Arc::clone(&pool),
             len: 8,
-            _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
         assert!(pool.lock().unwrap().free.is_empty());
@@ -3267,7 +3288,6 @@ mod tests {
             output: Some(completed_output),
             output_pool: Arc::clone(&pool),
             len: 8,
-            _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
         let reused = pool
@@ -3292,7 +3312,6 @@ mod tests {
             output_pool: Arc::clone(&pool),
             len: 8,
             failure_observer: None,
-            _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
         let reused = pool
