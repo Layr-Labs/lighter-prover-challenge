@@ -686,36 +686,118 @@ kernel void range_check_gate_quotient(
         for (uint op = 0; op < num_ops; ++op) {
             ulong input = wires[(ulong)op * lde_rows + source_row];
             ulong aux_base = (ulong)num_ops + (ulong)num_aux * op;
-            ulong computed = wires[(aux_base + num_aux - 1u) * lde_rows + source_row];
-            for (uint remaining = num_aux - 1u; remaining > 0u; --remaining) {
-                uint j = remaining - 1u;
-                ulong limb = wires[(aux_base + j) * lde_rows + source_row];
-                computed = gl_add(gl_quadruple(computed), limb);
-            }
-            range_check_gate_emit(
-                gl_sub(computed, input),
-                alpha_powers,
-                alpha_stride,
-                gate_accumulators,
-                constraint_index++);
 
-            for (uint j = 0; j < num_aux; ++j) {
-                ulong x = wires[(aux_base + j) * lde_rows + source_row];
-                ulong constraint;
-                if (j + 1u == num_aux && final_limb_range == 2u) {
-                    constraint = gl_mul(x, gl_sub(x, 1));
-                } else {
-                    // x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3),
-                    // exactly the production CPU specialization.
-                    ulong y = gl_mul(x, gl_sub(x, 3));
-                    constraint = gl_mul(y, gl_add(y, 2));
-                }
+            if (num_aux == 4u) {
+                // Read each limb exactly once from global memory into scalars.
+                ulong limb0 = wires[(aux_base + 0u) * lde_rows + source_row];
+                ulong limb1 = wires[(aux_base + 1u) * lde_rows + source_row];
+                ulong limb2 = wires[(aux_base + 2u) * lde_rows + source_row];
+                ulong limb3 = wires[(aux_base + 3u) * lde_rows + source_row];
+
+                // Base-4 recomposition: 4^3*limb3 + 4^2*limb2 + 4*limb1 + limb0.
+                ulong computed = limb3;
+                computed = gl_add(gl_quadruple(computed), limb2);
+                computed = gl_add(gl_quadruple(computed), limb1);
+                computed = gl_add(gl_quadruple(computed), limb0);
+
                 range_check_gate_emit(
-                    constraint,
+                    gl_sub(computed, input),
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
                     constraint_index++);
+
+                // limb0..limb2 are non-final: x(x-1)(x-2)(x-3) via y=x(x-3).
+                {
+                    ulong y = gl_mul(limb0, gl_sub(limb0, 3));
+                    range_check_gate_emit(gl_mul(y, gl_add(y, 2)),
+                        alpha_powers, alpha_stride, gate_accumulators, constraint_index++);
+                }
+                {
+                    ulong y = gl_mul(limb1, gl_sub(limb1, 3));
+                    range_check_gate_emit(gl_mul(y, gl_add(y, 2)),
+                        alpha_powers, alpha_stride, gate_accumulators, constraint_index++);
+                }
+                {
+                    ulong y = gl_mul(limb2, gl_sub(limb2, 3));
+                    range_check_gate_emit(gl_mul(y, gl_add(y, 2)),
+                        alpha_powers, alpha_stride, gate_accumulators, constraint_index++);
+                }
+                // Final limb: branch on final_limb_range.
+                if (final_limb_range == 2u) {
+                    range_check_gate_emit(gl_mul(limb3, gl_sub(limb3, 1)),
+                        alpha_powers, alpha_stride, gate_accumulators, constraint_index++);
+                } else {
+                    ulong y = gl_mul(limb3, gl_sub(limb3, 3));
+                    range_check_gate_emit(gl_mul(y, gl_add(y, 2)),
+                        alpha_powers, alpha_stride, gate_accumulators, constraint_index++);
+                }
+            } else if (num_aux == 3u) {
+                ulong limb0 = wires[(aux_base + 0u) * lde_rows + source_row];
+                ulong limb1 = wires[(aux_base + 1u) * lde_rows + source_row];
+                ulong limb2 = wires[(aux_base + 2u) * lde_rows + source_row];
+
+                // Base-4 recomposition: 4^2*limb2 + 4*limb1 + limb0.
+                ulong computed = limb2;
+                computed = gl_add(gl_quadruple(computed), limb1);
+                computed = gl_add(gl_quadruple(computed), limb0);
+
+                range_check_gate_emit(
+                    gl_sub(computed, input),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+
+                {
+                    ulong y = gl_mul(limb0, gl_sub(limb0, 3));
+                    range_check_gate_emit(gl_mul(y, gl_add(y, 2)),
+                        alpha_powers, alpha_stride, gate_accumulators, constraint_index++);
+                }
+                {
+                    ulong y = gl_mul(limb1, gl_sub(limb1, 3));
+                    range_check_gate_emit(gl_mul(y, gl_add(y, 2)),
+                        alpha_powers, alpha_stride, gate_accumulators, constraint_index++);
+                }
+                if (final_limb_range == 2u) {
+                    range_check_gate_emit(gl_mul(limb2, gl_sub(limb2, 1)),
+                        alpha_powers, alpha_stride, gate_accumulators, constraint_index++);
+                } else {
+                    ulong y = gl_mul(limb2, gl_sub(limb2, 3));
+                    range_check_gate_emit(gl_mul(y, gl_add(y, 2)),
+                        alpha_powers, alpha_stride, gate_accumulators, constraint_index++);
+                }
+            } else {
+                // Generic fallback for other limb counts.
+                ulong computed = wires[(aux_base + num_aux - 1u) * lde_rows + source_row];
+                for (uint remaining = num_aux - 1u; remaining > 0u; --remaining) {
+                    uint j = remaining - 1u;
+                    ulong limb = wires[(aux_base + j) * lde_rows + source_row];
+                    computed = gl_add(gl_quadruple(computed), limb);
+                }
+                range_check_gate_emit(
+                    gl_sub(computed, input),
+                    alpha_powers,
+                    alpha_stride,
+                    gate_accumulators,
+                    constraint_index++);
+
+                for (uint j = 0; j < num_aux; ++j) {
+                    ulong x = wires[(aux_base + j) * lde_rows + source_row];
+                    ulong constraint;
+                    if (j + 1u == num_aux && final_limb_range == 2u) {
+                        constraint = gl_mul(x, gl_sub(x, 1));
+                    } else {
+                        ulong y = gl_mul(x, gl_sub(x, 3));
+                        constraint = gl_mul(y, gl_add(y, 2));
+                    }
+                    range_check_gate_emit(
+                        constraint,
+                        alpha_powers,
+                        alpha_stride,
+                        gate_accumulators,
+                        constraint_index++);
+                }
             }
         }
 

@@ -24,7 +24,7 @@ pub const LIGHT_TX_MODE: u8 = TX_LIGHT;
 pub const ON_CHAIN_OPERATIONS_LIMIT: usize = 1;
 pub const PUBLIC_HEAVY_TX_COUNT: usize = 10;
 pub const PUBLIC_LIGHT_TX_COUNT: usize = 490;
-pub const PROVER_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
+pub const PROVER_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
 
 pub struct Circuits {
     pub heavy_tx_target: BlockTxTarget,
@@ -61,10 +61,6 @@ pub struct Circuits {
     pub dummy_heavy_proof: Proof,
     pub dummy_light_proof: Proof,
 }
-
-// Revalidate the fixed permutation-mask and release-log stack on the ranked host.
-// Repeat the validated stack after the official runner spread exceeded four percent.
-// Keep the production diff fixed while sampling the ranked-host tail once more.
 
 pub(crate) struct PathCircuits {
     pub(crate) tx_target: BlockTxTarget,
