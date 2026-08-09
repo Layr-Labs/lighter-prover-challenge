@@ -60,15 +60,22 @@ pub enum U32QuotientGate {
     /// Byte decomposition: `1 + num_limbs` routed words (sum then bytes)
     /// plus `4 * num_limbs` base-4 aux limbs per operation,
     /// `1 + 5 * num_limbs` constraint rows per operation.
-    ByteDecomposition { num_ops: usize, num_limbs: usize },
+    ByteDecomposition {
+        num_ops: usize,
+        num_limbs: usize,
+    },
     /// Degree-5 extension-field multiplication over the base field: fifteen
     /// routed words per operation (five limbs each for the two inputs and
     /// the output), five constraint rows per operation.
-    QuinticMultiplication { num_ops: usize },
+    QuinticMultiplication {
+        num_ops: usize,
+    },
     /// Degree-5 extension-field squaring over the base field: ten routed
     /// words (input and output limbs) plus ten temporary wires per
     /// operation, fifteen constraint rows per operation.
-    QuinticSquaring { num_ops: usize },
+    QuinticSquaring {
+        num_ops: usize,
+    },
     /// Random access with a little-endian binary index, `2^bits` list items
     /// per copy, and optional routed local constants.
     RandomAccess {
@@ -77,12 +84,29 @@ pub enum U32QuotientGate {
         num_extra_constants: usize,
     },
     /// Weighted base-field addition with two gate-local constants.
-    BaseAddition { num_ops: usize },
+    BaseAddition {
+        num_ops: usize,
+    },
     /// Little-endian base decomposition: one sum wire followed by `num_limbs`
     /// limbs, with the recomposition constraint followed by limb checks.
-    BaseSum { base: usize, num_limbs: usize },
+    BaseSum {
+        base: usize,
+        num_limbs: usize,
+    },
     /// Four routed values and one temporary per operation; two constraints.
-    Selection { num_ops: usize },
+    Selection {
+        num_ops: usize,
+    },
+}
+
+/// Exact layout tag for the two CPU gates whose ranked final-block quotient
+/// constraints can share a single bit traversal and reduce directly into the
+/// alpha accumulator. This is a prover-only evaluation hint; it does not
+/// change gate serialization or the constraint system.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterleavePairGate {
+    Interleave { num_ops: usize },
+    UninterleaveToU32 { num_ops: usize },
 }
 
 /// A custom gate.
@@ -340,6 +364,13 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
     /// Advertises one of the exact promoted gate layouts to optional quotient
     /// backends. The default leaves unrelated gates on the CPU.
     fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+        None
+    }
+
+    /// Advertises one of the exact layouts accepted by the joint CPU
+    /// interleave reducer. Unsupported or unpaired layouts use the ordinary
+    /// gate evaluator.
+    fn interleave_pair_gate(&self) -> Option<InterleavePairGate> {
         None
     }
 

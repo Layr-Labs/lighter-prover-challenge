@@ -30,12 +30,13 @@ use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{
-    eval_vanishing_poly_base_batch, get_lut_poly, PermutationBatch, VanishingScratch,
+    eval_vanishing_poly_base_batch, get_lut_poly, interleave_pair_plan, PermutationBatch,
+    VanishingScratch,
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
+use crate::util::log2_ceil;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil};
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -631,14 +632,10 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     let mut quotient_products_0: Vec<F> = Vec::with_capacity(product_count);
     let mut quotient_products_1: Vec<F> = Vec::with_capacity(product_count);
     {
-        let product_slots_0 = crate::hash::merkle_tree::capacity_up_to_mut(
-            &mut quotient_products_0,
-            product_count,
-        );
-        let product_slots_1 = crate::hash::merkle_tree::capacity_up_to_mut(
-            &mut quotient_products_1,
-            product_count,
-        );
+        let product_slots_0 =
+            crate::hash::merkle_tree::capacity_up_to_mut(&mut quotient_products_0, product_count);
+        let product_slots_1 =
+            crate::hash::merkle_tree::capacity_up_to_mut(&mut quotient_products_1, product_count);
         product_slots_0
             .par_chunks_mut(INV_BATCH * num_chunks)
             .zip(product_slots_1.par_chunks_mut(INV_BATCH * num_chunks))
@@ -751,8 +748,10 @@ fn wires_permutation_partial_products_and_zs<
     // witness generation and the Zs/partial-products commitment.
     let product_count = subgroup.len() * num_chunks;
     let mut all_quotient_chunk_products: Vec<F> = Vec::with_capacity(product_count);
-    let product_slots =
-        crate::hash::merkle_tree::capacity_up_to_mut(&mut all_quotient_chunk_products, product_count);
+    let product_slots = crate::hash::merkle_tree::capacity_up_to_mut(
+        &mut all_quotient_chunk_products,
+        product_count,
+    );
     product_slots
         .par_chunks_mut(INV_BATCH * num_chunks)
         .zip(subgroup.par_chunks(INV_BATCH))
@@ -1238,14 +1237,13 @@ fn start_gpu_range_check_gate_quotient<
     crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
 )> {
     use core::sync::atomic::Ordering;
+
     use crate::gates::equality_base::EqualityGate;
     use crate::gates::exponentiation::ExponentiationGate;
     use crate::gates::gate::U32QuotientGate;
     use crate::gates::reducing::ReducingGate;
     use crate::gates::reducing_extension::ReducingExtensionGate;
-    use crate::hash::poseidon2::metal::{
-        RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec,
-    };
+    use crate::hash::poseidon2::metal::{RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec};
 
     GPU_RANGE_QUOTIENT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     // `EqualityGate` reads a gate-local constant, whose commitment column is
@@ -1283,9 +1281,7 @@ fn start_gpu_range_check_gate_quotient<
         let u32_gate = gate.0.u32_quotient_gate();
         if range.is_some() && u32_gate.is_some() {
             if gpu_poseidon_quotient_diagnostics_enabled() {
-                eprintln!(
-                    "[gpu-range-quotient] gate {gate_index} advertised conflicting layouts"
-                );
+                eprintln!("[gpu-range-quotient] gate {gate_index} advertised conflicting layouts");
             }
             return None;
         }
@@ -1331,10 +1327,7 @@ fn start_gpu_range_check_gate_quotient<
                 // Every width shares one layout: five routed words per
                 // operation followed by `base_bits / 2` base-4 result limbs,
                 // so the wire and constraint counts are linear in the width.
-                U32QuotientGate::Subtraction {
-                    num_ops,
-                    base_bits,
-                } => {
+                U32QuotientGate::Subtraction { num_ops, base_bits } => {
                     let Some(result_limbs) = supported_quotient_result_limbs(base_bits) else {
                         if gpu_poseidon_quotient_diagnostics_enabled() {
                             eprintln!("[gpu-range-quotient] invalid U32 metadata: {u32_gate:?}");
@@ -1362,9 +1355,7 @@ fn start_gpu_range_check_gate_quotient<
                     };
                     if num_addends == 0 || num_addends > 16 || num_carry_limbs == 0 {
                         if gpu_poseidon_quotient_diagnostics_enabled() {
-                            eprintln!(
-                                "[gpu-range-quotient] invalid U32 metadata: {u32_gate:?}"
-                            );
+                            eprintln!("[gpu-range-quotient] invalid U32 metadata: {u32_gate:?}");
                         }
                         return None;
                     }
@@ -1383,9 +1374,7 @@ fn start_gpu_range_check_gate_quotient<
                 U32QuotientGate::ByteDecomposition { num_ops, num_limbs } => {
                     if num_limbs == 0 || num_limbs > 24 {
                         if gpu_poseidon_quotient_diagnostics_enabled() {
-                            eprintln!(
-                                "[gpu-range-quotient] invalid byte metadata: {u32_gate:?}"
-                            );
+                            eprintln!("[gpu-range-quotient] invalid byte metadata: {u32_gate:?}");
                         }
                         return None;
                     }
@@ -1564,9 +1553,7 @@ fn start_gpu_range_check_gate_quotient<
                     reducing.num_coeffs.checked_mul(2)?,
                 ))
             }
-        } else if let Some(reducing) =
-            gate.0.as_any().downcast_ref::<ReducingExtensionGate<D>>()
-        {
+        } else if let Some(reducing) = gate.0.as_any().downcast_ref::<ReducingExtensionGate<D>>() {
             if D != 2 {
                 None
             } else {
@@ -1804,12 +1791,11 @@ fn compute_quotient_polys<
     // computed once per circuit shape for the process and shared across proofs. Each cached
     // entry is bit-identical to the per-point inversion it replaces.
     #[cfg(feature = "std")]
-    let z_h_on_coset = z_h_on_coset.with_l_0_denominator_inverses(
-        l_0_table_cache::l_0_denominator_inverses::<F>(
+    let z_h_on_coset =
+        z_h_on_coset.with_l_0_denominator_inverses(l_0_table_cache::l_0_denominator_inverses::<F>(
             common_data.degree_bits(),
             quotient_degree_bits,
-        ),
-    );
+        ));
 
     // Precompute the lookup table evals on the challenges in delta
     // These values are used to produce the final RE constraints for each lut,
@@ -1869,16 +1855,29 @@ fn compute_quotient_polys<
     // prefix. Do not gather dead high columns for offloaded Poseidon/Range
     // gates into every 32-point CPU scratch batch.
     // survivor-list once per proof v4-17.76
-    let cpu_gate_indices = (0..common_data.gates.len())
+    let all_cpu_gate_indices = (0..common_data.gates.len())
         .filter(|gate_index| !excluded_gate_indices.contains(gate_index))
         .collect::<Vec<_>>();
-    let cpu_num_wires = cpu_gate_indices
+    let cpu_num_wires = all_cpu_gate_indices
         .iter()
         .map(|&i| common_data.gates[i].0.num_wires())
         .max()
         .unwrap_or(0)
         .max(num_routed_wires);
     debug_assert!(cpu_num_wires <= common_data.config.num_wires);
+    // The exact final-block interleave pair still needs all 136 gathered wire
+    // columns, but its constraints are reduced directly into the alpha seed.
+    // Detect it only after GPU ownership is fixed, then remove it from the
+    // ordinary shared constraint matrix while retaining the wire width above.
+    let interleave_pair = interleave_pair_plan(common_data, &all_cpu_gate_indices, alphas);
+    let cpu_gate_indices = all_cpu_gate_indices
+        .into_iter()
+        .filter(|&gate_index| {
+            interleave_pair
+                .as_ref()
+                .map_or(true, |plan| !plan.contains_gate(gate_index))
+        })
+        .collect::<Vec<_>>();
     // Same argument, applied to the shared constraint rows instead of the wire
     // gather: an excluded gate's rows stay zero, so the CPU only ever writes
     // the prefix below and the per-batch memset and Horner reduction can stop
@@ -1894,8 +1893,7 @@ fn compute_quotient_polys<
         eprintln!(
             "[gpu-gate-quotient] CPU wire gather width {cpu_num_wires}/{}; \
              constraint rows {cpu_num_gate_constraints}/{}; excluded={excluded_gate_indices:?}",
-            common_data.config.num_wires,
-            common_data.num_gate_constraints,
+            common_data.config.num_wires, common_data.num_gate_constraints,
         );
     }
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2150,6 +2148,7 @@ fn compute_quotient_polys<
                     alphas,
                     &cpu_gate_indices,
                     cpu_num_gate_constraints,
+                    interleave_pair.as_ref(),
                     &z_h_on_coset,
                     &lut_re_poly_evals_refs,
                     &mut scratch.vanishing,
@@ -2227,9 +2226,7 @@ fn compute_quotient_polys<
                     "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
                 );
                 if gpu_poseidon_quotient_diagnostics_enabled() {
-                    eprintln!(
-                        "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
-                    );
+                    eprintln!("[gpu-range-quotient] runtime failure; falling back to CPU: {error}");
                 }
                 let result = compute_quotient_polys(
                     common_data,
@@ -2384,7 +2381,10 @@ pub(crate) mod precomputed {
         pub(crate) fn shifted_two_adic_subgroup<F: Field>(n_log: usize) -> Arc<Vec<F>> {
             get_or_compute(&SHIFTED_SUBGROUPS, n_log, || {
                 let shift = F::coset_shift();
-                two_adic_subgroup::<F>(n_log).iter().map(|&x| shift * x).collect()
+                two_adic_subgroup::<F>(n_log)
+                    .iter()
+                    .map(|&x| shift * x)
+                    .collect()
             })
         }
 
@@ -2417,7 +2417,12 @@ pub(crate) mod precomputed {
 
         pub(crate) fn shifted_two_adic_subgroup<F: Field>(n_log: usize) -> Arc<Vec<F>> {
             let shift = F::coset_shift();
-            Arc::new(F::two_adic_subgroup(n_log).into_iter().map(|x| shift * x).collect::<Vec<F>>())
+            Arc::new(
+                F::two_adic_subgroup(n_log)
+                    .into_iter()
+                    .map(|x| shift * x)
+                    .collect::<Vec<F>>(),
+            )
         }
 
         pub(crate) fn inverse_coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
@@ -2443,9 +2448,9 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
+    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field, Field64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2457,9 +2462,9 @@ mod quotient_layout_tests {
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
-    use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+    use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
@@ -2864,9 +2869,8 @@ mod flat_chunk_products_tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
     use plonky2_field::types::{Field, PrimeField64};
 
-    use crate::util::partial_products::quotient_chunk_products_into;
-
     use super::divide_chunk_products;
+    use crate::util::partial_products::quotient_chunk_products_into;
 
     type F = GoldilocksField;
 
@@ -3085,18 +3089,17 @@ mod l_0_table_tests {
 /// comparisons here are on the raw `to_noncanonical_u64` limbs instead.
 #[cfg(all(test, feature = "std"))]
 mod permutation_pairing_tests {
+    use super::{
+        all_wires_permutation_partial_products, paired_permutation_batch_count,
+        two_challenge_wires_permutation_partial_products_and_zs,
+        wires_permutation_partial_products_and_zs,
+    };
     use crate::field::polynomial::PolynomialValues;
     use crate::field::types::{Field, Field64, PrimeField64};
     use crate::iop::witness::MatrixWitness;
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
-
-    use super::{
-        all_wires_permutation_partial_products, paired_permutation_batch_count,
-        two_challenge_wires_permutation_partial_products_and_zs,
-        wires_permutation_partial_products_and_zs,
-    };
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
