@@ -1238,6 +1238,7 @@ fn start_gpu_range_check_gate_quotient<
     crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
 )> {
     use core::sync::atomic::Ordering;
+    use crate::gates::base_sum::BaseSumGate;
     use crate::gates::equality_base::EqualityGate;
     use crate::gates::exponentiation::ExponentiationGate;
     use crate::gates::gate::U32QuotientGate;
@@ -1501,7 +1502,20 @@ fn start_gpu_range_check_gate_quotient<
         // the production circuits and are pure arithmetic, so they are matched
         // by type here instead of through the downstream-crate trait hooks
         // (those hooks exist only to avoid a `plonky2` -> circuit-crate dep).
-        let native = if let Some(exponentiation) =
+        let native = if let Some(base_sum) =
+            gate.0.as_any().downcast_ref::<BaseSumGate<2>>()
+        {
+            // The promoted binary gate occupies the recurring CPU constraint
+            // floor: one recomposition row followed by one boolean row per
+            // little-endian limb. Evaluate it in the existing union command.
+            let num_limbs = base_sum.num_limbs;
+            Some((
+                U32QuotientKind::BaseSumBinary,
+                num_limbs,
+                num_limbs.checked_add(1)?,
+                num_limbs.checked_add(1)?,
+            ))
+        } else if let Some(exponentiation) =
             gate.0.as_any().downcast_ref::<ExponentiationGate<F, D>>()
         {
             let num_power_bits = exponentiation.num_power_bits;
