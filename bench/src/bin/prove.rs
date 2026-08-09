@@ -27,8 +27,9 @@ use plonky2::fri::oracle::PolynomialBatch;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// Return freed pages to the OS as soon as they are unused instead of retaining
-// them for the process lifetime.
+// Retain freed pages in the process address space instead of returning them
+// to the OS, so that the next allocation reuses already-resident pages.
+// On the sequential single-worker harness, RSS is not a shared resource.
 //
 // The benchmark runs five of these workers concurrently and the score is the
 // sum of their lifetimes, so every resident page one worker holds is a page the
@@ -53,7 +54,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // /etc/malloc.conf can still override it.
 #[cfg(not(target_env = "msvc"))]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-static MALLOC_CONF: &[u8; 34] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
+static MALLOC_CONF: &[u8; 36] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
@@ -80,6 +81,16 @@ fn main() {
     // Do not link and initialize an unused logger in every scored process.
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
+        .start_handler(|_| {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                type qos_class_t = u32;
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(qos: qos_class_t, rel: i32) -> i32;
+                }
+                let _ = pthread_set_qos_class_self_np(0x21, 0);
+            }
+        })
         .build_global()
         .expect("cannot configure prover thread pool");
     #[cfg(feature = "diagnostic_profile")]
