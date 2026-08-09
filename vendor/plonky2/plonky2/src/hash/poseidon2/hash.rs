@@ -680,11 +680,38 @@ impl<T> AsRef<[T]> for Poseidon2Permutation<T> {
 
 trait Permuter: Sized {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH];
+
+    fn try_find_pow_witness(
+        _state: &[Self; WIDTH],
+        _witness_pos: usize,
+        _min_leading_zeros: u32,
+    ) -> Option<Self> {
+        None
+    }
 }
 
 impl<F: Poseidon2> Permuter for F {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH] {
         <F as Poseidon2>::poseidon2(input)
+    }
+
+    fn try_find_pow_witness(
+        _state: &[Self; WIDTH],
+        _witness_pos: usize,
+        _min_leading_zeros: u32,
+    ) -> Option<Self> {
+        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+        {
+            crate::hash::poseidon2::metal::try_find_pow_witness(
+                _state,
+                _witness_pos,
+                _min_leading_zeros,
+            )
+        }
+        #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+        {
+            None
+        }
     }
 }
 
@@ -726,6 +753,10 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
 
     fn permute(&mut self) {
         self.state = T::permute(self.state);
+    }
+
+    fn try_find_pow_witness(&self, witness_pos: usize, min_leading_zeros: u32) -> Option<T> {
+        T::try_find_pow_witness(&self.state, witness_pos, min_leading_zeros)
     }
 
     fn squeeze(&self) -> &[T] {

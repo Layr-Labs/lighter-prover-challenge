@@ -89,6 +89,14 @@ pub trait PlonkyPermutation<T: Copy + Default>:
     /// Apply permutation to internal state
     fn permute(&mut self);
 
+    /// Optionally search for a FRI proof-of-work witness using this prepared
+    /// overwrite-mode state. A returned value must make the canonical final
+    /// squeeze lane satisfy `min_leading_zeros`; the caller replays it through
+    /// the ordinary challenger. Returning `None` preserves the CPU search.
+    fn try_find_pow_witness(&self, _witness_pos: usize, _min_leading_zeros: u32) -> Option<T> {
+        None
+    }
+
     /// Return a slice of `RATE` elements
     fn squeeze(&self) -> &[T];
 }

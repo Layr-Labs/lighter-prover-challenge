@@ -3,6 +3,7 @@ using namespace metal;
 
 constant ulong GOLDILOCKS_PRIME = 0xffffffff00000001UL;
 constant ulong GOLDILOCKS_EPSILON = 0xffffffffUL;
+constant uint POW_RESPONSE_LANE = 7;
 
 // Compile-time Poseidon2 round constants (same values as config.rs).
 // File-scope constant arrays keep the round loops compact so register
@@ -419,6 +420,37 @@ inline void poseidon2(thread ulong state[12], constant ulong* /*parameters*/) {
             state[i] = pow7(gl_add(state[i], POSEIDON2_EXTERNAL_RC[round][i]));
         }
         external_linear_layer(state);
+    }
+}
+
+// Searches a bounded candidate interval with a persistent grid. Threads walk
+// strided offsets until one publishes a valid witness; offsets below the
+// current best keep running so the final result is deterministic within the
+// interval, while all later work stops without another command-buffer round.
+kernel void poseidon2_find_pow(
+    const device ulong* prepared_state [[buffer(0)]],
+    constant ulong* parameters [[buffer(1)]],
+    device atomic_uint* best_offset [[buffer(2)]],
+    constant ulong& candidate_start [[buffer(3)]],
+    constant uint& witness_pos [[buffer(4)]],
+    constant uint& min_leading_zeros [[buffer(5)]],
+    constant uint& candidate_count [[buffer(6)]],
+    constant uint& worker_count [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]) {
+    for (uint offset = gid; offset < candidate_count; offset += worker_count) {
+        if (offset >= atomic_load_explicit(best_offset, memory_order_relaxed)) {
+            break;
+        }
+
+        ulong state[12];
+        for (uint i = 0; i < 12; ++i) {
+            state[i] = prepared_state[i];
+        }
+        state[witness_pos] = candidate_start + (ulong)offset;
+        poseidon2(state, parameters);
+        if (clz(gl_canonicalize(state[POW_RESPONSE_LANE])) >= min_leading_zeros) {
+            atomic_fetch_min_explicit(best_offset, offset, memory_order_relaxed);
+        }
     }
 }
 

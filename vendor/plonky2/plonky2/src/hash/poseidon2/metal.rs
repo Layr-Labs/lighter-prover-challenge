@@ -27,13 +27,16 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "6a65119780a2645ce0077ef1da44d2774ca31aa1ef5c511162280d1b2f15213f";
+    "4b66eaa4738efc94d98242efa04db7a8bfe82e8e401ccb95717a045c27183381";
+#[cfg(test)]
+const SHADER_METALLIB_SHA256: &str =
+    "cc1e1c7cba90bcc32b5c3d1fe5607e878c0237054287b64e6f4731dac225e8f3";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
 /// source. This deliberately includes the lazily-built gate-quotient kernels:
 /// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 9] = [
+const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
     "poseidon2_hash_parents",
@@ -43,6 +46,7 @@ const METALLIB_REQUIRED_KERNELS: [&str; 9] = [
     "ifft_finalize",
     "poseidon2_gate_quotient",
     "range_check_gate_quotient",
+    "poseidon2_find_pow",
 ];
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
 /// (6654d43) ranked-validated this raised value inside its composition; my
@@ -639,11 +643,16 @@ impl LazyPipeline {
         }
         self.built.get()?.as_ref()
     }
+
+    fn try_get(&self) -> Option<&ComputePipelineState> {
+        self.built.get()?.as_ref()
+    }
 }
 
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
+static POW_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     POSEIDON_GATE_QUOTIENT_PIPELINE.get()
@@ -655,6 +664,10 @@ fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState>
 
 fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.get()
+}
+
+fn pow_pipeline() -> Option<&'static ComputePipelineState> {
+    POW_PIPELINE.try_get()
 }
 
 /// Starts the two gate-quotient pipeline builds on detached threads.
@@ -674,6 +687,7 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
         ),
         ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
+        ("poseidon2_find_pow", &POW_PIPELINE),
     ] {
         let device = device.clone();
         let library = library.clone();
@@ -800,6 +814,106 @@ pub fn prewarm() {
         .ok();
 }
 
+/// Searches one bounded canonical-candidate range against a prepared
+/// overwrite-mode challenger state. The caller still replays any returned
+/// witness through the ordinary CPU challenger before accepting it.
+fn find_pow_witness_range<F: PrimeField64>(
+    state: &[F; 12],
+    witness_pos: usize,
+    start: u64,
+    count: u32,
+    min_leading_zeros: u32,
+) -> Result<Option<u64>, String> {
+    if F::ORDER != 0xffff_ffff_0000_0001 || size_of::<F>() != size_of::<u64>() {
+        return Err("Metal PoW requires the Goldilocks field".to_owned());
+    }
+    if witness_pos >= 8 || count == 0 || min_leading_zeros > 64 {
+        return Err("invalid Metal PoW search parameters".to_owned());
+    }
+    let end = start
+        .checked_add(count as u64)
+        .ok_or("Metal PoW candidate range overflow")?;
+    if end > F::ORDER {
+        return Err("Metal PoW candidate range is not canonical".to_owned());
+    }
+
+    let context = force_context().as_ref().map_err(Clone::clone)?;
+    let pipeline = pow_pipeline().ok_or("Metal PoW pipeline unavailable")?;
+    let state = state.map(|element| element.to_canonical_u64());
+    let empty = u32::MAX;
+    let state_buffer = context.device.new_buffer_with_data(
+        state.as_ptr().cast::<c_void>(),
+        size_of_val(&state) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let result_buffer = context.device.new_buffer_with_data(
+        (&empty as *const u32).cast::<c_void>(),
+        size_of::<u32>() as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let worker_count = count.min(4096);
+
+    let command_buffer = autoreleasepool(|| {
+        let command_buffer = context.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(&state_buffer), 0);
+        encoder.set_buffer(1, Some(&context.parameters), 0);
+        encoder.set_buffer(2, Some(&result_buffer), 0);
+        encoder.set_bytes(
+            3,
+            size_of::<u64>() as NSUInteger,
+            (&start as *const u64).cast::<c_void>(),
+        );
+        set_u32(encoder, 4, witness_pos as u32);
+        set_u32(encoder, 5, min_leading_zeros);
+        set_u32(encoder, 6, count);
+        set_u32(encoder, 7, worker_count);
+        dispatch(encoder, pipeline, worker_count as usize);
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.to_owned()
+    });
+    command_buffer.wait_until_completed();
+    if command_buffer.status() != MTLCommandBufferStatus::Completed {
+        return Err(format!(
+            "Metal PoW command buffer ended with status {:?}",
+            command_buffer.status()
+        ));
+    }
+
+    // SAFETY: the completed kernel writes one aligned u32 in shared storage.
+    let offset = unsafe { *result_buffer.contents().cast::<u32>() };
+    Ok((offset != u32::MAX).then(|| start + offset as u64))
+}
+
+/// Attempts an adaptive Metal PoW search without ever waiting for the shared
+/// GPU lane. Unavailable/busy Metal and any command failure fall back to the
+/// caller's unchanged CPU search.
+pub(crate) fn try_find_pow_witness<F: PrimeField64>(
+    state: &[F; 12],
+    witness_pos: usize,
+    min_leading_zeros: u32,
+) -> Option<F> {
+    pow_pipeline()?;
+    let _permit = try_acquire_pow_permit()?;
+    let mut start = 0u64;
+    loop {
+        let remaining = F::ORDER.checked_sub(start)?;
+        if remaining == 0 {
+            return None;
+        }
+        let count = remaining.min(1 << 20) as u32;
+        if let Some(witness) =
+            find_pow_witness_range::<F>(state, witness_pos, start, count, min_leading_zeros)
+                .ok()?
+        {
+            return Some(F::from_canonical_u64(witness));
+        }
+        start += count as u64;
+    }
+}
+
 /// True while the prover is inside an exclusive serial phase (pre-execution
 /// or final block proof) where no concurrent proof can contend for the
 /// serialized GPU stream. Process-global on purpose: the phases it brackets
@@ -837,12 +951,67 @@ impl GpuJobGuard {
         GPU_JOBS_IN_FLIGHT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         GpuJobGuard
     }
+
+    fn try_begin_exclusive() -> Option<Self> {
+        GPU_JOBS_IN_FLIGHT
+            .compare_exchange(
+                0,
+                1,
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .ok()
+            .map(|_| GpuJobGuard)
+    }
 }
 
 impl Drop for GpuJobGuard {
     fn drop(&mut self) {
         GPU_JOBS_IN_FLIGHT.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     }
+}
+
+struct PowGpuPermit {
+    context: &'static MetalShared,
+    set: Option<BufferSet>,
+    _job: GpuJobGuard,
+}
+
+impl Drop for PowGpuPermit {
+    fn drop(&mut self) {
+        if let Some(set) = self.set.take() {
+            self.context.release_set(set);
+        }
+    }
+}
+
+/// Reserves the existing single Metal tree lane without waiting. A caller that
+/// loses this race must stay on the CPU; queueing PoW behind another proof's
+/// tree would turn otherwise overlapped CPU work into FIFO GPU latency.
+fn try_acquire_pow_permit() -> Option<PowGpuPermit> {
+    if GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) != 0 || !context_ready() {
+        return None;
+    }
+    let context = CONTEXT.as_ref().ok()?;
+    let mut pool = context.pool.try_lock().ok()?;
+    let job = GpuJobGuard::try_begin_exclusive()?;
+    let set = if let Some(set) = pool.free.pop() {
+        set
+    } else if pool.created < MAX_BUFFER_SETS {
+        pool.created += 1;
+        BufferSet {
+            input: None,
+            output: None,
+        }
+    } else {
+        return None;
+    };
+    drop(pool);
+    Some(PowGpuPermit {
+        context,
+        set: Some(set),
+        _job: job,
+    })
 }
 
 fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bool {
@@ -3155,6 +3324,9 @@ mod tests {
     use crate::field::types::{Field64, PrimeField64};
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
+    use crate::hash::hashing::PlonkyPermutation;
+    use crate::hash::poseidon2::hash::Poseidon2;
+    use crate::hash::poseidon2::hash::Poseidon2Permutation;
 
     /// The prebuilt AIR library is only sound while it is the compiled form of
     /// the MSL we ship. Nothing in the type system ties the two together, so
@@ -3178,6 +3350,18 @@ mod tests {
              xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib\n\
              then update SHADER_SOURCE_SHA256 to {digest}."
         );
+
+        let output = std::process::Command::new("/usr/bin/shasum")
+            .args(["-a", "256", &format!("{dir}/poseidon2.metallib")])
+            .output()
+            .expect("shasum must be available to verify the metallib artifact");
+        assert!(output.status.success(), "metallib shasum failed");
+        let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
+        let digest = digest.split_whitespace().next().expect("empty shasum output");
+        assert_eq!(
+            digest, SHADER_METALLIB_SHA256,
+            "poseidon2.metallib changed without updating its pinned SHA-256"
+        );
     }
 
     /// The fallback in `MetalShared::new` hides a broken artifact behind a
@@ -3197,6 +3381,95 @@ mod tests {
                 "prebuilt metallib is missing kernel {name}"
             );
         }
+    }
+
+    #[test]
+    fn metal_pow_search_returns_cpu_valid_witness() {
+        type F = GoldilocksField;
+        if Device::system_default().is_none() {
+            return;
+        }
+        force_context_for_tests();
+        POW_PIPELINE.get().expect("Metal PoW pipeline must build");
+
+        let mut rng = StdRng::seed_from_u64(0x455_50_57);
+        for witness_pos in 0..8 {
+            let state = core::array::from_fn(|_| F::from_canonical_u64(rng.next_u64() % F::ORDER));
+            let start = rng.next_u64() % (F::ORDER - (1 << 16));
+            let witness = find_pow_witness_range::<F>(&state, witness_pos, start, 1 << 16, 8)
+                .expect("Metal PoW search must execute")
+                .expect("a 2^16-candidate range must contain an 8-bit witness");
+
+            assert!((start..start + (1 << 16)).contains(&witness));
+            let mut replay = state;
+            replay[witness_pos] = F::from_canonical_u64(witness);
+            let response = F::poseidon2(replay)[7].to_canonical_u64();
+            assert!(response.leading_zeros() >= 8);
+        }
+    }
+
+    #[test]
+    fn metal_pow_permutation_hook_returns_cpu_valid_witness() {
+        type F = GoldilocksField;
+        if Device::system_default().is_none() {
+            return;
+        }
+        force_context_for_tests();
+
+        let state = core::array::from_fn(|i| F::from_canonical_usize(1000 + i));
+        let permutation = Poseidon2Permutation::new(state);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let witness = loop {
+            if let Some(witness) = permutation.try_find_pow_witness(3, 8) {
+                break witness;
+            }
+            assert!(Instant::now() < deadline, "Metal PoW lane remained busy");
+            std::thread::yield_now();
+        };
+        let mut replay = state;
+        replay[3] = witness;
+        assert!(F::poseidon2(replay)[7].to_canonical_u64().leading_zeros() >= 8);
+    }
+
+    #[test]
+    #[ignore = "component timing probe"]
+    fn benchmark_metal_pow_search_idle() {
+        type F = GoldilocksField;
+        if Device::system_default().is_none() {
+            return;
+        }
+        force_context_for_tests();
+        POW_PIPELINE.get().expect("Metal PoW pipeline must build");
+
+        const RUNS: usize = 64;
+        let mut rng = StdRng::seed_from_u64(0x455_50_57_16);
+        let mut durations = Vec::with_capacity(RUNS);
+        let mut offsets = Vec::with_capacity(RUNS);
+        for run in 0..RUNS {
+            let state = core::array::from_fn(|_| F::from_canonical_u64(rng.next_u64() % F::ORDER));
+            let start = Instant::now();
+            let witness = find_pow_witness_range::<F>(&state, run % 8, 0, 1 << 20, 16)
+                .expect("Metal PoW search must execute")
+                .expect("the timing range must contain a 16-bit witness");
+            durations.push(start.elapsed());
+            offsets.push(witness);
+
+            let mut replay = state;
+            replay[run % 8] = F::from_canonical_u64(witness);
+            assert!(F::poseidon2(replay)[7].to_canonical_u64().leading_zeros() >= 16);
+        }
+        durations.sort_unstable();
+        let total: Duration = durations.iter().copied().sum();
+        offsets.sort_unstable();
+        eprintln!(
+            "Metal PoW idle: runs={RUNS} total={total:?} mean={:?} p50={:?} p95={:?} max={:?} offset_p50={} offset_max={}",
+            total / RUNS as u32,
+            durations[RUNS / 2],
+            durations[RUNS * 95 / 100],
+            durations[RUNS - 1],
+            offsets[RUNS / 2],
+            offsets[RUNS - 1],
+        );
     }
 
     #[test]
