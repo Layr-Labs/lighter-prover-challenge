@@ -57,9 +57,9 @@ pub trait PackedEvaluableBase<F: RichField + Extendable<D>, const D: usize>: Gat
         combined_gate_constraints: &mut [F],
     ) {
         let n = vars_batch.len();
-        assert_eq!(filters.len(), n);
+        debug_assert_eq!(filters.len(), n);
         let num_constraints = self.num_constraints();
-        assert!(combined_gate_constraints.len() >= num_constraints * n);
+        debug_assert!(combined_gate_constraints.len() >= num_constraints * n);
         let width = <<F as Packable>::Packing as PackedField>::WIDTH;
 
         // Scratch for one lane group's constraint block. Batches are 32 points, so for

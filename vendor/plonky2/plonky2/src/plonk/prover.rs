@@ -1868,9 +1868,14 @@ fn compute_quotient_polys<
     // remaining gates, while the permutation argument always needs the routed
     // prefix. Do not gather dead high columns for offloaded Poseidon/Range
     // gates into every 32-point CPU scratch batch.
-    // survivor-list once per proof v4-17.76
+    // Build the survivor list once per proof. Zero-constraint gates (notably
+    // `NoopGate`) cannot change the quotient, but evaluating their selector
+    // filters still scans the whole domain. Keep them out of the CPU pass.
     let cpu_gate_indices = (0..common_data.gates.len())
-        .filter(|gate_index| !excluded_gate_indices.contains(gate_index))
+        .filter(|gate_index| {
+            !excluded_gate_indices.contains(gate_index)
+                && common_data.gates[*gate_index].0.num_constraints() != 0
+        })
         .collect::<Vec<_>>();
     let cpu_num_wires = cpu_gate_indices
         .iter()
