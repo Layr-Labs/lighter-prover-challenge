@@ -80,6 +80,20 @@ fn main() {
     // Do not link and initialize an unused logger in every scored process.
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
+        .start_handler(|_| {
+            // Pin every rayon worker at USER_INTERACTIVE so the prover's
+            // parallel FFT, gate-eval and Merkle passes run on P-cores at
+            // full clock instead of inheriting the thread pool's default QoS.
+            // Value-exact: only changes scheduling, not computation.
+            #[cfg(target_os = "macos")]
+            unsafe {
+                type qos_class_t = u32;
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(qos: qos_class_t, rel: i32) -> i32;
+                }
+                let _ = pthread_set_qos_class_self_np(0x21, 0);
+            }
+        })
         .build_global()
         .expect("cannot configure prover thread pool");
     #[cfg(feature = "diagnostic_profile")]
