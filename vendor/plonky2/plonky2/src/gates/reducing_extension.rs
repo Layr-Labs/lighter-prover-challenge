@@ -5,6 +5,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
+use core::mem::MaybeUninit;
 use core::ops::Range;
 
 use anyhow::Result;
@@ -159,7 +160,34 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ReducingExtens
             .map(|p| ext(Self::wires_old_acc().start, p))
             .collect();
 
-        let mut scratch = vec![F::ZERO; D * n];
+        // Safe construction of `EvaluationVarsBaseBatch` rejects `n == 0`.
+        // Retain a defensive return for an internal zero-width value without
+        // ever publishing uninitialized scratch as `F`.
+        if n == 0 {
+            return;
+        }
+
+        // One `D x n` constraint block, overwritten before every read. Keep
+        // production quotient batches on the stack without zeroing dead
+        // contents; unusual larger batches retain the exact heap fallback.
+        const STACK_SCRATCH: usize = 128;
+        let scratch_len = D * n;
+        let mut scratch_stack = [MaybeUninit::<F>::uninit(); STACK_SCRATCH];
+        let mut scratch_heap;
+        let scratch: &mut [MaybeUninit<F>] = if scratch_len <= STACK_SCRATCH {
+            &mut scratch_stack[..scratch_len]
+        } else {
+            scratch_heap = vec![F::ZERO; scratch_len];
+            // SAFETY: viewing initialized `F`s as `MaybeUninit<F>` preserves
+            // their layout and validity. The Vec remains alive and is not
+            // otherwise accessed until this borrow ends.
+            unsafe {
+                core::slice::from_raw_parts_mut(
+                    scratch_heap.as_mut_ptr().cast::<MaybeUninit<F>>(),
+                    scratch_len,
+                )
+            }
+        };
         for i in 0..self.num_coeffs {
             let coeff_start = Self::wires_coeff(i).start;
             let acc_start = self.wires_accs(i).start;
@@ -168,14 +196,19 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ReducingExtens
                 let constraint = accs[p] * alphas[p] + ext(coeff_start, p) - next_acc;
                 let arr = constraint.to_basefield_array();
                 for (d, a) in arr.iter().enumerate() {
-                    scratch[d * n + p] = *a;
+                    scratch[d * n + p].write(*a);
                 }
                 accs[p] = next_acc;
             }
+            // SAFETY: the point loop just wrote every `(d, p)` in
+            // `0..D x 0..n`, which is exactly `scratch_len`. No `F` slice is
+            // created for `num_coeffs == 0`, and `n == 0` returned above.
+            let initialized_scratch =
+                unsafe { core::slice::from_raw_parts(scratch.as_ptr().cast::<F>(), scratch_len) };
             for d in 0..D {
                 batch_multiply_add_inplace(
                     &mut combined_gate_constraints[(i * D + d) * n..][..n],
-                    &scratch[d * n..][..n],
+                    &initialized_scratch[d * n..][..n],
                     filters,
                 );
             }
