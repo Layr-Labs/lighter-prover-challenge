@@ -582,6 +582,12 @@ pub struct ProverOnlyCircuitData<
     /// start of every proof. Runtime-only: it is a pure function of `generator_indices_by_watches`
     /// and is reconstructed on deserialization, so the serialized format is unchanged.
     pub generator_watch_counts: Vec<usize>,
+    /// Whether every generator is known to require all of its watched representatives before it
+    /// can make progress.
+    ///
+    /// Runtime-only: this is derived from the generator trait objects at build/deserialization
+    /// time, so it changes neither circuit serialization nor proof bytes.
+    pub all_generators_require_all_watches: bool,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.
@@ -597,6 +603,14 @@ pub struct ProverOnlyCircuitData<
     /// zero-extended at every indexing site. The serialized encoding keeps the legacy 8-byte
     /// per-entry format.
     pub representative_map: Vec<u32>,
+    /// One bit per routed `(row, column)` position, in row-major order. A set bit means that the
+    /// position is the sole routed member of its copy-constraint component, hence its sigma
+    /// permutation target is itself and its permutation factor cancels for every proof.
+    ///
+    /// Runtime-only: this is derived from [`Self::representative_map`] during circuit construction
+    /// and reconstructed during deserialization, so it changes neither the serialized format nor
+    /// the circuit digest.
+    pub fixed_routed_wires: Vec<u8>,
     /// Pre-computed roots for faster FFT.
     pub fft_root_table: Option<FftRootTable<F>>,
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to

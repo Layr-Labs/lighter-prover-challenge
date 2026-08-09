@@ -867,8 +867,13 @@ pub trait Read {
     ) -> IoResult<ProverOnlyCircuitData<F, C, D>> {
         let gen_len = self.read_usize()?;
         let mut generators = Vec::with_capacity(gen_len);
+        let mut all_generators_require_all_watches = true;
         for _ in 0..gen_len {
-            generators.push(self.read_generator(generator_serializer, common_data)?);
+            let generator = self.read_generator(generator_serializer, common_data)?;
+            if all_generators_require_all_watches {
+                all_generators_require_all_watches = generator.0.requires_all_watches();
+            }
+            generators.push(generator);
         }
         let map_len = self.read_usize()?;
         let mut generator_indices_by_watches = BTreeMap::new();
@@ -907,6 +912,13 @@ pub trait Read {
         let public_inputs = self.read_target_vec()?;
 
         let representative_map = self.read_usize_encoded_u32_vec()?;
+        let fixed_routed_wires = crate::plonk::permutation_argument::fixed_routed_wire_mask(
+            &representative_map,
+            common_data.config.num_wires,
+            common_data.config.num_routed_wires,
+            subgroup.len(),
+        )
+        .ok_or(IoError)?;
 
         let is_some = self.read_bool()?;
         let fft_root_table = match is_some {
@@ -944,11 +956,13 @@ pub trait Read {
             generators,
             generator_indices_by_watches,
             generator_watch_counts,
+            all_generators_require_all_watches,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
             public_inputs,
             representative_map,
+            fixed_routed_wires,
             fft_root_table,
             circuit_digest,
             lookup_rows,
@@ -1922,6 +1936,8 @@ pub trait Write {
             // Runtime-only: reconstructed from `generator_indices_by_watches` on read, so it
             // contributes no bytes and the serialized format is unchanged.
             generator_watch_counts: _,
+            // Runtime-only: reconstructed from the generator trait objects on read.
+            all_generators_require_all_watches: _,
             // Runtime-only: contributes no bytes; the serialized format is unchanged.
             constants_sigmas_quotient_cache: _,
             constants_sigmas_quotient_step: _,
@@ -1931,6 +1947,9 @@ pub trait Write {
             subgroup,
             public_inputs,
             representative_map,
+            // Runtime-only: reconstructed from `representative_map` on read, so it contributes
+            // no bytes and the serialized format is unchanged.
+            fixed_routed_wires: _,
             fft_root_table,
             circuit_digest,
             lookup_rows,
@@ -2400,8 +2419,8 @@ mod tests {
 
     /// Prover-only data with a `u32` representative map keeps the legacy serialized format: the
     /// re-encoding of a decoded buffer is byte-identical, the decoded map matches entry for entry,
-    /// the runtime-only watch counts are reconstructed to exactly the builder-derived vector, and
-    /// the decoded data still proves and verifies.
+    /// the runtime-only watch counts and scheduling capability are reconstructed to exactly the
+    /// builder-derived values, and the decoded data still proves and verifies.
     #[test]
     fn prover_only_data_round_trip_preserves_rep_map_and_watch_counts() -> Result<()> {
         let (circuit, x, y) = small_circuit();
@@ -2427,9 +2446,18 @@ mod tests {
             circuit.prover_only.representative_map
         );
         assert_eq!(
+            decoded.fixed_routed_wires, circuit.prover_only.fixed_routed_wires,
+            "runtime fixed-factor mask was not reconstructed from the representative map"
+        );
+        assert_eq!(
             decoded.generator_watch_counts,
             circuit.prover_only.generator_watch_counts,
             "reconstructed watch counts differ from the builder-derived ones"
+        );
+        assert_eq!(
+            decoded.all_generators_require_all_watches,
+            circuit.prover_only.all_generators_require_all_watches,
+            "reconstructed scheduling capability differs from the builder-derived value"
         );
         assert_eq!(
             decoded.generators.len(),

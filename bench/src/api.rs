@@ -62,6 +62,10 @@ pub struct Circuits {
     pub dummy_light_proof: Proof,
 }
 
+// Revalidate the fixed permutation-mask and release-log stack on the ranked host.
+// Repeat the validated stack after the official runner spread exceeded four percent.
+// Keep the production diff fixed while sampling the ranked-host tail once more.
+
 pub(crate) struct PathCircuits {
     pub(crate) tx_target: BlockTxTarget,
     pub(crate) tx_data: CircuitData<F, C, D>,

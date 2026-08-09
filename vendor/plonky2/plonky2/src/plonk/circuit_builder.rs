@@ -49,7 +49,7 @@ use crate::plonk::circuit_data::{
 };
 use crate::plonk::config::{AlgebraicHasher, GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::copy_constraint::CopyConstraint;
-use crate::plonk::permutation_argument::Forest;
+use crate::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::timed;
 use crate::util::context_tree::ContextTree;
@@ -1328,10 +1328,14 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // watches. Deduplicating each generator's typically short watch list first gives the CSR
         // builder one flat edge array in ascending generator order. This avoids constructing a
         // `BTreeMap` node and a separately allocated `Vec` for every watched representative.
+        let mut all_generators_require_all_watches = true;
         let mut generator_watch_counts = vec![0usize; self.generators.len()];
         let mut generator_watch_representatives = Vec::new();
         let mut generator_representatives = Vec::new();
         for (i, generator) in self.generators.iter().enumerate() {
+            if all_generators_require_all_watches {
+                all_generators_require_all_watches = generator.0.requires_all_watches();
+            }
             let watches = generator.0.watch_list();
             generator_representatives.clear();
             generator_representatives.extend(watches.into_iter().map(|watch| {
@@ -1454,15 +1458,25 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             }
         };
 
+        let fixed_routed_wires = fixed_routed_wire_mask(
+            &forest.parents,
+            common.config.num_wires,
+            common.config.num_routed_wires,
+            subgroup.len(),
+        )
+        .expect("builder produced an invalid compressed representative map");
+
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,
             generator_indices_by_watches,
             generator_watch_counts,
+            all_generators_require_all_watches,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
             public_inputs: self.public_inputs,
             representative_map: forest.parents,
+            fixed_routed_wires,
             fft_root_table: Some(fft_root_table),
             circuit_digest,
             lookup_rows: self.lookup_rows.clone(),

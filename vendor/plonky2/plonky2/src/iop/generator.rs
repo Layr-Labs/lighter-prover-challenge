@@ -401,6 +401,29 @@ impl<F: Field> Witness<F> for PartitionFeeder<'_, '_, F> {
     }
 }
 
+/// Builds the first worklist in generator-index order.
+///
+/// If every generator declares that all its watches are required, a non-ready invocation is known
+/// to be inert and can be omitted. If any generator retains the conservative default, preserve the
+/// legacy schedule of invoking every generator: a general [`WitnessGenerator`] may emit incremental
+/// output before its watches are all populated.
+fn initial_pending_generator_indices(
+    unresolved_watches: &[usize],
+    all_generators_require_all_watches: bool,
+) -> Vec<usize> {
+    if all_generators_require_all_watches {
+        unresolved_watches
+            .iter()
+            .enumerate()
+            .filter_map(|(generator_idx, &unresolved)| {
+                (unresolved == 0).then_some(generator_idx)
+            })
+            .collect()
+    } else {
+        (0..unresolved_watches.len()).collect()
+    }
+}
+
 /// Resumable witness generation: [`Self::start`] seeds an initial set of inputs and runs every
 /// generator that can already make progress, each [`Self::feed`] sets newly available inputs and
 /// resumes only the generators watching them, and [`Self::finish`] performs the same completeness
@@ -475,14 +498,17 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
 
-        // Initially, all generators are queued.
+        let pending_generator_indices = initial_pending_generator_indices(
+            &unresolved_watches,
+            prover_data.all_generators_require_all_watches,
+        );
         run_generator_worklist(
             &mut witness,
             prover_data,
             &mut unresolved_watches,
             &mut generator_is_expired,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            pending_generator_indices,
             parallel_threshold,
         )?;
 
@@ -498,9 +524,8 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
 
     /// Like [`Self::start`], but the initial inputs are written by `seed`
     /// directly into the partition through a [`PartitionSeeder`] — no
-    /// intermediate `PartialWitness` map is built or replayed. Worklist
-    /// initialization is unchanged: all generators are queued, gated by the
-    /// same unresolved-watch counters the map-seeded path would produce.
+    /// intermediate `PartialWitness` map is built or replayed. Worklist initialization uses the
+    /// same readiness rule and unresolved-watch counters as the map-seeded path.
     pub fn start_seeded(
         prover_data: &'a ProverOnlyCircuitData<F, C, D>,
         common_data: &CommonCircuitData<F, D>,
@@ -524,14 +549,17 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
 
-        // Initially, all generators are queued.
+        let pending_generator_indices = initial_pending_generator_indices(
+            &unresolved_watches,
+            prover_data.all_generators_require_all_watches,
+        );
         run_generator_worklist(
             &mut witness,
             prover_data,
             &mut unresolved_watches,
             &mut generator_is_expired,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            pending_generator_indices,
             PARALLEL_WORKLIST_THRESHOLD,
         )?;
 
@@ -633,6 +661,17 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
     /// flag is true, the generator will never be run again, otherwise it will be queued for another
     /// run next time a target in its watch list is populated.
     fn run(&self, witness: &PartitionWitness<F>, out_buffer: &mut GeneratedValues<F>) -> bool;
+
+    /// Whether this generator can only make progress after every watched representative is
+    /// populated.
+    ///
+    /// The default is deliberately conservative: general witness generators may emit partial
+    /// results as individual watches become available, including on their initial invocation.
+    /// Schedulers may use `true` to omit invocations which are known to be inert.
+    #[doc(hidden)]
+    fn requires_all_watches(&self) -> bool {
+        false
+    }
 
     /// Scheduler entry point carrying a hint that every watched representative is populated.
     ///
@@ -791,6 +830,10 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
         } else {
             false
         }
+    }
+
+    fn requires_all_watches(&self) -> bool {
+        true
     }
 
     fn run_with_ready_hint(
@@ -1099,6 +1142,50 @@ mod tests {
         ) -> IoResult<Self> {
             unreachable!("test generator is never deserialized")
         }
+    }
+
+    #[test]
+    fn initial_worklist_filters_only_when_universally_safe() {
+        let unresolved_watches = [0, 2, 0, 1, 0];
+        assert_eq!(
+            initial_pending_generator_indices(&unresolved_watches, true),
+            vec![0, 2, 4],
+            "ready generators must retain ascending index order"
+        );
+        assert_eq!(
+            initial_pending_generator_indices(&unresolved_watches, false),
+            vec![0, 1, 2, 3, 4],
+            "the conservative fallback must retain the legacy all-index worklist"
+        );
+    }
+
+    #[test]
+    fn zero_watch_simple_generator_proves_with_ready_only_startup() -> Result<()> {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let output = builder.add_virtual_target();
+        let dependency_calls = Arc::new(AtomicUsize::new(0));
+        let run_calls = Arc::new(AtomicUsize::new(0));
+        builder.add_simple_generator(CountingSimpleGenerator {
+            dependencies: vec![],
+            output,
+            dependency_calls: Arc::clone(&dependency_calls),
+            run_calls: Arc::clone(&run_calls),
+        });
+        builder.register_public_input(output);
+
+        let circuit = builder.build::<C>();
+        assert!(circuit.prover_only.all_generators_require_all_watches);
+        let dependency_calls_after_build = dependency_calls.load(Ordering::Relaxed);
+        let proof = circuit.prove(PartialWitness::new())?;
+
+        assert_eq!(proof.public_inputs, vec![F::ZERO]);
+        assert_eq!(run_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            dependency_calls.load(Ordering::Relaxed),
+            dependency_calls_after_build,
+            "ready scheduling must not rescan adapter dependencies"
+        );
+        circuit.verify(proof)
     }
 
     #[test]
@@ -1736,12 +1823,14 @@ mod tests {
     }
 
     #[test]
-    fn readiness_hint_preserves_incremental_witness_generator_fallback() {
+    fn mixed_generators_preserve_incremental_witness_generator_fallback() {
         let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
         let trigger = builder.constant(F::from_canonical_u64(11));
         let early_output = builder.add_virtual_target();
         let final_output = builder.add_virtual_target();
+        let simple_output = builder.add_virtual_target();
         let run_calls = Arc::new(AtomicUsize::new(0));
+        let simple_run_calls = Arc::new(AtomicUsize::new(0));
 
         builder.add_generators(vec![WitnessGeneratorRef::new(IncrementalGenerator {
             trigger,
@@ -1749,15 +1838,27 @@ mod tests {
             final_output,
             run_calls: Arc::clone(&run_calls),
         })]);
-        builder.register_public_inputs(&[early_output, final_output]);
+        builder.add_simple_generator(CountingSimpleGenerator {
+            dependencies: vec![],
+            output: simple_output,
+            dependency_calls: Arc::new(AtomicUsize::new(0)),
+            run_calls: Arc::clone(&simple_run_calls),
+        });
+        builder.register_public_inputs(&[early_output, final_output, simple_output]);
 
         let circuit = builder.build::<C>();
+        assert!(
+            !circuit.prover_only.all_generators_require_all_watches,
+            "one conservative generator must select the legacy startup worklist"
+        );
         let witness =
             generate_partial_witness(PartialWitness::new(), &circuit.prover_only, &circuit.common)
                 .unwrap();
 
         assert_eq!(witness.get_target(early_output), F::from_canonical_u64(7));
         assert_eq!(witness.get_target(final_output), F::from_canonical_u64(11));
+        assert_eq!(witness.get_target(simple_output), F::ZERO);
         assert_eq!(run_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(simple_run_calls.load(Ordering::Relaxed), 1);
     }
 }
