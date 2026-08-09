@@ -509,6 +509,76 @@ unsafe fn gl_sub_neon(
     vsubq_u64(diff2, vandq_u64(under2, eps))
 }
 
+/// Low-layer variant of [`fft_classic_simd_single_layer_neon`] that removes
+/// the raw-identity twiddle multiply at `j == 0` in every block.
+///
+/// The first twiddle in every root-table row is the literal raw word `ONE`.
+/// Multiplying any raw Goldilocks representative by that word has a zero high
+/// product limb, so the scalar reduction returns the input word unchanged.
+/// The adjacent `j == 1` lane still takes the exact one-lane widening multiply
+/// used by the ordinary paired kernel, and every remaining pair is unchanged.
+/// This specialization is intentionally limited by the caller to the measured
+/// positive layers 2 through 4; larger layers retain the paired multiply for
+/// instruction-level parallelism.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_single_layer_neon_unity(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    lg_half_m: usize,
+    omega_row: &[crate::goldilocks_field::GoldilocksField],
+) {
+    use core::arch::aarch64::*;
+
+    use crate::arch::aarch64::neon_goldilocks_field::{mul_reduce_one, NeonGoldilocksField};
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    let half = 1usize << lg_half_m;
+    let m = half << 1;
+    debug_assert!((2..=4).contains(&lg_half_m));
+    debug_assert!(omega_row.len() >= half);
+    debug_assert_eq!(omega_row[0].0, 1);
+    let base = values.as_mut_ptr().cast::<u64>();
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        let mut k = 0;
+        while k + m <= values.len() {
+            let v0 = *values.get_unchecked(k + half);
+            let v1 = *values.get_unchecked(k + half + 1);
+            let t1 = mul_reduce_one(omega_row.get_unchecked(1).0, v1.0);
+            let tv = vcombine_u64(vcreate_u64(v0.0), vcreate_u64(t1));
+            let u = vld1q_u64(base.add(k));
+            vst1q_u64(base.add(k), gl_add_neon(u, tv, eps));
+            vst1q_u64(base.add(k + half), gl_sub_neon(u, tv, eps));
+
+            let mut j = 2;
+            while j + 2 <= half {
+                let v = NeonGoldilocksField([
+                    *values.get_unchecked(k + half + j),
+                    *values.get_unchecked(k + half + j + 1),
+                ]);
+                let w = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j),
+                    *omega_row.get_unchecked(j + 1),
+                ]);
+                let t = w * v;
+                let tv = vcombine_u64(vcreate_u64(t.0[0].0), vcreate_u64(t.0[1].0));
+                let u = vld1q_u64(base.add(k + j));
+                vst1q_u64(base.add(k + j), gl_add_neon(u, tv, eps));
+                vst1q_u64(base.add(k + half + j), gl_sub_neon(u, tv, eps));
+                j += 2;
+            }
+            while j < half {
+                let t = omega_row[j] * values[k + half + j];
+                let u = values[k + j];
+                values[k + j] = u + t;
+                values[k + half + j] = u - t;
+                j += 1;
+            }
+            k += m;
+        }
+    }
+}
+
 /// One butterfly layer over base-field scalars, with the modular reduction in
 /// vector registers.
 ///
@@ -639,6 +709,107 @@ fn fft_classic_simd_two_layers_neon(
             let cd0 = [c2[0] + t2.0[0], c2[1] + t2.0[1]];
             let cd1 = [c2[0] - t2.0[0], c2[1] - t2.0[1]];
             // Stage-2 products.
+            let t3 = NeonGoldilocksField([w2a2[0], w2a2[1]]) * NeonGoldilocksField(cd0);
+            let t4 = NeonGoldilocksField([w2b2[0], w2b2[1]]) * NeonGoldilocksField(cd1);
+            // SAFETY: every chunk holds exactly 2 elements (`chunks_exact`),
+            // `GoldilocksField` is `#[repr(transparent)]` over `u64`, and each
+            // load/store stays inside its own chunk. Indexing never leaves the
+            // zips; only the vector intrinsics are unsafe.
+            unsafe {
+                let av = vld1q_u64(a2.as_ptr().cast::<u64>());
+                let t1v = vcombine_u64(vcreate_u64(t1.0[0].0), vcreate_u64(t1.0[1].0));
+                let ab0 = gl_add_neon(av, t1v, eps);
+                let ab1 = gl_sub_neon(av, t1v, eps);
+                let t3v = vcombine_u64(vcreate_u64(t3.0[0].0), vcreate_u64(t3.0[1].0));
+                let t4v = vcombine_u64(vcreate_u64(t4.0[0].0), vcreate_u64(t4.0[1].0));
+                vst1q_u64(a2.as_mut_ptr().cast::<u64>(), gl_add_neon(ab0, t3v, eps));
+                vst1q_u64(c2.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab0, t3v, eps));
+                vst1q_u64(b2.as_mut_ptr().cast::<u64>(), gl_add_neon(ab1, t4v, eps));
+                vst1q_u64(d2.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab1, t4v, eps));
+            }
+        }
+    }
+}
+
+/// Low-pair specialization of the fused base-field kernel. Const layer 2/4
+/// monomorphs copy the three raw-ONE lane-0 products in the first pair, keep
+/// both stage-1 lane-1 products paired, and use the exact scalar reduction for
+/// the remaining dependent stage-2 lane. Every later pair is the original body.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_two_layers_neon_unity<const LG_HALF_M: usize>(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    w1_row: &[crate::goldilocks_field::GoldilocksField],
+    w2_row: &[crate::goldilocks_field::GoldilocksField],
+) {
+    use core::arch::aarch64::*;
+
+    use crate::arch::aarch64::neon_goldilocks_field::{mul_reduce_one, NeonGoldilocksField};
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    debug_assert!(matches!(LG_HALF_M, 2 | 4));
+    let q = 1usize << LG_HALF_M;
+    let w1_row = &w1_row[..q];
+    let (w2_lo, w2_hi) = w2_row[..2 * q].split_at(q);
+
+    let eps = unsafe { vdupq_n_u64(EPSILON) };
+    for block in values.chunks_exact_mut(4 * q) {
+        let (ab, cd) = block.split_at_mut(2 * q);
+        let (quarter_a, quarter_b) = ab.split_at_mut(q);
+        let (quarter_c, quarter_d) = cd.split_at_mut(q);
+        let mut pairs = quarter_a
+            .chunks_exact_mut(2)
+            .zip(quarter_b.chunks_exact_mut(2))
+            .zip(quarter_c.chunks_exact_mut(2))
+            .zip(quarter_d.chunks_exact_mut(2))
+            .zip(w1_row.chunks_exact(2).zip(w2_lo.chunks_exact(2)))
+            .zip(w2_hi.chunks_exact(2));
+
+        {
+            // SAFETY: the only monomorphs are layers 2 and 4, hence q >= 4
+            // and every equal-length quarter has a first pair.
+            let (((((a2, b2), c2), d2), (w12, w2a2)), w2b2) =
+                unsafe { pairs.next().unwrap_unchecked() };
+            debug_assert_eq!(w12[0].0, 1);
+            debug_assert_eq!(w2a2[0].0, 1);
+            // The two non-unity stage-1 products stay paired for ILP; both
+            // raw-ONE lane-0 products are their input words unchanged.
+            let nonunity =
+                NeonGoldilocksField([w12[1], w12[1]]) * NeonGoldilocksField([b2[1], d2[1]]);
+            let t1 = NeonGoldilocksField([b2[0], nonunity.0[0]]);
+            let t2 = NeonGoldilocksField([d2[0], nonunity.0[1]]);
+            // C/D stage-1 butterfly in scalar registers: these values are the
+            // stage-2 multiplier inputs, so keeping them out of the vector
+            // file avoids a NEON->GPR crossing on the critical path.
+            let cd0 = [c2[0] + t2.0[0], c2[1] + t2.0[1]];
+            let cd1 = [c2[0] - t2.0[0], c2[1] - t2.0[1]];
+            let t3 = NeonGoldilocksField([
+                cd0[0],
+                crate::goldilocks_field::GoldilocksField(mul_reduce_one(w2a2[1].0, cd0[1].0)),
+            ]);
+            let t4 = NeonGoldilocksField([w2b2[0], w2b2[1]]) * NeonGoldilocksField(cd1);
+            unsafe {
+                let av = vld1q_u64(a2.as_ptr().cast::<u64>());
+                let t1v = vcombine_u64(vcreate_u64(t1.0[0].0), vcreate_u64(t1.0[1].0));
+                let ab0 = gl_add_neon(av, t1v, eps);
+                let ab1 = gl_sub_neon(av, t1v, eps);
+                let t3v = vcombine_u64(vcreate_u64(t3.0[0].0), vcreate_u64(t3.0[1].0));
+                let t4v = vcombine_u64(vcreate_u64(t4.0[0].0), vcreate_u64(t4.0[1].0));
+                vst1q_u64(a2.as_mut_ptr().cast::<u64>(), gl_add_neon(ab0, t3v, eps));
+                vst1q_u64(c2.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab0, t3v, eps));
+                vst1q_u64(b2.as_mut_ptr().cast::<u64>(), gl_add_neon(ab1, t4v, eps));
+                vst1q_u64(d2.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab1, t4v, eps));
+            }
+        }
+
+        for (((((a2, b2), c2), d2), (w12, w2a2)), w2b2) in pairs {
+            // Literal original paired body for every remaining twiddle pair.
+            let t1 = NeonGoldilocksField([w12[0], w12[1]])
+                * NeonGoldilocksField([b2[0], b2[1]]);
+            let t2 = NeonGoldilocksField([w12[0], w12[1]])
+                * NeonGoldilocksField([d2[0], d2[1]]);
+            let cd0 = [c2[0] + t2.0[0], c2[1] + t2.0[1]];
+            let cd1 = [c2[0] - t2.0[0], c2[1] - t2.0[1]];
             let t3 = NeonGoldilocksField([w2a2[0], w2a2[1]]) * NeonGoldilocksField(cd0);
             let t4 = NeonGoldilocksField([w2b2[0], w2b2[1]]) * NeonGoldilocksField(cd1);
             // SAFETY: every chunk holds exactly 2 elements (`chunks_exact`),
@@ -794,7 +965,11 @@ fn fft_classic_simd_single_layer_with<P, M>(
                 row.len(),
             )
         };
-        fft_classic_simd_single_layer_neon(scalars, lg_half_m, omega_row);
+        if lg_half_m <= 4 {
+            fft_classic_simd_single_layer_neon_unity(scalars, lg_half_m, omega_row);
+        } else {
+            fft_classic_simd_single_layer_neon(scalars, lg_half_m, omega_row);
+        }
         return;
     }
     // Quadratic-extension (FRI) fast path: the butterfly add/sub reductions
@@ -1009,7 +1184,11 @@ fn fft_classic_simd_layers<P, M>(
                         row.len(),
                     )
                 };
-                fft_classic_simd_two_layers_neon(scalars, lg_half_m, w1_row, w2_row);
+                match lg_half_m {
+                    2 => fft_classic_simd_two_layers_neon_unity::<2>(scalars, w1_row, w2_row),
+                    4 => fft_classic_simd_two_layers_neon_unity::<4>(scalars, w1_row, w2_row),
+                    _ => fft_classic_simd_two_layers_neon(scalars, lg_half_m, w1_row, w2_row),
+                }
                 lg_half_m += 2;
             }
         }

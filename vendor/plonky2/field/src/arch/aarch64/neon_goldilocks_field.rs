@@ -333,6 +333,37 @@ impl Sum for NeonGoldilocksField {
     }
 }
 
+/// One branchless Goldilocks widening multiply/reduction, with the exact
+/// instruction sequence and raw representative used by one lane of
+/// [`mul_reduce_pair`]. FFT layers whose first twiddle is raw `ONE` use this
+/// for the other lane instead of issuing a needless identity multiply.
+#[inline(always)]
+pub(crate) fn mul_reduce_one(a: u64, b: u64) -> u64 {
+    let mut result = a;
+    let scratch = b;
+
+    unsafe {
+        asm!(
+            "umulh {hi}, {result}, {scratch}",
+            "mul   {result}, {result}, {scratch}",
+            "umull {scratch}, {hi:w}, {epsilon:w}",
+            "subs  {result}, {result}, {hi}, lsr #32",
+            "csetm {hi:w}, cc",
+            "sub   {result}, {result}, {hi}",
+            "adds  {result}, {result}, {scratch}",
+            "csetm {scratch:w}, cs",
+            "add   {result}, {result}, {scratch}",
+            result = inout(reg) result,
+            scratch = inout(reg) scratch => _,
+            hi = out(reg) _,
+            epsilon = in(reg) GoldilocksField::ORDER.wrapping_neg(),
+            options(pure, nomem, nostack),
+        );
+    }
+
+    result
+}
+
 /// Reduce two independent 128-bit products modulo
 /// `2^64 - 2^32 + 1`, interleaving the instruction streams for ILP.
 ///
