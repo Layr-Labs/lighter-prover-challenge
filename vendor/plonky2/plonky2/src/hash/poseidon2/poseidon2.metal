@@ -339,6 +339,24 @@ inline void external_linear_layer(thread ulong state[12]) {
     }
 }
 
+// A Merkle digest exposes only lanes 0..3 after the permutation. The final
+// external layer still needs all three M4 blocks to form their column sums,
+// but lanes 4..11 never need to be reduced back to ordinary field words.
+inline void external_linear_layer_digest(thread ulong state[12]) {
+    lazy_t lazy[12];
+    for (uint i = 0; i < 12; ++i) {
+        lazy[i] = lazy_of(state[i]);
+    }
+    mat4(lazy);
+    mat4(lazy + 4);
+    mat4(lazy + 8);
+
+    for (uint i = 0; i < 4; ++i) {
+        lazy_t sum = lazy_add(lazy_add(lazy[i], lazy[i + 4]), lazy[i + 8]);
+        state[i] = lazy_materialize(lazy_add(lazy[i], sum));
+    }
+}
+
 // Same carry-free split as lazy_t: twelve operands keep both halves below
 // 12 * (2^32 - 1) < 2^36.
 inline ulong sum_state(thread const ulong state[12]) {
@@ -370,7 +388,10 @@ inline void internal_linear_layer(thread ulong state[12], constant ulong* diagon
 
 // Parameter layout: 8 x 12 external constants, 22 internal constants,
 // then the 12-element internal diagonal.
-inline void poseidon2(thread ulong state[12], constant ulong* parameters) {
+inline void poseidon2(
+    thread ulong state[12],
+    constant ulong* parameters,
+    bool digest_only) {
     constant ulong* external_constants = parameters;
     constant ulong* internal_constants = parameters + 96;
     constant ulong* diagonal = parameters + 118;
@@ -389,10 +410,19 @@ inline void poseidon2(thread ulong state[12], constant ulong* parameters) {
         internal_linear_layer(state, diagonal);
     }
 
-    for (uint round = 4; round < 8; ++round) {
+    for (uint round = 4; round < 7; ++round) {
         for (uint i = 0; i < 12; ++i) {
             state[i] = pow7(gl_add(state[i], external_constants[round * 12 + i]));
         }
+        external_linear_layer(state);
+    }
+
+    for (uint i = 0; i < 12; ++i) {
+        state[i] = pow7(gl_add(state[i], external_constants[7 * 12 + i]));
+    }
+    if (digest_only) {
+        external_linear_layer_digest(state);
+    } else {
         external_linear_layer(state);
     }
 }
@@ -1394,7 +1424,7 @@ kernel void poseidon2_hash_leaves(
         for (uint i = 0; i < chunk_size; ++i) {
             state[i] = gl_canonicalize(input[offset + i]);
         }
-        poseidon2(state, parameters);
+        poseidon2(state, parameters, offset + 8 >= leaf_width);
     }
     for (uint i = 0; i < 4; ++i) {
         output[i] = gl_canonicalize(state[i]);
@@ -1517,7 +1547,7 @@ kernel void poseidon2_hash_leaves_colmajor(
         for (uint i = 0; i < chunk_size; ++i) {
             state[i] = gl_canonicalize(leaves[(ulong)(offset + i) * leaf_count + gid]);
         }
-        poseidon2(state, parameters);
+        poseidon2(state, parameters, offset + 8 >= leaf_width);
     }
     for (uint i = 0; i < 4; ++i) {
         output[i] = gl_canonicalize(state[i]);
@@ -1539,7 +1569,7 @@ kernel void poseidon2_hash_parents(
     for (uint i = 0; i < 8; ++i) {
         state[i] = input[i];
     }
-    poseidon2(state, parameters);
+    poseidon2(state, parameters, true);
 
     device ulong* output = parents + (ulong)gid * 4;
     for (uint i = 0; i < 4; ++i) {
@@ -1579,7 +1609,7 @@ kernel void poseidon2_absorb_pass(
     for (uint i = 0; i < chunk_size; ++i) {
         st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
     }
-    poseidon2(st, parameters);
+    poseidon2(st, parameters, final_pass != 0u);
     if (final_pass != 0u) {
         uint out_row = log_leaf_count == 0
             ? gid
