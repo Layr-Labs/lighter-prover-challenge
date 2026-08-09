@@ -712,6 +712,13 @@ pub(crate) fn prove_block_after_pre(
     // own extensions on top of them.
     circuits.release_finished_circuit_extensions();
 
+    // The final witness and block proof are the second fully exposed serial
+    // spine in this worker. The transaction paths have joined, but the proof's
+    // serial sections still alternate with work on the default-QoS Rayon pool;
+    // keep this calling thread on a performance core just as the promoted chain
+    // spine does. This is best-effort and a no-op away from macOS.
+    mark_spine_thread_latency_critical();
+
     let (light_chain_input, heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
     // The final block witness runs on the serial tail with nothing else proving, so it alone
