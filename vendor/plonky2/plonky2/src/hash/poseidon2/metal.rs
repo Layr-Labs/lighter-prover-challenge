@@ -27,7 +27,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "e9a39d28eaeb2323b164fefec4b533669c05cc17988f9e66387f37e3720a9441";
+    "ed4f05fb35a45f98384b6780f1fe37ec9207a8a57441ea7d0949146f436e889f";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
