@@ -18,6 +18,7 @@ path = "src/bin/prove.rs"
 default = ["parallel", "std"]
 parallel = ["plonky2/parallel"]
 std = ["plonky2/std"]
+diagnostic_profile = ["plonky2/diagnostic_profile"]
 
 [dependencies]
 num = { workspace = true }

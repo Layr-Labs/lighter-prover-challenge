@@ -5,6 +5,14 @@ use core::slice;
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
+#[cfg(feature = "diagnostic_profile")]
+use block::ConcreteBlock;
+#[cfg(feature = "diagnostic_profile")]
+use metal::CommandBufferRef;
+#[cfg(feature = "diagnostic_profile")]
+use objc::runtime::Sel;
+#[cfg(feature = "diagnostic_profile")]
+use objc::Message;
 use metal::{
     Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
     MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSUInteger,
@@ -14,8 +22,82 @@ use plonky2_maybe_rayon::*;
 
 use crate::field::types::{Field, PrimeField64};
 use crate::hash::hash_types::{HashOut, RichField};
-use crate::hash::merkle_tree::LevelOrderDigests;
+use crate::hash::merkle_tree::{DigestStore, LevelOrderDigests};
 use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
+
+#[cfg(feature = "diagnostic_profile")]
+static PROFILE_COMMAND_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "diagnostic_profile")]
+fn profile_command_buffer(
+    command_buffer: &CommandBufferRef,
+    name: &'static str,
+    work_items: u64,
+) {
+    use std::sync::atomic::Ordering;
+
+    let sequence = PROFILE_COMMAND_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    crate::util::profile::counter("metal_submit", "queue_sequence", sequence);
+    crate::util::profile::counter("metal_submit", name, work_items);
+
+    let scheduled = Arc::new(Mutex::new(Some(crate::util::profile::span(
+        "metal_submit_to_scheduled",
+        name,
+    ))));
+    let scheduled_callback = Arc::clone(&scheduled);
+    let scheduled_handler = ConcreteBlock::new(move |_: &CommandBufferRef| {
+        drop(
+            scheduled_callback
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(),
+        );
+    })
+    .copy();
+    command_buffer.add_scheduled_handler(&scheduled_handler);
+
+    let completed = Arc::new(Mutex::new(Some(crate::util::profile::span(
+        "metal_submit_to_completed",
+        name,
+    ))));
+    let completed_callback = Arc::clone(&completed);
+    let completed_handler = ConcreteBlock::new(move |buffer: &CommandBufferRef| {
+        let mut completed = completed_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(span) = completed.as_ref() {
+            let gpu_start: Result<f64, _> =
+                unsafe { buffer.send_message(Sel::register("GPUStartTime"), ()) };
+            let gpu_end: Result<f64, _> =
+                unsafe { buffer.send_message(Sel::register("GPUEndTime"), ()) };
+            if let (Ok(gpu_start), Ok(gpu_end)) = (gpu_start, gpu_end) {
+                if gpu_start.is_finite() && gpu_end.is_finite() && gpu_end >= gpu_start {
+                    span.counter(
+                        "metal_gpu",
+                        "execution_ns",
+                        ((gpu_end - gpu_start) * 1_000_000_000.0).round() as u64,
+                    );
+                    span.counter(
+                        "metal_gpu",
+                        "start_host_ns",
+                        (gpu_start * 1_000_000_000.0).round() as u64,
+                    );
+                    span.counter(
+                        "metal_gpu",
+                        "end_host_ns",
+                        (gpu_end * 1_000_000_000.0).round() as u64,
+                    );
+                }
+            }
+            span.counter("metal_complete", "queue_sequence", sequence);
+            span.counter("metal_complete", "status", buffer.status() as u64);
+        }
+        drop(completed.take());
+    })
+    .copy();
+    command_buffer.add_completed_handler(&completed_handler);
+}
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 
@@ -82,6 +164,10 @@ const STAGING_CHUNK: usize = 1 << 19;
 /// peak unified-memory pressure.
 const MAX_CACHED_QUOTIENT_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
+/// Retain the recurring d14/d16 digest buffers, but not the one-off d18 final
+/// tree. These buffers replace equally large CPU digest vectors.
+const MAX_CACHED_DIGEST_OUTPUT_BYTES: u64 = 40 * 1024 * 1024;
+const MAX_CACHED_DIGEST_OUTPUTS: usize = 4;
 
 struct MetalShared {
     device: Device,
@@ -98,6 +184,9 @@ struct MetalShared {
     /// Kept separate from the tree pool so quotient allocation never delays
     /// Merkle admission or contends on its condition variable.
     quotient_output_pool: Arc<Mutex<QuotientOutputPool>>,
+    /// Buffers backing live level-order digest stores return here after the
+    /// proof has extracted its sparse Merkle paths.
+    digest_output_pool: Arc<Mutex<DigestOutputPool>>,
     available: Condvar,
     /// Per-`log2(lde_size)` concatenated FFT twiddle rows (canonical u64), with
     /// `offsets[lg_half_m]` giving each stage row's element offset.
@@ -539,14 +628,141 @@ impl QuotientOutputPool {
     }
 }
 
+#[derive(Default)]
+struct DigestOutputPool {
+    free: Vec<Buffer>,
+}
+
+impl DigestOutputPool {
+    fn take_best_fit(&mut self, bytes: u64) -> Option<Buffer> {
+        let index = self
+            .free
+            .iter()
+            .enumerate()
+            .filter(|(_, buffer)| buffer.length() >= bytes)
+            .min_by_key(|(_, buffer)| buffer.length())
+            .map(|(index, _)| index)?;
+        Some(self.free.swap_remove(index))
+    }
+
+    fn recycle(&mut self, buffer: Buffer) {
+        let length = buffer.length();
+        if length > MAX_CACHED_DIGEST_OUTPUT_BYTES {
+            return;
+        }
+        if self.free.len() < MAX_CACHED_DIGEST_OUTPUTS {
+            self.free.push(buffer);
+            return;
+        }
+        let (smallest_index, smallest_length) = self
+            .free
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, cached)| cached.length())
+            .map(|(index, cached)| (index, cached.length()))
+            .expect("full digest output pool is nonempty");
+        if length > smallest_length {
+            self.free[smallest_index] = buffer;
+        }
+    }
+}
+
+struct MetalDigestInner {
+    buffer: Buffer,
+    pool: Arc<Mutex<DigestOutputPool>>,
+}
+
+impl Drop for MetalDigestInner {
+    fn drop(&mut self) {
+        if let Ok(mut pool) = self.pool.try_lock() {
+            pool.recycle(self.buffer.clone());
+        }
+    }
+}
+
+/// Immutable level-order digests retained in the CPU-visible Metal output
+/// buffer. The last clone returns the buffer to the bounded size-aware cache.
+pub struct MetalDigests<T> {
+    inner: Arc<MetalDigestInner>,
+    base: usize,
+    len: usize,
+    _phantom: PhantomData<T>,
+}
+
+impl<T> MetalDigests<T> {
+    fn with_buffer(buffer: Buffer, pool: Arc<Mutex<DigestOutputPool>>, len: usize) -> Self {
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .expect("Metal digest byte length overflow");
+        assert!(bytes as u64 <= buffer.length());
+        let base = buffer.contents() as usize;
+        Self {
+            inner: Arc::new(MetalDigestInner { buffer, pool }),
+            base,
+            len,
+            _phantom: PhantomData,
+        }
+    }
+
+    pub(crate) fn as_slice(&self) -> &[T] {
+        // SAFETY: the only constructor receives a completed shared Metal
+        // buffer whose first `len` slots were fully written as `T`. The buffer
+        // is immutable and retained by `inner` for the returned slice's life.
+        unsafe { slice::from_raw_parts(self.base as *const T, self.len) }
+    }
+}
+
+impl<T> Clone for MetalDigests<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            base: self.base,
+            len: self.len,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<T> core::fmt::Debug for MetalDigests<T> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("MetalDigests")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: PartialEq> PartialEq for MetalDigests<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<T: Eq> Eq for MetalDigests<T> {}
+
 struct DetachedOutput<'a> {
     owner: &'a MetalShared,
     buffer: Option<Buffer>,
 }
 
 impl DetachedOutput<'_> {
+    #[cfg(test)]
     fn buffer(&self) -> &Buffer {
         self.buffer.as_ref().expect("detached output present")
+    }
+
+    fn into_digests<T>(mut self, len: usize) -> MetalDigests<T> {
+        let buffer = self.buffer.take().expect("detached output present");
+        let digest_pool = Arc::clone(&self.owner.digest_output_pool);
+        let mut pool = self
+            .owner
+            .pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(pool.detached_readback);
+        pool.detached_readback = false;
+        drop(pool);
+        MetalDigests::with_buffer(buffer, digest_pool, len)
     }
 }
 
@@ -591,10 +807,22 @@ impl<F: RichField> TreeReadback<'_, F> {
                 cap_height,
                 marker: _,
             } => {
-                let nodes = unsafe {
-                    slice::from_raw_parts(output.buffer().contents().cast::<u64>(), output_len)
-                };
-                tree_from_levels(nodes, &level_offsets, leaf_count, cap_height)
+                let cap_count = 1usize << cap_height;
+                let node_count = 2 * leaf_count - cap_count;
+                assert_eq!(output_len, node_count * 4);
+                assert_eq!(size_of::<HashOut<F>>(), 4 * size_of::<u64>());
+                let level_offsets: Vec<usize> =
+                    level_offsets.iter().map(|offset| offset / 4).collect();
+                let nodes = output.into_digests::<HashOut<F>>(node_count);
+                let cap_offset = *level_offsets.last().unwrap();
+                let cap = nodes.as_slice()[cap_offset..cap_offset + cap_count].to_vec();
+                (
+                    LevelOrderDigests {
+                        nodes: DigestStore::Shared(nodes),
+                        level_offsets,
+                    },
+                    cap,
+                )
             }
         }
     }
@@ -1537,6 +1765,8 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 9, (group == groups - 1) as u32);
             dispatch(encoder, pipeline, leaf_count);
             encoder.end_encoding();
+            #[cfg(feature = "diagnostic_profile")]
+            profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -1577,6 +1807,8 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
 
             child_count = parent_count;
         }
+        #[cfg(feature = "diagnostic_profile")]
+        profile_command_buffer(command_buffer, "merkle_parents", leaf_count as u64);
         command_buffer.commit();
         command_buffer.to_owned()
     });
@@ -1915,6 +2147,7 @@ impl MetalShared {
                     detached_readback: false,
                 }),
                 quotient_output_pool: Arc::new(Mutex::new(QuotientOutputPool::default())),
+                digest_output_pool: Arc::new(Mutex::new(DigestOutputPool::default())),
                 available: Condvar::new(),
                 ntt_roots: Mutex::new(HashMap::new()),
                 ntt_shifts: Mutex::new(HashMap::new()),
@@ -2001,6 +2234,12 @@ impl MetalShared {
             set_u32(encoder, 12, include_unused_selector as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
+            #[cfg(feature = "diagnostic_profile")]
+            profile_command_buffer(
+                command_buffer,
+                "poseidon_quotient",
+                (quotient_rows * (group.end - group.start)) as u64,
+            );
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -2067,6 +2306,12 @@ impl MetalShared {
             set_u32(encoder, 10, u32_count as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
+            #[cfg(feature = "diagnostic_profile")]
+            profile_command_buffer(
+                command_buffer,
+                "range_u32_quotient",
+                (quotient_rows * (range_count + u32_count)) as u64,
+            );
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -2135,16 +2380,25 @@ impl MetalShared {
         output_bytes: usize,
     ) -> Result<Option<DetachedOutput<'_>>, String> {
         let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
-        if pool.waiters == 0 || pool.detached_readback {
+        if pool.detached_readback {
             return Ok(None);
         }
-        let replacement = match pool.spare_output.take() {
-            Some(buffer) if buffer.length() >= output_bytes as u64 => buffer,
-            _ => autoreleasepool(|| {
-                self.device
-                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
-            }),
-        };
+        let replacement = pool
+            .spare_output
+            .take()
+            .filter(|buffer| buffer.length() >= output_bytes as u64)
+            .or_else(|| {
+                self.digest_output_pool
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take_best_fit(output_bytes as u64)
+            })
+            .unwrap_or_else(|| {
+                autoreleasepool(|| {
+                    self.device
+                        .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
+                })
+            });
         let completed = set
             .output
             .replace(replacement)
@@ -2507,6 +2761,12 @@ impl MetalShared {
                     child_count = parent_count;
                 }
 
+                #[cfg(feature = "diagnostic_profile")]
+                profile_command_buffer(
+                    command_buffer,
+                    "values_ntt_merkle",
+                    (lde_size * cols) as u64,
+                );
                 command_buffer.commit();
                 command_buffer.to_owned()
             });
@@ -2767,6 +3027,12 @@ impl MetalShared {
                 child_count = parent_count;
             }
 
+            #[cfg(feature = "diagnostic_profile")]
+            profile_command_buffer(
+                command_buffer,
+                "coeff_ntt_merkle",
+                (lde_size * cols) as u64,
+            );
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -2986,6 +3252,12 @@ impl MetalShared {
             }
             encoder.end_encoding();
 
+            #[cfg(feature = "diagnostic_profile")]
+            profile_command_buffer(
+                command_buffer,
+                "merkle_tree",
+                (leaf_count * leaf_width) as u64,
+            );
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -3133,7 +3405,7 @@ fn tree_from_levels<F: RichField>(
     let cap = digests[cap_offset..cap_offset + cap_count].to_vec();
     (
         LevelOrderDigests {
-            nodes: digests,
+            nodes: digests.into(),
             level_offsets,
         },
         cap,
@@ -3310,7 +3582,7 @@ mod tests {
     use crate::plonk::vars::EvaluationVarsBaseBatch;
 
     #[test]
-    fn does_not_detach_output_without_a_waiting_build() {
+    fn detaches_output_without_a_waiter_for_resident_store() {
         let context = MetalShared::new().expect("Metal context");
         let mut set = context.acquire_set().expect("buffer set");
         set.output = Some(autoreleasepool(|| {
@@ -3318,14 +3590,18 @@ mod tests {
                 .device
                 .new_buffer(64, MTLResourceOptions::StorageModeShared)
         }));
+        let original = set.output.as_ref().unwrap().contents();
 
         let detached = context
             .try_detach_completed_output(&mut set, 64)
-            .expect("pool state");
-        assert!(detached.is_none());
+            .expect("pool state")
+            .expect("resident digest storage always detaches");
+        assert_eq!(detached.buffer().contents(), original);
+        assert_ne!(set.output.as_ref().unwrap().contents(), original);
+        assert!(context.pool.lock().unwrap().detached_readback);
+        drop(detached);
         let pool = context.pool.lock().unwrap();
-        assert_eq!(pool.waiters, 0);
-        assert!(pool.spare_output.is_none());
+        assert!(pool.spare_output.is_some());
         assert!(!pool.detached_readback);
     }
 
@@ -3402,7 +3678,11 @@ mod tests {
         context.pool.lock().unwrap().waiters = 0;
         context.release_set(set);
 
-        assert_eq!(pending.finish(), expected);
+        let resident = pending.finish();
+        assert!(resident.0.nodes.is_shared());
+        assert_eq!(resident, expected);
+        drop(resident);
+        assert_eq!(context.digest_output_pool.lock().unwrap().free.len(), 1);
     }
 
     fn gpu_duration(command_buffer: &CommandBuffer, wall: Duration) -> Duration {
@@ -5592,6 +5872,10 @@ kernel void goldilocks_mul_bench_native(
                     )
                     .unwrap();
                 let cpu = cpu_tree(&leaves, cap_height);
+                assert!(
+                    gpu.0.nodes.is_shared(),
+                    "completed Metal digest levels must stay resident",
+                );
                 assert_tree_eq(&gpu, &cpu, width, cap_height);
                 assert_all_paths_match_cpu(&gpu, &cpu, leaves.len(), cap_height);
 
