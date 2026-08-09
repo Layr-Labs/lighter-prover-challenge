@@ -17,7 +17,12 @@ hashbrown = { version = "0.14.3", default-features = false, features = [
   "serde",
 ] } # NOTE: When upgrading, see `ahash` dependency.
 itertools = { version = "0.13.0", default-features = false }
-log = { version = "0.4.14", default-features = false }
+# Ranked workers do not consume application logs. Keep logging available in
+# debug/test builds, but compile every log call out of release binaries so the
+# proving hot path does not repeatedly load and compare the global max level.
+log = { version = "0.4.14", default-features = false, features = [
+  "release_max_level_off",
+] }
 num = { version = "0.4", default-features = false, features = [
   "rand",
   "serde",
