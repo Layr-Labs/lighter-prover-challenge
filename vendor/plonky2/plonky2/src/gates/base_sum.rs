@@ -7,7 +7,7 @@ use anyhow::Result;
 use crate::field::extension::Extendable;
 use crate::field::packed::PackedField;
 use crate::field::types::{Field, Field64};
-use crate::gates::gate::Gate;
+use crate::gates::gate::{Gate, U32QuotientGate};
 use crate::gates::packed_util::PackedEvaluableBase;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -130,6 +130,15 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> Gate<F, D> fo
             });
         }
         constraints
+    }
+
+    fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+        matches!((B, self.num_limbs), (2, 63) | (4, 4 | 16 | 32)).then_some(
+            U32QuotientGate::BaseSum {
+                base: B,
+                num_limbs: self.num_limbs,
+            },
+        )
     }
 
     fn generators(&self, row: usize, _local_constants: &[F]) -> Vec<WitnessGeneratorRef<F, D>> {
@@ -279,6 +288,34 @@ mod tests {
         type C = PoseidonGoldilocksConfig;
         type F = <C as GenericConfig<D>>::F;
         test_eval_fns::<F, C, _, D>(BaseSumGate::<6>::new(11))
+    }
+
+    #[test]
+    fn metal_quotient_metadata_matches_supported_shapes() {
+        use crate::gates::gate::{Gate, U32QuotientGate};
+
+        type F = GoldilocksField;
+        const D: usize = 2;
+        for num_limbs in [4, 16, 32] {
+            let gate = BaseSumGate::<4>::new(num_limbs);
+            assert_eq!(
+                <BaseSumGate<4> as Gate<F, D>>::u32_quotient_gate(&gate),
+                Some(U32QuotientGate::BaseSum { base: 4, num_limbs })
+            );
+        }
+        let gate = BaseSumGate::<2>::new(63);
+        assert_eq!(
+            <BaseSumGate<2> as Gate<F, D>>::u32_quotient_gate(&gate),
+            Some(U32QuotientGate::BaseSum {
+                base: 2,
+                num_limbs: 63,
+            })
+        );
+        let unsupported = BaseSumGate::<2>::new(32);
+        assert_eq!(
+            <BaseSumGate<2> as Gate<F, D>>::u32_quotient_gate(&unsupported),
+            None
+        );
     }
 
     /// Differential oracle for the packed evaluator: every point of a 32-point

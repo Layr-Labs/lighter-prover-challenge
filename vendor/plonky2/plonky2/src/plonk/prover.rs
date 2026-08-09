@@ -1238,7 +1238,6 @@ fn start_gpu_range_check_gate_quotient<
     crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
 )> {
     use core::sync::atomic::Ordering;
-    use crate::gates::base_sum::BaseSumGate;
     use crate::gates::equality_base::EqualityGate;
     use crate::gates::exponentiation::ExponentiationGate;
     use crate::gates::gate::U32QuotientGate;
@@ -1467,6 +1466,33 @@ fn start_gpu_range_check_gate_quotient<
                         expected_constraints,
                     )
                 }
+                U32QuotientGate::BaseAddition { num_ops } => {
+                    if gate.0.num_constants() != 2
+                        || raw_constant_base.checked_add(2)? > common_data.num_constants
+                    {
+                        return None;
+                    }
+                    (
+                        U32QuotientKind::BaseAddition {
+                            constant_base: raw_constant_base,
+                        },
+                        num_ops,
+                        num_ops.checked_mul(3)?,
+                        num_ops,
+                    )
+                }
+                U32QuotientGate::BaseSum { base, num_limbs } => (
+                    U32QuotientKind::BaseSum { base },
+                    num_limbs,
+                    num_limbs.checked_add(1)?,
+                    num_limbs.checked_add(1)?,
+                ),
+                U32QuotientGate::Selection { num_ops } => (
+                    U32QuotientKind::Selection,
+                    num_ops,
+                    num_ops.checked_mul(5)?,
+                    num_ops.checked_mul(2)?,
+                ),
             };
             if num_ops == 0
                 || gate.0.num_wires() != expected_wires
@@ -1502,20 +1528,7 @@ fn start_gpu_range_check_gate_quotient<
         // the production circuits and are pure arithmetic, so they are matched
         // by type here instead of through the downstream-crate trait hooks
         // (those hooks exist only to avoid a `plonky2` -> circuit-crate dep).
-        let native = if let Some(base_sum) =
-            gate.0.as_any().downcast_ref::<BaseSumGate<2>>()
-        {
-            // The promoted binary gate occupies the recurring CPU constraint
-            // floor: one recomposition row followed by one boolean row per
-            // little-endian limb. Evaluate it in the existing union command.
-            let num_limbs = base_sum.num_limbs;
-            Some((
-                U32QuotientKind::BaseSumBinary,
-                num_limbs,
-                num_limbs.checked_add(1)?,
-                num_limbs.checked_add(1)?,
-            ))
-        } else if let Some(exponentiation) =
+        let native = if let Some(exponentiation) =
             gate.0.as_any().downcast_ref::<ExponentiationGate<F, D>>()
         {
             let num_power_bits = exponentiation.num_power_bits;
@@ -2218,7 +2231,7 @@ fn compute_quotient_polys<
                         "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
                     );
                 }
-                return compute_quotient_polys(
+                let result = compute_quotient_polys(
                     common_data,
                     prover_data,
                     public_inputs_hash,
@@ -2232,6 +2245,9 @@ fn compute_quotient_polys<
                     col_major_perm,
                     false,
                 );
+                #[cfg(test)]
+                job.mark_cpu_recompute_completed_for_tests();
+                return result;
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
@@ -2436,6 +2452,8 @@ mod quotient_layout_tests {
     use crate::gates::gate::U32QuotientGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::noop::NoopGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::iop::target::Target;
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
@@ -2464,6 +2482,20 @@ mod quotient_layout_tests {
         (data, pw)
     }
 
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn add_base_sum<const B: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+        num_limbs: usize,
+        value: usize,
+    ) {
+        let row = builder.add_gate(
+            crate::gates::base_sum::BaseSumGate::<B>::new(num_limbs),
+            vec![],
+        );
+        let sum = builder.constant(F::from_canonical_usize(value));
+        builder.connect(sum, Target::wire(row, 0));
+    }
+
     /// B1/B2/D1 differential gate: within a single prove call — same witness,
     /// commitments and challenges — the default column-major (`PolyMajor`)
     /// quotient path and the per-point (`PointMajor`) reference path must
@@ -2483,14 +2515,17 @@ mod quotient_layout_tests {
         Ok(())
     }
 
-    /// End-to-end retained-column differential for every audited random-access
-    /// layout. The same prove call compares the combined Metal quotient with a
-    /// full CPU recomputation over identical LDE columns and challenges, then
-    /// verifies the resulting proof.
+    /// End-to-end retained-column differential for every audited combined-gate
+    /// layout. The same prove call compares the Metal quotient with a full CPU
+    /// recomputation over identical LDE columns and challenges, then verifies
+    /// the resulting proof.
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     #[test]
-    fn metal_random_access_quotient_matches_cpu_and_verifies() -> Result<()> {
+    fn metal_combined_gate_quotient_matches_cpu_and_verifies() -> Result<()> {
+        crate::hash::poseidon2::metal::force_context_for_tests();
         let config = CircuitConfig::standard_recursion_config();
+        let addition_gate = crate::gates::addition_base::AdditionGate::new_from_config(&config);
+        let selection_gate = crate::gates::select_base::SelectionGate::new_from_config(&config);
         let mut builder = CircuitBuilder::<F, D>::new(config);
         for (bits, copies) in [(3usize, 8usize), (4, 4), (6, 1)] {
             let vec_size = 1usize << bits;
@@ -2509,6 +2544,52 @@ mod quotient_layout_tests {
                 builder.connect(selected, expected);
                 builder.register_public_input(selected);
             }
+        }
+        let addition_row = builder.add_gate(
+            addition_gate.clone(),
+            vec![F::from_canonical_u64(3), F::from_canonical_u64(5)],
+        );
+        for op in 0..addition_gate.num_ops {
+            let addend_0 = builder.constant(F::from_canonical_usize(2 * op + 1));
+            let addend_1 = builder.constant(F::from_canonical_usize(2 * op + 2));
+            builder.connect(
+                addend_0,
+                Target::wire(
+                    addition_row,
+                    crate::gates::addition_base::AdditionGate::wire_ith_addend_0(op),
+                ),
+            );
+            builder.connect(
+                addend_1,
+                Target::wire(
+                    addition_row,
+                    crate::gates::addition_base::AdditionGate::wire_ith_addend_1(op),
+                ),
+            );
+        }
+        add_base_sum::<2>(&mut builder, 63, 0x1234_5678);
+        add_base_sum::<4>(&mut builder, 4, 173);
+        add_base_sum::<4>(&mut builder, 16, 0x2345_6789);
+        add_base_sum::<4>(&mut builder, 32, 0x3456_789a);
+        let selection_row = builder.add_gate(selection_gate.clone(), vec![]);
+        for op in 0..selection_gate.num_ops {
+            let choose_x = op % 2;
+            let x = 100 + 2 * op;
+            let y = x + 1;
+            for (wire, value) in [
+                (selection_gate.wire_ith_selector(op), choose_x),
+                (selection_gate.wire_ith_element_0(op), x),
+                (selection_gate.wire_ith_element_1(op), y),
+            ] {
+                let value = builder.constant(F::from_canonical_usize(value));
+                builder.connect(value, Target::wire(selection_row, wire));
+            }
+            let expected =
+                builder.constant(F::from_canonical_usize(if choose_x == 1 { x } else { y }));
+            builder.connect(
+                expected,
+                Target::wire(selection_row, selection_gate.wire_ith_output(op)),
+            );
         }
         // A 2^16-point LDE retains both wire and constants/sigmas commitments
         // in shared Metal columns, exercising the production full-domain seam.
@@ -2532,6 +2613,37 @@ mod quotient_layout_tests {
             .collect::<Vec<_>>();
         advertised.sort_unstable();
         assert_eq!(advertised, vec![(3, 8, 0), (4, 4, 2), (6, 1, 2)]);
+        let base_additions = data
+            .common
+            .gates
+            .iter()
+            .filter_map(|gate| match gate.0.u32_quotient_gate() {
+                Some(U32QuotientGate::BaseAddition { num_ops }) => Some(num_ops),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(base_additions, vec![26]);
+        let mut base_sums = data
+            .common
+            .gates
+            .iter()
+            .filter_map(|gate| match gate.0.u32_quotient_gate() {
+                Some(U32QuotientGate::BaseSum { base, num_limbs }) => Some((base, num_limbs)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        base_sums.sort_unstable();
+        assert_eq!(base_sums, vec![(2, 63), (4, 4), (4, 16), (4, 32)]);
+        let selections = data
+            .common
+            .gates
+            .iter()
+            .filter_map(|gate| match gate.0.u32_quotient_gate() {
+                Some(U32QuotientGate::Selection { num_ops }) => Some(num_ops),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(selections, vec![20]);
 
         let before = gpu_poseidon_quotient_stats();
         COMPARE_GPU_QUOTIENT.store(true, Ordering::SeqCst);
@@ -2542,6 +2654,14 @@ mod quotient_layout_tests {
         assert!(after.range_started > before.range_started);
         assert!(after.range_completed > before.range_completed);
         data.verify(proof)?;
+
+        let fault = crate::hash::poseidon2::metal::force_range_quotient_finish_failure_for_tests();
+        let fallback_proof = data.prove(PartialWitness::new())?;
+        assert!(fault.captured());
+        assert!(fault.forced());
+        assert!(fault.cpu_recompute_completed());
+        drop(fault);
+        data.verify(fallback_proof)?;
         Ok(())
     }
 

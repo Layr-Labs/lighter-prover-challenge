@@ -27,7 +27,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a92a4d2c202c00a23ac55e94c20cda4f8ac0bf6042d6ff395232ba0f7d3e011a";
+    "ae31bfae0c973fe2fdabccb654efa32c6c0b51aba7f58812ae8dfdb019b91311";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -132,8 +132,76 @@ pub(crate) struct RangeCheckGateQuotientJob<F> {
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
     len: usize,
+    #[cfg(test)]
+    failure_observer: Option<Arc<RangeQuotientFailureObserver>>,
     _job: GpuJobGuard,
     _phantom: PhantomData<F>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FORCE_RANGE_QUOTIENT_FINISH_FAILURE:
+        core::cell::RefCell<Option<Arc<RangeQuotientFailureObserver>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct RangeQuotientFailureObserver {
+    captured: core::sync::atomic::AtomicBool,
+    forced: core::sync::atomic::AtomicBool,
+    cpu_recompute_completed: core::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+pub(crate) struct ForceRangeQuotientFinishFailureGuard {
+    observer: Arc<RangeQuotientFailureObserver>,
+    _not_send: core::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(test)]
+pub(crate) fn force_range_quotient_finish_failure_for_tests(
+) -> ForceRangeQuotientFinishFailureGuard {
+    let observer = Arc::new(RangeQuotientFailureObserver::default());
+    FORCE_RANGE_QUOTIENT_FINISH_FAILURE.with(|fault| {
+        let mut fault = fault.borrow_mut();
+        assert!(fault.is_none(), "range quotient fault already active");
+        *fault = Some(Arc::clone(&observer));
+    });
+    ForceRangeQuotientFinishFailureGuard {
+        observer,
+        _not_send: core::marker::PhantomData,
+    }
+}
+
+#[cfg(test)]
+impl ForceRangeQuotientFinishFailureGuard {
+    pub(crate) fn captured(&self) -> bool {
+        self.observer
+            .captured
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn forced(&self) -> bool {
+        self.observer
+            .forced
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn cpu_recompute_completed(&self) -> bool {
+        self.observer
+            .cpu_recompute_completed
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceRangeQuotientFinishFailureGuard {
+    fn drop(&mut self) {
+        FORCE_RANGE_QUOTIENT_FINISH_FAILURE.with(|fault| {
+            fault.borrow_mut().take();
+        });
+    }
 }
 impl<F: RichField> PoseidonGateQuotientJob<F> {
     pub(crate) fn finish(&self) -> Result<&[F], String> {
@@ -160,10 +228,26 @@ impl<F: RichField> RangeCheckGateQuotientJob<F> {
                 self.command_buffer.status()
             ));
         }
+        #[cfg(test)]
+        if let Some(observer) = &self.failure_observer {
+            observer
+                .forced
+                .store(true, core::sync::atomic::Ordering::Relaxed);
+            return Err("forced RangeCheck quotient completion failure".to_string());
+        }
         // SAFETY: construction is restricted to an 8-byte Goldilocks field,
         // and the completed kernel canonicalized every output word.
         let output = self.output.as_ref().expect("quotient output present");
         Ok(unsafe { slice::from_raw_parts(output.contents().cast::<F>(), self.len) })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_cpu_recompute_completed_for_tests(&self) {
+        if let Some(observer) = &self.failure_observer {
+            observer
+                .cpu_recompute_completed
+                .store(true, core::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -268,9 +352,15 @@ pub(crate) enum U32QuotientKind {
     Reducing {
         extension_coeffs: bool,
     },
-    /// Binary `BaseSumGate<2>`: `num_ops` carries the limb count. Wire zero is
-    /// the claimed sum and wires `1..=num_ops` are its little-endian bits.
-    BaseSumBinary,
+    /// Weighted base-field addition: `out = c0 * x + c1 * y`.
+    BaseAddition {
+        constant_base: usize,
+    },
+    /// Base-2/base-4 decomposition; `num_ops` carries the limb count.
+    BaseSum {
+        base: usize,
+    },
+    Selection,
 }
 
 #[derive(Clone, Debug)]
@@ -673,6 +763,13 @@ fn force_context() -> &'static Result<MetalShared, String> {
     let context = &*CONTEXT;
     CONTEXT_READY.store(true, core::sync::atomic::Ordering::Release);
     context
+}
+
+#[cfg(test)]
+pub(crate) fn force_context_for_tests() {
+    force_context()
+        .as_ref()
+        .expect("Metal context must initialize for a Metal-only differential");
 }
 
 /// Non-blocking readiness query. Never dereferences [`CONTEXT`].
@@ -1190,14 +1287,45 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                         spec.num_ops.checked_mul(2)?,
                     )
                 }
-                U32QuotientKind::BaseSumBinary => (
-                    10usize,
-                    0usize,
-                    0usize,
-                    0usize,
-                    spec.num_ops.checked_add(1)?,
-                    spec.num_ops.checked_add(1)?,
-                ),
+                U32QuotientKind::BaseAddition { constant_base } => {
+                    if constant_base.checked_add(2)? > constants.cols {
+                        return None;
+                    }
+                    (
+                        10usize,
+                        constant_base,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_mul(3)?,
+                        spec.num_ops,
+                    )
+                }
+                U32QuotientKind::BaseSum { base } => {
+                    if !matches!((base, spec.num_ops), (2, 63) | (4, 4 | 16 | 32)) {
+                        return None;
+                    }
+                    (
+                        11usize,
+                        base,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_add(1)?,
+                        spec.num_ops.checked_add(1)?,
+                    )
+                }
+                U32QuotientKind::Selection => {
+                    if spec.num_ops != 20 {
+                        return None;
+                    }
+                    (
+                        12usize,
+                        0usize,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_mul(5)?,
+                        spec.num_ops.checked_mul(2)?,
+                    )
+                }
             };
         if wire_count > wires.cols
             || spec.selector_column >= constants.cols
@@ -1942,11 +2070,23 @@ impl MetalShared {
             command_buffer.commit();
             command_buffer.to_owned()
         });
+        #[cfg(test)]
+        let failure_observer = FORCE_RANGE_QUOTIENT_FINISH_FAILURE.with(|fault| {
+            let observer = fault.borrow().clone();
+            if let Some(observer) = &observer {
+                observer
+                    .captured
+                    .store(true, core::sync::atomic::Ordering::Relaxed);
+            }
+            observer
+        });
         Ok(RangeCheckGateQuotientJob {
             command_buffer,
             output: Some(output),
             output_pool: Arc::clone(&self.quotient_output_pool),
             len,
+            #[cfg(test)]
+            failure_observer,
             _job: job_guard,
             _phantom: PhantomData,
         })
@@ -3137,6 +3277,31 @@ mod tests {
             .expect("completed output must be reusable");
         assert_eq!(reused.contents(), completed_output_ptr);
         assert!(pool.lock().unwrap().free.is_empty());
+
+        let completed = autoreleasepool(|| {
+            let command_buffer = queue.new_command_buffer();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            command_buffer.to_owned()
+        });
+        let completed_output = output();
+        let completed_output_ptr = completed_output.contents();
+        drop(RangeCheckGateQuotientJob::<F> {
+            command_buffer: completed,
+            output: Some(completed_output),
+            output_pool: Arc::clone(&pool),
+            len: 8,
+            failure_observer: None,
+            _job: GpuJobGuard::begin(),
+            _phantom: PhantomData,
+        });
+        let reused = pool
+            .lock()
+            .unwrap()
+            .take_best_fit(64)
+            .expect("completed RangeCheck output must be reusable");
+        assert_eq!(reused.contents(), completed_output_ptr);
+        assert!(pool.lock().unwrap().free.is_empty());
     }
     use crate::gates::selectors::UNUSED_SELECTOR;
     use crate::hash::hash_types::HashOut;
@@ -3597,6 +3762,39 @@ mod tests {
                 },
             });
         }
+        for (base, num_limbs) in [(2usize, 63usize), (4, 4), (4, 16), (4, 32)] {
+            let selector_column = specs.len();
+            let gate_index = 220 + 3 * selector_column;
+            specs.push(U32QuotientSpec {
+                selector_column,
+                gate_index,
+                group: gate_index - 1..gate_index + 2,
+                include_unused_selector: true,
+                num_ops: num_limbs,
+                kind: U32QuotientKind::BaseSum { base },
+            });
+        }
+        let selection_selector_column = specs.len();
+        specs.push(U32QuotientSpec {
+            selector_column: selection_selector_column,
+            gate_index: 238,
+            group: 237..240,
+            include_unused_selector: true,
+            num_ops: 20,
+            kind: U32QuotientKind::Selection,
+        });
+        let addition_selector_column = specs.len();
+        let addition_constant_base = addition_selector_column + 1;
+        specs.push(U32QuotientSpec {
+            selector_column: addition_selector_column,
+            gate_index: 200,
+            group: 199..202,
+            include_unused_selector: true,
+            num_ops: 26,
+            kind: U32QuotientKind::BaseAddition {
+                constant_base: addition_constant_base,
+            },
+        });
 
         for step in [1, 4] {
             let full_rows = QUOTIENT_ROWS * step;
@@ -3604,7 +3802,7 @@ mod tests {
                 .allocate_columns::<F>(full_rows, WIRE_COLUMNS)
                 .expect("wire columns must allocate");
             let mut constants = context
-                .allocate_columns::<F>(full_rows, specs.len())
+                .allocate_columns::<F>(full_rows, specs.len() + 2)
                 .expect("selector columns must allocate");
             let mut rng = StdRng::seed_from_u64(0x3200_0000 + step as u64);
             for column in wires.columns_mut().expect("unique wire columns") {
@@ -3629,6 +3827,13 @@ mod tests {
                         _ => F::from_canonical_u64(rng.next_u64() % F::ORDER),
                     };
                 }
+            }
+            let mut constant_columns = constants.columns_mut().expect("unique constant columns");
+            for row in 0..full_rows {
+                constant_columns[addition_constant_base][row] =
+                    F::from_canonical_u64(3 + (row % 19) as u64);
+                constant_columns[addition_constant_base + 1][row] =
+                    F::from_canonical_u64(5 + (row % 23) as u64);
             }
 
             let mut expected = vec![F::ZERO; QUOTIENT_ROWS * 2];
@@ -3753,6 +3958,49 @@ mod tests {
                             }
                             assert_eq!(constraints.len(), spec.num_ops * (total_limbs + 3));
                         }
+                        U32QuotientKind::BaseAddition { constant_base } => {
+                            let const_0 = constants.col(constant_base)[source_row];
+                            let const_1 = constants.col(constant_base + 1)[source_row];
+                            for op in 0..spec.num_ops {
+                                let wire_base = 3 * op;
+                                constraints.push(
+                                    wires.col(wire_base + 2)[source_row]
+                                        - wires.col(wire_base)[source_row] * const_0
+                                        - wires.col(wire_base + 1)[source_row] * const_1,
+                                );
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops);
+                        }
+                        U32QuotientKind::BaseSum { base } => {
+                            let base = F::from_canonical_usize(base);
+                            let mut computed = F::ZERO;
+                            for limb in (0..spec.num_ops).rev() {
+                                computed = computed * base + wires.col(1 + limb)[source_row];
+                            }
+                            constraints.push(computed - wires.col(0)[source_row]);
+                            for limb in 0..spec.num_ops {
+                                let x = wires.col(1 + limb)[source_row];
+                                constraints.push(if base == F::TWO {
+                                    x * (x - F::ONE)
+                                } else {
+                                    let y = x * (x - F::from_canonical_u64(3));
+                                    y * (y + F::TWO)
+                                });
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops + 1);
+                        }
+                        U32QuotientKind::Selection => {
+                            for op in 0..spec.num_ops {
+                                let b = wires.col(4 * op)[source_row];
+                                let x = wires.col(4 * op + 1)[source_row];
+                                let y = wires.col(4 * op + 2)[source_row];
+                                let result = wires.col(4 * op + 3)[source_row];
+                                let temp = wires.col(4 * spec.num_ops + op)[source_row];
+                                constraints.push((b * y - y) - temp);
+                                constraints.push((b * x - temp) - result);
+                            }
+                            assert_eq!(constraints.len(), 2 * spec.num_ops);
+                        }
                         _ => unreachable!(
                             "covered by metal_byte_and_quintic_gate_quotient_matches_cpu"
                         ),
@@ -3864,9 +4112,6 @@ mod tests {
                     extension_coeffs: true,
                 }),
             ),
-            // The production BaseSumGate<2> has one claimed-sum wire plus 63
-            // little-endian limbs and emits the same number of constraint rows.
-            (63, UnionShape::U32(U32QuotientKind::BaseSumBinary)),
         ];
         // Four shapes are appended below: EqualityGate plus three
         // RandomAccess copies. The constants commitment carries the raw
@@ -4285,18 +4530,6 @@ mod tests {
                             }
                             assert_eq!(constraints.len(), spec.num_ops * 2);
                         }
-                        U32QuotientKind::BaseSumBinary => {
-                            let mut computed_sum = F::ZERO;
-                            for j in (0..spec.num_ops).rev() {
-                                computed_sum = (computed_sum + computed_sum) + wire(1 + j);
-                            }
-                            constraints.push(computed_sum - wire(0));
-                            for j in 0..spec.num_ops {
-                                let limb = wire(1 + j);
-                                constraints.push(limb * (limb - F::ONE));
-                            }
-                            assert_eq!(constraints.len(), spec.num_ops + 1);
-                        }
                         U32QuotientKind::Arithmetic => {
                             for op in 0..spec.num_ops {
                                 let routed = 6 * op;
@@ -4377,6 +4610,15 @@ mod tests {
                                 constraints.len(),
                                 spec.num_ops * (bits + 2) + num_extra_constants
                             );
+                        }
+                        U32QuotientKind::BaseAddition { .. } => {
+                            unreachable!("covered by metal_u32_gate_quotient_matches_cpu")
+                        }
+                        U32QuotientKind::BaseSum { .. } => {
+                            unreachable!("covered by metal_u32_gate_quotient_matches_cpu")
+                        }
+                        U32QuotientKind::Selection => {
+                            unreachable!("covered by metal_u32_gate_quotient_matches_cpu")
                         }
                     }
 
