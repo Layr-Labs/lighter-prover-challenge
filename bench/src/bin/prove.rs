@@ -10,17 +10,19 @@ mod embedded;
 #[path = "../prover.rs"]
 mod prover;
 
-use std::env;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::BufWriter;
+use std::path::Path;
+use std::{env, io};
 
 use api::{
     Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
     PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
 };
-use circuit::block_pre_execution_constraints::Circuit as _;
 use circuit::block::Block;
+use circuit::block_pre_execution_constraints::Circuit as _;
 use circuit::types::config::{C, F};
+use memmap2::{Mmap, MmapOptions};
 use plonky2::fri::oracle::PolynomialBatch;
 
 #[cfg(not(target_env = "msvc"))]
@@ -58,6 +60,21 @@ static MALLOC_CONF: &[u8; 34] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
+fn map_fixture(path: &Path) -> io::Result<(File, Mmap)> {
+    let file = File::open(path)?;
+    // SAFETY: the benchmark owns immutable fixture files for the full lifetime
+    // of the mapping. Returning the file alongside the map keeps that lifetime
+    // relationship explicit until parsing finishes.
+    let mapping = unsafe { MmapOptions::new().map(&file)? };
+    if mapping.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "prover fixture is empty",
+        ));
+    }
+    Ok((file, mapping))
+}
+
 fn main() {
     // First statement in the process: the Metal shader compile and pipeline
     // lowering behind the GPU hash path cost the better part of a second on a
@@ -81,7 +98,8 @@ fn main() {
     // Fixture parse overlaps the pre-execution circuit load; both are fast.
     let (block, pre_circuits) = rayon::join(
         || {
-            let json = fs::read(&fixture).expect("cannot read prover fixture");
+            let (_fixture_file, json) =
+                map_fixture(Path::new(&fixture)).expect("cannot open or map prover fixture");
             Block::<F>::from_json_with_empty_txs(
                 &json,
                 HEAVY_TX_PER_PROOF,
@@ -214,6 +232,101 @@ fn main() {
         fn _exit(status: i32) -> !;
     }
     unsafe { _exit(0) }
+}
+
+#[cfg(test)]
+mod fixture_mapping_tests {
+    use std::fs;
+    use std::io::ErrorKind;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn unique_temp_path(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after the Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "lighter-prover-{label}-{}-{nonce}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn mapped_fixture_matches_read_bytes_and_block_parse() {
+        std::thread::Builder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(|| {
+                let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("bench_test.json");
+                let read_bytes = fs::read(&fixture).expect("public fixture must be readable");
+                let (_fixture_file, mapped) =
+                    map_fixture(&fixture).expect("public fixture must be mappable");
+
+                assert_eq!(&mapped[..], read_bytes);
+
+                let read_block = Block::<F>::from_json_with_empty_txs(
+                    &read_bytes,
+                    HEAVY_TX_PER_PROOF,
+                    LIGHT_TX_PER_PROOF,
+                    PUBLIC_HEAVY_TX_COUNT,
+                    PUBLIC_LIGHT_TX_COUNT,
+                )
+                .expect("read fixture must parse");
+                let mapped_block = Block::<F>::from_json_with_empty_txs(
+                    &mapped,
+                    HEAVY_TX_PER_PROOF,
+                    LIGHT_TX_PER_PROOF,
+                    PUBLIC_HEAVY_TX_COUNT,
+                    PUBLIC_LIGHT_TX_COUNT,
+                )
+                .expect("mapped fixture must parse");
+
+                assert_eq!(mapped_block.created_at, read_block.created_at);
+                assert_eq!(mapped_block.block_number, read_block.block_number);
+                assert_eq!(mapped_block.old_state_root, read_block.old_state_root);
+                assert_eq!(mapped_block.new_state_root, read_block.new_state_root);
+                assert_eq!(
+                    mapped_block
+                        .tx_chunks
+                        .iter()
+                        .map(Vec::len)
+                        .collect::<Vec<_>>(),
+                    read_block
+                        .tx_chunks
+                        .iter()
+                        .map(Vec::len)
+                        .collect::<Vec<_>>()
+                );
+            })
+            .expect("fixture mapping test thread must start")
+            .join()
+            .expect("fixture mapping test thread must finish");
+    }
+
+    #[test]
+    fn missing_fixture_returns_not_found() {
+        let missing = unique_temp_path("missing");
+        assert!(!missing.exists());
+
+        let error = map_fixture(&missing)
+            .map(|_| ())
+            .expect_err("missing fixture must fail");
+
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn empty_fixture_returns_mapping_error() {
+        let empty = unique_temp_path("empty");
+        File::create(&empty).expect("empty fixture must be creatable");
+
+        let result = map_fixture(&empty);
+        fs::remove_file(&empty).expect("empty fixture must be removable");
+
+        assert!(result.is_err(), "empty fixture must not produce a mapping");
+    }
 }
 
 // p90-fire-808-1786266919
