@@ -104,6 +104,34 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .rev()
             .fold(Self::Extension::ZERO, |acc, &term| acc * beta + term)
     }
+
+    /// Internal hook for reducing coefficient columns with extension-field
+    /// weights. The default preserves the generic field operation sequence;
+    /// a base field may specialize the fixed representation used by the
+    /// prover without changing polynomial ordering or reduction-factor state.
+    #[doc(hidden)]
+    #[inline]
+    fn reduce_base_polys_block(
+        powers: &[Self::Extension],
+        coefficient_columns: &[&[Self]],
+        coefficient_start: usize,
+        out: &mut [Self::Extension],
+    ) {
+        debug_assert_eq!(powers.len(), coefficient_columns.len());
+        out.fill(Self::Extension::ZERO);
+        for (power, coefficients) in powers.iter().zip(coefficient_columns) {
+            if coefficients.len() <= coefficient_start {
+                continue;
+            }
+            let live = (coefficients.len() - coefficient_start).min(out.len());
+            for (accumulator, &coefficient) in out[..live]
+                .iter_mut()
+                .zip(&coefficients[coefficient_start..coefficient_start + live])
+            {
+                *accumulator += power.scalar_mul(coefficient);
+            }
+        }
+    }
 }
 
 impl<F: Field + Frobenius<1> + FieldExtension<1, BaseField = F>> Extendable<1> for F {

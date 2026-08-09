@@ -6,7 +6,7 @@ use unroll::unroll_for_loops;
 use crate::extension::quadratic::QuadraticExtension;
 use crate::extension::quartic::QuarticExtension;
 use crate::extension::quintic::{QuinticExtension, QuinticFirstCoeff};
-use crate::extension::{Extendable, Frobenius};
+use crate::extension::{Extendable, FieldExtension, Frobenius};
 use crate::goldilocks_field::{reduce160, GoldilocksField};
 use crate::types::Field;
 
@@ -43,6 +43,78 @@ impl Extendable<2> for GoldilocksField {
         beta_powers: &[QuadraticExtension<Self>; 16],
     ) -> QuadraticExtension<Self> {
         ext2_dot_product_arity16(terms, beta_powers)
+    }
+
+    #[inline]
+    fn reduce_base_polys_block(
+        powers: &[QuadraticExtension<Self>],
+        coefficient_columns: &[&[Self]],
+        coefficient_start: usize,
+        out: &mut [QuadraticExtension<Self>],
+    ) {
+        debug_assert_eq!(powers.len(), coefficient_columns.len());
+
+        // This specialization is intentionally exact to the ranked opening
+        // batch. Other counts and ragged blocks retain the historical field
+        // operation sequence, making the reduce160 bound a code invariant.
+        let block_end = coefficient_start + out.len();
+        if !matches!(powers.len(), 258 | 260)
+            || coefficient_columns
+                .iter()
+                .any(|coefficients| coefficients.len() < block_end)
+        {
+            out.fill(QuadraticExtension::ZERO);
+            for (power, coefficients) in powers.iter().zip(coefficient_columns) {
+                if coefficients.len() <= coefficient_start {
+                    continue;
+                }
+                let live = (coefficients.len() - coefficient_start).min(out.len());
+                for (accumulator, &coefficient) in out[..live]
+                    .iter_mut()
+                    .zip(&coefficients[coefficient_start..coefficient_start + live])
+                {
+                    *accumulator +=
+                        <QuadraticExtension<Self> as FieldExtension<2>>::scalar_mul(
+                            power,
+                            coefficient,
+                        );
+                }
+            }
+            return;
+        }
+
+        // Preserve polynomial-major locality. Split arrays avoid accumulator
+        // struct padding; a 256-slot micro-block uses 10 KiB in total.
+        const INNER_BLOCK: usize = 256;
+        let mut c0_lo = [0u128; INNER_BLOCK];
+        let mut c0_hi = [0u32; INNER_BLOCK];
+        let mut c1_lo = [0u128; INNER_BLOCK];
+        let mut c1_hi = [0u32; INNER_BLOCK];
+
+        for (inner_block, out_block) in out.chunks_mut(INNER_BLOCK).enumerate() {
+            let start = coefficient_start + inner_block * INNER_BLOCK;
+            let len = out_block.len();
+            c0_lo[..len].fill(0);
+            c0_hi[..len].fill(0);
+            c1_lo[..len].fill(0);
+            c1_hi[..len].fill(0);
+
+            for (power, coefficients) in powers.iter().zip(coefficient_columns) {
+                let QuadraticExtension([p0, p1]) = *power;
+                for (i, &coefficient) in coefficients[start..start + len].iter().enumerate() {
+                    u160_add_product(&mut c0_lo[i], &mut c0_hi[i], p0.0, coefficient.0);
+                    u160_add_product(&mut c1_lo[i], &mut c1_hi[i], p1.0, coefficient.0);
+                }
+            }
+
+            for i in 0..len {
+                // At most 260 products sum to < 260 * 2^128 < 2^137,
+                // with the high carry limb < 260. Both are inside reduce160's bound.
+                let c0 = unsafe { reduce160(c0_lo[i], c0_hi[i]) };
+                let c1 = unsafe { reduce160(c1_lo[i], c1_hi[i]) };
+                out_block[i] = QuadraticExtension([c0, c1]);
+            }
+        }
     }
 }
 
@@ -202,7 +274,7 @@ const fn u160_times_7(x: u128, y: u32) -> (u128, u32) {
 }
 
 /// Add one 64-by-64-bit product to a little-endian 160-bit accumulator.
-/// The fixed 16-term quadratic dot product keeps the high limb below 2^7.
+/// Callers bound their product count so the high limb cannot overflow.
 #[inline(always)]
 fn u160_add_product(lo: &mut u128, hi: &mut u32, a: u64, b: u64) {
     let (sum, carry) = lo.overflowing_add((a as u128) * (b as u128));

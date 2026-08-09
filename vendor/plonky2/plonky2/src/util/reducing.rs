@@ -146,6 +146,14 @@ impl<F: Field> ReducingFactor<F> {
             return PolynomialCoeffs::new(accumulate_chunk(&polys, &base_powers));
         }
 
+        let coefficient_columns: Vec<&[BF]> = polys
+            .iter()
+            .map(|poly| {
+                let poly: &PolynomialCoeffs<BF> = Borrow::borrow(poly);
+                poly.coeffs.as_slice()
+            })
+            .collect();
+
         // Coefficient slots are independent. Partition the result so each
         // worker visits all polynomials for one cache-sized output range,
         // deleting the full-degree partial vector per polynomial chunk and
@@ -158,19 +166,7 @@ impl<F: Field> ReducingFactor<F> {
             .enumerate()
             .for_each(|(block, out)| {
                 let start = block * SLOT_BLOCK;
-                for (base_power, poly) in base_powers.iter().zip(&polys) {
-                    let coeffs: &PolynomialCoeffs<BF> = Borrow::borrow(poly);
-                    if coeffs.coeffs.len() <= start {
-                        continue;
-                    }
-                    let live = (coeffs.coeffs.len() - start).min(out.len());
-                    for (a, &c) in out[..live]
-                        .iter_mut()
-                        .zip(&coeffs.coeffs[start..start + live])
-                    {
-                        *a += <F as FieldExtension<D>>::scalar_mul(base_power, c);
-                    }
-                }
+                BF::reduce_base_polys_block(&base_powers, &coefficient_columns, start, out);
             });
         PolynomialCoeffs::new(acc)
     }
@@ -517,5 +513,108 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn reduce_polys_base_delayed_u160_matches_field_reference() {
+        const D: usize = 2;
+        const CHAIN_POLYS: usize = 258;
+        const WIDE_POLYS: usize = 260;
+        const GOLDILOCKS_ORDER: u64 = 0xffff_ffff_0000_0001;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type FF = <C as GenericConfig<D>>::FE;
+
+        fn legacy(alpha: FF, polys: &[PolynomialCoeffs<F>]) -> (Vec<FF>, FF) {
+            let mut rf = ReducingFactor::new(alpha);
+            let mut acc = Vec::new();
+            for (base_power, poly) in rf.base.powers().zip(polys) {
+                rf.count += 1;
+                if poly.coeffs.len() > acc.len() {
+                    acc.resize(poly.coeffs.len(), FF::ZERO);
+                }
+                for (a, &c) in acc.iter_mut().zip(&poly.coeffs) {
+                    *a += <FF as FieldExtension<D>>::scalar_mul(&base_power, c);
+                }
+            }
+            let shift = rf.shift_factor();
+            (acc, shift)
+        }
+
+        let cases = [
+            ("258-canonical", CHAIN_POLYS, 257, true, false),
+            ("258-raw", CHAIN_POLYS, 2051, true, true),
+            ("260-raw", WIDE_POLYS, 2051, true, true),
+            ("260-ragged-tail", WIDE_POLYS, 2051, false, true),
+            ("257-fallback", CHAIN_POLYS - 1, 7, true, true),
+            ("259-fallback", CHAIN_POLYS + 1, 7, true, true),
+            ("261-fallback", WIDE_POLYS + 1, 7, true, true),
+        ];
+        let mut saw_noncanonical_input = false;
+
+        for (case, num_polys, max_len, uniform, noncanonical) in cases {
+            let alpha_limbs = if noncanonical {
+                [u64::MAX, GOLDILOCKS_ORDER + 7]
+            } else {
+                [17, 29]
+            };
+            let alpha = FF::from_basefield_array(alpha_limbs.map(F::from_noncanonical_u64));
+            let mut lengths = vec![max_len; num_polys];
+            if !uniform {
+                // Block 0 uses delayed reduction; one short column sends the
+                // three-slot tail through the historical ragged fallback.
+                lengths[num_polys / 2] -= 1;
+            }
+            let polys: Vec<PolynomialCoeffs<F>> = lengths
+                .iter()
+                .enumerate()
+                .map(|(j, &len)| {
+                    let coeffs = (0..len)
+                        .map(|i| {
+                            let mixed = (j as u64)
+                                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                                .wrapping_add((i as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9));
+                            let raw = if noncanonical {
+                                match mixed & 3 {
+                                    0 => GOLDILOCKS_ORDER,
+                                    1 => GOLDILOCKS_ORDER + (mixed & 0xff),
+                                    2 => u64::MAX,
+                                    _ => mixed,
+                                }
+                            } else {
+                                mixed % GOLDILOCKS_ORDER
+                            };
+                            saw_noncanonical_input |= raw >= GOLDILOCKS_ORDER;
+                            F::from_noncanonical_u64(raw)
+                        })
+                        .collect();
+                    PolynomialCoeffs::new(coeffs)
+                })
+                .collect();
+
+            let (expected, expected_shift) = legacy(alpha, &polys);
+            let mut actual_factor = ReducingFactor::new(alpha);
+            let actual = actual_factor.reduce_polys_base::<F, D>(polys.iter());
+            let actual_shift = actual_factor.shift_factor();
+
+            assert_eq!(actual_shift, expected_shift, "alpha count for {case}");
+            assert_eq!(actual.coeffs.len(), expected.len(), "length for {case}");
+            for (i, (actual, expected)) in actual.coeffs.iter().zip(&expected).enumerate() {
+                let actual: [F; D] = actual.to_basefield_array();
+                let expected: [F; D] = expected.to_basefield_array();
+                for limb in 0..D {
+                    assert_eq!(
+                        actual[limb], expected[limb],
+                        "{case} coefficient {i} limb {limb}"
+                    );
+                    assert_eq!(
+                        actual[limb].0, expected[limb].0,
+                        "raw {case} coefficient {i} limb {limb}"
+                    );
+                }
+            }
+        }
+
+        assert!(saw_noncanonical_input);
     }
 }
