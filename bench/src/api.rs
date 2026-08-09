@@ -176,9 +176,6 @@ impl Circuits {
                 .get_mut()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
-            // The quotient-domain cache is reachable only from the same proofs
-            // as the commitment above, so wherever that is dead this is too.
-            // Clearing it is idempotent for a path that already released its own.
             data.prover_only.constants_sigmas_quotient_cache = None;
         }
     }
@@ -212,9 +209,6 @@ impl Circuits {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
-            // Same guard, same argument: the exclusive acquisition proves no
-            // reader remains, and the quotient-domain cache is read only by the
-            // proofs that read the commitment.
             data.prover_only.constants_sigmas_quotient_cache = None;
         }
     }
@@ -236,9 +230,6 @@ impl Circuits {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
-            // Same guard, same argument: the exclusive acquisition proves no
-            // reader remains, and the quotient-domain cache is read only by the
-            // proofs that read the commitment.
             data.prover_only.constants_sigmas_quotient_cache = None;
         }
     }
