@@ -237,7 +237,9 @@ impl<F: RichField + Extendable<D>, H: AlgebraicHasher<F>, const D: usize>
         if self.output_buffer.is_empty() {
             // Evaluate the permutation to produce `r` new outputs.
             self.sponge_state = builder.permute::<H>(self.sponge_state);
-            self.output_buffer = self.sponge_state.squeeze().to_vec();
+            self.output_buffer.clear();
+            self.output_buffer
+                .extend_from_slice(self.sponge_state.squeeze());
         }
 
         self.output_buffer
@@ -296,7 +298,9 @@ impl<F: RichField + Extendable<D>, H: AlgebraicHasher<F>, const D: usize>
             self.sponge_state = builder.permute::<H>(self.sponge_state);
         }
 
-        self.output_buffer = self.sponge_state.squeeze().to_vec();
+        self.output_buffer.clear();
+        self.output_buffer
+            .extend_from_slice(self.sponge_state.squeeze());
 
         self.input_buffer.clear();
     }
