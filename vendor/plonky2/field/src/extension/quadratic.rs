@@ -40,6 +40,13 @@ impl<F: Extendable<2>> FieldExtension<2> for QuadraticExtension<F> {
     fn from_basefield(x: F) -> Self {
         x.into()
     }
+
+    #[inline(always)]
+    fn scalar_mul(&self, scalar: F) -> Self {
+        Self(<F as Extendable<2>>::mul_quadratic_by_base(
+            self.0, scalar,
+        ))
+    }
 }
 
 impl<F: Extendable<2>> From<F> for QuadraticExtension<F> {

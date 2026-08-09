@@ -27,6 +27,26 @@ impl Extendable<2> for GoldilocksField {
     const EXT_POWER_OF_TWO_GENERATOR: [Self; 2] = [Self(0), Self(7226896044987257365)];
 
     #[inline(always)]
+    fn mul_quadratic_by_base(value: [Self; 2], scalar: Self) -> [Self; 2] {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+
+            // `NeonGoldilocksField` interleaves the two independent widening
+            // products in one assembly block. Each lane follows scalar
+            // `reduce128` exactly, including its non-canonical raw `u64`
+            // representative.
+            return (NeonGoldilocksField(value) * scalar).0;
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let [a0, a1] = value;
+            [a0 * scalar, a1 * scalar]
+        }
+    }
+
+    #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
         // contain [w, 0], so scalar-multiply the two value limbs. Each limb
@@ -627,6 +647,38 @@ mod tests {
     type GF = GoldilocksField;
     type Q2 = QuadraticExtension<GoldilocksField>;
     type QE = QuinticExtension<GoldilocksField>;
+
+    #[test]
+    fn quadratic_scalar_mul_matches_limbwise_raw() {
+        let values = [
+            GF::ZERO,
+            GF::ONE,
+            GF::TWO,
+            GF::from_noncanonical_u64(GF::ORDER - 1),
+            GF::from_noncanonical_u64(GF::ORDER),
+            GF::from_noncanonical_u64(GF::ORDER + 1),
+            GF::from_noncanonical_u64(u32::MAX as u64),
+            GF::from_noncanonical_u64(1 << 32),
+            GF::from_noncanonical_u64(u64::MAX),
+            GF::from_noncanonical_u64(14_479_013_849_828_404_771),
+            GF::from_noncanonical_u64(9_087_029_921_428_221_768),
+            GF::from_noncanonical_u64(2_441_288_194_761_790_662),
+        ];
+
+        for (i, &a0) in values.iter().enumerate() {
+            for (j, &a1) in values.iter().enumerate() {
+                let x = QuadraticExtension([a0, a1]);
+                let scalar = values[(i + 5 * j) % values.len()];
+                let actual = FieldExtension::<2>::scalar_mul(&x, scalar);
+                let expected = [a0 * scalar, a1 * scalar];
+                assert_eq!(
+                    [actual.0[0].0, actual.0[1].0],
+                    [expected[0].0, expected[1].0],
+                    "raw scalar product mismatch for x={x:?}, scalar={scalar:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn fri_fold_arity16_matches_horner_raw() {

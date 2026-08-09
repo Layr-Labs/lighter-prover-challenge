@@ -77,6 +77,17 @@ pub trait Extendable<const D: usize>: Field + Sized {
     /// with the base field which implies that the FFT commutes with field inclusion.
     const EXT_POWER_OF_TWO_GENERATOR: [Self; D];
 
+    /// Internal quadratic-extension hook for multiplying both limbs by one
+    /// base-field scalar. The default preserves the historical limb-by-limb
+    /// multiplication order; a base field may evaluate the two independent
+    /// products through an architecture-specific paired kernel.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn mul_quadratic_by_base(value: [Self; 2], scalar: Self) -> [Self; 2] {
+        let [a0, a1] = value;
+        [a0 * scalar, a1 * scalar]
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.
