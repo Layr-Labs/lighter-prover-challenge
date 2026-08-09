@@ -372,7 +372,8 @@ inline void internal_linear_layer(thread ulong state[12], constant ulong* diagon
 // then the 12-element internal diagonal.
 inline void poseidon2(thread ulong state[12], constant ulong* parameters) {
     constant ulong* external_constants = parameters;
-    constant ulong* internal_constants = parameters + 96;
+    // INTERNAL_CONSTANTS and MATRIX_DIAG_12_U64 are compile-time immediates
+    // below; the parameter-buffer layout is unchanged for ABI stability.
     constant ulong* diagonal = parameters + 118;
 
     external_linear_layer(state);
@@ -384,10 +385,54 @@ inline void poseidon2(thread ulong state[12], constant ulong* parameters) {
         external_linear_layer(state);
     }
 
-    for (uint round = 0; round < 22; ++round) {
-        state[0] = pow7(gl_add(state[0], internal_constants[round]));
-        internal_linear_layer(state, diagonal);
-    }
+    // INTERNAL_CONSTANTS are fixed by the hash configuration. Spell them as
+    // immediates (same strategy as the internal diagonal) so each of the 22
+    // internal-round RC adds is a constant-operand gl_add rather than a
+    // dynamically indexed constant-buffer load.
+    state[0] = pow7(gl_add(state[0], 0xa571418d95897b60UL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0x8f32676574fcf6d3UL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0x731102d4e3fb1bbeUL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0x0330f08328a82d2bUL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0x7f0449b6557f785dUL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0x62f06210658dcbcbUL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0xd5a98af9f89c458bUL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0x77ec69083a346385UL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0xef7ca48bbc27f890UL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0x53e9652f61eac532UL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0xa71c634abff4f0ccUL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0xb16f5f0d7e28ea29UL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0xc9dde31d0a003ab2UL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0x2ddadf9775902533UL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0xe4fa73fb16408b47UL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0x90242ebc00d2ee59UL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0xbb02dffd9f381982UL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0xdea328364c50907cUL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0x1395d3b924857cf8UL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0x7d3ead0d5aec04e6UL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0xc2f12be3fed74668UL));
+    internal_linear_layer(state, diagonal);
+    state[0] = pow7(gl_add(state[0], 0x0ba3c338f8c3d285UL));
+    internal_linear_layer(state, diagonal);
 
     for (uint round = 4; round < 8; ++round) {
         for (uint i = 0; i < 12; ++i) {
