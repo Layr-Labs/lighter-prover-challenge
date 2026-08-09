@@ -153,6 +153,45 @@ where
     let quotient_degree = common_data.quotient_degree();
     let degree = common_data.degree();
 
+    #[cfg(feature = "diagnostic_profile")]
+    let _profile_context = {
+        let digest_bytes =
+            crate::plonk::config::GenericHashOut::to_bytes(&prover_data.circuit_digest);
+        let mut digest_prefix = [0u8; 8];
+        let prefix_len = digest_bytes.len().min(digest_prefix.len());
+        digest_prefix[..prefix_len].copy_from_slice(&digest_bytes[..prefix_len]);
+        crate::util::profile::enter_proof(
+            u64::from_le_bytes(digest_prefix),
+            common_data.degree_bits(),
+            config.num_wires,
+            config.num_routed_wires,
+            common_data.quotient_degree_factor,
+            num_challenges,
+            common_data.num_gate_constraints,
+            common_data.num_lookup_polys,
+        )
+    };
+    #[cfg(feature = "diagnostic_profile")]
+    let _profile_proof = crate::util::profile::span("proof", "prove_with_partition_witness");
+    #[cfg(feature = "diagnostic_profile")]
+    {
+        let count = |name, value: usize| {
+            crate::util::profile::counter("shape", name, value as u64);
+        };
+        count("degree_rows", degree);
+        count("lde_rows", common_data.lde_size());
+        count("wire_values", degree * config.num_wires);
+        count(
+            "routed_wire_values",
+            degree * config.num_routed_wires,
+        );
+        count(
+            "quotient_domain_points",
+            degree * common_data.quotient_degree_factor,
+        );
+        count("fri_query_rounds", config.fri_config.num_query_rounds);
+    }
+
     set_lookup_wires(prover_data, common_data, &mut partition_witness)?;
 
     let public_inputs = partition_witness.get_targets(&prover_data.public_inputs);
