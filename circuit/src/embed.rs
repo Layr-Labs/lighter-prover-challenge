@@ -131,14 +131,16 @@ fn read_section<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
 }
 
 fn write_compressed_section(out: &mut Vec<u8>, raw: &[u8]) {
-    let compressed = lz4_flex::block::compress_prepend_size(raw);
-    write_section(out, &compressed);
+    // The zstd outer wrap (see serialize_embedded) already entropy-codes the
+    // whole blob; a per-section LZ4 pass on top would compress near-random
+    // coefficients poorly and force a second decompression on the scored
+    // startup path. Sections are written raw and the outer wrap handles them.
+    write_section(out, raw);
 }
 
 fn read_compressed_section(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
-    let compressed = read_section(bytes, pos)?;
-    lz4_flex::block::decompress_size_prepended(compressed)
-        .context("embedded circuit blob failed LZ4 decompression")
+    // Raw section (outer zstd wrap already decoded it); zero-copy view.
+    read_section(bytes, pos).map(<[u8]>::to_vec)
 }
 
 // ---------------------------------------------------------------------------
