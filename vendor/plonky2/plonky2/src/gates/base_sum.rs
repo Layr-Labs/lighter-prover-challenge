@@ -179,12 +179,19 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> PackedEvaluab
     ) {
         let sum = vars.local_wires[Self::WIRE_SUM];
         let limbs = vars.local_wires.view(self.limbs());
-        // B=2 folds radix powers by doubling, which is cheaper than the generic
-        // multiply-by-radix Horner fold and value-identical to it.
+        // Power-of-two radices fold by additions, which is cheaper than the
+        // generic multiply-by-radix Horner fold and value-identical to it.
         let computed_sum = if B == 2 {
             let mut radix_sum = P::ZEROS;
             for &limb in limbs.iter().rev() {
                 radix_sum = (radix_sum + radix_sum) + limb;
+            }
+            radix_sum
+        } else if B == 4 {
+            let mut radix_sum = P::ZEROS;
+            for &limb in limbs.iter().rev() {
+                let twice = radix_sum + radix_sum;
+                radix_sum = (twice + twice) + limb;
             }
             radix_sum
         } else {
@@ -193,13 +200,15 @@ impl<F: RichField + Extendable<D>, const D: usize, const B: usize> PackedEvaluab
 
         yield_constr.one(computed_sum - sum);
 
-        // B=2's only roots are 0 and 1, so the range-constraint product
-        // `limb * (limb - 1)` is one fewer packed subtraction and one fewer
-        // iterator step than the generic `(0..B)` product, and value-identical
-        // to it.
+        // Specialize the production power-of-two radices without changing the
+        // constraint polynomial. For B=4, setting t=x(x-3) gives
+        // (x-1)(x-2)=t+2, reducing the four-factor product to t(t+2).
         let constraints_iter = limbs.iter().map(|&limb| {
             if B == 2 {
                 limb * (limb - P::ONES)
+            } else if B == 4 {
+                let t = limb * (limb - F::from_canonical_usize(3));
+                t * (t + F::TWO)
             } else {
                 (0..B)
                     .map(|i| limb - F::from_canonical_usize(i))
@@ -322,7 +331,7 @@ mod tests {
     /// batch (multiple packed groups plus the scalar leftovers) must produce
     /// exactly the scalar per-point evaluation. This is the gate that the
     /// `B = 2` doubling and range-constraint specializations live in, so it is
-    /// exercised for both the specialized base and the generic base.
+    /// exercised for both specialized bases and a generic base.
     #[test]
     fn packed_batch_matches_scalar_per_point() {
         use crate::gates::gate::Gate;
@@ -374,11 +383,12 @@ mod tests {
         }
 
         compare::<2>(11);
+        compare::<4>(11);
         compare::<6>(11);
     }
 
     /// Manual timing harness for the packed accumulate path of the production
-    /// `B = 2` gate, modeled on `exp_accumulate_micro` in `gates/exponentiation.rs`.
+    /// `B = 4` gate, modeled on `exp_accumulate_micro` in `gates/exponentiation.rs`.
     /// Run with:
     /// `cargo test --release -p plonky2 base_sum_accumulate_micro -- --ignored --nocapture`
     #[test]
@@ -394,13 +404,13 @@ mod tests {
 
         const D: usize = 2;
         type F = GoldilocksField;
-        let gate = BaseSumGate::<2>::new(32);
+        let gate = BaseSumGate::<4>::new(32);
         let n = 32;
-        let wires = F::rand_vec(<BaseSumGate<2> as Gate<F, D>>::num_wires(&gate) * n);
+        let wires = F::rand_vec(<BaseSumGate<4> as Gate<F, D>>::num_wires(&gate) * n);
         let constants: Vec<F> = Vec::new();
         let hash = crate::hash::hash_types::HashOut::ZERO;
         let filters = F::rand_vec(n);
-        let nc = <BaseSumGate<2> as Gate<F, D>>::num_constraints(&gate);
+        let nc = <BaseSumGate<4> as Gate<F, D>>::num_constraints(&gate);
         let mut combined = vec![F::ZERO; nc * n];
         let iters = 50_000u32;
         let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
@@ -409,14 +419,14 @@ mod tests {
         for _ in 0..4 {
             let s = Instant::now();
             for _ in 0..iters {
-                <BaseSumGate<2> as Gate<F, D>>::eval_unfiltered_base_batch_accumulate(
+                <BaseSumGate<4> as Gate<F, D>>::eval_unfiltered_base_batch_accumulate(
                     &gate, vars, &filters, black_box(&mut combined),
                 );
             }
             t += s.elapsed().as_secs_f64();
         }
         println!(
-            "base_sum B=2 accumulate per batch (n=32): {:.3} us",
+            "base_sum B=4 accumulate per batch (n=32): {:.3} us",
             t / (4.0 * iters as f64) * 1e6
         );
     }

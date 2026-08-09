@@ -161,26 +161,9 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         let n_chunks = coeffs.coeffs.len() / arity;
         let support = coeffs.coeffs.len() >> fri_params.config.rate_bits;
         let live_chunks = support.div_ceil(arity).min(n_chunks);
-        let beta_powers_16 = if arity == 16 {
-            let mut powers = [F::Extension::ONE; 16];
-            for i in 1..16 {
-                powers[i] = powers[i - 1] * beta;
-            }
-            Some(powers)
-        } else {
-            None
-        };
         let mut folded = coeffs.coeffs[..live_chunks * arity]
             .par_chunks_exact(arity)
-            .map(|chunk| match &beta_powers_16 {
-                Some(beta_powers) => {
-                    let terms: &[F::Extension; 16] = chunk
-                        .try_into()
-                        .expect("arity-16 FRI chunk must contain 16 terms");
-                    F::fri_fold_arity16(terms, beta, beta_powers)
-                }
-                None => reduce_with_powers(chunk, beta),
-            })
+            .map(|chunk| reduce_with_powers(chunk, beta))
             .collect::<Vec<_>>();
         // The historical `resize(n_chunks, ZERO)` zero-filled the whole dead
         // tail. Zeros are actually *read as values* only where the next
