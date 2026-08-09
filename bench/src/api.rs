@@ -1,4 +1,4 @@
-// Redraw marker 250
+// horner-fma+logstrip-redraw-1786286925 fire3 stack 26.95/26.84
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
