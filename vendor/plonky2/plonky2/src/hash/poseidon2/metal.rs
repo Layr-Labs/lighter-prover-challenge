@@ -2135,7 +2135,14 @@ impl MetalShared {
         output_bytes: usize,
     ) -> Result<Option<DetachedOutput<'_>>, String> {
         let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
-        if pool.waiters == 0 || pool.detached_readback {
+        // Always detach when a completed output is still owned by the set and no
+        // other detach is in flight. Contended builds already need this so the
+        // BufferSet can return to `free` before CPU `tree_from_levels` copies
+        // digests. Uncontended builds gain the same early-release window: a
+        // waiter that arrives during the copy can start the next GPU job
+        // without waiting for digest conversion. The only extra cost is a
+        // spare output buffer swap (often recycled via `spare_output`).
+        if pool.detached_readback {
             return Ok(None);
         }
         let replacement = match pool.spare_output.take() {
@@ -3310,7 +3317,7 @@ mod tests {
     use crate::plonk::vars::EvaluationVarsBaseBatch;
 
     #[test]
-    fn does_not_detach_output_without_a_waiting_build() {
+    fn always_detaches_output_without_a_waiting_build() {
         let context = MetalShared::new().expect("Metal context");
         let mut set = context.acquire_set().expect("buffer set");
         set.output = Some(autoreleasepool(|| {
@@ -3318,15 +3325,27 @@ mod tests {
                 .device
                 .new_buffer(64, MTLResourceOptions::StorageModeShared)
         }));
+        let original = set.output.as_ref().unwrap().contents();
 
         let detached = context
             .try_detach_completed_output(&mut set, 64)
-            .expect("pool state");
-        assert!(detached.is_none());
+            .expect("pool state")
+            .expect("uncontended always-detach");
+        assert_eq!(detached.buffer().contents(), original);
+        assert_ne!(
+            set.output.as_ref().unwrap().contents(),
+            original,
+            "replacement output installed so the set can return early"
+        );
         let pool = context.pool.lock().unwrap();
         assert_eq!(pool.waiters, 0);
         assert!(pool.spare_output.is_none());
+        assert!(pool.detached_readback);
+        drop(pool);
+        drop(detached);
+        let pool = context.pool.lock().unwrap();
         assert!(!pool.detached_readback);
+        assert!(pool.spare_output.is_some());
     }
 
     #[test]
