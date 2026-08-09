@@ -532,13 +532,14 @@ fn fft_classic_simd_single_layer_neon(
     let half = 1usize << lg_half_m;
     let m = half << 1;
     debug_assert!(omega_row.len() >= half);
+    debug_assert_eq!(half & 1, 0);
     let base = values.as_mut_ptr().cast::<u64>();
     unsafe {
         let eps = vdupq_n_u64(EPSILON);
         let mut k = 0;
         while k + m <= values.len() {
             let mut j = 0;
-            while j + 2 <= half {
+            while j < half {
                 let v = NeonGoldilocksField([
                     *values.get_unchecked(k + half + j),
                     *values.get_unchecked(k + half + j + 1),
@@ -554,16 +555,6 @@ fn fft_classic_simd_single_layer_neon(
                 vst1q_u64(base.add(k + j), gl_add_neon(u, tv, eps));
                 vst1q_u64(base.add(k + half + j), gl_sub_neon(u, tv, eps));
                 j += 2;
-            }
-            // `half` is a power of two and at least 2 whenever this path is
-            // taken, so this tail never runs; kept so the kernel is correct for
-            // any shape rather than only the ones production uses.
-            while j < half {
-                let t = omega_row[j] * values[k + half + j];
-                let u = values[k + j];
-                values[k + j] = u + t;
-                values[k + half + j] = u - t;
-                j += 1;
             }
             k += m;
         }
