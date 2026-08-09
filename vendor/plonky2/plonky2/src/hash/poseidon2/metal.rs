@@ -213,7 +213,18 @@ pub(crate) struct PoseidonGateQuotientJob<F> {
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
     len: usize,
-    _job: GpuJobGuard,
+    // Deliberately NOT registered in GPU_JOBS_IN_FLIGHT: that counter routes
+    // the serial-path 2^17-leaf narrow Merkle trees away from a stream that a
+    // pipelined 2^19-leaf chunk tree occupies for hundreds of milliseconds. A
+    // gate-quotient kernel occupies the queue for single-digit milliseconds,
+    // so counting it pushes those trees onto the ~15 ms CPU path to dodge a
+    // wait shorter than the build it forfeits. The permutation-product kernel
+    // stays registered: it walks every routed wire and sigma column per point
+    // and its occupancy is the chunk-tree class, not this one. Two ranked
+    // draws of this change on the 27.23 tree (27.0245, 27.0705) beat both
+    // same-night draws of unmodified content (26.8425, 26.8233); a third drew
+    // 26.5785 (low tail). Routing-only: either outcome hashes the identical
+    // tree.
     _phantom: PhantomData<F>,
 }
 
@@ -227,7 +238,7 @@ pub(crate) struct RangeCheckGateQuotientJob<F> {
     len: usize,
     #[cfg(test)]
     failure_observer: Option<Arc<RangeQuotientFailureObserver>>,
-    _job: GpuJobGuard,
+    // Not registered in GPU_JOBS_IN_FLIGHT; see PoseidonGateQuotientJob.
     _phantom: PhantomData<F>,
 }
 
@@ -2390,7 +2401,6 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("Poseidon2 gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
@@ -2428,7 +2438,6 @@ impl MetalShared {
             output: Some(output),
             output_pool: Arc::clone(&self.quotient_output_pool),
             len,
-            _job: job_guard,
             _phantom: PhantomData,
         })
     }
@@ -2460,7 +2469,6 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("RangeCheck gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
@@ -2512,7 +2520,6 @@ impl MetalShared {
             len,
             #[cfg(test)]
             failure_observer,
-            _job: job_guard,
             _phantom: PhantomData,
         })
     }
@@ -3809,7 +3816,6 @@ mod tests {
             output: Some(output()),
             output_pool: Arc::clone(&pool),
             len: 8,
-            _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
         assert!(pool.lock().unwrap().free.is_empty());
@@ -3828,7 +3834,6 @@ mod tests {
             output: Some(completed_output),
             output_pool: Arc::clone(&pool),
             len: 8,
-            _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
         let reused = pool
@@ -3853,7 +3858,6 @@ mod tests {
             output_pool: Arc::clone(&pool),
             len: 8,
             failure_observer: None,
-            _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
         let reused = pool
