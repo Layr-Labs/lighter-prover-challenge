@@ -27,7 +27,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "6a65119780a2645ce0077ef1da44d2774ca31aa1ef5c511162280d1b2f15213f";
+    "8a728e28a2d778422297b5d98c989ebde78b0cedbffc1193ff901a3ea612e6b8";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -361,6 +361,27 @@ pub(crate) enum U32QuotientKind {
         base: usize,
     },
     Selection,
+    /// U32InterleaveGate: two routed words and 32 big-endian bit wires per
+    /// operation; 34 constraints per operation.
+    Interleave,
+    /// UninterleaveToU32Gate: four routed words and 64 big-endian bit wires
+    /// per operation; 68 constraints per operation.
+    Uninterleave,
+    /// `ArithmeticGate`: four routed words per operation and two base-field
+    /// constants beginning at `constant_base`.
+    BaseArithmetic {
+        constant_base: usize,
+    },
+    /// `ArithmeticExtensionGate<2>`: four quadratic-extension values per
+    /// operation and two base-field constants beginning at `constant_base`.
+    ExtensionArithmetic {
+        constant_base: usize,
+    },
+    /// `MulExtensionGate<2>`: three quadratic-extension values per operation
+    /// and one base-field scalar at `constant_column`.
+    ExtensionMultiplication {
+        constant_column: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1323,6 +1344,59 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                         0usize,
                         0usize,
                         spec.num_ops.checked_mul(5)?,
+                        spec.num_ops.checked_mul(2)?,
+                    )
+                }
+                U32QuotientKind::Interleave => {
+                    if spec.num_ops != 4 {
+                        return None;
+                    }
+                    let count = spec.num_ops.checked_mul(34)?;
+                    (13usize, 0usize, 0usize, 0usize, count, count)
+                }
+                U32QuotientKind::Uninterleave => {
+                    if spec.num_ops != 2 {
+                        return None;
+                    }
+                    let count = spec.num_ops.checked_mul(68)?;
+                    (14usize, 0usize, 0usize, 0usize, count, count)
+                }
+                U32QuotientKind::BaseArithmetic { constant_base } => {
+                    if constant_base.checked_add(2)? > constants.cols {
+                        return None;
+                    }
+                    (
+                        15usize,
+                        constant_base,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_mul(4)?,
+                        spec.num_ops,
+                    )
+                }
+                U32QuotientKind::ExtensionArithmetic { constant_base } => {
+                    if constant_base.checked_add(2)? > constants.cols {
+                        return None;
+                    }
+                    (
+                        16usize,
+                        constant_base,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_mul(8)?,
+                        spec.num_ops.checked_mul(2)?,
+                    )
+                }
+                U32QuotientKind::ExtensionMultiplication { constant_column } => {
+                    if constant_column >= constants.cols {
+                        return None;
+                    }
+                    (
+                        17usize,
+                        constant_column,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_mul(6)?,
                         spec.num_ops.checked_mul(2)?,
                     )
                 }
@@ -3783,8 +3857,25 @@ mod tests {
             num_ops: 20,
             kind: U32QuotientKind::Selection,
         });
+        let interleave_selector_column = specs.len();
+        specs.push(U32QuotientSpec {
+            selector_column: interleave_selector_column,
+            gate_index: 241,
+            group: 240..243,
+            include_unused_selector: true,
+            num_ops: 4,
+            kind: U32QuotientKind::Interleave,
+        });
+        let uninterleave_selector_column = specs.len();
+        specs.push(U32QuotientSpec {
+            selector_column: uninterleave_selector_column,
+            gate_index: 244,
+            group: 243..246,
+            include_unused_selector: true,
+            num_ops: 2,
+            kind: U32QuotientKind::Uninterleave,
+        });
         let addition_selector_column = specs.len();
-        let addition_constant_base = addition_selector_column + 1;
         specs.push(U32QuotientSpec {
             selector_column: addition_selector_column,
             gate_index: 200,
@@ -3792,9 +3883,53 @@ mod tests {
             include_unused_selector: true,
             num_ops: 26,
             kind: U32QuotientKind::BaseAddition {
-                constant_base: addition_constant_base,
+                constant_base: 0,
             },
         });
+        let arithmetic_selector_column = specs.len();
+        specs.push(U32QuotientSpec {
+            selector_column: arithmetic_selector_column,
+            gate_index: 247,
+            group: 246..249,
+            include_unused_selector: true,
+            num_ops: 20,
+            kind: U32QuotientKind::BaseArithmetic { constant_base: 0 },
+        });
+        let extension_arithmetic_selector_column = specs.len();
+        specs.push(U32QuotientSpec {
+            selector_column: extension_arithmetic_selector_column,
+            gate_index: 250,
+            group: 249..252,
+            include_unused_selector: true,
+            num_ops: 10,
+            kind: U32QuotientKind::ExtensionArithmetic { constant_base: 0 },
+        });
+        let extension_multiplication_selector_column = specs.len();
+        specs.push(U32QuotientSpec {
+            selector_column: extension_multiplication_selector_column,
+            gate_index: 253,
+            group: 252..255,
+            include_unused_selector: true,
+            num_ops: 13,
+            kind: U32QuotientKind::ExtensionMultiplication { constant_column: 0 },
+        });
+        // Every native arithmetic gate reads the same gate-local constant
+        // columns immediately after the selector prefix, just as production.
+        let gate_constant_base = specs.len();
+        specs[addition_selector_column].kind = U32QuotientKind::BaseAddition {
+            constant_base: gate_constant_base,
+        };
+        specs[arithmetic_selector_column].kind = U32QuotientKind::BaseArithmetic {
+            constant_base: gate_constant_base,
+        };
+        specs[extension_arithmetic_selector_column].kind =
+            U32QuotientKind::ExtensionArithmetic {
+                constant_base: gate_constant_base,
+            };
+        specs[extension_multiplication_selector_column].kind =
+            U32QuotientKind::ExtensionMultiplication {
+                constant_column: gate_constant_base,
+            };
 
         for step in [1, 4] {
             let full_rows = QUOTIENT_ROWS * step;
@@ -3830,9 +3965,9 @@ mod tests {
             }
             let mut constant_columns = constants.columns_mut().expect("unique constant columns");
             for row in 0..full_rows {
-                constant_columns[addition_constant_base][row] =
+                constant_columns[gate_constant_base][row] =
                     F::from_canonical_u64(3 + (row % 19) as u64);
-                constant_columns[addition_constant_base + 1][row] =
+                constant_columns[gate_constant_base + 1][row] =
                     F::from_canonical_u64(5 + (row % 23) as u64);
             }
 
@@ -3998,6 +4133,121 @@ mod tests {
                                 let temp = wires.col(4 * spec.num_ops + op)[source_row];
                                 constraints.push((b * y - y) - temp);
                                 constraints.push((b * x - temp) - result);
+                            }
+                            assert_eq!(constraints.len(), 2 * spec.num_ops);
+                        }
+                        U32QuotientKind::Interleave => {
+                            for op in 0..spec.num_ops {
+                                let routed = 2 * op;
+                                let bit_base = 2 * spec.num_ops + 32 * op;
+                                let mut recomposed = F::ZERO;
+                                let mut interleaved = F::ZERO;
+                                for j in 0..32 {
+                                    let bit = wires.col(bit_base + j)[source_row];
+                                    recomposed = recomposed.double() + bit;
+                                    interleaved = interleaved * four + bit;
+                                }
+                                constraints.push(recomposed - wires.col(routed)[source_row]);
+                                constraints.push(
+                                    interleaved - wires.col(routed + 1)[source_row],
+                                );
+                                for j in 0..32 {
+                                    let bit = wires.col(bit_base + j)[source_row];
+                                    constraints.push(bit * (bit - F::ONE));
+                                }
+                            }
+                            assert_eq!(constraints.len(), 34 * spec.num_ops);
+                        }
+                        U32QuotientKind::Uninterleave => {
+                            for op in 0..spec.num_ops {
+                                let routed = 4 * op;
+                                let bit_base = 4 * spec.num_ops + 64 * op;
+                                let mut high = F::ZERO;
+                                let mut low = F::ZERO;
+                                let mut evens = F::ZERO;
+                                let mut odds = F::ZERO;
+                                for j in 0..64 {
+                                    let bit = wires.col(bit_base + j)[source_row];
+                                    if j < 32 {
+                                        high = high.double() + bit;
+                                    } else {
+                                        low = low.double() + bit;
+                                    }
+                                    if j & 1 == 0 {
+                                        evens = evens.double() + bit;
+                                    } else {
+                                        odds = odds.double() + bit;
+                                    }
+                                }
+                                let inverse = wires.col(routed + 3)[source_row];
+                                constraints.push((inverse * (u32_max - high) - F::ONE) * low);
+                                constraints.push(
+                                    high * base32 + low - wires.col(routed)[source_row],
+                                );
+                                constraints.push(evens - wires.col(routed + 1)[source_row]);
+                                constraints.push(odds - wires.col(routed + 2)[source_row]);
+                                for j in 0..64 {
+                                    let bit = wires.col(bit_base + j)[source_row];
+                                    constraints.push(bit * (bit - F::ONE));
+                                }
+                            }
+                            assert_eq!(constraints.len(), 68 * spec.num_ops);
+                        }
+                        U32QuotientKind::BaseArithmetic { constant_base } => {
+                            let const_0 = constants.col(constant_base)[source_row];
+                            let const_1 = constants.col(constant_base + 1)[source_row];
+                            for op in 0..spec.num_ops {
+                                let wire_base = 4 * op;
+                                let x = wires.col(wire_base)[source_row];
+                                let y = wires.col(wire_base + 1)[source_row];
+                                let addend = wires.col(wire_base + 2)[source_row];
+                                let output = wires.col(wire_base + 3)[source_row];
+                                constraints.push(
+                                    output - (x * y * const_0 + addend * const_1),
+                                );
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops);
+                        }
+                        U32QuotientKind::ExtensionArithmetic { constant_base } => {
+                            let const_0 = constants.col(constant_base)[source_row];
+                            let const_1 = constants.col(constant_base + 1)[source_row];
+                            let nonresidue = F::from_canonical_u64(7);
+                            for op in 0..spec.num_ops {
+                                let wire_base = 8 * op;
+                                let x_0 = wires.col(wire_base)[source_row];
+                                let x_1 = wires.col(wire_base + 1)[source_row];
+                                let y_0 = wires.col(wire_base + 2)[source_row];
+                                let y_1 = wires.col(wire_base + 3)[source_row];
+                                let addend_0 = wires.col(wire_base + 4)[source_row];
+                                let addend_1 = wires.col(wire_base + 5)[source_row];
+                                let output_0 = wires.col(wire_base + 6)[source_row];
+                                let output_1 = wires.col(wire_base + 7)[source_row];
+                                let product_0 = x_0 * y_0 + nonresidue * x_1 * y_1;
+                                let product_1 = x_0 * y_1 + x_1 * y_0;
+                                constraints.push(
+                                    output_0 - (product_0 * const_0 + addend_0 * const_1),
+                                );
+                                constraints.push(
+                                    output_1 - (product_1 * const_0 + addend_1 * const_1),
+                                );
+                            }
+                            assert_eq!(constraints.len(), 2 * spec.num_ops);
+                        }
+                        U32QuotientKind::ExtensionMultiplication { constant_column } => {
+                            let const_0 = constants.col(constant_column)[source_row];
+                            let nonresidue = F::from_canonical_u64(7);
+                            for op in 0..spec.num_ops {
+                                let wire_base = 6 * op;
+                                let x_0 = wires.col(wire_base)[source_row];
+                                let x_1 = wires.col(wire_base + 1)[source_row];
+                                let y_0 = wires.col(wire_base + 2)[source_row];
+                                let y_1 = wires.col(wire_base + 3)[source_row];
+                                let output_0 = wires.col(wire_base + 4)[source_row];
+                                let output_1 = wires.col(wire_base + 5)[source_row];
+                                let product_0 = x_0 * y_0 + nonresidue * x_1 * y_1;
+                                let product_1 = x_0 * y_1 + x_1 * y_0;
+                                constraints.push(output_0 - product_0 * const_0);
+                                constraints.push(output_1 - product_1 * const_0);
                             }
                             assert_eq!(constraints.len(), 2 * spec.num_ops);
                         }
@@ -4618,6 +4868,13 @@ mod tests {
                             unreachable!("covered by metal_u32_gate_quotient_matches_cpu")
                         }
                         U32QuotientKind::Selection => {
+                            unreachable!("covered by metal_u32_gate_quotient_matches_cpu")
+                        }
+                        U32QuotientKind::Interleave
+                        | U32QuotientKind::Uninterleave
+                        | U32QuotientKind::BaseArithmetic { .. }
+                        | U32QuotientKind::ExtensionArithmetic { .. }
+                        | U32QuotientKind::ExtensionMultiplication { .. } => {
                             unreachable!("covered by metal_u32_gate_quotient_matches_cpu")
                         }
                     }
