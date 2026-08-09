@@ -247,6 +247,13 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
     ) {
         let batch_size = vars_batch.len();
         debug_assert!(self.num_constraints() * batch_size <= combined_gate_constraints.len());
+        // A gate with no constraints contributes nothing to the quotient: its filtered
+        // accumulator is the selector filter multiplied into zero constraint rows.
+        // Skipping it deletes the filter computation (a per-point product over the
+        // selector column) without changing any field value the transcript observes.
+        if self.num_constraints() == 0 {
+            return;
+        }
         // Contiguous-column filter computation: read the selector constant
         // column once and accumulate the same product terms, in the same
         // order, as the per-point `compute_filter` — identical field values
