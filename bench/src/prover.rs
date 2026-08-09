@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use circuit::block::Block;
-use circuit::block_constraints::{BlockCircuit, Circuit as _};
+use circuit::block_constraints::BlockCircuit;
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
 use circuit::block_pre_execution_constraints::{
     BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
@@ -579,8 +579,9 @@ pub(crate) fn prove_block_after_pre(
         let active_paths = &active_paths;
         std::thread::scope(|scope| {
             // The final block circuit depends only on already-built circuit data
-            // and is not needed until the final proof, so it builds concurrently
-            // with the entire transaction/chain proving pipeline.
+            // and is not needed until the final proof, so it loads concurrently
+            // with the entire transaction/chain proving pipeline (falling back
+            // to the original build path if the embedded blob is unavailable).
             // Two-phase final-block witness (H13): this lane also runs the
             // EARLY witness phase (block data + pre-proof generators) after the
             // build, then joins the heavy path — which finishes ~30 s before
@@ -619,7 +620,7 @@ pub(crate) fn prove_block_after_pre(
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
-                    let (block_target, block_data) = circuits.build_block_circuit();
+                    let (block_target, block_data) = circuits.load_block_circuit();
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
                     let early = BlockCircuit::witness_inputs_early(
@@ -639,8 +640,9 @@ pub(crate) fn prove_block_after_pre(
                         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                     // The heavy path's thread has exited, so its shared guards
                     // on the heavy transaction and chain circuits are gone, and
-                    // this lane dropped its own guard when `build_block_circuit`
-                    // returned above. Nothing reads those two circuits again:
+                    // this lane dropped any fallback-build guard when
+                    // `load_block_circuit` returned above. Nothing reads those
+                    // two circuits again:
                     // the light pipeline uses the light pair, and the final
                     // block proof uses only `block_data`, the three finished
                     // proofs and the block. Retire their preprocessed
@@ -688,10 +690,11 @@ pub(crate) fn prove_block_after_pre(
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             // The light path's thread has exited, so its shared guards on the
             // light transaction and chain circuits are gone, and the block lane
-            // dropped its own light-chain guard when `build_block_circuit`
-            // returned long ago. Nothing reads the light pair again: the final
-            // block proof uses only `block_data`, the three finished proofs and
-            // the block. Retire their preprocessed extensions here — 438 MiB of
+            // dropped any fallback-build light-chain guard when
+            // `load_block_circuit` returned long ago. Nothing reads the light
+            // pair again: the final block proof uses only `block_data`, the
+            // three finished proofs and the block. Retire their preprocessed
+            // extensions here — 438 MiB of
             // Metal shared buffers whose release returns the pages to the OS
             // immediately — instead of holding them through the final witness
             // setup until the backstop below.

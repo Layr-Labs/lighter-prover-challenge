@@ -53,7 +53,7 @@ use crate::ecdsa::curve::secp256k1::Secp256K1;
 use crate::types::config::{C, D, F};
 
 /// Generator registry used for embedded blobs: the block registry already
-/// covers every generator of the five embedded circuits (the chain circuits
+/// covers every generator of the six embedded circuits (the chain circuits
 /// use `dummy_proof_and_constant_vk_no_generator`, so no `DummyProofGenerator`
 /// ever reaches a generator list).
 pub type EmbedGeneratorSerializer = BlockGeneratorSerializer<C, D, Secp256K1>;

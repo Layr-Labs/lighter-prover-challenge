@@ -1,19 +1,22 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Embedded startup circuits.
+//! Embedded fixed circuits.
 //!
-//! `build.rs` constructs the five startup circuits during the untimed compile
-//! job and serializes them (see `circuit::embed`) into OUT_DIR blobs that are
-//! compiled into this binary. [`Circuits::from_embedded`] reconstitutes the
-//! exact `Circuits` value `Circuits::new` builds, several times faster than
-//! rebuilding, moving that work out of the scored worker lifetime.
+//! `build.rs` constructs the five startup circuits and final block circuit
+//! during the untimed compile job and serializes them (see `circuit::embed`)
+//! into OUT_DIR blobs that are compiled into this binary.
+//! [`Circuits::from_embedded`] reconstitutes the exact `Circuits` value
+//! `Circuits::new` builds, while [`Circuits::load_block_circuit`] reconstitutes
+//! the exact final circuit [`Circuits::build_block_circuit`] builds.
 //!
 //! [`Circuits::load`] is the production entry point: embedded first, build
 //! fallback on any error, `LIGHTER_BUILD_CIRCUITS=1` to force the build path
-//! (measurement A/B). The `embedded_matches_rebuilt` ignored test is the
-//! value-equality oracle between the two paths.
+//! (measurement A/B). `LIGHTER_BUILD_BLOCK_CIRCUIT=1` independently forces the
+//! final circuit's build path. The `embedded_matches_rebuilt` ignored test is
+//! the value-equality oracle between the paths.
 
+use circuit::block_constraints::BlockTarget;
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
@@ -28,6 +31,7 @@ static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx
 static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
 static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+static BLOCK_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block.embed"));
 
 /// The four startup circuits that do not participate in pre-execution. Keeping
 /// this separate lets the worker start the pre-execution proof from its already
@@ -136,6 +140,23 @@ impl Circuits {
         // transaction circuits).
         let (pre, remaining) = rayon::join(Self::load_pre, Self::load_remaining_embedded);
         Ok(remaining?.into_circuits(pre?))
+    }
+
+    /// Loads the fixed final block circuit, falling back to the existing build
+    /// path if the blob is absent or invalid. The compact codec validates the
+    /// reconstructed commitment cap before returning.
+    pub fn load_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
+        if std::env::var_os("LIGHTER_BUILD_BLOCK_CIRCUIT").is_some_and(|value| value == "1") {
+            log::info!("LIGHTER_BUILD_BLOCK_CIRCUIT=1: building final block circuit");
+            return self.build_block_circuit();
+        }
+        match load_blob::<BlockTarget>("block", BLOCK_BLOB) {
+            Ok(block) => block,
+            Err(error) => {
+                log::warn!("embedded final block circuit unavailable ({error:#}); building it");
+                self.build_block_circuit()
+            }
+        }
     }
 
     /// Production loader: embedded circuits when available, otherwise a fresh
@@ -271,7 +292,7 @@ mod tests {
         );
     }
 
-    /// Determinism oracle for the embed mechanism: builds all five circuits
+    /// Determinism oracle for the embed mechanism: builds all six circuits
     /// from scratch AND loads the embedded set, then asserts value identity.
     /// This is the gate for `Circuits::from_embedded` — if it fails, the
     /// mechanism is wrong. Run:
@@ -334,6 +355,21 @@ mod tests {
                 ),
             );
 
+            let mut rebuilt = rebuilt;
+            let mut embedded = embedded;
+            rebuilt.release_finished_circuit_extensions();
+            embedded.release_finished_circuit_extensions();
+            let rebuilt_block = rebuilt.build_block_circuit();
+            let embedded_block = load_blob::<BlockTarget>("block", BLOCK_BLOB)
+                .expect("embedded final block circuit must load");
+            assert_circuit_pair_identical(
+                "block",
+                (&rebuilt_block.0, &rebuilt_block.1),
+                (&embedded_block.0, &embedded_block.1),
+            );
+            drop(rebuilt_block);
+            drop(embedded_block);
+
             // The gate serializer round trip below also pins the common data
             // encoding used by the blobs.
             let mut bytes = Vec::new();
@@ -345,7 +381,7 @@ mod tests {
                 .expect("common data must serialize");
             assert!(!bytes.is_empty());
 
-            println!("embedded_matches_rebuilt: all five circuits are value-identical");
+            println!("embedded_matches_rebuilt: all six circuits are value-identical");
         });
     }
 
@@ -424,6 +460,7 @@ mod tests {
             ("heavy_chain", HEAVY_CHAIN_BLOB),
             ("light_tx", LIGHT_TX_BLOB),
             ("light_chain", LIGHT_CHAIN_BLOB),
+            ("block", BLOCK_BLOB),
         ] {
             assert!(
                 !blob.is_empty(),
