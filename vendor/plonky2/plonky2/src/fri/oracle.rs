@@ -1,3 +1,4 @@
+// Retry attempt: identical prover baseline, resubmit to sample CI variance.
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec::Vec};
 
