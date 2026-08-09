@@ -215,6 +215,13 @@ pub(crate) enum PermutationBatch<'a, F> {
         /// Sigma columns (`sigmas_range` of the constants-sigmas commitment).
         s_sigmas_cols: &'a [F],
     },
+    /// The routed-wire product checks are evaluated asynchronously on Metal.
+    /// The CPU retains only the local Z columns needed by the two L_0 boundary
+    /// terms and shifts its gate accumulator past the full permutation prefix.
+    GpuProducts {
+        local_zs_cols: &'a [F],
+        gate_alpha_shifts: &'a [F],
+    },
 }
 
 const INTERLEAVE_PAIR_WIRES: usize = 136;
@@ -494,6 +501,36 @@ fn reduce_gate_constraints_base_batch<F: Field>(
     }
 }
 
+fn fold_gpu_permutation_boundary_terms<F: Field>(
+    local_zs_cols: &[F],
+    l_0_xs: &[F],
+    alphas: &[F],
+    gate_alpha_shifts: &[F],
+    batch_size: usize,
+    res_out: &mut [F],
+) {
+    let num_challenges = alphas.len();
+    debug_assert_eq!(gate_alpha_shifts.len(), num_challenges);
+    debug_assert_eq!(local_zs_cols.len(), batch_size * num_challenges);
+    debug_assert_eq!(l_0_xs.len(), batch_size);
+    debug_assert_eq!(res_out.len(), batch_size * num_challenges);
+
+    for point in 0..batch_size {
+        let result = &mut res_out
+            [point * num_challenges..(point + 1) * num_challenges];
+        for (output_challenge, value) in result.iter_mut().enumerate() {
+            let alpha = alphas[output_challenge];
+            *value *= gate_alpha_shifts[output_challenge];
+            let mut power = F::ONE;
+            for permutation_challenge in 0..num_challenges {
+                let z = local_zs_cols[permutation_challenge * batch_size + point];
+                *value += l_0_xs[point] * (z - F::ONE) * power;
+                power *= alpha;
+            }
+        }
+    }
+}
+
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
 ///
 /// Results are stored point-major: the challenges for point `k` occupy
@@ -561,6 +598,37 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
     reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out, true);
+
+    if let PermutationBatch::GpuProducts {
+        local_zs_cols,
+        gate_alpha_shifts,
+    } = perm
+    {
+        assert!(
+            !has_lookup,
+            "lookup circuits cannot offload permutation products"
+        );
+        assert_eq!(local_zs_cols.len(), num_challenges * n);
+        assert_eq!(gate_alpha_shifts.len(), num_challenges);
+        let l_0_xs = &mut scratch.vanishing_z_1_terms;
+        l_0_xs.clear();
+        l_0_xs.extend(
+            indices_batch
+                .iter()
+                .zip(xs_batch)
+                .map(|(&index, &x)| z_h_on_coset.eval_l_0(index, x)),
+        );
+        fold_gpu_permutation_boundary_terms(
+            local_zs_cols,
+            l_0_xs,
+            alphas,
+            gate_alpha_shifts,
+            n,
+            res_out,
+        );
+        l_0_xs.clear();
+        return;
+    }
 
     let numerator_values = &mut scratch.numerator_values;
     let denominator_values = &mut scratch.denominator_values;
@@ -1659,7 +1727,7 @@ pub(crate) fn eval_vanishing_poly_circuit<F: RichField + Extendable<D>, const D:
 #[cfg(test)]
 mod tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
-    use plonky2_field::types::PrimeField64;
+    use plonky2_field::types::{Field64, PrimeField64};
 
     use super::*;
 
@@ -1852,6 +1920,58 @@ mod tests {
                     "alpha reduction mismatch at {index}, batch={batch_size}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn gpu_permutation_boundary_fold_preserves_global_alpha_order() {
+        type F = GoldilocksField;
+        const BATCH: usize = 7;
+        const CHALLENGES: usize = 2;
+        const PERMUTATION_ROWS: usize = 8;
+
+        let alphas = [F::from_canonical_u64(3), F::from_canonical_u64(5)];
+        let gate_alpha_shifts = alphas.map(|alpha| alpha.exp_u64(PERMUTATION_ROWS as u64));
+        let local_zs_cols = (0..BATCH * CHALLENGES)
+            .map(|i| F::from_canonical_usize(11 + i))
+            .collect::<Vec<_>>();
+        let l_0_xs = (0..BATCH)
+            .map(|i| F::from_canonical_usize(37 + i))
+            .collect::<Vec<_>>();
+        let mut actual = (0..BATCH * CHALLENGES)
+            .map(|i| F::from_canonical_usize(53 + i))
+            .collect::<Vec<_>>();
+        let mut expected = actual.clone();
+
+        for point in 0..BATCH {
+            for output_challenge in 0..CHALLENGES {
+                let alpha = alphas[output_challenge];
+                let mut power = F::ONE;
+                expected[point * CHALLENGES + output_challenge] *=
+                    gate_alpha_shifts[output_challenge];
+                for permutation_challenge in 0..CHALLENGES {
+                    let term = l_0_xs[point]
+                        * local_zs_cols[permutation_challenge * BATCH + point].sub_one();
+                    expected[point * CHALLENGES + output_challenge] += term * power;
+                    power *= alpha;
+                }
+            }
+        }
+
+        fold_gpu_permutation_boundary_terms(
+            &local_zs_cols,
+            &l_0_xs,
+            &alphas,
+            &gate_alpha_shifts,
+            BATCH,
+            &mut actual,
+        );
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                actual.to_canonical_u64(),
+                expected.to_canonical_u64(),
+                "boundary fold mismatch at word {index}"
+            );
         }
     }
 
