@@ -160,8 +160,9 @@ impl Field for Secp256K1Base {
 impl PrimeField for Secp256K1Base {
     fn to_canonical_biguint(&self) -> BigUint {
         let mut result = biguint_from_array(self.0);
-        if result >= Self::order() {
-            result -= Self::order();
+        let order = Self::order();
+        if result >= order {
+            result -= order;
         }
         result
     }
@@ -186,8 +187,9 @@ impl Add for Secp256K1Base {
     #[inline]
     fn add(self, rhs: Self) -> Self {
         let mut result = self.to_canonical_biguint() + rhs.to_canonical_biguint();
-        if result >= Self::order() {
-            result -= Self::order();
+        let order = Self::order();
+        if result >= order {
+            result -= order;
         }
         Self::from_noncanonical_biguint(result)
     }
