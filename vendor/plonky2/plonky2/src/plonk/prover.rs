@@ -1778,6 +1778,13 @@ fn compute_quotient_polys<
             )
         })
         .flatten();
+    // GPU gate jobs return additive vanishing numerators. When any job is
+    // active, merge every numerator first and apply the common `Z_H` inverse
+    // exactly once in the last active merge instead of once per contribution.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let defer_quotient_scaling = gpu_poseidon.is_some() || gpu_range.is_some();
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let defer_quotient_scaling = false;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let excluded_gate_indices = gpu_poseidon
         .as_ref()
@@ -2156,14 +2163,16 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
+                if !defer_quotient_scaling {
+                    for (&i, quotient_values) in indices_batch
+                        .iter()
+                        .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
+                    {
+                        let denominator_inv = z_h_on_coset.eval_inverse(i);
+                        quotient_values
+                            .iter_mut()
+                            .for_each(|v| *v *= denominator_inv);
+                    }
                 }
             },
         );
@@ -2202,14 +2211,23 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
+        // Preserve overlap with the queued Range/U32/Byte job: when it is
+        // pending, this first merge is add-only and the Range merge scales.
+        let range_pending = gpu_range.is_some();
         quotient_values
             .par_chunks_exact_mut(num_challenges)
             .zip(gpu_values.par_chunks_exact(num_challenges))
             .enumerate()
             .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                if range_pending {
+                    for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                        *cpu += gpu;
+                    }
+                } else {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                        *cpu = (*cpu + gpu) * denominator_inv;
+                    }
                 }
             });
     }
@@ -2258,7 +2276,7 @@ fn compute_quotient_polys<
             .for_each(|(i, (cpu_values, gpu_values))| {
                 let denominator_inv = z_h_on_coset.eval_inverse(i);
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    *cpu = (*cpu + gpu) * denominator_inv;
                 }
             });
     }
@@ -2447,7 +2465,7 @@ mod quotient_layout_tests {
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::{Field, Field64};
+    use crate::field::types::{Field, Field64, PrimeField64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::gate::U32QuotientGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2494,6 +2512,76 @@ mod quotient_layout_tests {
         );
         let sum = builder.constant(F::from_canonical_usize(value));
         builder.connect(sum, Target::wire(row, 0));
+    }
+
+    /// The deferred denominator merge has four runtime shapes depending on
+    /// which optional Metal jobs were actually accepted. Compare each shape
+    /// against the original separately-scaled formula over adversarial values.
+    #[test]
+    fn deferred_quotient_scaling_paths_agree() {
+        type F = GoldilocksField;
+        let cases = [
+            (F::ZERO, F::ONE, F::ONE, F::ONE),
+            (
+                F::ZERO,
+                F::ONE,
+                F::from_canonical_u64(F::ORDER - 3),
+                F::from_canonical_u64(F::ORDER - 1),
+            ),
+            (
+                F::from_canonical_u64(F::ORDER - 1),
+                F::from_canonical_u64(F::ORDER - 2),
+                F::from_canonical_u64(F::ORDER - 3),
+                F::from_canonical_u64(F::ORDER - 4),
+            ),
+            (
+                F::from_canonical_u64(0xffff_ffff),
+                F::from_canonical_u64(0x1_0000_0000),
+                F::from_canonical_u64(0xdead_beef_cafe_babe),
+                F::from_canonical_u64(0x1234_5678_9abc_def0),
+            ),
+        ];
+
+        let mut saw_non_identical_raw_representative = false;
+        for &(cpu, poseidon, range, denominator_inv) in &cases {
+            for (poseidon_active, range_active) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let mut separately_scaled = cpu * denominator_inv;
+                if poseidon_active {
+                    separately_scaled += poseidon * denominator_inv;
+                }
+                if range_active {
+                    separately_scaled += range * denominator_inv;
+                }
+
+                let mut deferred = cpu;
+                if !poseidon_active && !range_active {
+                    deferred *= denominator_inv;
+                }
+                if poseidon_active {
+                    if range_active {
+                        deferred += poseidon;
+                    } else {
+                        deferred = (deferred + poseidon) * denominator_inv;
+                    }
+                }
+                if range_active {
+                    deferred = (deferred + range) * denominator_inv;
+                }
+
+                assert_eq!(
+                    deferred.to_canonical_u64(),
+                    separately_scaled.to_canonical_u64(),
+                    "poseidon_active={poseidon_active} range_active={range_active}"
+                );
+                saw_non_identical_raw_representative |= deferred.0 != separately_scaled.0;
+            }
+        }
+        assert!(
+            saw_non_identical_raw_representative,
+            "the test vectors should exercise valid non-identical raw representatives"
+        );
     }
 
     /// B1/B2/D1 differential gate: within a single prove call — same witness,
