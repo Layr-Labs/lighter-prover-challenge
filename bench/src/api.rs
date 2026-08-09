@@ -1,4 +1,4 @@
-// Redraw marker 250
+// BEST-STACK horner-fma+logstrip multi-1786293128 (guard-drop closed 26.31)
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
