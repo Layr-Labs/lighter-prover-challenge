@@ -1427,17 +1427,19 @@ pub(crate) fn allocate_columns<F: RichField>(
 /// staging buffer.
 /// Retained buffers for the streamed sponge build: the inter-pass state
 /// (12 u64 lanes per leaf, column-major) and the level-order digest output.
-/// One streamed build runs at a time (exclusive proving phases only), so a
-/// single grow-on-demand pair suffices; holding the lock for the whole build
-/// serializes any unexpected second caller onto the classic path.
+/// One streamed build runs at a time, so a single grow-on-demand pair
+/// suffices; the mutex is held for the whole build, and a second caller
+/// (exclusive phases cannot produce one; pipelined phases fall back to the
+/// classic path via `try_lock`) never shares the buffers.
 static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
 
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
-/// the GPU absorbs each group while the CPU fills the next. Only used inside
-/// exclusive proving phases (nothing else contends for the GPU stream) and
-/// for large wide trees, where the overlap converts the previously serial
-/// CPU-FFT-then-GPU-hash commitment into max(FFT, hash) + one pass.
+/// the GPU absorbs each group while the CPU fills the next. The overlap
+/// converts the previously serial CPU-FFT-then-GPU-hash commitment into
+/// max(FFT, hash) + one pass for the big wide trees that own the serialized
+/// GPU stream: the exclusive phases'' 2^20+ leaf trees (pre-execution, final
+/// block) and the pipelined tx proofs'' 2^19-leaf x 136-column wires tree.
 ///
 /// Value-exact: the fill closure runs the same `batch_multiply_into` +
 /// zero-padded FFT as `fill_lde_column_store`, and each absorb pass performs
@@ -1455,15 +1457,23 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
+    let exclusive = EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed);
+    // The pipelined tx-proof wires tree (2^19 leaves x 136 columns) is the
+    // streamed shape outside an exclusive phase: it is wide enough that the
+    // CPU LDE fill (~60 ms) is comparable to the GPU absorb (~83 ms), so
+    // fusing them removes the fill from the proof''s critical path. Narrower
+    // 2^19 trees (Zs/quotient, ~20 columns) have short fills and stay
+    // classic. 2^17-leaf trees (chain steps) are below the floor entirely.
+    let large_wide = leaf_count >= 1 << 19 && leaf_width >= 128;
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || leaf_width < 16
-        || leaf_count < 1 << 20
+        || leaf_count < 1 << 19
         || !leaf_count.is_power_of_two()
         || leaf_count > u32::MAX as usize
         || leaf_width > u32::MAX as usize
         || cap_height > leaf_count.ilog2() as usize
-        || !EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
+        || (!exclusive && !large_wide)
     {
         return None;
     }
@@ -1478,7 +1488,21 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let state_bytes = leaf_count.checked_mul(12)?.checked_mul(size_of::<u64>())?;
 
     let job = GpuJobGuard::begin();
-    let mut buffers = STREAMED_BUFFERS.lock().ok()?;
+    // Exclusive phases serialize by construction; the pipelined phases run two
+    // tx proofs concurrently, so never block a second streamed build on the
+    // first — a contended lock means the other proof''s classic path wins and
+    // this one falls back to it.
+    let mut buffers = if exclusive {
+        match STREAMED_BUFFERS.lock() {
+            Ok(guard) => guard,
+            Err(_) => return None,
+        }
+    } else {
+        match STREAMED_BUFFERS.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => return None,
+        }
+    };
     let needs_new = buffers.as_ref().map_or(true, |(state, output)| {
         state.length() < state_bytes as u64 || output.length() < output_bytes as u64
     });
