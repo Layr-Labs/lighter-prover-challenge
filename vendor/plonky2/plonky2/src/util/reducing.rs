@@ -34,6 +34,16 @@ impl<F: Field> ReducingFactor<F> {
         Self { base, count: 0 }
     }
 
+    /// Return the consecutive powers consumed by a polynomial batch and advance
+    /// the reduction count by the same logical number of polynomials. Structured
+    /// reducers use this to replace many circuit-fixed polynomials with an
+    /// algebraically equivalent aggregate without shifting later alpha powers.
+    pub(crate) fn powers_and_advance(&mut self, len: usize) -> Vec<F> {
+        let powers = self.base.powers().take(len).collect();
+        self.count += len as u64;
+        powers
+    }
+
     fn mul(&mut self, x: F) -> F {
         self.count += 1;
         self.base * x
@@ -104,8 +114,7 @@ impl<F: Field> ReducingFactor<F> {
             .map(|p| p.borrow().coeffs.len())
             .max()
             .unwrap_or(0);
-        let base_powers: Vec<F> = self.base.powers().take(num_polys).collect();
-        self.count += num_polys as u64;
+        let base_powers = self.powers_and_advance(num_polys);
 
         let accumulate_chunk = |ps: &[_], powers: &[F]| -> Vec<F> {
             // Build the accumulator straight from the chunk's first

@@ -39,7 +39,8 @@ use plonky2::field::polynomial::PolynomialValues;
 use plonky2::field::types::Field;
 use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::plonk::circuit_data::{
-    CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
+    CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, SigmaDeviationCache,
+    VerifierOnlyCircuitData,
 };
 use plonky2::plonk::permutation_argument::Forest;
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
@@ -573,6 +574,13 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         }
     };
 
+    let sigma_deviation_cache = SigmaDeviationCache::for_ranked_circuit(
+        &sigmas,
+        &subgroup,
+        &common.k_is,
+        common.constants_range().len(),
+    );
+
     let prover_only = ProverOnlyCircuitData::<F, C, D> {
         constants_sigmas_quotient_cache,
         constants_sigmas_quotient_step,
@@ -582,6 +590,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         generator_watch_counts,
         constants_sigmas_commitment,
         sigmas,
+        sigma_deviation_cache,
         subgroup,
         public_inputs,
         representative_map,

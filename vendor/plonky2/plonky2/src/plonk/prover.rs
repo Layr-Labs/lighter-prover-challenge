@@ -437,7 +437,8 @@ where
             &wires_commitment,
             &partial_products_zs_and_lookup_commitment,
             &quotient_polys_commitment,
-            common_data
+            common_data,
+            prover_data.sigma_deviation_cache.as_ref(),
         )
     );
     challenger.observe_openings(&openings.to_fri_openings());
@@ -458,6 +459,7 @@ where
             &common_data.fri_params,
             None,
             None,
+            prover_data.sigma_deviation_cache.as_ref(),
             timing,
         )
     );

@@ -43,7 +43,8 @@ use crate::iop::wire::Wire;
 use crate::plonk::circuit_builder::LookupWire;
 use crate::plonk::circuit_data::{
     CircuitConfig, CircuitData, CommonCircuitData, GeneratorWatchIndex, ProverCircuitData,
-    ProverOnlyCircuitData, VerifierCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
+    ProverOnlyCircuitData, SigmaDeviationCache, VerifierCircuitData, VerifierCircuitTarget,
+    VerifierOnlyCircuitData,
 };
 use crate::plonk::config::{GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::plonk_common::salt_size;
@@ -940,12 +941,20 @@ pub trait Read {
             lut_to_lookups.push(self.read_target_lut()?);
         }
 
+        let sigma_deviation_cache = SigmaDeviationCache::for_ranked_circuit(
+            &sigmas,
+            &subgroup,
+            &common_data.k_is,
+            common_data.constants_range().len(),
+        );
+
         Ok(ProverOnlyCircuitData {
             generators,
             generator_indices_by_watches,
             generator_watch_counts,
             constants_sigmas_commitment,
             sigmas,
+            sigma_deviation_cache,
             subgroup,
             public_inputs,
             representative_map,
@@ -1926,6 +1935,7 @@ pub trait Write {
             constants_sigmas_quotient_cache: _,
             constants_sigmas_quotient_step: _,
             constants_sigmas_quotient_domain: _,
+            sigma_deviation_cache: _,
             constants_sigmas_commitment,
             sigmas,
             subgroup,

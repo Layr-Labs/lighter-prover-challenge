@@ -44,8 +44,8 @@ use crate::iop::target::{BoolTarget, Target};
 use crate::iop::wire::Wire;
 use crate::plonk::circuit_data::{
     CircuitConfig, CircuitData, CommonCircuitData, GeneratorWatchIndex, MockCircuitData,
-    ProverCircuitData, ProverOnlyCircuitData, VerifierCircuitData, VerifierCircuitTarget,
-    VerifierOnlyCircuitData,
+    ProverCircuitData, ProverOnlyCircuitData, SigmaDeviationCache, VerifierCircuitData,
+    VerifierCircuitTarget, VerifierOnlyCircuitData,
 };
 use crate::plonk::config::{AlgebraicHasher, GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::copy_constraint::CopyConstraint;
@@ -1456,12 +1456,20 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             }
         };
 
+        let sigma_deviation_cache = SigmaDeviationCache::for_ranked_circuit(
+            &sigmas,
+            &subgroup,
+            &common.k_is,
+            num_constants,
+        );
+
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,
             generator_indices_by_watches,
             generator_watch_counts,
             constants_sigmas_commitment,
             sigmas,
+            sigma_deviation_cache,
             subgroup,
             public_inputs: self.public_inputs,
             representative_map: forest.parents,

@@ -6,7 +6,7 @@ use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
-use crate::field::extension::Extendable;
+use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::fft::{
     FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
 };
@@ -15,10 +15,11 @@ use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
 use crate::fri::proof::FriProof;
 use crate::fri::prover::fri_proof;
-use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
+use crate::fri::structure::{FriBatchInfo, FriInstanceInfo, FriPolynomialInfo};
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::{ColumnStore, MerkleLeaves, MerkleTree};
 use crate::iop::challenger::Challenger;
+use crate::plonk::circuit_data::SigmaDeviationCache;
 use crate::plonk::config::{GenericConfig, Hasher};
 use crate::timed;
 use crate::util::reducing::ReducingFactor;
@@ -27,6 +28,146 @@ use crate::util::{log2_strict, reverse_bits};
 
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
+
+fn parallel_ifft_values<F: Field>(mut values: Vec<F>) -> PolynomialCoeffs<F> {
+    let n = values.len();
+    let n_inv = F::inverse_2exp(log2_strict(n));
+    fft_in_place_with_options_parallel(&mut values, None, None);
+
+    let (left, right) = values.split_at_mut(n / 2);
+    left[0] *= n_inv;
+    right[0] *= n_inv;
+    left[1..]
+        .par_iter_mut()
+        .zip(right[1..].par_iter_mut().rev())
+        .for_each(|(low, high)| {
+            let low_value = *low;
+            let high_value = *high;
+            *low = high_value * n_inv;
+            *high = low_value * n_inv;
+        });
+    PolynomialCoeffs::new(values)
+}
+
+/// Reduce a FRI opening batch while exploiting the fixed geometry of the 80
+/// permutation sigma polynomials. On the subgroup,
+///
+/// `sigma_j(X) = k_j * X + IFFT(delta_j)(X)`.
+///
+/// Therefore their alpha-weighted sum needs one sparse value accumulation and
+/// one extension-field IFFT, rather than 80 dense coefficient-vector scans.
+/// Returns `None` unless the batch contains the exact contiguous sigma block.
+fn reduce_batch_with_sparse_sigmas<F: RichField + Extendable<D>, const D: usize>(
+    alpha: &mut ReducingFactor<F::Extension>,
+    infos: &[FriPolynomialInfo],
+    polys: &[&PolynomialCoeffs<F>],
+    cache: &SigmaDeviationCache<F>,
+) -> Option<PolynomialCoeffs<F::Extension>> {
+    let sigma_count = cache.k_is.len();
+    if sigma_count == 0
+        || infos.len() != polys.len()
+        || cache.row_offsets.len() != cache.degree + 1
+        || cache.columns.len() != cache.deltas.len()
+    {
+        return None;
+    }
+    let sigma_start = infos.iter().position(|info| {
+        info.oracle_index == 0 && info.polynomial_index == cache.num_constants
+    })?;
+    if sigma_start + sigma_count > infos.len()
+        || (0..sigma_count).any(|j| {
+            let info = infos[sigma_start + j];
+            info.oracle_index != 0 || info.polynomial_index != cache.num_constants + j
+        })
+    {
+        return None;
+    }
+
+    let max_len = polys.iter().map(|p| p.coeffs.len()).max().unwrap_or(0);
+    if max_len != cache.degree {
+        return None;
+    }
+
+    // Consume the exact same alpha powers as the dense reducer. Later batches
+    // therefore see the same shift even though 80 polynomials are represented
+    // here by one structured aggregate.
+    let powers = alpha.powers_and_advance(polys.len());
+    let live_indices = (0..polys.len())
+        .filter(|&i| i < sigma_start || i >= sigma_start + sigma_count)
+        .collect::<Vec<_>>();
+
+    const PARALLEL_CHUNK: usize = 16;
+    let (mut composition, sigma_coeffs) = plonky2_maybe_rayon::join(
+        || {
+            let partials = live_indices
+                .par_chunks(PARALLEL_CHUNK)
+                .map(|indices| {
+                    let mut iter = indices.iter().copied();
+                    let mut acc = match iter.next() {
+                        Some(index) => {
+                            let mut acc = Vec::with_capacity(max_len);
+                            acc.extend(
+                                polys[index]
+                                    .coeffs
+                                    .iter()
+                                    .map(|&coefficient| powers[index].scalar_mul(coefficient)),
+                            );
+                            acc.resize(max_len, F::Extension::ZERO);
+                            acc
+                        }
+                        None => vec![F::Extension::ZERO; max_len],
+                    };
+                    for index in iter {
+                        for (dst, &coefficient) in acc.iter_mut().zip(&polys[index].coeffs) {
+                            *dst += powers[index].scalar_mul(coefficient);
+                        }
+                    }
+                    acc
+                })
+                .collect::<Vec<_>>();
+
+            let mut composition = vec![F::Extension::ZERO; max_len];
+            for partial in partials {
+                for (dst, value) in composition.iter_mut().zip(partial) {
+                    *dst += value;
+                }
+            }
+            composition
+        },
+        || {
+            let sigma_values = (0..cache.degree)
+                .into_par_iter()
+                .map(|row| {
+                    let start = cache.row_offsets[row] as usize;
+                    let end = cache.row_offsets[row + 1] as usize;
+                    let mut value = F::Extension::ZERO;
+                    for entry in start..end {
+                        let column = cache.columns[entry] as usize;
+                        value +=
+                            powers[sigma_start + column].scalar_mul(cache.deltas[entry]);
+                    }
+                    value
+                })
+                .collect::<Vec<_>>();
+            let mut sigma_coeffs = parallel_ifft_values(sigma_values);
+            let linear_coefficient = cache
+                .k_is
+                .iter()
+                .enumerate()
+                .map(|(column, &k)| powers[sigma_start + column].scalar_mul(k))
+                .sum::<F::Extension>();
+            if sigma_coeffs.coeffs.len() > 1 {
+                sigma_coeffs.coeffs[1] += linear_coefficient;
+            }
+            sigma_coeffs
+        },
+    );
+    for (dst, value) in composition.iter_mut().zip(sigma_coeffs.coeffs) {
+        *dst += value;
+    }
+
+    Some(PolynomialCoeffs::new(composition))
+}
 
 /// Route the whole commitment (NTT + hashing) through the GPU backend.
 /// Official ranked A/B: submission 644c4257 (this on, over the 8.0011
@@ -606,6 +747,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         fri_params: &FriParams,
         final_poly_coeff_len: Option<usize>,
         max_num_query_steps: Option<usize>,
+        sigma_deviation_cache: Option<&SigmaDeviationCache<F>>,
         timing: &mut TimingTree,
     ) -> FriProof<F, C::Hasher, D> {
         assert!(D > 1, "Not implemented for D=1.");
@@ -624,9 +766,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // The oracles used in Plonky2 are given in `FRI_ORACLES` in `plonky2/src/plonk/plonk_common.rs`.
         for FriBatchInfo { point, polynomials } in &instance.batches {
             // Collect the coefficients of all the polynomials in `polynomials`.
-            let polys_coeff = polynomials.iter().map(|fri_poly| {
-                &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
-            });
+            let polys_coeff = polynomials
+                .iter()
+                .map(|fri_poly| {
+                    &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
+                })
+                .collect::<Vec<_>>();
             // The label is formatted unconditionally, but `timing`'s `push` is
             // compiled out unless the `timing` feature is on — which it is not
             // here — so the `String` is allocated, written and dropped without
@@ -635,7 +780,17 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             let composition_poly = timed!(
                 timing,
                 "reduce batch of polynomials",
-                alpha.reduce_polys_base(polys_coeff)
+                match sigma_deviation_cache.and_then(|cache| {
+                    reduce_batch_with_sparse_sigmas(
+                        &mut alpha,
+                        polynomials,
+                        &polys_coeff,
+                        cache,
+                    )
+                }) {
+                    Some(composition) => composition,
+                    None => alpha.reduce_polys_base(polys_coeff),
+                }
             );
             // Fused (value-exact) form of:
             //   let quotient = composition_poly.divide_by_linear_padded_in_place(*point);
@@ -806,9 +961,130 @@ fn accumulate_linear_quotient<F: Field>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::field::extension::FieldExtension;
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::Sample;
+    use crate::plonk::circuit_data::SigmaDeviationCache;
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+    use crate::plonk::proof::evaluate_sparse_sigmas;
+
+    #[test]
+    fn sparse_sigma_openings_and_fri_reduction_match_dense_polynomials() {
+        const D: usize = 2;
+        const DEGREE_BITS: usize = 4;
+        const DEGREE: usize = 1 << DEGREE_BITS;
+        const NUM_CONSTANTS: usize = 3;
+        const NUM_SIGMAS: usize = 80;
+        type F = GoldilocksField;
+        type E = <F as Extendable<D>>::Extension;
+
+        let subgroup = F::two_adic_subgroup(DEGREE_BITS);
+        let k_is = (0..NUM_SIGMAS)
+            .map(|column| F::from_canonical_usize(column + 2))
+            .collect::<Vec<_>>();
+        let mut sigma_rows = subgroup
+            .iter()
+            .map(|&x| k_is.iter().map(|&k| k * x).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        for (row, sigma_row) in sigma_rows.iter_mut().enumerate() {
+            for (column, sigma) in sigma_row.iter_mut().enumerate() {
+                if (row * 5 + column * 3) % 7 < 3 {
+                    *sigma += F::from_canonical_usize(1 + row + column * 17);
+                }
+            }
+        }
+        let cache = SigmaDeviationCache::from_sigmas(
+            &sigma_rows,
+            &subgroup,
+            &k_is,
+            NUM_CONSTANTS,
+        );
+        assert!(!cache.deltas.is_empty());
+        assert!(cache.deltas.len() < DEGREE * NUM_SIGMAS);
+
+        let sigma_polys = (0..NUM_SIGMAS)
+            .map(|column| {
+                PolynomialValues::new(
+                    sigma_rows.iter().map(|row| row[column]).collect::<Vec<_>>(),
+                )
+                .ifft()
+            })
+            .collect::<Vec<_>>();
+        let zeta = E::from_basefield_array([
+            F::from_canonical_u64(0x1234_5678),
+            F::from_canonical_u64(0x9abc_def0),
+        ]);
+        assert_ne!(zeta.exp_power_of_2(DEGREE_BITS), E::ONE);
+        let sparse_openings =
+            evaluate_sparse_sigmas::<F, D>(zeta, &subgroup, DEGREE_BITS, &cache);
+        let zeta_powers = zeta.powers().take(DEGREE).collect::<Vec<_>>();
+        let dense_openings = sigma_polys
+            .iter()
+            .map(|poly| {
+                poly.coeffs
+                    .iter()
+                    .zip(&zeta_powers)
+                    .map(|(&coefficient, power)| {
+                        <E as FieldExtension<D>>::scalar_mul(power, coefficient)
+                    })
+                    .sum::<E>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sparse_openings, dense_openings);
+
+        let constants = (0..NUM_CONSTANTS)
+            .map(|column| {
+                PolynomialCoeffs::new(
+                    (0..DEGREE)
+                        .map(|row| F::from_canonical_usize(1 + row * 11 + column * 19))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let trailing = (0..2)
+            .map(|column| {
+                PolynomialCoeffs::new(
+                    (0..DEGREE)
+                        .map(|row| F::from_canonical_usize(7 + row * 13 + column * 23))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut all_polys = constants.iter().collect::<Vec<_>>();
+        all_polys.extend(sigma_polys.iter());
+        all_polys.extend(trailing.iter());
+        let mut infos = (0..NUM_CONSTANTS + NUM_SIGMAS)
+            .map(|polynomial_index| FriPolynomialInfo {
+                oracle_index: 0,
+                polynomial_index,
+            })
+            .collect::<Vec<_>>();
+        infos.extend((0..trailing.len()).map(|polynomial_index| FriPolynomialInfo {
+            oracle_index: 1,
+            polynomial_index,
+        }));
+
+        let alpha = E::from_basefield_array([
+            F::from_canonical_u64(0xdead_beef),
+            F::from_canonical_u64(0x1020_3040),
+        ]);
+        let mut dense_factor = ReducingFactor::new(alpha);
+        let dense = dense_factor.reduce_polys_base::<F, D>(all_polys.iter().copied());
+        let dense_shift = dense_factor.shift_factor();
+
+        let mut sparse_factor = ReducingFactor::new(alpha);
+        let sparse = reduce_batch_with_sparse_sigmas::<F, D>(
+            &mut sparse_factor,
+            &infos,
+            &all_polys,
+            &cache,
+        )
+        .expect("synthetic batch must expose the exact sigma span");
+        let sparse_shift = sparse_factor.shift_factor();
+
+        assert_eq!(sparse, dense);
+        assert_eq!(sparse_shift, dense_shift);
+    }
 
     #[test]
     fn shared_coset_powers_match_per_polynomial_shifts() {

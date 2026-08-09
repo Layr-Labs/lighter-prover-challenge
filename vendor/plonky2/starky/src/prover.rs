@@ -465,6 +465,7 @@ where
             &fri_params,
             final_poly_coeff_len,
             max_num_query_steps,
+            None,
             timing,
         )
     );

@@ -479,6 +479,91 @@ impl GeneratorWatchIndex {
     }
 }
 
+/// Sparse representation of the circuit-fixed part of the permutation sigma columns.
+///
+/// On the evaluation subgroup, an untouched routed wire has
+/// `sigma_j(x_i) = k_j * x_i`. Only copy-connected cells differ from that identity
+/// map. The ranked circuits use the same sigma columns for many proofs, so retaining
+/// just those deviations lets the opening and FRI reducers avoid rescanning all 80
+/// dense coefficient polynomials on every proof.
+#[derive(Eq, PartialEq, Debug)]
+pub struct SigmaDeviationCache<F: Field> {
+    /// CSR row offsets into `columns` and `deltas`.
+    pub row_offsets: Vec<u32>,
+    /// Routed-wire column for each non-identity cell. Ranked circuits have 80
+    /// routed wires, so a byte is sufficient and keeps the repeated sparse scan compact.
+    pub columns: Vec<u8>,
+    /// `sigma_j(x_i) - k_j * x_i`, parallel to `columns`.
+    pub deltas: Vec<F>,
+    pub k_is: Vec<F>,
+    pub num_constants: usize,
+    pub degree: usize,
+}
+
+impl<F: Field> SigmaDeviationCache<F> {
+    pub(crate) fn from_sigmas(
+        sigmas: &[Vec<F>],
+        subgroup: &[F],
+        k_is: &[F],
+        num_constants: usize,
+    ) -> Self {
+        let degree = subgroup.len();
+        assert_eq!(sigmas.len(), degree);
+        assert!(k_is.len() <= u8::MAX as usize + 1);
+        assert!(sigmas.iter().all(|row| row.len() == k_is.len()));
+
+        let mut row_offsets = Vec::with_capacity(degree + 1);
+        let mut columns = Vec::new();
+        let mut deltas = Vec::new();
+        row_offsets.push(0);
+        for (&x, sigma_row) in subgroup.iter().zip(sigmas) {
+            for (column, (&k, &sigma)) in k_is.iter().zip(sigma_row).enumerate() {
+                let delta = sigma - k * x;
+                if !delta.is_zero() {
+                    columns.push(column as u8);
+                    deltas.push(delta);
+                }
+            }
+            row_offsets.push(columns.len() as u32);
+        }
+
+        Self {
+            row_offsets,
+            columns,
+            deltas,
+            k_is: k_is.to_vec(),
+            num_constants,
+            degree,
+        }
+    }
+
+    /// Build the cache only for the two recurring ranked shapes. The one-shot
+    /// degree-2^18 block circuit is built concurrently with the light critical
+    /// path; scanning its 21 million cells here could move work onto that path.
+    pub fn for_ranked_circuit(
+        sigmas: &[Vec<F>],
+        subgroup: &[F],
+        k_is: &[F],
+        num_constants: usize,
+    ) -> Option<Self> {
+        let degree = subgroup.len();
+        if (degree != (1 << 14) && degree != (1 << 16))
+            || k_is.len() != 80
+            || sigmas.len() != degree
+            || sigmas.iter().any(|row| row.len() != k_is.len())
+        {
+            return None;
+        }
+
+        Some(Self::from_sigmas(
+            sigmas,
+            subgroup,
+            k_is,
+            num_constants,
+        ))
+    }
+}
+
 /// Circuit data required by the prover, but not the verifier.
 #[derive(Eq, PartialEq, Debug)]
 pub struct ProverOnlyCircuitData<
@@ -504,6 +589,10 @@ pub struct ProverOnlyCircuitData<
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.
     pub sigmas: Vec<Vec<F>>,
+    /// Runtime-only sparse deviations from `sigma_j(x) = k_j * x` for the
+    /// recurring ranked circuits. This is derived from `sigmas`, `subgroup`, and
+    /// `common.k_is`; it is never serialized and has a dense fallback.
+    pub sigma_deviation_cache: Option<SigmaDeviationCache<F>>,
     /// Subgroup of order `degree`.
     pub subgroup: Vec<F>,
     /// Targets to be made public.

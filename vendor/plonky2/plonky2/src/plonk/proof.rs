@@ -26,7 +26,9 @@ use crate::hash::hash_types::{MerkleCapTarget, RichField};
 use crate::hash::merkle_tree::MerkleCap;
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::Target;
-use crate::plonk::circuit_data::{CommonCircuitData, VerifierOnlyCircuitData};
+use crate::plonk::circuit_data::{
+    CommonCircuitData, SigmaDeviationCache, VerifierOnlyCircuitData,
+};
 use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::verifier::verify_with_challenges;
 use crate::util::serialization::{Buffer, Read, Write};
@@ -312,6 +314,62 @@ pub struct OpeningSet<F: RichField + Extendable<D>, const D: usize> {
     pub lookup_zs_next: Vec<F::Extension>,
 }
 
+pub(crate) fn evaluate_sparse_sigmas<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
+    zeta: F::Extension,
+    subgroup: &[F],
+    degree_bits: usize,
+    cache: &SigmaDeviationCache<F>,
+) -> Vec<F::Extension> {
+    let degree = 1usize << degree_bits;
+    debug_assert_eq!(cache.degree, degree);
+    debug_assert_eq!(subgroup.len(), degree);
+    debug_assert_eq!(cache.columns.len(), cache.deltas.len());
+    debug_assert_eq!(cache.row_offsets.len(), degree + 1);
+
+    let lagrange_scale = (zeta.exp_power_of_2(degree_bits) - F::Extension::ONE)
+        .scalar_mul(F::from_canonical_usize(degree).inverse());
+
+    const ROW_CHUNK: usize = 2048;
+    let partials = (0..degree)
+        .step_by(ROW_CHUNK)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|start| {
+            let end = (start + ROW_CHUNK).min(degree);
+            let denominators = subgroup[start..end]
+                .iter()
+                .map(|&x| zeta - F::Extension::from_basefield(x))
+                .collect::<Vec<_>>();
+            let inverses = F::Extension::batch_multiplicative_inverse(&denominators);
+            let mut sums = vec![F::Extension::ZERO; cache.k_is.len()];
+            for row in start..end {
+                let row_factor = inverses[row - start].scalar_mul(subgroup[row]);
+                let entry_start = cache.row_offsets[row] as usize;
+                let entry_end = cache.row_offsets[row + 1] as usize;
+                for entry in entry_start..entry_end {
+                    let column = cache.columns[entry] as usize;
+                    sums[column] += row_factor.scalar_mul(cache.deltas[entry]);
+                }
+            }
+            sums
+        })
+        .collect::<Vec<_>>();
+
+    let mut sums = vec![F::Extension::ZERO; cache.k_is.len()];
+    for partial in partials {
+        for (sum, value) in sums.iter_mut().zip(partial) {
+            *sum += value;
+        }
+    }
+    sums.into_iter()
+        .zip(&cache.k_is)
+        .map(|(deviation, &k)| zeta.scalar_mul(k) + deviation * lagrange_scale)
+        .collect()
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
     pub fn new<C: GenericConfig<D, F = F>>(
         zeta: F::Extension,
@@ -321,6 +379,7 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         zs_partial_products_lookup_commitment: &PolynomialBatch<F, C, D>,
         quotient_polys_commitment: &PolynomialBatch<F, C, D>,
         common_data: &CommonCircuitData<F, D>,
+        sigma_deviation_cache: Option<&SigmaDeviationCache<F>>,
     ) -> Self {
         // Every committed polynomial in these batches has at most `degree`
         // coefficients, so one powers table per opening point covers all of
@@ -385,7 +444,35 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
             eval_polynomials(pows, &c.polynomials)
         };
-        let constants_sigmas_eval = eval_commitment(&zeta_pows, constants_sigmas_commitment);
+        let (constants_eval, sigmas_eval) = match sigma_deviation_cache {
+            Some(cache)
+                if cache.degree == degree
+                    && cache.num_constants == common_data.constants_range().len()
+                    && cache.k_is.len() == common_data.sigmas_range().len() =>
+            {
+                plonky2_maybe_rayon::join(
+                    || eval_polynomials(
+                        &zeta_pows,
+                        &constants_sigmas_commitment.polynomials[common_data.constants_range()],
+                    ),
+                    || {
+                        evaluate_sparse_sigmas(
+                            zeta,
+                            &g_subgroup,
+                            common_data.degree_bits(),
+                            cache,
+                        )
+                    },
+                )
+            }
+            _ => {
+                let all = eval_commitment(&zeta_pows, constants_sigmas_commitment);
+                (
+                    all[common_data.constants_range()].to_vec(),
+                    all[common_data.sigmas_range()].to_vec(),
+                )
+            }
+        };
 
         // `zs_partial_products_lookup_eval` contains the permutation argument polynomials as well as lookup polynomials.
         let zs_partial_products_lookup_eval =
@@ -394,8 +481,8 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         let quotient_polys = eval_commitment(&zeta_pows, quotient_polys_commitment);
 
         Self {
-            constants: constants_sigmas_eval[common_data.constants_range()].to_vec(),
-            plonk_sigmas: constants_sigmas_eval[common_data.sigmas_range()].to_vec(),
+            constants: constants_eval,
+            plonk_sigmas: sigmas_eval,
             wires: eval_commitment(&zeta_pows, wires_commitment),
             plonk_zs: zs_partial_products_lookup_eval[common_data.zs_range()].to_vec(),
             // Partial-product polynomials are opened only at `zeta`, never at
