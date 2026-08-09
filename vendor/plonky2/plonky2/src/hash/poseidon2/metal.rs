@@ -75,6 +75,27 @@ const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
 /// official ranked host (submission 41467098), so concurrent GPU submission is
 /// intentionally disabled.
 const MAX_BUFFER_SETS: usize = 1;
+/// One extra set, reserved for the chain spine's own commitment trees.
+///
+/// The single-set cap above serializes GPU tree builds, and that is the right
+/// policy for the transaction pipeline: raising it for everything measured
+/// -21.6% on the ranked host at three sets (submission `41467098`) and -5.9% at
+/// two (`853c0271`). Both of those let *chunk* trees run beside each other,
+/// which delays every tree by interleaving 2^19-leaf work on a FIFO queue.
+///
+/// The spine is the opposite case. A chain fold's commitments are the 2^17-leaf
+/// shapes, its 49 steps are strictly sequential, and it is the block's tail.
+/// Instrumented on the public fixture, the same fixed-size fold completes every
+/// 0.46 s while the transaction pipeline is live and every 0.11-0.17 s once the
+/// pipeline drains and the spine runs alone — a 4x latency penalty paid purely
+/// for waiting behind chunk work.
+///
+/// This set is admitted only for those serial-critical shapes, so a fold's tree
+/// never queues behind a chunk tree, while chunk trees keep the promoted
+/// one-at-a-time policy against each other. The extra footprint is one 2^17
+/// output buffer (8 MiB) and no staging: the spine's sources are retained
+/// shared columns, which allocate no input buffer at all.
+const SPINE_BUFFER_SETS: usize = 2;
 /// Parallel staging copy granularity in u64 elements (4 MiB chunks).
 const STAGING_CHUNK: usize = 1 << 19;
 /// Reuse only the recurring transaction/chain quotient outputs. The final
@@ -2092,13 +2113,26 @@ impl MetalShared {
         })
     }
 
-    fn acquire_set(&self) -> Result<BufferSet, String> {
+    /// `spine` marks a build whose shape is the chain fold's serial-critical
+    /// one; those may use one extra set so they do not queue behind chunk work.
+    fn acquire_set(&self, spine: bool) -> Result<BufferSet, String> {
+        let max_sets = if spine {
+            SPINE_BUFFER_SETS
+        } else {
+            MAX_BUFFER_SETS
+        };
         let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
         loop {
-            if let Some(set) = pool.free.pop() {
-                return Ok(set);
+            // Chunk builds keep the promoted policy against each other: they may
+            // take a free set only when no other build holds one, so the extra
+            // set never turns into chunk-versus-chunk concurrency.
+            let blocked = !spine && pool.created != pool.free.len();
+            if !blocked {
+                if let Some(set) = pool.free.pop() {
+                    return Ok(set);
+                }
             }
-            if pool.created < MAX_BUFFER_SETS {
+            if !blocked && pool.created < max_sets {
                 pool.created += 1;
                 return Ok(BufferSet {
                     input: None,
@@ -2342,7 +2376,7 @@ impl MetalShared {
                 .new_buffer(value_bytes as u64, MTLResourceOptions::StorageModeShared)
         });
 
-        let mut set = self.acquire_set()?;
+        let mut set = self.acquire_set(false)?;
         let result = (|| -> Result<TreeReadback<'_, F>, String> {
             if set
                 .input
@@ -2599,7 +2633,7 @@ impl MetalShared {
                 .new_buffer(column_bytes as u64, MTLResourceOptions::StorageModeShared)
         });
 
-        let mut set = self.acquire_set()?;
+        let mut set = self.acquire_set(false)?;
         let result = self.build_from_coeffs_with_set(
             &mut set,
             coeff_columns,
@@ -2812,7 +2846,8 @@ impl MetalShared {
             .ok_or("Metal Merkle output size overflow")?;
 
         let job = GpuJobGuard::begin();
-        let mut set = self.acquire_set()?;
+        let mut set = self.acquire_set(leaf_count == 1 << 17 && leaf_width > 4
+            && matches!(&source, LeafSource::Shared(_)))?;
         let result = self.build_with_set(
             &mut set,
             source,
@@ -3312,7 +3347,7 @@ mod tests {
     #[test]
     fn does_not_detach_output_without_a_waiting_build() {
         let context = MetalShared::new().expect("Metal context");
-        let mut set = context.acquire_set().expect("buffer set");
+        let mut set = context.acquire_set(false).expect("buffer set");
         set.output = Some(autoreleasepool(|| {
             context
                 .device
@@ -3334,7 +3369,7 @@ mod tests {
         use std::sync::mpsc;
 
         let context = MetalShared::new().expect("Metal context");
-        let mut set = context.acquire_set().expect("first set");
+        let mut set = context.acquire_set(false).expect("first set");
         set.output = Some(autoreleasepool(|| {
             context
                 .device
@@ -3346,7 +3381,7 @@ mod tests {
             let (tx, rx) = mpsc::sync_channel(0);
             let context_ref = &context;
             scope.spawn(move || {
-                let next = context_ref.acquire_set().expect("waiting set");
+                let next = context_ref.acquire_set(false).expect("waiting set");
                 tx.send(next).expect("return acquired set");
             });
 
@@ -3383,7 +3418,7 @@ mod tests {
         type F = GoldilocksField;
 
         let context = MetalShared::new().expect("Metal context");
-        let mut set = context.acquire_set().expect("buffer set");
+        let mut set = context.acquire_set(false).expect("buffer set");
         let limbs: Vec<u64> = (0..28).collect();
         set.output = Some(autoreleasepool(|| {
             context.device.new_buffer_with_data(
