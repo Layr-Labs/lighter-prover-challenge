@@ -27,7 +27,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "8e307f75b8e65209a7605a5aa1965e5eae804b0107de98244c9569e9823e114f";
+    "fa54954544ea619c6a2fe849e19893402356d554bbacc917575f5dff73bace95";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -268,6 +268,9 @@ pub(crate) enum U32QuotientKind {
     Reducing {
         extension_coeffs: bool,
     },
+    /// Binary `BaseSumGate<2>`: `num_ops` carries the limb count. Wire zero is
+    /// the claimed sum and wires `1..=num_ops` are its little-endian bits.
+    BaseSumBinary,
 }
 
 #[derive(Clone, Debug)]
@@ -1187,6 +1190,14 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                         spec.num_ops.checked_mul(2)?,
                     )
                 }
+                U32QuotientKind::BaseSumBinary => (
+                    10usize,
+                    0usize,
+                    0usize,
+                    0usize,
+                    spec.num_ops.checked_add(1)?,
+                    spec.num_ops.checked_add(1)?,
+                ),
             };
         if wire_count > wires.cols
             || spec.selector_column >= constants.cols
@@ -3853,6 +3864,9 @@ mod tests {
                     extension_coeffs: true,
                 }),
             ),
+            // The production BaseSumGate<2> has one claimed-sum wire plus 63
+            // little-endian limbs and emits the same number of constraint rows.
+            (63, UnionShape::U32(U32QuotientKind::BaseSumBinary)),
         ];
         // Four shapes are appended below: EqualityGate plus three
         // RandomAccess copies. The constants commitment carries the raw
@@ -4270,6 +4284,18 @@ mod tests {
                                 acc_1 = next_1;
                             }
                             assert_eq!(constraints.len(), spec.num_ops * 2);
+                        }
+                        U32QuotientKind::BaseSumBinary => {
+                            let mut computed_sum = F::ZERO;
+                            for j in (0..spec.num_ops).rev() {
+                                computed_sum = (computed_sum + computed_sum) + wire(1 + j);
+                            }
+                            constraints.push(computed_sum - wire(0));
+                            for j in 0..spec.num_ops {
+                                let limb = wire(1 + j);
+                                constraints.push(limb * (limb - F::ONE));
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops + 1);
                         }
                         U32QuotientKind::Arithmetic => {
                             for op in 0..spec.num_ops {

@@ -563,11 +563,11 @@ inline void range_check_gate_emit(
 // It is followed by promoted-family records with the same five selector words,
 // then kind (arithmetic=0, subtraction=1, add-many=2, byte-decomposition=3,
 // quintic-multiplication=4, quintic-squaring=5, random-access=6,
-// exponentiation=7, equality=8, reducing=9), operation or copy count, and
-// three explicit kind words. Random access uses the final words for index
-// bits, extra constants, and the raw constant-column base; equality carries
-// its constants column and reducing its extension-coefficient flag in the
-// addend-count word.
+// exponentiation=7, equality=8, reducing=9, binary-base-sum=10), operation,
+// copy, or limb count, and three explicit kind words. Random access uses the
+// final words for index bits, extra constants, and the raw constant-column
+// base; equality carries its constants column and reducing its
+// extension-coefficient flag in the addend-count word.
 // The result-limb count is what makes the subtraction and add-many branches
 // width-generic: a `2 * result_limbs`-bit word recomposes from that many
 // base-4 limbs and its overflow weight is `1 << (2 * result_limbs)`, which
@@ -1266,6 +1266,29 @@ kernel void range_check_gate_quotient(
 
                 acc_0 = next_0;
                 acc_1 = next_1;
+            }
+        } else if (kind == 10u) {
+            // BaseSumGate<2>: wire zero is the claimed sum and the following
+            // `num_ops` wires are little-endian binary limbs. The recomposition
+            // row precedes the limb rows exactly as in the CPU evaluator.
+            uint num_limbs = num_ops;
+            ulong computed_sum = 0;
+            for (uint remaining = num_limbs; remaining > 0u; --remaining) {
+                uint j = remaining - 1u;
+                ulong limb = wires[((ulong)1u + j) * lde_rows + source_row];
+                computed_sum = gl_add(gl_add(computed_sum, computed_sum), limb);
+            }
+            ulong claimed_sum = wires[(ulong)0 * lde_rows + source_row];
+            range_check_gate_emit(
+                gl_sub(computed_sum, claimed_sum),
+                alpha_powers, alpha_stride, gate_accumulators,
+                constraint_index++);
+            for (uint j = 0; j < num_limbs; ++j) {
+                ulong limb = wires[((ulong)1u + j) * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_mul(limb, gl_sub(limb, 1)),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
             }
         } else {
             // The Rust encoder rejects unknown discriminants; if a malformed
