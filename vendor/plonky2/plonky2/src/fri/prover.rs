@@ -122,6 +122,18 @@ fn bitrev_flatten<F: RichField + Extendable<D>, const D: usize>(values: &[F::Ext
     flat
 }
 
+#[inline]
+fn advance_fri_shift<F: Field>(shift: F, arity_bits: usize) -> F {
+    if arity_bits == 0 {
+        // `exp_u64(1)` can normalize a non-canonical raw representation while
+        // `exp_power_of_2(0)` would return it unchanged. Keep that exact edge
+        // behavior even though production reductions use positive arity bits.
+        shift.exp_u64(1)
+    } else {
+        shift.exp_power_of_2(arity_bits)
+    }
+}
+
 fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     mut coeffs: PolynomialCoeffs<F::Extension>,
     mut values: PolynomialValues<F::Extension>,
@@ -186,7 +198,7 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
             *value = F::Extension::ZERO;
         }
         coeffs = PolynomialCoeffs::new(folded);
-        shift = shift.exp_u64(arity as u64);
+        shift = advance_fri_shift(shift, *arity_bits);
         // Chunk-wise folding preserves the zero tail: the coefficient vector
         // keeps `1/2^rate_bits` support every round (asserted by the
         // truncation below), so the FFT's zero-run shortcut always applies.
