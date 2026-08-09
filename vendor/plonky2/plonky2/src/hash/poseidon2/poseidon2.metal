@@ -640,19 +640,20 @@ inline ulong random_access_select_8(
     return items[0];
 }
 
-kernel void range_check_gate_quotient(
-    const device ulong* wires [[buffer(0)]],
-    const device ulong* constants [[buffer(1)]],
-    device ulong* output [[buffer(2)]],
-    constant ulong* alpha_powers [[buffer(3)]],
-    constant uint* metadata [[buffer(4)]],
-    constant uint& lde_rows [[buffer(5)]],
-    constant uint& quotient_rows [[buffer(6)]],
-    constant uint& step [[buffer(7)]],
-    constant uint& alpha_stride [[buffer(8)]],
-    constant uint& range_count [[buffer(9)]],
-    constant uint& u32_count [[buffer(10)]],
-    uint gid [[thread_position_in_grid]]) {
+template <bool DEFER_Q4>
+inline void range_check_gate_quotient_impl(
+    const device ulong* wires,
+    const device ulong* constants,
+    device ulong* output,
+    constant ulong* alpha_powers,
+    constant uint* metadata,
+    uint lde_rows,
+    uint quotient_rows,
+    uint step,
+    uint alpha_stride,
+    uint range_count,
+    uint u32_count,
+    uint gid) {
     if (gid >= quotient_rows) {
         return;
     }
@@ -701,21 +702,25 @@ kernel void range_check_gate_quotient(
 
             for (uint j = 0; j < num_aux; ++j) {
                 ulong x = wires[(aux_base + j) * lde_rows + source_row];
-                ulong constraint;
                 if (j + 1u == num_aux && final_limb_range == 2u) {
-                    constraint = gl_mul(x, gl_sub(x, 1));
-                } else {
+                    range_check_gate_emit(
+                        gl_mul(x, gl_sub(x, 1)),
+                        alpha_powers,
+                        alpha_stride,
+                        gate_accumulators,
+                        constraint_index);
+                } else if (!DEFER_Q4) {
                     // x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3),
                     // exactly the production CPU specialization.
                     ulong y = gl_mul(x, gl_sub(x, 3));
-                    constraint = gl_mul(y, gl_add(y, 2));
+                    range_check_gate_emit(
+                        gl_mul(y, gl_add(y, 2)),
+                        alpha_powers,
+                        alpha_stride,
+                        gate_accumulators,
+                        constraint_index);
                 }
-                range_check_gate_emit(
-                    constraint,
-                    alpha_powers,
-                    alpha_stride,
-                    gate_accumulators,
-                    constraint_index++);
+                constraint_index++;
             }
         }
 
@@ -788,13 +793,16 @@ kernel void range_check_gate_quotient(
                 for (uint remaining = 32u; remaining > 0u; --remaining) {
                     uint j = remaining - 1u;
                     ulong x = wires[(limb_base + j) * lde_rows + source_row];
-                    ulong y = gl_mul(x, gl_sub(x, 3));
-                    range_check_gate_emit(
-                        gl_mul(y, gl_add(y, 2)),
-                        alpha_powers,
-                        alpha_stride,
-                        gate_accumulators,
-                        constraint_index++);
+                    if (!DEFER_Q4) {
+                        ulong y = gl_mul(x, gl_sub(x, 3));
+                        range_check_gate_emit(
+                            gl_mul(y, gl_add(y, 2)),
+                            alpha_powers,
+                            alpha_stride,
+                            gate_accumulators,
+                            constraint_index);
+                    }
+                    constraint_index++;
                     if (j < 16u) {
                         combined_low = gl_add(gl_quadruple(combined_low), x);
                     } else {
@@ -840,13 +848,16 @@ kernel void range_check_gate_quotient(
                 for (uint remaining = result_limbs; remaining > 0u; --remaining) {
                     uint j = remaining - 1u;
                     ulong x = wires[(limb_base + j) * lde_rows + source_row];
-                    ulong y = gl_mul(x, gl_sub(x, 3));
-                    range_check_gate_emit(
-                        gl_mul(y, gl_add(y, 2)),
-                        alpha_powers,
-                        alpha_stride,
-                        gate_accumulators,
-                        constraint_index++);
+                    if (!DEFER_Q4) {
+                        ulong y = gl_mul(x, gl_sub(x, 3));
+                        range_check_gate_emit(
+                            gl_mul(y, gl_add(y, 2)),
+                            alpha_powers,
+                            alpha_stride,
+                            gate_accumulators,
+                            constraint_index);
+                    }
+                    constraint_index++;
                     recomposed = gl_add(gl_quadruple(recomposed), x);
                 }
                 range_check_gate_emit(
@@ -895,13 +906,16 @@ kernel void range_check_gate_quotient(
                 for (uint remaining = total_limbs; remaining > 0u; --remaining) {
                     uint j = remaining - 1u;
                     ulong x = wires[(limb_base + j) * lde_rows + source_row];
-                    ulong y = gl_mul(x, gl_sub(x, 3));
-                    range_check_gate_emit(
-                        gl_mul(y, gl_add(y, 2)),
-                        alpha_powers,
-                        alpha_stride,
-                        gate_accumulators,
-                        constraint_index++);
+                    if (!DEFER_Q4) {
+                        ulong y = gl_mul(x, gl_sub(x, 3));
+                        range_check_gate_emit(
+                            gl_mul(y, gl_add(y, 2)),
+                            alpha_powers,
+                            alpha_stride,
+                            gate_accumulators,
+                            constraint_index);
+                    }
+                    constraint_index++;
                     if (j < result_limbs) {
                         combined_result = gl_add(gl_quadruple(combined_result), x);
                     } else {
@@ -937,13 +951,16 @@ kernel void range_check_gate_quotient(
                     (ulong)routed_per_op * num_ops + (ulong)op * aux_per_op;
                 for (uint j = 0; j < aux_per_op; ++j) {
                     ulong x = wires[(aux_base + j) * lde_rows + source_row];
-                    ulong y = gl_mul(x, gl_sub(x, 3));
-                    range_check_gate_emit(
-                        gl_mul(y, gl_add(y, 2)),
-                        alpha_powers,
-                        alpha_stride,
-                        gate_accumulators,
-                        constraint_index++);
+                    if (!DEFER_Q4) {
+                        ulong y = gl_mul(x, gl_sub(x, 3));
+                        range_check_gate_emit(
+                            gl_mul(y, gl_add(y, 2)),
+                            alpha_powers,
+                            alpha_stride,
+                            gate_accumulators,
+                            constraint_index);
+                    }
+                    constraint_index++;
                 }
                 for (uint byte_index = 0; byte_index < num_limbs; ++byte_index) {
                     ulong chunk = aux_base + (ulong)byte_index * 4u;
@@ -1340,17 +1357,19 @@ kernel void range_check_gate_quotient(
                 constraint_index++);
             for (uint limb = 0; limb < num_ops; ++limb) {
                 ulong x = wires[((ulong)1u + limb) * lde_rows + source_row];
-                ulong constraint;
                 if (base == 2u) {
-                    constraint = gl_mul(x, gl_sub(x, 1));
-                } else {
+                    range_check_gate_emit(
+                        gl_mul(x, gl_sub(x, 1)),
+                        alpha_powers, alpha_stride, gate_accumulators,
+                        constraint_index);
+                } else if (!DEFER_Q4) {
                     ulong y = gl_mul(x, gl_sub(x, 3));
-                    constraint = gl_mul(y, gl_add(y, 2));
+                    range_check_gate_emit(
+                        gl_mul(y, gl_add(y, 2)),
+                        alpha_powers, alpha_stride, gate_accumulators,
+                        constraint_index);
                 }
-                range_check_gate_emit(
-                    constraint,
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
+                constraint_index++;
             }
         } else if (kind == 12u) {
             // SelectionGate: four routed wires per operation followed by one
@@ -1385,6 +1404,158 @@ kernel void range_check_gate_quotient(
 
     output[(ulong)gid * 2] = gl_canonicalize(total[0]);
     output[(ulong)gid * 2 + 1] = gl_canonicalize(total[1]);
+}
+
+kernel void range_check_gate_quotient(
+    const device ulong* wires [[buffer(0)]],
+    const device ulong* constants [[buffer(1)]],
+    device ulong* output [[buffer(2)]],
+    constant ulong* alpha_powers [[buffer(3)]],
+    constant uint* metadata [[buffer(4)]],
+    constant uint& lde_rows [[buffer(5)]],
+    constant uint& quotient_rows [[buffer(6)]],
+    constant uint& step [[buffer(7)]],
+    constant uint& alpha_stride [[buffer(8)]],
+    constant uint& range_count [[buffer(9)]],
+    constant uint& u32_count [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]) {
+    range_check_gate_quotient_impl<false>(
+        wires, constants, output, alpha_powers, metadata, lde_rows,
+        quotient_rows, step, alpha_stride, range_count, u32_count, gid);
+}
+
+kernel void range_check_gate_quotient_residual(
+    const device ulong* wires [[buffer(0)]],
+    const device ulong* constants [[buffer(1)]],
+    device ulong* output [[buffer(2)]],
+    constant ulong* alpha_powers [[buffer(3)]],
+    constant uint* metadata [[buffer(4)]],
+    constant uint& lde_rows [[buffer(5)]],
+    constant uint& quotient_rows [[buffer(6)]],
+    constant uint& step [[buffer(7)]],
+    constant uint& alpha_stride [[buffer(8)]],
+    constant uint& range_count [[buffer(9)]],
+    constant uint& u32_count [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]) {
+    range_check_gate_quotient_impl<true>(
+        wires, constants, output, alpha_powers, metadata, lde_rows,
+        quotient_rows, step, alpha_stride, range_count, u32_count, gid);
+}
+
+inline ulong range_check_q4_filter(
+    const device ulong* constants,
+    constant uint* metadata,
+    uint descriptor_index,
+    uint lde_rows,
+    uint source_row) {
+    constant uint* spec = metadata + descriptor_index * 10u;
+    ulong selector = constants[(ulong)spec[0] * lde_rows + source_row];
+    ulong filter = 1;
+    for (uint gate = spec[2]; gate < spec[3]; ++gate) {
+        if (gate != spec[1]) {
+            filter = gl_mul(filter, gl_sub((ulong)gate, selector));
+        }
+    }
+    if (spec[4] != 0u) {
+        filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
+    }
+    return filter;
+}
+
+inline ulong range_check_q4_select_filter(
+    uint slot,
+    ulong f0,
+    ulong f1,
+    ulong f2,
+    ulong f3,
+    ulong f4,
+    ulong f5,
+    ulong f6,
+    ulong f7,
+    ulong f8,
+    ulong f9) {
+    switch (slot) {
+        case 0u: return f0;
+        case 1u: return f1;
+        case 2u: return f2;
+        case 3u: return f3;
+        case 4u: return f4;
+        case 5u: return f5;
+        case 6u: return f6;
+        case 7u: return f7;
+        case 8u: return f8;
+        default: return f9;
+    }
+}
+
+// Exact light-transaction q4 owner. The Rust-side descriptor guard ensures
+// the ten filter slots and 135 columns below can never be used for another
+// circuit layout. `column_items` stores (filter_slot, constraint_row) pairs.
+kernel void range_check_q4_columns(
+    const device ulong* wires [[buffer(0)]],
+    const device ulong* constants [[buffer(1)]],
+    device ulong* output [[buffer(2)]],
+    constant ulong* alpha_powers [[buffer(3)]],
+    constant uint* metadata [[buffer(4)]],
+    const device uint* column_offsets [[buffer(5)]],
+    const device uint* column_items [[buffer(6)]],
+    constant uint& lde_rows [[buffer(7)]],
+    constant uint& quotient_rows [[buffer(8)]],
+    constant uint& step [[buffer(9)]],
+    constant uint& alpha_stride [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= quotient_rows) {
+        return;
+    }
+
+    uint source_row = gid * step;
+    ulong f0 = range_check_q4_filter(constants, metadata, 0u, lde_rows, source_row);
+    ulong f1 = range_check_q4_filter(constants, metadata, 1u, lde_rows, source_row);
+    ulong f2 = range_check_q4_filter(constants, metadata, 2u, lde_rows, source_row);
+    ulong f3 = range_check_q4_filter(constants, metadata, 9u, lde_rows, source_row);
+    ulong f4 = range_check_q4_filter(constants, metadata, 10u, lde_rows, source_row);
+    ulong f5 = range_check_q4_filter(constants, metadata, 13u, lde_rows, source_row);
+    ulong f6 = range_check_q4_filter(constants, metadata, 14u, lde_rows, source_row);
+    ulong f7 = range_check_q4_filter(constants, metadata, 15u, lde_rows, source_row);
+    ulong f8 = range_check_q4_filter(constants, metadata, 16u, lde_rows, source_row);
+    ulong f9 = range_check_q4_filter(constants, metadata, 17u, lde_rows, source_row);
+    ulong total0 = 0;
+    ulong total1 = 0;
+
+    for (uint column = 1u; column <= 135u; ++column) {
+        ulong beta0 = 0;
+        ulong beta1 = 0;
+        for (uint occurrence = column_offsets[column];
+             occurrence < column_offsets[column + 1u];
+             ++occurrence) {
+            uint filter_slot = column_items[2u * occurrence];
+            uint row = column_items[2u * occurrence + 1u];
+            ulong filter = range_check_q4_select_filter(
+                filter_slot, f0, f1, f2, f3, f4, f5, f6, f7, f8, f9);
+            beta0 = gl_mul_add(filter, alpha_powers[row], beta0);
+            beta1 = gl_mul_add(
+                filter, alpha_powers[alpha_stride + row], beta1);
+        }
+        ulong x = wires[(ulong)column * lde_rows + source_row];
+        ulong y = gl_mul(x, gl_sub(x, 3));
+        ulong q4 = gl_mul(y, gl_add(y, 2));
+        total0 = gl_mul_add(q4, beta0, total0);
+        total1 = gl_mul_add(q4, beta1, total1);
+    }
+    output[(ulong)gid * 2] = gl_canonicalize(total0);
+    output[(ulong)gid * 2 + 1] = gl_canonicalize(total1);
+}
+
+kernel void range_check_q4_combine(
+    device ulong* residual_and_output [[buffer(0)]],
+    const device ulong* q4 [[buffer(1)]],
+    constant uint& word_count [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= word_count) {
+        return;
+    }
+    residual_and_output[gid] =
+        gl_canonicalize(gl_add(residual_and_output[gid], q4[gid]));
 }
 
 kernel void poseidon2_hash_leaves(

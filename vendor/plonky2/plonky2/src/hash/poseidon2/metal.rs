@@ -27,13 +27,13 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "6a65119780a2645ce0077ef1da44d2774ca31aa1ef5c511162280d1b2f15213f";
+    "43ab66ab4ae65bdb537fa285614844d3dc273987e2dd14516bd38f0fc3ab6f2d";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
 /// source. This deliberately includes the lazily-built gate-quotient kernels:
 /// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 9] = [
+const METALLIB_REQUIRED_KERNELS: [&str; 12] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
     "poseidon2_hash_parents",
@@ -43,6 +43,9 @@ const METALLIB_REQUIRED_KERNELS: [&str; 9] = [
     "ifft_finalize",
     "poseidon2_gate_quotient",
     "range_check_gate_quotient",
+    "range_check_gate_quotient_residual",
+    "range_check_q4_columns",
+    "range_check_q4_combine",
 ];
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
 /// (6654d43) ranked-validated this raised value inside its composition; my
@@ -98,6 +101,8 @@ struct MetalShared {
     /// Kept separate from the tree pool so quotient allocation never delays
     /// Merkle admission or contends on its condition variable.
     quotient_output_pool: Arc<Mutex<QuotientOutputPool>>,
+    light_tx_q4_column_offsets: Buffer,
+    light_tx_q4_column_items: Buffer,
     available: Condvar,
     /// Per-`log2(lde_size)` concatenated FFT twiddle rows (canonical u64), with
     /// `offsets[lg_half_m]` giving each stage row's element offset.
@@ -130,10 +135,13 @@ pub(crate) struct PoseidonGateQuotientJob<F> {
 pub(crate) struct RangeCheckGateQuotientJob<F> {
     command_buffer: CommandBuffer,
     output: Option<Buffer>,
+    q4_scratch: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
     len: usize,
     #[cfg(test)]
     failure_observer: Option<Arc<RangeQuotientFailureObserver>>,
+    #[cfg(test)]
+    q4_banked: bool,
     _job: GpuJobGuard,
     _phantom: PhantomData<F>,
 }
@@ -249,6 +257,11 @@ impl<F: RichField> RangeCheckGateQuotientJob<F> {
                 .store(true, core::sync::atomic::Ordering::Relaxed);
         }
     }
+
+    #[cfg(test)]
+    fn q4_banked_for_tests(&self) -> bool {
+        self.q4_banked
+    }
 }
 
 fn recycle_completed_quotient_output(
@@ -287,6 +300,11 @@ impl<F> Drop for RangeCheckGateQuotientJob<F> {
         recycle_completed_quotient_output(
             &self.command_buffer,
             &mut self.output,
+            &self.output_pool,
+        );
+        recycle_completed_quotient_output(
+            &self.command_buffer,
+            &mut self.q4_scratch,
             &self.output_pool,
         );
     }
@@ -371,6 +389,148 @@ pub(crate) struct U32QuotientSpec {
     pub include_unused_selector: bool,
     pub num_ops: usize,
     pub kind: U32QuotientKind,
+}
+
+// Exact descriptor order emitted by the ranked light-transaction circuit.
+// The first three records are RangeCheck gates; the remaining seventeen are
+// U32-family records. The q4 bank is enabled only when every word matches, so
+// a circuit/layout change automatically retains the generic kernel.
+const LIGHT_TX_Q4_DESCRIPTORS: [[u32; 10]; 20] = [
+    [2, 14, 12, 17, 1, 15, 8, 4, 0, 0],
+    [2, 15, 12, 17, 1, 5, 24, 4, 0, 0],
+    [2, 16, 12, 17, 1, 8, 16, 4, 0, 0],
+    [0, 2, 0, 7, 1, 10, 26, 6, 0, 0],
+    [0, 3, 0, 7, 1, 11, 63, 2, 0, 0],
+    [0, 4, 0, 7, 1, 8, 22, 6, 0, 0],
+    [0, 5, 0, 7, 1, 4, 5, 0, 0, 0],
+    [0, 6, 0, 7, 1, 5, 6, 0, 0, 0],
+    [1, 7, 7, 12, 1, 12, 20, 0, 0, 0],
+    [1, 10, 7, 12, 1, 11, 16, 4, 0, 0],
+    [1, 11, 7, 12, 1, 3, 3, 8, 0, 0],
+    [2, 12, 12, 17, 1, 7, 67, 0, 0, 0],
+    [2, 13, 12, 17, 1, 6, 8, 3, 0, 6],
+    [3, 17, 17, 22, 1, 1, 10, 0, 8, 0],
+    [3, 18, 17, 22, 1, 2, 5, 6, 16, 2],
+    [3, 19, 17, 22, 1, 0, 3, 0, 16, 0],
+    [3, 20, 17, 22, 1, 1, 6, 0, 16, 0],
+    [3, 21, 17, 22, 1, 1, 4, 0, 24, 0],
+    [4, 22, 22, 24, 1, 6, 4, 4, 2, 6],
+    [5, 24, 24, 25, 1, 6, 1, 6, 2, 6],
+];
+
+struct LightTxQ4ColumnBank {
+    column_offsets: Vec<u32>,
+    /// Consecutive `(filter_slot, constraint_row)` pairs.
+    column_items: Vec<u32>,
+}
+
+#[cfg(test)]
+fn light_tx_q4_expected_metadata() -> Vec<u32> {
+    LIGHT_TX_Q4_DESCRIPTORS
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn is_light_tx_q4_schedule(
+    metadata: &[u32],
+    range_count: usize,
+    u32_count: usize,
+    wire_columns: usize,
+) -> bool {
+    range_count == 3
+        && u32_count == 17
+        && wire_columns == 136
+        && metadata
+            .iter()
+            .copied()
+            .eq(LIGHT_TX_Q4_DESCRIPTORS.into_iter().flatten())
+}
+
+fn light_tx_q4_column_bank() -> LightTxQ4ColumnBank {
+    // Filter slots map to descriptor indices 0,1,2,9,10,13,14,15,16,17.
+    // Each row below is the exact constraint index used by the generic
+    // gate-major kernel; grouping by wire column lets q(w) be evaluated once.
+    let mut by_filter = vec![Vec::<(u32, u32)>::new(); 10];
+    let mut push = |filter_slot: usize, column: usize, row: usize| {
+        by_filter[filter_slot].push((column as u32, row as u32));
+    };
+
+    for (filter_slot, num_ops, num_aux) in [(0, 15, 8), (1, 5, 24), (2, 8, 16)] {
+        for op in 0..num_ops {
+            for limb in 0..num_aux {
+                push(
+                    filter_slot,
+                    num_ops + op * num_aux + limb,
+                    op * (num_aux + 1) + 1 + limb,
+                );
+            }
+        }
+    }
+    // BaseSum<4, 16>.
+    for limb in 0..16 {
+        push(3, 1 + limb, 1 + limb);
+    }
+    // ByteDecomposition<8>, three operations.
+    for op in 0..3 {
+        for limb in 0..32 {
+            push(4, 27 + op * 32 + limb, op * 41 + limb);
+        }
+    }
+    // 16/32/48-bit subtraction gates.
+    for (filter_slot, num_ops, limbs) in [(5, 10, 8), (8, 6, 16), (9, 4, 24)] {
+        for op in 0..num_ops {
+            for emitted in 0..limbs {
+                let limb = limbs - 1 - emitted;
+                push(
+                    filter_slot,
+                    num_ops * 5 + op * limbs + limb,
+                    op * (limbs + 3) + 1 + emitted,
+                );
+            }
+        }
+    }
+    // AddMany<6, 16, 2>, five operations.
+    for op in 0..5 {
+        for emitted in 0..18 {
+            let limb = 17 - emitted;
+            push(6, 45 + op * 18 + limb, op * 21 + 1 + emitted);
+        }
+    }
+    // U32Arithmetic, three operations.
+    for op in 0..3 {
+        for emitted in 0..32 {
+            let limb = 31 - emitted;
+            push(7, 18 + op * 32 + limb, op * 36 + 2 + emitted);
+        }
+    }
+
+    let mut by_column = vec![Vec::<(u32, u32)>::new(); 136];
+    for (filter_slot, occurrences) in by_filter.iter().enumerate() {
+        for &(column, row) in occurrences {
+            by_column[column as usize].push((filter_slot as u32, row));
+        }
+    }
+    let mut column_offsets = Vec::with_capacity(137);
+    let mut column_items = Vec::with_capacity(938 * 2);
+    column_offsets.push(0);
+    for occurrences in &by_column {
+        for &(filter_slot, row) in occurrences {
+            column_items.extend([filter_slot, row]);
+        }
+        column_offsets.push((column_items.len() / 2) as u32);
+    }
+
+    debug_assert_eq!(column_offsets.len(), 137);
+    debug_assert_eq!(column_offsets[1], 0);
+    debug_assert_eq!(column_offsets[136], 938);
+    debug_assert_eq!(column_items.len(), 938 * 2);
+    debug_assert!(by_column[1..].iter().all(|items| !items.is_empty()));
+    debug_assert_eq!(by_column.iter().map(Vec::len).max(), Some(9));
+    LightTxQ4ColumnBank {
+        column_offsets,
+        column_items,
+    }
 }
 
 /// LDE columns computed and retained in a CPU-visible Metal shared buffer.
@@ -600,13 +760,12 @@ impl<F: RichField> TreeReadback<'_, F> {
     }
 }
 
-/// The two gate-quotient pipelines, lowered off the context's blocking path.
+/// Optional pipelines lowered off the context's blocking path.
 ///
 /// Each is `None` until its background build finishes and `Some(None)` if that
-/// build failed. Both readers already treat an absent pipeline as "evaluate
-/// this gate on the CPU", which is the same behaviour a failed build produced
-/// before, so a caller that arrives early simply takes the CPU path it would
-/// have taken had the kernel been unbuildable.
+/// build failed. Readers preserve their existing fallback: generic GPU Range
+/// evaluation for the q4 specialization, and CPU evaluation where the full
+/// gate pipeline itself is unavailable.
 struct LazyPipeline {
     built: std::sync::OnceLock<Option<ComputePipelineState>>,
     builder: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -643,6 +802,9 @@ impl LazyPipeline {
 
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
+static RANGE_CHECK_RESIDUAL_PIPELINE: LazyPipeline = LazyPipeline::new();
+static RANGE_CHECK_Q4_COLUMNS_PIPELINE: LazyPipeline = LazyPipeline::new();
+static RANGE_CHECK_Q4_COMBINE_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
@@ -653,15 +815,26 @@ fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState>
     RANGE_CHECK_GATE_QUOTIENT_PIPELINE.get()
 }
 
+fn range_check_q4_pipelines() -> Option<(
+    &'static ComputePipelineState,
+    &'static ComputePipelineState,
+    &'static ComputePipelineState,
+)> {
+    Some((
+        RANGE_CHECK_RESIDUAL_PIPELINE.get()?,
+        RANGE_CHECK_Q4_COLUMNS_PIPELINE.get()?,
+        RANGE_CHECK_Q4_COMBINE_PIPELINE.get()?,
+    ))
+}
+
 fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.get()
 }
 
-/// Starts the two gate-quotient pipeline builds on detached threads.
+/// Starts optional pipeline builds on detached threads.
 ///
-/// One thread each rather than one for both: they are the two slowest kernels
-/// in the shader, so serializing them would keep the GPU quotient path on the
-/// CPU for the sum of their lowerings instead of the larger of the two.
+/// One thread each keeps independent kernel lowering off the blocking path and
+/// avoids serializing the exact-schedule residual/q4/combine specialization.
 ///
 /// Scheduling only. The pipelines are the same objects the blocking build
 /// produced, lowered from the same library, so nothing they later compute can
@@ -673,6 +846,12 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             "range_check_gate_quotient",
             &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
         ),
+        (
+            "range_check_gate_quotient_residual",
+            &RANGE_CHECK_RESIDUAL_PIPELINE,
+        ),
+        ("range_check_q4_columns", &RANGE_CHECK_Q4_COLUMNS_PIPELINE),
+        ("range_check_q4_combine", &RANGE_CHECK_Q4_COMBINE_PIPELINE),
         ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
     ] {
         let device = device.clone();
@@ -1896,6 +2075,17 @@ impl MetalShared {
                 size_of_val(parameter_values.as_slice()) as u64,
                 MTLResourceOptions::StorageModeShared,
             );
+            let light_tx_q4_bank = light_tx_q4_column_bank();
+            let light_tx_q4_column_offsets = device.new_buffer_with_data(
+                light_tx_q4_bank.column_offsets.as_ptr().cast::<c_void>(),
+                size_of_val(light_tx_q4_bank.column_offsets.as_slice()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let light_tx_q4_column_items = device.new_buffer_with_data(
+                light_tx_q4_bank.column_items.as_ptr().cast::<c_void>(),
+                size_of_val(light_tx_q4_bank.column_items.as_slice()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
 
             Ok(Self {
                 queue: device.new_command_queue(),
@@ -1915,6 +2105,8 @@ impl MetalShared {
                     detached_readback: false,
                 }),
                 quotient_output_pool: Arc::new(Mutex::new(QuotientOutputPool::default())),
+                light_tx_q4_column_offsets,
+                light_tx_q4_column_items,
                 available: Condvar::new(),
                 ntt_roots: Mutex::new(HashMap::new()),
                 ntt_shifts: Mutex::new(HashMap::new()),
@@ -2027,13 +2219,28 @@ impl MetalShared {
         alpha_powers: &[u64],
         alpha_stride: usize,
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
-        let pipeline = range_check_gate_quotient_pipeline()
-            .ok_or("RangeCheck gate quotient pipeline unavailable")?;
         if metadata.len() != (range_count + u32_count) * 10
             || alpha_powers.len() != alpha_stride * 2
         {
             return Err("invalid RangeCheck quotient metadata".to_string());
         }
+        let q4_pipelines = (quotient_rows <= u32::MAX as usize / 2
+            && is_light_tx_q4_schedule(
+                metadata,
+                range_count,
+                u32_count,
+                wires.cols,
+            ))
+        .then(range_check_q4_pipelines)
+        .flatten();
+        let full_pipeline = if q4_pipelines.is_none() {
+            Some(
+                range_check_gate_quotient_pipeline()
+                    .ok_or("RangeCheck gate quotient pipeline unavailable")?,
+            )
+        } else {
+            None
+        };
         let len = quotient_rows
             .checked_mul(2)
             .ok_or("RangeCheck gate quotient output length overflow")?;
@@ -2041,32 +2248,72 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("RangeCheck gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
+        let q4_scratch = q4_pipelines.map(|_| self.acquire_quotient_output(bytes as u64));
         let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&wires.buffer), 0);
-            encoder.set_buffer(1, Some(&constants.buffer), 0);
-            encoder.set_buffer(2, Some(&output), 0);
-            encoder.set_bytes(
+            let range_pipeline = q4_pipelines
+                .map(|(residual, _, _)| residual)
+                .or(full_pipeline)
+                .expect("one RangeCheck pipeline selected");
+            let residual_encoder = command_buffer.new_compute_command_encoder();
+            residual_encoder.set_compute_pipeline_state(range_pipeline);
+            residual_encoder.set_buffer(0, Some(&wires.buffer), 0);
+            residual_encoder.set_buffer(1, Some(&constants.buffer), 0);
+            residual_encoder.set_buffer(2, Some(&output), 0);
+            residual_encoder.set_bytes(
                 3,
                 size_of_val(alpha_powers) as NSUInteger,
                 alpha_powers.as_ptr().cast::<c_void>(),
             );
-            encoder.set_bytes(
+            residual_encoder.set_bytes(
                 4,
                 size_of_val(metadata) as NSUInteger,
                 metadata.as_ptr().cast::<c_void>(),
             );
-            set_u32(encoder, 5, wires.rows as u32);
-            set_u32(encoder, 6, quotient_rows as u32);
-            set_u32(encoder, 7, step as u32);
-            set_u32(encoder, 8, alpha_stride as u32);
-            set_u32(encoder, 9, range_count as u32);
-            set_u32(encoder, 10, u32_count as u32);
-            dispatch(encoder, pipeline, quotient_rows);
-            encoder.end_encoding();
+            set_u32(residual_encoder, 5, wires.rows as u32);
+            set_u32(residual_encoder, 6, quotient_rows as u32);
+            set_u32(residual_encoder, 7, step as u32);
+            set_u32(residual_encoder, 8, alpha_stride as u32);
+            set_u32(residual_encoder, 9, range_count as u32);
+            set_u32(residual_encoder, 10, u32_count as u32);
+            dispatch(residual_encoder, range_pipeline, quotient_rows);
+            residual_encoder.end_encoding();
+
+            if let Some((_, q4_pipeline, combine_pipeline)) = q4_pipelines {
+                let q4_output = q4_scratch.as_ref().expect("q4 scratch allocated");
+                let q4_encoder = command_buffer.new_compute_command_encoder();
+                q4_encoder.set_compute_pipeline_state(q4_pipeline);
+                q4_encoder.set_buffer(0, Some(&wires.buffer), 0);
+                q4_encoder.set_buffer(1, Some(&constants.buffer), 0);
+                q4_encoder.set_buffer(2, Some(q4_output), 0);
+                q4_encoder.set_bytes(
+                    3,
+                    size_of_val(alpha_powers) as NSUInteger,
+                    alpha_powers.as_ptr().cast::<c_void>(),
+                );
+                q4_encoder.set_bytes(
+                    4,
+                    size_of_val(metadata) as NSUInteger,
+                    metadata.as_ptr().cast::<c_void>(),
+                );
+                q4_encoder.set_buffer(5, Some(&self.light_tx_q4_column_offsets), 0);
+                q4_encoder.set_buffer(6, Some(&self.light_tx_q4_column_items), 0);
+                set_u32(q4_encoder, 7, wires.rows as u32);
+                set_u32(q4_encoder, 8, quotient_rows as u32);
+                set_u32(q4_encoder, 9, step as u32);
+                set_u32(q4_encoder, 10, alpha_stride as u32);
+                dispatch(q4_encoder, q4_pipeline, quotient_rows);
+                q4_encoder.end_encoding();
+
+                let combine_encoder = command_buffer.new_compute_command_encoder();
+                combine_encoder.set_compute_pipeline_state(combine_pipeline);
+                combine_encoder.set_buffer(0, Some(&output), 0);
+                combine_encoder.set_buffer(1, Some(q4_output), 0);
+                set_u32(combine_encoder, 2, len as u32);
+                dispatch(combine_encoder, combine_pipeline, len);
+                combine_encoder.end_encoding();
+            }
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -2083,10 +2330,13 @@ impl MetalShared {
         Ok(RangeCheckGateQuotientJob {
             command_buffer,
             output: Some(output),
+            q4_scratch,
             output_pool: Arc::clone(&self.quotient_output_pool),
             len,
             #[cfg(test)]
             failure_observer,
+            #[cfg(test)]
+            q4_banked: q4_pipelines.is_some(),
             _job: job_guard,
             _phantom: PhantomData,
         })
@@ -3289,9 +3539,11 @@ mod tests {
         drop(RangeCheckGateQuotientJob::<F> {
             command_buffer: completed,
             output: Some(completed_output),
+            q4_scratch: None,
             output_pool: Arc::clone(&pool),
             len: 8,
             failure_observer: None,
+            q4_banked: false,
             _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
@@ -4656,6 +4908,291 @@ mod tests {
                     "byte/quintic gate quotient mismatch at word {i}, step {step}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn light_tx_q4_banked_matches_full_kernel_on_raw_representatives() {
+        type F = GoldilocksField;
+        const QUOTIENT_ROWS: usize = 257;
+        const ALPHA_STRIDE: usize = 136;
+        let context = shared_context().expect("Metal context must initialize");
+        let metadata = light_tx_q4_expected_metadata();
+        let boundary = [
+            0,
+            1,
+            2,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            u32::MAX as u64,
+            1 << 32,
+            u64::MAX,
+            14_479_013_849_828_404_771,
+            9_087_029_921_428_221_768,
+            2_441_288_194_761_790_662,
+        ];
+        let raw = |index: usize, salt: usize| {
+            if (index + salt) % 5 == 0 {
+                boundary[(index.wrapping_mul(7) + salt) % boundary.len()]
+            } else {
+                (index as u64)
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    .rotate_left((salt & 63) as u32)
+                    .wrapping_add(salt as u64)
+            }
+        };
+        let alpha_powers = (0..2 * ALPHA_STRIDE)
+            .map(|index| raw(index, 47))
+            .collect::<Vec<_>>();
+
+        for step in [1usize, 4] {
+            let full_rows = QUOTIENT_ROWS * step;
+            let mut wires = context
+                .allocate_columns::<F>(full_rows, 136)
+                .expect("wire columns allocate");
+            let mut constants = context
+                .allocate_columns::<F>(full_rows, 8)
+                .expect("constant columns allocate");
+            for (column, values) in wires
+                .columns_mut()
+                .expect("unique wires")
+                .into_iter()
+                .enumerate()
+            {
+                for (row, value) in values.iter_mut().enumerate() {
+                    *value = GoldilocksField(raw(column * full_rows + row, 17));
+                }
+            }
+            for (column, values) in constants
+                .columns_mut()
+                .expect("unique constants")
+                .into_iter()
+                .enumerate()
+            {
+                for (row, value) in values.iter_mut().enumerate() {
+                    *value = GoldilocksField(raw(column * full_rows + row, 31));
+                }
+            }
+
+            let banked = context
+                .start_range_check_gate_quotient(
+                    &wires,
+                    &constants,
+                    QUOTIENT_ROWS,
+                    step,
+                    &metadata,
+                    3,
+                    17,
+                    &alpha_powers,
+                    ALPHA_STRIDE,
+                )
+                .expect("banked RangeCheck job starts");
+            assert!(banked.q4_banked_for_tests());
+            let banked_words = banked
+                .finish()
+                .expect("banked RangeCheck job finishes")
+                .iter()
+                .map(PrimeField64::to_noncanonical_u64)
+                .collect::<Vec<_>>();
+
+            let full_pipeline = range_check_gate_quotient_pipeline()
+                .expect("generic RangeCheck pipeline available");
+            let full_output = context.acquire_quotient_output(
+                (QUOTIENT_ROWS * 2 * size_of::<u64>()) as u64,
+            );
+            let command_buffer = autoreleasepool(|| {
+                let command_buffer = context.queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(full_pipeline);
+                encoder.set_buffer(0, Some(&wires.buffer), 0);
+                encoder.set_buffer(1, Some(&constants.buffer), 0);
+                encoder.set_buffer(2, Some(&full_output), 0);
+                encoder.set_bytes(
+                    3,
+                    size_of_val(alpha_powers.as_slice()) as NSUInteger,
+                    alpha_powers.as_ptr().cast::<c_void>(),
+                );
+                encoder.set_bytes(
+                    4,
+                    size_of_val(metadata.as_slice()) as NSUInteger,
+                    metadata.as_ptr().cast::<c_void>(),
+                );
+                set_u32(encoder, 5, full_rows as u32);
+                set_u32(encoder, 6, QUOTIENT_ROWS as u32);
+                set_u32(encoder, 7, step as u32);
+                set_u32(encoder, 8, ALPHA_STRIDE as u32);
+                set_u32(encoder, 9, 3);
+                set_u32(encoder, 10, 17);
+                dispatch(encoder, full_pipeline, QUOTIENT_ROWS);
+                encoder.end_encoding();
+                command_buffer.commit();
+                command_buffer.to_owned()
+            });
+            command_buffer.wait_until_completed();
+            assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+            let full_words = unsafe {
+                slice::from_raw_parts(full_output.contents().cast::<u64>(), QUOTIENT_ROWS * 2)
+            };
+            assert_eq!(banked_words, full_words, "raw mismatch at step {step}");
+        }
+    }
+
+    #[test]
+    #[ignore = "manual exact-production-shape Range q4 timing"]
+    fn benchmark_light_tx_q4_banked_vs_full() {
+        type F = GoldilocksField;
+        const ROWS: usize = 1 << 19;
+        const ALPHA_STRIDE: usize = 136;
+        const SAMPLES: usize = 11;
+        let context = shared_context().expect("Metal context must initialize");
+        let metadata = light_tx_q4_expected_metadata();
+        let alpha_powers = (0..2 * ALPHA_STRIDE)
+            .map(|index| {
+                (index as u64)
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    .wrapping_add(F::ORDER)
+            })
+            .collect::<Vec<_>>();
+        let wires = context
+            .allocate_columns::<F>(ROWS, 136)
+            .expect("wire columns allocate");
+        let constants = context
+            .allocate_columns::<F>(ROWS, 8)
+            .expect("constant columns allocate");
+        unsafe {
+            core::ptr::write_bytes(wires.buffer.contents().cast::<u8>(), 0x5a, 136 * ROWS * 8);
+            core::ptr::write_bytes(constants.buffer.contents().cast::<u8>(), 0xa5, 8 * ROWS * 8);
+        }
+
+        let run_banked = || {
+            let started = Instant::now();
+            let job = context
+                .start_range_check_gate_quotient(
+                    &wires,
+                    &constants,
+                    ROWS,
+                    1,
+                    &metadata,
+                    3,
+                    17,
+                    &alpha_powers,
+                    ALPHA_STRIDE,
+                )
+                .expect("banked job starts");
+            assert!(job.q4_banked_for_tests());
+            job.finish().expect("banked job finishes");
+            gpu_duration(&job.command_buffer, started.elapsed())
+        };
+        let run_full = || {
+            let pipeline = range_check_gate_quotient_pipeline()
+                .expect("generic RangeCheck pipeline available");
+            let output = context.acquire_quotient_output((ROWS * 2 * 8) as u64);
+            let started = Instant::now();
+            let command_buffer = autoreleasepool(|| {
+                let command_buffer = context.queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(pipeline);
+                encoder.set_buffer(0, Some(&wires.buffer), 0);
+                encoder.set_buffer(1, Some(&constants.buffer), 0);
+                encoder.set_buffer(2, Some(&output), 0);
+                encoder.set_bytes(
+                    3,
+                    size_of_val(alpha_powers.as_slice()) as NSUInteger,
+                    alpha_powers.as_ptr().cast::<c_void>(),
+                );
+                encoder.set_bytes(
+                    4,
+                    size_of_val(metadata.as_slice()) as NSUInteger,
+                    metadata.as_ptr().cast::<c_void>(),
+                );
+                set_u32(encoder, 5, ROWS as u32);
+                set_u32(encoder, 6, ROWS as u32);
+                set_u32(encoder, 7, 1);
+                set_u32(encoder, 8, ALPHA_STRIDE as u32);
+                set_u32(encoder, 9, 3);
+                set_u32(encoder, 10, 17);
+                dispatch(encoder, pipeline, ROWS);
+                encoder.end_encoding();
+                command_buffer.commit();
+                command_buffer.to_owned()
+            });
+            command_buffer.wait_until_completed();
+            assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+            let duration = gpu_duration(&command_buffer, started.elapsed());
+            if let Ok(mut pool) = context.quotient_output_pool.lock() {
+                pool.recycle(output);
+            }
+            duration
+        };
+
+        run_full();
+        run_banked();
+        let mut full = Vec::with_capacity(SAMPLES);
+        let mut banked = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            if sample & 1 == 0 {
+                full.push(run_full());
+                banked.push(run_banked());
+            } else {
+                banked.push(run_banked());
+                full.push(run_full());
+            }
+        }
+        let mut full_sorted = full.clone();
+        let mut banked_sorted = banked.clone();
+        full_sorted.sort_unstable();
+        banked_sorted.sort_unstable();
+        let full_median = full_sorted[SAMPLES / 2];
+        let banked_median = banked_sorted[SAMPLES / 2];
+        eprintln!(
+            "[light-tx-q4-production] rows={ROWS} full_ms={:?} banked_ms={:?} \
+             median_full_ms={:.6} median_banked_ms={:.6} speedup={:.6}x",
+            full.iter().map(|d| d.as_secs_f64() * 1e3).collect::<Vec<_>>(),
+            banked.iter().map(|d| d.as_secs_f64() * 1e3).collect::<Vec<_>>(),
+            full_median.as_secs_f64() * 1e3,
+            banked_median.as_secs_f64() * 1e3,
+            full_median.as_secs_f64() / banked_median.as_secs_f64(),
+        );
+    }
+
+    #[test]
+    fn light_tx_q4_column_bank_is_exact_and_rejects_descriptor_drift() {
+        let metadata = light_tx_q4_expected_metadata();
+        assert_eq!(metadata.len(), 20 * 10);
+        assert!(is_light_tx_q4_schedule(&metadata, 3, 17, 136));
+
+        let mut drifted = metadata.clone();
+        drifted[17 * 10 + 6] ^= 1;
+        assert!(!is_light_tx_q4_schedule(&drifted, 3, 17, 136));
+        assert!(!is_light_tx_q4_schedule(&metadata, 2, 18, 136));
+        assert!(!is_light_tx_q4_schedule(&metadata, 3, 17, 135));
+
+        let bank = light_tx_q4_column_bank();
+        assert_eq!(bank.column_offsets.len(), 137);
+        assert_eq!(bank.column_items.len(), 938 * 2);
+        assert_eq!(bank.column_offsets[0], 0);
+        assert_eq!(bank.column_offsets[1], 0);
+        assert_eq!(bank.column_offsets[136], 938);
+        assert!(bank.column_offsets.windows(2).all(|window| window[0] <= window[1]));
+        assert!(bank
+            .column_items
+            .chunks_exact(2)
+            .all(|item| item[0] < 10 && item[1] < 136));
+    }
+
+    #[test]
+    fn light_tx_q4_kernels_are_part_of_the_pinned_metallib_contract() {
+        for name in [
+            "range_check_gate_quotient_residual",
+            "range_check_q4_columns",
+            "range_check_q4_combine",
+        ] {
+            assert!(
+                METALLIB_REQUIRED_KERNELS.contains(&name),
+                "missing pinned q4 kernel {name}"
+            );
+            assert!(SHADER_SOURCE.contains(&format!("kernel void {name}(")));
         }
     }
 
