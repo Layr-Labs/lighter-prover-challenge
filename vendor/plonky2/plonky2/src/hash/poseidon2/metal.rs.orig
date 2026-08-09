@@ -27,7 +27,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "f5bdc674cf23ea03f8fb86be86fb12a00876f8e04fd44f8904bd443109fd347e";
+    "ae31bfae0c973fe2fdabccb654efa32c6c0b51aba7f58812ae8dfdb019b91311";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -2830,154 +2830,6 @@ impl MetalShared {
     }
 
     #[allow(clippy::too_many_arguments)]
-    /// Completes a tree whose leaf level was split between the two engines.
-    ///
-    /// Hashes the trailing `cpu_leaves` natural rows on the pool while the GPU's
-    /// leaf command buffer is still in flight, joins it, publishes the CPU
-    /// digests at their tree-leaf positions, and only then encodes the parent
-    /// levels — which read the whole leaf level and therefore cannot be encoded
-    /// before both halves exist.
-    #[allow(clippy::too_many_arguments)]
-    fn finish_cohashed_tree<F: RichField>(
-        &self,
-        leaf_command_buffer: &CommandBuffer,
-        output_buffer: &Buffer,
-        source: &LeafSource<'_, F>,
-        leaf_width: usize,
-        leaf_count: usize,
-        cpu_leaves: usize,
-        cap_count: usize,
-        level_offsets: &mut Vec<usize>,
-    ) -> Result<(), String> {
-        let log_leaf_count = leaf_count.ilog2() as usize;
-        let first_cpu_row = leaf_count - cpu_leaves;
-
-        // The kernel's sponge, in the CPU's own implementation of it: a zeroed
-        // twelve-element state absorbing the leaf in rate-8 chunks with no
-        // padding, which is exactly `hash_no_pad`.
-        // Four rows at a time: `hash_quad_no_pad` runs four independent sponges
-        // through one permutation body, which is how the CPU hasher reaches its
-        // packed throughput. Gathering the four leaves together also turns four
-        // separate strided walks over the column store into one interleaved
-        // pass. Both are the same sponge the kernel runs — a zeroed twelve-word
-        // state absorbing rate-8 chunks with no padding — so the digests are
-        // bit-identical to the ones the GPU would have produced for these rows.
-        let cpu_digests: Vec<HashOut<F>> = (first_cpu_row..leaf_count)
-            .into_par_iter()
-            .step_by(4)
-            .flat_map_iter(|row| {
-                let quad = (leaf_count - row).min(4);
-                let mut leaves = [
-                    Vec::with_capacity(leaf_width),
-                    Vec::with_capacity(leaf_width),
-                    Vec::with_capacity(leaf_width),
-                    Vec::with_capacity(leaf_width),
-                ];
-                for column in 0..leaf_width {
-                    let values: &[F] = match source {
-                        LeafSource::Columns(columns) => &columns[column],
-                        LeafSource::Shared(columns) => columns.col(column),
-                        LeafSource::Rows(_) => unreachable!("row sources are never eligible"),
-                    };
-                    for (lane, leaf) in leaves.iter_mut().enumerate() {
-                        // The tail pads with the first row of the group, whose
-                        // digest is then discarded; padding keeps the four
-                        // sponges the same length without a scalar fallback.
-                        leaf.push(values[row + if lane < quad { lane } else { 0 }]);
-                    }
-                }
-                let (a, b, c, d) = crate::hash::poseidon2::hash::hash_quad_no_pad::<F>(
-                    &leaves[0], &leaves[1], &leaves[2], &leaves[3],
-                );
-                [a, b, c, d].into_iter().take(quad)
-            })
-            .collect();
-
-        leaf_command_buffer.wait_until_completed();
-        if leaf_command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(format!(
-                "leaf command buffer ended with status {:?}",
-                leaf_command_buffer.status()
-            ));
-        }
-
-        // Natural row `r` is tree leaf `reverse_bits(r)` — the same mapping the
-        // kernel applies to its own `gid`, so the GPU's `gid < first_cpu_row`
-        // and these rows write disjoint leaf slots.
-        //
-        // The digests are staged in a private vector rather than written
-        // straight into the shared allocation: mutating a buffer the GPU is
-        // concurrently writing is undefined even on disjoint ranges, and this
-        // copy is 32 bytes per leaf against the 17 permutations that produced it.
-        let output_ptr = output_buffer.contents().cast::<F>();
-        for (offset, digest) in cpu_digests.iter().enumerate() {
-            let leaf_index = crate::util::reverse_bits(first_cpu_row + offset, log_leaf_count);
-            // SAFETY: the buffer holds every node of the tree and
-            // `leaf_index < leaf_count`, so these four words are inside the leaf
-            // level; the GPU's command buffer has completed above, so nothing
-            // else is writing the allocation.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    digest.elements.as_ptr(),
-                    output_ptr.add(leaf_index * 4),
-                    4,
-                );
-            }
-        }
-
-        let parent_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(&self.parent_pipeline);
-            let output_resource: &metal::ResourceRef = output_buffer;
-
-            // The leaf level's offset was already recorded by the caller
-            // before it handed the leaf command buffer over.
-            let mut level_offset = 0usize;
-            let mut child_count = leaf_count;
-            let mut first = true;
-            while child_count > cap_count {
-                if !first {
-                    encoder.memory_barrier_with_resources(&[output_resource]);
-                }
-                first = false;
-
-                let parent_count = child_count / 2;
-                let child_offset = level_offset;
-                level_offset += child_count * 4;
-                level_offsets.push(level_offset);
-
-                encoder.set_buffer(
-                    0,
-                    Some(output_buffer),
-                    (child_offset * size_of::<u64>()) as NSUInteger,
-                );
-                encoder.set_buffer(
-                    1,
-                    Some(output_buffer),
-                    (level_offset * size_of::<u64>()) as NSUInteger,
-                );
-                encoder.set_buffer(2, Some(&self.parameters), 0);
-                set_u32(encoder, 3, parent_count as u32);
-                dispatch(encoder, &self.parent_pipeline, parent_count);
-
-                child_count = parent_count;
-            }
-            encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.to_owned()
-        });
-
-        parent_buffer.wait_until_completed();
-        if parent_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(format!(
-                "parent command buffer ended with status {:?}",
-                parent_buffer.status()
-            ));
-        }
-        Ok(())
-    }
-
     fn build_with_set<F: RichField>(
         &self,
         set: &mut BufferSet,
@@ -3059,18 +2911,6 @@ impl MetalShared {
         }
         let output_buffer = set.output.as_ref().unwrap();
 
-        // CPU/GPU co-hashing of one tree: the GPU kernel takes the leading
-        // natural rows and the pool hashes the trailing `cpu_leaves` rows while
-        // it runs. Only the column-fed kernels are eligible: they derive each
-        // leaf from `columns[j][row]`, which the CPU can read directly, whereas
-        // the row-major kernel consumes a staged buffer.
-        let cpu_leaves = match &source {
-            LeafSource::Columns(_) | LeafSource::Shared(_) => {
-                cpu_cohash_leaves(leaf_width, leaf_count, cap_height)
-            }
-            LeafSource::Rows(_) => 0,
-        };
-
         let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let leaf_count_u32 = leaf_count as u32;
@@ -3103,20 +2943,12 @@ impl MetalShared {
                     (&log_leaf_count_u32 as *const u32).cast::<c_void>(),
                 );
             }
-            dispatch(encoder, leaf_pipeline, leaf_count - cpu_leaves);
+            dispatch(encoder, leaf_pipeline, leaf_count);
 
             let mut level_offset = 0usize;
             let mut child_count = leaf_count;
             level_offsets.push(level_offset);
             let output_resource: &metal::ResourceRef = output_buffer;
-            if cpu_leaves != 0 {
-                // The parent levels read every leaf digest, including the ones
-                // the CPU is still computing, so they cannot share this encoder.
-                // `finish_cohashed_tree` encodes them after the CPU half lands.
-                encoder.end_encoding();
-                command_buffer.commit();
-                return command_buffer.to_owned();
-            }
             if child_count > cap_count {
                 encoder.set_compute_pipeline_state(&self.parent_pipeline);
             }
@@ -3158,25 +2990,12 @@ impl MetalShared {
             command_buffer.to_owned()
         });
 
-        if cpu_leaves != 0 {
-            self.finish_cohashed_tree(
-                &command_buffer,
-                output_buffer,
-                &source,
-                leaf_width,
-                leaf_count,
-                cpu_leaves,
-                cap_count,
-                &mut level_offsets,
-            )?;
-        } else {
-            command_buffer.wait_until_completed();
-            if command_buffer.status() != MTLCommandBufferStatus::Completed {
-                return Err(format!(
-                    "command buffer ended with status {:?}",
-                    command_buffer.status()
-                ));
-            }
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(format!(
+                "command buffer ended with status {:?}",
+                command_buffer.status()
+            ));
         }
 
         self.completed_tree_readback(
@@ -3220,60 +3039,6 @@ fn dispatch2d(
             depth: 1,
         },
     );
-}
-
-/// Fraction (in percent) of a wide tree's leaf digests the CPU computes while
-/// the GPU kernel runs the rest.
-///
-/// The serialized Metal stream is this worker's binding resource: a published
-/// wall model puts the main thread ~66% blocked on Merkle builds with the GPU
-/// stream ~95% occupied and 81% of it Merkle, against ~46% idle CPU. Routing a
-/// *whole* tree to that idle CPU is known to lose, because the CPU is ~5.7x
-/// slower per permutation and the GPU then idles for the tree's whole duration.
-/// Splitting one tree does not have that shape: both engines run at once and
-/// the phase ends when the slower half does.
-///
-/// Measured on this host at the production wide shape (2^19 leaves x 136
-/// columns, 17 sponge permutations per leaf): GPU 67.8 Mperm/s, CPU 11.8
-/// Mperm/s across the pool. Balancing the engines wants C / (C + G) = 14.9%.
-/// The constant sits below that balance point on purpose: inside a scored
-/// worker the CPU is contended by witness generation and quotient evaluation,
-/// so its effective rate is lower than this idle-host figure. Overshooting
-/// makes the CPU half the tail; undershooting only forfeits part of the win.
-///
-/// In-worker calibration on the public fixture, instrumented per tree with the
-/// CPU half's duration and the GPU's residual wait after it: at a 6.25% share
-/// the GPU was still the tail on 48 of 55 eligible trees with a 41 ms mean
-/// residual, and at 12% the CPU became the tail on 38 of 55. Eight percent sits
-/// inside that measured band, on the side where the CPU half stays hidden.
-const CPU_COHASH_PERCENT: usize = 8;
-
-/// Minimum leaf count for the split. Below this the second command buffer's
-/// submission latency outweighs the leaves the CPU could absorb.
-const CPU_COHASH_MIN_LEAVES: usize = 1 << 18;
-
-/// Minimum leaf width for the split. The narrow quotient and Z batches (16 and
-/// 20 columns) cost 2-3 permutations per leaf against the wide wires batch's
-/// 17, so their whole build is short enough that the split's fixed cost
-/// dominates.
-const CPU_COHASH_MIN_WIDTH: usize = 64;
-
-/// Natural rows the CPU takes from the tail of the leaf range, or 0 when this
-/// tree is not eligible.
-///
-/// The split point needs no alignment: the GPU writes `reverse_bits(gid)` for
-/// `gid` below it and the CPU writes `reverse_bits(row)` for the rows above,
-/// and bit reversal is a bijection, so any cut covers every tree leaf exactly
-/// once.
-fn cpu_cohash_leaves(leaf_width: usize, leaf_count: usize, cap_height: usize) -> usize {
-    if leaf_count < CPU_COHASH_MIN_LEAVES || leaf_width < CPU_COHASH_MIN_WIDTH {
-        return 0;
-    }
-    let share = leaf_count * CPU_COHASH_PERCENT / 100;
-    if share == 0 || share >= leaf_count || leaf_count - share <= (1usize << cap_height) {
-        return 0;
-    }
-    share
 }
 
 fn dispatch(
