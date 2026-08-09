@@ -11,6 +11,8 @@ extern crate alloc;
 extern crate std;
 
 pub(crate) mod arch;
+#[cfg(target_arch = "aarch64")]
+pub use arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
 
 pub mod batch_util;
 pub mod cosets;

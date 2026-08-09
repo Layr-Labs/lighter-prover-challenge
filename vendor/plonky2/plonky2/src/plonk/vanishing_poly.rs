@@ -461,6 +461,58 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     let sigma_col = &s_sigmas_cols[j * n..][..n];
                     let beta_k_0 = beta_k_is[j];
                     let beta_k_1 = beta_k_is[num_routed_wires + j];
+
+                    #[cfg(target_arch = "aarch64")]
+                    if core::any::TypeId::of::<F>()
+                        == core::any::TypeId::of::<
+                            plonky2_field::goldilocks_field::GoldilocksField,
+                        >()
+                    {
+                        type G = plonky2_field::goldilocks_field::GoldilocksField;
+                        use plonky2_field::NeonGoldilocksField;
+
+                        for k in 0..n {
+                            let wire = wire_col[k];
+                            let sigma = sigma_col[k];
+                            let x = xs_batch[k];
+
+                            let num_factor_0 = wire + beta_k_0 * x + gamma_0;
+                            let den_factor_0 = wire + beta_0 * sigma + gamma_0;
+                            let num_factor_1 = wire + beta_k_1 * x + gamma_1;
+                            let den_factor_1 = wire + beta_1 * sigma + gamma_1;
+
+                            unsafe {
+                                let num_pair = NeonGoldilocksField([
+                                    *num_prod.as_ptr().add(k).cast::<G>(),
+                                    *num_prod_second.as_ptr().add(k).cast::<G>(),
+                                ]) * NeonGoldilocksField([
+                                    *(&num_factor_0 as *const F).cast::<G>(),
+                                    *(&num_factor_1 as *const F).cast::<G>(),
+                                ]);
+
+                                let den_pair = NeonGoldilocksField([
+                                    *den_prod.as_ptr().add(k).cast::<G>(),
+                                    *den_prod_second.as_ptr().add(k).cast::<G>(),
+                                ]) * NeonGoldilocksField([
+                                    *(&den_factor_0 as *const F).cast::<G>(),
+                                    *(&den_factor_1 as *const F).cast::<G>(),
+                                ]);
+
+                                *num_prod.as_mut_ptr().add(k).cast::<G>() =
+                                    num_pair.0[0];
+                                *num_prod_second.as_mut_ptr().add(k).cast::<G>() =
+                                    num_pair.0[1];
+
+                                *den_prod.as_mut_ptr().add(k).cast::<G>() =
+                                    den_pair.0[0];
+                                *den_prod_second.as_mut_ptr().add(k).cast::<G>() =
+                                    den_pair.0[1];
+                            }
+                        }
+
+                        continue;
+                    }
+
                     for k in 0..n {
                         let wire = wire_col[k];
                         let sigma = sigma_col[k];
