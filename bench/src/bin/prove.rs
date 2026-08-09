@@ -59,24 +59,35 @@ static MALLOC_CONF: &[u8; 34] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
-    // First statement in the process: the Metal shader compile and pipeline
-    // lowering behind the GPU hash path cost the better part of a second on a
-    // cold OS shader cache, and the benchmark sandbox denies writes to that
-    // cache, which disables it entirely — so every scored worker pays the full
-    // price. Starting it here overlaps it with the startup work below instead
-    // of stalling the first proving step that wants the GPU. Pure scheduling:
-    // the compiled kernels are identical either way.
+    // Argument handling moved ahead of the pre-warm below, which used to be the
+    // first statement in the process. It is a few microseconds of work, and the
+    // GPU context needs one thing out of it before it starts: a directory it may
+    // write to. `MTLBinaryArchiveDescriptor` takes a file URL and nothing else,
+    // and the only path a sandboxed worker can create a file under is the
+    // scratch directory the harness hands it as the proof output. Publishing it
+    // here — before the context exists — is what lets the context open the
+    // prebuilt pipeline archive instead of lowering every kernel again.
+    let mut args = env::args().skip(1);
+    let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
+    let output = args.next().expect("usage: prove FIXTURE OUTPUT");
+    assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
+    if let Some(scratch) = std::path::Path::new(&output).parent() {
+        plonky2::hash::poseidon2::set_binary_archive_dir(scratch.to_path_buf());
+    }
+
+    // The Metal shader compile and pipeline lowering behind the GPU hash path
+    // cost the better part of a second on a cold OS shader cache, and the
+    // benchmark sandbox denies writes to that cache, which disables it entirely
+    // — so every scored worker pays the full price. Starting it here overlaps it
+    // with the startup work below instead of stalling the first proving step
+    // that wants the GPU. Pure scheduling: the compiled kernels are identical
+    // either way.
     plonky2::hash::poseidon2::prewarm_gpu();
     env_logger::init();
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
         .expect("cannot configure prover thread pool");
-
-    let mut args = env::args().skip(1);
-    let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
-    let output = args.next().expect("usage: prove FIXTURE OUTPUT");
-    assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
     // Fixture parse overlaps the pre-execution circuit load; both are fast.
     let (block, pre_circuits) = rayon::join(
