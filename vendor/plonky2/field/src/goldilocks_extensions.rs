@@ -1,6 +1,7 @@
 use core::ops::Mul;
 
 use static_assertions::const_assert;
+use unroll::unroll_for_loops;
 
 use crate::extension::quadratic::QuadraticExtension;
 use crate::extension::quartic::QuarticExtension;
@@ -33,6 +34,15 @@ impl Extendable<2> for GoldilocksField {
         let [w, _] = twiddle;
         let [a0, a1] = value;
         [w * a0, w * a1]
+    }
+
+    #[inline(always)]
+    fn fri_fold_arity16(
+        terms: &[QuadraticExtension<Self>; 16],
+        _beta: QuadraticExtension<Self>,
+        beta_powers: &[QuadraticExtension<Self>; 16],
+    ) -> QuadraticExtension<Self> {
+        ext2_dot_product_arity16(terms, beta_powers)
     }
 }
 
@@ -189,6 +199,54 @@ const fn u160_times_7(x: u128, y: u32) -> (u128, u32) {
     let (d, br) = (x << 3).overflowing_sub(x);
     // NB: subtracting the borrow can't underflow
     (d, 7 * y + (x >> (128 - 3)) as u32 - br as u32)
+}
+
+/// Add one 64-by-64-bit product to a little-endian 160-bit accumulator.
+/// The fixed 16-term quadratic dot product keeps the high limb below 2^7.
+#[inline(always)]
+fn u160_add_product(lo: &mut u128, hi: &mut u32, a: u64, b: u64) {
+    let (sum, carry) = lo.overflowing_add((a as u128) * (b as u128));
+    *lo = sum;
+    *hi += carry as u32;
+}
+
+/// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction
+/// across the complete production FRI arity. For raw limbs below 2^64,
+///
+/// - c0 < 16 * (1 + 7) * 2^128 = 2^135;
+/// - c1 < 16 * 2 * 2^128 = 2^133.
+///
+/// Both coefficients therefore satisfy `reduce160`'s bound with ample room.
+#[inline(always)]
+#[unroll_for_loops]
+fn ext2_dot_product_arity16(
+    terms: &[QuadraticExtension<GoldilocksField>; 16],
+    powers: &[QuadraticExtension<GoldilocksField>; 16],
+) -> QuadraticExtension<GoldilocksField> {
+    const_assert!(<GoldilocksField as Extendable<2>>::W.0 == 7u64);
+
+    let (mut c0_plain_lo, mut c0_plain_hi) = (0u128, 0u32);
+    let (mut c0_w_lo, mut c0_w_hi) = (0u128, 0u32);
+    let (mut c1_lo, mut c1_hi) = (0u128, 0u32);
+
+    for i in 0..16 {
+        let QuadraticExtension([a0, a1]) = terms[i];
+        let QuadraticExtension([b0, b1]) = powers[i];
+        u160_add_product(&mut c0_plain_lo, &mut c0_plain_hi, a0.0, b0.0);
+        u160_add_product(&mut c0_w_lo, &mut c0_w_hi, a1.0, b1.0);
+        u160_add_product(&mut c1_lo, &mut c1_hi, a0.0, b1.0);
+        u160_add_product(&mut c1_lo, &mut c1_hi, a1.0, b0.0);
+    }
+
+    let (c0_w_lo, c0_w_hi) = u160_times_7(c0_w_lo, c0_w_hi);
+    let (c0_lo, carry) = c0_plain_lo.overflowing_add(c0_w_lo);
+    let c0_hi = c0_plain_hi + c0_w_hi + carry as u32;
+
+    // SAFETY: the bounds documented above are far below reduce160's
+    // `2^160 - 2^128 + 2^96` precondition.
+    let c0 = unsafe { reduce160(c0_lo, c0_hi) };
+    let c1 = unsafe { reduce160(c1_lo, c1_hi) };
+    QuadraticExtension([c0, c1])
 }
 
 /*
@@ -560,13 +618,62 @@ pub(crate) fn ext5_mul(a: [u64; 5], b: [u64; 5]) -> [GoldilocksField; 5] {
 
 #[cfg(test)]
 mod tests {
+    use crate::extension::quadratic::QuadraticExtension;
     use crate::extension::quintic::{QuinticExtension, QuinticFirstCoeff};
     use crate::extension::{Extendable, FieldExtension, Frobenius, OEF};
     use crate::goldilocks_field::GoldilocksField;
     use crate::types::{Field, Field64, PrimeField64};
 
     type GF = GoldilocksField;
+    type Q2 = QuadraticExtension<GoldilocksField>;
     type QE = QuinticExtension<GoldilocksField>;
+
+    #[test]
+    fn fri_fold_arity16_matches_horner_raw() {
+        let check = |terms: [Q2; 16], beta: Q2| {
+            let mut beta_powers = [Q2::ONE; 16];
+            for i in 1..16 {
+                beta_powers[i] = beta_powers[i - 1] * beta;
+            }
+            let expected = terms
+                .iter()
+                .rev()
+                .fold(Q2::ZERO, |acc, &term| acc * beta + term);
+            let actual = <GF as Extendable<2>>::fri_fold_arity16(
+                &terms,
+                beta,
+                &beta_powers,
+            );
+            for limb in 0..2 {
+                assert_eq!(
+                    actual.0[limb].0, expected.0[limb].0,
+                    "raw limb {limb} mismatch for beta={beta:?}"
+                );
+            }
+        };
+
+        check([Q2::ZERO; 16], Q2::ZERO);
+        check([Q2::ONE; 16], Q2::ONE);
+
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..2000 {
+            let terms = core::array::from_fn(|_| {
+                QuadraticExtension(core::array::from_fn(|_| {
+                    GF::from_noncanonical_u64(next())
+                }))
+            });
+            let beta = QuadraticExtension(core::array::from_fn(|_| {
+                GF::from_noncanonical_u64(next())
+            }));
+            check(terms, beta);
+        }
+    }
 
     /// The generic `Frobenius::repeated_frobenius` default implementation
     /// (from `extension/mod.rs`), reconstructed as the reference oracle.

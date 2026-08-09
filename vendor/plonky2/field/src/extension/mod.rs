@@ -87,6 +87,23 @@ pub trait Extendable<const D: usize>: Field + Sized {
         let [b0, b1] = value;
         [a0 * b0 + Self::W * a1 * b1, a0 * b1 + a1 * b0]
     }
+
+    /// Internal fixed-shape FRI hook. The default keeps the historical
+    /// reversed Horner recurrence, including its raw field representation.
+    /// A base field may specialize the production arity without changing the
+    /// generic FRI implementation or any other reduction call site.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn fri_fold_arity16(
+        terms: &[Self::Extension; 16],
+        beta: Self::Extension,
+        _beta_powers: &[Self::Extension; 16],
+    ) -> Self::Extension {
+        terms
+            .iter()
+            .rev()
+            .fold(Self::Extension::ZERO, |acc, &term| acc * beta + term)
+    }
 }
 
 impl<F: Field + Frobenius<1> + FieldExtension<1, BaseField = F>> Extendable<1> for F {
