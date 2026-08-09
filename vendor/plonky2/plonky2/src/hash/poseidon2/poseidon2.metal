@@ -351,9 +351,21 @@ inline ulong sum_state(thread const ulong state[12]) {
 
 inline void internal_linear_layer(thread ulong state[12], constant ulong* diagonal) {
     ulong sum = sum_state(state);
-    for (uint i = 0; i < 12; ++i) {
-        state[i] = gl_mul_add(state[i], diagonal[i], sum);
-    }
+    // Poseidon2's internal diagonal is fixed by the hash configuration. Spell
+    // it as immediates so the Metal compiler can specialize the constant
+    // operand of all 264 internal-round multiplications per permutation.
+    state[0] = gl_mul_add(state[0], 0xc3b6c08e23ba9300UL, sum);
+    state[1] = gl_mul_add(state[1], 0xd84b5de94a324fb6UL, sum);
+    state[2] = gl_mul_add(state[2], 0x0d0c371c5b35b84fUL, sum);
+    state[3] = gl_mul_add(state[3], 0x7964f570e7188037UL, sum);
+    state[4] = gl_mul_add(state[4], 0x5daf18bbd996604bUL, sum);
+    state[5] = gl_mul_add(state[5], 0x6743bc47b9595257UL, sum);
+    state[6] = gl_mul_add(state[6], 0x5528b9362c59bb70UL, sum);
+    state[7] = gl_mul_add(state[7], 0xac45e25b7127b68bUL, sum);
+    state[8] = gl_mul_add(state[8], 0xa2077d7dfbb606b5UL, sum);
+    state[9] = gl_mul_add(state[9], 0xf3faac6faee378aeUL, sum);
+    state[10] = gl_mul_add(state[10], 0x0c6388b51545e883UL, sum);
+    state[11] = gl_mul_add(state[11], 0xd27dbb6944917b60UL, sum);
 }
 
 // Parameter layout: 8 x 12 external constants, 22 internal constants,
