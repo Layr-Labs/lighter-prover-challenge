@@ -26,13 +26,6 @@ inline void sub_epsilon_u32(thread uint& lo, thread uint& hi, uint active) {
     hi -= underflow & (uint)(old0 != 0xffffffffU);
 }
 
-// Multiplying by four is two doublings; a doubling is one field add.
-inline ulong gl_add(ulong a, ulong b);
-inline ulong gl_quadruple(ulong a) {
-    ulong twice = gl_add(a, a);
-    return gl_add(twice, twice);
-}
-
 inline ulong gl_add(ulong a, ulong b) {
 #if defined(POSEIDON2_NATIVE_ARITHMETIC_REFERENCE)
     ulong sum = a + b;
@@ -674,7 +667,7 @@ kernel void range_check_gate_quotient(
             for (uint remaining = num_aux - 1u; remaining > 0u; --remaining) {
                 uint j = remaining - 1u;
                 ulong limb = wires[(aux_base + j) * lde_rows + source_row];
-                computed = gl_add(gl_quadruple(computed), limb);
+                computed = gl_add(gl_mul(computed, 4), limb);
             }
             range_check_gate_emit(
                 gl_sub(computed, input),
@@ -780,9 +773,9 @@ kernel void range_check_gate_quotient(
                         gate_accumulators,
                         constraint_index++);
                     if (j < 16u) {
-                        combined_low = gl_add(gl_quadruple(combined_low), x);
+                        combined_low = gl_add(gl_mul(combined_low, 4), x);
                     } else {
-                        combined_high = gl_add(gl_quadruple(combined_high), x);
+                        combined_high = gl_add(gl_mul(combined_high, 4), x);
                     }
                 }
                 range_check_gate_emit(
@@ -831,7 +824,7 @@ kernel void range_check_gate_quotient(
                         alpha_stride,
                         gate_accumulators,
                         constraint_index++);
-                    recomposed = gl_add(gl_quadruple(recomposed), x);
+                    recomposed = gl_add(gl_mul(recomposed, 4), x);
                 }
                 range_check_gate_emit(
                     gl_sub(recomposed, output_result),
@@ -887,9 +880,9 @@ kernel void range_check_gate_quotient(
                         gate_accumulators,
                         constraint_index++);
                     if (j < result_limbs) {
-                        combined_result = gl_add(gl_quadruple(combined_result), x);
+                        combined_result = gl_add(gl_mul(combined_result, 4), x);
                     } else {
-                        combined_carry = gl_add(gl_quadruple(combined_carry), x);
+                        combined_carry = gl_add(gl_mul(combined_carry, 4), x);
                     }
                 }
                 range_check_gate_emit(
@@ -935,7 +928,7 @@ kernel void range_check_gate_quotient(
                     for (uint remaining = 3u; remaining > 0u; --remaining) {
                         uint k = remaining - 1u;
                         recomposed = gl_add(
-                            gl_quadruple(recomposed),
+                            gl_mul(recomposed, 4),
                             wires[(chunk + k) * lde_rows + source_row]);
                     }
                     ulong byte_value =
