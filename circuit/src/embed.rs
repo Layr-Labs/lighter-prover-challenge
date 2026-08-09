@@ -25,7 +25,8 @@
 //!   offsets + `u32` watcher ids);
 //! * constant polynomials are stored as *values* (step-function selectors,
 //!   long constant runs) rather than incompressible coefficients;
-//! * every bulky section is LZ4-compressed.
+//! * every bulky section is independently zstd-compressed, keeping parallel
+//!   load memory bounded without a second whole-blob decompression pass.
 //!
 //! Everything recomputed is validated at load: the recomputed commitment cap
 //! must equal the embedded verifier data's cap, which transitively pins the
@@ -131,14 +132,35 @@ fn read_section<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
 }
 
 fn write_compressed_section(out: &mut Vec<u8>, raw: &[u8]) {
-    let compressed = lz4_flex::block::compress_prepend_size(raw);
+    // Compression happens in the untimed build job. Encoding each bulky
+    // section directly with zstd avoids the former runtime double decode
+    // (whole-blob zstd followed by per-section LZ4) while retaining bounded
+    // per-section peak memory during parallel circuit loading.
+    let compressed = zstd::bulk::compress(raw, 19)
+        .expect("zstd-compressing embedded circuit section");
+    out.extend_from_slice(&(raw.len() as u64).to_le_bytes());
     write_section(out, &compressed);
 }
 
 fn read_compressed_section(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
+    ensure!(
+        bytes.len() >= *pos + 8,
+        "embedded circuit blob truncated at compressed section header"
+    );
+    let raw_len = usize::try_from(u64::from_le_bytes(
+        bytes[*pos..*pos + 8].try_into().unwrap(),
+    ))
+    .context("embedded circuit compressed section length exceeds usize")?;
+    *pos += 8;
     let compressed = read_section(bytes, pos)?;
-    lz4_flex::block::decompress_size_prepended(compressed)
-        .context("embedded circuit blob failed LZ4 decompression")
+    let raw = zstd::bulk::decompress(compressed, raw_len)
+        .context("embedded circuit blob failed zstd section decompression")?;
+    ensure!(
+        raw.len() == raw_len,
+        "embedded circuit compressed section expanded to {} bytes, expected {raw_len}",
+        raw.len()
+    );
+    Ok(raw)
 }
 
 // ---------------------------------------------------------------------------
@@ -265,13 +287,7 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     }
     write_compressed_section(&mut out, &buf);
 
-    // Outer entropy-coded wrap: LZ4 sections carry no entropy stage, so the
-    // assembled blob still shrinks ~3x under zstd. Binary bytes are what the
-    // per-spawn signature-validation tax charges for, so the wrap is applied
-    // to the whole blob rather than per section.
-    let wrapped = zstd::stream::encode_all(&out[..], 19)
-        .context("zstd-wrapping embedded circuit blob")?;
-    Ok(wrapped)
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -622,5 +638,18 @@ mod tests {
         assert_eq!(zigzag(0), 0);
         assert_eq!(zigzag(-1), 1);
         assert_eq!(zigzag(1), 2);
+    }
+
+    #[test]
+    fn compressed_section_round_trips() {
+        let input = (0..1_000_000usize)
+            .map(|i| ((i.wrapping_mul(131) ^ (i >> 3)) & 0xff) as u8)
+            .collect::<Vec<_>>();
+        let mut framed = Vec::new();
+        write_compressed_section(&mut framed, &input);
+        let mut pos = 0;
+        let decoded = read_compressed_section(&framed, &mut pos).unwrap();
+        assert_eq!(decoded, input);
+        assert_eq!(pos, framed.len());
     }
 }
