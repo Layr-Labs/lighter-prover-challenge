@@ -548,12 +548,11 @@ inline void range_check_gate_emit(
 // It is followed by promoted-family records with the same five selector words,
 // then kind (arithmetic=0, subtraction=1, add-many=2, byte-decomposition=3,
 // quintic-multiplication=4, quintic-squaring=5, random-access=6,
-// exponentiation=7, equality=8, reducing=9, base-addition=10, base-sum=11,
-// selection=12), operation or copy count, and
-// three explicit kind words. Random access uses the final words for index
-// bits, extra constants, and the raw constant-column base; equality carries
-// its constants column and reducing its extension-coefficient flag in the
-// addend-count word.
+// exponentiation=7, equality=8, reducing=9, binary-base-sum=10), operation,
+// copy, or limb count, and three explicit kind words. Random access uses the
+// final words for index bits, extra constants, and the raw constant-column
+// base; equality carries its constants column and reducing its
+// extension-coefficient flag in the addend-count word.
 // The result-limb count is what makes the subtraction and add-many branches
 // width-generic: a `2 * result_limbs`-bit word recomposes from that many
 // base-4 limbs and its overflow weight is `1 << (2 * result_limbs)`, which
@@ -1254,70 +1253,25 @@ kernel void range_check_gate_quotient(
                 acc_1 = next_1;
             }
         } else if (kind == 10u) {
-            // AdditionGate: three routed words per operation (x, y, output).
-            // The addend-count slot carries the first of its two raw constant
-            // columns, immediately after the selector prefix.
-            uint constant_base = num_addends;
-            ulong const_0 = constants[(ulong)constant_base * lde_rows + source_row];
-            ulong const_1 = constants[((ulong)constant_base + 1u) * lde_rows + source_row];
-            for (uint op = 0; op < num_ops; ++op) {
-                ulong wire_base = (ulong)op * 3u;
-                ulong addend_0 = wires[(wire_base + 0u) * lde_rows + source_row];
-                ulong addend_1 = wires[(wire_base + 1u) * lde_rows + source_row];
-                ulong output_value = wires[(wire_base + 2u) * lde_rows + source_row];
-                ulong computed = gl_add(
-                    gl_mul(addend_0, const_0),
-                    gl_mul(addend_1, const_1));
-                range_check_gate_emit(
-                    gl_sub(output_value, computed),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
+            // BaseSumGate<2>: wire zero is the claimed sum and the following
+            // `num_ops` wires are little-endian binary limbs. The recomposition
+            // row precedes the limb rows exactly as in the CPU evaluator.
+            uint num_limbs = num_ops;
+            ulong computed_sum = 0;
+            for (uint remaining = num_limbs; remaining > 0u; --remaining) {
+                uint j = remaining - 1u;
+                ulong limb = wires[((ulong)1u + j) * lde_rows + source_row];
+                computed_sum = gl_add(gl_add(computed_sum, computed_sum), limb);
             }
-        } else if (kind == 11u) {
-            // BaseSumGate: wire 0 is the sum and the next `num_ops` wires are
-            // little-endian limbs. The addend-count slot carries base 2 or 4.
-            ulong base = num_addends;
-            ulong computed = 0;
-            for (uint remaining = num_ops; remaining > 0u; --remaining) {
-                uint limb = remaining - 1u;
-                computed = gl_add(
-                    gl_mul(computed, base),
-                    wires[((ulong)1u + limb) * lde_rows + source_row]);
-            }
+            ulong claimed_sum = wires[(ulong)0 * lde_rows + source_row];
             range_check_gate_emit(
-                gl_sub(computed, wires[source_row]),
+                gl_sub(computed_sum, claimed_sum),
                 alpha_powers, alpha_stride, gate_accumulators,
                 constraint_index++);
-            for (uint limb = 0; limb < num_ops; ++limb) {
-                ulong x = wires[((ulong)1u + limb) * lde_rows + source_row];
-                ulong constraint;
-                if (base == 2u) {
-                    constraint = gl_mul(x, gl_sub(x, 1));
-                } else {
-                    ulong y = gl_mul(x, gl_sub(x, 3));
-                    constraint = gl_mul(y, gl_add(y, 2));
-                }
+            for (uint j = 0; j < num_limbs; ++j) {
+                ulong limb = wires[((ulong)1u + j) * lde_rows + source_row];
                 range_check_gate_emit(
-                    constraint,
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-            }
-        } else if (kind == 12u) {
-            // SelectionGate: four routed wires per operation followed by one
-            // temporary wire per operation.
-            for (uint op = 0; op < num_ops; ++op) {
-                ulong b = wires[((ulong)(4u * op)) * lde_rows + source_row];
-                ulong x = wires[((ulong)(4u * op + 1u)) * lde_rows + source_row];
-                ulong y = wires[((ulong)(4u * op + 2u)) * lde_rows + source_row];
-                ulong result = wires[((ulong)(4u * op + 3u)) * lde_rows + source_row];
-                ulong temp = wires[
-                    ((ulong)(4u * num_ops + op)) * lde_rows + source_row];
-                range_check_gate_emit(
-                    gl_sub(gl_sub(gl_mul(b, y), y), temp),
-                    alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
-                range_check_gate_emit(
-                    gl_sub(gl_sub(gl_mul(b, x), temp), result),
+                    gl_mul(limb, gl_sub(limb, 1)),
                     alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
