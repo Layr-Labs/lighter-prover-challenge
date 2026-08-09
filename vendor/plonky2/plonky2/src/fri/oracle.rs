@@ -610,10 +610,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) -> FriProof<F, C::Hasher, D> {
         assert!(D > 1, "Not implemented for D=1.");
         let alpha = challenger.get_extension_challenge::<D>();
-        let mut alpha = ReducingFactor::new(alpha);
-
-        // Final low-degree polynomial that goes into FRI.
-        let mut final_poly = PolynomialCoeffs::empty();
 
         // Each batch `i` consists of an opening point `z_i` and polynomials `{f_ij}_j` to be opened at that point.
         // For each batch, we compute the composition polynomial `F_i = sum alpha^j f_ij`,
@@ -622,32 +618,77 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // where the `k_i`s are chosen such that each power of `alpha` appears only once in the final sum.
         // There are usually two batches for the openings at `zeta` and `g * zeta`.
         // The oracles used in Plonky2 are given in `FRI_ORACLES` in `plonky2/src/plonk/plonk_common.rs`.
-        for FriBatchInfo { point, polynomials } in &instance.batches {
-            // Collect the coefficients of all the polynomials in `polynomials`.
-            let polys_coeff = polynomials.iter().map(|fri_poly| {
-                &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
-            });
-            // The label is formatted unconditionally, but `timing`'s `push` is
-            // compiled out unless the `timing` feature is on — which it is not
-            // here — so the `String` is allocated, written and dropped without
-            // ever being read. A static label costs nothing and reads the same
-            // in a timing build.
-            let composition_poly = timed!(
-                timing,
-                "reduce batch of polynomials",
-                alpha.reduce_polys_base(polys_coeff)
-            );
-            // Fused (value-exact) form of:
-            //   let quotient = composition_poly.divide_by_linear_padded_in_place(*point);
-            //   alpha.shift_poly(&mut final_poly);
-            //   final_poly += quotient;
-            // (where the in-place division runs the classic `divide_by_linear`
-            // Horner recurrence and leaves its top slot as the power-of-two
-            // pad), writing straight into `final_poly`'s reusable buffer
-            // instead of a division pass + shift pass + add pass.
-            let shift = alpha.shift_factor();
-            accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
-        }
+        // Opening batches are algebraically independent: each starts its
+        // composition at alpha^0, and its alpha^len factor is used only when
+        // the completed quotient is folded into the ordered result. The
+        // production zeta and g*zeta batches can therefore compute their
+        // composition and synthetic division concurrently. This hides the
+        // second batch's scalar reduction and Horner chain beneath the large
+        // first batch instead of placing both sequentially on the proof spine.
+        #[cfg(not(feature = "timing"))]
+        let final_poly = {
+            let quotients = instance
+                .batches
+                .par_iter()
+                .map(|FriBatchInfo { point, polynomials }| {
+                    let polys_coeff = polynomials.iter().map(|fri_poly| {
+                        &oracles[fri_poly.oracle_index].polynomials
+                            [fri_poly.polynomial_index]
+                    });
+                    let mut reducing = ReducingFactor::new(alpha);
+                    let composition = reducing.reduce_polys_base(polys_coeff);
+                    let shift = reducing.shift_factor();
+                    (
+                        composition.divide_by_linear_padded_in_place(*point),
+                        shift,
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            let mut quotients = quotients.into_iter();
+            let mut result = match quotients.next() {
+                Some((quotient, _)) => quotient,
+                None => PolynomialCoeffs::empty(),
+            };
+            for (quotient, shift) in quotients {
+                let common = result.len().min(quotient.len());
+                result.coeffs[..common]
+                    .par_iter_mut()
+                    .zip(quotient.coeffs[..common].par_iter())
+                    .for_each(|(left, &right)| *left = *left * shift + right);
+                result.coeffs[common..]
+                    .par_iter_mut()
+                    .for_each(|left| *left *= shift);
+                if quotient.len() > common {
+                    result
+                        .coeffs
+                        .extend_from_slice(&quotient.coeffs[common..]);
+                }
+            }
+            result
+        };
+
+        // A profiling build retains nested timing scopes and their serial
+        // order because TimingTree is deliberately mutable.
+        #[cfg(feature = "timing")]
+        let final_poly = {
+            let mut reducing = ReducingFactor::new(alpha);
+            let mut result = PolynomialCoeffs::empty();
+            for FriBatchInfo { point, polynomials } in &instance.batches {
+                let polys_coeff = polynomials.iter().map(|fri_poly| {
+                    &oracles[fri_poly.oracle_index].polynomials
+                        [fri_poly.polynomial_index]
+                });
+                let composition_poly = timed!(
+                    timing,
+                    "reduce batch of polynomials",
+                    reducing.reduce_polys_base(polys_coeff)
+                );
+                let shift = reducing.shift_factor();
+                accumulate_linear_quotient(&mut result, &composition_poly, *point, shift);
+            }
+            result
+        };
 
         // `final_poly` is dead after this point, so pad it in place instead of
         // the clone-then-resize that `lde(&self)` performs.
@@ -773,6 +814,7 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
 /// only dropped work is the recurrence's final step (the remainder `p(z)`,
 /// which the division discards) and the reference's `+ ZERO` on the pad
 /// slot / `ZERO * shift` on fresh slots, all of which leave values unchanged.
+#[cfg(any(feature = "timing", test))]
 fn accumulate_linear_quotient<F: Field>(
     final_poly: &mut PolynomialCoeffs<F>,
     composition_poly: &PolynomialCoeffs<F>,
