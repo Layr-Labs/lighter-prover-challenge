@@ -948,6 +948,7 @@ fn compute_all_lookup_polys<
 ) -> Vec<PolynomialValues<F>> {
     if lookup {
         let polys: Vec<Vec<PolynomialValues<F>>> = (0..common_data.config.num_challenges)
+            .into_par_iter()
             .map(|c| {
                 compute_lookup_polys(
                     witness,
@@ -1818,6 +1819,7 @@ fn compute_quotient_polys<
     let lut_re_poly_evals: Vec<Vec<F>> = if has_lookup {
         let num_lut_slots = LookupTableGate::num_slots(&common_data.config);
         (0..num_challenges)
+            .into_par_iter()
             .map(move |i| {
                 let cur_deltas = &deltas[NUM_COINS_LOOKUP * i..NUM_COINS_LOOKUP * (i + 1)];
                 let cur_challenge_delta = cur_deltas[LookupChallenges::ChallengeDelta as usize];
