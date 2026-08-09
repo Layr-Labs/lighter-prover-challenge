@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::ops::Range;
 
 use anyhow::Result;
@@ -322,8 +323,40 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
         // otherwise run once per 32-point batch call.
         let domain = crate::field::fft::cached_two_adic_subgroup::<F>(self.subgroup_bits);
         let weights = &self.barycentric_weights;
-        let mut values = vec![F::Extension::ZERO; self.num_points()];
-        let mut scratch = vec![F::ZERO; num_constraints * n];
+        // Same stack-or-heap reservation the sibling gates use: both buffers
+        // are re-allocated on every 32-point quotient batch otherwise. Only
+        // the used prefix is zeroed, and it receives exactly the zeros the
+        // `vec!` gave it.
+        let num_points = self.num_points();
+        let scratch_len = num_constraints * n;
+        let mut values_stack = [MaybeUninit::<F::Extension>::uninit(); 64];
+        let mut values_heap;
+        let values: &mut [F::Extension] = if num_points <= values_stack.len() {
+            let prefix = &mut values_stack[..num_points];
+            prefix.fill(MaybeUninit::new(F::Extension::ZERO));
+            // SAFETY: every element of `prefix` was just written, and
+            // `MaybeUninit<T>` shares layout and alignment with `T`.
+            unsafe {
+                core::slice::from_raw_parts_mut(
+                    prefix.as_mut_ptr().cast::<F::Extension>(),
+                    num_points,
+                )
+            }
+        } else {
+            values_heap = vec![F::Extension::ZERO; num_points];
+            &mut values_heap
+        };
+        let mut scratch_stack = [MaybeUninit::<F>::uninit(); 1024];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if scratch_len <= scratch_stack.len() {
+            let prefix = &mut scratch_stack[..scratch_len];
+            prefix.fill(MaybeUninit::new(F::ZERO));
+            // SAFETY: as above.
+            unsafe { core::slice::from_raw_parts_mut(prefix.as_mut_ptr().cast::<F>(), scratch_len) }
+        } else {
+            scratch_heap = vec![F::ZERO; scratch_len];
+            &mut scratch_heap
+        };
 
         for (p, vars) in vars_base.iter().enumerate() {
             let shift = vars.local_wires[self.wire_shift()];

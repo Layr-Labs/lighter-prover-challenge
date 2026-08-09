@@ -312,6 +312,13 @@ pub struct OpeningSet<F: RichField + Extendable<D>, const D: usize> {
     pub lookup_zs_next: Vec<F::Extension>,
 }
 
+/// Cached form of the `LIGHTER_GZETA_TABLE_ASSERT` probe: `var_os` takes the
+/// process-wide environ lock, and `OpeningSet::new` runs ~105 times per worker.
+fn gzeta_table_assert_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("LIGHTER_GZETA_TABLE_ASSERT").is_some())
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
     pub fn new<C: GenericConfig<D, F = F>>(
         zeta: F::Extension,
@@ -353,7 +360,7 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
             .zip(g_subgroup.iter())
             .map(|(&zeta_pow, &g_pow)| zeta_pow.scalar_mul(g_pow))
             .collect();
-        if std::env::var_os("LIGHTER_GZETA_TABLE_ASSERT").is_some() {
+        if gzeta_table_assert_enabled() {
             let reference = table(g * zeta);
             assert_eq!(reference.len(), g_zeta_pows.len());
             for (i, (a, b)) in reference.iter().zip(&g_zeta_pows).enumerate() {
@@ -374,11 +381,27 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
             polynomials
                 .par_iter()
                 .map(|p| {
-                    p.coeffs
-                        .iter()
-                        .zip(pows)
-                        .map(|(&coeff, zp)| zp.scalar_mul(coeff))
-                        .sum::<F::Extension>()
+                    // Four independent accumulators instead of one dependent
+                    // add chain of length `degree`: field addition is exact and
+                    // associative, so the sum is the same element.
+                    let mut acc = [F::Extension::ZERO; 4];
+                    let mut pairs = p.coeffs.iter().zip(pows);
+                    loop {
+                        let mut done = false;
+                        for a in acc.iter_mut() {
+                            match pairs.next() {
+                                Some((&coeff, zp)) => *a += zp.scalar_mul(coeff),
+                                None => {
+                                    done = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if done {
+                            break;
+                        }
+                    }
+                    (acc[0] + acc[1]) + (acc[2] + acc[3])
                 })
                 .collect::<Vec<_>>()
         };
