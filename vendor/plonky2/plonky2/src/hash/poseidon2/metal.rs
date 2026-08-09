@@ -176,9 +176,9 @@ struct MetalShared {
     leaf_pipeline: ComputePipelineState,
     leaf_colmajor_pipeline: ComputePipelineState,
     parent_pipeline: ComputePipelineState,
-    ntt_prepare_pipeline: ComputePipelineState,
-    ntt_stage_pipeline: ComputePipelineState,
-    ifft_finalize_pipeline: ComputePipelineState,
+    ntt_prepare_pipeline: Option<ComputePipelineState>,
+    ntt_stage_pipeline: Option<ComputePipelineState>,
+    ifft_finalize_pipeline: Option<ComputePipelineState>,
     parameters: Buffer,
     pool: Mutex<BufferPool>,
     /// Small, nonblocking cache for completed gate-quotient output buffers.
@@ -2260,9 +2260,7 @@ impl MetalShared {
                 let leaf_colmajor =
                     scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
                 let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
-                let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
-                let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
-                let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
+
                 // A panic inside a pipeline build is a bug, not a runtime
                 // condition; propagate it rather than papering over it.
                 (
@@ -2271,15 +2269,9 @@ impl MetalShared {
                         .join()
                         .expect("col-major leaf pipeline thread panicked"),
                     parent.join().expect("parent pipeline thread panicked"),
-                    ntt_prepare
-                        .join()
-                        .expect("ntt prepare pipeline thread panicked"),
-                    ntt_stage
-                        .join()
-                        .expect("ntt stage pipeline thread panicked"),
-                    ifft_finalize
-                        .join()
-                        .expect("ifft finalize pipeline thread panicked"),
+                    None,
+                    None,
+                    None,
                 )
             });
             // Surfaced in kernel order, so a single missing or unbuildable
@@ -2291,9 +2283,12 @@ impl MetalShared {
             let leaf_pipeline = leaf_pipeline?;
             let leaf_colmajor_pipeline = leaf_colmajor_pipeline?;
             let parent_pipeline = parent_pipeline?;
-            let ntt_prepare_pipeline = ntt_prepare_pipeline?;
-            let ntt_stage_pipeline = ntt_stage_pipeline?;
-            let ifft_finalize_pipeline = ifft_finalize_pipeline?;
+            // NTT pipelines not built: GPU_NTT_COMMITMENTS is false in
+            // production, so NTT-based commitment paths never dispatch.
+            // Skipping their lowering saves ~240ms per worker.
+            let ntt_prepare_pipeline = ntt_prepare_pipeline;
+            let ntt_stage_pipeline = ntt_stage_pipeline;
+            let ifft_finalize_pipeline = ifft_finalize_pipeline;
 
             spawn_optional_pipelines(&device, &library);
 
@@ -2925,6 +2920,11 @@ impl MetalShared {
             }
             let output_buffer = set.output.as_ref().unwrap();
 
+            // NTT pipelines are not built when GPU_NTT_COMMITMENTS is false.
+            // Return early so the caller falls back to CPU.
+            if self.ntt_prepare_pipeline.is_none() {
+                return Err("NTT pipelines not built (GPU_NTT_COMMITMENTS disabled)".to_string());
+            }
             let mut level_offsets = Vec::with_capacity(log_lde as usize + 1);
             let command_buffer = autoreleasepool(|| -> CommandBuffer {
                 let degree_u32 = degree as u32;
@@ -2940,7 +2940,7 @@ impl MetalShared {
                 // column buffer serves as scratch; it is dead once the IFFT
                 // finalize gather has produced the coefficients.
                 let gather = command_buffer.new_compute_command_encoder();
-                gather.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+                gather.set_compute_pipeline_state(self.ntt_prepare_pipeline.as_ref().unwrap());
                 gather.set_buffer(0, Some(input_buffer), 0);
                 gather.set_buffer(1, Some(&ones_buffer), 0);
                 gather.set_buffer(2, Some(&column_buffer), 0);
@@ -2948,12 +2948,12 @@ impl MetalShared {
                 set_u32(gather, 4, degree_u32);
                 set_u32(gather, 5, log_degree_u32);
                 set_u32(gather, 6, 0);
-                dispatch2d(gather, &self.ntt_prepare_pipeline, degree, cols);
+                dispatch2d(gather, self.ntt_prepare_pipeline.as_ref().unwrap(), degree, cols);
                 gather.end_encoding();
 
                 for stage in 0..log_degree_u32 {
                     let stage_encoder = command_buffer.new_compute_command_encoder();
-                    stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
+                    stage_encoder.set_compute_pipeline_state(self.ntt_stage_pipeline.as_ref().unwrap());
                     stage_encoder.set_buffer(0, Some(&column_buffer), 0);
                     stage_encoder.set_buffer(
                         1,
@@ -2963,12 +2963,12 @@ impl MetalShared {
                     set_u32(stage_encoder, 2, degree_u32);
                     set_u32(stage_encoder, 3, stage);
                     set_u32(stage_encoder, 4, 0);
-                    dispatch2d(stage_encoder, &self.ntt_stage_pipeline, degree / 2, cols);
+                    dispatch2d(stage_encoder, self.ntt_stage_pipeline.as_ref().unwrap(), degree / 2, cols);
                     stage_encoder.end_encoding();
                 }
 
                 let finalize = command_buffer.new_compute_command_encoder();
-                finalize.set_compute_pipeline_state(&self.ifft_finalize_pipeline);
+                finalize.set_compute_pipeline_state(self.ifft_finalize_pipeline.as_ref().unwrap());
                 finalize.set_buffer(0, Some(&column_buffer), 0);
                 finalize.set_buffer(1, Some(&coeffs_buffer), 0);
                 set_u32(finalize, 2, degree_u32);
@@ -2977,12 +2977,12 @@ impl MetalShared {
                     size_of::<u64>() as NSUInteger,
                     (&n_inv as *const u64).cast::<c_void>(),
                 );
-                dispatch2d(finalize, &self.ifft_finalize_pipeline, degree, cols);
+                dispatch2d(finalize, self.ifft_finalize_pipeline.as_ref().unwrap(), degree, cols);
                 finalize.end_encoding();
 
                 // Coset LDE of the coefficients, exactly as build_from_coeffs.
                 let prepare = command_buffer.new_compute_command_encoder();
-                prepare.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+                prepare.set_compute_pipeline_state(self.ntt_prepare_pipeline.as_ref().unwrap());
                 prepare.set_buffer(0, Some(&coeffs_buffer), 0);
                 prepare.set_buffer(1, Some(&shift_buffer), 0);
                 prepare.set_buffer(2, Some(&column_buffer), 0);
@@ -2990,12 +2990,12 @@ impl MetalShared {
                 set_u32(prepare, 4, lde_size_u32);
                 set_u32(prepare, 5, log_degree_u32);
                 set_u32(prepare, 6, rate_bits_u32);
-                dispatch2d(prepare, &self.ntt_prepare_pipeline, lde_size, cols);
+                dispatch2d(prepare, self.ntt_prepare_pipeline.as_ref().unwrap(), lde_size, cols);
                 prepare.end_encoding();
 
                 for stage in rate_bits as u32..log_lde {
                     let stage_encoder = command_buffer.new_compute_command_encoder();
-                    stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
+                    stage_encoder.set_compute_pipeline_state(self.ntt_stage_pipeline.as_ref().unwrap());
                     stage_encoder.set_buffer(0, Some(&column_buffer), 0);
                     stage_encoder.set_buffer(
                         1,
@@ -3005,7 +3005,7 @@ impl MetalShared {
                     set_u32(stage_encoder, 2, lde_size_u32);
                     set_u32(stage_encoder, 3, stage);
                     set_u32(stage_encoder, 4, u32::from(stage == log_lde - 1));
-                    dispatch2d(stage_encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
+                    dispatch2d(stage_encoder, self.ntt_stage_pipeline.as_ref().unwrap(), lde_size / 2, cols);
                     stage_encoder.end_encoding();
                 }
 
@@ -3234,17 +3234,22 @@ impl MetalShared {
         }
         let output_buffer = set.output.as_ref().unwrap();
 
+        // NTT pipelines are not built when GPU_NTT_COMMITMENTS is false.
+        // Return early so the caller falls back to CPU.
+        if self.ntt_prepare_pipeline.is_none() {
+            return Err("NTT pipelines not built (GPU_NTT_COMMITMENTS disabled)".to_string());
+        }
         let mut level_offsets = Vec::with_capacity(log_lde as usize + 1);
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let degree_u32 = degree as u32;
             let lde_size_u32 = lde_size as u32;
-            let log_degree_u32 = degree.ilog2();
+                       let log_degree_u32 = degree.ilog2();
             let rate_bits_u32 = rate_bits as u32;
             let cols_u32 = cols as u32;
             let command_buffer = self.queue.new_command_buffer();
 
             let prepare = command_buffer.new_compute_command_encoder();
-            prepare.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+            prepare.set_compute_pipeline_state(self.ntt_prepare_pipeline.as_ref().unwrap());
             prepare.set_buffer(0, Some(input_buffer), 0);
             prepare.set_buffer(1, Some(shift_buffer), 0);
             prepare.set_buffer(2, Some(column_buffer), 0);
@@ -3252,12 +3257,12 @@ impl MetalShared {
             set_u32(prepare, 4, lde_size_u32);
             set_u32(prepare, 5, log_degree_u32);
             set_u32(prepare, 6, rate_bits_u32);
-            dispatch2d(prepare, &self.ntt_prepare_pipeline, lde_size, cols);
+            dispatch2d(prepare, self.ntt_prepare_pipeline.as_ref().unwrap(), lde_size, cols);
             prepare.end_encoding();
 
             for stage in rate_bits as u32..log_lde {
                 let stage_encoder = command_buffer.new_compute_command_encoder();
-                stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
+                stage_encoder.set_compute_pipeline_state(self.ntt_stage_pipeline.as_ref().unwrap());
                 stage_encoder.set_buffer(0, Some(column_buffer), 0);
                 stage_encoder.set_buffer(
                     1,
@@ -3271,7 +3276,7 @@ impl MetalShared {
                     4,
                     u32::from(stage == log_lde - 1),
                 );
-                dispatch2d(stage_encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
+                dispatch2d(stage_encoder, self.ntt_stage_pipeline.as_ref().unwrap(), lde_size / 2, cols);
                 stage_encoder.end_encoding();
             }
 
