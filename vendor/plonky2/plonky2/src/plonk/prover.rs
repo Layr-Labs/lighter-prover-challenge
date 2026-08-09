@@ -709,10 +709,11 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
         quotient_products_1.set_len(product_count);
     }
 
-    vec![
-        z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
-        z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
-    ]
+    let (z0, z1) = plonky2_maybe_rayon::join(
+        || z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
+        || z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
+    );
+    vec![z0, z1]
 }
 
 /// Compute the partial products used in the `Z` polynomial.
@@ -846,33 +847,36 @@ fn compute_lookup_polys<
         first_lut_gate: first_lut_row,
     } in prover_data.lookup_rows.clone()
     {
+        // Pre-allocate scratch buffers reused across rows to avoid per-row
+        // heap allocations in the hot lookup polynomial loop.
+        let mut looked_combos = Vec::with_capacity(num_lut_slots);
+        let mut minus_looked_combos = Vec::with_capacity(num_lut_slots);
+        let mut lookup_combos = Vec::with_capacity(num_lut_slots);
+
         // Set values for partial Sums and RE.
         for row in (last_lut_row..(first_lut_row + 1)).rev() {
             // Get combos for Sum.
-            let looked_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| {
-                    let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
-                    let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
-
-                    looked_inp + deltas[LookupChallenges::ChallengeA as usize] * looked_out
-                })
-                .collect();
+            looked_combos.clear();
+            looked_combos.extend((0..num_lut_slots).map(|s| {
+                let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
+                let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
+                looked_inp + deltas[LookupChallenges::ChallengeA as usize] * looked_out
+            }));
             // Get (alpha - combo).
-            let minus_looked_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| deltas[LookupChallenges::ChallengeAlpha as usize] - looked_combos[s])
-                .collect();
+            minus_looked_combos.clear();
+            minus_looked_combos.extend(
+                (0..num_lut_slots).map(|s| deltas[LookupChallenges::ChallengeAlpha as usize] - looked_combos[s]),
+            );
             // Get 1/(alpha - combo).
             let looked_combo_inverses = F::batch_multiplicative_inverse(&minus_looked_combos);
 
             // Get lookup combos, used to check the well formation of the LUT.
-            let lookup_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| {
-                    let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
-                    let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
-
-                    looked_inp + deltas[LookupChallenges::ChallengeB as usize] * looked_out
-                })
-                .collect();
+            lookup_combos.clear();
+            lookup_combos.extend((0..num_lut_slots).map(|s| {
+                let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
+                let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
+                looked_inp + deltas[LookupChallenges::ChallengeB as usize] * looked_out
+            }));
 
             // Compute next row's first value of RE.
             // If `row == first_lut_row`, then `final_poly_vecs[0].values[row + 1] == 0`.
@@ -900,20 +904,21 @@ fn compute_lookup_polys<
         }
 
         // Set values for partial LDCs.
+        let mut looking_combos = Vec::with_capacity(num_lu_slots);
+        let mut minus_looking_combos = Vec::with_capacity(num_lu_slots);
         for row in (last_lu_row..last_lut_row).rev() {
             // Get looking combos.
-            let looking_combos: Vec<F> = (0..num_lu_slots)
-                .map(|s| {
-                    let looking_in = witness.get_wire(row, LookupGate::wire_ith_looking_inp(s));
-                    let looking_out = witness.get_wire(row, LookupGate::wire_ith_looking_out(s));
-
-                    looking_in + deltas[LookupChallenges::ChallengeA as usize] * looking_out
-                })
-                .collect();
+            looking_combos.clear();
+            looking_combos.extend((0..num_lu_slots).map(|s| {
+                let looking_in = witness.get_wire(row, LookupGate::wire_ith_looking_inp(s));
+                let looking_out = witness.get_wire(row, LookupGate::wire_ith_looking_out(s));
+                looking_in + deltas[LookupChallenges::ChallengeA as usize] * looking_out
+            }));
             // Get (alpha - combo).
-            let minus_looking_combos: Vec<F> = (0..num_lu_slots)
-                .map(|s| deltas[LookupChallenges::ChallengeAlpha as usize] - looking_combos[s])
-                .collect();
+            minus_looking_combos.clear();
+            minus_looking_combos.extend(
+                (0..num_lu_slots).map(|s| deltas[LookupChallenges::ChallengeAlpha as usize] - looking_combos[s]),
+            );
             // Get 1 / (alpha - combo).
             let looking_combo_inverses = F::batch_multiplicative_inverse(&minus_looking_combos);
 
@@ -949,6 +954,7 @@ fn compute_all_lookup_polys<
 ) -> Vec<PolynomialValues<F>> {
     if lookup {
         let polys: Vec<Vec<PolynomialValues<F>>> = (0..common_data.config.num_challenges)
+            .into_par_iter()
             .map(|c| {
                 compute_lookup_polys(
                     witness,
@@ -1819,6 +1825,7 @@ fn compute_quotient_polys<
     let lut_re_poly_evals: Vec<Vec<F>> = if has_lookup {
         let num_lut_slots = LookupTableGate::num_slots(&common_data.config);
         (0..num_challenges)
+            .into_par_iter()
             .map(move |i| {
                 let cur_deltas = &deltas[NUM_COINS_LOOKUP * i..NUM_COINS_LOOKUP * (i + 1)];
                 let cur_challenge_delta = cur_deltas[LookupChallenges::ChallengeDelta as usize];

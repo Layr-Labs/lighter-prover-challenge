@@ -81,7 +81,7 @@ const STAGING_CHUNK: usize = 1 << 19;
 /// block's one-off 32 MiB outputs remain uncached so the pool cannot amplify
 /// peak unified-memory pressure.
 const MAX_CACHED_QUOTIENT_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
+const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 3;
 
 struct MetalShared {
     device: Device,
