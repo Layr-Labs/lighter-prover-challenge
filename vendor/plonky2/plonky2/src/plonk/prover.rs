@@ -2301,15 +2301,17 @@ fn compute_quotient_polys<
                 }
             }
         });
-    let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
+    let normalized_inverse_coset_shift_powers =
+        precomputed::normalized_inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
         .map(|column| {
-            // Fuse the coset post-scaling into the IFFT instead of walking the
-            // whole coefficient vector again afterwards, reusing a
-            // process-global inverse-shift power chain.
-            PolynomialValues::new(column)
-                .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
+            // The cached powers already include the IFFT's `1 / n` factor,
+            // so the fused reversal/postscale pass needs one multiplication
+            // per coefficient instead of two.
+            PolynomialValues::new(column).coset_ifft_with_normalized_powers(
+                normalized_inverse_coset_shift_powers.as_slice(),
+            )
         })
         .collect()
 }
@@ -2326,6 +2328,7 @@ pub(crate) mod precomputed {
     #[cfg(feature = "std")]
     mod imp {
         use core::any::{Any, TypeId};
+        use plonky2_util::log2_strict;
         use std::collections::HashMap;
         use std::sync::{Arc, OnceLock, RwLock};
 
@@ -2336,7 +2339,7 @@ pub(crate) mod precomputed {
         static SUBGROUPS: OnceLock<Map> = OnceLock::new();
         static COSET_POWERS: OnceLock<Map> = OnceLock::new();
         static SHIFTED_SUBGROUPS: OnceLock<Map> = OnceLock::new();
-        static INVERSE_COSET_POWERS: OnceLock<Map> = OnceLock::new();
+        static NORMALIZED_INVERSE_COSET_POWERS: OnceLock<Map> = OnceLock::new();
 
         fn get_or_compute<F: Field>(
             cache: &'static OnceLock<Map>,
@@ -2388,12 +2391,19 @@ pub(crate) mod precomputed {
             })
         }
 
-        /// Cached `F::coset_shift().inverse().powers().take(degree)`. The
-        /// quotient columns' coset IFFT post-scaling uses the same power chain
-        /// on every proof of a given size, so build it once per process.
-        pub(crate) fn inverse_coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
-            get_or_compute(&INVERSE_COSET_POWERS, degree, || {
-                F::coset_shift().inverse().powers().take(degree).collect()
+        /// Cached `n^-1 * F::coset_shift().inverse()^i` for `i in 0..degree`.
+        /// Starting the existing geometric chain at `n^-1` costs the same
+        /// `degree` iterator multiplications as starting it at one, while letting
+        /// every quotient column delete a separate normalization multiply.
+        pub(crate) fn normalized_inverse_coset_shift_powers<F: Field>(
+            degree: usize,
+        ) -> Arc<Vec<F>> {
+            get_or_compute(&NORMALIZED_INVERSE_COSET_POWERS, degree, || {
+                F::coset_shift()
+                    .inverse()
+                    .shifted_powers(F::inverse_2exp(log2_strict(degree)))
+                    .take(degree)
+                    .collect()
             })
         }
     }
@@ -2404,6 +2414,7 @@ pub(crate) mod precomputed {
     mod imp {
         use alloc::sync::Arc;
         use alloc::vec::Vec;
+        use plonky2_util::log2_strict;
 
         use crate::field::types::Field;
 
@@ -2420,11 +2431,13 @@ pub(crate) mod precomputed {
             Arc::new(F::two_adic_subgroup(n_log).into_iter().map(|x| shift * x).collect::<Vec<F>>())
         }
 
-        pub(crate) fn inverse_coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
+        pub(crate) fn normalized_inverse_coset_shift_powers<F: Field>(
+            degree: usize,
+        ) -> Arc<Vec<F>> {
             Arc::new(
                 F::coset_shift()
                     .inverse()
-                    .powers()
+                    .shifted_powers(F::inverse_2exp(log2_strict(degree)))
                     .take(degree)
                     .collect::<Vec<F>>(),
             )
@@ -2432,8 +2445,8 @@ pub(crate) mod precomputed {
     }
 
     pub(crate) use imp::{
-        coset_shift_powers, inverse_coset_shift_powers, shifted_two_adic_subgroup,
-        two_adic_subgroup,
+        coset_shift_powers, normalized_inverse_coset_shift_powers,
+        shifted_two_adic_subgroup, two_adic_subgroup,
     };
 }
 

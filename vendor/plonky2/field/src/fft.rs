@@ -321,6 +321,38 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
     PolynomialCoeffs { coeffs: buffer }
 }
 
+/// IFFT with a postscale that already includes the `1 / n` normalization.
+///
+/// This is deliberately separate from `ifft_with_options_and_postscale`: its
+/// caller promises that `normalized_postscale[i] == n^-1 * scale[i]` in the
+/// field, so the reversal pass needs one multiplication per coefficient rather
+/// than first multiplying by `n^-1` and then by `scale[i]`. Generic IFFT and
+/// the historical unnormalized postscale retain their exact operation order.
+pub(crate) fn ifft_with_options_and_normalized_postscale<F: Field>(
+    poly: PolynomialValues<F>,
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+    normalized_postscale: &[F],
+) -> PolynomialCoeffs<F> {
+    let n = poly.len();
+    let PolynomialValues { values: mut buffer } = poly;
+    fft_dispatch(&mut buffer, zero_factor, root_table);
+
+    assert_eq!(normalized_postscale.len(), n);
+    buffer[0] *= normalized_postscale[0];
+    if n > 1 {
+        buffer[n / 2] *= normalized_postscale[n / 2];
+    }
+    for i in 1..(n / 2) {
+        let j = n - i;
+        let coeffs_i = buffer[j] * normalized_postscale[i];
+        let coeffs_j = buffer[i] * normalized_postscale[j];
+        buffer[i] = coeffs_i;
+        buffer[j] = coeffs_j;
+    }
+    PolynomialCoeffs { coeffs: buffer }
+}
+
 /// `ifft` of a borrowed column without the caller-side copy: the initial
 /// bit-reversal permutation is applied as an out-of-place gather from
 /// `values` into the fresh buffer (the same permutation `fft_classic`'s
