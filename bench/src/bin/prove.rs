@@ -59,6 +59,7 @@ static MALLOC_CONF: &[u8; 34] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
+    let probe_process_started = std::time::Instant::now();
     // First statement in the process: the Metal shader compile and pipeline
     // lowering behind the GPU hash path cost the better part of a second on a
     // cold OS shader cache, and the benchmark sandbox denies writes to that
@@ -185,6 +186,18 @@ fn main() {
     // `fsync` would only add durability latency to the scored process lifetime.
     let file = writer.into_inner().expect("cannot flush proof output");
     drop(file);
+
+    // Measurement only, and only under `LIGHTER_COMMIT_PROBE=1`, which the
+    // scored path cannot set. Printed after the proof has reached its
+    // descriptor, so it cannot perturb anything the harness times or reads.
+    let probe_report = plonky2::hash::poseidon2::commit_probe_report();
+    if !probe_report.is_empty() {
+        eprint!("{probe_report}");
+        eprintln!(
+            "process wall {:.1} ms",
+            probe_process_started.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
     // The score is the sum of worker process lifetimes (spawn -> exit), so the
     // destructor teardown after the proof is written is scored dead work: the
