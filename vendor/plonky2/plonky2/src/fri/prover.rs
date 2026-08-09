@@ -8,7 +8,7 @@ use plonky2_maybe_rayon::*;
 
 use crate::field::extension::{unflatten, Extendable, FieldExtension};
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
-use crate::fri::oracle::coset_fft_zero_tail;
+use crate::fri::oracle::coset_fft_zero_tail_cached_base;
 use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQueryStep};
 use crate::fri::{FriConfig, FriParams};
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
@@ -132,7 +132,10 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
 ) -> FriCommitedTrees<F, C, D> {
     let mut trees = Vec::with_capacity(fri_params.reduction_arity_bits.len());
 
-    let mut shift = F::MULTIPLICATIVE_GROUP_GENERATOR;
+    let prefix_support = coeffs.len() >> fri_params.config.rate_bits;
+    let fri_coset_powers =
+        crate::plonk::prover::precomputed::coset_shift_powers::<F>(prefix_support);
+    let mut prefix_power_stride = 1usize;
     let num_rounds = fri_params.reduction_arity_bits.len();
     for (round, arity_bits) in fri_params.reduction_arity_bits.iter().enumerate() {
         let arity = 1 << arity_bits;
@@ -203,7 +206,7 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
             *value = F::Extension::ZERO;
         }
         coeffs = PolynomialCoeffs::new(folded);
-        shift = shift.exp_u64(arity as u64);
+        prefix_power_stride *= arity;
         // Chunk-wise folding preserves the zero tail: the coefficient vector
         // keeps `1/2^rate_bits` support every round (asserted by the
         // truncation below), so the FFT's zero-run shortcut always applies.
@@ -216,9 +219,10 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // unread — everything below this loop uses only `coeffs` — so the
         // last round's transform is entirely dead work. Skip it.
         if round + 1 < num_rounds {
-            values = coset_fft_zero_tail(
+            values = coset_fft_zero_tail_cached_base::<F, D>(
                 &coeffs,
-                shift.into(),
+                &fri_coset_powers,
+                prefix_power_stride,
                 live_chunks,
                 Some(fri_params.config.rate_bits),
                 None,

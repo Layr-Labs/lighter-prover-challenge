@@ -6,7 +6,7 @@ use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
-use crate::field::extension::Extendable;
+use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::fft::{
     FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
 };
@@ -684,13 +684,18 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // zeros written by the `resize` just above, so the FFT's zero-run
             // shortcut applies and the coset scaling over that tail is a
             // multiply-by-zero: scale only the `live_coeffs` prefix.
-            coset_fft_zero_tail(
-                &lde_final_poly,
-                F::coset_shift().into(),
-                live_coeffs,
-                Some(fri_params.config.rate_bits),
-                None,
-            )
+            {
+                let fri_coset_powers =
+                    crate::plonk::prover::precomputed::coset_shift_powers::<F>(live_coeffs);
+                coset_fft_zero_tail_cached_base::<F, D>(
+                    &lde_final_poly,
+                    &fri_coset_powers,
+                    1,
+                    live_coeffs,
+                    Some(fri_params.config.rate_bits),
+                    None,
+                )
+            }
         );
 
         let fri_proof = fri_proof::<F, C, D>(
@@ -750,6 +755,58 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
         unsafe { scaled.set_len(len) };
     } else {
         scaled.resize(len, F::ZERO);
+    }
+    if crate::hash::poseidon2::is_exclusive_gpu_phase() {
+        fft_in_place_with_options_parallel(&mut scaled, zero_factor, root_table);
+    } else {
+        fft_in_place_with_options(&mut scaled, zero_factor, root_table);
+    }
+    PolynomialValues::new(scaled)
+}
+
+/// Extension-field FRI sibling of [`coset_fft_zero_tail`] whose coset shift is
+/// known to lie in the base field. `coset_powers[i * power_stride]` is exactly
+/// the extension-valued `shift^i` used by the generic path; `scalar_mul`
+/// therefore computes the same two limb products while deleting the general
+/// extension multiply and its serial extension-power recurrence.
+pub(crate) fn coset_fft_zero_tail_cached_base<F: Field + Extendable<D>, const D: usize>(
+    coeffs: &PolynomialCoeffs<F::Extension>,
+    coset_powers: &[F],
+    power_stride: usize,
+    live: usize,
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F::Extension>>,
+) -> PolynomialValues<F::Extension> {
+    let len = coeffs.len();
+    debug_assert!(live <= len);
+    debug_assert!(power_stride > 0);
+    debug_assert!(
+        live == 0
+            || (live - 1)
+                .checked_mul(power_stride)
+                .is_some_and(|last| last < coset_powers.len())
+    );
+    let zero_tail_is_unread =
+        matches!(zero_factor, Some(r) if r > 0 && live >= 2 && live == len >> r);
+    debug_assert!(zero_tail_is_unread || coeffs.coeffs[live..].iter().all(F::Extension::is_zero));
+    let mut scaled = Vec::with_capacity(len);
+    scaled.extend(
+        coeffs.coeffs[..live]
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, coefficient)| {
+                <F::Extension as FieldExtension<D>>::scalar_mul(
+                    &coefficient,
+                    coset_powers[i * power_stride],
+                )
+            }),
+    );
+    if zero_tail_is_unread {
+        // Same write-before-read invariant as the generic zero-tail path.
+        unsafe { scaled.set_len(len) };
+    } else {
+        scaled.resize(len, F::Extension::ZERO);
     }
     if crate::hash::poseidon2::is_exclusive_gpu_phase() {
         fft_in_place_with_options_parallel(&mut scaled, zero_factor, root_table);
