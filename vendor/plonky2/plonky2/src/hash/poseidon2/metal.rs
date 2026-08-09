@@ -173,6 +173,7 @@ const MAX_CACHED_DIGEST_OUTPUTS: usize = 4;
 struct MetalShared {
     device: Device,
     queue: CommandQueue,
+    low_latency_queue: CommandQueue,
     leaf_pipeline: ComputePipelineState,
     leaf_colmajor_pipeline: ComputePipelineState,
     parent_pipeline: ComputePipelineState,
@@ -2310,6 +2311,7 @@ impl MetalShared {
 
             Ok(Self {
                 queue: device.new_command_queue(),
+                low_latency_queue: device.new_command_queue(),
                 device,
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
@@ -3475,7 +3477,7 @@ impl MetalShared {
                 LeafSource::Rows(_) => &self.leaf_pipeline,
                 LeafSource::Columns(_) | LeafSource::Shared(_) => &self.leaf_colmajor_pipeline,
             };
-            let command_buffer = self.queue.new_command_buffer();
+            let command_buffer = self.low_latency_queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(leaf_pipeline);
             encoder.set_buffer(0, Some(input_buffer), 0);
