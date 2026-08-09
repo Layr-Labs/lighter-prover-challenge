@@ -19,6 +19,103 @@ use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MAT
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 
+/// Builds the committed `MTLBinaryArchive` of every kernel in
+/// [`METALLIB_REQUIRED_KERNELS`] and writes it to `out_path`.
+///
+/// STANDALONE AND RE-RUNNABLE BY A HUMAN, DELIBERATELY NOT A BUILD STEP.
+/// `build.rs` must never touch Metal (it has failed 6/6 times across two
+/// solvers), so the artifact is committed and regenerated on demand:
+///
+/// ```text
+/// cargo run --release --example gen_pipeline_archive
+/// ```
+///
+/// It lives here rather than in the tool so that it reads the same
+/// `SHADER_SOURCE` and the same kernel list the runtime does. A generator that
+/// keeps its own copy of either would drift silently, and a drifted archive
+/// misses at runtime without a word.
+///
+/// Compiles from source rather than from `SHADER_METALLIB` on purpose: an
+/// archive is keyed on the compiled function, so it only hits for the library
+/// the worker actually ends up with. See [`select_library`].
+///
+/// Self-checking: after serializing, it reloads the archive and re-creates
+/// every pipeline with `FailOnBinaryArchiveMiss`. Without that flag Metal
+/// silently compiles on a miss and "success" would prove nothing, so the
+/// verification is the whole point of the tool and not a courtesy.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+pub fn generate_pipeline_archive(out_path: &std::path::Path) -> Result<String, String> {
+    use metal::{BinaryArchiveDescriptor, ComputePipelineDescriptor, MTLPipelineOption};
+
+    autoreleasepool(|| {
+        let device = Device::system_default().ok_or("no Metal device")?;
+        let library = device
+            .new_library_with_source(SHADER_SOURCE, &CompileOptions::new())
+            .map_err(|error| format!("shader compilation failed: {error}"))?;
+
+        let archive = device
+            .new_binary_archive_with_descriptor(&BinaryArchiveDescriptor::new())
+            .map_err(|error| format!("could not create binary archive: {error}"))?;
+        for name in METALLIB_REQUIRED_KERNELS {
+            let function = library
+                .get_function(name, None)
+                .map_err(|error| format!("kernel {name} unavailable: {error}"))?;
+            let descriptor = ComputePipelineDescriptor::new();
+            descriptor.set_compute_function(Some(&function));
+            archive
+                .add_compute_pipeline_functions_with_descriptor(&descriptor)
+                .map_err(|error| format!("could not archive {name}: {error}"))?;
+        }
+
+        // `serializeToURL:` refuses to overwrite.
+        let _ = std::fs::remove_file(out_path);
+        archive
+            .serialize_to_url(&archive_url(out_path))
+            .map_err(|error| format!("could not serialize archive: {error}"))?;
+
+        // Reload from disk exactly as a worker would, then demand a hit.
+        let descriptor = BinaryArchiveDescriptor::new();
+        descriptor.set_url(&archive_url(out_path));
+        let reloaded = device
+            .new_binary_archive_with_descriptor(&descriptor)
+            .map_err(|error| format!("archive did not reload: {error}"))?;
+        for name in METALLIB_REQUIRED_KERNELS {
+            let function = library
+                .get_function(name, None)
+                .map_err(|error| format!("kernel {name} unavailable: {error}"))?;
+            let descriptor = ComputePipelineDescriptor::new();
+            descriptor.set_compute_function(Some(&function));
+            descriptor.set_binary_archives(&[&reloaded]);
+            device
+                .new_compute_pipeline_state_with_reflection(
+                    &descriptor,
+                    MTLPipelineOption::FailOnBinaryArchiveMiss,
+                )
+                .map_err(|error| {
+                    format!("archive verification MISSED on {name}: {error}")
+                })?;
+        }
+
+        let bytes = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
+        Ok(format!(
+            "wrote {} ({bytes} bytes); {} kernels verified present under \
+             FailOnBinaryArchiveMiss",
+            out_path.display(),
+            METALLIB_REQUIRED_KERNELS.len(),
+        ))
+    })
+}
+
+/// `URLWithString:` hands back an autoreleased object that the binding wraps as
+/// owned and would release a second time.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn archive_url(path: &std::path::Path) -> std::mem::ManuallyDrop<metal::URL> {
+    std::mem::ManuallyDrop::new(metal::URL::new_with_string(&format!(
+        "file://{}",
+        path.display()
+    )))
+}
+
 /// `poseidon2.metal` precompiled to AIR, so a worker that cannot use the Metal
 /// shader cache does not pay the MSL front end. Regenerate whenever
 /// `poseidon2.metal` changes (see `MetalShared::new`); the
@@ -44,6 +141,254 @@ const METALLIB_REQUIRED_KERNELS: [&str; 9] = [
     "poseidon2_gate_quotient",
     "range_check_gate_quotient",
 ];
+/// Serialized `MTLBinaryArchive` of every kernel in
+/// [`METALLIB_REQUIRED_KERNELS`], produced by [`generate_pipeline_archive`].
+///
+/// Creating a compute pipeline lowers that kernel's AIR to GPU ISA through
+/// MTLCompilerService. Measured on an M4 Pro with the shader cache DENIED (the
+/// ranked sandbox profile denies writes to `com.apple.metal`, so entries are
+/// never populated), the nine lowerings cost 1628 ms serially --
+/// `range_check_gate_quotient` 497, `poseidon2_gate_quotient` 406, the four
+/// Poseidon2 kernels 168-186 each. Loading them from an archive instead costs
+/// 0.02-0.19 ms apiece.
+///
+/// Regenerate with `cargo run --release --example gen_pipeline_archive`.
+const PIPELINE_ARCHIVE: &[u8] = include_bytes!("poseidon2_pipelines.metalar");
+
+/// The library-choice POLICY, separated from the environment it runs in.
+///
+/// `select_library` mixes a decision with two facts it cannot control on a
+/// given host: whether the archive loads, and whether the OS will accept the
+/// prebuilt metallib. On macOS 15.x the second is always `false`, so the branch
+/// that returns a metallib is unreachable here and a passing suite would imply
+/// coverage it does not have — the same shape as
+/// `metallib_loads_and_exposes_every_kernel`, a guard that could not fail on the
+/// machine it protected and therefore never did.
+///
+/// Splitting the policy out makes the DECISION exhaustively testable on any
+/// host (see `bench/tests/pipeline_archive.rs`), leaving only the environmental
+/// fact untested — which is documented rather than implied.
+///
+/// True means "try the prebuilt metallib first". Only sound when the archive is
+/// unusable: with a usable archive the library must be the source compile the
+/// archive was built from, or every lookup misses in silence.
+#[doc(hidden)]
+pub const fn prefer_prebuilt_metallib(archive_usable: bool) -> bool {
+    !archive_usable
+}
+
+/// Which library to build the pipelines from, decided at runtime.
+///
+/// A binary archive is keyed on the *compiled function*, so [`PIPELINE_ARCHIVE`]
+/// only hits for the library it was built from — the source compile. That gives
+/// two regimes, and taking the wrong one in either costs us:
+///
+/// * **archive usable** → pin the source compile. Accepting the prebuilt
+///   metallib here (on a host whose OS can load it) would swap in different AIR,
+///   every lookup would miss, and — because production must never set
+///   `FailOnBinaryArchiveMiss` — the miss would be SILENT: full cold lowering, a
+///   correct proof, a green verifier.
+/// * **archive unusable** → the archive can save nothing, so prefer the
+///   metallib and recover the ~185 ms front-end compile it skips.
+///
+/// Deciding it on the archive rather than on a constant is what makes the
+/// mechanism weakly dominate current behaviour in *every* regime instead of
+/// losing ~185 ms/worker in the corner where the archive does not load but the
+/// metallib would have.
+///
+/// NOTE: the third path — archive unusable AND metallib usable — is
+/// unreachable on macOS 15.x, where `newLibraryWithData:` rejects the committed
+/// artifact with "This library is using language version 4.0 which is not
+/// supported on this OS". It is therefore UNEXERCISED by the test suite on this
+/// hardware. A passing suite here does not cover it.
+fn select_library(device: &Device, archive_usable: bool) -> Result<metal::Library, String> {
+    if prefer_prebuilt_metallib(archive_usable) {
+        if let Some(library) = device
+            .new_library_with_data(SHADER_METALLIB)
+            .ok()
+            .filter(|library| {
+                METALLIB_REQUIRED_KERNELS
+                    .iter()
+                    .all(|name| library.get_function(name, None).is_ok())
+            })
+        {
+            log::info!(
+                "pipeline archive unusable; using the prebuilt metallib and skipping the \
+                 source compile"
+            );
+            return Ok(library);
+        }
+    }
+    device
+        .new_library_with_source(SHADER_SOURCE, &CompileOptions::new())
+        .map_err(|error| format!("shader compilation failed: {error}"))
+}
+
+/// Where the archive was materialized for this process, set once.
+static PIPELINE_ARCHIVE_PATH: std::sync::OnceLock<std::path::PathBuf> =
+    std::sync::OnceLock::new();
+/// Pipelines whose creation took long enough to have been a cold lowering
+/// rather than an archive hit. Non-zero means the archive is not supplying the
+/// code -- the observable half of "a miss must degrade, not abort".
+static PIPELINE_ARCHIVE_SLOW_BUILDS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+/// A hit is sub-millisecond and a cold lowering is >150 ms, so anything above
+/// this is unambiguously a miss without needing `FailOnBinaryArchiveMiss` --
+/// which production must not set, because a miss has to degrade.
+const PIPELINE_ARCHIVE_SLOW_MS: u128 = 25;
+
+/// Number of pipelines that were lowered rather than loaded. Zero on a healthy
+/// host; the whole count on a host whose GPU or driver the archive does not
+/// match. Read by tests and by the diagnostics path.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+pub fn pipeline_archive_slow_builds() -> usize {
+    PIPELINE_ARCHIVE_SLOW_BUILDS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Writes the embedded archive somewhere Metal can open it.
+///
+/// Every candidate is soft and every failure returns `None`, which leaves the
+/// caller lowering kernels exactly as it did before this existed.
+fn materialize_pipeline_archive() -> Option<&'static std::path::Path> {
+    if let Some(path) = PIPELINE_ARCHIVE_PATH.get() {
+        return Some(path.as_path());
+    }
+    if PIPELINE_ARCHIVE.len() < 64 {
+        return None;
+    }
+    let name = format!("lighter_poseidon2_pipelines_{}.metalar", std::process::id());
+    let mut dirs: Vec<std::path::PathBuf> = Vec::with_capacity(3);
+    if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+        dirs.push(std::path::PathBuf::from(tmpdir));
+    }
+    dirs.push(std::env::temp_dir());
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    for dir in dirs {
+        let path = dir.join(&name);
+        if std::fs::write(&path, PIPELINE_ARCHIVE).is_ok() {
+            let _ = PIPELINE_ARCHIVE_PATH.set(path);
+            return PIPELINE_ARCHIVE_PATH.get().map(|p| p.as_path());
+        }
+    }
+    log::debug!("pipeline archive could not be materialized; lowering kernels instead");
+    None
+}
+
+/// Opens the materialized archive for `device`.
+///
+/// `MTLBinaryArchive` is neither `Send` nor `Sync`, so each pipeline-building
+/// thread opens its own; the 1 MiB write happens once and the reopen is a file
+/// open. A serialized archive is ISA- and driver-specific, so a host this
+/// archive was not built for lands here with an error and gets `None` -- never
+/// a hard failure, because `shared_context()` treats a shader failure as "run
+/// Merkle on the CPU", which is 81% of GPU occupancy and would be a
+/// catastrophic silent regression rather than a visible one.
+fn open_pipeline_archive(device: &Device) -> Option<metal::BinaryArchive> {
+    let path = materialize_pipeline_archive()?;
+    let descriptor = metal::BinaryArchiveDescriptor::new();
+    descriptor.set_url(&archive_url(path));
+    match device.new_binary_archive_with_descriptor(&descriptor) {
+        Ok(archive) => Some(archive),
+        Err(error) => {
+            log::info!(
+                "pipeline archive unusable on this device ({error}); lowering kernels instead"
+            );
+            None
+        }
+    }
+}
+
+/// Creates one compute pipeline, preferring the archived lowering.
+///
+/// The descriptor carries the archive but NOT `FailOnBinaryArchiveMiss`: on a
+/// miss Metal lowers the kernel normally, which is the required graceful
+/// degradation. The elapsed time is what makes the miss observable — see
+/// [`PIPELINE_ARCHIVE_SLOW_MS`].
+fn build_pipeline(
+    device: &Device,
+    library: &metal::Library,
+    name: &str,
+) -> Result<ComputePipelineState, String> {
+    let function = library
+        .get_function(name, None)
+        .map_err(|error| format!("{name} kernel unavailable: {error}"))?;
+    let descriptor = metal::ComputePipelineDescriptor::new();
+    descriptor.set_compute_function(Some(&function));
+    let archive = open_pipeline_archive(device);
+    if let Some(archive) = archive.as_ref() {
+        descriptor.set_binary_archives(&[archive]);
+    }
+    let started = std::time::Instant::now();
+    let pipeline = device
+        .new_compute_pipeline_state(&descriptor)
+        .map_err(|error| format!("{name} pipeline creation failed: {error}"))?;
+    let elapsed = started.elapsed().as_millis();
+    if elapsed >= PIPELINE_ARCHIVE_SLOW_MS {
+        PIPELINE_ARCHIVE_SLOW_BUILDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        log::info!("pipeline {name} took {elapsed} ms: archive MISS, lowered from AIR");
+    }
+    Ok(pipeline)
+}
+
+/// Checks the committed [`PIPELINE_ARCHIVE`] against kernels compiled from
+/// `source` (`None` = the shipped [`SHADER_SOURCE`]), demanding a hit for every
+/// one under `FailOnBinaryArchiveMiss`.
+///
+/// This is the only place the flag belongs outside the generator. Production
+/// must never set it: on a ranked GPU this archive was not built for, a hard
+/// pipeline failure propagates into `shared_context()`, which treats a shader
+/// failure as "hash Merkle on the CPU" — 81% of GPU occupancy, a correct proof,
+/// a green verifier, and a catastrophic regression with no signal. Here, where
+/// a failure is a test result rather than a fallback, demanding the hit is
+/// exactly right: without the flag Metal silently lowers on a miss and a pass
+/// would prove nothing.
+///
+/// Returns the number of kernels verified.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+pub fn verify_pipeline_archive(source: Option<&str>) -> Result<usize, String> {
+    use metal::{BinaryArchiveDescriptor, ComputePipelineDescriptor, MTLPipelineOption};
+
+    autoreleasepool(|| {
+        let device = Device::system_default().ok_or("no Metal device")?;
+        let library = device
+            .new_library_with_source(source.unwrap_or(SHADER_SOURCE), &CompileOptions::new())
+            .map_err(|error| format!("shader compilation failed: {error}"))?;
+        let path = materialize_pipeline_archive()
+            .ok_or("committed pipeline archive could not be materialized")?;
+        let descriptor = BinaryArchiveDescriptor::new();
+        descriptor.set_url(&archive_url(path));
+        let archive = device
+            .new_binary_archive_with_descriptor(&descriptor)
+            .map_err(|error| format!("committed pipeline archive did not load: {error}"))?;
+
+        for name in METALLIB_REQUIRED_KERNELS {
+            let function = library
+                .get_function(name, None)
+                .map_err(|error| format!("kernel {name} unavailable: {error}"))?;
+            let descriptor = ComputePipelineDescriptor::new();
+            descriptor.set_compute_function(Some(&function));
+            descriptor.set_binary_archives(&[&archive]);
+            device
+                .new_compute_pipeline_state_with_reflection(
+                    &descriptor,
+                    MTLPipelineOption::FailOnBinaryArchiveMiss,
+                )
+                .map_err(|error| {
+                    format!(
+                        "pipeline archive MISSES {name}. The archive is stale relative to \
+                         poseidon2.metal; regenerate it with\n  \
+                         cargo run --release --example gen_pipeline_archive\n({error})"
+                    )
+                })?;
+        }
+        Ok(METALLIB_REQUIRED_KERNELS.len())
+    })
+}
+
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
 /// (6654d43) ranked-validated this raised value inside its composition; my
 /// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
@@ -680,13 +1025,8 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
         let spawned = std::thread::Builder::new()
             .name(format!("poseidon2-metal-{name}"))
             .spawn(move || {
-                let pipeline = autoreleasepool(|| {
-                    library.get_function(name, None).ok().and_then(|function| {
-                        device
-                            .new_compute_pipeline_state_with_function(&function)
-                            .ok()
-                    })
-                });
+                let pipeline =
+                    autoreleasepool(|| build_pipeline(&device, &library, name).ok());
                 if pipeline.is_none() {
                     log::debug!("{name} pipeline unavailable; evaluating those gates on the CPU");
                 }
@@ -1767,22 +2107,10 @@ impl MetalShared {
             //   xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib
             // and `metallib_matches_shader_source` fails the test run if you
             // forget.
-            let library = device
-                .new_library_with_data(SHADER_METALLIB)
-                .ok()
-                .filter(|library| {
-                    METALLIB_REQUIRED_KERNELS
-                        .iter()
-                        .all(|name| library.get_function(name, None).is_ok())
-                })
-                .map_or_else(
-                    || {
-                        device
-                            .new_library_with_source(SHADER_SOURCE, &options)
-                            .map_err(|error| format!("shader compilation failed: {error}"))
-                    },
-                    Ok,
-                )?;
+            // Probe the archive once, before choosing a library: the choice
+            // depends on whether the archive can supply lowerings at all.
+            let archive_usable = open_pipeline_archive(&device).is_some();
+            let library = select_library(&device, archive_usable)?;
             // Build the compute pipelines concurrently, one thread each.
             //
             // Every `newComputePipelineStateWithFunction:` lowers that kernel's
@@ -1804,16 +2132,11 @@ impl MetalShared {
             // that created them rather than leaking.
             let device_ref = &device;
             let library_ref = &library;
-            let required = |name: &'static str, kind: &'static str| {
+            let required = |name: &'static str, _kind: &'static str| {
                 move || -> Result<ComputePipelineState, String> {
-                    autoreleasepool(|| {
-                        let function = library_ref
-                            .get_function(name, None)
-                            .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
-                        device_ref
-                            .new_compute_pipeline_state_with_function(&function)
-                            .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
-                    })
+                    // Through `build_pipeline` so the committed archive is
+                    // consulted; on a miss it lowers exactly as before.
+                    autoreleasepool(|| build_pipeline(device_ref, library_ref, name))
                 }
             };
             // The two gate-quotient kernels are the two most expensive to lower
