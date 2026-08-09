@@ -27,7 +27,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "6a65119780a2645ce0077ef1da44d2774ca31aa1ef5c511162280d1b2f15213f";
+    "f055ecd7a6fe33b9d2a593bcef80b177b600addff9483be00b1eb2faf515a17a";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -361,6 +361,12 @@ pub(crate) enum U32QuotientKind {
         base: usize,
     },
     Selection,
+    /// U32InterleaveGate: two routed words and 32 big-endian bit wires per
+    /// operation; 34 constraints per operation.
+    Interleave,
+    /// UninterleaveToU32Gate: four routed words and 64 big-endian bit wires
+    /// per operation; 68 constraints per operation.
+    Uninterleave,
 }
 
 #[derive(Clone, Debug)]
@@ -1325,6 +1331,20 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                         spec.num_ops.checked_mul(5)?,
                         spec.num_ops.checked_mul(2)?,
                     )
+                }
+                U32QuotientKind::Interleave => {
+                    if spec.num_ops != 4 {
+                        return None;
+                    }
+                    let count = spec.num_ops.checked_mul(34)?;
+                    (13usize, 0usize, 0usize, 0usize, count, count)
+                }
+                U32QuotientKind::Uninterleave => {
+                    if spec.num_ops != 2 {
+                        return None;
+                    }
+                    let count = spec.num_ops.checked_mul(68)?;
+                    (14usize, 0usize, 0usize, 0usize, count, count)
                 }
             };
         if wire_count > wires.cols
@@ -3783,6 +3803,24 @@ mod tests {
             num_ops: 20,
             kind: U32QuotientKind::Selection,
         });
+        let interleave_selector_column = specs.len();
+        specs.push(U32QuotientSpec {
+            selector_column: interleave_selector_column,
+            gate_index: 241,
+            group: 240..243,
+            include_unused_selector: true,
+            num_ops: 4,
+            kind: U32QuotientKind::Interleave,
+        });
+        let uninterleave_selector_column = specs.len();
+        specs.push(U32QuotientSpec {
+            selector_column: uninterleave_selector_column,
+            gate_index: 244,
+            group: 243..246,
+            include_unused_selector: true,
+            num_ops: 2,
+            kind: U32QuotientKind::Uninterleave,
+        });
         let addition_selector_column = specs.len();
         let addition_constant_base = addition_selector_column + 1;
         specs.push(U32QuotientSpec {
@@ -4000,6 +4038,63 @@ mod tests {
                                 constraints.push((b * x - temp) - result);
                             }
                             assert_eq!(constraints.len(), 2 * spec.num_ops);
+                        }
+                        U32QuotientKind::Interleave => {
+                            for op in 0..spec.num_ops {
+                                let routed = 2 * op;
+                                let bit_base = 2 * spec.num_ops + 32 * op;
+                                let mut recomposed = F::ZERO;
+                                let mut interleaved = F::ZERO;
+                                for j in 0..32 {
+                                    let bit = wires.col(bit_base + j)[source_row];
+                                    recomposed = recomposed.double() + bit;
+                                    interleaved = interleaved * four + bit;
+                                }
+                                constraints.push(recomposed - wires.col(routed)[source_row]);
+                                constraints.push(
+                                    interleaved - wires.col(routed + 1)[source_row],
+                                );
+                                for j in 0..32 {
+                                    let bit = wires.col(bit_base + j)[source_row];
+                                    constraints.push(bit * (bit - F::ONE));
+                                }
+                            }
+                            assert_eq!(constraints.len(), 34 * spec.num_ops);
+                        }
+                        U32QuotientKind::Uninterleave => {
+                            for op in 0..spec.num_ops {
+                                let routed = 4 * op;
+                                let bit_base = 4 * spec.num_ops + 64 * op;
+                                let mut high = F::ZERO;
+                                let mut low = F::ZERO;
+                                let mut evens = F::ZERO;
+                                let mut odds = F::ZERO;
+                                for j in 0..64 {
+                                    let bit = wires.col(bit_base + j)[source_row];
+                                    if j < 32 {
+                                        high = high.double() + bit;
+                                    } else {
+                                        low = low.double() + bit;
+                                    }
+                                    if j & 1 == 0 {
+                                        evens = evens.double() + bit;
+                                    } else {
+                                        odds = odds.double() + bit;
+                                    }
+                                }
+                                let inverse = wires.col(routed + 3)[source_row];
+                                constraints.push((inverse * (u32_max - high) - F::ONE) * low);
+                                constraints.push(
+                                    high * base32 + low - wires.col(routed)[source_row],
+                                );
+                                constraints.push(evens - wires.col(routed + 1)[source_row]);
+                                constraints.push(odds - wires.col(routed + 2)[source_row]);
+                                for j in 0..64 {
+                                    let bit = wires.col(bit_base + j)[source_row];
+                                    constraints.push(bit * (bit - F::ONE));
+                                }
+                            }
+                            assert_eq!(constraints.len(), 68 * spec.num_ops);
                         }
                         _ => unreachable!(
                             "covered by metal_byte_and_quintic_gate_quotient_matches_cpu"
@@ -4618,6 +4713,10 @@ mod tests {
                             unreachable!("covered by metal_u32_gate_quotient_matches_cpu")
                         }
                         U32QuotientKind::Selection => {
+                            unreachable!("covered by metal_u32_gate_quotient_matches_cpu")
+                        }
+                        U32QuotientKind::Interleave
+                        | U32QuotientKind::Uninterleave => {
                             unreachable!("covered by metal_u32_gate_quotient_matches_cpu")
                         }
                     }

@@ -83,6 +83,12 @@ pub enum U32QuotientGate {
     BaseSum { base: usize, num_limbs: usize },
     /// Four routed values and one temporary per operation; two constraints.
     Selection { num_ops: usize },
+    /// A 32-bit word, its zero-interleaved image, and one big-endian bit
+    /// decomposition per operation.
+    Interleave { num_ops: usize },
+    /// A 64-bit interleaved word, its even/odd 32-bit halves, an inverse used
+    /// for Goldilocks canonicity, and one big-endian bit decomposition.
+    Uninterleave { num_ops: usize },
 }
 
 /// A custom gate.

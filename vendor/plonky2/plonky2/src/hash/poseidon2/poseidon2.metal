@@ -1355,6 +1355,96 @@ kernel void range_check_gate_quotient(
                     alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
+        } else if (kind == 13u) {
+            // U32InterleaveGate: two routed words per operation (x and its
+            // zero-interleaved image), followed by 32 big-endian bit wires.
+            // The reductions and boolean rows match the CPU gate's order;
+            // rows may be accumulated out of execution order because each is
+            // multiplied by its explicit alpha power.
+            for (uint op = 0; op < num_ops; ++op) {
+                uint row_base = constraint_index;
+                ulong routed_base = (ulong)op * 2u;
+                ulong bit_base = (ulong)num_ops * 2u + (ulong)op * 32u;
+                ulong recomposed = 0;
+                ulong interleaved = 0;
+                for (uint j = 0; j < 32u; ++j) {
+                    ulong bit = wires[(bit_base + j) * lde_rows + source_row];
+                    recomposed = gl_add(gl_add(recomposed, recomposed), bit);
+                    interleaved = gl_add(gl_quadruple(interleaved), bit);
+                    range_check_gate_emit(
+                        gl_mul(bit, gl_sub(bit, 1)),
+                        alpha_powers, alpha_stride, gate_accumulators,
+                        row_base + 2u + j);
+                }
+                ulong x = wires[routed_base * lde_rows + source_row];
+                ulong x_interleaved =
+                    wires[(routed_base + 1u) * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(recomposed, x),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    row_base);
+                range_check_gate_emit(
+                    gl_sub(interleaved, x_interleaved),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    row_base + 1u);
+                constraint_index = row_base + 34u;
+            }
+        } else if (kind == 14u) {
+            // UninterleaveToU32Gate: four routed words per operation
+            // (interleaved input, even half, odd half, inverse), followed by
+            // its 64 big-endian bits. The first four rows are the Goldilocks
+            // canonicity, full recomposition, even and odd recompositions;
+            // the remaining rows enforce bitness.
+            for (uint op = 0; op < num_ops; ++op) {
+                uint row_base = constraint_index;
+                ulong routed_base = (ulong)op * 4u;
+                ulong bit_base = (ulong)num_ops * 4u + (ulong)op * 64u;
+                ulong high = 0;
+                ulong low = 0;
+                ulong evens = 0;
+                ulong odds = 0;
+                for (uint j = 0; j < 64u; ++j) {
+                    ulong bit = wires[(bit_base + j) * lde_rows + source_row];
+                    if (j < 32u) {
+                        high = gl_add(gl_add(high, high), bit);
+                    } else {
+                        low = gl_add(gl_add(low, low), bit);
+                    }
+                    if ((j & 1u) == 0u) {
+                        evens = gl_add(gl_add(evens, evens), bit);
+                    } else {
+                        odds = gl_add(gl_add(odds, odds), bit);
+                    }
+                    range_check_gate_emit(
+                        gl_mul(bit, gl_sub(bit, 1)),
+                        alpha_powers, alpha_stride, gate_accumulators,
+                        row_base + 4u + j);
+                }
+
+                ulong x_interleaved = wires[routed_base * lde_rows + source_row];
+                ulong x_evens = wires[(routed_base + 1u) * lde_rows + source_row];
+                ulong x_odds = wires[(routed_base + 2u) * lde_rows + source_row];
+                ulong inverse = wires[(routed_base + 3u) * lde_rows + source_row];
+                ulong high_not_max = gl_sub(
+                    gl_mul(inverse, gl_sub(0xffffffffUL, high)), 1);
+                range_check_gate_emit(
+                    gl_mul(high_not_max, low),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    row_base);
+                range_check_gate_emit(
+                    gl_sub(gl_add(gl_mul(high, 4294967296UL), low), x_interleaved),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    row_base + 1u);
+                range_check_gate_emit(
+                    gl_sub(evens, x_evens),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    row_base + 2u);
+                range_check_gate_emit(
+                    gl_sub(odds, x_odds),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    row_base + 3u);
+                constraint_index = row_base + 68u;
+            }
         } else {
             // The Rust encoder rejects unknown discriminants; if a malformed
             // record reaches the shader, make its selected row unsatisfiable.

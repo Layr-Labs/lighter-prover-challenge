@@ -648,7 +648,11 @@ mod tests {
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::uint::u32::gates::arithmetic_u32::U32ArithmeticGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::uint::u32::gates::interleave_u32::U32InterleaveGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::uint::u32::gates::subtraction_u32::U32SubtractionGate;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::uint::u32::gates::uninterleave_to_u32::UninterleaveToU32Gate;
 
     use super::*;
 
@@ -703,6 +707,21 @@ mod tests {
         config.security_bits = 0;
         config.fri_config.proof_of_work_bits = 0;
         config.fri_config.num_query_rounds = 1;
+
+        // A fresh worker deliberately diverts its first eligible commitment
+        // while the Metal context warms in the background. Spend that
+        // production startup probe on a small throwaway circuit so the test's
+        // constants tree is retained and the quotient differential cannot
+        // silently exercise only the CPU fallback.
+        plonky2::hash::poseidon2::prewarm_gpu();
+        plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
+        let mut warmup_builder = CircuitBuilder::<F, D>::new(config.clone());
+        while warmup_builder.num_gates() < 1025 {
+            warmup_builder.add_gate(NoopGate, vec![]);
+        }
+        let warmup_data = warmup_builder.build::<C>();
+        warmup_data.prove(PartialWitness::new())?;
+
         let mut builder = CircuitBuilder::<F, D>::new(config.clone());
         let mut inputs = Vec::new();
         for bit_size in [16usize, 32, 48] {
@@ -748,13 +767,31 @@ mod tests {
         builder.connect(carry, Target::wire(row, add_many.wire_ith_carry(op)));
         u32_inputs.push((carry, 7));
 
-        // 4097 rows pad to degree 8192. Its rate-8 constants/sigmas and wire
-        // commitments both exceed the retained-Metal routing threshold.
+        let interleave = U32InterleaveGate::new_from_config(&config);
+        let (row, op) = builder.find_slot(interleave, &[], &[]);
+        let x = builder.add_virtual_target();
+        builder.connect(x, Target::wire(row, interleave.wire_ith_x(op)));
+        u32_inputs.push((x, 0x1234_5678));
+
+        let uninterleave = UninterleaveToU32Gate::new_from_config(&config);
+        let (row, op) = builder.find_slot(uninterleave, &[], &[]);
+        let x_interleaved = builder.add_virtual_target();
+        builder.connect(
+            x_interleaved,
+            Target::wire(row, uninterleave.wire_ith_x_interleaved(op)),
+        );
+        u32_inputs.push((x_interleaved, 0x1234_5678_9abc_def0));
+
+        // 4097 rows pad to degree 8192. Retain the constants/sigmas commitment
+        // with the production final-proof routing policy; the much wider wire
+        // commitment exceeds the default Metal threshold on its own.
         while builder.num_gates() < 4097 {
             builder.add_gate(NoopGate, vec![]);
         }
 
+        plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
         let data = builder.build::<C>();
+        plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
         let mut pw = PartialWitness::new();
         for (input, bit_size) in inputs {
             let value = match bit_size {
