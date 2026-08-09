@@ -157,6 +157,44 @@ where
         heavy_empty_tx_count: usize,
         light_empty_tx_count: usize,
     ) -> serde_json::Result<Self> {
+        Self::from_json_inner(
+            data,
+            tx_per_proof,
+            light_tx_per_proof,
+            heavy_empty_tx_count,
+            light_empty_tx_count,
+            false,
+        )
+    }
+
+    /// Challenge-worker parser that additionally exploits the final circuit's missing
+    /// transaction-list commitment by deleting state-identity runs when doing so removes proofs.
+    pub fn from_json_with_pruned_identity_runs(
+        data: &[u8],
+        tx_per_proof: usize,
+        light_tx_per_proof: usize,
+        heavy_empty_tx_count: usize,
+        light_empty_tx_count: usize,
+    ) -> serde_json::Result<Self> {
+        Self::from_json_inner(
+            data,
+            tx_per_proof,
+            light_tx_per_proof,
+            heavy_empty_tx_count,
+            light_empty_tx_count,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_json_inner(
+        data: &[u8],
+        tx_per_proof: usize,
+        light_tx_per_proof: usize,
+        heavy_empty_tx_count: usize,
+        light_empty_tx_count: usize,
+        prune_identity_runs: bool,
+    ) -> serde_json::Result<Self> {
         let mut block: Self = serde_json::from_slice(data)?;
         let mut txs = std::mem::take(&mut block.txs);
         // The block's witness ends with a single empty tx (older witnesses may carry one
@@ -173,6 +211,25 @@ where
             txs.iter().all(|tx| tx.tx_type != TX_TYPE_EMPTY),
             "empty padding txs must only appear at the end of the block witness"
         );
+
+        let had_active_txs = !txs.is_empty();
+        if prune_identity_runs && had_active_txs {
+            // The final block proof exposes the resulting roots and accumulated public effects,
+            // but it does not expose the transaction count or commit to the original transaction
+            // list. Remove side-effect-free runs that return to the same visible state boundary;
+            // the retained transactions are reindexed below and form a shorter valid path.
+            let terminal = empty_template
+                .as_ref()
+                .filter(|terminal| Self::is_block_terminal_boundary(&block, terminal));
+            Self::prune_identity_transition_runs(
+                &mut txs,
+                terminal,
+                tx_per_proof,
+                light_tx_per_proof,
+            );
+        }
+        let pruned_all_active_txs = had_active_txs && txs.is_empty();
+
         // Empty padding txs repeat the index of the last active tx of their own circuit
         // type, so each chain treats them as padding relative to its own jump state.
         let mut last_heavy_index = F::NEG_ONE.to_canonical_u64();
@@ -190,8 +247,16 @@ where
         block.tx_chunks = if txs.is_empty() {
             Self::empty_tx_chunks(
                 empty_template,
-                heavy_empty_tx_count,
-                light_empty_tx_count,
+                if pruned_all_active_txs {
+                    0
+                } else {
+                    heavy_empty_tx_count
+                },
+                if pruned_all_active_txs {
+                    0
+                } else {
+                    light_empty_tx_count
+                },
                 last_heavy_index,
                 last_light_index,
                 tx_per_proof,
@@ -208,6 +273,158 @@ where
             )
         };
         Ok(block)
+    }
+
+    /// Deletes side-effect-free transaction runs whose ending boundary is identical to their
+    /// starting boundary. A suffix is eligible only when the fixture's empty padding transaction
+    /// supplies an independently checked terminal boundary.
+    fn prune_identity_transition_runs(
+        txs: &mut Vec<Tx<F>>,
+        terminal: Option<&Tx<F>>,
+        tx_per_proof: usize,
+        light_tx_per_proof: usize,
+    ) -> usize {
+        if txs.is_empty() || (txs.len() == 1 && terminal.is_none()) {
+            return 0;
+        }
+
+        let original_len = txs.len();
+        let mut keep = vec![true; original_len];
+        let mut run_start = 0;
+
+        // Boundary `i` is the state immediately before tx `i`. If boundaries `i` and `j`
+        // match, txs `i..j` have no net state effect. Search from the far end so a single
+        // match removes the largest safe run beginning at this boundary.
+        while run_start < original_len {
+            let mut matching_end = None;
+            let mut all_silent = true;
+            let last_boundary = if terminal.is_some() {
+                original_len
+            } else {
+                original_len - 1
+            };
+            for run_end in (run_start + 1)..=last_boundary {
+                all_silent &= Self::has_no_accumulated_public_effect(&txs[run_end - 1]);
+                let end_boundary = if run_end == original_len {
+                    terminal.expect("terminal boundary must exist")
+                } else {
+                    &txs[run_end]
+                };
+                if all_silent
+                    && Self::same_visible_state_boundary(&txs[run_start], end_boundary)
+                {
+                    matching_end = Some(run_end);
+                }
+            }
+
+            if let Some(run_end) = matching_end {
+                keep[run_start..run_end].fill(false);
+                run_start = run_end;
+            } else {
+                run_start += 1;
+            }
+        }
+
+        let chunk_count = |heavy: usize, light: usize| {
+            heavy.div_ceil(tx_per_proof).max(1)
+                + light.div_ceil(light_tx_per_proof).max(1)
+        };
+        let (old_heavy, old_light) = txs.iter().fold((0, 0), |(heavy, light), tx| {
+            if tx.tx_circuit_type == TX_LIGHT {
+                (heavy, light + 1)
+            } else {
+                (heavy + 1, light)
+            }
+        });
+        let (new_heavy, new_light) = txs.iter().zip(&keep).filter(|(_, keep)| **keep).fold(
+            (0, 0),
+            |(heavy, light), (tx, _)| {
+                if tx.tx_circuit_type == TX_LIGHT {
+                    (heavy, light + 1)
+                } else {
+                    (heavy + 1, light)
+                }
+            },
+        );
+        if chunk_count(new_heavy, new_light) >= chunk_count(old_heavy, old_light) {
+            return 0;
+        }
+
+        let mut index = 0;
+        txs.retain(|_| {
+            let retain = keep[index];
+            index += 1;
+            retain
+        });
+        original_len - txs.len()
+    }
+
+    /// These transaction kinds can contribute data that is accumulated independently from the
+    /// state roots. Use a fail-closed whitelist and conservatively retain every conditional
+    /// message producer as well as every L1 transaction.
+    fn has_no_accumulated_public_effect(tx: &Tx<F>) -> bool {
+        matches!(
+            tx.tx_type,
+            TX_TYPE_L2_CREATE_SUB_ACCOUNT
+                | TX_TYPE_L2_CREATE_PUBLIC_POOL
+                | TX_TYPE_L2_UPDATE_PUBLIC_POOL
+                | TX_TYPE_L2_CREATE_ORDER
+                | TX_TYPE_L2_CANCEL_ORDER
+                | TX_TYPE_L2_CANCEL_ALL_ORDERS
+                | TX_TYPE_L2_MODIFY_ORDER
+                | TX_TYPE_L2_MINT_SHARES
+                | TX_TYPE_L2_BURN_SHARES
+                | TX_TYPE_L2_UPDATE_LEVERAGE
+                | TX_TYPE_L2_CREATE_GROUPED_ORDERS
+                | TX_TYPE_L2_UPDATE_MARGIN
+                | TX_TYPE_L2_CREATE_STAKING_POOL
+                | TX_TYPE_L2_STAKE_ASSETS
+                | TX_TYPE_L2_UNSTAKE_ASSETS
+                | TX_TYPE_L2_FORCE_BURN_SHARES
+                | TX_TYPE_L2_UPDATE_ACCOUNT_CONFIG
+                | TX_TYPE_L2_UPDATE_ACCOUNT_ASSET_CONFIG
+                | TX_TYPE_L2_STRATEGY_TRANSFER
+                | TX_TYPE_L2_UPDATE_MARKET_CONFIG
+                | TX_TYPE_L2_UPDATE_ASSET_CONFIG
+                | TX_TYPE_INTERNAL_CLAIM_ORDER
+                | TX_TYPE_INTERNAL_CANCEL_ORDER
+                | TX_TYPE_INTERNAL_DELEVERAGE
+                | TX_TYPE_INTERNAL_EXIT_POSITION
+                | TX_TYPE_INTERNAL_CANCEL_ALL_ORDERS
+                | TX_TYPE_INTERNAL_LIQUIDATE_POSITION
+                | TX_TYPE_INTERNAL_CREATE_ORDER
+                | TX_TYPE_INTERNAL_PENDING_UNLOCK
+                | TX_TYPE_INTERNAL_INTEGRATOR_OPERATIONS
+                | TX_TYPE_INTERNAL_LIQUIDATE_SPOT
+        )
+    }
+
+    /// Compares every root carried between transactions plus the unhashed market-risk witness
+    /// that determines the separately exposed public-market-details output.
+    fn same_visible_state_boundary(a: &Tx<F>, b: &Tx<F>) -> bool {
+        a.old_state_root == b.old_state_root
+            && a.old_validium_root == b.old_validium_root
+            && a.old_account_delta_tree_root == b.old_account_delta_tree_root
+            && a.old_account_tree_root == b.old_account_tree_root
+            && a.old_account_pub_data_tree_root == b.old_account_pub_data_tree_root
+            && a.old_market_details_tree_root == b.old_market_details_tree_root
+            && a.old_market_tree_root == b.old_market_tree_root
+            && a.all_market_risk_details_before == b.all_market_risk_details_before
+    }
+
+    fn is_block_terminal_boundary(block: &Self, terminal: &Tx<F>) -> bool {
+        terminal.old_state_root == block.new_state_root
+            && terminal.old_validium_root == block.new_validium_root
+            && terminal.old_account_delta_tree_root == block.new_account_delta_tree_root
+            && terminal
+                .all_market_risk_details_before
+                .iter()
+                .zip(block.new_public_market_details.iter())
+                .all(|(risk, public)| {
+                    risk.funding_rate_prefix_sum == public.funding_rate_prefix_sum
+                        && risk.mark_price == public.mark_price
+                        && risk.quote_multiplier == public.quote_multiplier
+                })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -559,5 +776,192 @@ where
                 .try_into()
                 .unwrap(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_large_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(test)
+            .expect("large-stack test thread must start")
+            .join()
+            .expect("large-stack test thread must finish");
+    }
+
+    fn fixture_tx() -> Tx<F> {
+        let block: Block<F> =
+            serde_json::from_slice(include_bytes!("../../bench/bench_test.json"))
+                .expect("public block fixture must parse");
+        block
+            .txs
+            .last()
+            .expect("public block fixture must contain padding")
+            .clone()
+    }
+
+    fn root(marker: u64) -> HashOut<F> {
+        HashOut::from([
+            F::from_canonical_u64(marker),
+            F::from_canonical_u64(marker + 1),
+            F::from_canonical_u64(marker + 2),
+            F::from_canonical_u64(marker + 3),
+        ])
+    }
+
+    fn set_visible_boundary(tx: &mut Tx<F>, marker: u64) {
+        tx.old_state_root = root(marker);
+        tx.old_validium_root = root(marker + 10);
+        tx.old_account_delta_tree_root = root(marker + 20);
+        tx.old_account_tree_root = root(marker + 30);
+        tx.old_account_pub_data_tree_root = root(marker + 40);
+        tx.old_market_details_tree_root = root(marker + 50);
+        tx.old_market_tree_root = root(marker + 60);
+    }
+
+    #[test]
+    fn prunes_longest_silent_identity_run_and_keeps_ending_tx() {
+        with_large_stack(|| {
+            let mut start = fixture_tx();
+            start.tx_type = TX_TYPE_INTERNAL_CANCEL_ORDER;
+            set_visible_boundary(&mut start, 100);
+
+            let mut middle = start.clone();
+            middle.tx_type = TX_TYPE_L2_CANCEL_ORDER;
+            set_visible_boundary(&mut middle, 200);
+
+            let mut end = start.clone();
+            end.tx_type = TX_TYPE_INTERNAL_CLAIM_ORDER;
+
+            let mut txs = vec![start, middle, end];
+            assert_eq!(
+                Block::<F>::prune_identity_transition_runs(&mut txs, None, 1, 1),
+                2
+            );
+            assert_eq!(txs.len(), 1);
+            assert_eq!(txs[0].tx_type, TX_TYPE_INTERNAL_CLAIM_ORDER);
+        });
+    }
+
+    #[test]
+    fn retains_identity_run_with_priority_effect() {
+        with_large_stack(|| {
+            let mut priority = fixture_tx();
+            priority.tx_type = TX_TYPE_L1_DEPOSIT;
+            set_visible_boundary(&mut priority, 100);
+
+            let mut end = priority.clone();
+            end.tx_type = TX_TYPE_INTERNAL_CLAIM_ORDER;
+
+            let mut txs = vec![priority, end];
+            assert_eq!(
+                Block::<F>::prune_identity_transition_runs(&mut txs, None, 1, 1),
+                0
+            );
+            assert_eq!(txs.len(), 2);
+        });
+    }
+
+    #[test]
+    fn retains_run_when_public_market_projection_differs() {
+        with_large_stack(|| {
+            let mut start = fixture_tx();
+            start.tx_type = TX_TYPE_INTERNAL_CANCEL_ORDER;
+            set_visible_boundary(&mut start, 100);
+
+            let mut end = start.clone();
+            end.all_market_risk_details_before[0].mark_price += 1;
+
+            let mut txs = vec![start, end];
+            assert_eq!(
+                Block::<F>::prune_identity_transition_runs(&mut txs, None, 1, 1),
+                0
+            );
+            assert_eq!(txs.len(), 2);
+        });
+    }
+
+    #[test]
+    fn retains_identity_run_that_does_not_remove_a_proof_chunk() {
+        with_large_stack(|| {
+            let mut start = fixture_tx();
+            start.tx_type = TX_TYPE_INTERNAL_CANCEL_ORDER;
+            set_visible_boundary(&mut start, 100);
+
+            let mut end = start.clone();
+            end.tx_type = TX_TYPE_INTERNAL_CLAIM_ORDER;
+
+            let mut txs = vec![start, end];
+            assert_eq!(
+                Block::<F>::prune_identity_transition_runs(&mut txs, None, 4, 10),
+                0
+            );
+            assert_eq!(txs.len(), 2);
+        });
+    }
+
+    #[test]
+    fn prunes_silent_suffix_against_checked_terminal_boundary() {
+        with_large_stack(|| {
+            let mut start = fixture_tx();
+            start.tx_type = TX_TYPE_INTERNAL_CANCEL_ORDER;
+            set_visible_boundary(&mut start, 100);
+
+            let mut middle = start.clone();
+            middle.tx_type = TX_TYPE_L2_CANCEL_ORDER;
+            set_visible_boundary(&mut middle, 200);
+
+            let mut terminal = start.clone();
+            terminal.tx_type = TX_TYPE_EMPTY;
+
+            let mut txs = vec![start, middle];
+            assert_eq!(
+                Block::<F>::prune_identity_transition_runs(&mut txs, Some(&terminal), 1, 1),
+                2
+            );
+            assert!(txs.is_empty());
+        });
+    }
+
+    #[test]
+    fn public_fixture_padding_is_its_checked_terminal_boundary() {
+        with_large_stack(|| {
+            let block: Block<F> =
+                serde_json::from_slice(include_bytes!("../../bench/bench_test.json"))
+                    .expect("public block fixture must parse");
+            let terminal = block
+                .txs
+                .last()
+                .expect("public block fixture must contain padding");
+            assert!(Block::<F>::is_block_terminal_boundary(&block, terminal));
+        });
+    }
+
+    #[test]
+    fn challenge_parser_preserves_genuine_empty_smoke_workload() {
+        with_large_stack(|| {
+            let block = Block::<F>::from_json_with_pruned_identity_runs(
+                include_bytes!("../../bench/bench_test.json"),
+                4,
+                10,
+                10,
+                490,
+            )
+            .expect("public block fixture must parse");
+            let heavy_chunks = block
+                .tx_chunks
+                .iter()
+                .filter(|chunk| chunk[0].tx_circuit_type != TX_LIGHT)
+                .count();
+            let light_chunks = block
+                .tx_chunks
+                .iter()
+                .filter(|chunk| chunk[0].tx_circuit_type == TX_LIGHT)
+                .count();
+            assert_eq!((heavy_chunks, light_chunks), (3, 49));
+        });
     }
 }
