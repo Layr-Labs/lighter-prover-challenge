@@ -3,6 +3,7 @@ use core::fmt::Debug;
 use plonky2_field::ops::Square;
 use plonky2_field::packable::Packable;
 use plonky2_field::packed::PackedField;
+use plonky2_maybe_rayon::*;
 
 use super::config::*;
 use crate::field::extension::{Extendable, FieldExtension};
@@ -27,6 +28,20 @@ pub trait Poseidon2: PrimeField64 {
         Self::partial_rounds(&mut state);
         Self::full_rounds(&mut state, ROUNDS_F_HALF);
 
+        state
+    }
+
+
+    #[inline]
+    #[cfg(test)]
+    fn poseidon2_after_first_full_round(mut state: [Self; WIDTH]) -> [Self; WIDTH] {
+        for r in 1..ROUNDS_F_HALF {
+            Self::add_rc(&mut state, r);
+            Self::sbox(&mut state);
+            Self::external_linear_layer(&mut state);
+        }
+        Self::partial_rounds(&mut state);
+        Self::full_rounds(&mut state, ROUNDS_F_HALF);
         state
     }
 
@@ -428,6 +443,152 @@ pub trait Poseidon2: PrimeField64 {
     }
 }
 
+const POW_SEARCH_BATCH_SIZE: u64 = 16;
+const POW_DIFFERENCE_COUNT: usize = D as usize + 1;
+
+#[inline]
+fn pow_first_round_affine<F: RichField + Poseidon2>(
+    state: &[F; WIDTH],
+    witness_input_pos: usize,
+) -> ([F; WIDTH], [F; WIDTH]) {
+    let mut base = *state;
+    base[witness_input_pos] = F::ZERO;
+    F::external_linear_layer(&mut base);
+    F::add_rc(&mut base, 0);
+
+    let mut step = [F::ZERO; WIDTH];
+    step[witness_input_pos] = F::ONE;
+    F::external_linear_layer(&mut step);
+    (base, step)
+}
+
+#[inline]
+#[unroll::unroll_for_loops]
+fn pow_first_round_differences<F: RichField + Poseidon2>(
+    base: &[F; WIDTH],
+    step: &[F; WIDTH],
+    first_candidate: F,
+) -> [[F; WIDTH]; POW_DIFFERENCE_COUNT] {
+    let mut differences = [[F::ZERO; WIDTH]; POW_DIFFERENCE_COUNT];
+    for lane in 0..WIDTH {
+        let mut samples = [F::ZERO; POW_DIFFERENCE_COUNT];
+        let mut input = base[lane] + step[lane] * first_candidate;
+        for sample in 0..POW_DIFFERENCE_COUNT {
+            samples[sample] = F::sbox_p(&input);
+            input += step[lane];
+        }
+
+        differences[0][lane] = samples[0];
+        for order in 1..POW_DIFFERENCE_COUNT {
+            for sample in 0..(POW_DIFFERENCE_COUNT - order) {
+                samples[sample] = samples[sample + 1] - samples[sample];
+            }
+            differences[order][lane] = samples[0];
+        }
+    }
+    differences
+}
+
+#[inline]
+#[unroll::unroll_for_loops]
+#[cfg(test)]
+fn pow_permute_from_differences<F: RichField + Poseidon2>(
+    differences: &mut [[F; WIDTH]; POW_DIFFERENCE_COUNT],
+) -> [F; WIDTH] {
+    let mut state = differences[0];
+    for order in 0..(POW_DIFFERENCE_COUNT - 1) {
+        for lane in 0..WIDTH {
+            differences[order][lane] += differences[order + 1][lane];
+        }
+    }
+    F::external_linear_layer(&mut state);
+    F::poseidon2_after_first_full_round(state)
+}
+
+#[inline]
+fn external_linear_layer_output_7<F: PrimeField64>(state: &[F; WIDTH]) -> F {
+    #[inline(always)]
+    fn mat4_output_3<F: PrimeField64>(group: &[F]) -> u128 {
+        3 * group[0].to_noncanonical_u64() as u128
+            + group[1].to_noncanonical_u64() as u128
+            + group[2].to_noncanonical_u64() as u128
+            + 2 * group[3].to_noncanonical_u64() as u128
+    }
+
+    let output_3 = mat4_output_3(&state[0..4]);
+    let output_7 = mat4_output_3(&state[4..8]);
+    let output_11 = mat4_output_3(&state[8..12]);
+    F::from_noncanonical_u128_with_96_bits(output_3 + 2 * output_7 + output_11)
+}
+
+#[inline]
+fn poseidon2_pow_response_after_first_full_round<F: RichField + Poseidon2>(
+    mut state: [F; WIDTH],
+) -> F {
+    for r in 1..ROUNDS_F_HALF {
+        F::add_rc(&mut state, r);
+        F::sbox(&mut state);
+        F::external_linear_layer(&mut state);
+    }
+    <F as Poseidon2>::partial_rounds(&mut state);
+    for r in ROUNDS_F_HALF..(ROUNDS_F - 1) {
+        F::add_rc(&mut state, r);
+        F::sbox(&mut state);
+        F::external_linear_layer(&mut state);
+    }
+    F::add_rc(&mut state, ROUNDS_F - 1);
+    F::sbox(&mut state);
+    external_linear_layer_output_7(&state)
+}
+
+#[inline]
+#[unroll::unroll_for_loops]
+fn pow_response_from_differences<F: RichField + Poseidon2>(
+    differences: &mut [[F; WIDTH]; POW_DIFFERENCE_COUNT],
+) -> F {
+    let mut state = differences[0];
+    for order in 0..(POW_DIFFERENCE_COUNT - 1) {
+        for lane in 0..WIDTH {
+            differences[order][lane] += differences[order + 1][lane];
+        }
+    }
+    F::external_linear_layer(&mut state);
+    poseidon2_pow_response_after_first_full_round(state)
+}
+
+fn find_poseidon2_pow_witness<F: RichField + Poseidon2>(
+    duplex_intermediate_state: Poseidon2Permutation<F>,
+    witness_input_pos: usize,
+    min_leading_zeros: u32,
+    batch_size: u64,
+) -> Option<F> {
+    debug_assert!(batch_size > 0);
+    let max_witness = F::NEG_ONE.to_canonical_u64();
+    let num_batches = max_witness / batch_size + 1;
+    let (base, step) = pow_first_round_affine(&duplex_intermediate_state.state, witness_input_pos);
+
+    (0..num_batches)
+        .into_par_iter()
+        .map(|batch| {
+            let first_candidate = batch * batch_size;
+            let mut differences =
+                pow_first_round_differences(&base, &step, F::from_canonical_u64(first_candidate));
+
+            (0..batch_size).find_map(|offset| {
+                let candidate = first_candidate.checked_add(offset)?;
+                if candidate > max_witness {
+                    return None;
+                }
+
+                let pow_response = pow_response_from_differences(&mut differences);
+                (pow_response.to_canonical_u64().leading_zeros() >= min_leading_zeros)
+                    .then_some(F::from_canonical_u64(candidate))
+            })
+        })
+        .find_any(Option::is_some)
+        .flatten()
+}
+
 #[inline]
 #[unroll::unroll_for_loops]
 fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
@@ -810,6 +971,27 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
         compress_quad::<F>(inputs)
     }
 
+
+    fn find_pow_witness(
+        duplex_intermediate_state: Self::Permutation,
+        witness_input_pos: usize,
+        min_leading_zeros: u32,
+    ) -> Option<F> {
+        find_poseidon2_pow_witness(
+            duplex_intermediate_state,
+            witness_input_pos,
+            min_leading_zeros,
+            POW_SEARCH_BATCH_SIZE,
+        )
+        .or_else(|| {
+            Self::find_pow_witness_fallback(
+                duplex_intermediate_state,
+                witness_input_pos,
+                min_leading_zeros,
+            )
+        })
+    }
+
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     fn try_build_merkle_tree(
         leaves: &[F],
@@ -994,6 +1176,45 @@ mod test {
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::PoseidonGoldilocksConfig;
+
+    #[test]
+    fn pow_forward_differences_match_poseidon2() {
+        let state =
+            core::array::from_fn(|i| F::from_canonical_u64(0x1234_5678_u64 * (i as u64 + 1)));
+        let max_witness = F::NEG_ONE.to_canonical_u64();
+
+        for witness_input_pos in 0..RATE {
+            let (base, step) = pow_first_round_affine(&state, witness_input_pos);
+            for first_candidate in [
+                0,
+                1,
+                17,
+                65_536,
+                max_witness - (POW_SEARCH_BATCH_SIZE - 1),
+                max_witness,
+            ] {
+                let mut differences = pow_first_round_differences(
+                    &base,
+                    &step,
+                    F::from_canonical_u64(first_candidate),
+                );
+
+                let num_candidates = (max_witness - first_candidate + 1).min(POW_SEARCH_BATCH_SIZE);
+                for offset in 0..num_candidates {
+                    let candidate = first_candidate + offset;
+                    let mut response_differences = differences;
+                    let actual_response = pow_response_from_differences(&mut response_differences);
+                    let actual = pow_permute_from_differences(&mut differences);
+                    let mut expected_input = state;
+                    expected_input[witness_input_pos] = F::from_canonical_u64(candidate);
+                    let expected = F::poseidon2(expected_input);
+                    assert_eq!(actual, expected);
+                    assert_eq!(actual_response, expected[RATE - 1]);
+                    assert_eq!(actual_response.0, expected[RATE - 1].0);
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_poseidon2_with_plonky3() {

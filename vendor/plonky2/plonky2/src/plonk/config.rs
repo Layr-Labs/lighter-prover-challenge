@@ -12,6 +12,7 @@ use core::fmt::Debug;
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use plonky2_maybe_rayon::*;
 
 use crate::field::extension::quadratic::QuadraticExtension;
 use crate::field::extension::{Extendable, FieldExtension};
@@ -125,6 +126,40 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
     }
 
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash;
+
+
+    /// Generic exhaustive FRI proof-of-work search. Specialized hashers keep
+    /// this path as an exact, runtime-selectable fallback.
+    fn find_pow_witness_fallback(
+        duplex_intermediate_state: Self::Permutation,
+        witness_input_pos: usize,
+        min_leading_zeros: u32,
+    ) -> Option<F> {
+        (0..=F::NEG_ONE.to_canonical_u64())
+            .into_par_iter()
+            .find_any(|&candidate| {
+                let mut duplex_state = duplex_intermediate_state;
+                duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+                duplex_state.permute();
+                let pow_response = duplex_state.squeeze().iter().last().unwrap();
+                pow_response.to_canonical_u64().leading_zeros() >= min_leading_zeros
+            })
+            .map(F::from_canonical_u64)
+    }
+
+    /// Search for a FRI proof-of-work witness. Implementations may specialize
+    /// this, but must preserve the exhaustive generic fallback above.
+    fn find_pow_witness(
+        duplex_intermediate_state: Self::Permutation,
+        witness_input_pos: usize,
+        min_leading_zeros: u32,
+    ) -> Option<F> {
+        Self::find_pow_witness_fallback(
+            duplex_intermediate_state,
+            witness_input_pos,
+            min_leading_zeros,
+        )
+    }
 
     /// Build the native Merkle digests and cap with a specialized backend, when available.
     ///
