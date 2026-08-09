@@ -27,7 +27,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "6a65119780a2645ce0077ef1da44d2774ca31aa1ef5c511162280d1b2f15213f";
+    "52987d90b4b5b218b215383d298664da6225a675ce14e899139a7927998b5d03";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -120,7 +120,6 @@ pub(crate) struct PoseidonGateQuotientJob<F> {
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
     len: usize,
-    _job: GpuJobGuard,
     _phantom: PhantomData<F>,
 }
 
@@ -134,7 +133,6 @@ pub(crate) struct RangeCheckGateQuotientJob<F> {
     len: usize,
     #[cfg(test)]
     failure_observer: Option<Arc<RangeQuotientFailureObserver>>,
-    _job: GpuJobGuard,
     _phantom: PhantomData<F>,
 }
 
@@ -1977,7 +1975,6 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("Poseidon2 gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
@@ -2009,7 +2006,6 @@ impl MetalShared {
             output: Some(output),
             output_pool: Arc::clone(&self.quotient_output_pool),
             len,
-            _job: job_guard,
             _phantom: PhantomData,
         })
     }
@@ -2041,7 +2037,6 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("RangeCheck gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
@@ -2087,7 +2082,6 @@ impl MetalShared {
             len,
             #[cfg(test)]
             failure_observer,
-            _job: job_guard,
             _phantom: PhantomData,
         })
     }
@@ -2135,7 +2129,8 @@ impl MetalShared {
         output_bytes: usize,
     ) -> Result<Option<DetachedOutput<'_>>, String> {
         let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
-        if pool.waiters == 0 || pool.detached_readback {
+        // Always detach: free BufferSet early even with no waiters (scheduling only).
+        if pool.detached_readback {
             return Ok(None);
         }
         let replacement = match pool.spare_output.take() {
@@ -3248,7 +3243,6 @@ mod tests {
             output: Some(output()),
             output_pool: Arc::clone(&pool),
             len: 8,
-            _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
         assert!(pool.lock().unwrap().free.is_empty());
@@ -3267,7 +3261,6 @@ mod tests {
             output: Some(completed_output),
             output_pool: Arc::clone(&pool),
             len: 8,
-            _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
         let reused = pool
@@ -3292,7 +3285,6 @@ mod tests {
             output_pool: Arc::clone(&pool),
             len: 8,
             failure_observer: None,
-            _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
         let reused = pool
@@ -3310,7 +3302,7 @@ mod tests {
     use crate::plonk::vars::EvaluationVarsBaseBatch;
 
     #[test]
-    fn does_not_detach_output_without_a_waiting_build() {
+    fn detaches_completed_output_without_a_waiting_build() {
         let context = MetalShared::new().expect("Metal context");
         let mut set = context.acquire_set().expect("buffer set");
         set.output = Some(autoreleasepool(|| {
@@ -3321,12 +3313,13 @@ mod tests {
 
         let detached = context
             .try_detach_completed_output(&mut set, 64)
-            .expect("pool state");
-        assert!(detached.is_none());
-        let pool = context.pool.lock().unwrap();
-        assert_eq!(pool.waiters, 0);
-        assert!(pool.spare_output.is_none());
-        assert!(!pool.detached_readback);
+            .expect("pool state")
+            .expect("always-detach frees BufferSet even with no waiter");
+        assert!(set.output.is_some());
+        assert!(context.pool.lock().unwrap().detached_readback);
+        drop(detached);
+        assert!(!context.pool.lock().unwrap().detached_readback);
+        assert!(context.pool.lock().unwrap().spare_output.is_some());
     }
 
     #[test]
