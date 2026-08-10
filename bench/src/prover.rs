@@ -705,6 +705,18 @@ pub(crate) fn prove_block_after_pre(
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
+                    #[cfg(target_os = "macos")]
+                    unsafe {
+                        #[allow(non_camel_case_types)]
+                        type qos_class_t = u32;
+                        unsafe extern "C" {
+                            fn pthread_set_qos_class_self_np(
+                                qos_class: qos_class_t,
+                                relative_priority: i32,
+                            ) -> i32;
+                        }
+                        let _ = pthread_set_qos_class_self_np(0x11, 0);
+                    }
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_context = plonky2::util::profile::enter_context(
                         "final_block_build",
@@ -720,6 +732,18 @@ pub(crate) fn prove_block_after_pre(
                             plonky2::util::profile::span("orchestration", "build_block_circuit");
                         circuits.build_block_circuit()
                     };
+                    #[cfg(target_os = "macos")]
+                    unsafe {
+                        #[allow(non_camel_case_types)]
+                        type qos_class_t = u32;
+                        unsafe extern "C" {
+                            fn pthread_set_qos_class_self_np(
+                                qos_class: qos_class_t,
+                                relative_priority: i32,
+                            ) -> i32;
+                        }
+                        let _ = pthread_set_qos_class_self_np(0x15, 0);
+                    }
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
                     let early = BlockCircuit::witness_inputs_early(
