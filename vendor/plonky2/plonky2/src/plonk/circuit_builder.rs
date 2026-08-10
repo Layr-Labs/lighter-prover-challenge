@@ -1329,9 +1329,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // builder one flat edge array in ascending generator order. This avoids constructing a
         // `BTreeMap` node and a separately allocated `Vec` for every watched representative.
         let mut generator_watch_counts = vec![0usize; self.generators.len()];
+        let mut generator_readiness_is_authoritative = Vec::with_capacity(self.generators.len());
         let mut generator_watch_representatives = Vec::new();
         let mut generator_representatives = Vec::new();
         for (i, generator) in self.generators.iter().enumerate() {
+            generator_readiness_is_authoritative.push(generator.0.readiness_is_authoritative());
             let watches = generator.0.watch_list();
             generator_representatives.clear();
             generator_representatives.extend(watches.into_iter().map(|watch| {
@@ -1464,6 +1466,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
 
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,
+            generator_readiness_is_authoritative,
             generator_indices_by_watches,
             generator_watch_counts,
             constants_sigmas_commitment,

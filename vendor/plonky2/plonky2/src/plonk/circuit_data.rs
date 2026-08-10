@@ -569,6 +569,10 @@ pub struct ProverOnlyCircuitData<
     const D: usize,
 > {
     pub generators: Vec<WitnessGeneratorRef<F, D>>,
+    /// Per-generator scheduler contract: `true` means an invocation with any unresolved watch is
+    /// guaranteed to produce no values or side effects. Runtime-only and reconstructed from the
+    /// generator trait after build/load, so the serialized format is unchanged.
+    pub generator_readiness_is_authoritative: Vec<bool>,
     /// Generator indices (within the `Vec` above), indexed by the representative of each target
     /// they watch.
     pub generator_indices_by_watches: GeneratorWatchIndex,

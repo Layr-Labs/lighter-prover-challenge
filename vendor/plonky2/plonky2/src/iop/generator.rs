@@ -105,6 +105,83 @@ fn parallel_rounds_enabled() -> bool {
     false
 }
 
+#[cfg(feature = "std")]
+fn authoritative_ready_skip_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var_os("LIGHTER_DISABLE_AUTHORITATIVE_READY_SKIP")
+            .is_some_and(|value| value == "1")
+    })
+}
+
+#[cfg(not(feature = "std"))]
+const fn authoritative_ready_skip_enabled() -> bool {
+    true
+}
+
+fn run_generator_worklist<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &mut PartitionWitness<F>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    unresolved_watches: &mut [usize],
+    generator_is_expired: &mut [bool],
+    remaining_generators: &mut usize,
+    pending_generator_indices: Vec<usize>,
+    parallel_threshold: usize,
+) -> Result<()> {
+    run_generator_worklist_with_authoritative_ready_skip(
+        witness,
+        prover_data,
+        unresolved_watches,
+        generator_is_expired,
+        remaining_generators,
+        pending_generator_indices,
+        parallel_threshold,
+        authoritative_ready_skip_enabled(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_generator_worklist_with_authoritative_ready_skip<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &mut PartitionWitness<F>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    unresolved_watches: &mut [usize],
+    generator_is_expired: &mut [bool],
+    remaining_generators: &mut usize,
+    pending_generator_indices: Vec<usize>,
+    parallel_threshold: usize,
+    enabled: bool,
+) -> Result<()> {
+    if enabled {
+        run_generator_worklist_inner::<F, C, D, true>(
+            witness,
+            prover_data,
+            unresolved_watches,
+            generator_is_expired,
+            remaining_generators,
+            pending_generator_indices,
+            parallel_threshold,
+        )
+    } else {
+        run_generator_worklist_inner::<F, C, D, false>(
+            witness,
+            prover_data,
+            unresolved_watches,
+            generator_is_expired,
+            remaining_generators,
+            pending_generator_indices,
+            parallel_threshold,
+        )
+    }
+}
+
 /// Runs the given pending generators, and transitively any generator watching a newly populated
 /// representative, until no further progress can be made.
 ///
@@ -114,10 +191,11 @@ fn parallel_rounds_enabled() -> bool {
 /// values and only merged values mutate the witness, so every schedule (sequential, parallel at
 /// any thread count) reaches the same fixpoint, and the deterministic merge order keeps
 /// contradiction detection (`set_target_returning_rep`) behavior identical across runs.
-fn run_generator_worklist<
+fn run_generator_worklist_inner<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
     const D: usize,
+    const SKIP_AUTHORITATIVE_UNREADY: bool,
 >(
     witness: &mut PartitionWitness<F>,
     prover_data: &ProverOnlyCircuitData<F, C, D>,
@@ -129,6 +207,8 @@ fn run_generator_worklist<
 ) -> Result<()> {
     let generators = &prover_data.generators;
     let generator_indices_by_watches = &prover_data.generator_indices_by_watches;
+    let generator_readiness_is_authoritative =
+        &prover_data.generator_readiness_is_authoritative;
 
     let parallel_rounds = parallel_rounds_enabled();
     let mut buffer = GeneratedValues::empty();
@@ -179,6 +259,12 @@ fn run_generator_worklist<
                     let mut round_buffer = GeneratedValues::empty();
                     for &generator_idx in chunk {
                         if round_generator_is_expired[generator_idx] {
+                            continue;
+                        }
+                        if SKIP_AUTHORITATIVE_UNREADY
+                            && generator_readiness_is_authoritative[generator_idx]
+                            && round_unresolved_watches[generator_idx] != 0
+                        {
                             continue;
                         }
                         let finished = generators[generator_idx].0.run_with_ready_hint(
@@ -241,6 +327,12 @@ fn run_generator_worklist<
 
         for &generator_idx in &pending_generator_indices {
             if generator_is_expired[generator_idx] {
+                continue;
+            }
+            if SKIP_AUTHORITATIVE_UNREADY
+                && generator_readiness_is_authoritative[generator_idx]
+                && unresolved_watches[generator_idx] != 0
+            {
                 continue;
             }
 
@@ -634,6 +726,14 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
     /// run next time a target in its watch list is populated.
     fn run(&self, witness: &PartitionWitness<F>, out_buffer: &mut GeneratedValues<F>) -> bool;
 
+    /// Whether an invocation with any unresolved watch is guaranteed to return unfinished without
+    /// producing values or other side effects. The scheduler caches this per circuit and may skip
+    /// such invocations entirely. Custom generators remain on the existing path by default.
+    #[doc(hidden)]
+    fn readiness_is_authoritative(&self) -> bool {
+        false
+    }
+
     /// Scheduler entry point carrying a hint that every watched representative is populated.
     ///
     /// General generators may produce values before all watches are populated, so the default
@@ -791,6 +891,10 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
         } else {
             false
         }
+    }
+
+    fn readiness_is_authoritative(&self) -> bool {
+        true
     }
 
     fn run_with_ready_hint(

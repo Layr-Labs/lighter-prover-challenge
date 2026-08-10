@@ -870,6 +870,10 @@ pub trait Read {
         for _ in 0..gen_len {
             generators.push(self.read_generator(generator_serializer, common_data)?);
         }
+        let generator_readiness_is_authoritative = generators
+            .iter()
+            .map(|generator| generator.0.readiness_is_authoritative())
+            .collect();
         let map_len = self.read_usize()?;
         let mut generator_indices_by_watches = BTreeMap::new();
         for _ in 0..map_len {
@@ -949,6 +953,7 @@ pub trait Read {
 
         Ok(ProverOnlyCircuitData {
             generators,
+            generator_readiness_is_authoritative,
             generator_indices_by_watches,
             generator_watch_counts,
             constants_sigmas_commitment,
@@ -1926,6 +1931,9 @@ pub trait Write {
     ) -> IoResult<()> {
         let ProverOnlyCircuitData {
             generators,
+            // Runtime-only: reconstructed from the generator trait on read, so it contributes no
+            // bytes and the serialized format is unchanged.
+            generator_readiness_is_authoritative: _,
             generator_indices_by_watches,
             // Runtime-only: reconstructed from `generator_indices_by_watches` on read, so it
             // contributes no bytes and the serialized format is unchanged.
