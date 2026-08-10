@@ -27,6 +27,24 @@ use plonky2::fri::oracle::PolynomialBatch;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[cfg(not(target_env = "msvc"))]
+union JemallocConfigPointer {
+    byte: &'static u8,
+    c_char: &'static std::ffi::c_char,
+}
+
+// Keep allocations at or above jemalloc's 8 MiB oversize threshold in the
+// normal arena set, where the default dirty-page decay can retain and reuse
+// the prover's repeatedly allocated large coefficient and witness buffers.
+#[cfg(not(target_env = "msvc"))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static JEMALLOC_CONFIG: Option<&'static std::ffi::c_char> = Some(unsafe {
+    JemallocConfigPointer {
+        byte: &b"oversize_threshold:0\0"[0],
+    }
+    .c_char
+});
+
 // jemalloc runs with its default decay periods (dirty 10 s): freed pages stay
 // mapped long enough for the next identically-shaped allocation to reuse them.
 //
@@ -252,4 +270,40 @@ fn main() {
     unsafe { _exit(0) }
 }
 
+#[cfg(all(test, not(target_env = "msvc")))]
+mod allocator_tests {
+    use std::ffi::{c_char, c_void};
+
+    unsafe extern "C" {
+        #[link_name = "_rjem_mallctl"]
+        fn mallctl(
+            name: *const c_char,
+            old_value: *mut c_void,
+            old_len: *mut usize,
+            new_value: *mut c_void,
+            new_len: usize,
+        ) -> i32;
+    }
+
+    #[test]
+    fn jemalloc_oversize_threshold_is_disabled() {
+        let mut threshold = usize::MAX;
+        let mut threshold_len = size_of::<usize>();
+        let result = unsafe {
+            mallctl(
+                c"opt.oversize_threshold".as_ptr(),
+                (&raw mut threshold).cast(),
+                &raw mut threshold_len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+
+        assert_eq!(result, 0, "jemalloc mallctl query failed");
+        assert_eq!(threshold_len, size_of::<usize>());
+        assert_eq!(threshold, 0);
+    }
+}
+
 // p90-fire-b7-1786376354
+// Allocator repeat marker: executable behavior is unchanged.
