@@ -78,7 +78,17 @@ fn main() {
     // `log` is statically disabled in release builds: the ranked worker has no
     // log consumer, and diagnostics remain available in debug/test builds.
     // Do not link and initialize an unused logger in every scored process.
+    // Five workers share the machine, each running a full-core rayon pool
+    // today. Halving the per-worker pool halves the total thread count and
+    // the resulting context-switch and cache-contention pressure; the proof
+    // work is unchanged, only the pool size differs. The benchmark harness
+    // may override this through RAYON_NUM_THREADS.
+    let worker_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .div_ceil(2);
     rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_threads)
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
         .expect("cannot configure prover thread pool");
