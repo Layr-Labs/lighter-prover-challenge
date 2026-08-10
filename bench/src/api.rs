@@ -1,4 +1,4 @@
-// Redraw marker 701-claude-fable-r2
+// Redraw marker 702-claude-fable-r3-defense-1of2
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
