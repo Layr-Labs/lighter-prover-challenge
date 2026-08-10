@@ -1275,6 +1275,26 @@ fn supported_quotient_result_limbs(base_bits: usize) -> Option<usize> {
 }
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+#[inline]
+fn native_gate_offload_enabled(
+    kind: &crate::hash::poseidon2::metal::U32QuotientKind,
+    quotient_rows: usize,
+) -> bool {
+    use crate::hash::poseidon2::metal::U32QuotientKind;
+
+    quotient_rows != (1usize << 19)
+        || !matches!(
+            kind,
+            U32QuotientKind::BaseFieldArithmetic { .. }
+                | U32QuotientKind::ExtensionArithmetic { .. }
+                | U32QuotientKind::ExtensionMultiplication { .. }
+                | U32QuotientKind::CosetInterpolation
+                | U32QuotientKind::Constant { .. }
+                | U32QuotientKind::PublicInput
+        )
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn start_gpu_range_check_gate_quotient<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -1285,19 +1305,26 @@ fn start_gpu_range_check_gate_quotient<
     wires_commitment: &PolynomialBatch<F, C, D>,
     quotient_rows: usize,
     step: usize,
+    public_inputs_hash: &crate::hash::hash_types::HashOut<F>,
     alphas: &[F],
 ) -> Option<(
     Vec<usize>,
     crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
 )> {
     use core::sync::atomic::Ordering;
+    use crate::gates::arithmetic_base::ArithmeticGate;
+    use crate::gates::arithmetic_extension::ArithmeticExtensionGate;
+    use crate::gates::constant::ConstantGate;
+    use crate::gates::coset_interpolation::CosetInterpolationGate;
     use crate::gates::equality_base::EqualityGate;
     use crate::gates::exponentiation::ExponentiationGate;
     use crate::gates::gate::U32QuotientGate;
+    use crate::gates::multiplication_extension::MulExtensionGate;
+    use crate::gates::public_input::PublicInputGate;
     use crate::gates::reducing::ReducingGate;
     use crate::gates::reducing_extension::ReducingExtensionGate;
     use crate::hash::poseidon2::metal::{
-        RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec,
+        RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec, COSET_16_WEIGHTS_U64,
     };
 
     GPU_RANGE_QUOTIENT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
@@ -1581,7 +1608,103 @@ fn start_gpu_range_check_gate_quotient<
         // the production circuits and are pure arithmetic, so they are matched
         // by type here instead of through the downstream-crate trait hooks
         // (those hooks exist only to avoid a `plonky2` -> circuit-crate dep).
-        let native = if let Some(exponentiation) =
+        let native = if let Some(coset) = gate
+            .0
+            .as_any()
+            .downcast_ref::<CosetInterpolationGate<F, D>>()
+        {
+            let weights_match = coset
+                .barycentric_weights
+                .iter()
+                .map(|weight| weight.to_canonical_u64())
+                .eq(COSET_16_WEIGHTS_U64);
+            if D != 2
+                || coset.subgroup_bits != 4
+                || coset.degree != 6
+                || !weights_match
+                || gate.0.num_constants() != 0
+            {
+                None
+            } else {
+                Some((U32QuotientKind::CosetInterpolation, 2, 47, 12))
+            }
+        } else if gate.0.as_any().downcast_ref::<ConstantGate>().is_some() {
+            if gate.0.num_constants() != 2
+                || raw_constant_base.checked_add(2)? > common_data.num_constants
+            {
+                None
+            } else {
+                Some((
+                    U32QuotientKind::Constant {
+                        constant_base: raw_constant_base,
+                    },
+                    2,
+                    2,
+                    2,
+                ))
+            }
+        } else if gate.0.as_any().downcast_ref::<PublicInputGate>().is_some() {
+            if gate.0.num_constants() != 0 {
+                None
+            } else {
+                Some((U32QuotientKind::PublicInput, 4, 4, 4))
+            }
+        } else if let Some(arithmetic) = gate.0.as_any().downcast_ref::<ArithmeticGate>() {
+            if gate.0.num_constants() != 2
+                || raw_constant_base.checked_add(2)? > common_data.num_constants
+            {
+                None
+            } else {
+                Some((
+                    U32QuotientKind::BaseFieldArithmetic {
+                        constant_base: raw_constant_base,
+                    },
+                    arithmetic.num_ops,
+                    arithmetic.num_ops.checked_mul(4)?,
+                    arithmetic.num_ops,
+                ))
+            }
+        } else if let Some(arithmetic) = gate
+            .0
+            .as_any()
+            .downcast_ref::<ArithmeticExtensionGate<D>>()
+        {
+            if D != 2
+                || gate.0.num_constants() != 2
+                || raw_constant_base.checked_add(2)? > common_data.num_constants
+            {
+                None
+            } else {
+                Some((
+                    U32QuotientKind::ExtensionArithmetic {
+                        constant_base: raw_constant_base,
+                    },
+                    arithmetic.num_ops,
+                    arithmetic.num_ops.checked_mul(8)?,
+                    arithmetic.num_ops.checked_mul(2)?,
+                ))
+            }
+        } else if let Some(multiplication) = gate
+            .0
+            .as_any()
+            .downcast_ref::<MulExtensionGate<D>>()
+        {
+            if D != 2
+                || gate.0.num_constants() != 1
+                || raw_constant_base.checked_add(1)? > common_data.num_constants
+            {
+                None
+            } else {
+                Some((
+                    U32QuotientKind::ExtensionMultiplication {
+                        constant_base: raw_constant_base,
+                    },
+                    multiplication.num_ops,
+                    multiplication.num_ops.checked_mul(6)?,
+                    multiplication.num_ops.checked_mul(2)?,
+                ))
+            }
+        } else if let Some(exponentiation) =
             gate.0.as_any().downcast_ref::<ExponentiationGate<F, D>>()
         {
             let num_power_bits = exponentiation.num_power_bits;
@@ -1636,6 +1759,12 @@ fn start_gpu_range_check_gate_quotient<
             None
         };
         if let Some((kind, num_ops, expected_wires, expected_constraints)) = native {
+            // Kinds 13..=18 regress the degree-16 GPU pole. Declining them here
+            // leaves their indices out of the exclusion list, so the existing CPU
+            // evaluator remains authoritative while kinds 0..=12 stay offloaded.
+            if !native_gate_offload_enabled(&kind, quotient_rows) {
+                continue;
+            }
             if range.is_some() || u32_gate.is_some() {
                 if gpu_poseidon_quotient_diagnostics_enabled() {
                     eprintln!(
@@ -1704,6 +1833,7 @@ fn start_gpu_range_check_gate_quotient<
         step,
         &specs,
         &u32_specs,
+        public_inputs_hash,
         alphas,
         alpha_offset,
     ) else {
@@ -1885,6 +2015,7 @@ fn compute_quotient_polys<
                 wires_commitment,
                 lde_size,
                 step,
+                public_inputs_hash,
                 alphas,
             )
         })
@@ -2015,7 +2146,10 @@ fn compute_quotient_polys<
     // gates into every 32-point CPU scratch batch.
     // survivor-list once per proof v4-17.76
     let cpu_gate_indices = (0..common_data.gates.len())
-        .filter(|gate_index| !excluded_gate_indices.contains(gate_index))
+        .filter(|gate_index| {
+            !excluded_gate_indices.contains(gate_index)
+                && common_data.gates[*gate_index].0.num_constraints() != 0
+        })
         .collect::<Vec<_>>();
     // Detect the exact pair only after GPU ownership is fixed. If either gate
     // has been offloaded, the plan is absent and the remaining CPU gate keeps
@@ -2134,11 +2268,15 @@ fn compute_quotient_polys<
                     );
                     let cc = common_data.constants_range().len();
                     let q = prover_data.constants_sigmas_quotient_domain;
-                    scratch.local_constants.resize(cc * n, F::ZERO);
-                    for ci in 0..cc {
-                        scratch.local_constants[ci * n..(ci + 1) * n].copy_from_slice(
-                            &cache[ci * q + cache_start..ci * q + cache_start + n],
-                        );
+                    if cpu_gate_indices.is_empty() {
+                        scratch.local_constants.clear();
+                    } else {
+                        scratch.local_constants.resize(cc * n, F::ZERO);
+                        for ci in 0..cc {
+                            scratch.local_constants[ci * n..(ci + 1) * n].copy_from_slice(
+                                &cache[ci * q + cache_start..ci * q + cache_start + n],
+                            );
+                        }
                     }
                     if permutation_products_offloaded {
                         scratch.s_sigmas_flat.clear();
@@ -2153,13 +2291,17 @@ fn compute_quotient_polys<
                         }
                     }
                 } else {
-                    prover_data.constants_sigmas_commitment.fill_lde_batch(
-                        &scratch.indices,
-                        step,
-                        common_data.constants_range(),
-                        BatchLayout::PolyMajor,
-                        &mut scratch.local_constants,
-                    );
+                    if cpu_gate_indices.is_empty() {
+                        scratch.local_constants.clear();
+                    } else {
+                        prover_data.constants_sigmas_commitment.fill_lde_batch(
+                            &scratch.indices,
+                            step,
+                            common_data.constants_range(),
+                            BatchLayout::PolyMajor,
+                            &mut scratch.local_constants,
+                        );
+                    }
                     // Layout seam: the no-lookup column evaluator consumes the
                     // PolyMajor gathers as-is (and the "next" gather narrows to
                     // the Z columns, the only ones it reads); the per-point path
