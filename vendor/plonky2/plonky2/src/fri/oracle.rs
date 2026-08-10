@@ -646,7 +646,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // pad), writing straight into `final_poly`'s reusable buffer
             // instead of a division pass + shift pass + add pass.
             let shift = alpha.shift_factor();
-            accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+            accumulate_linear_quotient(&mut final_poly, composition_poly, *point, shift);
         }
 
         // `final_poly` is dead after this point, so pad it in place instead of
@@ -775,11 +775,33 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
 /// slot / `ZERO * shift` on fresh slots, all of which leave values unchanged.
 fn accumulate_linear_quotient<F: Field>(
     final_poly: &mut PolynomialCoeffs<F>,
-    composition_poly: &PolynomialCoeffs<F>,
+    mut composition_poly: PolynomialCoeffs<F>,
     z: F,
     shift: F,
 ) {
     let d = composition_poly.len();
+    if final_poly.coeffs.is_empty() {
+        // First contribution: donate the composition allocation to
+        // `final_poly` instead of zero-filling a fresh buffer and adding
+        // the quotient into it. The synthetic division runs in place;
+        // each source slot is read before it is replaced, so the Horner
+        // recurrence and every stored raw representative are unchanged,
+        // and the discarded remainder is the recurrence step the
+        // division never stores.
+        let coeffs = &mut composition_poly.coeffs;
+        if d != 0 {
+            let mut acc = F::ZERO;
+            for i in (1..d).rev() {
+                let c = coeffs[i];
+                let prev = acc;
+                acc = acc * z + c;
+                coeffs[i] = prev;
+            }
+            coeffs[0] = acc;
+        }
+        *final_poly = composition_poly;
+        return;
+    }
     let coeffs = &composition_poly.coeffs;
     let buf = &mut final_poly.coeffs;
     // Entries past the padded quotient's length only see the shift.
@@ -1058,6 +1080,7 @@ mod tests {
         ] {
             let initial = PolynomialCoeffs::new(F::rand_vec(old_len));
             let composition_poly = PolynomialCoeffs::new(F::rand_vec(d));
+            let source_ptr = composition_poly.coeffs.as_ptr();
             let z = F::rand();
             let shift = F::rand();
 
@@ -1079,10 +1102,15 @@ mod tests {
             expected_in_place += quotient_in_place;
 
             let mut actual = initial;
-            accumulate_linear_quotient(&mut actual, &composition_poly, z, shift);
+            accumulate_linear_quotient(&mut actual, composition_poly, z, shift);
 
             assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
             assert_eq!(raw(&actual.coeffs), raw(&expected_in_place.coeffs));
+            if old_len == 0 {
+                // The first contribution must reuse the composition vector,
+                // not merely reproduce its values through a fresh buffer.
+                assert_eq!(actual.coeffs.as_ptr(), source_ptr);
+            }
         }
     }
 
