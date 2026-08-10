@@ -5,9 +5,7 @@ use core::slice;
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
-#[cfg(feature = "diagnostic_profile")]
 use block::ConcreteBlock;
-#[cfg(feature = "diagnostic_profile")]
 use metal::CommandBufferRef;
 #[cfg(feature = "diagnostic_profile")]
 use objc::runtime::Sel;
@@ -209,11 +207,10 @@ struct NttRoots {
 /// An asynchronously submitted Poseidon2 gate-constraint evaluation. Its
 /// point-major output stays in shared storage for zero-copy CPU combination.
 pub(crate) struct PoseidonGateQuotientJob<F> {
-    command_buffer: CommandBuffer,
+    command_buffer: TrackedCommandBuffer,
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
     len: usize,
-    _job: GpuJobGuard,
     _phantom: PhantomData<F>,
 }
 
@@ -221,13 +218,12 @@ pub(crate) struct PoseidonGateQuotientJob<F> {
 /// contributions. Its layout matches [`PoseidonGateQuotientJob`]: two
 /// challenge values per quotient-domain point.
 pub(crate) struct RangeCheckGateQuotientJob<F> {
-    command_buffer: CommandBuffer,
+    command_buffer: TrackedCommandBuffer,
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
     len: usize,
     #[cfg(test)]
     failure_observer: Option<Arc<RangeQuotientFailureObserver>>,
-    _job: GpuJobGuard,
     _phantom: PhantomData<F>,
 }
 
@@ -235,11 +231,10 @@ pub(crate) struct RangeCheckGateQuotientJob<F> {
 /// The kernel emits only the partial-product terms (alpha rows 2 onward);
 /// the two cheap `L_0(x) * (Z_i(x) - 1)` rows stay on the CPU.
 pub(crate) struct PermutationQuotientJob<F> {
-    command_buffer: CommandBuffer,
+    command_buffer: TrackedCommandBuffer,
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
     len: usize,
-    _job: GpuJobGuard,
     _phantom: PhantomData<F>,
 }
 
@@ -373,7 +368,7 @@ impl<F: RichField> PermutationQuotientJob<F> {
 }
 
 fn recycle_completed_quotient_output(
-    command_buffer: &CommandBuffer,
+    command_buffer: &CommandBufferRef,
     output: &mut Option<Buffer>,
     pool: &Arc<Mutex<QuotientOutputPool>>,
 ) {
@@ -1201,37 +1196,163 @@ pub fn is_exclusive_gpu_phase() -> bool {
     EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Number of Merkle builds currently occupying the serialized GPU stream
-/// (from buffer acquisition through `wait_until_completed`). Routing reads
-/// this to decide whether a small serial-path tree would enqueue behind
-/// in-flight work; the count is a heuristic only — either routing outcome
-/// hashes the identical tree, so races are benign.
-static GPU_JOBS_IN_FLIGHT: core::sync::atomic::AtomicUsize =
+/// Number of submitted Metal command buffers which have not reached a
+/// terminal status. Routing reads this to decide whether a small serial-path
+/// tree would enqueue behind real GPU work. It deliberately does not count
+/// Rust job ownership, CPU result merging, buffer-pool admission, or recycling.
+///
+/// The count is only a scheduling heuristic: either routing outcome hashes the
+/// identical tree, so a concurrent submission immediately after a zero read is
+/// benign.
+static GPU_COMMAND_BUFFERS_IN_FLIGHT: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-struct GpuJobGuard;
+/// One-shot counter token. The completion callback may race a waiter or owner
+/// Drop status refresh, so terminal observation must be idempotent.
+struct GpuActivityToken {
+    counter: &'static core::sync::atomic::AtomicUsize,
+    terminal: core::sync::atomic::AtomicBool,
+}
 
-impl GpuJobGuard {
-    fn begin() -> Self {
-        GPU_JOBS_IN_FLIGHT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        GpuJobGuard
+impl GpuActivityToken {
+    fn begin(counter: &'static core::sync::atomic::AtomicUsize) -> Self {
+        counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        Self {
+            counter,
+            terminal: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn mark_terminal(&self) {
+        if self
+            .terminal
+            .compare_exchange(
+                false,
+                true,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let previous = self
+                .counter
+                .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+            debug_assert!(previous > 0, "Metal command-buffer count underflow");
+        }
+    }
+
+    fn refresh(&self, status: MTLCommandBufferStatus) {
+        if matches!(
+            status,
+            MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+        ) {
+            self.mark_terminal();
+        }
     }
 }
 
-impl Drop for GpuJobGuard {
+impl Drop for GpuActivityToken {
     fn drop(&mut self) {
-        GPU_JOBS_IN_FLIGHT.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        // Metal's copied handler owns an Arc while submitted work is live.
+        // This is only a fallback if Metal releases it without invoking it.
+        self.mark_terminal();
     }
 }
 
-fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bool {
+fn add_gpu_completion_handler(
+    command_buffer: &CommandBufferRef,
+    activity: Arc<GpuActivityToken>,
+) {
+    let completed_handler = ConcreteBlock::new(move |_: &CommandBufferRef| {
+        activity.mark_terminal();
+    })
+    .copy();
+    command_buffer.add_completed_handler(&completed_handler);
+}
+
+/// A command buffer plus completion accounting. Job outputs keep their buffers
+/// alive independently; this wrapper tracks whether submitted GPU work can
+/// still occupy the serial queue.
+struct TrackedCommandBuffer {
+    command_buffer: CommandBuffer,
+    activity: Arc<GpuActivityToken>,
+}
+
+impl TrackedCommandBuffer {
+    fn commit(command_buffer: &CommandBufferRef) -> Self {
+        Self::commit_with_counter(command_buffer, &GPU_COMMAND_BUFFERS_IN_FLIGHT)
+    }
+
+    fn commit_with_counter(
+        command_buffer: &CommandBufferRef,
+        counter: &'static core::sync::atomic::AtomicUsize,
+    ) -> Self {
+        let activity = Arc::new(GpuActivityToken::begin(counter));
+        // Register before commit so even an empty/fast command cannot complete
+        // between submission and handler installation. The copied handler owns
+        // only the token, never this wrapper or the command buffer.
+        add_gpu_completion_handler(command_buffer, Arc::clone(&activity));
+        command_buffer.commit();
+        Self {
+            command_buffer: command_buffer.to_owned(),
+            activity,
+        }
+    }
+
+    fn wait_until_completed(&self) {
+        self.command_buffer.wait_until_completed();
+        self.refresh_status();
+    }
+
+    fn status(&self) -> MTLCommandBufferStatus {
+        let status = self.command_buffer.status();
+        self.activity.refresh(status);
+        status
+    }
+
+    fn refresh_status(&self) {
+        self.activity.refresh(self.command_buffer.status());
+    }
+
+    #[cfg(test)]
+    fn untracked_for_recycle_test(command_buffer: CommandBuffer) -> Self {
+        let activity = Arc::new(GpuActivityToken::begin(&GPU_COMMAND_BUFFERS_IN_FLIGHT));
+        activity.mark_terminal();
+        Self {
+            command_buffer,
+            activity,
+        }
+    }
+}
+
+impl Drop for TrackedCommandBuffer {
+    fn drop(&mut self) {
+        // Nonblocking: a live command stays counted by the handler's Arc.
+        self.refresh_status();
+    }
+}
+
+impl core::ops::Deref for TrackedCommandBuffer {
+    type Target = CommandBufferRef;
+
+    fn deref(&self) -> &Self::Target {
+        self.command_buffer.as_ref()
+    }
+}
+
+fn gpu_worthwhile_with_activity(
+    leaf_width: usize,
+    leaf_count: usize,
+    cap_height: usize,
+    exclusive: bool,
+    command_buffers_in_flight: usize,
+) -> bool {
     let leaf_permutations = if leaf_width <= 4 {
         0
     } else {
         leaf_width.div_ceil(8) * leaf_count
     };
     let parent_permutations = leaf_count - (1usize << cap_height);
-    let exclusive = EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed);
     let min_permutations = if exclusive {
         EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS
     } else {
@@ -1257,9 +1378,19 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     if serial_critical_shape {
         return exclusive
             || leaf_width > 64
-            || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
+            || command_buffers_in_flight == 0;
     }
     leaf_permutations + parent_permutations >= min_permutations
+}
+
+fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bool {
+    gpu_worthwhile_with_activity(
+        leaf_width,
+        leaf_count,
+        cap_height,
+        EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed),
+        GPU_COMMAND_BUFFERS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 fn shared_context() -> Option<&'static MetalShared> {
@@ -1957,7 +2088,6 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let output_bytes = output_len.checked_mul(size_of::<u64>())?;
     let state_bytes = leaf_count.checked_mul(12)?.checked_mul(size_of::<u64>())?;
 
-    let job = GpuJobGuard::begin();
     let mut buffers = STREAMED_BUFFERS.lock().ok()?;
     let needs_new = buffers.as_ref().map_or(true, |(state, output)| {
         state.length() < state_bytes as u64 || output.length() < output_bytes as u64
@@ -1983,7 +2113,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // order, and each pass is committed before the next group''s fill starts.
     let groups = leaf_width.div_ceil(8);
     let base = columns.buffer.contents().cast::<F>();
-    let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
+    let mut absorb_commands: Vec<TrackedCommandBuffer> = Vec::with_capacity(groups);
     for group in 0..groups {
         let col_start = group * 8;
         let chunk = (leaf_width - col_start).min(8);
@@ -2001,7 +2131,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
                 .collect();
             fill_group(group, &mut slices);
         }
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
+        let command_buffer = autoreleasepool(|| -> TrackedCommandBuffer {
             let command_buffer = context.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
@@ -2019,8 +2149,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
-            command_buffer.commit();
-            command_buffer.to_owned()
+            TrackedCommandBuffer::commit(command_buffer)
         });
         absorb_commands.push(command_buffer);
     }
@@ -2028,7 +2157,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // Parent levels over the completed leaf digests, exactly as in the
     // classic single-command build.
     let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
-    let parents_command = autoreleasepool(|| -> CommandBuffer {
+    let parents_command = autoreleasepool(|| -> TrackedCommandBuffer {
         let command_buffer = context.queue.new_command_buffer();
         let mut level_offset = 0usize;
         let mut child_count = leaf_count;
@@ -2061,8 +2190,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         }
         #[cfg(feature = "diagnostic_profile")]
         profile_command_buffer(command_buffer, "merkle_parents", leaf_count as u64);
-        command_buffer.commit();
-        command_buffer.to_owned()
+        TrackedCommandBuffer::commit(command_buffer)
     });
 
     parents_command.wait_until_completed();
@@ -2073,7 +2201,6 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             command_buffer.wait_until_completed();
             command_buffer.status() == MTLCommandBufferStatus::Completed
         });
-    drop(job);
     if !all_ok {
         log::warn!("streamed Metal sponge build failed; falling back to the classic path");
         return None;
@@ -2476,8 +2603,7 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("Poseidon2 gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
+        let command_buffer = autoreleasepool(|| -> TrackedCommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
@@ -2506,15 +2632,13 @@ impl MetalShared {
                 "poseidon_quotient",
                 (quotient_rows * (group.end - group.start)) as u64,
             );
-            command_buffer.commit();
-            command_buffer.to_owned()
+            TrackedCommandBuffer::commit(command_buffer)
         });
         Ok(PoseidonGateQuotientJob {
             command_buffer,
             output: Some(output),
             output_pool: Arc::clone(&self.quotient_output_pool),
             len,
-            _job: job_guard,
             _phantom: PhantomData,
         })
     }
@@ -2546,8 +2670,7 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("RangeCheck gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
+        let command_buffer = autoreleasepool(|| -> TrackedCommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
@@ -2578,8 +2701,7 @@ impl MetalShared {
                 "range_u32_quotient",
                 (quotient_rows * (range_count + u32_count)) as u64,
             );
-            command_buffer.commit();
-            command_buffer.to_owned()
+            TrackedCommandBuffer::commit(command_buffer)
         });
         #[cfg(test)]
         let failure_observer = FORCE_RANGE_QUOTIENT_FINISH_FAILURE.with(|fault| {
@@ -2598,7 +2720,6 @@ impl MetalShared {
             len,
             #[cfg(test)]
             failure_observer,
-            _job: job_guard,
             _phantom: PhantomData,
         })
     }
@@ -2638,8 +2759,7 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("permutation quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
+        let command_buffer = autoreleasepool(|| -> TrackedCommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
@@ -2675,15 +2795,13 @@ impl MetalShared {
                 "permutation_quotient",
                 (quotient_rows * num_routed_wires * 2) as u64,
             );
-            command_buffer.commit();
-            command_buffer.to_owned()
+            TrackedCommandBuffer::commit(command_buffer)
         });
         Ok(PermutationQuotientJob {
             command_buffer,
             output: Some(output),
             output_pool: Arc::clone(&self.quotient_output_pool),
             len,
-            _job: job_guard,
             _phantom: PhantomData,
         })
     }
@@ -2932,7 +3050,6 @@ impl MetalShared {
         let cap_count = 1usize << cap_height;
         let total_node_count = 2 * lde_size - cap_count;
 
-        let job = GpuJobGuard::begin();
         let value_len = degree
             .checked_mul(cols)
             .ok_or("NTT value length overflow")?;
@@ -3009,7 +3126,7 @@ impl MetalShared {
             let output_buffer = set.output.as_ref().unwrap();
 
             let mut level_offsets = Vec::with_capacity(log_lde as usize + 1);
-            let command_buffer = autoreleasepool(|| -> CommandBuffer {
+            let command_buffer = autoreleasepool(|| -> TrackedCommandBuffer {
                 let degree_u32 = degree as u32;
                 let lde_size_u32 = lde_size as u32;
                 let log_degree_u32 = degree.ilog2();
@@ -3139,8 +3256,7 @@ impl MetalShared {
                     "values_ntt_merkle",
                     (lde_size * cols) as u64,
                 );
-                command_buffer.commit();
-                command_buffer.to_owned()
+                TrackedCommandBuffer::commit(command_buffer)
             });
 
             command_buffer.wait_until_completed();
@@ -3160,7 +3276,6 @@ impl MetalShared {
             )
         })();
         self.release_set(set);
-        drop(job);
         let (digests, cap) = result?.finish();
 
         // Copy the coefficients out for the oracle's `polynomials` field.
@@ -3201,7 +3316,6 @@ impl MetalShared {
         let cap_count = 1usize << cap_height;
         let total_node_count = 2 * lde_size - cap_count;
 
-        let job = GpuJobGuard::begin();
         let coeff_len = degree
             .checked_mul(cols)
             .ok_or("NTT coefficient length overflow")?;
@@ -3246,7 +3360,6 @@ impl MetalShared {
             output_bytes,
         );
         self.release_set(set);
-        drop(job);
         let (digests, cap) = result?.finish();
         Ok((
             MetalColumns::with_buffer(column_buffer, lde_size, cols),
@@ -3316,7 +3429,7 @@ impl MetalShared {
         let output_buffer = set.output.as_ref().unwrap();
 
         let mut level_offsets = Vec::with_capacity(log_lde as usize + 1);
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
+        let command_buffer = autoreleasepool(|| -> TrackedCommandBuffer {
             let degree_u32 = degree as u32;
             let lde_size_u32 = lde_size as u32;
             let log_degree_u32 = degree.ilog2();
@@ -3403,8 +3516,7 @@ impl MetalShared {
                 "coeff_ntt_merkle",
                 (lde_size * cols) as u64,
             );
-            command_buffer.commit();
-            command_buffer.to_owned()
+            TrackedCommandBuffer::commit(command_buffer)
         });
 
         command_buffer.wait_until_completed();
@@ -3447,7 +3559,6 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("Metal Merkle output size overflow")?;
 
-        let job = GpuJobGuard::begin();
         let mut set = self.acquire_set()?;
         let result = self.build_with_set(
             &mut set,
@@ -3461,7 +3572,6 @@ impl MetalShared {
             output_bytes,
         );
         self.release_set(set);
-        drop(job);
         Ok(result?.finish())
     }
 
@@ -3548,7 +3658,7 @@ impl MetalShared {
         let output_buffer = set.output.as_ref().unwrap();
 
         let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
+        let command_buffer = autoreleasepool(|| -> TrackedCommandBuffer {
             let leaf_count_u32 = leaf_count as u32;
             let leaf_width_u32 = leaf_width as u32;
             let log_leaf_count_u32 = leaf_count.ilog2();
@@ -3628,8 +3738,7 @@ impl MetalShared {
                 "merkle_tree",
                 (leaf_count * leaf_width) as u64,
             );
-            command_buffer.commit();
-            command_buffer.to_owned()
+            TrackedCommandBuffer::commit(command_buffer)
         });
 
         command_buffer.wait_until_completed();
@@ -3842,6 +3951,120 @@ mod tests {
     }
 
     #[test]
+    fn gpu_command_completion_is_exactly_once() {
+        static COUNT: core::sync::atomic::AtomicUsize =
+            core::sync::atomic::AtomicUsize::new(0);
+
+        COUNT.store(0, core::sync::atomic::Ordering::Relaxed);
+        let completion = GpuActivityToken::begin(&COUNT);
+        assert_eq!(COUNT.load(core::sync::atomic::Ordering::Relaxed), 1);
+
+        completion.mark_terminal();
+        completion.mark_terminal();
+        drop(completion);
+        assert_eq!(COUNT.load(core::sync::atomic::Ordering::Relaxed), 0);
+
+        let dropped_without_refresh = GpuActivityToken::begin(&COUNT);
+        assert_eq!(COUNT.load(core::sync::atomic::Ordering::Relaxed), 1);
+        drop(dropped_without_refresh);
+        assert_eq!(COUNT.load(core::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn gpu_command_completion_survives_owner_drop_without_routing() {
+        static COUNT: core::sync::atomic::AtomicUsize =
+            core::sync::atomic::AtomicUsize::new(0);
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        COUNT.store(0, core::sync::atomic::Ordering::Relaxed);
+        let queue = device.new_command_queue();
+        let release = device.new_shared_event();
+        let (command, observer, activity) = autoreleasepool(|| {
+            let command_buffer = queue.new_command_buffer();
+            command_buffer.encode_wait_for_event(&release, 1);
+            let command = TrackedCommandBuffer::commit_with_counter(command_buffer, &COUNT);
+            let observer = command.command_buffer.to_owned();
+            let activity = Arc::downgrade(&command.activity);
+            (command, observer, activity)
+        });
+
+        assert_eq!(COUNT.load(core::sync::atomic::Ordering::Acquire), 1);
+        assert!(!matches!(
+            observer.status(),
+            MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+        ));
+        drop(command);
+        assert_eq!(COUNT.load(core::sync::atomic::Ordering::Acquire), 1);
+        assert!(activity.upgrade().is_some(), "handler must own the live token");
+
+        // From here there is deliberately no TrackedCommandBuffer status call
+        // and no routing decision. Metal's completion callback is the only
+        // path that can clear the count after the event releases the command.
+        release.set_signaled_value(1);
+        observer.wait_until_completed();
+        assert_eq!(observer.status(), MTLCommandBufferStatus::Completed);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while COUNT.load(core::sync::atomic::Ordering::Acquire) != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "completion callback did not clear command activity"
+            );
+            std::thread::yield_now();
+        }
+        drop(observer);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while activity.upgrade().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "completed handler retained its token"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            COUNT.load(core::sync::atomic::Ordering::Relaxed),
+            0,
+            "owner Drop and callback must not double-decrement"
+        );
+    }
+
+    #[test]
+    fn serial_critical_routing_uses_submitted_command_activity() {
+        let narrow_width = 8;
+        let serial_leaf_count = 1 << 17;
+        let cap_height = 4;
+
+        assert!(gpu_worthwhile_with_activity(
+            narrow_width,
+            serial_leaf_count,
+            cap_height,
+            false,
+            0,
+        ));
+        assert!(!gpu_worthwhile_with_activity(
+            narrow_width,
+            serial_leaf_count,
+            cap_height,
+            false,
+            1,
+        ));
+        assert!(gpu_worthwhile_with_activity(
+            135,
+            serial_leaf_count,
+            cap_height,
+            false,
+            1,
+        ));
+        assert!(gpu_worthwhile_with_activity(
+            narrow_width,
+            serial_leaf_count,
+            cap_height,
+            true,
+            1,
+        ));
+    }
+
+    #[test]
     fn quotient_output_pool_is_bounded_and_best_fit() {
         let Some(device) = Device::system_default() else {
             return;
@@ -3886,11 +4109,10 @@ mod tests {
 
         let not_enqueued = queue.new_command_buffer().to_owned();
         drop(PoseidonGateQuotientJob::<F> {
-            command_buffer: not_enqueued,
+            command_buffer: TrackedCommandBuffer::untracked_for_recycle_test(not_enqueued),
             output: Some(output()),
             output_pool: Arc::clone(&pool),
             len: 8,
-            _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
         assert!(pool.lock().unwrap().free.is_empty());
@@ -3905,11 +4127,10 @@ mod tests {
         let completed_output = output();
         let completed_output_ptr = completed_output.contents();
         drop(PoseidonGateQuotientJob::<F> {
-            command_buffer: completed,
+            command_buffer: TrackedCommandBuffer::untracked_for_recycle_test(completed),
             output: Some(completed_output),
             output_pool: Arc::clone(&pool),
             len: 8,
-            _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
         let reused = pool
@@ -3929,12 +4150,11 @@ mod tests {
         let completed_output = output();
         let completed_output_ptr = completed_output.contents();
         drop(RangeCheckGateQuotientJob::<F> {
-            command_buffer: completed,
+            command_buffer: TrackedCommandBuffer::untracked_for_recycle_test(completed),
             output: Some(completed_output),
             output_pool: Arc::clone(&pool),
             len: 8,
             failure_observer: None,
-            _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
         let reused = pool
