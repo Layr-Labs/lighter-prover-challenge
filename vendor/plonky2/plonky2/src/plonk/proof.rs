@@ -322,6 +322,30 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         quotient_polys_commitment: &PolynomialBatch<F, C, D>,
         common_data: &CommonCircuitData<F, D>,
     ) -> Self {
+        let subgroup =
+            crate::plonk::prover::precomputed::two_adic_subgroup::<F>(common_data.degree_bits());
+        Self::new_with_subgroup(
+            zeta,
+            g,
+            subgroup.as_slice(),
+            constants_sigmas_commitment,
+            wires_commitment,
+            zs_partial_products_lookup_commitment,
+            quotient_polys_commitment,
+            common_data,
+        )
+    }
+
+    pub(super) fn new_with_subgroup<C: GenericConfig<D, F = F>>(
+        zeta: F::Extension,
+        g: F::Extension,
+        subgroup: &[F],
+        constants_sigmas_commitment: &PolynomialBatch<F, C, D>,
+        wires_commitment: &PolynomialBatch<F, C, D>,
+        zs_partial_products_lookup_commitment: &PolynomialBatch<F, C, D>,
+        quotient_polys_commitment: &PolynomialBatch<F, C, D>,
+        common_data: &CommonCircuitData<F, D>,
+    ) -> Self {
         // Every committed polynomial in these batches has at most `degree`
         // coefficients, so one powers table per opening point covers all of
         // them. Evaluating as `sum_i c_i * z^i` against the table replaces the
@@ -338,19 +362,20 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         let table = |z: F::Extension| -> Vec<F::Extension> { z.powers().take(degree).collect() };
         let zeta_pows = table(zeta);
         // `g` is the order-`degree` subgroup generator, so `g^i` is exactly
-        // the process-cached natural-order two-adic subgroup, and
-        // `(g·ζ)^i = g^i · ζ^i` in the exact field. Deriving the shifted
-        // table from the `ζ` table by one elementwise base-field scalar
-        // product deletes the second serial `powers()` chain (a
-        // `degree`-long dependent extension-multiply chain in this serial
-        // opening phase) per proof. Representative-exactness is checkable at
-        // runtime: `LIGHTER_GZETA_TABLE_ASSERT=1` recomputes the old chain
-        // and compares every entry by raw noncanonical limbs.
-        let g_subgroup =
-            crate::plonk::prover::precomputed::two_adic_subgroup::<F>(common_data.degree_bits());
+        // the prover's already-resident natural-order two-adic subgroup, and
+        // `(g·ζ)^i = g^i · ζ^i` in the exact field. Reusing that same table
+        // avoids a second cache lookup (and its first-use allocation/power
+        // chain) solely for these openings. Deriving the shifted table from
+        // the `ζ` table by one elementwise base-field scalar product deletes
+        // the second serial `powers()` chain (a `degree`-long dependent
+        // extension-multiply chain in this serial opening phase) per proof.
+        // Representative-exactness is checkable at runtime:
+        // `LIGHTER_GZETA_TABLE_ASSERT=1` recomputes the old chain and compares
+        // every entry by raw noncanonical limbs.
+        assert_eq!(subgroup.len(), degree, "opening subgroup length mismatch");
         let g_zeta_pows: Vec<F::Extension> = zeta_pows
             .iter()
-            .zip(g_subgroup.iter())
+            .zip(subgroup)
             .map(|(&zeta_pow, &g_pow)| zeta_pow.scalar_mul(g_pow))
             .collect();
         if std::env::var_os("LIGHTER_GZETA_TABLE_ASSERT").is_some() {

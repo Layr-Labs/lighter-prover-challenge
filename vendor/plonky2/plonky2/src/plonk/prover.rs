@@ -471,9 +471,10 @@ where
     let openings = timed!(
         timing,
         "construct the opening set, including lookups",
-        OpeningSet::new(
+        OpeningSet::new_with_subgroup(
             zeta,
             g,
+            &prover_data.subgroup,
             &prover_data.constants_sigmas_commitment,
             &wires_commitment,
             &partial_products_zs_and_lookup_commitment,
