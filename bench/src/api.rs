@@ -1,4 +1,4 @@
-// Redraw marker 701-claude-fable-r2
+// FRI arity4 delayed-fold on tip — marker 616-fri4-1786405156
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 

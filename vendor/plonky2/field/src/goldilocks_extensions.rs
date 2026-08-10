@@ -53,6 +53,15 @@ impl Extendable<2> for GoldilocksField {
     ) -> QuadraticExtension<Self> {
         ext2_dot_product_arity16(terms, beta_powers)
     }
+
+    #[inline(always)]
+    fn fri_fold_arity4(
+        terms: &[QuadraticExtension<Self>; 4],
+        _beta: QuadraticExtension<Self>,
+        beta_powers: &[QuadraticExtension<Self>; 4],
+    ) -> QuadraticExtension<Self> {
+        ext2_dot_product_arity4(terms, beta_powers)
+    }
 }
 
 impl Mul for QuadraticExtension<GoldilocksField> {
@@ -277,6 +286,35 @@ fn ext2_base_scalar_dot_product(
         start = end;
     }
     result
+}
+/// Arity-4 analogue of `ext2_dot_product_arity16`: delayed-reduction FRI fold
+/// `sum_{i<4} terms[i] * beta^i` (both extension terms), one reduce160 per limb.
+/// 4-term bounds: c0 < 4*(1+7)*2^128 = 2^131; c1 < 4*2*2^128 = 2^131; both are
+/// far below reduce160's 2^160-2^128+2^96 precondition.
+#[inline(always)]
+#[unroll_for_loops]
+fn ext2_dot_product_arity4(
+    terms: &[QuadraticExtension<GoldilocksField>; 4],
+    powers: &[QuadraticExtension<GoldilocksField>; 4],
+) -> QuadraticExtension<GoldilocksField> {
+    const_assert!(<GoldilocksField as Extendable<2>>::W.0 == 7u64);
+    let (mut c0_plain_lo, mut c0_plain_hi) = (0u128, 0u32);
+    let (mut c0_w_lo, mut c0_w_hi) = (0u128, 0u32);
+    let (mut c1_lo, mut c1_hi) = (0u128, 0u32);
+    for i in 0..4 {
+        let QuadraticExtension([a0, a1]) = terms[i];
+        let QuadraticExtension([b0, b1]) = powers[i];
+        u160_add_product(&mut c0_plain_lo, &mut c0_plain_hi, a0.0, b0.0);
+        u160_add_product(&mut c0_w_lo, &mut c0_w_hi, a1.0, b1.0);
+        u160_add_product(&mut c1_lo, &mut c1_hi, a0.0, b1.0);
+        u160_add_product(&mut c1_lo, &mut c1_hi, a1.0, b0.0);
+    }
+    let (c0_w_lo, c0_w_hi) = u160_times_7(c0_w_lo, c0_w_hi);
+    let (c0_lo, carry) = c0_plain_lo.overflowing_add(c0_w_lo);
+    let c0_hi = c0_plain_hi + c0_w_hi + carry as u32;
+    let c0 = unsafe { reduce160(c0_lo, c0_hi) };
+    let c1 = unsafe { reduce160(c1_lo, c1_hi) };
+    QuadraticExtension([c0, c1])
 }
 
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction

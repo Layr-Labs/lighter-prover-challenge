@@ -126,6 +126,21 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .rev()
             .fold(Self::Extension::ZERO, |acc, &term| acc * beta + term)
     }
+    /// Internal fixed-shape FRI hook for arity-4 rounds. Default is reversed
+    /// Horner; Goldilocks quadratic may specialize delayed reduction.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn fri_fold_arity4(
+        terms: &[Self::Extension; 4],
+        beta: Self::Extension,
+        _beta_powers: &[Self::Extension; 4],
+    ) -> Self::Extension {
+        terms
+            .iter()
+            .rev()
+            .fold(Self::Extension::ZERO, |acc, &term| acc * beta + term)
+    }
+
 }
 
 impl<F: Field + Frobenius<1> + FieldExtension<1, BaseField = F>> Extendable<1> for F {
