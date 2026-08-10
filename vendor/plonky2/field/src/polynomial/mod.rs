@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::extension::{Extendable, FieldExtension};
 use crate::fft::{
     FftRootTable, fft, fft_with_options, ifft, ifft_with_options_and_postscale,
+    ifft_with_options_and_postscale_chunks,
 };
 use crate::types::Field;
 
@@ -78,6 +79,24 @@ impl<F: Field> PolynomialValues<F> {
     /// already has the inverse powers of that coset's shift.
     pub fn coset_ifft_with_powers(self, inverse_shift_powers: &[F]) -> PolynomialCoeffs<F> {
         ifft_with_options_and_postscale(self, None, None, Some(inverse_shift_powers))
+    }
+
+    /// Coset IFFT whose scaled, natural-order coefficients are written
+    /// directly into `chunk_len`-sized polynomials instead of first forming a
+    /// large polynomial and copying it with [`PolynomialCoeffs::chunks`].
+    pub fn coset_ifft_chunks_with_powers(
+        self,
+        inverse_shift_powers: &[F],
+        trim_len: usize,
+        chunk_len: usize,
+    ) -> Option<Vec<PolynomialCoeffs<F>>> {
+        ifft_with_options_and_postscale_chunks(
+            self,
+            None,
+            inverse_shift_powers,
+            trim_len,
+            chunk_len,
+        )
     }
 
     pub fn lde_multiple(polys: Vec<Self>, rate_bits: usize) -> Vec<Self> {
@@ -552,6 +571,54 @@ mod tests {
                     .map(|value| value.0)
                     .collect::<Vec<_>>()
             );
+        }
+    }
+
+    #[test]
+    fn test_coset_ifft_chunks_with_powers_matches_materialize_then_split() {
+        type F = GoldilocksField;
+
+        for k in [3usize, 8, 12] {
+            let n = 1 << k;
+            let chunk_len = n / 4;
+            let trim_len = 3 * chunk_len;
+            let shift = F::coset_shift();
+            let inverse_powers = shift.inverse().powers().take(n).collect::<Vec<_>>();
+
+            // Build a polynomial whose rounded-up final quarter is exactly
+            // zero, then evaluate it on the quotient coset.
+            let mut coeffs = (0..trim_len)
+                .map(|i| {
+                    F::from_noncanonical_u64(
+                        u64::MAX.wrapping_sub((i as u64 + 1) * 0x1234_5678),
+                    )
+                })
+                .collect::<Vec<_>>();
+            coeffs.resize(n, F::ZERO);
+            let evals = PolynomialCoeffs::new(coeffs).coset_fft(shift);
+
+            let mut expected = evals.clone().coset_ifft_with_powers(&inverse_powers);
+            expected.trim_to_len(trim_len).unwrap();
+            let expected = expected.chunks(chunk_len);
+            let actual = evals
+                .coset_ifft_chunks_with_powers(&inverse_powers, trim_len, chunk_len)
+                .unwrap();
+
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert_eq!(
+                    actual
+                        .coeffs
+                        .iter()
+                        .map(|value| value.0)
+                        .collect::<Vec<_>>(),
+                    expected
+                        .coeffs
+                        .iter()
+                        .map(|value| value.0)
+                        .collect::<Vec<_>>()
+                );
+            }
         }
     }
 

@@ -321,6 +321,63 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
     PolynomialCoeffs { coeffs: buffer }
 }
 
+/// IFFT + caller-provided coefficient scaling whose final writes go directly
+/// to fixed-size coefficient polynomials.
+///
+/// The ordinary quotient path first materializes one large coefficient vector
+/// and then copies it into degree-sized chunks. This variant keeps the exact
+/// accepted FFT schedule and multiplication order, but makes those chunk
+/// allocations the destination of the existing reversal/normalization pass.
+/// `trim_len` may be shorter than the transform when the quotient-degree
+/// factor is not a power of two; the discarded coefficients are checked after
+/// the same scaling as the ordinary `trim_to_len` path.
+pub(crate) fn ifft_with_options_and_postscale_chunks<F: Field>(
+    poly: PolynomialValues<F>,
+    root_table: Option<&FftRootTable<F>>,
+    postscale: &[F],
+    trim_len: usize,
+    chunk_len: usize,
+) -> Option<Vec<PolynomialCoeffs<F>>> {
+    let n = poly.len();
+    let lg_n = log2_strict(n);
+    let n_inv = F::inverse_2exp(lg_n);
+    assert_eq!(postscale.len(), n);
+    assert!(trim_len <= n);
+    assert!(chunk_len != 0);
+    assert_eq!(trim_len % chunk_len, 0);
+
+    let PolynomialValues { values: mut buffer } = poly;
+    // Deliberately use the established complete FFT. Unlike an extracted-tail
+    // implementation, this cannot perturb the accepted paired-stage schedule.
+    fft_dispatch(&mut buffer, None, root_table);
+
+    let coefficient = |i: usize| {
+        let source = if i == 0 { 0 } else { n - i };
+        let mut value = buffer[source] * n_inv;
+        value *= postscale[i];
+        value
+    };
+
+    // Match `trim_to_len`: a nonzero coefficient in the rounded-up transform
+    // tail means the quotient was not divisible by the vanishing polynomial.
+    if (trim_len..n).any(|i| !coefficient(i).is_zero()) {
+        return None;
+    }
+
+    Some(
+        (0..trim_len)
+            .step_by(chunk_len)
+            .map(|start| {
+                PolynomialCoeffs::new(
+                    (start..start + chunk_len)
+                        .map(&coefficient)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect(),
+    )
+}
+
 /// `ifft` of a borrowed column without the caller-side copy: the initial
 /// bit-reversal permutation is applied as an out-of-place gather from
 /// `values` into the fresh buffer (the same permutation `fft_classic`'s

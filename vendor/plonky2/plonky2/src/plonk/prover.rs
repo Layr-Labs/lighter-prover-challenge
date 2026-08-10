@@ -354,6 +354,7 @@ where
             // circuit has no lookups; the per-point path otherwise.
             !has_lookup,
             true,
+            (quotient_degree, degree),
         )
     );
 
@@ -375,6 +376,7 @@ where
             &alphas,
             true,
             false,
+            (quotient_degree, degree),
         );
         assert_eq!(quotient_polys.len(), reference.len());
         for (p, (actual, expected)) in quotient_polys.iter().zip(reference.iter()).enumerate() {
@@ -414,6 +416,7 @@ where
             &alphas,
             false,
             false,
+            (quotient_degree, degree),
         );
         assert_eq!(quotient_polys.len(), reference.len());
         for (p, (a, b)) in quotient_polys.iter().zip(reference.iter()).enumerate() {
@@ -428,20 +431,10 @@ where
         }
     }
 
-    let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
-        timing,
-        "split up quotient polys",
-        quotient_polys
-            .into_par_iter()
-            .flat_map(|mut quotient_poly| {
-                quotient_poly.trim_to_len(quotient_degree).expect(
-                    "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
-                );
-                // Split quotient into degree-n chunks.
-                quotient_poly.chunks(degree)
-            })
-            .collect()
-    );
+    // The quotient IFFT writes directly into these final degree-n polynomial
+    // allocations, so there is no full coefficient vector left to split and
+    // copy in a second whole-array pass.
+    let all_quotient_poly_chunks = quotient_polys;
 
     let quotient_polys_commitment = timed!(
         timing,
@@ -1819,6 +1812,7 @@ fn compute_quotient_polys<
     alphas: &[F],
     col_major_perm: bool,
     allow_gpu_poseidon: bool,
+    output_chunking: (usize, usize),
 ) -> Vec<PolynomialCoeffs<F>> {
     let num_challenges = common_data.config.num_challenges;
 
@@ -2376,6 +2370,7 @@ fn compute_quotient_polys<
                     alphas,
                     col_major_perm,
                     false,
+                    output_chunking,
                 );
             }
         };
@@ -2422,6 +2417,7 @@ fn compute_quotient_polys<
                     alphas,
                     col_major_perm,
                     false,
+                    output_chunking,
                 );
                 #[cfg(test)]
                 job.mark_cpu_recompute_completed_for_tests();
@@ -2462,6 +2458,7 @@ fn compute_quotient_polys<
                     alphas,
                     col_major_perm,
                     false,
+                    output_chunking,
                 );
             }
         };
@@ -2517,14 +2514,22 @@ fn compute_quotient_polys<
             }
         });
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
+    let (trim_len, chunk_len) = output_chunking;
     challenge_columns
         .into_par_iter()
-        .map(|column| {
-            // Fuse the coset post-scaling into the IFFT instead of walking the
-            // whole coefficient vector again afterwards, reusing a
-            // process-global inverse-shift power chain.
+        .flat_map(|column| {
+            // Keep the complete accepted FFT schedule, but make its
+            // reversal/normalization/postscale pass write directly to the
+            // final quotient chunks instead of a copied intermediate.
             PolynomialValues::new(column)
-                .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
+                .coset_ifft_chunks_with_powers(
+                    inverse_coset_shift_powers.as_slice(),
+                    trim_len,
+                    chunk_len,
+                )
+                .expect(
+                    "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
+                )
         })
         .collect()
 }
