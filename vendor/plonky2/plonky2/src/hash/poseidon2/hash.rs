@@ -680,11 +680,21 @@ impl<T> AsRef<[T]> for Poseidon2Permutation<T> {
 
 trait Permuter: Sized {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH];
+
+    fn permute_quad(inputs: [[Self; WIDTH]; 4]) -> [[Self; WIDTH]; 4] {
+        inputs.map(Self::permute)
+    }
 }
 
 impl<F: Poseidon2> Permuter for F {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH] {
         <F as Poseidon2>::poseidon2(input)
+    }
+
+    fn permute_quad(inputs: [[Self; WIDTH]; 4]) -> [[Self; WIDTH]; 4] {
+        let [a, b, c, d] = inputs;
+        let (a, b, c, d) = <F as Poseidon2>::poseidon2_x4(a, b, c, d);
+        [a, b, c, d]
     }
 }
 
@@ -726,6 +736,17 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
 
     fn permute(&mut self) {
         self.state = T::permute(self.state);
+    }
+
+    fn permute_quad(states: &mut [Self; 4]) {
+        let [a, b, c, d] = *states;
+        let [a, b, c, d] = T::permute_quad([a.state, b.state, c.state, d.state]);
+        *states = [
+            Self { state: a },
+            Self { state: b },
+            Self { state: c },
+            Self { state: d },
+        ];
     }
 
     fn squeeze(&self) -> &[T] {
@@ -1109,6 +1130,7 @@ mod test {
     use super::*;
     use crate::field::types::PrimeField64;
     use crate::hash::hashing::hash_n_to_m_no_pad;
+    use crate::hash::poseidon::PoseidonPermutation;
     use crate::hash::poseidon2::p3::p3_poseidon2_hash_n_to_m_no_pad;
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_data::CircuitConfig;
@@ -1138,6 +1160,98 @@ mod test {
                 expected_output_f3[i].as_canonical_u64()
             );
         }
+    }
+
+    /// The four-lane permutation is a scheduling-only optimization. Pin raw
+    /// Goldilocks words, not merely canonical equality, against four scalar
+    /// permutations over deterministic and random states.
+    #[test]
+    fn poseidon2_permute_quad_matches_four_scalar_raw_words() {
+        let mut rng = thread_rng();
+        for sample in 0..256u64 {
+            let states: [Poseidon2Permutation<F>; 4] = core::array::from_fn(|lane| {
+                Poseidon2Permutation {
+                    state: core::array::from_fn(|word| {
+                        let random = rng.next_u64();
+                        F::from_canonical_u64(
+                            random.wrapping_add(sample << 16).wrapping_add(
+                                (lane * WIDTH + word) as u64,
+                            ) % 0xffff_ffff_0000_0001,
+                        )
+                    }),
+                }
+            });
+
+            let mut scalar = states;
+            scalar.iter_mut().for_each(PlonkyPermutation::permute);
+            let mut quad = states;
+            <Poseidon2Permutation<F> as PlonkyPermutation<F>>::permute_quad(&mut quad);
+
+            for lane in 0..4 {
+                let scalar_raw: [u64; WIDTH] =
+                    core::array::from_fn(|word| scalar[lane].state[word].0);
+                let quad_raw: [u64; WIDTH] =
+                    core::array::from_fn(|word| quad[lane].state[word].0);
+                assert_eq!(quad_raw, scalar_raw, "sample {sample}, lane {lane}");
+            }
+        }
+    }
+
+    #[test]
+    fn generic_permute_quad_fallback_matches_four_scalar() {
+        let states: [PoseidonPermutation<F>; 4] = core::array::from_fn(|lane| {
+            PoseidonPermutation::new((0..PoseidonPermutation::<F>::WIDTH).map(|word| {
+                F::from_canonical_usize(lane * PoseidonPermutation::<F>::WIDTH + word + 1)
+            }))
+        });
+        let mut scalar = states;
+        scalar.iter_mut().for_each(PlonkyPermutation::permute);
+        let mut fallback = states;
+        <PoseidonPermutation<F> as PlonkyPermutation<F>>::permute_quad(&mut fallback);
+        assert_eq!(fallback, scalar);
+    }
+
+    /// Manual release-only microbenchmark for the exact primitive used by the
+    /// PoW search. It is ignored in normal test runs.
+    #[test]
+    #[ignore = "manual primitive timing harness"]
+    fn time_poseidon2_permute_scalar_vs_quad() {
+        const ITERS: usize = 100_000;
+        let states: [Poseidon2Permutation<F>; 4] = core::array::from_fn(|lane| {
+            Poseidon2Permutation {
+                state: core::array::from_fn(|word| {
+                    F::from_canonical_usize(lane * WIDTH + word + 1)
+                }),
+            }
+        });
+
+        let scalar_start = std::time::Instant::now();
+        let mut scalar_sink = F::ZERO;
+        for _ in 0..ITERS {
+            let mut batch = core::hint::black_box(states);
+            batch.iter_mut().for_each(PlonkyPermutation::permute);
+            for state in core::hint::black_box(batch) {
+                scalar_sink += core::hint::black_box(state.state[0]);
+            }
+        }
+        let scalar_time = scalar_start.elapsed();
+
+        let quad_start = std::time::Instant::now();
+        let mut quad_sink = F::ZERO;
+        for _ in 0..ITERS {
+            let mut batch = core::hint::black_box(states);
+            <Poseidon2Permutation<F> as PlonkyPermutation<F>>::permute_quad(&mut batch);
+            for state in core::hint::black_box(batch) {
+                quad_sink += core::hint::black_box(state.state[0]);
+            }
+        }
+        let quad_time = quad_start.elapsed();
+
+        assert_eq!(quad_sink, scalar_sink);
+        println!(
+            "scalar={scalar_time:?} quad={quad_time:?} speedup={:.3}x",
+            scalar_time.as_secs_f64() / quad_time.as_secs_f64()
+        );
     }
 
     #[test]
