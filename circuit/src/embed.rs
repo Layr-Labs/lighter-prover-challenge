@@ -36,7 +36,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use plonky2::field::fft::{cached_fft_root_table, cached_two_adic_subgroup};
 use plonky2::field::polynomial::PolynomialValues;
-use plonky2::field::types::Field;
+use plonky2::field::types::PrimeField64;
 use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::plonk::circuit_data::{
     CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
@@ -512,14 +512,30 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).
     let mut constants_sigmas_vecs = constant_values;
     constants_sigmas_vecs.extend(sigma_vecs);
-    let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
-        constants_sigmas_vecs,
-        rate_bits,
-        false,
-        cap_height,
-        &mut TimingTree::default(),
-        Some(&root_table),
+    let digest = verifier_only.circuit_digest.elements;
+    let shared_cache_key = format!(
+        "{:016x}{:016x}{:016x}{:016x}",
+        digest[0].to_canonical_u64(),
+        digest[1].to_canonical_u64(),
+        digest[2].to_canonical_u64(),
+        digest[3].to_canonical_u64(),
     );
+    // The ranked verifier launches one worker per fixture over the same five
+    // public circuits. Scope only this deterministic commitment under its
+    // circuit digest so a Metal backend may share the immutable LDE pages
+    // across those processes. All coefficient polynomials remain locally
+    // recomputed and the cap check below is still the exact correctness oracle.
+    let constants_sigmas_commitment =
+        plonky2::hash::poseidon2::with_shared_column_cache_key(&shared_cache_key, || {
+            PolynomialBatch::<F, C, D>::from_values(
+                constants_sigmas_vecs,
+                rate_bits,
+                false,
+                cap_height,
+                &mut TimingTree::default(),
+                Some(&root_table),
+            )
+        });
     if constants_sigmas_commitment.merkle_tree.cap != verifier_only.constants_sigmas_cap {
         bail!(
             "recomputed constants/sigmas commitment cap diverges from the embedded verifier data \

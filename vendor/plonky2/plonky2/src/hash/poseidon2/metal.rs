@@ -2,8 +2,15 @@ use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::mem::{size_of, size_of_val};
 use core::slice;
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::fs::OpenOptions;
+use std::io::ErrorKind;
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "diagnostic_profile")]
 use block::ConcreteBlock;
@@ -169,6 +176,61 @@ const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
 /// tree. These buffers replace equally large CPU digest vectors.
 const MAX_CACHED_DIGEST_OUTPUT_BYTES: u64 = 40 * 1024 * 1024;
 const MAX_CACHED_DIGEST_OUTPUTS: usize = 4;
+
+/// Ranked throughput launches five isolated workers over the same public
+/// circuit set. Their constants/sigmas LDE columns are byte-identical, but an
+/// ordinary `newBufferWithLength:` allocation gives every process its own
+/// physical copy. This opt-in cache lets those immutable pages be backed by
+/// one file in the verifier-owned scratch directory and mapped by every
+/// worker. Witnesses, proofs and fixture-derived data never enter it.
+struct SharedColumnCacheConfig {
+    directory: PathBuf,
+    participants: u64,
+}
+
+static SHARED_COLUMN_CACHE: OnceLock<SharedColumnCacheConfig> = OnceLock::new();
+
+std::thread_local! {
+    /// The embedded loader scopes this to one public circuit commitment. A TLS
+    /// key is sufficient because allocation happens on the `from_coeffs`
+    /// caller after its parallel IFFT has joined.
+    static SHARED_COLUMN_CACHE_KEY: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Enables cross-process immutable-column sharing inside `directory`.
+/// Configuration is process-wide and one-shot; normal library users never
+/// call this, so every pre-existing allocation path remains unchanged.
+pub fn configure_shared_column_cache(directory: &Path, participants: usize) {
+    if participants < 2 || participants > 64 {
+        return;
+    }
+    let _ = SHARED_COLUMN_CACHE.set(SharedColumnCacheConfig {
+        directory: directory.to_path_buf(),
+        participants: participants as u64,
+    });
+}
+
+struct SharedColumnCacheKeyGuard(Option<String>);
+
+impl Drop for SharedColumnCacheKeyGuard {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        SHARED_COLUMN_CACHE_KEY.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// Runs one deterministic public-circuit commitment under `key`. Keys are
+/// internal hex circuit digests, not fixture-controlled strings.
+pub fn with_shared_column_cache_key<T>(key: &str, build: impl FnOnce() -> T) -> T {
+    if !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return build();
+    }
+    let previous = SHARED_COLUMN_CACHE_KEY.with(|slot| slot.borrow_mut().replace(key.to_owned()));
+    let guard = SharedColumnCacheKeyGuard(previous);
+    let result = build();
+    drop(guard);
+    result
+}
 
 struct MetalShared {
     device: Device,
@@ -504,10 +566,130 @@ pub(crate) struct U32QuotientSpec {
     pub kind: U32QuotientKind,
 }
 
+// Apple Silicon uses 16 KiB VM pages. `newBufferWithBytesNoCopy:` requires a
+// page-aligned address and page-multiple length, so place metadata in one full
+// page and expose only the following column bytes to Metal.
+const SHARED_COLUMN_DATA_OFFSET: usize = 16 * 1024;
+const SHARED_COLUMN_MAGIC: u64 = 0x4c44_4553_4841_5245; // "LDESHARE"
+const SHARED_COLUMN_VERSION: u64 = 1;
+const SHARED_COLUMN_BUILDING: u64 = 1;
+const SHARED_COLUMN_READY: u64 = 2;
+const SHARED_COLUMN_FAILED: u64 = 3;
+const SHARED_COLUMN_WAIT: Duration = Duration::from_secs(4);
+
+#[repr(C)]
+struct SharedColumnHeader {
+    /// Published last. An acquire load of `magic` makes every shape field
+    /// below safe to inspect in a process that raced file creation.
+    magic: AtomicU64,
+    version: u64,
+    rows: u64,
+    cols: u64,
+    data_bytes: u64,
+    participants: u64,
+    status: AtomicU64,
+    attachments: AtomicU64,
+}
+
+unsafe extern "C" {
+    fn mmap(
+        address: *mut c_void,
+        length: usize,
+        protection: i32,
+        flags: i32,
+        file_descriptor: i32,
+        offset: i64,
+    ) -> *mut c_void;
+    fn munmap(address: *mut c_void, length: usize) -> i32;
+}
+
+const PROT_READ_WRITE: i32 = 0x1 | 0x2;
+const MAP_SHARED: i32 = 0x0001;
+
+struct SharedColumnMapping {
+    base: usize,
+    len: usize,
+    path: PathBuf,
+    leader: bool,
+    published: AtomicBool,
+}
+
+impl SharedColumnMapping {
+    fn map(
+        file: &std::fs::File,
+        len: usize,
+        path: PathBuf,
+        leader: bool,
+    ) -> Result<Self, String> {
+        let address = unsafe {
+            mmap(
+                core::ptr::null_mut(),
+                len,
+                PROT_READ_WRITE,
+                MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if address as usize == usize::MAX {
+            return Err(format!(
+                "mapping shared column cache failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self {
+            base: address as usize,
+            len,
+            path,
+            leader,
+            published: AtomicBool::new(false),
+        })
+    }
+
+    fn header(&self) -> &SharedColumnHeader {
+        // SAFETY: `base` is a live shared mapping at least one metadata page
+        // long, and the leader initializes a `SharedColumnHeader` there before
+        // publishing `magic`.
+        unsafe { &*(self.base as *const SharedColumnHeader) }
+    }
+
+    fn data(&self) -> *const c_void {
+        (self.base + SHARED_COLUMN_DATA_OFFSET) as *const c_void
+    }
+
+    fn publish(&self) {
+        if !self.leader || self.published.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        // Every LDE write happens-before this release; followers acquire the
+        // same status word before binding the pages as a Metal input.
+        self.header()
+            .status
+            .store(SHARED_COLUMN_READY, Ordering::Release);
+    }
+}
+
+impl Drop for SharedColumnMapping {
+    fn drop(&mut self) {
+        if self.leader && !self.published.load(Ordering::Relaxed) {
+            self.header()
+                .status
+                .store(SHARED_COLUMN_FAILED, Ordering::Release);
+        }
+        unsafe {
+            let _ = munmap(self.base as *mut c_void, self.len);
+        }
+    }
+}
+
 /// LDE columns computed and retained in a CPU-visible Metal shared buffer.
 /// Written once during the fused NTT + Merkle build, immutable afterwards.
 pub struct MetalColumns<F> {
     buffer: Buffer,
+    /// Keeps an external file mapping alive until the last cloned Metal buffer
+    /// has been released. `buffer` is declared first, so Rust drops it before
+    /// this owner and never leaves Metal pointing at unmapped pages.
+    shared_mapping: Option<Arc<SharedColumnMapping>>,
     /// `buffer.contents()`, captured once at construction and held as an address.
     ///
     /// `Buffer::contents` is an Objective-C message send — `objc_msgSend` through
@@ -533,11 +715,42 @@ impl<F> MetalColumns<F> {
         let base = buffer.contents() as usize;
         Self {
             buffer,
+            shared_mapping: None,
             base,
             rows,
             cols,
             uniqueness: Arc::new(()),
             _phantom: PhantomData,
+        }
+    }
+
+    fn with_shared_mapping(
+        buffer: Buffer,
+        mapping: Arc<SharedColumnMapping>,
+        rows: usize,
+        cols: usize,
+    ) -> Self {
+        let base = buffer.contents() as usize;
+        Self {
+            buffer,
+            shared_mapping: Some(mapping),
+            base,
+            rows,
+            cols,
+            uniqueness: Arc::new(()),
+            _phantom: PhantomData,
+        }
+    }
+
+    pub(crate) fn cache_is_preinitialized(&self) -> bool {
+        self.shared_mapping
+            .as_ref()
+            .is_some_and(|mapping| !mapping.leader)
+    }
+
+    pub(crate) fn publish_cache_initialization(&self) {
+        if let Some(mapping) = &self.shared_mapping {
+            mapping.publish();
         }
     }
 }
@@ -546,6 +759,7 @@ impl<F> Clone for MetalColumns<F> {
     fn clone(&self) -> Self {
         Self {
             buffer: self.buffer.clone(),
+            shared_mapping: self.shared_mapping.clone(),
             // Same buffer, therefore the same contents address.
             base: self.base,
             rows: self.rows,
@@ -576,6 +790,10 @@ impl<F: RichField> MetalColumns<F> {
     }
 
     pub(crate) fn columns_mut(&mut self) -> Option<Vec<&mut [F]>> {
+        // A follower observes a completed mapping and must never overwrite it.
+        if self.cache_is_preinitialized() {
+            return None;
+        }
         if Arc::strong_count(&self.uniqueness) != 1 {
             return None;
         }
@@ -1784,6 +2002,143 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     }
 }
 
+fn try_allocate_shared_column_cache<F>(
+    context: &MetalShared,
+    rows: usize,
+    cols: usize,
+) -> Result<Option<MetalColumns<F>>, String> {
+    let Some(config) = SHARED_COLUMN_CACHE.get() else {
+        return Ok(None);
+    };
+    let Some(key) = SHARED_COLUMN_CACHE_KEY.with(|slot| slot.borrow().clone()) else {
+        return Ok(None);
+    };
+    let data_bytes = rows
+        .checked_mul(cols)
+        .and_then(|elements| elements.checked_mul(size_of::<u64>()))
+        .ok_or("shared column cache size overflow")?;
+    // All ranked constants/sigmas shapes satisfy this. Decline unusual small
+    // shapes rather than violating Metal's bytes-no-copy page contract.
+    if data_bytes == 0 || data_bytes % SHARED_COLUMN_DATA_OFFSET != 0 {
+        return Ok(None);
+    }
+    let mapping_len = SHARED_COLUMN_DATA_OFFSET
+        .checked_add(data_bytes)
+        .ok_or("shared column mapping size overflow")?;
+    let path = config.directory.join(format!(
+        "lighter-lde-v{}-{key}-{rows}x{cols}.cache",
+        SHARED_COLUMN_VERSION
+    ));
+
+    let mapping = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => {
+            file.set_len(mapping_len as u64)
+                .map_err(|error| format!("sizing shared column cache failed: {error}"))?;
+            let mapping = Arc::new(SharedColumnMapping::map(
+                &file,
+                mapping_len,
+                path.clone(),
+                true,
+            )?);
+            unsafe {
+                core::ptr::write(
+                    mapping.base as *mut SharedColumnHeader,
+                    SharedColumnHeader {
+                        magic: AtomicU64::new(0),
+                        version: SHARED_COLUMN_VERSION,
+                        rows: rows as u64,
+                        cols: cols as u64,
+                        data_bytes: data_bytes as u64,
+                        participants: config.participants,
+                        status: AtomicU64::new(SHARED_COLUMN_BUILDING),
+                        attachments: AtomicU64::new(1),
+                    },
+                );
+            }
+            mapping
+                .header()
+                .magic
+                .store(SHARED_COLUMN_MAGIC, Ordering::Release);
+            mapping
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let deadline = Instant::now() + SHARED_COLUMN_WAIT;
+            let file = loop {
+                match OpenOptions::new().read(true).write(true).open(&path) {
+                    Ok(file) => match file.metadata() {
+                        Ok(metadata) if metadata.len() == mapping_len as u64 => break file,
+                        Ok(_) | Err(_) if Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Ok(_) | Err(_) => return Ok(None),
+                    },
+                    Err(_) => return Ok(None),
+                }
+            };
+            let mapping = Arc::new(SharedColumnMapping::map(
+                &file,
+                mapping_len,
+                path.clone(),
+                false,
+            )?);
+            loop {
+                let header = mapping.header();
+                if header.magic.load(Ordering::Acquire) == SHARED_COLUMN_MAGIC {
+                    if header.version != SHARED_COLUMN_VERSION
+                        || header.rows != rows as u64
+                        || header.cols != cols as u64
+                        || header.data_bytes != data_bytes as u64
+                        || header.participants != config.participants
+                    {
+                        return Err("shared column cache header mismatch".to_string());
+                    }
+                    match header.status.load(Ordering::Acquire) {
+                        SHARED_COLUMN_READY => {
+                            let attachments =
+                                header.attachments.fetch_add(1, Ordering::AcqRel) + 1;
+                            // Once every ranked worker has the inode mapped, its
+                            // directory entry is unnecessary. Unlinking lets
+                            // the kernel reclaim pages immediately as the last
+                            // circuit user unmaps them instead of retaining a
+                            // 1 GiB scratch-file cache until verifier cleanup.
+                            if attachments == config.participants {
+                                let _ = std::fs::remove_file(&mapping.path);
+                            }
+                            break mapping;
+                        }
+                        SHARED_COLUMN_FAILED => return Ok(None),
+                        _ => {}
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        Err(error) => {
+            return Err(format!("creating shared column cache failed: {error}"));
+        }
+    };
+
+    let buffer = autoreleasepool(|| {
+        context.device.new_buffer_with_bytes_no_copy(
+            mapping.data(),
+            data_bytes as NSUInteger,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        )
+    });
+    Ok(Some(MetalColumns::with_shared_mapping(
+        buffer, mapping, rows, cols,
+    )))
+}
+
 /// Allocates the final retained column store before the CPU LDE is computed,
 /// so the same shared buffer can be bound directly as the Metal leaf input.
 pub(crate) fn allocate_columns<F: RichField>(
@@ -1805,6 +2160,13 @@ pub(crate) fn allocate_columns<F: RichField>(
     }
 
     let context = ready_context_for_allocation(cols, rows)?;
+    match try_allocate_shared_column_cache(context, rows, cols) {
+        Ok(Some(columns)) => return Some(columns),
+        Ok(None) => {}
+        Err(error) => {
+            log::warn!("shared column cache unavailable; using private Metal storage: {error}");
+        }
+    }
     match context.allocate_columns(rows, cols) {
         Ok(columns) => Some(columns),
         Err(error) => {

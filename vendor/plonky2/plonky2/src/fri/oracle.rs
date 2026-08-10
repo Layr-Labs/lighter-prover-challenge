@@ -169,6 +169,23 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             if let Some(mut columns) =
                 C::Hasher::try_allocate_merkle_tree_columns(polynomials.len(), lde_len, cap_height)
             {
+                // A ranked sibling may already have filled these immutable
+                // public-circuit LDE pages. Its release/acquire publication
+                // makes the columns ready to hash without repeating any FFT.
+                if columns.cache_is_preinitialized() {
+                    let merkle_tree = timed!(
+                        timing,
+                        "build Merkle tree",
+                        MerkleTree::new_column_store(columns, cap_height)
+                    );
+                    return Self {
+                        polynomials,
+                        merkle_tree,
+                        degree_log: log2_strict(degree),
+                        rate_bits,
+                        blinding,
+                    };
+                }
                 // Streamed exclusive-phase path: the backend absorbs each
                 // group of eight LDE columns while the CPU computes the next
                 // group, collapsing the serial FFT-then-hash commitment into
@@ -211,6 +228,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     )
                 };
                 if let Some((level_digests, cap)) = streamed {
+                    columns.publish_cache_initialization();
                     let merkle_tree = timed!(
                         timing,
                         "build Merkle tree",
@@ -235,6 +253,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     )
                 );
                 if initialized {
+                    columns.publish_cache_initialization();
                     let merkle_tree = timed!(
                         timing,
                         "build Merkle tree",

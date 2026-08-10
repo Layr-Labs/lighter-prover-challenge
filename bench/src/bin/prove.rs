@@ -13,6 +13,7 @@ mod prover;
 use std::env;
 use std::fs::{self, File};
 use std::io::BufWriter;
+use std::path::Path;
 
 use api::{
     Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
@@ -93,6 +94,23 @@ fn main() {
     let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
+
+    // Every ranked worker receives an output inside the verifier's one shared,
+    // writable scratch directory. Use it only for immutable public-circuit LDE
+    // pages; the Metal layer validates circuit digest, shape and readiness and
+    // falls back to the existing private allocation on any failure.
+    let output_parent = Path::new(&output)
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let shared_cache_participants = env::var("LIGHTER_EXPECTED_FIXTURE_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(5);
+    plonky2::hash::poseidon2::configure_shared_column_cache(
+        output_parent,
+        shared_cache_participants,
+    );
 
     // Fixture parse overlaps the pre-execution circuit load; both are fast.
     let (block, pre_circuits) = rayon::join(

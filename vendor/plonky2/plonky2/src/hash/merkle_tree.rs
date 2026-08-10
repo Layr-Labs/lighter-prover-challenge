@@ -85,6 +85,25 @@ impl<F: RichField> ColumnStore<F> {
             ColumnStore::Shared(columns) => columns.columns_mut(),
         }
     }
+
+    /// True when another worker already completed this immutable file-backed
+    /// column store. Only the Metal implementation can return true.
+    pub(crate) fn cache_is_preinitialized(&self) -> bool {
+        match self {
+            ColumnStore::Owned(_) => false,
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            ColumnStore::Shared(columns) => columns.cache_is_preinitialized(),
+        }
+    }
+
+    /// Publishes a fully initialized file-backed store to follower workers.
+    pub(crate) fn publish_cache_initialization(&self) {
+        match self {
+            ColumnStore::Owned(_) => {}
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            ColumnStore::Shared(columns) => columns.publish_cache_initialization(),
+        }
+    }
 }
 
 /// Backing storage for the Merkle tree leaves.

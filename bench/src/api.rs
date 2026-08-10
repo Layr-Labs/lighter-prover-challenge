@@ -272,7 +272,18 @@ impl Circuits {
         );
         drop(light_chain_data);
         drop(heavy_chain_data);
-        (block.target, block.builder.build::<C>())
+        // This final verifier circuit is public and identical in every ranked
+        // worker, just like the five embedded startup circuits. Its builder
+        // has no circuit digest until `build` finishes, but the cache lives in
+        // a fresh verifier-owned scratch directory and validates the exact
+        // rows/columns before use, so a fixed version tag safely elects one LDE
+        // producer for this one call. Fixture-derived witnesses are created
+        // later and never pass through the cache scope.
+        let data =
+            plonky2::hash::poseidon2::with_shared_column_cache_key("b10cc1c017de0001", || {
+                block.builder.build::<C>()
+            });
+        (block.target, data)
     }
 }
 
