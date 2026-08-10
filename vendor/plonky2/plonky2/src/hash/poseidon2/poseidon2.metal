@@ -399,27 +399,143 @@ inline void internal_linear_layer(thread ulong state[12]) {
 // Parameter buffer remains in the ABI for host binding; sponge arithmetic uses
 // compile-time constant tables so RC adds do not depend on device buffer loads.
 // Round loops stay compact (unlike full unroll) to preserve occupancy.
+// A4: fold the next round constant into the preceding linear/reduction layer.
+// The helpers preserve the compact round loops and all lazy/reduction bounds.
+inline ulong gl_mul_add2(ulong a, ulong b, ulong addend1, ulong addend2) {
+    uint l0;
+    uint l1;
+    uint h0;
+    uint h1;
+    mul_128(a, b, l0, l1, h0, h1);
+
+    // Absorb addend1 into the low limbs.
+    uint d0 = (uint)addend1;
+    uint d1 = (uint)(addend1 >> 32);
+    uint s0 = l0 + d0;
+    uint c0 = (uint)(s0 < l0);
+    uint s1 = l1 + d1;
+    uint c1 = (uint)(s1 < l1);
+    uint s1b = s1 + c0;
+    c1 += (uint)(s1b < s1);
+    l0 = s0;
+    l1 = s1b;
+    uint hh0 = h0 + c1;
+    h1 += (uint)(hh0 < h0);
+    h0 = hh0;
+
+    // Absorb addend2 into the low limbs.
+    uint e0 = (uint)addend2;
+    uint e1 = (uint)(addend2 >> 32);
+    uint t0 = l0 + e0;
+    uint c2 = (uint)(t0 < l0);
+    uint t1 = l1 + e1;
+    uint c3 = (uint)(t1 < l1);
+    uint t1b = t1 + c2;
+    c3 += (uint)(t1b < t1);
+    l0 = t0;
+    l1 = t1b;
+    uint hhh0 = h0 + c3;
+    h1 += (uint)(hhh0 < h0);
+    h0 = hhh0;
+
+    uint r0 = l0 - h0;
+    uint borrow = (uint)(r0 > l0);
+    uint next = r0 - h1;
+    borrow += (uint)(next > r0);
+    r0 = next;
+
+    uint r1 = l1 + h0;
+    uint carry = (uint)(r1 < l1);
+    next = r1 - borrow;
+    uint under = (uint)(next > r1);
+    r1 = next;
+
+    return reduce_top(r0, r1, (int)carry - (int)under);
+}
+
+inline void external_linear_layer_rc(
+    thread ulong state[12],
+    constant ulong* rc) {
+    lazy_t lazy[12];
+    for (uint i = 0; i < 12; ++i) {
+        lazy[i] = lazy_of(state[i]);
+    }
+    mat4(lazy);
+    mat4(lazy + 4);
+    mat4(lazy + 8);
+
+    lazy_t sums[4];
+    for (uint i = 0; i < 4; ++i) {
+        sums[i] = lazy_add(lazy_add(lazy[i], lazy[i + 4]), lazy[i + 8]);
+    }
+    for (uint i = 0; i < 12; ++i) {
+        lazy_t v = lazy_add(lazy[i], sums[i & 3]);
+        v = lazy_add(v, lazy_of(rc[i]));
+        state[i] = lazy_materialize(v);
+    }
+}
+
+inline void internal_linear_layer_rc(
+    thread ulong state[12],
+    ulong next_rc) {
+    ulong sum = sum_state(state);
+    state[0] = gl_mul_add2(state[0], 0xc3b6c08e23ba9300UL, sum, next_rc);
+    state[1] = gl_mul_add(state[1], 0xd84b5de94a324fb6UL, sum);
+    state[2] = gl_mul_add(state[2], 0x0d0c371c5b35b84fUL, sum);
+    state[3] = gl_mul_add(state[3], 0x7964f570e7188037UL, sum);
+    state[4] = gl_mul_add(state[4], 0x5daf18bbd996604bUL, sum);
+    state[5] = gl_mul_add(state[5], 0x6743bc47b9595257UL, sum);
+    state[6] = gl_mul_add(state[6], 0x5528b9362c59bb70UL, sum);
+    state[7] = gl_mul_add(state[7], 0xac45e25b7127b68bUL, sum);
+    state[8] = gl_mul_add(state[8], 0xa2077d7dfbb606b5UL, sum);
+    state[9] = gl_mul_add(state[9], 0xf3faac6faee378aeUL, sum);
+    state[10] = gl_mul_add(state[10], 0x0c6388b51545e883UL, sum);
+    state[11] = gl_mul_add(state[11], 0xd27dbb6944917b60UL, sum);
+}
+
 inline void poseidon2(thread ulong state[12], constant ulong* /*parameters*/) {
+    // RC fold: fold each round's RC constants into the preceding linear layer's
+    // lazy accumulator, eliminating ~105 of ~118 full gl_add calls per permutation.
+    // The RC enters the lazy accumulator with coefficient 1, raising the max
+    // coefficient sum from 28 to 29 < 32 = 2^5, so lazy_materialize's bound is untouched.
+    // Transitions between layer types keep their gl_add (13 total).
+
+    // First external half: fold RC[0]..RC[3] into the linear layers.
+    external_linear_layer_rc(state, POSEIDON2_EXTERNAL_RC[0]);
+    for (uint round = 0; round < 3; ++round) {
+        for (uint i = 0; i < 12; ++i) {
+            state[i] = pow7(state[i]);
+        }
+        external_linear_layer_rc(state, POSEIDON2_EXTERNAL_RC[round + 1]);
+    }
+    // Last round of first external half (no next external RC).
+    for (uint i = 0; i < 12; ++i) {
+        state[i] = pow7(state[i]);
+    }
     external_linear_layer(state);
 
-    for (uint round = 0; round < 4; ++round) {
-        for (uint i = 0; i < 12; ++i) {
-            state[i] = pow7(gl_add(state[i], POSEIDON2_EXTERNAL_RC[round][i]));
-        }
-        external_linear_layer(state);
+    // Transition: add internal RC[0] to state[0] (not folded — layer type changes).
+    state[0] = pow7(gl_add(state[0], POSEIDON2_INTERNAL_RC[0]));
+    // Internal rounds: fold RC[1]..RC[21] into the linear layers.
+    for (uint round = 0; round < 21; ++round) {
+        internal_linear_layer_rc(state, POSEIDON2_INTERNAL_RC[round + 1]);
+        state[0] = pow7(state[0]);
     }
+    // Last internal round (no next internal RC).
+    internal_linear_layer(state);
 
-    for (uint round = 0; round < 22; ++round) {
-        state[0] = pow7(gl_add(state[0], POSEIDON2_INTERNAL_RC[round]));
-        internal_linear_layer(state);
+    // Transition: add external RC[4] to all lanes (not folded — layer type changes).
+    for (uint i = 0; i < 12; ++i) {
+        state[i] = pow7(gl_add(state[i], POSEIDON2_EXTERNAL_RC[4][i]));
     }
-
-    for (uint round = 4; round < 8; ++round) {
+    // Second external half: fold RC[5]..RC[7] into the linear layers.
+    for (uint round = 5; round < 8; ++round) {
+        external_linear_layer_rc(state, POSEIDON2_EXTERNAL_RC[round]);
         for (uint i = 0; i < 12; ++i) {
-            state[i] = pow7(gl_add(state[i], POSEIDON2_EXTERNAL_RC[round][i]));
+            state[i] = pow7(state[i]);
         }
-        external_linear_layer(state);
     }
+    external_linear_layer(state);
 }
 
 inline ulong poseidon2_gate_wire(
