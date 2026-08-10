@@ -422,6 +422,61 @@ inline void poseidon2(thread ulong state[12], constant ulong* /*parameters*/) {
     }
 }
 
+inline void poseidon2_nopeel(
+    thread ulong state[12],
+    constant ulong* /*parameters*/) {
+    external_linear_layer(state);
+
+    for (uint round = 0; round < 4; ++round) {
+        for (uint i = 0; i < 12; ++i) {
+            state[i] = pow7(gl_add(state[i], POSEIDON2_EXTERNAL_RC[round][i]));
+        }
+        external_linear_layer(state);
+    }
+
+    for (uint round = 0; round < 22; ++round) {
+        state[0] = pow7(gl_add(state[0], POSEIDON2_INTERNAL_RC[round]));
+        internal_linear_layer(state);
+    }
+
+    for (uint round = 4; round < 8; ++round) {
+        for (uint i = 0; i < 12; ++i) {
+            state[i] = pow7(gl_add(state[i], POSEIDON2_EXTERNAL_RC[round][i]));
+        }
+        if (round != 7u) {
+            external_linear_layer(state);
+        }
+    }
+}
+
+inline void external_linear_layer_term(thread ulong state[12], uint mode) {
+    lazy_t lazy[12];
+    for (uint i = 0; i < 12; ++i) {
+        lazy[i] = lazy_of(state[i]);
+    }
+    mat4(lazy);
+    mat4(lazy + 4);
+    mat4(lazy + 8);
+
+    lazy_t sums[4];
+    for (uint i = 0; i < 4; ++i) {
+        sums[i] = lazy_add(lazy_add(lazy[i], lazy[i + 4]), lazy[i + 8]);
+    }
+    if (mode == 12u) {
+        for (uint i = 0; i < 12; ++i) {
+            state[i] = lazy_materialize(lazy_add(lazy[i], sums[i & 3]));
+        }
+    } else if (mode == 0u) {
+        for (uint i = 0; i < 4; ++i) {
+            state[i] = lazy_materialize(lazy_add(lazy[i], sums[i]));
+        }
+    } else {
+        for (uint i = 0; i < 4; ++i) {
+            state[i + 8] = lazy_materialize(lazy_add(lazy[i + 8], sums[i]));
+        }
+    }
+}
+
 inline ulong poseidon2_gate_wire(
     const device ulong* wires,
     uint column,
@@ -1666,7 +1721,8 @@ kernel void poseidon2_hash_parents(
     for (uint i = 0; i < 8; ++i) {
         state[i] = input[i];
     }
-    poseidon2(state, parameters);
+    poseidon2_nopeel(state, parameters);
+    external_linear_layer_term(state, 0u);
 
     device ulong* output = parents + (ulong)gid * 4;
     for (uint i = 0; i < 4; ++i) {
