@@ -334,9 +334,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
         // former path zero-filled and copied all `vec_size` input columns here,
         // then immediately consumed and discarded that mirror.
         let item_count = (vec_size / 2) * n;
-        // The ranked shape is bits=4 over a 32-point batch: eight folded
-        // columns fit exactly here. Larger generic shapes retain heap storage.
-        let mut items_stack = [MaybeUninit::<F>::uninit(); 8 * 32];
+        // The promoted quotient scheduler also keeps the ranked bits=6,
+        // one-copy form on this direct CPU evaluator. Its first selector
+        // level needs 32 folded columns over the same 32-point batch, so keep
+        // that hot shape out of the allocator as well. Larger generic shapes
+        // retain heap storage.
+        let mut items_stack = [MaybeUninit::<F>::uninit(); 32 * 32];
         let mut items_heap;
         let items_uninit: &mut [MaybeUninit<F>] = if item_count <= items_stack.len() {
             &mut items_stack[..item_count]
