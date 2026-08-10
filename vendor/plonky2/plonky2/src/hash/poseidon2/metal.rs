@@ -101,6 +101,19 @@ fn profile_command_buffer(
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 
+/// Standalone source for the permutation quotient kernel. Keeping this kernel
+/// separate lets its field-factor rewrite ship without invalidating the
+/// checked-in AIR library (and without putting the full MSL front end back on
+/// the context's blocking path).
+const PERMUTATION_QUOTIENT_WG_SOURCE: &str =
+    include_str!("permutation_quotient_wg.metal");
+
+/// SHA-256 of [`PERMUTATION_QUOTIENT_WG_SOURCE`]. The source is compiled at
+/// runtime, but pinning it makes the isolated kernel and its structural tests
+/// move together.
+const PERMUTATION_QUOTIENT_WG_SOURCE_SHA256: &str =
+    "5e1fa00ca46ddcfd7207afea38cfad039b0e7eaef641fbf55c7fb2ccee82f0f7";
+
 /// `poseidon2.metal` precompiled to AIR, so a worker that cannot use the Metal
 /// shader cache does not pay the MSL front end. Regenerate whenever
 /// `poseidon2.metal` changes (see `MetalShared::new`); the
@@ -884,13 +897,11 @@ impl<F: RichField> TreeReadback<'_, F> {
     }
 }
 
-/// The two gate-quotient pipelines, lowered off the context's blocking path.
+/// Optional pipelines, lowered off the context's blocking path.
 ///
 /// Each is `None` until its background build finishes and `Some(None)` if that
-/// build failed. Both readers already treat an absent pipeline as "evaluate
-/// this gate on the CPU", which is the same behaviour a failed build produced
-/// before, so a caller that arrives early simply takes the CPU path it would
-/// have taken had the kernel been unbuildable.
+/// build failed. Callers already treat an absent pipeline as "evaluate this on
+/// the CPU", which is the same behaviour a failed build produced before.
 struct LazyPipeline {
     built: std::sync::OnceLock<Option<ComputePipelineState>>,
     builder: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -946,15 +957,18 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.get()
 }
 
-/// Starts the two gate-quotient pipeline builds on detached threads.
+/// Starts the optional pipeline builds on detached threads.
 ///
-/// One thread each rather than one for both: they are the two slowest kernels
-/// in the shader, so serializing them would keep the GPU quotient path on the
-/// CPU for the sum of their lowerings instead of the larger of the two.
+/// One thread per optional pipeline: the quotient kernels are the slowest in
+/// the shader, so serializing their builds would delay the GPU quotient path by
+/// the sum of their lowerings instead of the largest individual build.
 ///
-/// Scheduling only. The pipelines are the same objects the blocking build
-/// produced, lowered from the same library, so nothing they later compute can
-/// differ; only the instant at which they become available does.
+/// The three precompiled kernels are lowered from the checked-in AIR library.
+/// The permutation kernel is compiled from its small standalone MSL source,
+/// then lowered on its own builder thread. If either operation fails, that
+/// thread tries the original checked-in AIR kernel before settling the slot to
+/// `None`; runtime compiler rejection therefore preserves the promoted GPU
+/// path whenever the original kernel remains usable.
 fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
     for (name, slot) in [
         ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
@@ -962,7 +976,6 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             "range_check_gate_quotient",
             &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
         ),
-        ("permutation_quotient", &PERMUTATION_QUOTIENT_PIPELINE),
         ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
     ] {
         let device = device.clone();
@@ -993,6 +1006,62 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             Err(_) => {
                 let _ = slot.built.set(None);
             }
+        }
+    }
+
+    let device = device.clone();
+    let library = library.clone();
+    let slot = &PERMUTATION_QUOTIENT_PIPELINE;
+    let spawned = std::thread::Builder::new()
+        .name("poseidon2-metal-permutation_quotient".to_owned())
+        .spawn(move || {
+            let pipeline = autoreleasepool(|| {
+                let options = CompileOptions::new();
+                let optimized = device
+                    .new_library_with_source(PERMUTATION_QUOTIENT_WG_SOURCE, &options)
+                    .map_err(|error| format!("standalone source compilation failed: {error}"))
+                    .and_then(|optimized_library| {
+                        optimized_library
+                            .get_function("permutation_quotient", None)
+                            .map_err(|error| format!("standalone kernel unavailable: {error}"))
+                    })
+                    .and_then(|function| {
+                        device
+                            .new_compute_pipeline_state_with_function(&function)
+                            .map_err(|error| format!("standalone pipeline creation failed: {error}"))
+                    });
+                match optimized {
+                    Ok(pipeline) => Some(pipeline),
+                    Err(error) => {
+                        log::debug!(
+                            "optimized permutation_quotient pipeline unavailable; trying checked-in AIR: {error}"
+                        );
+                        library
+                            .get_function("permutation_quotient", None)
+                            .ok()
+                            .and_then(|function| {
+                                device
+                                    .new_compute_pipeline_state_with_function(&function)
+                                    .ok()
+                            })
+                    }
+                }
+            });
+            if pipeline.is_none() {
+                log::debug!(
+                    "both permutation_quotient pipelines unavailable; evaluating it on the CPU"
+                );
+            }
+            let _ = slot.built.set(pipeline);
+        });
+    match spawned {
+        Ok(handle) => {
+            if let Ok(mut builder) = slot.builder.lock() {
+                *builder = Some(handle);
+            }
+        }
+        Err(_) => {
+            let _ = slot.built.set(None);
         }
     }
 }
@@ -3739,6 +3808,96 @@ mod tests {
              xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib\n\
              then update SHADER_SOURCE_SHA256 to {digest}."
         );
+    }
+
+    #[test]
+    fn standalone_permutation_quotient_source_is_pinned_and_structurally_stable() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
+        let output = std::process::Command::new("/usr/bin/shasum")
+            .args([
+                "-a",
+                "256",
+                &format!("{dir}/permutation_quotient_wg.metal"),
+            ])
+            .output()
+            .expect("shasum must be available to pin the standalone source");
+        assert!(output.status.success(), "shasum failed");
+        let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
+        let digest = digest.split_whitespace().next().expect("empty shasum output");
+        assert_eq!(
+            digest, PERMUTATION_QUOTIENT_WG_SOURCE_SHA256,
+            "permutation_quotient_wg.metal changed; audit the standalone kernel and update \
+             PERMUTATION_QUOTIENT_WG_SOURCE_SHA256 to {digest}."
+        );
+
+        let source = PERMUTATION_QUOTIENT_WG_SOURCE;
+        assert_eq!(
+            source.matches("kernel void permutation_quotient(").count(),
+            1,
+            "the standalone source must expose exactly one kernel"
+        );
+        let compact_signature = |source: &str| {
+            source
+                .split_once("kernel void permutation_quotient(")
+                .expect("permutation quotient kernel is missing")
+                .1
+                .split_once(") {")
+                .expect("permutation quotient signature is unterminated")
+                .0
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>()
+        };
+        assert_eq!(
+            compact_signature(source),
+            compact_signature(SHADER_SOURCE),
+            "the standalone kernel ABI diverged from the checked-in AIR kernel"
+        );
+        for index in 0..=15 {
+            let binding = format!("[[buffer({index})]]");
+            assert_eq!(
+                source.matches(&binding).count(),
+                1,
+                "buffer binding {index} must appear exactly once"
+            );
+        }
+
+        let compact = source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert_eq!(compact.matches("wg=gl_add(wire,gamma0);").count(), 2);
+        assert_eq!(compact.matches("wg=gl_add(wire,gamma1);").count(), 2);
+        for old_factor in [
+            "gl_add(gl_mul_add(beta_k0,x,wire),gamma0)",
+            "gl_add(gl_mul_add(beta0,sigma,wire),gamma0)",
+            "gl_add(gl_mul_add(beta_k1,x,wire),gamma1)",
+            "gl_add(gl_mul_add(beta1,sigma,wire),gamma1)",
+        ] {
+            assert!(
+                !compact.contains(old_factor),
+                "standalone source regressed to the duplicate wire-plus-gamma factor"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_permutation_quotient_source_compiles_and_builds() {
+        let Some(device) = Device::system_default() else {
+            return; // no Metal device in this environment
+        };
+        autoreleasepool(|| {
+            let options = CompileOptions::new();
+            let library = device
+                .new_library_with_source(PERMUTATION_QUOTIENT_WG_SOURCE, &options)
+                .expect("standalone permutation quotient source must compile");
+            let function = library
+                .get_function("permutation_quotient", None)
+                .expect("standalone permutation quotient function must resolve");
+            device
+                .new_compute_pipeline_state_with_function(&function)
+                .expect("standalone permutation quotient pipeline must build");
+        });
     }
 
     /// The fallback in `MetalShared::new` hides a broken artifact behind a
