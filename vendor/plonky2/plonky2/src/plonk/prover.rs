@@ -723,10 +723,19 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                                 }
                                 let wire_value = witness.get_wire(i, j);
                                 let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                // Both factors at this position contain the same `wire + gamma`.
+                                // Share only that term: unlike an edge-factor reuse, this remains
+                                // valid for an arbitrary (including constraint-violating) witness.
+                                let wire_gamma_0 = wire_value + gamma_0;
+                                let wire_gamma_1 = wire_value + gamma_1;
+                                numerator_0 *=
+                                    wire_gamma_0.multiply_accumulate(beta_k_is_0[j], x);
+                                numerator_1 *=
+                                    wire_gamma_1.multiply_accumulate(beta_k_is_1[j], x);
+                                denominator_0 *=
+                                    wire_gamma_0.multiply_accumulate(beta_0, sigma);
+                                denominator_1 *=
+                                    wire_gamma_1.multiply_accumulate(beta_1, sigma);
                             }
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
@@ -831,8 +840,10 @@ fn wires_permutation_partial_products_and_zs<
                         let mut denominator_product = F::ONE;
                         for j in start..end {
                             let wire_value = witness.get_wire(i, j);
-                            numerator_product *= wire_value + beta_k_is[j] * x + gamma;
-                            denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
+                            let wire_gamma = wire_value + gamma;
+                            numerator_product *= wire_gamma.multiply_accumulate(beta_k_is[j], x);
+                            denominator_product *=
+                                wire_gamma.multiply_accumulate(beta, s_sigmas[j]);
                         }
                         quotient_products[t * num_chunks + chunk].write(numerator_product);
                         denominator_products.push(denominator_product);
@@ -3293,7 +3304,7 @@ mod l_0_table_tests {
 mod permutation_pairing_tests {
     use crate::field::polynomial::PolynomialValues;
     use crate::field::types::{Field, Field64, PrimeField64};
-    use crate::iop::witness::MatrixWitness;
+    use crate::iop::witness::{MatrixWitness, PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
@@ -3627,6 +3638,35 @@ mod permutation_pairing_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn shared_wire_gamma_factors_are_field_equal() {
+        let mut rng = Rng::new(0x5a17_edf0_6a6d_6d61);
+        for _ in 0..1000 {
+            let wire = rng.next_field();
+            let gamma = rng.next_field();
+            let beta = rng.next_field();
+            let point = rng.next_field();
+            let old = wire + beta * point + gamma;
+            let wire_gamma = wire + gamma;
+            assert_eq!(wire_gamma.multiply_accumulate(beta, point), old);
+        }
+    }
+
+    #[test]
+    fn shared_wire_gamma_path_proves_and_verifies() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let x = builder.add_virtual_target();
+        let square = builder.mul(x, x);
+        builder.register_public_input(square);
+        let data = builder.build::<C>();
+
+        let mut witness = PartialWitness::new();
+        witness.set_target(x, F::from_canonical_u64(9)).unwrap();
+        let proof = data.prove(witness).unwrap();
+        data.verify(proof).unwrap();
     }
 
     /// Differential for the actual runtime mask seam. It uses the circuit's real sigma oracle,
