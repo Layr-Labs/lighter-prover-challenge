@@ -29,12 +29,46 @@ use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::util::timing::TimingTree;
 
-use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
+use crate::api::{CircuitSlot, Circuits, PROVER_THREAD_STACK_BYTES, Proof};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxPath {
     Heavy,
     Light,
+}
+
+enum CircuitSource<'a> {
+    Ready(std::sync::RwLockReadGuard<'a, CircuitData<F, C, D>>),
+    Deferred {
+        facade: &'static CircuitData<F, C, D>,
+        slot: &'a CircuitSlot,
+    },
+}
+
+impl<'a> CircuitSource<'a> {
+    fn new(slot: &'a CircuitSlot) -> Self {
+        match slot.witness_facade() {
+            Some(facade) => Self::Deferred { facade, slot },
+            None => Self::Ready(slot.wait_ready()),
+        }
+    }
+
+    fn witness_data(&self) -> &CircuitData<F, C, D> {
+        match self {
+            Self::Ready(data) => data,
+            Self::Deferred { facade, .. } => facade,
+        }
+    }
+
+    fn with_proof_data<R>(&self, f: impl FnOnce(&CircuitData<F, C, D>) -> R) -> R {
+        match self {
+            Self::Ready(data) => f(data),
+            Self::Deferred { slot, .. } => {
+                let data = slot.wait_ready();
+                f(&data)
+            }
+        }
+    }
 }
 
 #[cfg(feature = "diagnostic_profile")]
@@ -146,7 +180,7 @@ impl ChainState<'_> {
 fn chain_step_proof(
     path: TxPath,
     chain_target: &BlockTxChainTarget,
-    chain_data: &CircuitData<F, C, D>,
+    chain_source: &CircuitSource<'_>,
     chain_step: u64,
     previous: Option<ChainState<'_>>,
     base_proof: &Proof,
@@ -163,6 +197,7 @@ fn chain_step_proof(
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "chain_step");
     let result = (|| {
+        let chain_data = chain_source.witness_data();
         // Phase 1: run every generator that does not depend on the previous chain proof while
         // that proof may still be in flight. Inputs are written directly into
         // the partition's representative slots — no PartialWitness map, no
@@ -191,7 +226,7 @@ fn chain_step_proof(
                 feeder,
             )
         })?;
-        BlockTxChainCircuit::prove_prepared(pending, chain_data)
+        chain_source.with_proof_data(|data| BlockTxChainCircuit::prove_prepared(pending, data))
     })();
     result.unwrap_or_else(|error| {
         panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")
@@ -263,7 +298,7 @@ fn generate_tx_witness<'a>(
 fn prove_tx_witness(
     path: TxPath,
     chunk_index: usize,
-    tx_data: &CircuitData<F, C, D>,
+    tx_source: &CircuitSource<'_>,
     partition_witness: PartitionWitness<'_, F>,
 ) -> Proof {
     #[cfg(feature = "diagnostic_profile")]
@@ -274,20 +309,22 @@ fn prove_tx_witness(
     );
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "prove_tx_witness");
-    let proof = prove_with_partition_witness::<F, C, D>(
-        &tx_data.prover_only,
-        &tx_data.common,
-        partition_witness,
-        &mut TimingTree::default(),
-    )
-    .unwrap_or_else(|error| {
-        panic!("{path:?} block transaction chunk #{chunk_index} proof failed: {error:?}")
-    });
-    #[cfg(debug_assertions)]
-    tx_data
-        .verify(proof.clone())
-        .expect("transaction proof self-check failed");
-    proof
+    tx_source.with_proof_data(|tx_data| {
+        let proof = prove_with_partition_witness::<F, C, D>(
+            &tx_data.prover_only,
+            &tx_data.common,
+            partition_witness,
+            &mut TimingTree::default(),
+        )
+        .unwrap_or_else(|error| {
+            panic!("{path:?} block transaction chunk #{chunk_index} proof failed: {error:?}")
+        });
+        #[cfg(debug_assertions)]
+        tx_data
+            .verify(proof.clone())
+            .expect("transaction proof self-check failed");
+        proof
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -317,53 +354,24 @@ fn prove_path(
     );
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "prove_path");
-    // The heavy pair's shared guards are held for exactly as long as this path
-    // may read them — from here to the `return`, which is after its chain proof
-    // exists — so the exclusive acquisition in
-    // `Circuits::release_heavy_circuit_extensions` is a proof that the heavy
-    // path is finished with them. Shared guards never block one another, so
-    // this neither serializes the two paths nor delays the concurrent block
-    // circuit construction, which takes its own shared guard.
-    let heavy_tx_guard;
-    let heavy_chain_guard;
-    let light_tx_guard;
-    let light_chain_guard;
-    let (tx_data, tx_target, chain_data, chain_target, dummy_proof) = match path {
-        TxPath::Light => {
-            light_tx_guard = circuits
-                .light_tx_data
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            light_chain_guard = circuits
-                .light_chain_data
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                &*light_tx_guard,
-                &circuits.light_tx_target,
-                &*light_chain_guard,
-                &circuits.light_chain_target,
-                &circuits.dummy_light_proof,
-            )
-        }
-        TxPath::Heavy => {
-            heavy_tx_guard = circuits
-                .heavy_tx_data
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            heavy_chain_guard = circuits
-                .heavy_chain_data
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                &*heavy_tx_guard,
-                &circuits.heavy_tx_target,
-                &*heavy_chain_guard,
-                &circuits.heavy_chain_target,
-                &circuits.dummy_heavy_proof,
-            )
-        }
+    let (tx_slot, tx_target, chain_slot, chain_target, dummy_proof) = match path {
+        TxPath::Light => (
+            &*circuits.light_tx_data,
+            &circuits.light_tx_target,
+            &*circuits.light_chain_data,
+            &circuits.light_chain_target,
+            &circuits.dummy_light_proof,
+        ),
+        TxPath::Heavy => (
+            &*circuits.heavy_tx_data,
+            &circuits.heavy_tx_target,
+            &*circuits.heavy_chain_data,
+            &circuits.heavy_chain_target,
+            &circuits.dummy_heavy_proof,
+        ),
     };
+    let tx_source = CircuitSource::new(tx_slot);
+    let chain_source = CircuitSource::new(chain_slot);
 
     let base_proof = cyclic_base_witness(
         dummy_proof,
@@ -381,7 +389,7 @@ fn prove_path(
         path,
         current_chunk_index,
         first_txs,
-        tx_data,
+        tx_source.witness_data(),
         tx_target,
         created_at,
         state_metadata_hash,
@@ -390,6 +398,8 @@ fn prove_path(
     jump = next_jump;
 
 
+    let tx_source = &tx_source;
+    let chain_source = &chain_source;
     let chain_proof = std::thread::scope(|scope| {
         let base = &base_proof;
         let mut chain: Option<ChainState<'_>> = None;
@@ -409,7 +419,7 @@ fn prove_path(
                         chain_step_proof(
                             path,
                             chain_target,
-                            chain_data,
+                            chain_source,
                             chain_step,
                             previous,
                             base,
@@ -426,7 +436,7 @@ fn prove_path(
                 .name(format!("{path:?}-tx-proof-{current_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
-                    prove_tx_witness(path, current_chunk_index, tx_data, witness)
+                    prove_tx_witness(path, current_chunk_index, tx_source, witness)
                 })
                 .expect("transaction proof pipeline thread must start");
 
@@ -435,7 +445,7 @@ fn prove_path(
                     path,
                     chunk_index,
                     txs,
-                    tx_data,
+                    tx_source.witness_data(),
                     tx_target,
                     created_at,
                     state_metadata_hash,
@@ -489,7 +499,7 @@ fn prove_path(
                     chain_step_proof(
                         path,
                         chain_target,
-                        chain_data,
+                        chain_source,
                         chain_step,
                         previous,
                         base,
@@ -533,7 +543,7 @@ fn prove_path(
             chain = Some(ChainState::Ready(chain_step_proof(
                 path,
                 chain_target,
-                chain_data,
+                chain_source,
                 chain_step,
                 previous,
                 base,

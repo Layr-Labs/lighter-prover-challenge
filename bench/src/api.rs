@@ -13,6 +13,7 @@ use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
 use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::proof::ProofWithPublicInputs;
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard};
 
 pub type Proof = ProofWithPublicInputs<F, C, D>;
 
@@ -25,6 +26,107 @@ pub const ON_CHAIN_OPERATIONS_LIMIT: usize = 1;
 pub const PUBLIC_HEAVY_TX_COUNT: usize = 10;
 pub const PUBLIC_LIGHT_TX_COUNT: usize = 490;
 pub const PROVER_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug)]
+enum CircuitReadiness {
+    Pending,
+    Ready,
+    Failed(String),
+}
+
+/// A circuit whose proof-only constants/sigmas commitment may still be
+/// finalizing in the background. Deferred slots expose a separately parsed,
+/// immutable witness facade; proof readers wait for the full data.
+pub(crate) struct CircuitSlot {
+    data: RwLock<CircuitData<F, C, D>>,
+    witness_facade: Option<&'static CircuitData<F, C, D>>,
+    readiness: Mutex<CircuitReadiness>,
+    ready: Condvar,
+}
+
+impl CircuitSlot {
+    pub(crate) fn ready(data: CircuitData<F, C, D>) -> Arc<Self> {
+        Arc::new(Self {
+            data: RwLock::new(data),
+            witness_facade: None,
+            readiness: Mutex::new(CircuitReadiness::Ready),
+            ready: Condvar::new(),
+        })
+    }
+
+    pub(crate) fn pending(
+        data: CircuitData<F, C, D>,
+        witness_facade: &'static CircuitData<F, C, D>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            data: RwLock::new(data),
+            witness_facade: Some(witness_facade),
+            readiness: Mutex::new(CircuitReadiness::Pending),
+            ready: Condvar::new(),
+        })
+    }
+
+    pub(crate) fn witness_facade(&self) -> Option<&'static CircuitData<F, C, D>> {
+        self.witness_facade
+    }
+
+    pub(crate) fn wait_ready(&self) -> RwLockReadGuard<'_, CircuitData<F, C, D>> {
+        let mut readiness = self
+            .readiness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            match &*readiness {
+                CircuitReadiness::Ready => break,
+                CircuitReadiness::Failed(error) => {
+                    panic!("embedded circuit commitment finalization failed: {error}")
+                }
+                CircuitReadiness::Pending => {
+                    readiness = self
+                        .ready
+                        .wait(readiness)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+            }
+        }
+        drop(readiness);
+        self.data
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn install(
+        &self,
+        pending: circuit::embed::PendingEmbeddedCommitment,
+    ) -> anyhow::Result<()> {
+        let result = {
+            let mut data = self
+                .data
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.finalize_into(&mut data)
+        };
+        let mut readiness = self
+            .readiness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *readiness = match &result {
+            Ok(()) => CircuitReadiness::Ready,
+            Err(error) => CircuitReadiness::Failed(format!("{error:#}")),
+        };
+        self.ready.notify_all();
+        result
+    }
+
+    fn clear_extensions(&self) {
+        let mut data = self
+            .data
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+        data.prover_only.constants_sigmas_quotient_cache = None;
+    }
+}
 
 pub struct Circuits {
     pub heavy_tx_target: BlockTxTarget,
@@ -39,7 +141,7 @@ pub struct Circuits {
     /// once both are gone. Shared guards never block one another, so no reader
     /// is serialized against another and no work is added; the lock is a proof
     /// obligation discharged by the type system, not a scheduling change.
-    pub heavy_tx_data: std::sync::RwLock<CircuitData<F, C, D>>,
+    pub(crate) heavy_tx_data: Arc<CircuitSlot>,
     pub light_tx_target: BlockTxTarget,
     /// The light pair's extensions are dead the moment the light path's thread
     /// exits (the last light transaction proof and the last light chain step
@@ -49,15 +151,15 @@ pub struct Circuits {
     /// [`Circuits::release_light_circuit_extensions`] retire them right after
     /// the light thread joins — during the remaining block-lane join and final
     /// witness setup — instead of at [`Self::release_finished_circuit_extensions`].
-    pub light_tx_data: std::sync::RwLock<CircuitData<F, C, D>>,
+    pub(crate) light_tx_data: Arc<CircuitSlot>,
     pub pre_target: BlockPreExecutionTarget,
     pub pre_data: CircuitData<F, C, D>,
     pub heavy_chain_target: BlockTxChainTarget,
     /// See [`Circuits::heavy_tx_data`].
-    pub heavy_chain_data: std::sync::RwLock<CircuitData<F, C, D>>,
+    pub(crate) heavy_chain_data: Arc<CircuitSlot>,
     pub light_chain_target: BlockTxChainTarget,
     /// See [`Circuits::light_tx_data`].
-    pub light_chain_data: std::sync::RwLock<CircuitData<F, C, D>>,
+    pub(crate) light_chain_data: Arc<CircuitSlot>,
     pub dummy_heavy_proof: Proof,
     pub dummy_light_proof: Proof,
 }
@@ -119,15 +221,15 @@ impl Circuits {
         );
         Self {
             heavy_tx_target: heavy.tx_target,
-            heavy_tx_data: std::sync::RwLock::new(heavy.tx_data),
+            heavy_tx_data: CircuitSlot::ready(heavy.tx_data),
             light_tx_target: light.tx_target,
-            light_tx_data: std::sync::RwLock::new(light.tx_data),
+            light_tx_data: CircuitSlot::ready(light.tx_data),
             pre_target,
             pre_data,
             heavy_chain_target: heavy.chain_target,
-            heavy_chain_data: std::sync::RwLock::new(heavy.chain_data),
+            heavy_chain_data: CircuitSlot::ready(heavy.chain_data),
             light_chain_target: light.chain_target,
-            light_chain_data: std::sync::RwLock::new(light.chain_data),
+            light_chain_data: CircuitSlot::ready(light.chain_data),
             dummy_heavy_proof: heavy.dummy_proof,
             dummy_light_proof: light.dummy_proof,
         }
@@ -170,20 +272,13 @@ impl Circuits {
     pub fn release_finished_circuit_extensions(&mut self) {
         self.pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
         self.pre_data.prover_only.constants_sigmas_quotient_cache = None;
-        for lock in [
-            &mut self.light_tx_data,
-            &mut self.light_chain_data,
-            &mut self.heavy_tx_data,
-            &mut self.heavy_chain_data,
+        for slot in [
+            &self.light_tx_data,
+            &self.light_chain_data,
+            &self.heavy_tx_data,
+            &self.heavy_chain_data,
         ] {
-            let data = lock
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
-            // The quotient-domain cache is reachable only from the same proofs
-            // as the commitment above, so wherever that is dead this is too.
-            // Clearing it is idempotent for a path that already released its own.
-            data.prover_only.constants_sigmas_quotient_cache = None;
+            slot.clear_extensions();
         }
     }
 
@@ -211,15 +306,8 @@ impl Circuits {
     /// Value-exact and free: no quantity is computed differently and no work is
     /// added — storage that no subsequent read can reach is returned earlier.
     pub fn release_heavy_circuit_extensions(&self) {
-        for lock in [&self.heavy_tx_data, &self.heavy_chain_data] {
-            let mut data = lock
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
-            // Same guard, same argument: the exclusive acquisition proves no
-            // reader remains, and the quotient-domain cache is read only by the
-            // proofs that read the commitment.
-            data.prover_only.constants_sigmas_quotient_cache = None;
+        for slot in [&self.heavy_tx_data, &self.heavy_chain_data] {
+            slot.clear_extensions();
         }
     }
 
@@ -235,15 +323,8 @@ impl Circuits {
     /// CPU-visible Metal shared buffers released seconds before
     /// [`Self::release_finished_circuit_extensions`] would.
     pub fn release_light_circuit_extensions(&self) {
-        for lock in [&self.light_tx_data, &self.light_chain_data] {
-            let mut data = lock
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
-            // Same guard, same argument: the exclusive acquisition proves no
-            // reader remains, and the quotient-domain cache is read only by the
-            // proofs that read the commitment.
-            data.prover_only.constants_sigmas_quotient_cache = None;
+        for slot in [&self.light_tx_data, &self.light_chain_data] {
+            slot.clear_extensions();
         }
     }
 
@@ -255,23 +336,27 @@ impl Circuits {
         // (`handle_proofs` calls `constant_verifier_data` and `verify_proof`),
         // so the shared guard is needed only for the construction itself and is
         // dropped before the (much longer) `build` below.
-        let heavy_chain_data = self
-            .heavy_chain_data
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let light_chain_data = self
-            .light_chain_data
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let heavy_chain_guard;
+        let light_chain_guard;
+        let heavy_chain_data = if let Some(facade) = self.heavy_chain_data.witness_facade() {
+            facade
+        } else {
+            heavy_chain_guard = self.heavy_chain_data.wait_ready();
+            &*heavy_chain_guard
+        };
+        let light_chain_data = if let Some(facade) = self.light_chain_data.witness_facade() {
+            facade
+        } else {
+            light_chain_guard = self.light_chain_data.wait_ready();
+            &*light_chain_guard
+        };
         let block = BlockCircuit::define(
             CIRCUIT_CONFIG,
             &self.pre_data,
-            &light_chain_data,
-            &heavy_chain_data,
+            light_chain_data,
+            heavy_chain_data,
             ON_CHAIN_OPERATIONS_LIMIT,
         );
-        drop(light_chain_data);
-        drop(heavy_chain_data);
         (block.target, block.builder.build::<C>())
     }
 }

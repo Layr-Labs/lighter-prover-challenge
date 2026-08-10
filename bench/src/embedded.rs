@@ -17,11 +17,14 @@
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
-use circuit::embed::deserialize_embedded;
+use circuit::embed::{
+    PendingEmbeddedCommitment, deserialize_embedded, parse_embedded,
+    parse_embedded_witness_facade,
+};
 use circuit::types::config::{C, D, F};
 use plonky2::plonk::circuit_data::CircuitData;
 
-use crate::api::{Circuits, Proof};
+use crate::api::{CircuitSlot, Circuits, Proof};
 
 static PRE_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pre.embed"));
 static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx.embed"));
@@ -33,12 +36,19 @@ static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light
 /// this separate lets the worker start the pre-execution proof from its already
 /// decoded circuit while these independent blobs load in parallel.
 pub(crate) struct RemainingEmbeddedCircuits {
-    heavy_tx: (BlockTxTarget, CircuitData<F, C, D>),
-    heavy_chain: (BlockTxChainTarget, CircuitData<F, C, D>),
-    light_tx: (BlockTxTarget, CircuitData<F, C, D>),
-    light_chain: (BlockTxChainTarget, CircuitData<F, C, D>),
+    heavy_tx: DeferredEmbeddedCircuit<BlockTxTarget>,
+    heavy_chain: DeferredEmbeddedCircuit<BlockTxChainTarget>,
+    light_tx: DeferredEmbeddedCircuit<BlockTxTarget>,
+    light_chain: DeferredEmbeddedCircuit<BlockTxChainTarget>,
     dummy_heavy_proof: Proof,
     dummy_light_proof: Proof,
+}
+
+struct DeferredEmbeddedCircuit<T> {
+    target: T,
+    data: CircuitData<F, C, D>,
+    witness_facade: &'static CircuitData<F, C, D>,
+    pending: PendingEmbeddedCommitment,
 }
 
 impl RemainingEmbeddedCircuits {
@@ -47,24 +57,106 @@ impl RemainingEmbeddedCircuits {
         pre: (BlockPreExecutionTarget, CircuitData<F, C, D>),
     ) -> Circuits {
         let (pre_target, pre_data) = pre;
-        let (heavy_tx_target, heavy_tx_data) = self.heavy_tx;
-        let (heavy_chain_target, heavy_chain_data) = self.heavy_chain;
-        let (light_tx_target, light_tx_data) = self.light_tx;
-        let (light_chain_target, light_chain_data) = self.light_chain;
+        let DeferredEmbeddedCircuit {
+            target: heavy_tx_target,
+            data: heavy_tx_data,
+            witness_facade: heavy_tx_facade,
+            pending: heavy_tx_pending,
+        } = self.heavy_tx;
+        let DeferredEmbeddedCircuit {
+            target: heavy_chain_target,
+            data: heavy_chain_data,
+            witness_facade: heavy_chain_facade,
+            pending: heavy_chain_pending,
+        } = self.heavy_chain;
+        let DeferredEmbeddedCircuit {
+            target: light_tx_target,
+            data: light_tx_data,
+            witness_facade: light_tx_facade,
+            pending: light_tx_pending,
+        } = self.light_tx;
+        let DeferredEmbeddedCircuit {
+            target: light_chain_target,
+            data: light_chain_data,
+            witness_facade: light_chain_facade,
+            pending: light_chain_pending,
+        } = self.light_chain;
+
+        let heavy_tx_data = CircuitSlot::pending(heavy_tx_data, heavy_tx_facade);
+        let heavy_chain_data = CircuitSlot::pending(heavy_chain_data, heavy_chain_facade);
+        let light_tx_data = CircuitSlot::pending(light_tx_data, light_tx_facade);
+        let light_chain_data = CircuitSlot::pending(light_chain_data, light_chain_facade);
+
+        // One sequencer avoids four wide commitment builds competing for the
+        // same Metal queue. Light first matches the 49-fold critical spine;
+        // heavy has ample slack before its short path reaches proof work.
+        let finalizer_slots = [
+            light_tx_data.clone(),
+            light_chain_data.clone(),
+            heavy_tx_data.clone(),
+            heavy_chain_data.clone(),
+        ];
+        std::thread::Builder::new()
+            .name("embedded-commitments".into())
+            .spawn(move || {
+                for (slot, pending) in finalizer_slots.into_iter().zip([
+                    light_tx_pending,
+                    light_chain_pending,
+                    heavy_tx_pending,
+                    heavy_chain_pending,
+                ]) {
+                    let _ = slot.install(pending);
+                }
+            })
+            .expect("embedded commitment finalizer thread must start");
+
         Circuits {
             heavy_tx_target,
-            heavy_tx_data: std::sync::RwLock::new(heavy_tx_data),
+            heavy_tx_data,
             light_tx_target,
-            light_tx_data: std::sync::RwLock::new(light_tx_data),
+            light_tx_data,
             pre_target,
             pre_data,
             heavy_chain_target,
-            heavy_chain_data: std::sync::RwLock::new(heavy_chain_data),
+            heavy_chain_data,
             light_chain_target,
-            light_chain_data: std::sync::RwLock::new(light_chain_data),
+            light_chain_data,
             dummy_heavy_proof: self.dummy_heavy_proof,
             dummy_light_proof: self.dummy_light_proof,
         }
+    }
+
+    fn into_ready_circuits(
+        self,
+        pre: (BlockPreExecutionTarget, CircuitData<F, C, D>),
+    ) -> anyhow::Result<Circuits> {
+        fn finish<T>(
+            deferred: DeferredEmbeddedCircuit<T>,
+        ) -> anyhow::Result<(T, CircuitData<F, C, D>)> {
+            let mut data = deferred.data;
+            deferred.pending.finalize_into(&mut data)?;
+            Ok((deferred.target, data))
+        }
+
+        let (pre_target, pre_data) = pre;
+        let (heavy_tx_target, heavy_tx_data) = finish(self.heavy_tx)?;
+        let (heavy_chain_target, heavy_chain_data) = finish(self.heavy_chain)?;
+        let (light_tx_target, light_tx_data) = finish(self.light_tx)?;
+        let (light_chain_target, light_chain_data) = finish(self.light_chain)?;
+        Ok(Circuits {
+            heavy_tx_target,
+            heavy_tx_data: CircuitSlot::ready(heavy_tx_data),
+            light_tx_target,
+            light_tx_data: CircuitSlot::ready(light_tx_data),
+            pre_target,
+            pre_data,
+            heavy_chain_target,
+            heavy_chain_data: CircuitSlot::ready(heavy_chain_data),
+            light_chain_target,
+            light_chain_data: CircuitSlot::ready(light_chain_data),
+            dummy_heavy_proof: self.dummy_heavy_proof,
+            dummy_light_proof: self.dummy_light_proof,
+        })
     }
 }
 
@@ -78,6 +170,34 @@ fn load_blob<T: serde::de::DeserializeOwned>(
     );
     deserialize_embedded::<T>(blob)
         .map_err(|error| error.context(format!("loading embedded circuit {name}")))
+}
+
+fn load_blob_deferred<T: serde::de::DeserializeOwned>(
+    name: &'static str,
+    blob: &[u8],
+) -> anyhow::Result<DeferredEmbeddedCircuit<T>> {
+    anyhow::ensure!(
+        !blob.is_empty(),
+        "embedded circuit blob {name} is an empty stub (compiled with LIGHTER_SKIP_EMBED=1)"
+    );
+    let (target, data, pending) = parse_embedded::<T>(blob)
+        .map_err(|error| error.context(format!("parsing embedded circuit {name}")))?;
+
+    // Witness generation needs only generators, the watch index/counts,
+    // representative map, common data, and (for chain inputs) verifier data.
+    // A second parse gives it stable independent storage while the primary
+    // circuit is finalized in place. Drop all proof-only derivatives from the
+    // facade so the overlap does not retain a second wide sigma allocation.
+    let (_facade_target, facade) = parse_embedded_witness_facade::<T>(blob)
+        .map_err(|error| error.context(format!("parsing witness facade {name}")))?;
+    let witness_facade = Box::leak(Box::new(facade));
+
+    Ok(DeferredEmbeddedCircuit {
+        target,
+        data,
+        witness_facade,
+        pending,
+    })
 }
 
 impl Circuits {
@@ -95,14 +215,24 @@ impl Circuits {
         let (heavy, light) = rayon::join(
             || {
                 rayon::join(
-                    || load_blob::<BlockTxTarget>("heavy_tx", HEAVY_TX_BLOB),
-                    || load_blob::<BlockTxChainTarget>("heavy_chain", HEAVY_CHAIN_BLOB),
+                    || load_blob_deferred::<BlockTxTarget>("heavy_tx", HEAVY_TX_BLOB),
+                    || {
+                        load_blob_deferred::<BlockTxChainTarget>(
+                            "heavy_chain",
+                            HEAVY_CHAIN_BLOB,
+                        )
+                    },
                 )
             },
             || {
                 rayon::join(
-                    || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
-                    || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
+                    || load_blob_deferred::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
+                    || {
+                        load_blob_deferred::<BlockTxChainTarget>(
+                            "light_chain",
+                            LIGHT_CHAIN_BLOB,
+                        )
+                    },
                 )
             },
         );
@@ -135,7 +265,7 @@ impl Circuits {
         // independent (unlike builds, the chain loads do not wait on the
         // transaction circuits).
         let (pre, remaining) = rayon::join(Self::load_pre, Self::load_remaining_embedded);
-        Ok(remaining?.into_circuits(pre?))
+        remaining?.into_ready_circuits(pre?)
     }
 
     /// Production loader: embedded circuits when available, otherwise a fresh
@@ -293,44 +423,44 @@ mod tests {
                 "heavy_tx",
                 (
                     &rebuilt.heavy_tx_target,
-                    &rebuilt.heavy_tx_data.read().unwrap(),
+                    &rebuilt.heavy_tx_data.wait_ready(),
                 ),
                 (
                     &embedded.heavy_tx_target,
-                    &embedded.heavy_tx_data.read().unwrap(),
+                    &embedded.heavy_tx_data.wait_ready(),
                 ),
             );
             assert_circuit_pair_identical(
                 "heavy_chain",
                 (
                     &rebuilt.heavy_chain_target,
-                    &rebuilt.heavy_chain_data.read().unwrap(),
+                    &rebuilt.heavy_chain_data.wait_ready(),
                 ),
                 (
                     &embedded.heavy_chain_target,
-                    &embedded.heavy_chain_data.read().unwrap(),
+                    &embedded.heavy_chain_data.wait_ready(),
                 ),
             );
             assert_circuit_pair_identical(
                 "light_tx",
                 (
                     &rebuilt.light_tx_target,
-                    &rebuilt.light_tx_data.read().unwrap(),
+                    &rebuilt.light_tx_data.wait_ready(),
                 ),
                 (
                     &embedded.light_tx_target,
-                    &embedded.light_tx_data.read().unwrap(),
+                    &embedded.light_tx_data.wait_ready(),
                 ),
             );
             assert_circuit_pair_identical(
                 "light_chain",
                 (
                     &rebuilt.light_chain_target,
-                    &rebuilt.light_chain_data.read().unwrap(),
+                    &rebuilt.light_chain_data.wait_ready(),
                 ),
                 (
                     &embedded.light_chain_target,
-                    &embedded.light_chain_data.read().unwrap(),
+                    &embedded.light_chain_data.wait_ready(),
                 ),
             );
 
@@ -339,7 +469,7 @@ mod tests {
             let mut bytes = Vec::new();
             bytes
                 .write_common_circuit_data(
-                    &rebuilt.light_tx_data.read().unwrap().common,
+                    &rebuilt.light_tx_data.wait_ready().common,
                     &BlockGateSerializer,
                 )
                 .expect("common data must serialize");

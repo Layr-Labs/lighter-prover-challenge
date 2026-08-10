@@ -36,7 +36,6 @@
 use anyhow::{Context, Result, bail, ensure};
 use plonky2::field::fft::{cached_fft_root_table, cached_two_adic_subgroup};
 use plonky2::field::polynomial::PolynomialValues;
-use plonky2::field::types::Field;
 use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::plonk::circuit_data::{
     CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
@@ -161,6 +160,16 @@ fn read_compressed_section(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
         raw.len()
     );
     Ok(raw)
+}
+
+fn skip_compressed_section(bytes: &[u8], pos: &mut usize) -> Result<()> {
+    ensure!(
+        bytes.len() >= *pos + 8,
+        "embedded circuit blob truncated at compressed section header"
+    );
+    *pos += 8; // uncompressed length
+    let _ = read_section(bytes, pos)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -294,16 +303,97 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
 // Read side (runtime)
 // ---------------------------------------------------------------------------
 
-/// Reconstructs the target struct and the full [`CircuitData`] from a blob
-/// produced by [`serialize_embedded`].
+/// The expensive, proof-only half of an embedded circuit load.
 ///
-/// The returned `CircuitData` is value-identical to the freshly built one:
-/// deserialized components are byte round trips, and every recomputed
-/// component (subgroup, FFT root table, sigma values/transpose, watch counts,
-/// constants/sigmas commitment) is derived by the same code paths the builder
-/// itself runs, from the same inputs. The recomputed commitment cap is checked
-/// against the embedded verifier data before returning.
-pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, CircuitData<F, C, D>)> {
+/// Parsing and witness generation do not need the constants/sigmas LDE. Keeping
+/// its source values here lets the benchmark start witness work first and
+/// finalize the commitment on a background thread. [`deserialize_embedded`]
+/// remains the eager compatibility wrapper used by ordinary callers.
+pub struct PendingEmbeddedCommitment {
+    values: Vec<PolynomialValues<F>>,
+    rate_bits: usize,
+    cap_height: usize,
+}
+
+impl PendingEmbeddedCommitment {
+    /// Builds and installs the exact commitment omitted by
+    /// [`parse_embedded`], then derives the same quotient-domain cache as the
+    /// circuit builder. The verifier cap check is deliberately retained at the
+    /// installation boundary.
+    pub fn finalize_into(self, data: &mut CircuitData<F, C, D>) -> Result<()> {
+        let root_table = data
+            .prover_only
+            .fft_root_table
+            .as_ref()
+            .context("embedded circuit is missing its FFT root table")?;
+        let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
+            self.values,
+            self.rate_bits,
+            false,
+            self.cap_height,
+            &mut TimingTree::default(),
+            Some(root_table),
+        );
+        if constants_sigmas_commitment.merkle_tree.cap
+            != data.verifier_only.constants_sigmas_cap
+        {
+            bail!(
+                "recomputed constants/sigmas commitment cap diverges from the embedded verifier data \
+                 (stale or corrupt embedded circuit blob)"
+            );
+        }
+
+        let quotient_degree_bits =
+            plonky2::util::log2_ceil(data.common.quotient_degree_factor);
+        let step = 1
+            << (data.common.config.fri_config.rate_bits - quotient_degree_bits);
+        let domain = 1 << (data.common.degree_bits() + quotient_degree_bits);
+        let cols = data.common.constants_range().len() + data.common.sigmas_range().len();
+        let cache = if step != 1
+            && cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30
+        {
+            match (
+                constants_sigmas_commitment.extract_lde_batch_columns(
+                    step,
+                    data.common.constants_range(),
+                    domain,
+                ),
+                constants_sigmas_commitment.extract_lde_batch_columns(
+                    step,
+                    data.common.sigmas_range(),
+                    domain,
+                ),
+            ) {
+                (Some(constants), Some(sigmas)) => {
+                    let mut cache = constants;
+                    cache.extend(sigmas);
+                    Some(cache)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        data.prover_only.constants_sigmas_commitment = constants_sigmas_commitment;
+        data.prover_only.constants_sigmas_quotient_cache = cache;
+        data.prover_only.constants_sigmas_quotient_step = step;
+        data.prover_only.constants_sigmas_quotient_domain = domain;
+        Ok(())
+    }
+}
+
+/// Parses an embedded circuit and reconstructs all witness-facing data while
+/// deferring its constants/sigmas commitment. The returned `CircuitData` must
+/// not be used for proving until `pending.finalize_into(&mut data)` succeeds.
+fn parse_embedded_inner<T: DeserializeOwned>(
+    bytes: &[u8],
+    witness_only: bool,
+) -> Result<(
+    T,
+    CircuitData<F, C, D>,
+    Option<PendingEmbeddedCommitment>,
+)> {
     let gate_serializer = BlockGateSerializer;
     let generator_serializer = embed_generator_serializer();
 
@@ -349,41 +439,52 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         bincode::deserialize(&section).context("deserializing circuit target struct")?;
 
     // public inputs
-    let section = read_compressed_section(bytes, &mut pos)?;
-    let mut reader = Buffer::new(&section);
-    let public_inputs = reader
-        .read_target_vec()
-        .map_err(|e| anyhow::anyhow!("deserializing public inputs: {e:?}"))?;
+    let public_inputs = if witness_only {
+        skip_compressed_section(bytes, &mut pos)?;
+        Vec::new()
+    } else {
+        let section = read_compressed_section(bytes, &mut pos)?;
+        let mut reader = Buffer::new(&section);
+        reader
+            .read_target_vec()
+            .map_err(|e| anyhow::anyhow!("deserializing public inputs: {e:?}"))?
+    };
 
     // lookups
-    let section = read_section(bytes, &mut pos)?;
-    let mut reader = Buffer::new(section);
-    let lookup_count = reader
-        .read_usize()
-        .map_err(|e| anyhow::anyhow!("deserializing lookup rows: {e:?}"))?;
-    let mut lookup_rows = Vec::with_capacity(lookup_count);
-    for _ in 0..lookup_count {
-        let read = |r: &mut Buffer| -> Result<usize> {
-            r.read_usize()
-                .map_err(|e| anyhow::anyhow!("deserializing lookup rows: {e:?}"))
-        };
-        lookup_rows.push(plonky2::plonk::circuit_builder::LookupWire {
-            last_lu_gate: read(&mut reader)?,
-            last_lut_gate: read(&mut reader)?,
-            first_lut_gate: read(&mut reader)?,
-        });
-    }
-    let lut_count = reader
-        .read_usize()
-        .map_err(|e| anyhow::anyhow!("deserializing lookup tables: {e:?}"))?;
-    let mut lut_to_lookups = Vec::with_capacity(lut_count);
-    for _ in 0..lut_count {
-        lut_to_lookups.push(
-            reader
-                .read_target_lut()
-                .map_err(|e| anyhow::anyhow!("deserializing lookup tables: {e:?}"))?,
-        );
-    }
+    let (lookup_rows, lut_to_lookups) = if witness_only {
+        let _ = read_section(bytes, &mut pos)?;
+        (Vec::new(), Vec::new())
+    } else {
+        let section = read_section(bytes, &mut pos)?;
+        let mut reader = Buffer::new(section);
+        let lookup_count = reader
+            .read_usize()
+            .map_err(|e| anyhow::anyhow!("deserializing lookup rows: {e:?}"))?;
+        let mut lookup_rows = Vec::with_capacity(lookup_count);
+        for _ in 0..lookup_count {
+            let read = |r: &mut Buffer| -> Result<usize> {
+                r.read_usize()
+                    .map_err(|e| anyhow::anyhow!("deserializing lookup rows: {e:?}"))
+            };
+            lookup_rows.push(plonky2::plonk::circuit_builder::LookupWire {
+                last_lu_gate: read(&mut reader)?,
+                last_lut_gate: read(&mut reader)?,
+                first_lut_gate: read(&mut reader)?,
+            });
+        }
+        let lut_count = reader
+            .read_usize()
+            .map_err(|e| anyhow::anyhow!("deserializing lookup tables: {e:?}"))?;
+        let mut lut_to_lookups = Vec::with_capacity(lut_count);
+        for _ in 0..lut_count {
+            lut_to_lookups.push(
+                reader
+                    .read_target_lut()
+                    .map_err(|e| anyhow::anyhow!("deserializing lookup tables: {e:?}"))?,
+            );
+        }
+        (lookup_rows, lut_to_lookups)
+    };
 
     // generators
     let section = read_compressed_section(bytes, &mut pos)?;
@@ -432,30 +533,36 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let generator_indices_by_watches = GeneratorWatchIndex::from_parts(offsets, watchers);
 
     // constant polynomial values
-    let section = read_compressed_section(bytes, &mut pos)?;
-    let mut reader = Buffer::new(&section);
-    let num_constants = reader
-        .read_usize()
-        .map_err(|e| anyhow::anyhow!("deserializing constant polynomials: {e:?}"))?;
-    let degree = reader
-        .read_usize()
-        .map_err(|e| anyhow::anyhow!("deserializing constant polynomials: {e:?}"))?;
-    ensure!(
-        num_constants == common.num_constants,
-        "embedded constant polynomial count diverges from common circuit data"
-    );
-    ensure!(
-        degree == 1usize << common.degree_bits(),
-        "embedded constant polynomial degree diverges from common circuit data"
-    );
-    let mut constant_values = Vec::with_capacity(num_constants);
-    for _ in 0..num_constants {
-        constant_values.push(PolynomialValues::new(
-            reader
-                .read_field_vec::<F>(degree)
-                .map_err(|e| anyhow::anyhow!("deserializing constant polynomials: {e:?}"))?,
-        ));
-    }
+    let constant_values = if witness_only {
+        skip_compressed_section(bytes, &mut pos)?;
+        Vec::new()
+    } else {
+        let section = read_compressed_section(bytes, &mut pos)?;
+        let mut reader = Buffer::new(&section);
+        let num_constants = reader
+            .read_usize()
+            .map_err(|e| anyhow::anyhow!("deserializing constant polynomials: {e:?}"))?;
+        let degree = reader
+            .read_usize()
+            .map_err(|e| anyhow::anyhow!("deserializing constant polynomials: {e:?}"))?;
+        ensure!(
+            num_constants == common.num_constants,
+            "embedded constant polynomial count diverges from common circuit data"
+        );
+        ensure!(
+            degree == 1usize << common.degree_bits(),
+            "embedded constant polynomial degree diverges from common circuit data"
+        );
+        let mut constant_values = Vec::with_capacity(num_constants);
+        for _ in 0..num_constants {
+            constant_values.push(PolynomialValues::new(
+                reader
+                    .read_field_vec::<F>(degree)
+                    .map_err(|e| anyhow::anyhow!("deserializing constant polynomials: {e:?}"))?,
+            ));
+        }
+        constant_values
+    };
 
     // representative map
     let section = read_compressed_section(bytes, &mut pos)?;
@@ -470,8 +577,40 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     }
     ensure!(pos == bytes.len(), "trailing bytes in embedded circuit blob");
 
+    if witness_only {
+        let circuit_digest = verifier_only.circuit_digest;
+        let prover_only = ProverOnlyCircuitData::<F, C, D> {
+            constants_sigmas_quotient_cache: None,
+            constants_sigmas_quotient_step: 0,
+            constants_sigmas_quotient_domain: 0,
+            generators,
+            generator_indices_by_watches,
+            generator_watch_counts,
+            constants_sigmas_commitment: PolynomialBatch::default(),
+            sigmas: Vec::new(),
+            subgroup: Vec::new(),
+            public_inputs,
+            representative_map,
+            fixed_routed_wires: Vec::new(),
+            fft_root_table: None,
+            circuit_digest,
+            lookup_rows,
+            lut_to_lookups,
+        };
+        return Ok((
+            target,
+            CircuitData {
+                prover_only,
+                verifier_only,
+                common,
+            },
+            None,
+        ));
+    }
+
     // ---- recompute the derived prover-only components ----
     let degree_bits = common.degree_bits();
+    let degree = 1usize << degree_bits;
     let rate_bits = common.config.fri_config.rate_bits;
     let cap_height = common.config.fri_config.cap_height;
     let num_wires = common.config.num_wires;
@@ -508,82 +647,21 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // of two independent reads changes — no quantity is computed differently.
     let sigmas = transpose_poly_values_ref(&sigma_vecs);
 
-    // The builder's commitment path: values in, IFFT inside, LDE + Merkle.
+    // Keep the builder's exact commitment inputs for deferred finalization.
     // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).
     let mut constants_sigmas_vecs = constant_values;
     constants_sigmas_vecs.extend(sigma_vecs);
-    let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
-        constants_sigmas_vecs,
-        rate_bits,
-        false,
-        cap_height,
-        &mut TimingTree::default(),
-        Some(&root_table),
-    );
-    if constants_sigmas_commitment.merkle_tree.cap != verifier_only.constants_sigmas_cap {
-        bail!(
-            "recomputed constants/sigmas commitment cap diverges from the embedded verifier data \
-             (stale or corrupt embedded circuit blob)"
-        );
-    }
 
     let circuit_digest = verifier_only.circuit_digest;
 
-    // Mirror the builder's quotient-domain constants/sigmas cache (added by the
-    // Metal quotient-gate union frontier). It is a pure derivation from the
-    // freshly recomputed column-backed commitment — the same extraction the
-    // builder performs — and the documented `None` fallback keeps the quotient
-    // path correct if extraction declines.
-    // Skipped entirely at `step == 1`, where the cache cannot pay for itself:
-    // it exists to turn a strided gather into a contiguous copy, and at stride
-    // one the gather is *already* contiguous. Concretely,
-    // `extract_lde_batch_columns(1, range, domain)` memcpys
-    // `columns.col(c)[..domain]` per column, while the uncached quotient path
-    // reaches `fill_lde_batch` with `BatchLayout::PolyMajor`, `step == 1` and
-    // consecutive indices — which routes to `fill_lde_batch_contiguous` and
-    // copies `columns.col(c)[start..end]`. Same bytes out of the same buffer,
-    // one `copy_from_slice` per column either way. So the cache is a bit-exact
-    // duplicate of storage the commitment already retains, and building it
-    // costs one extra full-LDE allocation plus copy per circuit and holds that
-    // duplicate resident for the rest of the process.
-    let quotient_degree_bits = plonky2::util::log2_ceil(common.quotient_degree_factor);
-    let (constants_sigmas_quotient_cache, constants_sigmas_quotient_step, constants_sigmas_quotient_domain) = {
-        let step = 1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
-        let domain = 1 << (common.degree_bits() + quotient_degree_bits);
-        let cols = common.constants_range().len() + common.sigmas_range().len();
-        if step != 1 && cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
-            match (
-                constants_sigmas_commitment.extract_lde_batch_columns(
-                    step,
-                    common.constants_range(),
-                    domain,
-                ),
-                constants_sigmas_commitment.extract_lde_batch_columns(
-                    step,
-                    common.sigmas_range(),
-                    domain,
-                ),
-            ) {
-                (Some(constants), Some(sigmas_cache)) => {
-                    let mut cache: Vec<F> = constants;
-                    cache.extend(sigmas_cache);
-                    (Some(cache), step, domain)
-                }
-                _ => (None, step, domain),
-            }
-        } else {
-            (None, step, domain)
-        }
-    };
-
     let prover_only = ProverOnlyCircuitData::<F, C, D> {
-        constants_sigmas_quotient_cache,
-        constants_sigmas_quotient_step,
-        constants_sigmas_quotient_domain,
+        constants_sigmas_quotient_cache: None,
+        constants_sigmas_quotient_step: 0,
+        constants_sigmas_quotient_domain: 0,
         generators,
         generator_indices_by_watches,
         generator_watch_counts,
-        constants_sigmas_commitment,
+        constants_sigmas_commitment: PolynomialBatch::default(),
         sigmas,
         subgroup,
         public_inputs,
@@ -602,7 +680,46 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
             verifier_only,
             common,
         },
+        Some(PendingEmbeddedCommitment {
+            values: constants_sigmas_vecs,
+            rate_bits,
+            cap_height,
+        }),
     ))
+}
+
+pub fn parse_embedded<T: DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<(T, CircuitData<F, C, D>, PendingEmbeddedCommitment)> {
+    let (target, data, pending) = parse_embedded_inner(bytes, false)?;
+    Ok((
+        target,
+        data,
+        pending.expect("full embedded parse must retain commitment inputs"),
+    ))
+}
+
+/// Parses only the data touched by witness generation. Proof-only polynomial
+/// sections are skipped without decompression and no sigma polynomials are
+/// derived.
+pub fn parse_embedded_witness_facade<T: DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<(T, CircuitData<F, C, D>)> {
+    let (target, data, pending) = parse_embedded_inner(bytes, true)?;
+    debug_assert!(pending.is_none());
+    Ok((target, data))
+}
+
+/// Reconstructs the target struct and the full [`CircuitData`] from a blob
+/// produced by [`serialize_embedded`].
+///
+/// This eager wrapper preserves the original API and value-identity contract.
+pub fn deserialize_embedded<T: DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<(T, CircuitData<F, C, D>)> {
+    let (target, mut data, pending) = parse_embedded(bytes)?;
+    pending.finalize_into(&mut data)?;
+    Ok((target, data))
 }
 
 #[cfg(test)]
