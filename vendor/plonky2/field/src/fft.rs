@@ -620,31 +620,27 @@ fn fft_classic_simd_two_layers_neon(
         let (ab, cd) = block.split_at_mut(2 * q);
         let (quarter_a, quarter_b) = ab.split_at_mut(q);
         let (quarter_c, quarter_d) = cd.split_at_mut(q);
-        for (((((a2, b2), c2), d2), (w12, w2a2)), w2b2) in quarter_a
-            .chunks_exact_mut(2)
-            .zip(quarter_b.chunks_exact_mut(2))
-            .zip(quarter_c.chunks_exact_mut(2))
-            .zip(quarter_d.chunks_exact_mut(2))
-            .zip(w1_row.chunks_exact(2).zip(w2_lo.chunks_exact(2)))
-            .zip(w2_hi.chunks_exact(2))
-        {
-            // Stage-1 products for both butterflies, paired per twiddle row.
+        // One value-exact pair column (identical to the previous chunks_exact(2)
+        // body). Called twice per 4-stride so the ≥2^19 fused LDE hot path pays
+        // half the loop/zip overhead without widening the live register set the
+        // way packed radix-4 did — the second pair reuses the same temporaries
+        // after the first pair's stores retire.
+        let mut pair_column = |j: usize| {
+            let a2 = &mut quarter_a[j..j + 2];
+            let b2 = &mut quarter_b[j..j + 2];
+            let c2 = &mut quarter_c[j..j + 2];
+            let d2 = &mut quarter_d[j..j + 2];
+            let w12 = &w1_row[j..j + 2];
+            let w2a2 = &w2_lo[j..j + 2];
+            let w2b2 = &w2_hi[j..j + 2];
             let t1 =
                 NeonGoldilocksField([w12[0], w12[1]]) * NeonGoldilocksField([b2[0], b2[1]]);
             let t2 =
                 NeonGoldilocksField([w12[0], w12[1]]) * NeonGoldilocksField([d2[0], d2[1]]);
-            // C/D stage-1 butterfly in scalar registers: these values are the
-            // stage-2 multiplier inputs, so keeping them out of the vector
-            // file avoids a NEON->GPR crossing on the critical path.
             let cd0 = [c2[0] + t2.0[0], c2[1] + t2.0[1]];
             let cd1 = [c2[0] - t2.0[0], c2[1] - t2.0[1]];
-            // Stage-2 products.
             let t3 = NeonGoldilocksField([w2a2[0], w2a2[1]]) * NeonGoldilocksField(cd0);
             let t4 = NeonGoldilocksField([w2b2[0], w2b2[1]]) * NeonGoldilocksField(cd1);
-            // SAFETY: every chunk holds exactly 2 elements (`chunks_exact`),
-            // `GoldilocksField` is `#[repr(transparent)]` over `u64`, and each
-            // load/store stays inside its own chunk. Indexing never leaves the
-            // zips; only the vector intrinsics are unsafe.
             unsafe {
                 let av = vld1q_u64(a2.as_ptr().cast::<u64>());
                 let t1v = vcombine_u64(vcreate_u64(t1.0[0].0), vcreate_u64(t1.0[1].0));
@@ -657,7 +653,19 @@ fn fft_classic_simd_two_layers_neon(
                 vst1q_u64(b2.as_mut_ptr().cast::<u64>(), gl_add_neon(ab1, t4v, eps));
                 vst1q_u64(d2.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab1, t4v, eps));
             }
+        };
+
+        let mut j = 0usize;
+        while j + 4 <= q {
+            pair_column(j);
+            pair_column(j + 2);
+            j += 4;
         }
+        while j + 2 <= q {
+            pair_column(j);
+            j += 2;
+        }
+        debug_assert_eq!(j, q);
     }
 }
 
