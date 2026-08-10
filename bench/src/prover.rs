@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use circuit::block::Block;
-use circuit::block_constraints::{BlockCircuit, Circuit as _};
+use circuit::block_constraints::BlockCircuit;
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
 use circuit::block_pre_execution_constraints::{
     BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
@@ -24,7 +24,7 @@ use plonky2::hash::hash_types::{HashOut, HashOutTarget};
 use plonky2::iop::generator::{ParallelWitnessGuard, PendingPartitionWitness};
 #[cfg(test)]
 use plonky2::iop::generator::generate_partial_witness;
-use plonky2::iop::witness::{PartitionWitness, Witness};
+use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::util::timing::TimingTree;
@@ -722,16 +722,20 @@ pub(crate) fn prove_block_after_pre(
                     };
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
-                    let early = BlockCircuit::witness_inputs_early(
-                        &block_target,
-                        block_ref,
-                        pre_proof_ref,
-                    )
-                    .expect("final block early witness inputs failed");
-                    let mut pending = PendingPartitionWitness::start(
-                        early,
+                    // Seed the same early targets directly into representative slots. This
+                    // mirrors `BlockCircuit::prove` and avoids constructing and replaying a
+                    // temporary `PartialWitness` map on the split final-block lane.
+                    let mut pending = PendingPartitionWitness::start_seeded(
                         &block_data.prover_only,
                         &block_data.common,
+                        |seeder| {
+                            BlockCircuit::seed_witness_early_into(
+                                &block_target,
+                                block_ref,
+                                pre_proof_ref,
+                                seeder,
+                            )
+                        },
                     )
                     .expect("final block early witness phase failed");
                     #[cfg(feature = "diagnostic_profile")]
@@ -752,13 +756,12 @@ pub(crate) fn prove_block_after_pre(
                     // of holding them across the whole light phase.
                     circuits.release_heavy_circuit_extensions();
                     pending
-                        .feed(
-                            BlockCircuit::witness_inputs_heavy_chain(
-                                &block_target,
+                        .feed_seeded(|feeder| {
+                            feeder.set_proof_with_pis_target(
+                                &block_target.heavy_tx_chain_proof,
                                 &heavy_chain_proof,
                             )
-                            .expect("final block heavy-chain witness inputs failed"),
-                        )
+                        })
                         .expect("final block heavy-chain witness feed failed");
                     (block_target, block_data, pending, heavy_chain_proof)
                 })
@@ -842,10 +845,12 @@ pub(crate) fn prove_block_after_pre(
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("witness", "final_light_feed");
         block_pending
-            .feed(
-                BlockCircuit::witness_inputs_light_chain(&block_target, light_chain_input)
-                    .expect("final block light-chain witness inputs failed"),
-            )
+            .feed_seeded(|feeder| {
+                feeder.set_proof_with_pis_target(
+                    &block_target.light_tx_chain_proof,
+                    light_chain_input,
+                )
+            })
             .expect("final block light-chain witness feed failed");
     }
     let _ = heavy_chain_input;
