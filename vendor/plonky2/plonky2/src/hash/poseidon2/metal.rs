@@ -1791,6 +1791,15 @@ pub(crate) fn allocate_columns<F: RichField>(
     rows: usize,
     cap_height: usize,
 ) -> Option<MetalColumns<F>> {
+    // Shared residence is valuable independently of hash routing since the
+    // permutation-quotient kernel binds commitment columns directly: the
+    // serial-critical fold shapes (2^17 rows, narrow) previously lost shared
+    // residence whenever the busy GPU stream routed their HASH to the CPU,
+    // which silently disabled the fold's permutation offload
+    // (start_gpu_permutation_quotient requires shared_columns() on all three
+    // commitments). Admit those shapes unconditionally; gpu_worthwhile still
+    // owns the hash-routing decision.
+    let serial_critical_resident = rows == 1 << 17 && (5..=64).contains(&cols);
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || cols == 0
@@ -1799,7 +1808,7 @@ pub(crate) fn allocate_columns<F: RichField>(
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
         || cap_height > rows.ilog2() as usize
-        || !gpu_worthwhile(cols, rows, cap_height)
+        || !(gpu_worthwhile(cols, rows, cap_height) || serial_critical_resident)
     {
         return None;
     }
@@ -1818,17 +1827,46 @@ pub(crate) fn allocate_columns<F: RichField>(
 /// staging buffer.
 /// Retained buffers for the streamed sponge build: the inter-pass state
 /// (12 u64 lanes per leaf, column-major) and the level-order digest output.
-/// One streamed build runs at a time (exclusive proving phases only), so a
-/// single grow-on-demand pair suffices; holding the lock for the whole build
-/// serializes any unexpected second caller onto the classic path.
+/// One streamed build runs at a time, so a single grow-on-demand pair
+/// suffices. Exclusive phases wait for the pair; a pipelined caller uses
+/// `try_lock` and immediately falls back to the classic path when another
+/// streamed build already owns it.
 static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
+
+/// Number of eight-column absorb groups encoded into one command buffer for
+/// the pipelined transaction wires tree.
+///
+/// The exclusive final-proof trees retain one command per group: their CPU
+/// fill and GPU absorb are both hundreds of milliseconds in aggregate, and
+/// the fine-grained handoff is what hides nearly all of the fill. In the
+/// pipelined phase, however, 17 one-group command buffers per wires tree
+/// measurably overfill the shared FIFO when four proofs run at once. Four
+/// groups preserve an early handoff (after about one quarter of the 60 ms LDE
+/// fill) while reducing that tree to five absorb command buffers.
+const PIPELINED_STREAM_GROUPS_PER_COMMAND: usize = 4;
+
+/// Returns the grouping for a production streamed build, or `None` when the
+/// classic retained-column build should run.
+fn streamed_groups_per_command(
+    leaf_width: usize,
+    leaf_count: usize,
+    exclusive: bool,
+) -> Option<usize> {
+    if exclusive && leaf_width >= 16 && leaf_count >= 1 << 20 {
+        Some(1)
+    } else if !exclusive && leaf_width == 136 && leaf_count == 1 << 19 {
+        Some(PIPELINED_STREAM_GROUPS_PER_COMMAND)
+    } else {
+        None
+    }
+}
 
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
-/// the GPU absorbs each group while the CPU fills the next. Only used inside
-/// exclusive proving phases (nothing else contends for the GPU stream) and
-/// for large wide trees, where the overlap converts the previously serial
-/// CPU-FFT-then-GPU-hash commitment into max(FFT, hash) + one pass.
+/// the GPU absorbs each group while the CPU fills the next. Exclusive proving
+/// phases retain the one-group handoff. The pipelined transaction wires tree
+/// uses four-group handoffs, which retain most of the CPU/GPU overlap without
+/// placing 17 tiny command buffers on the shared FIFO.
 ///
 /// Value-exact: the fill closure runs the same `batch_multiply_into` +
 /// zero-padded FFT as `fill_lde_column_store`, and each absorb pass performs
@@ -1846,21 +1884,43 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
+    let exclusive = EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed);
+    let groups_per_command = streamed_groups_per_command(leaf_width, leaf_count, exclusive)?;
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
-        || leaf_width < 16
-        || leaf_count < 1 << 20
         || !leaf_count.is_power_of_two()
         || leaf_count > u32::MAX as usize
         || leaf_width > u32::MAX as usize
         || cap_height > leaf_count.ilog2() as usize
-        || !EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
     {
+        return None;
+    }
+    build_merkle_tree_shared_streamed_inner(
+        columns,
+        cap_height,
+        fill_group,
+        exclusive,
+        groups_per_command,
+    )
+}
+
+fn build_merkle_tree_shared_streamed_inner<F: RichField>(
+    columns: &MetalColumns<F>,
+    cap_height: usize,
+    fill_group: &(dyn Fn(usize, &mut [&mut [F]]) + Sync),
+    wait_for_buffers: bool,
+    groups_per_command: usize,
+) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
+    let leaf_width = columns.cols;
+    let leaf_count = columns.rows;
+    if groups_per_command == 0 {
         return None;
     }
     let context = ready_context(leaf_width, leaf_count)?;
     let pipeline = absorb_pass_pipeline()?;
-    log::debug!("streamed sponge build: {leaf_width} cols x {leaf_count} leaves");
+    log::debug!(
+        "streamed sponge build: {leaf_width} cols x {leaf_count} leaves, {groups_per_command} groups/command"
+    );
 
     let cap_count = 1usize << cap_height;
     let total_node_count = 2 * leaf_count - cap_count;
@@ -1869,7 +1929,11 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let state_bytes = leaf_count.checked_mul(12)?.checked_mul(size_of::<u64>())?;
 
     let job = GpuJobGuard::begin();
-    let mut buffers = STREAMED_BUFFERS.lock().ok()?;
+    let mut buffers = if wait_for_buffers {
+        STREAMED_BUFFERS.lock().ok()?
+    } else {
+        STREAMED_BUFFERS.try_lock().ok()?
+    };
     let needs_new = buffers.as_ref().map_or(true, |(state, output)| {
         state.length() < state_bytes as u64 || output.length() < output_bytes as u64
     });
@@ -1889,28 +1953,32 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     }
     let (state_buffer, output_buffer) = buffers.as_mut()?;
 
-    // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
-    // absorption of group g: commands on one queue execute in submission
-    // order, and each pass is committed before the next group''s fill starts.
+    // Batch-wise fill + absorb. All columns read by one command are complete
+    // before it is committed. While the GPU consumes that disjoint prefix,
+    // the CPU fills the next batch of columns in the same shared buffer.
     let groups = leaf_width.div_ceil(8);
     let base = columns.buffer.contents().cast::<F>();
-    let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
-    for group in 0..groups {
-        let col_start = group * 8;
-        let chunk = (leaf_width - col_start).min(8);
-        {
-            // SAFETY: each column slice covers a disjoint `leaf_count` range
-            // of the shared buffer; the GPU only reads columns of groups
-            // whose pass was already committed, after their fill completed.
-            let mut slices: Vec<&mut [F]> = (0..chunk)
-                .map(|k| unsafe {
-                    slice::from_raw_parts_mut(
-                        base.add((col_start + k) * leaf_count).cast::<F>(),
-                        leaf_count,
-                    )
-                })
-                .collect();
-            fill_group(group, &mut slices);
+    let mut absorb_commands: Vec<CommandBuffer> =
+        Vec::with_capacity(groups.div_ceil(groups_per_command));
+    for batch_start in (0..groups).step_by(groups_per_command) {
+        let batch_end = (batch_start + groups_per_command).min(groups);
+        for group in batch_start..batch_end {
+            let col_start = group * 8;
+            let chunk = (leaf_width - col_start).min(8);
+            {
+                // SAFETY: each column slice covers a disjoint `leaf_count`
+                // range. The GPU only reads batches whose fill completed;
+                // while it does so the CPU writes later disjoint columns.
+                let mut slices: Vec<&mut [F]> = (0..chunk)
+                    .map(|k| unsafe {
+                        slice::from_raw_parts_mut(
+                            base.add((col_start + k) * leaf_count).cast::<F>(),
+                            leaf_count,
+                        )
+                    })
+                    .collect();
+                fill_group(group, &mut slices);
+            }
         }
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = context.queue.new_command_buffer();
@@ -1922,14 +1990,28 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             encoder.set_buffer(3, Some(&context.parameters), 0);
             set_u32(encoder, 4, leaf_count as u32);
             set_u32(encoder, 5, leaf_count.ilog2());
-            set_u32(encoder, 6, col_start as u32);
-            set_u32(encoder, 7, chunk as u32);
-            set_u32(encoder, 8, (group == 0) as u32);
-            set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            let state_resource: &metal::ResourceRef = state_buffer;
+            for group in batch_start..batch_end {
+                if group != batch_start {
+                    // The next pass reads and updates the state written by the
+                    // preceding dispatch in this compute encoder.
+                    encoder.memory_barrier_with_resources(&[state_resource]);
+                }
+                let col_start = group * 8;
+                let chunk = (leaf_width - col_start).min(8);
+                set_u32(encoder, 6, col_start as u32);
+                set_u32(encoder, 7, chunk as u32);
+                set_u32(encoder, 8, (group == 0) as u32);
+                set_u32(encoder, 9, (group == groups - 1) as u32);
+                dispatch(encoder, pipeline, leaf_count);
+            }
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
+            profile_command_buffer(
+                command_buffer,
+                "merkle_absorb",
+                (leaf_count * ((batch_end * 8).min(leaf_width) - batch_start * 8)) as u64,
+            );
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -4221,6 +4303,47 @@ mod tests {
         }
     }
 
+    /// `start_permutation_quotient` (above) requires `shared_columns()` on all
+    /// three commitments, so the Zs/partial-products fold shape (2^17 rows,
+    /// narrow width) must get shared residence even when a busy GPU stream
+    /// routes its *hash* to the CPU. `allocate_columns` decouples the
+    /// allocation decision from `gpu_worthwhile`'s routing decision for
+    /// exactly this shape; this pins that contract independently of hash
+    /// routing, which must stay unchanged.
+    #[test]
+    fn serial_critical_shapes_get_shared_allocation_when_gpu_busy() {
+        // Forces the Metal context up front (as the neighboring functional
+        // tests do) and doubles as this test's "skip when no Metal device"
+        // guard, so `allocate_columns` below never races the one-shot
+        // startup probe that diverts allocations while the context is still
+        // being built.
+        let Some(_context) = shared_context() else {
+            return; // no Metal device in this environment
+        };
+
+        // The exclusive-phase flag is process-global; restore whatever this
+        // test observed on entry so other tests in this binary are unaffected.
+        struct ExclusivePhaseReset(bool);
+        impl Drop for ExclusivePhaseReset {
+            fn drop(&mut self) {
+                set_exclusive_gpu_phase(self.0);
+            }
+        }
+        let _reset = ExclusivePhaseReset(is_exclusive_gpu_phase());
+
+        // Mid-pipeline conditions: not exclusive, GPU stream occupied.
+        set_exclusive_gpu_phase(false);
+        let _job = GpuJobGuard::begin(); // forces GPU_JOBS_IN_FLIGHT > 0
+        // Zs/partial-products fold shape: 2^17 rows x 20 cols.
+        let columns = allocate_columns::<GoldilocksField>(20, 1 << 17, 4);
+        assert!(
+            columns.is_some(),
+            "serial-critical fold shapes must get shared residence even when hash routing says CPU"
+        );
+        // Routing itself must be unchanged: gpu_worthwhile still says no.
+        assert!(!gpu_worthwhile(20, 1 << 17, 4));
+    }
+
     #[test]
     fn metal_range_check_gate_quotient_matches_cpu() {
         type F = GoldilocksField;
@@ -6268,6 +6391,79 @@ kernel void goldilocks_mul_bench_native(
             .build(LeafSource::Shared(&columns), cols, rows, cap_height)
             .expect("classic tree");
         assert_eq!(streamed, classic);
+    }
+
+    #[test]
+    fn streamed_grouping_is_limited_to_the_measured_production_shapes() {
+        assert_eq!(streamed_groups_per_command(16, 1 << 20, true), Some(1));
+        assert_eq!(streamed_groups_per_command(136, 1 << 21, true), Some(1));
+        assert_eq!(
+            streamed_groups_per_command(136, 1 << 19, false),
+            Some(PIPELINED_STREAM_GROUPS_PER_COMMAND)
+        );
+
+        // Narrow tx commitments, serial-chain trees and smaller domains keep
+        // the classic retained-column build. An exclusive tree below the old
+        // 2^20 floor also remains classic.
+        for (cols, rows, exclusive) in [
+            (20, 1 << 19, false),
+            (128, 1 << 19, false),
+            (135, 1 << 19, false),
+            (137, 1 << 19, false),
+            (136, 1 << 17, false),
+            (136, 1 << 18, false),
+            (136, 1 << 19, true),
+        ] {
+            assert_eq!(streamed_groups_per_command(cols, rows, exclusive), None);
+        }
+    }
+
+    #[test]
+    fn coarse_streamed_absorb_matches_classic_tree() {
+        type F = GoldilocksField;
+
+        let context = shared_context().expect("Metal context");
+        let rows = 256;
+        // Five absorb groups exercise one full four-group command and a
+        // partial final command, including every inter-dispatch state barrier.
+        let cols = 33;
+        let cap_height = 4;
+        let columns = context
+            .allocate_columns::<F>(rows, cols)
+            .expect("shared columns");
+        let streamed = build_merkle_tree_shared_streamed_inner(
+            &columns,
+            cap_height,
+            &|group, destinations| {
+                for (index, destination) in destinations.iter_mut().enumerate() {
+                    let column = group * 8 + index;
+                    for (row, value) in destination.iter_mut().enumerate() {
+                        let raw = match (column * rows + row) & 7 {
+                            0 => 0,
+                            1 => 1,
+                            2 => F::ORDER - 1,
+                            3 => F::ORDER,
+                            4 => F::ORDER + 1,
+                            5 => u64::MAX,
+                            _ => (column as u64)
+                                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                                .wrapping_add(row as u64),
+                        };
+                        *value = GoldilocksField(raw);
+                    }
+                }
+            },
+            true,
+            PIPELINED_STREAM_GROUPS_PER_COMMAND,
+        )
+        .expect("coarse streamed tree");
+        assert!(streamed.0.nodes.is_shared());
+
+        let classic = context
+            .build(LeafSource::Shared(&columns), cols, rows, cap_height)
+            .expect("classic tree");
+        assert_tree_raw_eq(&streamed, &classic, cols, cap_height);
+        assert_all_paths_raw_eq(&streamed, &classic, rows, cap_height);
     }
 
     #[test]
