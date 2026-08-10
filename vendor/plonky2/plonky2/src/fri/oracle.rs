@@ -646,7 +646,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // pad), writing straight into `final_poly`'s reusable buffer
             // instead of a division pass + shift pass + add pass.
             let shift = alpha.shift_factor();
-            accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+            accumulate_linear_quotient(&mut final_poly, composition_poly, *point, shift);
         }
 
         // `final_poly` is dead after this point, so pad it in place instead of
@@ -775,11 +775,36 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
 /// slot / `ZERO * shift` on fresh slots, all of which leave values unchanged.
 fn accumulate_linear_quotient<F: Field>(
     final_poly: &mut PolynomialCoeffs<F>,
-    composition_poly: &PolynomialCoeffs<F>,
+    mut composition_poly: PolynomialCoeffs<F>,
     z: F,
     shift: F,
 ) {
     let d = composition_poly.len();
+
+    if final_poly.coeffs.is_empty() {
+        // The first contribution can become `final_poly` in its own allocation.
+        // The reference shifts an empty vector, resizes it with raw zeroes, then
+        // adds the quotient. Store the same quotient coefficients directly:
+        // each source slot is read before being replaced, the Horner recurrence
+        // remains `acc * z + c` in descending order, and coefficient zero is not
+        // read because that final recurrence step computes only the discarded
+        // remainder. For Goldilocks extension limbs, `ZERO + x` is raw-identical
+        // to `x`, so moving these stores also preserves the representative.
+        let coeffs = &mut composition_poly.coeffs;
+        if d != 0 {
+            let mut acc = F::ZERO;
+            for i in (1..d).rev() {
+                let c = coeffs[i];
+                let prev = acc;
+                acc = acc * z + c;
+                coeffs[i] = prev;
+            }
+            coeffs[0] = acc;
+        }
+        *final_poly = composition_poly;
+        return;
+    }
+
     let coeffs = &composition_poly.coeffs;
     let buf = &mut final_poly.coeffs;
     // Entries past the padded quotient's length only see the shift.
@@ -1031,13 +1056,22 @@ mod tests {
     /// classic reference (`divide_by_linear` + explicit zero pad +
     /// `shift_poly` + add) and this tree's in-place variant
     /// (`divide_by_linear_padded_in_place` + `shift_poly` + add), including
-    /// the empty-accumulator first batch and mismatched lengths.
+    /// the empty-accumulator first batch, adversarial raw limbs, and mismatched
+    /// lengths. The empty cases also prove that the composition allocation is
+    /// the one installed in `final_poly`.
     #[test]
     fn fused_quotient_accumulation_matches_reference() {
         use crate::field::extension::FieldExtension;
-        use crate::field::types::PrimeField64;
+        use crate::field::types::{Field64, PrimeField64};
 
         type F = <GoldilocksField as Extendable<2>>::Extension;
+
+        fn ext(a: u64, b: u64) -> F {
+            <F as FieldExtension<2>>::from_basefield_array([
+                GoldilocksField(a),
+                GoldilocksField(b),
+            ])
+        }
 
         fn raw(values: &[F]) -> Vec<u64> {
             values
@@ -1047,6 +1081,15 @@ mod tests {
                 .collect()
         }
 
+        let edge = [
+            0,
+            1,
+            GoldilocksField::ORDER - 1,
+            GoldilocksField::ORDER,
+            GoldilocksField::ORDER + 1,
+            u64::MAX - 96,
+            u64::MAX,
+        ];
         for &(old_len, d) in &[
             (0usize, 1usize),
             (0, 8),
@@ -1057,9 +1100,18 @@ mod tests {
             (256, 256),
         ] {
             let initial = PolynomialCoeffs::new(F::rand_vec(old_len));
-            let composition_poly = PolynomialCoeffs::new(F::rand_vec(d));
-            let z = F::rand();
-            let shift = F::rand();
+            let mut composition_coeffs = Vec::with_capacity(d + 17);
+            composition_coeffs.extend((0..d).map(|i| {
+                ext(
+                    edge[(i * 5 + old_len) % edge.len()],
+                    edge[(i * 3 + d + 2) % edge.len()],
+                )
+            }));
+            let composition_poly = PolynomialCoeffs::new(composition_coeffs);
+            let source_ptr = composition_poly.coeffs.as_ptr();
+            let source_capacity = composition_poly.coeffs.capacity();
+            let z = ext(edge[(d + 1) % edge.len()], edge[(old_len + 4) % edge.len()]);
+            let shift = ext(edge[(d + 3) % edge.len()], edge[(old_len + 6) % edge.len()]);
 
             // Classic reference: the op sequence in `prove_openings` before
             // either in-place rewrite.
@@ -1079,10 +1131,26 @@ mod tests {
             expected_in_place += quotient_in_place;
 
             let mut actual = initial;
-            accumulate_linear_quotient(&mut actual, &composition_poly, z, shift);
+            accumulate_linear_quotient(&mut actual, composition_poly, z, shift);
 
-            assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
+            let expected_raw = raw(&expected.coeffs);
+            assert_eq!(raw(&actual.coeffs), expected_raw);
             assert_eq!(raw(&actual.coeffs), raw(&expected_in_place.coeffs));
+            if old_len == 0 {
+                // Execution/allocation positive control: only the live empty
+                // arm can preserve the deliberately spare source buffer.
+                assert_eq!(actual.coeffs.as_ptr(), source_ptr);
+                assert_eq!(actual.coeffs.capacity(), source_capacity);
+            }
+            if (old_len, d) == (0, 8) {
+                // Mutation positive control for the raw-limb oracle.
+                let mut mutated = actual.clone();
+                let mut limbs = FieldExtension::<2>::to_basefield_array(&mutated.coeffs[3]);
+                limbs[0] = GoldilocksField(limbs[0].to_noncanonical_u64() ^ 1);
+                mutated.coeffs[3] =
+                    <F as FieldExtension<2>>::from_basefield_array(limbs);
+                assert_ne!(raw(&mutated.coeffs), expected_raw);
+            }
         }
     }
 
