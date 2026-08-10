@@ -1953,6 +1953,7 @@ fn compute_quotient_polys<
         l_0_table_cache::l_0_denominator_inverses::<F>(
             common_data.degree_bits(),
             quotient_degree_bits,
+            shifted_points.as_slice(),
         ),
     );
 
@@ -3037,26 +3038,47 @@ mod l_0_table_cache {
     /// prover feeds it, then `(n * (x - ONE)).inverse()` — the same inverse of the same
     /// product, so every entry is bit-identical to the value it replaces. Entries are
     /// independent, so the parallel map changes nothing.
-    fn build<F: Field>(degree_bits: usize, quotient_degree_bits: usize) -> Vec<F> {
+    /// Builds the table from the quotient loop's already materialized shifted
+    /// subgroup. Per entry, this keeps exactly the uncached `eval_l_0(i, x)`
+    /// operation `(n * (x - ONE)).inverse()`, so every value is bit-identical
+    /// while avoiding a duplicate subgroup construction and coset multiply.
+    /// Entries are independent, so the parallel map changes nothing.
+    fn build<F: Field>(
+        degree_bits: usize,
+        quotient_degree_bits: usize,
+        shifted_points: &[F],
+    ) -> Vec<F> {
+        let expected_len = 1usize << (degree_bits + quotient_degree_bits);
+        assert_eq!(
+            shifted_points.len(),
+            expected_len,
+            "shifted quotient domain does not match L_0 cache key"
+        );
         let n = F::from_canonical_usize(1 << degree_bits);
-        F::two_adic_subgroup(degree_bits + quotient_degree_bits)
-            .into_par_iter()
-            .map(|x| (n * (F::coset_shift() * x - F::ONE)).inverse())
+        shifted_points
+            .par_iter()
+            .map(|&x| (n * (x - F::ONE)).inverse())
             .collect()
     }
 
     pub(super) fn l_0_denominator_inverses<F: Field>(
         degree_bits: usize,
         quotient_degree_bits: usize,
+        shifted_points: &[F],
     ) -> Arc<Vec<F>> {
         let key = (TypeId::of::<F>(), degree_bits, quotient_degree_bits);
         let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        // A hit needs only the shape key; `shifted_points` is consumed on misses.
         if let Some(entry) = cache.lock().unwrap().get(&key) {
             return Arc::clone(entry).downcast::<Vec<F>>().unwrap();
         }
         // Built outside the lock so a slow build never serializes other keys; concurrent
         // builders of the same key produce identical tables and the first insert wins.
-        let table: Arc<Vec<F>> = Arc::new(build::<F>(degree_bits, quotient_degree_bits));
+        let table: Arc<Vec<F>> = Arc::new(build::<F>(
+            degree_bits,
+            quotient_degree_bits,
+            shifted_points,
+        ));
         let mut guard = cache.lock().unwrap();
         let entry = guard
             .entry(key)
@@ -3225,7 +3247,7 @@ mod l_0_table_tests {
     use plonky2_field::types::Field;
     use plonky2_field::zero_poly_coset::ZeroPolyOnCoset;
 
-    use super::l_0_table_cache::l_0_denominator_inverses;
+    use super::{l_0_table_cache::l_0_denominator_inverses, precomputed};
 
     type F = GoldilocksField;
 
@@ -3237,7 +3259,13 @@ mod l_0_table_tests {
     #[test]
     fn table_entries_match_legacy_per_point_inversion() {
         for (degree_bits, quotient_degree_bits) in COMBOS {
-            let table = l_0_denominator_inverses::<F>(degree_bits, quotient_degree_bits);
+            let shifted_points =
+                precomputed::shifted_two_adic_subgroup::<F>(degree_bits + quotient_degree_bits);
+            let table = l_0_denominator_inverses::<F>(
+                degree_bits,
+                quotient_degree_bits,
+                shifted_points.as_slice(),
+            );
             let points = F::two_adic_subgroup(degree_bits + quotient_degree_bits);
             assert_eq!(table.len(), points.len());
             let n = F::from_canonical_usize(1 << degree_bits);
@@ -3260,10 +3288,13 @@ mod l_0_table_tests {
     fn eval_l_0_with_table_matches_uncached() {
         for (degree_bits, quotient_degree_bits) in COMBOS {
             let plain = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits);
+            let shifted_points =
+                precomputed::shifted_two_adic_subgroup::<F>(degree_bits + quotient_degree_bits);
             let cached = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits)
                 .with_l_0_denominator_inverses(l_0_denominator_inverses::<F>(
                     degree_bits,
                     quotient_degree_bits,
+                    shifted_points.as_slice(),
                 ));
             for (i, point) in F::two_adic_subgroup(degree_bits + quotient_degree_bits)
                 .into_iter()
@@ -3277,6 +3308,27 @@ mod l_0_table_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn cache_miss_consumes_shifted_points_and_hit_reuses_the_table() {
+        let degree_bits = 10;
+        let quotient_degree_bits = 0;
+        let shifted_points =
+            precomputed::shifted_two_adic_subgroup::<F>(degree_bits + quotient_degree_bits);
+        let n = F::from_canonical_usize(1 << degree_bits);
+        let mut supplied = shifted_points.as_ref().clone();
+        supplied[0] += F::ONE;
+        let expected_first = (n * (supplied[0] - F::ONE)).inverse();
+
+        let miss = l_0_denominator_inverses::<F>(
+            degree_bits,
+            quotient_degree_bits,
+            &supplied,
+        );
+        assert_eq!(miss[0].0, expected_first.0);
+        let hit = l_0_denominator_inverses::<F>(degree_bits, quotient_degree_bits, &[]);
+        assert!(std::sync::Arc::ptr_eq(&miss, &hit));
     }
 }
 
