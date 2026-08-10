@@ -16,6 +16,7 @@
 
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
+use circuit::block_constraints::BlockTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
 use circuit::embed::deserialize_embedded;
 use circuit::types::config::{C, D, F};
@@ -28,6 +29,7 @@ static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx
 static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
 static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+static BLOCK_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block.embed"));
 
 /// The four startup circuits that do not participate in pre-execution. Keeping
 /// this separate lets the worker start the pre-execution proof from its already
@@ -86,6 +88,17 @@ impl Circuits {
     /// behind the remaining circuit loads.
     pub fn load_pre() -> anyhow::Result<(BlockPreExecutionTarget, CircuitData<F, C, D>)> {
         load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB)
+    }
+
+    /// Loads the final block circuit, which `build.rs` now builds too.
+    ///
+    /// It used to be constructed inside the scored worker by
+    /// `Circuits::build_block_circuit`, which measured 3,285 ms of a 24,607 ms
+    /// process — on the critical path, since the lane's join blocks for exactly
+    /// the window the lane runs in. Its inputs are all compile-time constants,
+    /// so there was never a reason for it to be built at run time.
+    pub fn load_block() -> anyhow::Result<(BlockTarget, CircuitData<F, C, D>)> {
+        load_blob::<BlockTarget>("block", BLOCK_BLOB)
     }
 
     /// Loads every embedded circuit except pre-execution. This is public to
@@ -419,6 +432,7 @@ mod tests {
     #[test]
     fn embedded_blobs_are_compiled_in() {
         for (name, blob) in [
+            ("block", BLOCK_BLOB),
             ("pre", PRE_BLOB),
             ("heavy_tx", HEAVY_TX_BLOB),
             ("heavy_chain", HEAVY_CHAIN_BLOB),

@@ -48,6 +48,9 @@ circuit = { path = "../circuit", default-features = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }
 circuit = { path = "../circuit", default-features = true }
+# `build.rs` now also builds the final block circuit, whose `CircuitData` it
+# must name. Already in the graph via `circuit`, so the lockfile is unchanged.
+plonky2 = { workspace = true, default-features = false }
 
 [dev-dependencies]
 flate2 = "1.0"
