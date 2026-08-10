@@ -287,16 +287,31 @@ pub(crate) fn fri_proof_of_work<
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
+    // Search four consecutive candidates per Rayon item. Poseidon2 overrides
+    // `permute_quad` with its bit-identical four-state implementation, exposing
+    // instruction-level parallelism inside each core; every other permutation
+    // uses the generic four-scalar fallback. Cancellation is still observed
+    // after at most one four-candidate group instead of after one candidate.
+    let max_candidate = F::NEG_ONE.to_canonical_u64();
+    let last_group = max_candidate / 4;
+    let pow_witness = (0..=last_group)
         .into_par_iter()
-        .find_any(|&candidate| {
-            let mut duplex_state = duplex_intermediate_state;
-            duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-            duplex_state.permute();
-            let pow_response = duplex_state.squeeze().iter().last().unwrap();
-            let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-            leading_zeros >= min_leading_zeros
+        .map(|group| {
+            // `group <= max_candidate / 4`, so this multiplication cannot
+            // overflow. The helper bounds every lane before `first + lane`,
+            // including the final partial group near the field modulus.
+            first_valid_pow_candidate_in_quad::<F, C::Hasher>(
+                duplex_intermediate_state,
+                witness_input_pos,
+                group * 4,
+                max_candidate,
+                min_leading_zeros,
+            )
         })
+        // This two-step form works with both Rayon's `ParallelIterator` and
+        // `plonky2_maybe_rayon::ParallelIteratorMock` when `parallel` is off.
+        .find_any(Option::is_some)
+        .flatten()
         .map(F::from_canonical_u64)
         .expect("Proof of work failed. This is highly unlikely!");
 
@@ -306,6 +321,41 @@ pub(crate) fn fri_proof_of_work<
     let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
     assert!(leading_zeros >= min_leading_zeros);
     pow_witness
+}
+
+/// Return the first valid candidate in `first..=min(first + 3, max_candidate)`.
+/// Invalid lanes in the final partial group duplicate `first` solely to keep
+/// the permutation call four-wide; their outputs are never inspected.
+fn first_valid_pow_candidate_in_quad<F: RichField, H: crate::plonk::config::Hasher<F>>(
+    intermediate_state: H::Permutation,
+    witness_input_pos: usize,
+    first: u64,
+    max_candidate: u64,
+    min_leading_zeros: u32,
+) -> Option<u64> {
+    debug_assert!(first <= max_candidate);
+    let lane_count = usize::try_from((max_candidate - first).min(3) + 1)
+        .expect("PoW lane count is at most four");
+    let mut states = [intermediate_state; 4];
+    for (lane, state) in states[..lane_count].iter_mut().enumerate() {
+        // `lane < lane_count <= max_candidate - first + 1`, hence this
+        // addition is both within the field candidate interval and overflow-free.
+        state.set_elt(F::from_canonical_u64(first + lane as u64), witness_input_pos);
+    }
+    H::Permutation::permute_quad(&mut states);
+
+    states[..lane_count]
+        .iter()
+        .position(|state| {
+            state
+                .squeeze()
+                .last()
+                .expect("a permutation rate must be nonzero")
+                .to_canonical_u64()
+                .leading_zeros()
+                >= min_leading_zeros
+        })
+        .map(|lane| first + lane as u64)
 }
 
 fn fri_prover_query_rounds<
@@ -366,10 +416,15 @@ fn fri_prover_query_round<
 
 #[cfg(test)]
 mod tests {
-    use plonky2_field::types::Sample;
+    use plonky2_field::types::{PrimeField64, Sample};
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::fri::reduction_strategies::FriReductionStrategy;
+    use crate::fri::verifier::fri_verify_proof_of_work;
+    use crate::hash::poseidon2::hash::Poseidon2Hash;
+    use crate::iop::challenger::Challenger;
+    use crate::plonk::config::Poseidon2GoldilocksConfig;
 
     /// `bitrev_flatten` must be raw-`u64`-identical to the serial
     /// gather-and-extend loop it replaced, for every leaf and every limb.
@@ -398,5 +453,131 @@ mod tests {
                 assert_eq!(a.0, e.0, "limb {k} of {n}");
             }
         }
+    }
+
+    fn scalar_first_valid_pow_candidate<F: RichField, H: crate::plonk::config::Hasher<F>>(
+        intermediate_state: H::Permutation,
+        witness_input_pos: usize,
+        first: u64,
+        max_candidate: u64,
+        min_leading_zeros: u32,
+    ) -> Option<u64> {
+        (first..=max_candidate.min(first.saturating_add(3))).find(|&candidate| {
+            let mut state = intermediate_state;
+            state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+            state.permute();
+            state
+                .squeeze()
+                .last()
+                .unwrap()
+                .to_canonical_u64()
+                .leading_zeros()
+                >= min_leading_zeros
+        })
+    }
+
+    /// Compare every returned lane against the scalar definition, and exercise
+    /// final groups of lengths one through four at the Goldilocks boundary.
+    #[test]
+    fn quad_pow_groups_match_scalar_lanes_and_boundaries() {
+        type F = GoldilocksField;
+        type H = Poseidon2Hash;
+
+        let mut challenger = Challenger::<F, H>::new();
+        challenger.observe_elements(&[
+            F::from_canonical_u64(0x1234_5678),
+            F::from_canonical_u64(0x8765_4321),
+            F::from_canonical_u64(0x55aa_aa55),
+        ]);
+        let mut intermediate = challenger.sponge_state;
+        let witness_input_pos = challenger.input_buffer.len();
+        intermediate.set_from_iter(challenger.input_buffer.clone(), 0);
+
+        let mut lanes_seen = [false; 4];
+        for group in 0..4096u64 {
+            let first = group * 4;
+            let expected = scalar_first_valid_pow_candidate::<F, H>(
+                intermediate,
+                witness_input_pos,
+                first,
+                first + 3,
+                4,
+            );
+            let actual = first_valid_pow_candidate_in_quad::<F, H>(
+                intermediate,
+                witness_input_pos,
+                first,
+                first + 3,
+                4,
+            );
+            assert_eq!(actual, expected, "group {group}");
+            if let Some(candidate) = actual {
+                lanes_seen[(candidate - first) as usize] = true;
+            }
+            if lanes_seen.iter().all(|&seen| seen) {
+                break;
+            }
+        }
+        assert!(lanes_seen.iter().all(|&seen| seen), "all lanes must be exercised");
+
+        let max = F::NEG_ONE.to_canonical_u64();
+        for extra_lanes in 0..4u64 {
+            let first = max - extra_lanes;
+            for min_leading_zeros in [0, 4, 12, 32, 64] {
+                assert_eq!(
+                    first_valid_pow_candidate_in_quad::<F, H>(
+                        intermediate,
+                        witness_input_pos,
+                        first,
+                        max,
+                        min_leading_zeros,
+                    ),
+                    scalar_first_valid_pow_candidate::<F, H>(
+                        intermediate,
+                        witness_input_pos,
+                        first,
+                        max,
+                        min_leading_zeros,
+                    ),
+                    "tail length {}, threshold {min_leading_zeros}",
+                    extra_lanes + 1,
+                );
+            }
+        }
+    }
+
+    /// A produced witness advances the prover transcript exactly as the native
+    /// verifier does and satisfies the verifier's proof-of-work predicate.
+    #[test]
+    fn batched_pow_witness_is_verifier_valid() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let config = FriConfig {
+            rate_bits: 3,
+            cap_height: 4,
+            proof_of_work_bits: 8,
+            reduction_strategy: FriReductionStrategy::ConstantArityBits(4, 5),
+            num_query_rounds: 28,
+        };
+        let mut prover = Challenger::<F, <C as GenericConfig<D>>::Hasher>::new();
+        prover.observe_elements(&[
+            F::from_canonical_u64(7),
+            F::from_canonical_u64(11),
+            F::from_canonical_u64(13),
+        ]);
+        let mut verifier = prover.clone();
+
+        let witness = fri_proof_of_work::<F, C, D>(&mut prover, &config);
+        verifier.observe_element(witness);
+        let response = verifier.get_challenge();
+        fri_verify_proof_of_work::<F, D>(response, &config).unwrap();
+
+        assert_eq!(
+            prover.get_challenge(),
+            verifier.get_challenge(),
+            "prover and verifier transcripts must remain synchronized"
+        );
     }
 }
