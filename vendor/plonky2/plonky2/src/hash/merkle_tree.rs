@@ -514,12 +514,116 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
 /// consumed by one call and never outlives it.
 const GATHER_TILE_LEAVES: usize = 16;
 
-/// Widest leaf the gathering path keeps on the stack. The tile is
-/// `GATHER_TILE_LEAVES * GATHER_MAX_WIDTH` field elements (4 KiB at
-/// `size_of::<F>() == 8`), and one tile is live per recursion frame, so the
-/// bound also bounds the recursion's stack growth. Wider leaves take the
-/// materializing path in [`MerkleTree::new_column_store`].
-const GATHER_MAX_WIDTH: usize = 32;
+/// Legacy maximum gathered leaf width.
+const GATHER_LEGACY_MAX_WIDTH: usize = 32;
+
+/// Candidate shape gate. This is only large enough to include the standard
+/// constants/sigmas width 82 while keeping the gathered tile bounded.
+const GATHER_CANDIDATE_MAX_WIDTH: usize = 96;
+
+/// Widest leaf the gathering implementation can keep on the stack. The tile
+/// is `GATHER_TILE_LEAVES * GATHER_MAX_WIDTH` field elements (12 KiB at
+/// `size_of::<F>() == 8`). Selection remains at the legacy width unless the
+/// documented candidate toggle is exactly `1`.
+const GATHER_MAX_WIDTH: usize = GATHER_CANDIDATE_MAX_WIDTH;
+
+/// Set to `1` to extend only the CPU fallback gathered-column shape gate from
+/// 32 through 96 columns. Unset, `0`, and all other values preserve legacy
+/// selection.
+#[cfg(feature = "std")]
+const MERKLE_GATHER_82_ENV: &str = "LIGHTER_MERKLE_GATHER_82";
+
+/// Set to `1` to report actual CPU fallback gathered/materialized widths and
+/// cumulative width-82 activation counters. Quiet by default.
+#[cfg(feature = "std")]
+const MERKLE_GATHER_82_DIAGNOSTIC_ENV: &str = "LIGHTER_MERKLE_GATHER_82_DIAGNOSTIC";
+
+#[cfg(feature = "std")]
+fn merkle_gather_82_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os(MERKLE_GATHER_82_ENV).is_some_and(|value| value == "1")
+    })
+}
+
+#[cfg(not(feature = "std"))]
+fn merkle_gather_82_enabled() -> bool {
+    false
+}
+
+#[cfg(feature = "std")]
+fn merkle_gather_82_diagnostics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os(MERKLE_GATHER_82_DIAGNOSTIC_ENV)
+            .is_some_and(|value| value == "1")
+    })
+}
+
+#[cfg(not(feature = "std"))]
+fn merkle_gather_82_diagnostics_enabled() -> bool {
+    false
+}
+
+#[inline]
+fn cpu_gather_width_limit() -> usize {
+    if merkle_gather_82_enabled() {
+        GATHER_CANDIDATE_MAX_WIDTH
+    } else {
+        GATHER_LEGACY_MAX_WIDTH
+    }
+}
+
+#[cfg(feature = "std")]
+fn record_cpu_fallback_path(gathered: bool, width: usize) {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static GATHERED_BUILDS: AtomicUsize = AtomicUsize::new(0);
+    static MATERIALIZED_BUILDS: AtomicUsize = AtomicUsize::new(0);
+    static GATHERED_WIDTH_82: AtomicUsize = AtomicUsize::new(0);
+    static MATERIALIZED_WIDTH_82: AtomicUsize = AtomicUsize::new(0);
+
+    if !merkle_gather_82_diagnostics_enabled() {
+        return;
+    }
+    let gathered_builds = if gathered {
+        GATHERED_BUILDS.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        GATHERED_BUILDS.load(Ordering::Relaxed)
+    };
+    let materialized_builds = if gathered {
+        MATERIALIZED_BUILDS.load(Ordering::Relaxed)
+    } else {
+        MATERIALIZED_BUILDS.fetch_add(1, Ordering::Relaxed) + 1
+    };
+    let gathered_width_82 = if gathered && width == 82 {
+        GATHERED_WIDTH_82.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        GATHERED_WIDTH_82.load(Ordering::Relaxed)
+    };
+    let materialized_width_82 = if !gathered && width == 82 {
+        MATERIALIZED_WIDTH_82.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        MATERIALIZED_WIDTH_82.load(Ordering::Relaxed)
+    };
+    eprintln!(
+        "[merkle-gather-82] mode={} cpu_fallback_path={} width={} cpu_gathered_builds={} cpu_materialized_builds={} cpu_gathered_width_82={} cpu_materialized_width_82={}",
+        if merkle_gather_82_enabled() {
+            "candidate"
+        } else {
+            "legacy-control"
+        },
+        if gathered { "gathered" } else { "materialized" },
+        width,
+        gathered_builds,
+        materialized_builds,
+        gathered_width_82,
+        materialized_width_82,
+    );
+}
+
+#[cfg(not(feature = "std"))]
+fn record_cpu_fallback_path(_gathered: bool, _width: usize) {}
 
 /// [`fill_subtree_flat`] over natural-order columns instead of a materialized
 /// bit-reversed row-major matrix: leaf `i` of the tree is
@@ -826,11 +930,12 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         // same order, so every digest is bit-identical (asserted below by
         // `gathered_matches_materialized`).
         let num_columns = columns.num_cols();
-        if num_columns <= GATHER_MAX_WIDTH {
+        if num_columns <= cpu_gather_width_limit() {
             let (digests, cap) = {
                 let borrowed: Vec<&[F]> = (0..num_columns).map(|j| columns.col(j)).collect();
                 Self::cpu_digests_gather(&borrowed, log_rows, num_leaves, cap_height)
             };
+            record_cpu_fallback_path(true, num_columns);
             return Self {
                 leaves: MerkleLeaves::Columns { columns, log_rows },
                 num_leaves,
@@ -857,6 +962,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             }
         };
         let (digests, cap) = Self::cpu_digests(&flat, num_columns, num_leaves, cap_height);
+        record_cpu_fallback_path(false, num_columns);
         Self {
             leaves: MerkleLeaves::Columns { columns, log_rows },
             num_leaves,
@@ -1156,6 +1262,10 @@ pub(crate) mod tests {
             (20, 9, 2),
             (31, 7, 1),
             (32, 11, 4),
+            (33, 5, 0),
+            (82, 4, 4),
+            (82, 6, 2),
+            (82, 8, 3),
         ] {
             let n = 1usize << log_n;
             let columns: Vec<Vec<F>> = (0..width).map(|_| F::rand_vec(n)).collect();
