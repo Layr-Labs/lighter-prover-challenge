@@ -8,7 +8,8 @@ use plonky2_maybe_rayon::*;
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
 use crate::field::extension::Extendable;
 use crate::field::fft::{
-    FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
+    FftRootTable, fft_in_place_four_with_options, fft_in_place_with_options,
+    fft_in_place_with_options_parallel,
 };
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
@@ -330,11 +331,84 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let degree = polynomials[0].len();
         let lde_len = degree << rate_bits;
         let coset_powers = crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
-        let Some(destinations) = columns.columns_mut() else {
+        let Some(mut destinations) = columns.columns_mut() else {
             return false;
         };
         assert_eq!(destinations.len(), polynomials.len());
         assert!(destinations.iter().all(|column| column.len() == lde_len));
+
+        // Wide base-field commitments have enough independent four-column
+        // groups to occupy every worker while each worker reuses a twiddle
+        // pair across its four columns. Narrow commitments keep the original
+        // one-column task granularity, as do non-aarch64 and extension-field
+        // instantiations for which the four-column FFT is only a fallback.
+        #[cfg(target_arch = "aarch64")]
+        #[cfg(feature = "parallel")]
+        let worker_count = plonky2_maybe_rayon::rayon::current_num_threads();
+        #[cfg(target_arch = "aarch64")]
+        #[cfg(not(feature = "parallel"))]
+        let worker_count = 1usize;
+        #[cfg(target_arch = "aarch64")]
+        let grouped_column_waves = destinations
+            .len()
+            .div_ceil(4)
+            .div_ceil(worker_count)
+            * 4;
+        #[cfg(target_arch = "aarch64")]
+        let independent_column_waves = destinations.len().div_ceil(worker_count);
+        #[cfg(target_arch = "aarch64")]
+        let lockstep_four = destinations.len() >= 64
+            && rate_bits > 0
+            && lde_len >= 1 << 19
+            && grouped_column_waves <= independent_column_waves
+            && core::any::TypeId::of::<F>()
+                == core::any::TypeId::of::<crate::field::goldilocks_field::GoldilocksField>();
+        #[cfg(not(target_arch = "aarch64"))]
+        let lockstep_four = false;
+
+        if lockstep_four {
+            destinations
+                .par_chunks_mut(4)
+                .zip(polynomials.par_chunks(4))
+                .for_each(|(destination_group, polynomial_group)| {
+                    for (destination, polynomial) in destination_group
+                        .iter_mut()
+                        .zip(polynomial_group.iter())
+                    {
+                        assert_eq!(
+                            polynomial.len(),
+                            degree,
+                            "Polynomial degrees inconsistent"
+                        );
+                        batch_multiply_into(
+                            &mut destination[..degree],
+                            &polynomial.coeffs,
+                            &coset_powers,
+                        );
+                        if rate_bits == 0 || degree < 2 {
+                            destination[degree..].fill(F::ZERO);
+                        }
+                    }
+
+                    match destination_group {
+                        [d0, d1, d2, d3] => fft_in_place_four_with_options(
+                            [&mut **d0, &mut **d1, &mut **d2, &mut **d3],
+                            Some(rate_bits),
+                            fft_root_table,
+                        ),
+                        tail => {
+                            for destination in tail {
+                                fft_in_place_with_options(
+                                    destination,
+                                    Some(rate_bits),
+                                    fft_root_table,
+                                );
+                            }
+                        }
+                    }
+                });
+            return true;
+        }
 
         destinations
             .into_par_iter()

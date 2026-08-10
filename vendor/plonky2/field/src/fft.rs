@@ -230,6 +230,97 @@ pub fn fft_in_place_with_options<F: Field>(
     fft_dispatch(buffer, zero_factor, root_table);
 }
 
+/// Computes four equal-shaped FFTs while sharing the base-field twiddle
+/// stream on aarch64. Other fields, architectures, and small transforms take
+/// the ordinary value-identical path four times.
+///
+/// This entry point is intended for already-parallel outer phases with many
+/// independent columns: grouping four columns reduces repeated root-row
+/// loads without adding a nested worker-pool phase. The zero-padded
+/// cache-block preparation remains column-local, while the large outer
+/// layers advance in lockstep.
+#[doc(hidden)]
+pub fn fft_in_place_four_with_options<F: Field>(
+    buffers: [&mut [F]; 4],
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+) {
+    let n = buffers[0].len();
+    assert!(buffers.iter().all(|buffer| buffer.len() == n));
+
+    if let Some(table) = root_table {
+        fft_dispatch_four(buffers, zero_factor, table);
+        return;
+    }
+    #[cfg(feature = "std")]
+    let computed_root_table = root_table_cache::get::<F>(log2_strict(n));
+    #[cfg(not(feature = "std"))]
+    let computed_root_table = fft_root_table::<F>(n);
+    fft_dispatch_four(buffers, zero_factor, &computed_root_table);
+}
+
+#[inline]
+fn fft_dispatch_four<F: Field>(
+    buffers: [&mut [F]; 4],
+    zero_factor: Option<usize>,
+    root_table: &FftRootTable<F>,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let n = buffers[0].len();
+        let lg_n = log2_strict(n);
+        let r = zero_factor.unwrap_or(0);
+        if r > 0
+            && r <= lg_n
+            && n >= FUSED_PAIR_MIN_SCALARS
+            && lg_n != F::TWO_ADICITY
+            && core::any::TypeId::of::<F>()
+                == core::any::TypeId::of::<crate::goldilocks_field::GoldilocksField>()
+        {
+            let [b0, b1, b2, b3] = buffers;
+            // SAFETY: exact `TypeId` equality proves every `F` is a
+            // `GoldilocksField`. The four mutable input slices are disjoint by
+            // the safe function signature; only their generic spelling changes.
+            let goldilocks = unsafe {
+                [
+                    core::slice::from_raw_parts_mut(
+                        b0.as_mut_ptr()
+                            .cast::<crate::goldilocks_field::GoldilocksField>(),
+                        n,
+                    ),
+                    core::slice::from_raw_parts_mut(
+                        b1.as_mut_ptr()
+                            .cast::<crate::goldilocks_field::GoldilocksField>(),
+                        n,
+                    ),
+                    core::slice::from_raw_parts_mut(
+                        b2.as_mut_ptr()
+                            .cast::<crate::goldilocks_field::GoldilocksField>(),
+                        n,
+                    ),
+                    core::slice::from_raw_parts_mut(
+                        b3.as_mut_ptr()
+                            .cast::<crate::goldilocks_field::GoldilocksField>(),
+                        n,
+                    ),
+                ]
+            };
+            let goldilocks_roots = unsafe {
+                // SAFETY: the same exact-type check proves the table rows
+                // contain `GoldilocksField` values with the same layout.
+                &*(root_table as *const FftRootTable<F>
+                    as *const FftRootTable<crate::goldilocks_field::GoldilocksField>)
+            };
+            fft_classic_four_goldilocks(goldilocks, r, goldilocks_roots);
+            return;
+        }
+    }
+
+    for buffer in buffers {
+        fft_classic(buffer, zero_factor.unwrap_or(0), root_table);
+    }
+}
+
 /// Computes an FFT in place, distributing independent blocks of the large
 /// outer stages across the feature-gated worker pool. Callers should use this
 /// only when the transform is not already nested in a wider parallel phase.
@@ -661,6 +752,148 @@ fn fft_classic_simd_two_layers_neon(
     }
 }
 
+/// Four-column form of [`fft_classic_simd_single_layer_neon`]. Each column
+/// executes the identical butterfly body and arithmetic order; only the
+/// twiddle pair is loaded once and reused across four disjoint columns.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_single_layer_neon_four(
+    values: [&mut [crate::goldilocks_field::GoldilocksField]; 4],
+    lg_half_m: usize,
+    omega_row: &[crate::goldilocks_field::GoldilocksField],
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    let n = values[0].len();
+    debug_assert!(values.iter().all(|column| column.len() == n));
+    let half = 1usize << lg_half_m;
+    let m = half << 1;
+    debug_assert!(omega_row.len() >= half);
+    let bases = [
+        values[0].as_mut_ptr(),
+        values[1].as_mut_ptr(),
+        values[2].as_mut_ptr(),
+        values[3].as_mut_ptr(),
+    ];
+
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        let mut k = 0;
+        while k + m <= n {
+            let mut j = 0;
+            while j + 2 <= half {
+                let w = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j),
+                    *omega_row.get_unchecked(j + 1),
+                ]);
+                for base in bases {
+                    let v = NeonGoldilocksField([
+                        *base.add(k + half + j),
+                        *base.add(k + half + j + 1),
+                    ]);
+                    let t = w * v;
+                    let tv = vcombine_u64(vcreate_u64(t.0[0].0), vcreate_u64(t.0[1].0));
+                    let words = base.cast::<u64>();
+                    let u = vld1q_u64(words.add(k + j));
+                    vst1q_u64(words.add(k + j), gl_add_neon(u, tv, eps));
+                    vst1q_u64(words.add(k + half + j), gl_sub_neon(u, tv, eps));
+                }
+                j += 2;
+            }
+            while j < half {
+                let w = *omega_row.get_unchecked(j);
+                for base in bases {
+                    let t = w * *base.add(k + half + j);
+                    let u = *base.add(k + j);
+                    *base.add(k + j) = u + t;
+                    *base.add(k + half + j) = u - t;
+                }
+                j += 1;
+            }
+            k += m;
+        }
+    }
+}
+
+/// Four-column form of [`fft_classic_simd_two_layers_neon`]. The twiddle
+/// triplet for a pair of positions is constructed once, then the proven
+/// raw-word-identical two-layer body runs for each disjoint column.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_two_layers_neon_four(
+    values: [&mut [crate::goldilocks_field::GoldilocksField]; 4],
+    lg_half_m: usize,
+    w1_row: &[crate::goldilocks_field::GoldilocksField],
+    w2_row: &[crate::goldilocks_field::GoldilocksField],
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    debug_assert!(lg_half_m >= 1);
+    let n = values[0].len();
+    debug_assert!(values.iter().all(|column| column.len() == n));
+    let q = 1usize << lg_half_m;
+    let w1_row = &w1_row[..q];
+    let (w2_lo, w2_hi) = w2_row[..2 * q].split_at(q);
+    let bases = [
+        values[0].as_mut_ptr(),
+        values[1].as_mut_ptr(),
+        values[2].as_mut_ptr(),
+        values[3].as_mut_ptr(),
+    ];
+
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        let mut k = 0;
+        while k + 4 * q <= n {
+            let mut j = 0;
+            while j + 2 <= q {
+                let w1 = NeonGoldilocksField([
+                    *w1_row.get_unchecked(j),
+                    *w1_row.get_unchecked(j + 1),
+                ]);
+                let w2a = NeonGoldilocksField([
+                    *w2_lo.get_unchecked(j),
+                    *w2_lo.get_unchecked(j + 1),
+                ]);
+                let w2b = NeonGoldilocksField([
+                    *w2_hi.get_unchecked(j),
+                    *w2_hi.get_unchecked(j + 1),
+                ]);
+                for base in bases {
+                    let a = base.add(k + j);
+                    let b = base.add(k + q + j);
+                    let c = base.add(k + 2 * q + j);
+                    let d = base.add(k + 3 * q + j);
+                    let t1 = w1 * NeonGoldilocksField([*b, *b.add(1)]);
+                    let t2 = w1 * NeonGoldilocksField([*d, *d.add(1)]);
+                    let cd0 = [*c + t2.0[0], *c.add(1) + t2.0[1]];
+                    let cd1 = [*c - t2.0[0], *c.add(1) - t2.0[1]];
+                    let t3 = w2a * NeonGoldilocksField(cd0);
+                    let t4 = w2b * NeonGoldilocksField(cd1);
+
+                    let av = vld1q_u64(a.cast::<u64>());
+                    let t1v = vcombine_u64(vcreate_u64(t1.0[0].0), vcreate_u64(t1.0[1].0));
+                    let ab0 = gl_add_neon(av, t1v, eps);
+                    let ab1 = gl_sub_neon(av, t1v, eps);
+                    let t3v = vcombine_u64(vcreate_u64(t3.0[0].0), vcreate_u64(t3.0[1].0));
+                    let t4v = vcombine_u64(vcreate_u64(t4.0[0].0), vcreate_u64(t4.0[1].0));
+                    vst1q_u64(a.cast::<u64>(), gl_add_neon(ab0, t3v, eps));
+                    vst1q_u64(c.cast::<u64>(), gl_sub_neon(ab0, t3v, eps));
+                    vst1q_u64(b.cast::<u64>(), gl_add_neon(ab1, t4v, eps));
+                    vst1q_u64(d.cast::<u64>(), gl_sub_neon(ab1, t4v, eps));
+                }
+                j += 2;
+            }
+            debug_assert_eq!(j, q);
+            k += 4 * q;
+        }
+    }
+}
+
 /// One FRI butterfly layer over quadratic-extension elements, with the
 /// modular reduction in vector registers.
 ///
@@ -1034,6 +1267,37 @@ fn fft_classic_simd_layers<P, M>(
     }
 }
 
+/// Advance four large Goldilocks transforms through the same outer stages.
+/// The production two-layer schedule is preserved exactly; the only changed
+/// data movement is one shared load of each twiddle pair for four columns.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fft_classic_simd_layers_neon_four(
+    values: [&mut [crate::goldilocks_field::GoldilocksField]; 4],
+    start: usize,
+    end: usize,
+    root_table: &FftRootTable<crate::goldilocks_field::GoldilocksField>,
+) {
+    let mut lg_half_m = start;
+    let [v0, v1, v2, v3] = values;
+    while lg_half_m + 2 <= end {
+        fft_classic_simd_two_layers_neon_four(
+            [&mut *v0, &mut *v1, &mut *v2, &mut *v3],
+            lg_half_m,
+            &root_table[lg_half_m],
+            &root_table[lg_half_m + 1],
+        );
+        lg_half_m += 2;
+    }
+    if lg_half_m < end {
+        fft_classic_simd_single_layer_neon_four(
+            [&mut *v0, &mut *v1, &mut *v2, &mut *v3],
+            lg_half_m,
+            &root_table[lg_half_m],
+        );
+    }
+}
+
 /// Small transforms do not amortize worker-pool scheduling. Production FRI
 /// first wins consistently at 2^18 elements; 2^17 is left on the serial path.
 const PARALLEL_FFT_MIN_SCALARS: usize = 1 << 18;
@@ -1355,6 +1619,66 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
     } else {
         fft_classic_with::<F, BaseSubfieldTwiddle>(values, r, root_table);
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn fft_classic_four_goldilocks(
+    values: [&mut [crate::goldilocks_field::GoldilocksField]; 4],
+    r: usize,
+    root_table: &FftRootTable<crate::goldilocks_field::GoldilocksField>,
+) {
+    use crate::goldilocks_field::GoldilocksField;
+
+    let n = values[0].len();
+    let lg_n = log2_strict(n);
+    if root_table.len() != lg_n {
+        panic!(
+            "Expected root table of length {}, but it was {}.",
+            lg_n,
+            root_table.len()
+        );
+    }
+    debug_assert!(r > 0 && r <= lg_n);
+    debug_assert!(n >= FUSED_PAIR_MIN_SCALARS);
+    let lg_packed_width = log2_strict(<GoldilocksField as Packable>::Packing::WIDTH);
+    let [v0, v1, v2, v3] = values;
+    let first_layers = [
+        prepare_zero_padded_fft::<GoldilocksField, BaseSubfieldTwiddle>(
+            &mut *v0,
+            r,
+            lg_n,
+            lg_packed_width,
+            root_table,
+        ),
+        prepare_zero_padded_fft::<GoldilocksField, BaseSubfieldTwiddle>(
+            &mut *v1,
+            r,
+            lg_n,
+            lg_packed_width,
+            root_table,
+        ),
+        prepare_zero_padded_fft::<GoldilocksField, BaseSubfieldTwiddle>(
+            &mut *v2,
+            r,
+            lg_n,
+            lg_packed_width,
+            root_table,
+        ),
+        prepare_zero_padded_fft::<GoldilocksField, BaseSubfieldTwiddle>(
+            &mut *v3,
+            r,
+            lg_n,
+            lg_packed_width,
+            root_table,
+        ),
+    ];
+    debug_assert!(first_layers.iter().all(|&layer| layer == first_layers[0]));
+    fft_classic_simd_layers_neon_four(
+        [&mut *v0, &mut *v1, &mut *v2, &mut *v3],
+        first_layers[0],
+        lg_n,
+        root_table,
+    );
 }
 
 pub(crate) fn fft_classic_parallel<F: Field>(
@@ -2423,7 +2747,8 @@ mod tests {
     use super::{BaseSubfieldTwiddle, FftTwiddleMul, GeneralTwiddle};
     use crate::extension::quadratic::QuadraticExtension;
     use crate::fft::{
-        FftRootTable, fft, fft_classic, fft_classic_parallel, fft_in_place_with_options,
+        FftRootTable, fft, fft_classic, fft_classic_parallel,
+        fft_in_place_four_with_options, fft_in_place_with_options,
         fft_in_place_with_options_parallel, fft_root_table, fft_with_options, ifft,
     };
     use crate::goldilocks_field::GoldilocksField;
@@ -3003,6 +3328,55 @@ mod tests {
                 expected.iter().map(|x| x.0).collect::<Vec<_>>(),
                 "raw limb mismatch at 2^{lg_n}, r={r}"
             );
+        }
+    }
+
+    /// Four-column dispatch must preserve the raw Montgomery-free limb image,
+    /// not merely field equality. The large shape is enabled on aarch64 so it
+    /// crosses the production gate and exercises the shared-twiddle NEON
+    /// scheduler; portable builds cover all fallback semantics cheaply.
+    #[test]
+    fn four_column_fft_matches_independent_raw_limbs() {
+        #[cfg(target_arch = "aarch64")]
+        let shapes = vec![(8usize, 0usize), (10, 1), (13, 3), (19, 3)];
+        #[cfg(not(target_arch = "aarch64"))]
+        let shapes = vec![(8usize, 0usize), (10, 1), (13, 3)];
+
+        for (lg_n, r) in shapes {
+            let n = 1usize << lg_n;
+            let nonzero_len = n >> r;
+            let roots = fft_root_table::<GoldilocksField>(n);
+            let mut expected: [Vec<GoldilocksField>; 4] = core::array::from_fn(|column| {
+                (0..n)
+                    .map(|i| {
+                        if i < nonzero_len {
+                            let x = (i as u64)
+                                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                                .rotate_left((column * 11) as u32)
+                                ^ (column as u64).wrapping_mul(0xd1b5_4a32_d192_ed03);
+                            GoldilocksField(x)
+                        } else {
+                            GoldilocksField::ZERO
+                        }
+                    })
+                    .collect()
+            });
+            let mut actual = expected.clone();
+            for column in &mut expected {
+                fft_in_place_with_options(column, Some(r), Some(&roots));
+            }
+            let [a0, a1, a2, a3] = &mut actual;
+            fft_in_place_four_with_options([a0, a1, a2, a3], Some(r), Some(&roots));
+
+            for column in 0..4 {
+                for i in 0..n {
+                    assert_eq!(
+                        actual[column][i].0,
+                        expected[column][i].0,
+                        "raw limb mismatch for column {column}, 2^{lg_n}, r={r}, index {i}"
+                    );
+                }
+            }
         }
     }
 
