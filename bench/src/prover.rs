@@ -1182,3 +1182,5 @@ mod tests {
             .expect("final chain step proof must verify");
     }
 }
+
+// Redraw token: unmodified 59c0155 tip, draw 5 (RaduNichita).
