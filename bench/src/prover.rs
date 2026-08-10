@@ -1,7 +1,7 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use circuit::block::Block;
@@ -83,12 +83,41 @@ fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
 /// disables occupancy-conditional routing process-wide for the light pipeline and
 /// simultaneously force-routes this path's own fold trees behind the light
 /// pipeline's chunk trees — it hurts both sides. The claim is legitimate only for
-/// the path that is the last one still proving, which this counter identifies.
+/// the path that is the last one still proving, after its local transaction
+/// window and the independently spawned final-block circuit build have both
+/// drained.
 ///
 /// Routing is a scheduling heuristic: either outcome hashes the identical tree,
 /// so a stale read here is benign and no proof byte depends on the answer.
-fn claims_exclusive_gpu_phase(active_paths: &AtomicUsize) -> bool {
-    active_paths.load(Ordering::Acquire) == 1
+fn claims_exclusive_gpu_phase(
+    active_paths: &AtomicUsize,
+    tx_proofs_in_flight: usize,
+    block_build_complete: &AtomicBool,
+) -> bool {
+    tx_proofs_in_flight == 0
+        && active_paths.load(Ordering::Acquire) == 1
+        && block_build_complete.load(Ordering::Acquire)
+}
+
+/// Scoped process-global routing hint. The caller first joins every other
+/// proof; the guard makes the reset unconditional on normal early returns.
+struct ExclusiveGpuPhaseGuard(bool);
+
+impl ExclusiveGpuPhaseGuard {
+    fn new(enabled: bool) -> Self {
+        if enabled {
+            plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
+        }
+        Self(enabled)
+    }
+}
+
+impl Drop for ExclusiveGpuPhaseGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+        }
+    }
 }
 
 /// Marks the calling thread as latency-critical to the macOS scheduler.
@@ -152,6 +181,7 @@ fn chain_step_proof(
     base_proof: &Proof,
     dummy_proof: &Proof,
     tx_proof: &Proof,
+    enter_exclusive_after_predecessor: bool,
 ) -> Proof {
     mark_spine_thread_latency_critical();
     #[cfg(feature = "diagnostic_profile")]
@@ -184,6 +214,11 @@ fn chain_step_proof(
 
         // Phase 2: wait for the previous chain proof, feed it directly, and prove.
         let previous_proof = previous.map(ChainState::wait);
+        // An exclusive drain request is made only after all transaction-proof
+        // handles have joined. Waiting for the predecessor above retires the
+        // last other chain proof without sacrificing early-witness overlap.
+        let _exclusive_gpu_phase =
+            ExclusiveGpuPhaseGuard::new(enter_exclusive_after_predecessor);
         pending.feed_seeded(|feeder| {
             BlockTxChainCircuit::witness_inputs_cyclic_into(
                 chain_target,
@@ -301,6 +336,7 @@ fn prove_path(
     pre_output: &BlockPreExecWitness<F>,
     state_metadata_hash: HashOut<F>,
     active_paths: &AtomicUsize,
+    block_build_complete: &AtomicBool,
 ) -> Proof {
     assert!(
         !chunks.is_empty(),
@@ -415,6 +451,7 @@ fn prove_path(
                             base,
                             dummy_proof,
                             &tx_proof,
+                            false,
                         )
                     })
                     .expect("chain step pipeline thread must start");
@@ -480,6 +517,9 @@ fn prove_path(
             }
         }
 
+        // A width-four light window normally leaves three transaction proofs
+        // alive here. They still share the Metal FIFO, so the chain tail is
+        // not exclusive until those handles have drained.
         if let Some((chain_step, tx_proof)) = pending_tx.take() {
             let previous = chain.take();
             let handle = std::thread::Builder::new()
@@ -495,18 +535,18 @@ fn prove_path(
                         base,
                         dummy_proof,
                         &tx_proof,
+                        false,
                     )
                 })
                 .expect("chain step pipeline thread must start");
             chain = Some(ChainState::InFlight(handle));
         }
-        // Past this point the pipeline spawns no new chunk work: the drain
-        // below is the strictly sequential chain tail, so its mid-size
-        // commitment trees can use the mostly idle GPU exactly like the
-        // pre-execution and final block phases — but only once this path is the
-        // last one proving, since the switch is process-global (see
-        // [`claims_exclusive_gpu_phase`]).
-        let exclusive_drain = claims_exclusive_gpu_phase(active_paths);
+        // Past this point the pipeline spawns no new chunk work. Keep the
+        // occupancy-aware routing policy while any already-spawned transaction
+        // proof remains: forcing a small chain tree onto Metal would only queue
+        // it behind that proof's large trees. Turn on exclusive routing for the
+        // final chain step once the local transaction window is genuinely
+        // empty and this is the last path still proving.
         #[cfg(feature = "diagnostic_profile")]
         {
             plonky2::util::profile::counter(
@@ -514,14 +554,6 @@ fn prove_path(
                 "drain_tx_in_flight",
                 in_flight.len() as u64,
             );
-            plonky2::util::profile::counter(
-                "scheduler",
-                "exclusive_drain_claimed",
-                exclusive_drain as u64,
-            );
-        }
-        if exclusive_drain {
-            plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
         }
         while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
             #[cfg(feature = "diagnostic_profile")]
@@ -529,6 +561,17 @@ fn prove_path(
             let tx_proof = proof_handle
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let exclusive_step = claims_exclusive_gpu_phase(
+                active_paths,
+                in_flight.len(),
+                block_build_complete,
+            );
+            #[cfg(feature = "diagnostic_profile")]
+            plonky2::util::profile::counter(
+                "scheduler",
+                "exclusive_drain_claimed",
+                exclusive_step as u64,
+            );
             let previous = chain.take();
             chain = Some(ChainState::Ready(chain_step_proof(
                 path,
@@ -539,14 +582,12 @@ fn prove_path(
                 base,
                 dummy_proof,
                 &tx_proof,
+                exclusive_step,
             )));
         }
         let chain_proof = chain
             .map(ChainState::wait)
             .expect("transaction path must produce a chain proof");
-        if exclusive_drain {
-            plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
-        }
         chain_proof
     });
     // This path has produced its last proof. Retiring it here — after the scope,
@@ -658,11 +699,17 @@ pub(crate) fn prove_block_after_pre(
     // apart from "no other proof is running": each path retires itself when its
     // chain proof is finished, so only the last one standing claims the phase.
     let active_paths = AtomicUsize::new(2);
+    // The final-block circuit build also creates a constants/sigmas
+    // commitment and may occupy the process-global Metal queue. It is not a
+    // transaction path, so track its completion separately before any chain
+    // tail claims that the GPU is truly exclusive.
+    let block_build_complete = AtomicBool::new(false);
     let (light_chain_proof, heavy_chain_proof, block_target, block_data, block_pending) = {
         // The pipeline only ever reads the circuits; the borrow ends with this
         // block so the finished extensions can be released below.
         let circuits = &circuits;
         let active_paths = &active_paths;
+        let block_build_complete = &block_build_complete;
         std::thread::scope(|scope| {
             // The final block circuit depends only on already-built circuit data
             // and is not needed until the final proof, so it builds concurrently
@@ -696,6 +743,7 @@ pub(crate) fn prove_block_after_pre(
                         &pre_output,
                         state_metadata_hash,
                         active_paths,
+                        block_build_complete,
                     )
                 })
                 .expect("heavy transaction chain thread must start");
@@ -720,6 +768,7 @@ pub(crate) fn prove_block_after_pre(
                             plonky2::util::profile::span("orchestration", "build_block_circuit");
                         circuits.build_block_circuit()
                     };
+                    block_build_complete.store(true, Ordering::Release);
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
                     let early = BlockCircuit::witness_inputs_early(
@@ -779,6 +828,7 @@ pub(crate) fn prove_block_after_pre(
                         &pre_output,
                         state_metadata_hash,
                         active_paths,
+                        block_build_complete,
                     )
                 })
                 .expect("light transaction chain thread must start");
@@ -962,15 +1012,70 @@ mod tests {
         // heavy path) must not claim the process-global exclusive phase while the
         // forty-nine-chunk light pipeline is still running.
         let active_paths = AtomicUsize::new(2);
-        assert!(!claims_exclusive_gpu_phase(&active_paths));
+        let block_build_complete = AtomicBool::new(true);
+        assert!(!claims_exclusive_gpu_phase(
+            &active_paths,
+            0,
+            &block_build_complete,
+        ));
 
         // The heavy path retires; the light path's drain is now genuinely alone.
         active_paths.fetch_sub(1, Ordering::Release);
-        assert!(claims_exclusive_gpu_phase(&active_paths));
+        assert!(claims_exclusive_gpu_phase(
+            &active_paths,
+            0,
+            &block_build_complete,
+        ));
 
         // Both retired: nothing is proving, so nothing claims the phase either.
         active_paths.fetch_sub(1, Ordering::Release);
-        assert!(!claims_exclusive_gpu_phase(&active_paths));
+        assert!(!claims_exclusive_gpu_phase(
+            &active_paths,
+            0,
+            &block_build_complete,
+        ));
+    }
+
+    #[test]
+    fn exclusive_gpu_phase_waits_for_local_transaction_window() {
+        let active_paths = AtomicUsize::new(1);
+        let block_build_complete = AtomicBool::new(true);
+        assert!(!claims_exclusive_gpu_phase(
+            &active_paths,
+            LIGHT_TX_PROOF_WINDOW - 1,
+            &block_build_complete,
+        ));
+        assert!(claims_exclusive_gpu_phase(
+            &active_paths,
+            0,
+            &block_build_complete,
+        ));
+        block_build_complete.store(false, Ordering::Release);
+        assert!(!claims_exclusive_gpu_phase(
+            &active_paths,
+            0,
+            &block_build_complete,
+        ));
+    }
+
+    #[test]
+    fn production_light_window_drains_last_three_transaction_proofs() {
+        let mut in_flight = std::collections::VecDeque::new();
+        let mut last_joined = None;
+        for step in 0..49u64 {
+            in_flight.push_back(step);
+            let window = if step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
+                LIGHT_TX_PROOF_WINDOW
+            } else {
+                1
+            };
+            if in_flight.len() >= window {
+                last_joined = in_flight.pop_front();
+            }
+        }
+
+        assert_eq!(last_joined, Some(45));
+        assert_eq!(in_flight.into_iter().collect::<Vec<_>>(), [46, 47, 48]);
     }
 
     #[test]
@@ -1164,6 +1269,7 @@ mod tests {
                 &base_proof,
                 &circuits.dummy_proof,
                 &tx_proof,
+                false,
             );
             let direct_elapsed = direct_start.elapsed();
             assert_eq!(proof.public_inputs, direct_proof.public_inputs);

@@ -539,6 +539,8 @@ fn all_wires_permutation_partial_products<
     // traversal; every other configuration keeps the general path unchanged.
     if num_challenges == 2 {
         PAIRED_PERMUTATION_BATCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        THREAD_PAIRED_PERMUTATION_BATCHES.with(|count| count.set(count.get() + 1));
         return two_challenge_wires_permutation_partial_products_and_zs(
             witness,
             betas,
@@ -570,10 +572,24 @@ fn all_wires_permutation_partial_products<
 static PAIRED_PERMUTATION_BATCHES: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
+std::thread_local! {
+    /// Test-thread-local mirror of the process counter. Rust runs independent
+    /// tests concurrently, so exact before/after assertions on the production
+    /// counter are inherently racy with other proof tests.
+    static THREAD_PAIRED_PERMUTATION_BATCHES: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
+
 /// Number of permutation batches this process has computed through the fused
 /// two-challenge path.
 pub fn paired_permutation_batch_count() -> usize {
     PAIRED_PERMUTATION_BATCHES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn thread_paired_permutation_batch_count() -> usize {
+    THREAD_PAIRED_PERMUTATION_BATCHES.with(core::cell::Cell::get)
 }
 
 #[inline]
@@ -723,10 +739,19 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                                 }
                                 let wire_value = witness.get_wire(i, j);
                                 let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                // Both factors at this position contain the same `wire + gamma`.
+                                // Share only that term: unlike an edge-factor reuse, this remains
+                                // valid for an arbitrary (including constraint-violating) witness.
+                                let wire_gamma_0 = wire_value + gamma_0;
+                                let wire_gamma_1 = wire_value + gamma_1;
+                                numerator_0 *=
+                                    wire_gamma_0.multiply_accumulate(beta_k_is_0[j], x);
+                                numerator_1 *=
+                                    wire_gamma_1.multiply_accumulate(beta_k_is_1[j], x);
+                                denominator_0 *=
+                                    wire_gamma_0.multiply_accumulate(beta_0, sigma);
+                                denominator_1 *=
+                                    wire_gamma_1.multiply_accumulate(beta_1, sigma);
                             }
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
@@ -831,8 +856,10 @@ fn wires_permutation_partial_products_and_zs<
                         let mut denominator_product = F::ONE;
                         for j in start..end {
                             let wire_value = witness.get_wire(i, j);
-                            numerator_product *= wire_value + beta_k_is[j] * x + gamma;
-                            denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
+                            let wire_gamma = wire_value + gamma;
+                            numerator_product *= wire_gamma.multiply_accumulate(beta_k_is[j], x);
+                            denominator_product *=
+                                wire_gamma.multiply_accumulate(beta, s_sigmas[j]);
                         }
                         quotient_products[t * num_chunks + chunk].write(numerator_product);
                         denominator_products.push(denominator_product);
@@ -3293,13 +3320,13 @@ mod l_0_table_tests {
 mod permutation_pairing_tests {
     use crate::field::polynomial::PolynomialValues;
     use crate::field::types::{Field, Field64, PrimeField64};
-    use crate::iop::witness::MatrixWitness;
+    use crate::iop::witness::{MatrixWitness, PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     use super::{
-        all_wires_permutation_partial_products, paired_permutation_batch_count,
+        all_wires_permutation_partial_products, thread_paired_permutation_batch_count,
         two_challenge_wires_permutation_partial_products_and_zs,
         wires_permutation_partial_products_and_zs,
     };
@@ -3540,7 +3567,7 @@ mod permutation_pairing_tests {
             // The dispatcher must route the production shape to the fused path
             // and return the same thing, and the counter must move — otherwise
             // this test could pass while production still ran two passes.
-            let before = paired_permutation_batch_count();
+            let before = thread_paired_permutation_batch_count();
             let dispatched = all_wires_permutation_partial_products(
                 &witness,
                 &betas,
@@ -3549,7 +3576,7 @@ mod permutation_pairing_tests {
                 &data.prover_only,
                 &data.common,
             );
-            let after = paired_permutation_batch_count();
+            let after = thread_paired_permutation_batch_count();
             assert_eq!(
                 after,
                 before + 1,
@@ -3579,7 +3606,7 @@ mod permutation_pairing_tests {
                 .iter()
                 .flat_map(|&beta| three.k_is.iter().map(move |&k_i| beta * k_i))
                 .collect();
-            let before = paired_permutation_batch_count();
+            let before = thread_paired_permutation_batch_count();
             let general3 = all_wires_permutation_partial_products(
                 &witness,
                 &betas3,
@@ -3589,7 +3616,7 @@ mod permutation_pairing_tests {
                 &three,
             );
             assert_eq!(
-                paired_permutation_batch_count(),
+                thread_paired_permutation_batch_count(),
                 before,
                 "fused path fired for num_challenges = 3"
             );
@@ -3627,6 +3654,35 @@ mod permutation_pairing_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn shared_wire_gamma_factors_are_field_equal() {
+        let mut rng = Rng::new(0x5a17_edf0_6a6d_6d61);
+        for _ in 0..1000 {
+            let wire = rng.next_field();
+            let gamma = rng.next_field();
+            let beta = rng.next_field();
+            let point = rng.next_field();
+            let old = wire + beta * point + gamma;
+            let wire_gamma = wire + gamma;
+            assert_eq!(wire_gamma.multiply_accumulate(beta, point), old);
+        }
+    }
+
+    #[test]
+    fn shared_wire_gamma_path_proves_and_verifies() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let x = builder.add_virtual_target();
+        let square = builder.mul(x, x);
+        builder.register_public_input(square);
+        let data = builder.build::<C>();
+
+        let mut witness = PartialWitness::new();
+        witness.set_target(x, F::from_canonical_u64(9)).unwrap();
+        let proof = data.prove(witness).unwrap();
+        data.verify(proof).unwrap();
     }
 
     /// Differential for the actual runtime mask seam. It uses the circuit's real sigma oracle,
