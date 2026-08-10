@@ -126,6 +126,22 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .rev()
             .fold(Self::Extension::ZERO, |acc, &term| acc * beta + term)
     }
+
+    /// Arity-4 analogue of `fri_fold_arity16`. Default keeps the historical
+    /// reversed Horner recurrence. A concrete base field may specialize it
+    /// to delay modular reduction (see Goldilocks).
+    #[doc(hidden)]
+    #[inline(always)]
+    fn fri_fold_arity4(
+        terms: &[Self::Extension; 4],
+        beta: Self::Extension,
+        _beta_powers: &[Self::Extension; 4],
+    ) -> Self::Extension {
+        terms
+            .iter()
+            .rev()
+            .fold(Self::Extension::ZERO, |acc, &term| acc * beta + term)
+    }
 }
 
 impl<F: Field + Frobenius<1> + FieldExtension<1, BaseField = F>> Extendable<1> for F {
