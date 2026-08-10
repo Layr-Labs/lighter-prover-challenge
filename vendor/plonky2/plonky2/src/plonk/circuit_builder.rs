@@ -49,10 +49,9 @@ use crate::plonk::circuit_data::{
 };
 use crate::plonk::config::{AlgebraicHasher, GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::copy_constraint::CopyConstraint;
-use crate::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
+use crate::plonk::permutation_argument::Forest;
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::timed;
-use crate::util::context_tree::ContextTree;
 use crate::util::partial_products::num_partial_products;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_ceil, log2_strict, transpose_poly_values_ref};
@@ -172,9 +171,6 @@ pub struct CircuitBuilder<F: RichField + Extendable<D>, const D: usize> {
 
     copy_constraints: Vec<CopyConstraint>,
 
-    /// A tree of named scopes, used for debugging.
-    context_log: ContextTree,
-
     /// Generators used to generate the witness.
     generators: Vec<WitnessGeneratorRef<F, D>>,
 
@@ -233,7 +229,6 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             public_inputs: Vec::new(),
             virtual_target_index: 0,
             copy_constraints: Vec::new(),
-            context_log: ContextTree::new(),
             generators: Vec::new(),
             constants_to_targets: HashMap::new(),
             targets_to_constants: HashMap::new(),
@@ -551,8 +546,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             y.is_routable(&self.config),
             "Tried to route a wire that isn't routable"
         );
-        self.copy_constraints
-            .push(CopyConstraint::new((x, y), self.context_log.open_stack()));
+        self.copy_constraints.push(CopyConstraint::from((x, y)));
     }
 
     /// Enforces that the underlying values of two [`Target`] arrays are equal.
@@ -734,12 +728,10 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         }
     }
 
-    pub fn push_context(&mut self, level: log::Level, ctx: &str) {
-        self.context_log.push(ctx, level, self.num_gates());
+    pub fn push_context(&mut self, _level: log::Level, _ctx: &str) {
     }
 
     pub fn pop_context(&mut self) {
-        self.context_log.pop(self.num_gates());
     }
 
     /// Returns the total number of LUTs.
@@ -1039,7 +1031,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .collect()
     }
 
-    fn sigma_vecs(&self, k_is: &[F], subgroup: &[F]) -> (Vec<PolynomialValues<F>>, Forest) {
+    fn sigma_vecs(
+        &self,
+        k_is: &[F],
+        subgroup: &[F],
+    ) -> (Vec<PolynomialValues<F>>, Forest, Vec<u8>) {
         let degree = self.gate_instances.len();
         let degree_log = log2_strict(degree);
         let config = &self.config;
@@ -1063,25 +1059,21 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             forest.add(Target::VirtualTarget { index });
         }
 
-        for &CopyConstraint { pair: (a, b), .. } in &self.copy_constraints {
+        for &CopyConstraint { pair: (a, b) } in &self.copy_constraints {
             forest.merge(a, b);
         }
 
         forest.compress_paths();
 
-        let wire_partition = forest.wire_partition();
-        (
-            wire_partition.get_sigma_polys(degree_log, k_is, subgroup),
-            forest,
-        )
+        let wire_partition = forest.wire_partition_with_fixed_routed_wires();
+        let sigma_polys = wire_partition.get_sigma_polys(degree_log, k_is, subgroup);
+        let fixed_routed_wires = wire_partition
+            .into_fixed_routed_wires()
+            .expect("builder requested fixed routed wires");
+        (sigma_polys, forest, fixed_routed_wires)
     }
 
-    pub fn print_gate_counts(&self, min_delta: usize) {
-        // Print gate counts for each context.
-        self.context_log
-            .filter(self.num_gates(), min_delta)
-            .print(self.num_gates());
-
+    pub fn print_gate_counts(&self, _min_delta: usize) {
         // Print total count of each gate type.
         debug!("Total gate counts:");
         for gate in self.gates.values().cloned() {
@@ -1266,7 +1258,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let subgroup = F::two_adic_subgroup(degree_bits);
 
         let k_is = get_unique_coset_shifts(degree, self.config.num_routed_wires);
-        let (sigma_vecs, forest) = timed!(
+        let (sigma_vecs, forest, fixed_routed_wires) = timed!(
             timing,
             "generate sigma polynomials",
             self.sigma_vecs(&k_is, &subgroup)
@@ -1453,14 +1445,6 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
                 (None, step, domain)
             }
         };
-
-        let fixed_routed_wires = fixed_routed_wire_mask(
-            &forest.parents,
-            common.config.num_wires,
-            common.config.num_routed_wires,
-            subgroup.len(),
-        )
-        .expect("builder produced an invalid compressed representative map");
 
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,

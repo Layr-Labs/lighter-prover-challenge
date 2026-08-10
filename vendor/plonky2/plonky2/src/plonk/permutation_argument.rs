@@ -2,6 +2,7 @@
 use alloc::vec::Vec;
 
 use plonky2_maybe_rayon::*;
+use core::mem::{forget, MaybeUninit};
 
 use crate::field::polynomial::PolynomialValues;
 use crate::field::types::Field;
@@ -250,35 +251,95 @@ impl Forest {
     /// previous implementation plus its closing sweep. This deletes the whole-forest `first`
     /// array and the final serial sweep over every forest entry.
     pub fn wire_partition(&mut self) -> WirePartition {
-        let mut sigma = vec![0u32; self.degree * self.num_routed_wires];
-        let mut last = vec![u32::MAX; self.parents.len()];
+        self.wire_partition_impl::<false>()
+    }
+
+    /// Builds the same sigma cycles while deriving the routed singleton mask in
+    /// the existing traversal. The ordinary loader path keeps using
+    /// [`Self::wire_partition`] because it validates a stored representative
+    /// map through [`fixed_routed_wire_mask`] separately.
+    pub fn wire_partition_with_fixed_routed_wires(&mut self) -> WirePartition {
+        self.wire_partition_impl::<true>()
+    }
+
+    fn wire_partition_impl<const WITH_FIXED: bool>(&mut self) -> WirePartition {
+        let sigma_len = self.degree * self.num_routed_wires;
+        let mut sigma = Vec::<MaybeUninit<u32>>::with_capacity(sigma_len);
+        // SAFETY: every column-major routed index is visited exactly once and
+        // written below. Reads are limited to an earlier initialized tail.
+        unsafe { sigma.set_len(sigma_len) };
+        let mut fixed_routed_wires = WITH_FIXED
+            .then(|| vec![0u8; (self.degree * self.num_routed_wires).div_ceil(8)]);
+        let mut last = Vec::<MaybeUninit<u32>>::with_capacity(self.parents.len());
+        // SAFETY: `MaybeUninit<u32>` has no validity invariant. A slot is read
+        // only after its bit in `seen` has been set by an earlier routed member.
+        unsafe { last.set_len(self.parents.len()) };
+        let mut seen = vec![0u64; self.parents.len().div_ceil(64)];
 
         for row in 0..self.degree {
             for column in 0..self.num_routed_wires {
                 let t = Target::Wire(Wire { row, column });
                 let parent = self.parents[self.target_index(t)] as usize;
                 let index = (column * self.degree + row) as u32;
-                let old_tail = last[parent];
-                if old_tail == u32::MAX {
-                    sigma[index as usize] = index;
+                let mask = 1u64 << (parent & 63);
+                let seen_word = &mut seen[parent >> 6];
+                if *seen_word & mask == 0 {
+                    sigma[index as usize].write(index);
+                    *seen_word |= mask;
+                    if WITH_FIXED {
+                        let routed_index = row * self.num_routed_wires + column;
+                        let fixed = fixed_routed_wires.as_mut().unwrap();
+                        fixed[routed_index >> 3] |= 1 << (routed_index & 7);
+                    }
                 } else {
-                    sigma[index as usize] = sigma[old_tail as usize];
-                    sigma[old_tail as usize] = index;
+                    // SAFETY: the set bit proves an earlier iteration wrote
+                    // this representative's tail slot and sigma entry.
+                    let old_tail = unsafe { last[parent].assume_init() };
+                    let old_successor = unsafe { sigma[old_tail as usize].assume_init() };
+                    sigma[index as usize].write(old_successor);
+                    sigma[old_tail as usize].write(index);
+                    if WITH_FIXED {
+                        let old_tail = old_tail as usize;
+                        let old_column = old_tail / self.degree;
+                        let old_row = old_tail % self.degree;
+                        let old_routed_index = old_row * self.num_routed_wires + old_column;
+                        let fixed = fixed_routed_wires.as_mut().unwrap();
+                        fixed[old_routed_index >> 3] &= !(1 << (old_routed_index & 7));
+                    }
                 }
-                last[parent] = index;
+                last[parent].write(index);
             }
         }
 
-        WirePartition { sigma }
+        // SAFETY: the nested traversal covers every `(column, row)` routed
+        // index exactly once, so all `sigma_len` slots are initialized. `u32`
+        // and `MaybeUninit<u32>` have identical layout and allocation rules.
+        let sigma = unsafe {
+            let ptr = sigma.as_mut_ptr().cast::<u32>();
+            let len = sigma.len();
+            let capacity = sigma.capacity();
+            forget(sigma);
+            Vec::from_raw_parts(ptr, len, capacity)
+        };
+
+        WirePartition {
+            sigma,
+            fixed_routed_wires,
+        }
     }
 }
 
 #[derive(Debug)]
 pub struct WirePartition {
     sigma: Vec<u32>,
+    fixed_routed_wires: Option<Vec<u8>>,
 }
 
 impl WirePartition {
+    pub fn into_fixed_routed_wires(self) -> Option<Vec<u8>> {
+        self.fixed_routed_wires
+    }
+
     pub fn get_sigma_polys<F: Field>(
         &self,
         degree_log: usize,
