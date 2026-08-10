@@ -386,11 +386,11 @@ fn recycle_completed_quotient_output(
     let Some(buffer) = output.take() else {
         return;
     };
-    // Allocation/recycling is an opportunistic micro-optimization. On lock
-    // contention or poisoning, drop normally instead of delaying a proof.
-    if let Ok(mut pool) = pool.try_lock() {
-        pool.recycle(buffer);
-    }
+    // Retain the completed page-warm buffer across brief pool contention;
+    // the critical section only mutates a tiny bounded Vec.
+    pool.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .recycle(buffer);
 }
 
 impl<F> Drop for PoseidonGateQuotientJob<F> {
@@ -557,15 +557,16 @@ impl ColumnStorePool {
 }
 
 /// Returns a pooled buffer of exactly `bytes` when one is free, else a fresh
-/// device allocation. Misses (including lock contention) fall through to the
-/// allocator; the pool is a best-effort page-warm cache, never a correctness
-/// dependency.
+/// device allocation. Size misses fall through to the allocator; brief lock
+/// contention waits for the tiny bounded pool operation so a page-warm buffer
+/// is not bypassed in favor of a fresh allocation.
 fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
     if bytes <= MAX_CACHED_COLUMN_STORE_BYTES {
-        if let Ok(mut pool) = COLUMN_STORE_POOL.try_lock() {
-            if let Some(buffer) = pool.take_best_fit(bytes) {
-                return buffer;
-            }
+        let mut pool = COLUMN_STORE_POOL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(buffer) = pool.take_best_fit(bytes) {
+            return buffer;
         }
     }
     autoreleasepool(|| device.new_buffer(bytes, MTLResourceOptions::StorageModeShared))
@@ -573,17 +574,18 @@ fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
 
 /// Owns one column-store buffer for the lifetime of all `MetalColumns`
 /// handles over it; the last handle's drop returns the buffer to the pool
-/// (same pattern as `MetalDigestInner`). `try_lock`: on contention the
-/// buffer simply drops.
+/// (same pattern as `MetalDigestInner`). Waiting through brief contention
+/// preserves the large page-warm allocation for reuse.
 struct ColumnStoreLease {
     buffer: Buffer,
 }
 
 impl Drop for ColumnStoreLease {
     fn drop(&mut self) {
-        if let Ok(mut pool) = COLUMN_STORE_POOL.try_lock() {
-            pool.recycle(self.buffer.clone());
-        }
+        COLUMN_STORE_POOL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recycle(self.buffer.clone());
     }
 }
 
@@ -805,9 +807,10 @@ struct MetalDigestInner {
 
 impl Drop for MetalDigestInner {
     fn drop(&mut self) {
-        if let Ok(mut pool) = self.pool.try_lock() {
-            pool.recycle(self.buffer.clone());
-        }
+        self.pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recycle(self.buffer.clone());
     }
 }
 
@@ -2442,10 +2445,12 @@ impl MetalShared {
 
     fn acquire_quotient_output(&self, bytes: u64) -> Buffer {
         if bytes <= MAX_CACHED_QUOTIENT_OUTPUT_BYTES {
-            if let Ok(mut pool) = self.quotient_output_pool.try_lock() {
-                if let Some(buffer) = pool.take_best_fit(bytes) {
-                    return buffer;
-                }
+            let mut pool = self
+                .quotient_output_pool
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(buffer) = pool.take_best_fit(bytes) {
+                return buffer;
             }
         }
         autoreleasepool(|| {
