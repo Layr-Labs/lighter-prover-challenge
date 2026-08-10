@@ -1085,6 +1085,21 @@ pub fn prewarm() {
     std::thread::Builder::new()
         .name("poseidon2-metal-prewarm".to_owned())
         .spawn(|| {
+            // The pipeline lowering runs at the head of every scored worker's
+            // critical path. The chain spine threads already lift themselves
+            // to the user-interactive QoS class; do the same here so the eight
+            // concurrent compiles are not demoted to efficiency cores while
+            // the worker's startup work competes for the P-cores.
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            unsafe {
+                extern "C" {
+                    fn pthread_set_qos_class_self_np(
+                        qos_class: u32,
+                        relative_priority: i32,
+                    ) -> i32;
+                }
+                let _ = pthread_set_qos_class_self_np(0x21, 0);
+            }
             let _ = force_context();
         })
         .ok();
