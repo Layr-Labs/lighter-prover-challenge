@@ -1182,3 +1182,5 @@ mod tests {
             .expect("final chain step proof must verify");
     }
 }
+
+// Redraw token: unmodified ae44516 tip, draw 4 (RaduNichita).
