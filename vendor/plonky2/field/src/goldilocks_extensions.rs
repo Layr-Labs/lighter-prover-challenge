@@ -27,14 +27,6 @@ impl Extendable<2> for GoldilocksField {
 
     const EXT_POWER_OF_TWO_GENERATOR: [Self; 2] = [Self(0), Self(7226896044987257365)];
 
-    #[inline]
-    fn extension_base_dot_product(
-        extension_values: &[QuadraticExtension<Self>],
-        base_scalars: &[Self],
-    ) -> QuadraticExtension<Self> {
-        ext2_base_scalar_dot_product(extension_values, base_scalars)
-    }
-
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -211,72 +203,12 @@ const fn u160_times_7(x: u128, y: u32) -> (u128, u32) {
 }
 
 /// Add one 64-by-64-bit product to a little-endian 160-bit accumulator.
-/// Callers bound their term counts so the high limb cannot overflow.
+/// The fixed 16-term quadratic dot product keeps the high limb below 2^7.
 #[inline(always)]
 fn u160_add_product(lo: &mut u128, hi: &mut u32, a: u64, b: u64) {
     let (sum, carry) = lo.overflowing_add((a as u128) * (b as u128));
     *lo = sum;
     *hi += carry as u32;
-}
-
-/// Compute `sum_i extension_values[i].scalar_mul(base_scalars[i])` in
-/// GF(p^2), delaying reduction across the complete dot product.
-///
-/// The iterator-compatible result uses the shorter input length. Raw
-/// Goldilocks limbs, including non-canonical representatives, are at most
-/// `2^64 - 1`; therefore each limb product is at most `(2^64 - 1)^2`.
-/// A chunk contains at most `2^32 - 1` terms, whose worst-case sum is
-///
-/// ```text
-/// (2^32 - 1)(2^64 - 1)^2
-///   = 2^160 - 2^128 - 2^97 + 2^65 + 2^32 - 1
-///   < 2^160 - 2^128 + 2^96.
-/// ```
-///
-/// This is exactly `reduce160`'s precondition. It also leaves the u32 high
-/// accumulator below `2^32 - 1`, so `u160_add_product` cannot overflow it.
-/// Inputs longer than one safe chunk are reduced chunk-wise; production
-/// openings are many orders of magnitude smaller and take the one-reduction
-/// path. The returned representative need not match reduce-per-term addition,
-/// but it represents the same field element.
-#[inline]
-fn ext2_base_scalar_dot_product(
-    extension_values: &[QuadraticExtension<GoldilocksField>],
-    base_scalars: &[GoldilocksField],
-) -> QuadraticExtension<GoldilocksField> {
-    const MAX_TERMS_PER_REDUCTION: usize = u32::MAX as usize;
-
-    let len = extension_values.len().min(base_scalars.len());
-    if len == 0 {
-        return QuadraticExtension::ZERO;
-    }
-
-    let reduce_chunk = |values: &[QuadraticExtension<GoldilocksField>],
-                        scalars: &[GoldilocksField]| {
-        debug_assert_eq!(values.len(), scalars.len());
-        debug_assert!(values.len() <= MAX_TERMS_PER_REDUCTION);
-        let (mut lo0, mut hi0) = (0u128, 0u32);
-        let (mut lo1, mut hi1) = (0u128, 0u32);
-        for (&QuadraticExtension([a0, a1]), &scalar) in values.iter().zip(scalars) {
-            u160_add_product(&mut lo0, &mut hi0, a0.0, scalar.0);
-            u160_add_product(&mut lo1, &mut hi1, a1.0, scalar.0);
-        }
-        // SAFETY: the exact worst-case bound above covers arbitrary u64
-        // representatives for every term in this chunk.
-        QuadraticExtension([unsafe { reduce160(lo0, hi0) }, unsafe {
-            reduce160(lo1, hi1)
-        }])
-    };
-
-    let first_end = len.min(MAX_TERMS_PER_REDUCTION);
-    let mut result = reduce_chunk(&extension_values[..first_end], &base_scalars[..first_end]);
-    let mut start = first_end;
-    while start < len {
-        let end = len.min(start + MAX_TERMS_PER_REDUCTION);
-        result += reduce_chunk(&extension_values[start..end], &base_scalars[start..end]);
-        start = end;
-    }
-    result
 }
 
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction
@@ -334,10 +266,9 @@ fn ext2_dot_product_arity16(
 ///
 /// Each 64x64 product is below `2^128`, so after `n` terms the 160-bit
 /// accumulator holds less than `n * 2^128`: its high limb stays below `n`,
-/// and the exact worst-case calculation above shows that `reduce160`'s
-/// `2^160 - 2^128 + 2^96` precondition holds through `n = 2^32 - 1`.
-/// The asserted bound below is far stricter than that limit and covers every
-/// production batch (a few hundred polynomials).
+/// and `reduce160`'s `2^160 - 2^128 + 2^96` precondition holds for any
+/// `n <= 2^32 - 2`. The asserted bound below is far stricter than either
+/// limit and covers every production batch (a few hundred polynomials).
 ///
 /// The result is the same field element as the reduce-per-term form; the raw
 /// representative may differ (both forms produce sub-2^64 representatives
@@ -761,7 +692,6 @@ pub(crate) fn ext5_mul(a: [u64; 5], b: [u64; 5]) -> [GoldilocksField; 5] {
 #[cfg(test)]
 mod tests {
     use crate::extension::quadratic::QuadraticExtension;
-    use crate::extension::quartic::QuarticExtension;
     use crate::extension::quintic::{QuinticExtension, QuinticFirstCoeff};
     use crate::extension::{Extendable, FieldExtension, Frobenius, OEF};
     use crate::goldilocks_field::GoldilocksField;
@@ -769,135 +699,7 @@ mod tests {
 
     type GF = GoldilocksField;
     type Q2 = QuadraticExtension<GoldilocksField>;
-    type Q4 = QuarticExtension<GoldilocksField>;
     type QE = QuinticExtension<GoldilocksField>;
-
-    fn generic_extension_base_dot_product(values: &[Q2], scalars: &[GF]) -> Q2 {
-        values
-            .iter()
-            .zip(scalars)
-            .map(|(&value, &scalar)| <Q2 as FieldExtension<2>>::scalar_mul(&value, scalar))
-            .sum()
-    }
-
-    #[test]
-    fn extension_base_dot_product_default_matches_scalar_mul_sum() {
-        let values: Vec<Q4> = (0..17)
-            .map(|i| {
-                QuarticExtension(core::array::from_fn(|limb| {
-                    GoldilocksField(
-                        (i as u64 + 1)
-                            .wrapping_mul(0x9E37_79B9_7F4A_7C15u64.rotate_left(limb as u32)),
-                    )
-                }))
-            })
-            .collect();
-        let scalars: Vec<GF> = (0..16)
-            .map(|i| GoldilocksField((i as u64).wrapping_mul(u64::MAX - 1)))
-            .collect();
-        let expected: Q4 = values
-            .iter()
-            .zip(&scalars)
-            .map(|(&value, &scalar)| <Q4 as FieldExtension<4>>::scalar_mul(&value, scalar))
-            .sum();
-        let actual = <GF as Extendable<4>>::extension_base_dot_product(&values, &scalars);
-        assert_eq!(actual, expected);
-        assert_eq!(
-            <GF as Extendable<4>>::extension_base_dot_product(&[], &scalars),
-            Q4::ZERO
-        );
-    }
-
-    #[test]
-    fn ext2_extension_base_dot_product_matches_generic_at_boundaries() {
-        let p = GF::ORDER;
-        let raw_specials = [0, 1, 2, p - 1, p, p + 1, u64::MAX];
-        // Zero/one, unequal zip lengths, SIMD/cache-sized powers of two, and
-        // the neighboring lengths most likely to expose loop-tail mistakes.
-        let lengths = [
-            (0, 0),
-            (0, 1),
-            (1, 0),
-            (1, 1),
-            (1, 2),
-            (2, 1),
-            (15, 15),
-            (16, 16),
-            (17, 17),
-            (63, 64),
-            (64, 63),
-            (65, 65),
-            (255, 255),
-            (256, 256),
-            (257, 257),
-            (2047, 2047),
-            (2048, 2048),
-            (2049, 2049),
-            (4095, 4096),
-            (4096, 4095),
-            (4097, 4097),
-        ];
-
-        let mut state = 0xA076_1D64_78BD_642Fu64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        for (values_len, scalars_len) in lengths {
-            let values: Vec<Q2> = (0..values_len)
-                .map(|i| {
-                    let a0 = if i < raw_specials.len() {
-                        raw_specials[i]
-                    } else {
-                        next()
-                    };
-                    let a1 = if i < raw_specials.len() {
-                        raw_specials[raw_specials.len() - 1 - i]
-                    } else {
-                        next()
-                    };
-                    QuadraticExtension([GoldilocksField(a0), GoldilocksField(a1)])
-                })
-                .collect();
-            let scalars: Vec<GF> = (0..scalars_len)
-                .map(|i| {
-                    GoldilocksField(if i < raw_specials.len() {
-                        raw_specials[(i * 3) % raw_specials.len()]
-                    } else {
-                        next()
-                    })
-                })
-                .collect();
-
-            let expected = generic_extension_base_dot_product(&values, &scalars);
-            let actual = <GF as Extendable<2>>::extension_base_dot_product(&values, &scalars);
-            for limb in 0..2 {
-                assert_eq!(
-                    actual.0[limb].to_canonical_u64(),
-                    expected.0[limb].to_canonical_u64(),
-                    "canonical limb {limb} mismatch at ({values_len}, {scalars_len})"
-                );
-            }
-        }
-        // Raw representatives are deliberately not part of the assertion:
-        // delayed and per-term reduction are required to agree as field
-        // values, including when every input can occupy the full u64 range.
-    }
-
-    #[test]
-    fn ext2_extension_base_dot_product_reduce160_bound() {
-        use num::BigUint;
-
-        let one = BigUint::from(1u8);
-        let max_product = ((&one << 64usize) - &one) * ((&one << 64usize) - &one);
-        let reduce160_limit = (&one << 160usize) - (&one << 128usize) + (&one << 96usize);
-        let max_safe_sum = BigUint::from(u32::MAX) * &max_product;
-        let first_unsafe_worst_case = BigUint::from(u64::from(u32::MAX) + 1) * max_product;
-        assert!(max_safe_sum < reduce160_limit);
-        assert!(first_unsafe_worst_case >= reduce160_limit);
-    }
 
     #[test]
     fn fri_fold_arity16_matches_horner_raw() {
