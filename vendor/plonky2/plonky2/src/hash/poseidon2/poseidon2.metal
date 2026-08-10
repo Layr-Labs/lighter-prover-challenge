@@ -744,25 +744,33 @@ inline ulong random_access_select_8(
     return items[0];
 }
 
-kernel void range_check_gate_quotient(
-    const device ulong* wires [[buffer(0)]],
-    const device ulong* constants [[buffer(1)]],
-    device ulong* output [[buffer(2)]],
-    constant ulong* alpha_powers [[buffer(3)]],
-    constant uint* metadata [[buffer(4)]],
-    constant uint& lde_rows [[buffer(5)]],
-    constant uint& quotient_rows [[buffer(6)]],
-    constant uint& step [[buffer(7)]],
-    constant uint& alpha_stride [[buffer(8)]],
-    constant uint& range_count [[buffer(9)]],
-    constant uint& u32_count [[buffer(10)]],
-    uint gid [[thread_position_in_grid]]) {
+template <uint mode>
+inline void range_check_gate_quotient_impl(
+
+    const device ulong* wires,
+    const device ulong* constants,
+    device ulong* output,
+    constant ulong* alpha_powers,
+    constant uint* metadata,
+    constant uint& lde_rows,
+    constant uint& quotient_rows,
+    constant uint& step,
+    constant uint& alpha_stride,
+    constant uint& range_count,
+    constant uint& u32_count,
+    uint gid) {
     if (gid >= quotient_rows) {
         return;
     }
 
     uint source_row = gid * step;
     ulong total[2] = { 0, 0 };
+    // The Q=5 pass starts from zero. S=6 and main fold into the prior pass.
+    if (mode == 1u || mode == 3u) {
+        total[0] = output[(ulong)gid * 2];
+        total[1] = output[(ulong)gid * 2 + 1];
+    }
+    if (mode == 0u || mode == 1u) {
     for (uint range_index = 0; range_index < range_count; ++range_index) {
         constant uint* spec = metadata + range_index * 10u;
         uint selector_column = spec[0];
@@ -826,6 +834,7 @@ kernel void range_check_gate_quotient(
         total[0] = gl_mul_add(filter, gate_accumulators[0], total[0]);
         total[1] = gl_mul_add(filter, gate_accumulators[1], total[1]);
     }
+    }
 
     constant uint* u32_metadata = metadata + range_count * 10u;
     for (uint u32_index = 0; u32_index < u32_count; ++u32_index) {
@@ -836,6 +845,13 @@ kernel void range_check_gate_quotient(
         uint group_end = spec[3];
         uint include_unused_selector = spec[4];
         uint kind = spec[5];
+        bool assigned = mode == 0u
+            || (mode == 1u && kind != 4u && kind != 5u)
+            || (mode == 2u && kind == 4u)
+            || (mode == 3u && kind == 5u);
+        if (!assigned) {
+            continue;
+        }
         uint num_ops = spec[6];
         uint num_addends = spec[7];
         uint result_limbs = spec[8];
@@ -857,6 +873,7 @@ kernel void range_check_gate_quotient(
         ulong gate_accumulators[2] = { 0, 0 };
         uint constraint_index = 0;
         if (kind == 0u) {
+            if (mode == 0u || mode == 1u) {
             // U32ArithmeticGate: six routed words followed by 32 base-4
             // output limbs per operation.
             for (uint op = 0; op < num_ops; ++op) {
@@ -918,7 +935,9 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 1u) {
+
+            }} else if (kind == 1u) {
+            if (mode == 0u || mode == 1u) {
             // U16/U32/U48 SubtractionGate: five routed words followed by
             // `result_limbs` base-4 result limbs per operation.
             for (uint op = 0; op < num_ops; ++op) {
@@ -966,7 +985,9 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 2u) {
+
+            }} else if (kind == 2u) {
+            if (mode == 0u || mode == 1u) {
             // U16/U32 AddManyGate: num_addends inputs, carry/result/output-carry,
             // then `result_limbs` result and `num_carry_limbs` carry base-4
             // limbs per operation.
@@ -1025,7 +1046,9 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 3u) {
+
+            }} else if (kind == 3u) {
+            if (mode == 0u || mode == 1u) {
             // ByteDecompositionGate: per operation, one routed sum wire and
             // `num_addends` routed byte wires (the metadata word carries the
             // byte count for this kind), then four base-4 aux limbs per
@@ -1083,7 +1106,9 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 4u) {
+
+            }} else if (kind == 4u) {
+            if (mode == 0u) {
             // QuinticMultiplicationGate: fifteen routed words per operation
             // (five limbs each for a, b and the claimed product c). The five
             // constraints are the schoolbook product limbs reduced by
@@ -1116,7 +1141,43 @@ kernel void range_check_gate_quotient(
                         constraint_index++);
                 }
             }
-        } else if (kind == 5u) {
+
+            } else if (mode == 2u) {
+            // QuinticMultiplicationGate: fifteen routed words per operation
+            // (five limbs each for a, b and the claimed product c). The five
+            // constraints are the schoolbook product limbs reduced by
+            // u^5 = 3, minus the claimed output limbs, in ascending limb
+            // order exactly like the CPU accumulator.
+            for (uint op = 0; op < 5u; ++op) {
+                ulong routed_base = (ulong)op * 15u;
+                ulong a[5];
+                ulong b[5];
+                for (uint j = 0; j < 5u; ++j) {
+                    a[j] = wires[(routed_base + j) * lde_rows + source_row];
+                    b[j] = wires[(routed_base + 5u + j) * lde_rows + source_row];
+                }
+                ulong d[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+                for (uint j = 0; j < 5u; ++j) {
+                    for (uint k = 0; k < 5u; ++k) {
+                        d[j + k] = gl_add(d[j + k], gl_mul(a[j], b[k]));
+                    }
+                }
+                for (uint k = 0; k < 5u; ++k) {
+                    ulong term = k < 4u
+                        ? gl_add(d[k], gl_mul(3, d[k + 5u]))
+                        : d[k];
+                    ulong c = wires[(routed_base + 10u + k) * lde_rows + source_row];
+                    range_check_gate_emit(
+                        gl_sub(term, c),
+                        alpha_powers,
+                        alpha_stride,
+                        gate_accumulators,
+                        constraint_index++);
+                }
+            }
+
+            }} else if (kind == 5u) {
+            if (mode == 0u) {
             // QuinticSquaringGate: ten routed words per operation (input
             // limbs a then output limbs c) plus ten temporary wires. Each
             // constraint checks one accumulation step of the squaring
@@ -1206,7 +1267,100 @@ kernel void range_check_gate_quotient(
                     alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 6u) {
+
+            } else if (mode == 3u) {
+            // QuinticSquaringGate: ten routed words per operation (input
+            // limbs a then output limbs c) plus ten temporary wires. Each
+            // constraint checks one accumulation step of the squaring
+            // against its temporary or output, in the exact CPU emission
+            // order.
+            for (uint op = 0; op < 6u; ++op) {
+                ulong routed_base = (ulong)op * 10u;
+                ulong temp_base = (ulong)6u * 10u + (ulong)op * 10u;
+                ulong a[5];
+                ulong c[5];
+                ulong extra[10];
+                for (uint j = 0; j < 5u; ++j) {
+                    a[j] = wires[(routed_base + j) * lde_rows + source_row];
+                    c[j] = wires[(routed_base + 5u + j) * lde_rows + source_row];
+                }
+                for (uint j = 0; j < 10u; ++j) {
+                    extra[j] = wires[(temp_base + j) * lde_rows + source_row];
+                }
+
+                // c[0]
+                range_check_gate_emit(
+                    gl_sub(gl_mul(a[0], a[0]), extra[0]),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_add(gl_mul(gl_mul(6, a[1]), a[4]), extra[0]), extra[1]),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_add(gl_mul(gl_mul(6, a[2]), a[3]), extra[1]), c[0]),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+
+                // c[1]
+                range_check_gate_emit(
+                    gl_sub(gl_mul(gl_mul(3, a[3]), a[3]), extra[2]),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[1]), extra[2]), extra[3]),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_add(gl_mul(gl_mul(6, a[2]), a[4]), extra[3]), c[1]),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+
+                // c[2]
+                range_check_gate_emit(
+                    gl_sub(gl_mul(a[1], a[1]), extra[4]),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[2]), extra[4]), extra[5]),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_add(gl_mul(gl_mul(6, a[3]), a[4]), extra[5]), c[2]),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+
+                // c[3]
+                range_check_gate_emit(
+                    gl_sub(gl_mul(gl_mul(3, a[4]), a[4]), extra[6]),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[3]), extra[6]), extra[7]),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_add(gl_mul(gl_mul(2, a[1]), a[2]), extra[7]), c[3]),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+
+                // c[4]
+                range_check_gate_emit(
+                    gl_sub(gl_mul(a[2], a[2]), extra[8]),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[4]), extra[8]), extra[9]),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(gl_add(gl_mul(gl_mul(2, a[1]), a[3]), extra[9]), c[4]),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+
+            }} else if (kind == 6u) {
+            if (mode == 0u || mode == 1u) {
             uint bits = num_addends;
             uint num_extra_constants = result_limbs;
             uint constant_base = num_carry_limbs;
@@ -1291,7 +1445,9 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 7u) {
+
+            }} else if (kind == 7u) {
+            if (mode == 0u || mode == 1u) {
             // ExponentiationGate: wire 0 is the base, wires 1..=n the power
             // bits in little-endian order, wire 1+n the output and wires
             // 2+n..2+2n the running intermediate values; `num_ops` carries n.
@@ -1326,7 +1482,9 @@ kernel void range_check_gate_quotient(
                 gl_sub(output_value, final_intermediate),
                 alpha_powers, alpha_stride, gate_accumulators,
                 constraint_index++);
-        } else if (kind == 8u) {
+
+            }} else if (kind == 8u) {
+            if (mode == 0u || mode == 1u) {
             // EqualityGate: three routed words per operation (x, y, equal)
             // followed by three unrouted temporaries (diff, invdiff, prod).
             // The addend slot carries the constants column holding the gate's
@@ -1360,7 +1518,9 @@ kernel void range_check_gate_quotient(
                     alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 9u) {
+
+            }} else if (kind == 9u) {
+            if (mode == 0u || mode == 1u) {
             // ReducingGate / ReducingExtensionGate at D == 2. Wires 0..2 are
             // the output, 2..4 alpha, 4..6 the incoming accumulator, then one
             // (base) or two (extension) wires per coefficient, then one
@@ -1407,7 +1567,9 @@ kernel void range_check_gate_quotient(
                 acc_0 = next_0;
                 acc_1 = next_1;
             }
-        } else if (kind == 10u) {
+
+            }} else if (kind == 10u) {
+            if (mode == 0u || mode == 1u) {
             // AdditionGate: three routed words per operation (x, y, output).
             // The addend-count slot carries the first of its two raw constant
             // columns, immediately after the selector prefix.
@@ -1427,7 +1589,9 @@ kernel void range_check_gate_quotient(
                     alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 11u) {
+
+            }} else if (kind == 11u) {
+            if (mode == 0u || mode == 1u) {
             // BaseSumGate: wire 0 is the sum and the next `num_ops` wires are
             // little-endian limbs. The addend-count slot carries base 2 or 4.
             ulong base = num_addends;
@@ -1456,7 +1620,9 @@ kernel void range_check_gate_quotient(
                     alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 12u) {
+
+            }} else if (kind == 12u) {
+            if (mode == 0u || mode == 1u) {
             // SelectionGate: four routed wires per operation followed by one
             // temporary wire per operation.
             for (uint op = 0; op < num_ops; ++op) {
@@ -1475,7 +1641,8 @@ kernel void range_check_gate_quotient(
                     alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
-        } else {
+
+            }} else {
             // The Rust encoder rejects unknown discriminants; if a malformed
             // record reaches the shader, make its selected row unsatisfiable.
             range_check_gate_emit(
@@ -1489,7 +1656,78 @@ kernel void range_check_gate_quotient(
 
     output[(ulong)gid * 2] = gl_canonicalize(total[0]);
     output[(ulong)gid * 2 + 1] = gl_canonicalize(total[1]);
+
 }
+
+kernel void range_check_gate_quotient(
+
+    const device ulong* wires [[buffer(0)]],
+    const device ulong* constants [[buffer(1)]],
+    device ulong* output [[buffer(2)]],
+    constant ulong* alpha_powers [[buffer(3)]],
+    constant uint* metadata [[buffer(4)]],
+    constant uint& lde_rows [[buffer(5)]],
+    constant uint& quotient_rows [[buffer(6)]],
+    constant uint& step [[buffer(7)]],
+    constant uint& alpha_stride [[buffer(8)]],
+    constant uint& range_count [[buffer(9)]],
+    constant uint& u32_count [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]) {
+    range_check_gate_quotient_impl<0u>(wires, constants, output, alpha_powers, metadata, lde_rows, quotient_rows, step, alpha_stride, range_count, u32_count, gid);
+}
+
+kernel void range_check_gate_quotient_d19_main(
+
+    const device ulong* wires [[buffer(0)]],
+    const device ulong* constants [[buffer(1)]],
+    device ulong* output [[buffer(2)]],
+    constant ulong* alpha_powers [[buffer(3)]],
+    constant uint* metadata [[buffer(4)]],
+    constant uint& lde_rows [[buffer(5)]],
+    constant uint& quotient_rows [[buffer(6)]],
+    constant uint& step [[buffer(7)]],
+    constant uint& alpha_stride [[buffer(8)]],
+    constant uint& range_count [[buffer(9)]],
+    constant uint& u32_count [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]) {
+    range_check_gate_quotient_impl<1u>(wires, constants, output, alpha_powers, metadata, lde_rows, quotient_rows, step, alpha_stride, range_count, u32_count, gid);
+}
+
+kernel void range_check_gate_quotient_quintic_mul5(
+
+    const device ulong* wires [[buffer(0)]],
+    const device ulong* constants [[buffer(1)]],
+    device ulong* output [[buffer(2)]],
+    constant ulong* alpha_powers [[buffer(3)]],
+    constant uint* metadata [[buffer(4)]],
+    constant uint& lde_rows [[buffer(5)]],
+    constant uint& quotient_rows [[buffer(6)]],
+    constant uint& step [[buffer(7)]],
+    constant uint& alpha_stride [[buffer(8)]],
+    constant uint& range_count [[buffer(9)]],
+    constant uint& u32_count [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]) {
+    range_check_gate_quotient_impl<2u>(wires, constants, output, alpha_powers, metadata, lde_rows, quotient_rows, step, alpha_stride, range_count, u32_count, gid);
+}
+
+kernel void range_check_gate_quotient_quintic_square6(
+
+    const device ulong* wires [[buffer(0)]],
+    const device ulong* constants [[buffer(1)]],
+    device ulong* output [[buffer(2)]],
+    constant ulong* alpha_powers [[buffer(3)]],
+    constant uint* metadata [[buffer(4)]],
+    constant uint& lde_rows [[buffer(5)]],
+    constant uint& quotient_rows [[buffer(6)]],
+    constant uint& step [[buffer(7)]],
+    constant uint& alpha_stride [[buffer(8)]],
+    constant uint& range_count [[buffer(9)]],
+    constant uint& u32_count [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]) {
+    range_check_gate_quotient_impl<3u>(wires, constants, output, alpha_powers, metadata, lde_rows, quotient_rows, step, alpha_stride, range_count, u32_count, gid);
+}
+
+
 
 kernel void poseidon2_hash_leaves(
     const device ulong* leaves [[buffer(0)]],

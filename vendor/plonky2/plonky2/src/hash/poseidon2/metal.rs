@@ -109,13 +109,13 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
+    "5d28442520b98f5f59be47bad6706b963e07baa6bcc29b1b496edfd9aaf8c3a2";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
 /// source. This deliberately includes the lazily-built gate-quotient kernels:
 /// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
+const METALLIB_REQUIRED_KERNELS: [&str; 13] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
     "poseidon2_hash_parents",
@@ -125,6 +125,9 @@ const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
     "ifft_finalize",
     "poseidon2_gate_quotient",
     "range_check_gate_quotient",
+    "range_check_gate_quotient_d19_main",
+    "range_check_gate_quotient_quintic_mul5",
+    "range_check_gate_quotient_quintic_square6",
     "permutation_quotient",
 ];
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
@@ -1016,6 +1019,9 @@ impl LazyPipeline {
 
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
+static RANGE_D19_MAIN_PIPELINE: LazyPipeline = LazyPipeline::new();
+static RANGE_QUINTIC_MUL5_PIPELINE: LazyPipeline = LazyPipeline::new();
+static RANGE_QUINTIC_SQUARE6_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
 
@@ -1025,6 +1031,18 @@ fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
 
 fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     RANGE_CHECK_GATE_QUOTIENT_PIPELINE.get()
+}
+
+fn range_d19_main_pipeline() -> Option<&'static ComputePipelineState> {
+    RANGE_D19_MAIN_PIPELINE.get()
+}
+
+fn range_quintic_mul5_pipeline() -> Option<&'static ComputePipelineState> {
+    RANGE_QUINTIC_MUL5_PIPELINE.get()
+}
+
+fn range_quintic_square6_pipeline() -> Option<&'static ComputePipelineState> {
+    RANGE_QUINTIC_SQUARE6_PIPELINE.get()
 }
 
 fn permutation_quotient_pipeline() -> Option<&'static ComputePipelineState> {
@@ -1082,6 +1100,59 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             Err(_) => {
                 let _ = slot.built.set(None);
             }
+        }
+    }
+
+    let device = device.clone();
+    let library = library.clone();
+    let spawned = std::thread::Builder::new()
+        .name("poseidon2-metal-range-d19-split".to_string())
+        .spawn(move || {
+            // Do not contend with the two slow baseline gate-pipeline lowerings.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            for prerequisite in [
+                &POSEIDON_GATE_QUOTIENT_PIPELINE,
+                &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
+            ] {
+                while prerequisite.built.get().is_none()
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            let build = |name: &str| {
+                autoreleasepool(|| {
+                    library.get_function(name, None).ok().and_then(|function| {
+                        device
+                            .new_compute_pipeline_state_with_function(&function)
+                            .ok()
+                    })
+                })
+            };
+            let (main, mul5, square6) = std::thread::scope(|scope| {
+                let main = scope.spawn(|| build("range_check_gate_quotient_d19_main"));
+                let mul5 = scope.spawn(|| build("range_check_gate_quotient_quintic_mul5"));
+                let square6 = scope.spawn(|| build("range_check_gate_quotient_quintic_square6"));
+                (
+                    main.join().unwrap_or(None),
+                    mul5.join().unwrap_or(None),
+                    square6.join().unwrap_or(None),
+                )
+            });
+            let _ = RANGE_D19_MAIN_PIPELINE.built.set(main);
+            let _ = RANGE_QUINTIC_MUL5_PIPELINE.built.set(mul5);
+            let _ = RANGE_QUINTIC_SQUARE6_PIPELINE.built.set(square6);
+        });
+    match spawned {
+        Ok(handle) => {
+            if let Ok(mut builder) = RANGE_D19_MAIN_PIPELINE.builder.lock() {
+                *builder = Some(handle);
+            }
+        }
+        Err(_) => {
+            let _ = RANGE_D19_MAIN_PIPELINE.built.set(None);
+            let _ = RANGE_QUINTIC_MUL5_PIPELINE.built.set(None);
+            let _ = RANGE_QUINTIC_SQUARE6_PIPELINE.built.set(None);
         }
     }
 }
@@ -2532,13 +2603,49 @@ impl MetalShared {
         alpha_powers: &[u64],
         alpha_stride: usize,
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
-        let pipeline = range_check_gate_quotient_pipeline()
-            .ok_or("RangeCheck gate quotient pipeline unavailable")?;
         if metadata.len() != (range_count + u32_count) * 10
             || alpha_powers.len() != alpha_stride * 2
         {
             return Err("invalid RangeCheck quotient metadata".to_string());
         }
+        // The two production d19 signatures put Q=5 and S=6 at U32 indices
+        // 3 and 4. Keep every other shape on the byte-for-byte generic kernel.
+        let u32_metadata = &metadata[range_count * 10..];
+        let audited_shape_counts = (wires.rows == (1 << 19)
+            && range_count == 3
+            && matches!(u32_count, 15 | 18))
+            // Exercise the same three-entrypoint path in the exhaustive
+            // random-invalid union differential below without allocating a
+            // production-sized test fixture. This branch compiles out of workers.
+            || (cfg!(test) && range_count == 1 && u32_count == 15);
+        let exact_d19_quintic_shape = audited_shape_counts
+            && u32_metadata[3 * 10 + 5] == 4
+            && u32_metadata[3 * 10 + 6] == 5
+            && u32_metadata[4 * 10 + 5] == 5
+            && u32_metadata[4 * 10 + 6] == 6
+            && (0..u32_count)
+                .filter(|&index| matches!(u32_metadata[index * 10 + 5], 4 | 5))
+                .eq([3, 4]);
+        let split_pipelines = if exact_d19_quintic_shape {
+            match (
+                range_d19_main_pipeline(),
+                range_quintic_mul5_pipeline(),
+                range_quintic_square6_pipeline(),
+            ) {
+                (Some(main), Some(mul5), Some(square6)) => Some((main, mul5, square6)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let generic_pipeline = if split_pipelines.is_none() {
+            Some(
+                range_check_gate_quotient_pipeline()
+                    .ok_or("RangeCheck gate quotient pipeline unavailable")?,
+            )
+        } else {
+            None
+        };
         let len = quotient_rows
             .checked_mul(2)
             .ok_or("RangeCheck gate quotient output length overflow")?;
@@ -2550,7 +2657,6 @@ impl MetalShared {
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&wires.buffer), 0);
             encoder.set_buffer(1, Some(&constants.buffer), 0);
             encoder.set_buffer(2, Some(&output), 0);
@@ -2570,12 +2676,30 @@ impl MetalShared {
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            if let Some((main, mul5, square6)) = split_pipelines {
+                let output_resource: &metal::ResourceRef = &output;
+                encoder.set_compute_pipeline_state(mul5);
+                dispatch(encoder, mul5, quotient_rows);
+                encoder.memory_barrier_with_resources(&[output_resource]);
+                encoder.set_compute_pipeline_state(square6);
+                dispatch(encoder, square6, quotient_rows);
+                encoder.memory_barrier_with_resources(&[output_resource]);
+                encoder.set_compute_pipeline_state(main);
+                dispatch(encoder, main, quotient_rows);
+            } else {
+                let pipeline = generic_pipeline.expect("generic Range pipeline selected");
+                encoder.set_compute_pipeline_state(pipeline);
+                dispatch(encoder, pipeline, quotient_rows);
+            }
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
                 command_buffer,
-                "range_u32_quotient",
+                if split_pipelines.is_some() {
+                    "range_u32_quotient_d19_fixed_qs"
+                } else {
+                    "range_u32_quotient"
+                },
                 (quotient_rows * (range_count + u32_count)) as u64,
             );
             command_buffer.commit();
