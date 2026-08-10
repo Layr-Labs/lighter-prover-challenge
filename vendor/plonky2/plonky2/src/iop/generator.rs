@@ -342,14 +342,37 @@ impl<F: Field> Debug for PartitionSeeder<'_, '_, F> {
 impl<F: Field> WitnessWrite<F> for PartitionSeeder<'_, '_, F> {
     fn set_target(&mut self, target: Target, value: F) -> Result<()> {
         if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
-            if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
-                for &generator_idx in watchers {
-                    debug_assert_ne!(self.unresolved_watches[generator_idx], 0);
-                    self.unresolved_watches[generator_idx] -= 1;
-                }
-            }
+            self.decrement_watchers(watch);
         }
         Ok(())
+    }
+}
+
+impl<F: Field> PartitionSeeder<'_, '_, F> {
+    /// Set a value using a representative resolved from a validated circuit-topology plan.
+    /// Watcher readiness and duplicate/conflict handling remain identical to `set_target`.
+    pub fn set_target_at_representative(
+        &mut self,
+        target: Target,
+        representative: usize,
+        value: F,
+    ) -> Result<()> {
+        if let Some(watch) = self
+            .witness
+            .set_representative_returning_rep(target, representative, value)?
+        {
+            self.decrement_watchers(watch);
+        }
+        Ok(())
+    }
+
+    fn decrement_watchers(&mut self, representative: usize) {
+        if let Some(watchers) = self.generator_indices_by_watches.get(&representative) {
+            for &generator_idx in watchers {
+                debug_assert_ne!(self.unresolved_watches[generator_idx], 0);
+                self.unresolved_watches[generator_idx] -= 1;
+            }
+        }
     }
 }
 

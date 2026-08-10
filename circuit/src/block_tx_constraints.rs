@@ -7,9 +7,12 @@ use log::Level;
 use plonky2::field::extension::Extendable;
 use plonky2::field::types::{Field, Field64};
 use plonky2::hash::hash_types::{HashOutTarget, NUM_HASH_OUT_ELTS, RichField};
+use plonky2::iop::generator::PartitionSeeder;
 use plonky2::iop::target::Target;
-use plonky2::iop::witness::PartialWitness;
-use plonky2::plonk::circuit_data::{CircuitConfig, CircuitData};
+use plonky2::iop::witness::{PartialWitness, Witness, WitnessWrite};
+use plonky2::plonk::circuit_data::{
+    CircuitConfig, CircuitData, CommonCircuitData, ProverOnlyCircuitData,
+};
 use plonky2::plonk::config::GenericConfig;
 use plonky2::plonk::proof::ProofWithPublicInputs;
 use plonky2::plonk::prover::prove;
@@ -56,6 +59,76 @@ pub trait Circuit<
 pub struct BlockTxCircuit {
     pub builder: Builder,
     pub target: BlockTxTarget,
+}
+
+/// A flat, source-ordered mapping from the fixed `set_tx_target` traversal to circuit
+/// representatives. The source targets are retained so every replay validates that the circuit
+/// topology and assignment order still match the first shape-checked traversal.
+#[derive(Clone, Debug)]
+pub struct TxTargetScatterPlan {
+    targets: Vec<Target>,
+    representatives: Vec<u32>,
+}
+
+struct TxTargetScatterCompiler<'s, 'a, 'b> {
+    seeder: &'s mut PartitionSeeder<'a, 'b, F>,
+    representative_map: &'s [u32],
+    num_wires: usize,
+    degree: usize,
+    targets: Vec<Target>,
+    representatives: Vec<u32>,
+}
+
+impl WitnessWrite<F> for TxTargetScatterCompiler<'_, '_, '_> {
+    fn set_target(&mut self, target: Target, value: F) -> Result<()> {
+        let target_index = target.index(self.num_wires, self.degree);
+        let representative = *self.representative_map.get(target_index).ok_or_else(|| {
+            anyhow::anyhow!("target index {target_index} is outside representative map")
+        })?;
+        self.targets.push(target);
+        self.representatives.push(representative);
+        self.seeder.set_target(target, value)
+    }
+}
+
+impl Witness<F> for TxTargetScatterCompiler<'_, '_, '_> {
+    fn try_get_target(&self, target: Target) -> Option<F> {
+        self.seeder.try_get_target(target)
+    }
+}
+
+struct TxTargetScatterReplay<'p, 's, 'a, 'b> {
+    seeder: &'s mut PartitionSeeder<'a, 'b, F>,
+    plan: &'p TxTargetScatterPlan,
+    cursor: usize,
+}
+
+impl WitnessWrite<F> for TxTargetScatterReplay<'_, '_, '_, '_> {
+    fn set_target(&mut self, target: Target, value: F) -> Result<()> {
+        let entry = self
+            .plan
+            .targets
+            .get(self.cursor)
+            .ok_or_else(|| anyhow::anyhow!("scatter plan exhausted before target {:?}", target))?;
+        if *entry != target {
+            anyhow::bail!(
+                "scatter topology mismatch at assignment {}: expected {:?}, got {:?}",
+                self.cursor,
+                entry,
+                target
+            );
+        }
+        let representative = self.plan.representatives[self.cursor] as usize;
+        self.cursor += 1;
+        self.seeder
+            .set_target_at_representative(target, representative, value)
+    }
+}
+
+impl Witness<F> for TxTargetScatterReplay<'_, '_, '_, '_> {
+    fn try_get_target(&self, target: Target) -> Option<F> {
+        self.seeder.try_get_target(target)
+    }
 }
 
 #[serde_with::serde_as]
@@ -253,6 +326,55 @@ impl BlockTxCircuit {
             .zip_eq(block.txs.iter())
             .try_for_each(|(t, tx)| pw.set_tx_target(t, tx))?;
 
+        Ok(())
+    }
+
+    /// Performs the first shape-checked witness traversal and records its flat representative
+    /// scatter plan. The first traversal uses the ordinary seeder path, so it is also the first
+    /// witness generation with unchanged conflict and watcher semantics.
+    pub fn generate_witness_into_compiling_scatter_plan(
+        block: &BlockTx<F>,
+        target: &BlockTxTarget,
+        seeder: &mut PartitionSeeder<'_, '_, F>,
+        prover_data: &ProverOnlyCircuitData<F, C, D>,
+        common_data: &CommonCircuitData<F, D>,
+    ) -> Result<TxTargetScatterPlan> {
+        let mut compiler = TxTargetScatterCompiler {
+            seeder,
+            representative_map: &prover_data.representative_map,
+            num_wires: common_data.config.num_wires,
+            degree: common_data.degree(),
+            targets: Vec::new(),
+            representatives: Vec::new(),
+        };
+        Self::generate_witness_into(block, target, &mut compiler)?;
+        Ok(TxTargetScatterPlan {
+            targets: compiler.targets,
+            representatives: compiler.representatives,
+        })
+    }
+
+    /// Replays a previously shape-checked plan while retaining the complete ordinary seeder
+    /// watcher processing and checked representative writes.
+    pub fn generate_witness_into_scatter_plan(
+        block: &BlockTx<F>,
+        target: &BlockTxTarget,
+        seeder: &mut PartitionSeeder<'_, '_, F>,
+        plan: &TxTargetScatterPlan,
+    ) -> Result<()> {
+        let mut replay = TxTargetScatterReplay {
+            seeder,
+            plan,
+            cursor: 0,
+        };
+        Self::generate_witness_into(block, target, &mut replay)?;
+        if replay.cursor != plan.targets.len() {
+            anyhow::bail!(
+                "scatter plan has {} unused assignments after replay cursor {}",
+                plan.targets.len() - replay.cursor,
+                replay.cursor
+            );
+        }
         Ok(())
     }
 }

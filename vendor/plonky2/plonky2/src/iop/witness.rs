@@ -373,6 +373,20 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     /// target was already set, returns `None`.
     pub fn set_target_returning_rep(&mut self, target: Target, value: F) -> Result<Option<usize>> {
         let rep_index = self.representative_map[self.target_index(target)] as usize;
+        self.set_representative_returning_rep(target, rep_index, value)
+    }
+
+    /// Set a value at a representative already resolved from the circuit topology.
+    ///
+    /// This is the checked write primitive used by topology-specialized witness seeders. It keeps
+    /// the same duplicate/conflict behavior as `set_target_returning_rep` while avoiding a second
+    /// target-index and representative-map lookup on replay.
+    pub(crate) fn set_representative_returning_rep(
+        &mut self,
+        target: Target,
+        rep_index: usize,
+        value: F,
+    ) -> Result<Option<usize>> {
         if self.is_set_by_rep_index(rep_index) {
             let old_value = self.values[rep_index];
             if value != old_value {

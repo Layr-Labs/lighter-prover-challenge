@@ -14,7 +14,7 @@ use circuit::block_tx::{BlockTx, JumpState, JumpStateTarget};
 use circuit::block_tx_chain_constraints::{
     BlockTxChainCircuit, BlockTxChainTarget, cyclic_base_witness,
 };
-use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget};
+use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, TxTargetScatterPlan};
 #[cfg(test)]
 use circuit::block_tx_constraints::Circuit as _;
 use circuit::tx::Tx;
@@ -228,7 +228,12 @@ fn generate_tx_witness<'a>(
     created_at: i64,
     state_metadata_hash: HashOut<F>,
     old_jump: JumpState<F>,
-) -> (PartitionWitness<'a, F>, JumpState<F>) {
+    scatter_plan: Option<&TxTargetScatterPlan>,
+) -> (
+    PartitionWitness<'a, F>,
+    JumpState<F>,
+    Option<TxTargetScatterPlan>,
+) {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context(
         profile_path_context(path, "witness"),
@@ -247,17 +252,39 @@ fn generate_tx_witness<'a>(
     // slots (array-indexed), bypassing the PartialWitness hash map and its
     // per-target hashing for the ~10^5 inputs of every transaction chunk,
     // while maintaining the same unresolved-watch counters.
+    let mut compiled_scatter_plan = None;
     let partition_witness = PendingPartitionWitness::start_seeded(
         &tx_data.prover_only,
         &tx_data.common,
-        |seeder| BlockTxCircuit::generate_witness_into(&block_tx, tx_target, seeder),
+        |seeder| match scatter_plan {
+            Some(plan) => {
+                BlockTxCircuit::generate_witness_into_scatter_plan(
+                    &block_tx,
+                    tx_target,
+                    seeder,
+                    plan,
+                )
+            }
+            None => {
+                compiled_scatter_plan = Some(
+                    BlockTxCircuit::generate_witness_into_compiling_scatter_plan(
+                        &block_tx,
+                        tx_target,
+                        seeder,
+                        &tx_data.prover_only,
+                        &tx_data.common,
+                    )?,
+                );
+                Ok(())
+            }
+        },
     )
     .and_then(PendingPartitionWitness::finish)
     .unwrap_or_else(|error| {
         panic!("{path:?} block transaction chunk #{chunk_index} witness generation failed: {error:?}")
     });
     let new_jump = jump_from_witness(&partition_witness, &tx_target.new_jump);
-    (partition_witness, new_jump)
+    (partition_witness, new_jump, compiled_scatter_plan)
 }
 
 fn prove_tx_witness(
@@ -377,7 +404,7 @@ fn prove_path(
     let mut chunks = chunks.into_iter();
     let (mut current_chunk_index, first_txs) =
         chunks.next().expect("transaction path must not be empty");
-    let (mut current_witness, next_jump) = generate_tx_witness(
+    let (mut current_witness, next_jump, scatter_plan) = generate_tx_witness(
         path,
         current_chunk_index,
         first_txs,
@@ -386,7 +413,9 @@ fn prove_path(
         created_at,
         state_metadata_hash,
         jump,
+        None,
     );
+    let scatter_plan = scatter_plan.expect("first transaction chunk must compile scatter plan");
     jump = next_jump;
 
 
@@ -431,7 +460,7 @@ fn prove_path(
                 .expect("transaction proof pipeline thread must start");
 
             let next_witness = chunks.next().map(|(chunk_index, txs)| {
-                let (witness, next_jump) = generate_tx_witness(
+                let (witness, next_jump, replay_plan) = generate_tx_witness(
                     path,
                     chunk_index,
                     txs,
@@ -440,7 +469,9 @@ fn prove_path(
                     created_at,
                     state_metadata_hash,
                     jump,
+                    Some(&scatter_plan),
                 );
+                debug_assert!(replay_plan.is_none());
                 jump = next_jump;
                 (chunk_index, witness)
             });
@@ -1053,7 +1084,7 @@ mod tests {
         let jump = JumpState::initial(new_state_root, old_delta_root);
 
         let light_chunk = vec![Arc::new(empty_tx); LIGHT_TX_PER_PROOF];
-        let (witness, _) = generate_tx_witness(
+        let (witness, _, _) = generate_tx_witness(
             TxPath::Light,
             0,
             light_chunk,
@@ -1062,6 +1093,7 @@ mod tests {
             block.created_at,
             state_metadata_hash,
             jump,
+            None,
         );
         let tx_prove_start = Instant::now();
         let mut tx_timing = TimingTree::new("tx-chunk-prove", log::Level::Debug);
