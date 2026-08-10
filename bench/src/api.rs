@@ -274,6 +274,39 @@ impl Circuits {
         drop(heavy_chain_data);
         (block.target, block.builder.build::<C>())
     }
+
+    /// Builds the final block circuit normally while replacing only the
+    /// deterministic sigma-edge planning pass with bytes derived by the
+    /// untimed build script. The caller verifies the resulting circuit digest
+    /// against the plan artifact before using the data.
+    pub fn build_block_circuit_with_permutation_factor_skips(
+        &self,
+        permutation_factor_skips: Vec<u8>,
+    ) -> (BlockTarget, CircuitData<F, C, D>) {
+        let heavy_chain_data = self
+            .heavy_chain_data
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let light_chain_data = self
+            .light_chain_data
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let block = BlockCircuit::define(
+            CIRCUIT_CONFIG,
+            &self.pre_data,
+            &light_chain_data,
+            &heavy_chain_data,
+            ON_CHAIN_OPERATIONS_LIMIT,
+        );
+        drop(light_chain_data);
+        drop(heavy_chain_data);
+        (
+            block.target,
+            block
+                .builder
+                .build_with_permutation_factor_skips::<C>(permutation_factor_skips),
+        )
+    }
 }
 
 #[cfg(test)]

@@ -102,6 +102,21 @@ where
         self.builder.build()
     }
 
+    pub fn build_with_permutation_factor_skips<C: GenericConfig<D, F = F>>(
+        self,
+        permutation_factor_skips: Vec<u8>,
+    ) -> CircuitData<F, C, D> {
+        if !self.range_checks.is_empty() {
+            log::warn!(
+                "Warning: range_checks still contains {} entries. Make sure you called perform_registered_range_checks at the end of your circuit.",
+                self.range_checks.len()
+            );
+        }
+
+        self.builder
+            .build_with_permutation_factor_skips(permutation_factor_skips)
+    }
+
     pub fn config(&self) -> &CircuitConfig {
         &self.builder.config
     }

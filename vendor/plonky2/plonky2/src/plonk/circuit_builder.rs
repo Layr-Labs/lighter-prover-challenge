@@ -49,7 +49,7 @@ use crate::plonk::circuit_data::{
 };
 use crate::plonk::config::{AlgebraicHasher, GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::copy_constraint::CopyConstraint;
-use crate::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
+use crate::plonk::permutation_argument::Forest;
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::timed;
 use crate::util::context_tree::ContextTree;
@@ -1039,7 +1039,13 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .collect()
     }
 
-    fn sigma_vecs(&self, k_is: &[F], subgroup: &[F]) -> (Vec<PolynomialValues<F>>, Forest) {
+    fn sigma_vecs(
+        &self,
+        k_is: &[F],
+        subgroup: &[F],
+        quotient_degree_factor: usize,
+        precomputed_permutation_factor_skips: Option<Vec<u8>>,
+    ) -> (Vec<PolynomialValues<F>>, Forest, Vec<u8>) {
         let degree = self.gate_instances.len();
         let degree_log = log2_strict(degree);
         let config = &self.config;
@@ -1070,9 +1076,26 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         forest.compress_paths();
 
         let wire_partition = forest.wire_partition();
+        let expected_skip_len = degree
+            .checked_mul(config.num_routed_wires.div_ceil(quotient_degree_factor))
+            .and_then(|len| len.checked_mul(quotient_degree_factor.div_ceil(8)))
+            .and_then(|len| len.checked_mul(2))
+            .expect("permutation-factor skip plan length overflow");
+        let permutation_factor_skips = match precomputed_permutation_factor_skips {
+            Some(skips) if skips.len() == expected_skip_len => skips,
+            Some(_) => panic!("precomputed permutation-factor skip plan has the wrong length"),
+            None => wire_partition
+                .permutation_factor_skip_mask(
+                    degree,
+                    config.num_routed_wires,
+                    quotient_degree_factor,
+                )
+                .expect("builder produced an invalid sigma permutation"),
+        };
         (
             wire_partition.get_sigma_polys(degree_log, k_is, subgroup),
             forest,
+            permutation_factor_skips,
         )
     }
 
@@ -1111,7 +1134,26 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         self,
         commit_to_sigma: bool,
     ) -> CircuitData<F, C, D> {
-        let (circuit_data, success) = self.try_build_with_options(commit_to_sigma);
+        let (circuit_data, success) =
+            self.try_build_with_options_and_permutation_factor_skips(commit_to_sigma, None);
+        if !success {
+            panic!("Failed to build circuit");
+        }
+        circuit_data
+    }
+
+    /// Builds a circuit while installing an untimed, circuit-specific permutation-factor plan.
+    /// The caller must bind the plan to the resulting circuit digest. This moves only the
+    /// deterministic sigma-edge planning pass out of a latency-sensitive build; sigma values,
+    /// commitments, verifier data, and every proof-time check are still built normally.
+    pub fn build_with_permutation_factor_skips<C: GenericConfig<D, F = F>>(
+        self,
+        permutation_factor_skips: Vec<u8>,
+    ) -> CircuitData<F, C, D> {
+        let (circuit_data, success) = self.try_build_with_options_and_permutation_factor_skips(
+            true,
+            Some(permutation_factor_skips),
+        );
         if !success {
             panic!("Failed to build circuit");
         }
@@ -1119,8 +1161,16 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
     }
 
     pub fn try_build_with_options<C: GenericConfig<D, F = F>>(
+        self,
+        commit_to_sigma: bool,
+    ) -> (CircuitData<F, C, D>, bool) {
+        self.try_build_with_options_and_permutation_factor_skips(commit_to_sigma, None)
+    }
+
+    fn try_build_with_options_and_permutation_factor_skips<C: GenericConfig<D, F = F>>(
         mut self,
         commit_to_sigma: bool,
+        precomputed_permutation_factor_skips: Option<Vec<u8>>,
     ) -> (CircuitData<F, C, D>, bool) {
         //Fill out the incomplete gates that need non-trivial generators and provide default values
         let incomplete_gates = self
@@ -1266,10 +1316,15 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let subgroup = F::two_adic_subgroup(degree_bits);
 
         let k_is = get_unique_coset_shifts(degree, self.config.num_routed_wires);
-        let (sigma_vecs, forest) = timed!(
+        let (sigma_vecs, forest, permutation_factor_skips) = timed!(
             timing,
             "generate sigma polynomials",
-            self.sigma_vecs(&k_is, &subgroup)
+            self.sigma_vecs(
+                &k_is,
+                &subgroup,
+                quotient_degree_factor,
+                precomputed_permutation_factor_skips,
+            )
         );
 
         // Precompute FFT roots.
@@ -1454,14 +1509,6 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             }
         };
 
-        let fixed_routed_wires = fixed_routed_wire_mask(
-            &forest.parents,
-            common.config.num_wires,
-            common.config.num_routed_wires,
-            subgroup.len(),
-        )
-        .expect("builder produced an invalid compressed representative map");
-
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,
             generator_indices_by_watches,
@@ -1471,7 +1518,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             subgroup,
             public_inputs: self.public_inputs,
             representative_map: forest.parents,
-            fixed_routed_wires,
+            permutation_factor_skips,
             fft_root_table: Some(fft_root_table),
             circuit_digest,
             lookup_rows: self.lookup_rows.clone(),
@@ -1703,6 +1750,27 @@ mod tests {
         assert_eq!(
             a.verifier_only.circuit_digest, b.verifier_only.circuit_digest,
             "circuit digest is not reproducible"
+        );
+
+        // A plan produced by the ordinary build must be a pure runtime-data
+        // substitution: installing it in a third identical builder may skip
+        // the sigma-edge planning scan, but every circuit-bound quantity and
+        // every proof-time permutation byte must remain identical.
+        let mut planned = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        program(&mut planned);
+        let c = planned.build_with_permutation_factor_skips::<C>(
+            a.prover_only.permutation_factor_skips.clone(),
+        );
+        assert_eq!(a.common, c.common);
+        assert_eq!(a.verifier_only, c.verifier_only);
+        assert_eq!(a.prover_only.sigmas, c.prover_only.sigmas);
+        assert_eq!(
+            a.prover_only.representative_map,
+            c.prover_only.representative_map
+        );
+        assert_eq!(
+            a.prover_only.permutation_factor_skips,
+            c.prover_only.permutation_factor_skips
         );
     }
 }

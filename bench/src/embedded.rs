@@ -17,9 +17,10 @@
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
-use circuit::embed::deserialize_embedded;
+use circuit::embed::{deserialize_embedded, deserialize_permutation_factor_plan};
 use circuit::types::config::{C, D, F};
 use plonky2::plonk::circuit_data::CircuitData;
+use plonky2::plonk::config::GenericHashOut;
 
 use crate::api::{Circuits, Proof};
 
@@ -28,6 +29,10 @@ static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx
 static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
 static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+static BLOCK_PERMUTATION_PLAN_BLOB: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/block-permutation-plan.embed"
+));
 
 /// The four startup circuits that do not participate in pre-execution. Keeping
 /// this separate lets the worker start the pre-execution proof from its already
@@ -124,6 +129,37 @@ impl Circuits {
             dummy_heavy_proof,
             dummy_light_proof,
         })
+    }
+
+    /// Keeps the final block circuit on its established parallel runtime-build
+    /// path, but installs the compressed build-time permutation plan so the
+    /// scored worker does not rescan every sigma edge. Any absent or
+    /// dimension/digest-mismatched artifact falls back to the original build.
+    pub(crate) fn build_block_circuit_with_embedded_permutation_plan(
+        &self,
+    ) -> (
+        circuit::block_constraints::BlockTarget,
+        CircuitData<F, C, D>,
+    ) {
+        let plan = deserialize_permutation_factor_plan(BLOCK_PERMUTATION_PLAN_BLOB);
+        let Ok(plan) = plan else {
+            return self.build_block_circuit();
+        };
+        let (target, data) = self.build_block_circuit_with_permutation_factor_skips(
+            plan.permutation_factor_skips,
+        );
+        let dimensions_match = data.common.degree_bits() == plan.degree_bits
+            && data.common.config.num_routed_wires == plan.num_routed_wires
+            && data.common.quotient_degree_factor == plan.quotient_degree_factor;
+        let digest_matches = data.prover_only.circuit_digest.to_bytes() == plan.circuit_digest;
+        if dimensions_match && digest_matches {
+            (target, data)
+        } else {
+            log::warn!(
+                "embedded block permutation plan does not match the runtime circuit; rebuilding"
+            );
+            self.build_block_circuit()
+        }
     }
 
     /// Reconstructs all five startup circuits from the blobs embedded at
@@ -424,6 +460,7 @@ mod tests {
             ("heavy_chain", HEAVY_CHAIN_BLOB),
             ("light_tx", LIGHT_TX_BLOB),
             ("light_chain", LIGHT_CHAIN_BLOB),
+            ("block_permutation_plan", BLOCK_PERMUTATION_PLAN_BLOB),
         ] {
             assert!(
                 !blob.is_empty(),

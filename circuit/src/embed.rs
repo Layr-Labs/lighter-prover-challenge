@@ -21,6 +21,9 @@
 //!   commitment path, guaranteeing a bit-identical Merkle cap;
 //! * the representative map is stored as zigzag-varint deltas against the
 //!   identity permutation (mostly zeros) instead of 8-byte usizes;
+//! * the proof-time permutation-factor bitplanes are computed once by the
+//!   untimed builder and stored as a compressed section, instead of rescanning
+//!   every sigma edge in every scored worker;
 //! * the generator watch index is stored in its CSR form (varint-delta
 //!   offsets + `u32` watcher ids);
 //! * constant polynomials are stored as *values* (step-function selectors,
@@ -36,12 +39,12 @@
 use anyhow::{Context, Result, bail, ensure};
 use plonky2::field::fft::{cached_fft_root_table, cached_two_adic_subgroup};
 use plonky2::field::polynomial::PolynomialValues;
-use plonky2::field::types::Field;
 use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::plonk::circuit_data::{
     CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
 };
-use plonky2::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
+use plonky2::plonk::config::{GenericConfig, GenericHashOut, Hasher};
+use plonky2::plonk::permutation_argument::Forest;
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
 use plonky2::util::{log2_ceil, transpose_poly_values_ref};
@@ -66,7 +69,19 @@ fn embed_generator_serializer() -> EmbedGeneratorSerializer {
 }
 
 const EMBED_MAGIC: u32 = 0x4C45_4331; // "LEC1"
-const EMBED_VERSION: u32 = 1;
+const EMBED_VERSION: u32 = 2;
+const PERMUTATION_PLAN_MAGIC: u32 = 0x4C50_5031; // "LPP1"
+const PERMUTATION_PLAN_VERSION: u32 = 1;
+
+/// The small circuit-specific artifact needed to skip the final block builder's
+/// sigma-edge planning pass without embedding the much larger block circuit.
+pub struct EmbeddedPermutationFactorPlan {
+    pub degree_bits: usize,
+    pub num_routed_wires: usize,
+    pub quotient_degree_factor: usize,
+    pub circuit_digest: Vec<u8>,
+    pub permutation_factor_skips: Vec<u8>,
+}
 
 // ---------------------------------------------------------------------------
 // Primitive encoding helpers
@@ -287,7 +302,103 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     }
     write_compressed_section(&mut out, &buf);
 
+    // Directed permutation-factor plan. This is a pure function of the sigma
+    // permutation and quotient chunking. Keeping it in the untimed artifact
+    // deletes a full sigma-edge scan from every scored worker; zstd compresses
+    // the long all-zero/all-one chunk runs compactly.
+    let expected_skip_len = degree
+        .checked_mul(num_routed.div_ceil(common.quotient_degree_factor))
+        .and_then(|len| len.checked_mul(common.quotient_degree_factor.div_ceil(8)))
+        .and_then(|len| len.checked_mul(2))
+        .context("embedded permutation-factor plan length overflow")?;
+    ensure!(
+        prover.permutation_factor_skips.len() == expected_skip_len,
+        "permutation-factor plan has {} bytes, expected {expected_skip_len}",
+        prover.permutation_factor_skips.len(),
+    );
+    write_compressed_section(&mut out, &prover.permutation_factor_skips);
+
     Ok(out)
+}
+
+/// Serializes only the final block circuit's permutation-factor plan. The
+/// runtime still defines and builds the circuit normally; only the redundant
+/// plan scan is replaced by these compressed, build-time-derived bytes.
+pub fn serialize_permutation_factor_plan(data: &CircuitData<F, C, D>) -> Result<Vec<u8>> {
+    let common = &data.common;
+    let degree = 1usize << common.degree_bits();
+    let expected_skip_len = degree
+        .checked_mul(
+            common
+                .config
+                .num_routed_wires
+                .div_ceil(common.quotient_degree_factor),
+        )
+        .and_then(|len| len.checked_mul(common.quotient_degree_factor.div_ceil(8)))
+        .and_then(|len| len.checked_mul(2))
+        .context("permutation-factor plan length overflow")?;
+    ensure!(
+        data.prover_only.permutation_factor_skips.len() == expected_skip_len,
+        "permutation-factor plan has the wrong length"
+    );
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&PERMUTATION_PLAN_MAGIC.to_le_bytes());
+    out.extend_from_slice(&PERMUTATION_PLAN_VERSION.to_le_bytes());
+    out.extend_from_slice(&(common.degree_bits() as u32).to_le_bytes());
+    out.extend_from_slice(&(common.config.num_routed_wires as u32).to_le_bytes());
+    out.extend_from_slice(&(common.quotient_degree_factor as u32).to_le_bytes());
+    let digest = data.prover_only.circuit_digest.to_bytes();
+    write_section(&mut out, &digest);
+    write_compressed_section(&mut out, &data.prover_only.permutation_factor_skips);
+    Ok(out)
+}
+
+/// Loads a mask-only artifact produced by [`serialize_permutation_factor_plan`].
+pub fn deserialize_permutation_factor_plan(bytes: &[u8]) -> Result<EmbeddedPermutationFactorPlan> {
+    ensure!(bytes.len() >= 20, "permutation-factor plan blob too short");
+    let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    ensure!(magic == PERMUTATION_PLAN_MAGIC, "permutation-factor plan magic mismatch");
+    ensure!(
+        version == PERMUTATION_PLAN_VERSION,
+        "permutation-factor plan version {version} unsupported"
+    );
+    let degree_bits = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let num_routed_wires = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let quotient_degree_factor =
+        u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+    ensure!(
+        degree_bits < usize::BITS as usize
+            && num_routed_wires != 0
+            && quotient_degree_factor != 0,
+        "invalid permutation-factor plan dimensions"
+    );
+    let mut pos = 20usize;
+    let circuit_digest = read_section(bytes, &mut pos)?.to_vec();
+    ensure!(
+        circuit_digest.len() == <<C as GenericConfig<D>>::Hasher as Hasher<F>>::HASH_SIZE,
+        "permutation-factor plan digest length mismatch"
+    );
+    let permutation_factor_skips = read_compressed_section(bytes, &mut pos)?;
+    let expected_skip_len = (1usize << degree_bits)
+        .checked_mul(num_routed_wires.div_ceil(quotient_degree_factor))
+        .and_then(|len| len.checked_mul(quotient_degree_factor.div_ceil(8)))
+        .and_then(|len| len.checked_mul(2))
+        .context("permutation-factor plan length overflow")?;
+    ensure!(
+        permutation_factor_skips.len() == expected_skip_len,
+        "permutation-factor plan has {} bytes, expected {expected_skip_len}",
+        permutation_factor_skips.len(),
+    );
+    ensure!(pos == bytes.len(), "trailing bytes in permutation-factor plan blob");
+    Ok(EmbeddedPermutationFactorPlan {
+        degree_bits,
+        num_routed_wires,
+        quotient_degree_factor,
+        circuit_digest,
+        permutation_factor_skips,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -468,6 +579,9 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         representative_map
             .push(u32::try_from(parent).context("representative map entry out of range")?);
     }
+
+    // permutation-factor plan (already derived by the untimed builder)
+    let permutation_factor_skips = read_compressed_section(bytes, &mut pos)?;
     ensure!(pos == bytes.len(), "trailing bytes in embedded circuit blob");
 
     // ---- recompute the derived prover-only components ----
@@ -496,9 +610,16 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let wire_partition = forest.wire_partition();
     let sigma_vecs = wire_partition.get_sigma_polys(degree_bits, &common.k_is, &subgroup);
     let representative_map = forest.into_parents();
-    let fixed_routed_wires =
-        fixed_routed_wire_mask(&representative_map, num_wires, num_routed, degree)
-            .context("embedded circuit has an invalid compressed representative map")?;
+    let expected_skip_len = degree
+        .checked_mul(num_routed.div_ceil(common.quotient_degree_factor))
+        .and_then(|len| len.checked_mul(common.quotient_degree_factor.div_ceil(8)))
+        .and_then(|len| len.checked_mul(2))
+        .context("embedded permutation-factor plan length overflow")?;
+    ensure!(
+        permutation_factor_skips.len() == expected_skip_len,
+        "embedded permutation-factor plan has {} bytes, expected {expected_skip_len}",
+        permutation_factor_skips.len(),
+    );
 
     // `prover_only.sigmas` is the transpose of the sigma *values*, and the
     // commitment below consumes those same values. Transposing first reads the
@@ -588,7 +709,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         subgroup,
         public_inputs,
         representative_map,
-        fixed_routed_wires,
+        permutation_factor_skips,
         fft_root_table: Some(root_table),
         circuit_digest,
         lookup_rows,

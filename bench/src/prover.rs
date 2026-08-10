@@ -718,7 +718,7 @@ pub(crate) fn prove_block_after_pre(
                         #[cfg(feature = "diagnostic_profile")]
                         let _span =
                             plonky2::util::profile::span("orchestration", "build_block_circuit");
-                        circuits.build_block_circuit()
+                        circuits.build_block_circuit_with_embedded_permutation_plan()
                     };
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
