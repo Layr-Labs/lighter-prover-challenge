@@ -37,19 +37,6 @@ enum TxPath {
     Light,
 }
 
-#[cfg(feature = "diagnostic_profile")]
-fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
-    match (path, stage) {
-        (TxPath::Heavy, "witness") => "heavy_tx_witness",
-        (TxPath::Light, "witness") => "light_tx_witness",
-        (TxPath::Heavy, "proof") => "heavy_tx_proof",
-        (TxPath::Light, "proof") => "light_tx_proof",
-        (TxPath::Heavy, "chain") => "heavy_chain",
-        (TxPath::Light, "chain") => "light_chain",
-        _ => "unknown_path_stage",
-    }
-}
-
 const LIGHT_TX_PROOF_WINDOW: usize = 4;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
@@ -131,8 +118,6 @@ enum ChainState<'scope> {
 
 impl ChainState<'_> {
     fn wait(self) -> Proof {
-        #[cfg(feature = "diagnostic_profile")]
-        let _wait = plonky2::util::profile::span("wait", "chain_predecessor_join");
         match self {
             ChainState::Ready(proof) => proof,
             ChainState::InFlight(handle) => handle
@@ -154,14 +139,6 @@ fn chain_step_proof(
     tx_proof: &Proof,
 ) -> Proof {
     mark_spine_thread_latency_critical();
-    #[cfg(feature = "diagnostic_profile")]
-    let _profile_context = plonky2::util::profile::enter_context(
-        profile_path_context(path, "chain"),
-        chain_step,
-        &[("chain_step", chain_step), ("path", path as u64)],
-    );
-    #[cfg(feature = "diagnostic_profile")]
-    let _profile_span = plonky2::util::profile::span("orchestration", "chain_step");
     let result = (|| {
         // Phase 1: run every generator that does not depend on the previous chain proof while
         // that proof may still be in flight. Inputs are written directly into
@@ -229,14 +206,6 @@ fn generate_tx_witness<'a>(
     state_metadata_hash: HashOut<F>,
     old_jump: JumpState<F>,
 ) -> (PartitionWitness<'a, F>, JumpState<F>) {
-    #[cfg(feature = "diagnostic_profile")]
-    let _profile_context = plonky2::util::profile::enter_context(
-        profile_path_context(path, "witness"),
-        chunk_index as u64,
-        &[("chunk_index", chunk_index as u64), ("path", path as u64)],
-    );
-    #[cfg(feature = "diagnostic_profile")]
-    let _profile_span = plonky2::util::profile::span("orchestration", "generate_tx_witness");
     let block_tx = BlockTx {
         created_at,
         state_metadata_hash,
@@ -266,14 +235,6 @@ fn prove_tx_witness(
     tx_data: &CircuitData<F, C, D>,
     partition_witness: PartitionWitness<'_, F>,
 ) -> Proof {
-    #[cfg(feature = "diagnostic_profile")]
-    let _profile_context = plonky2::util::profile::enter_context(
-        profile_path_context(path, "proof"),
-        chunk_index as u64,
-        &[("chunk_index", chunk_index as u64), ("path", path as u64)],
-    );
-    #[cfg(feature = "diagnostic_profile")]
-    let _profile_span = plonky2::util::profile::span("orchestration", "prove_tx_witness");
     let proof = prove_with_partition_witness::<F, C, D>(
         &tx_data.prover_only,
         &tx_data.common,
@@ -306,17 +267,6 @@ fn prove_path(
         !chunks.is_empty(),
         "{path:?} transaction path must contain at least one chunk"
     );
-    #[cfg(feature = "diagnostic_profile")]
-    let _profile_context = plonky2::util::profile::enter_context(
-        match path {
-            TxPath::Heavy => "heavy_path",
-            TxPath::Light => "light_path",
-        },
-        0,
-        &[("chunks", chunks.len() as u64), ("path", path as u64)],
-    );
-    #[cfg(feature = "diagnostic_profile")]
-    let _profile_span = plonky2::util::profile::span("orchestration", "prove_path");
     // The heavy pair's shared guards are held for exactly as long as this path
     // may read them — from here to the `return`, which is after its chain proof
     // exists — so the exclusive acquisition in
@@ -446,12 +396,6 @@ fn prove_path(
             });
 
             in_flight.push_back((current_step, proof_handle));
-            #[cfg(feature = "diagnostic_profile")]
-            plonky2::util::profile::counter(
-                "scheduler",
-                "tx_in_flight",
-                in_flight.len() as u64,
-            );
             let max_in_flight =
                 if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
                     LIGHT_TX_PROOF_WINDOW
@@ -462,8 +406,6 @@ fn prove_path(
                 let (proof_step, proof_handle) = in_flight
                     .pop_front()
                     .expect("transaction proof window must not be empty");
-                #[cfg(feature = "diagnostic_profile")]
-                let _join_wait = plonky2::util::profile::span("wait", "tx_proof_window_join");
                 let tx_proof = proof_handle
                     .join()
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
@@ -507,25 +449,10 @@ fn prove_path(
         // last one proving, since the switch is process-global (see
         // [`claims_exclusive_gpu_phase`]).
         let exclusive_drain = claims_exclusive_gpu_phase(active_paths);
-        #[cfg(feature = "diagnostic_profile")]
-        {
-            plonky2::util::profile::counter(
-                "scheduler",
-                "drain_tx_in_flight",
-                in_flight.len() as u64,
-            );
-            plonky2::util::profile::counter(
-                "scheduler",
-                "exclusive_drain_claimed",
-                exclusive_drain as u64,
-            );
-        }
         if exclusive_drain {
             plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
         }
         while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
-            #[cfg(feature = "diagnostic_profile")]
-            let _join_wait = plonky2::util::profile::span("wait", "tx_proof_drain_join");
             let tx_proof = proof_handle
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
@@ -585,14 +512,6 @@ pub(crate) fn prove_pre_execution_parallel(
     pre_target: &BlockPreExecutionTarget,
     pre_exec: &BlockPreExec<F>,
 ) -> Proof {
-    #[cfg(feature = "diagnostic_profile")]
-    let _profile_context = plonky2::util::profile::enter_context(
-        "pre_execution",
-        0,
-        &[("proof_kind", 0)],
-    );
-    #[cfg(feature = "diagnostic_profile")]
-    let _profile_span = plonky2::util::profile::span("orchestration", "pre_execution_proof");
     BlockPreExecutionCircuit::prove(pre_data, pre_exec, pre_target)
         .expect("block pre-execution proof failed")
 }
@@ -630,11 +549,6 @@ pub(crate) fn prove_block_after_pre(
     mut circuits: Circuits,
     pre_proof: Proof,
 ) -> Proof {
-    #[cfg(feature = "diagnostic_profile")]
-    let _profile_context =
-        plonky2::util::profile::enter_context("block_pipeline", block.block_number, &[]);
-    #[cfg(feature = "diagnostic_profile")]
-    let _profile_span = plonky2::util::profile::span("orchestration", "prove_block_after_pre");
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
@@ -705,21 +619,7 @@ pub(crate) fn prove_block_after_pre(
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
-                    #[cfg(feature = "diagnostic_profile")]
-                    let _profile_context = plonky2::util::profile::enter_context(
-                        "final_block_build",
-                        block_ref.block_number,
-                        &[],
-                    );
-                    #[cfg(feature = "diagnostic_profile")]
-                    let _profile_span =
-                        plonky2::util::profile::span("orchestration", "final_block_build_lane");
-                    let (block_target, block_data) = {
-                        #[cfg(feature = "diagnostic_profile")]
-                        let _span =
-                            plonky2::util::profile::span("orchestration", "build_block_circuit");
-                        circuits.build_block_circuit()
-                    };
+                    let (block_target, block_data) = circuits.build_block_circuit();
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
                     let early = BlockCircuit::witness_inputs_early(
@@ -734,9 +634,6 @@ pub(crate) fn prove_block_after_pre(
                         &block_data.common,
                     )
                     .expect("final block early witness phase failed");
-                    #[cfg(feature = "diagnostic_profile")]
-                    let _heavy_wait =
-                        plonky2::util::profile::span("wait", "heavy_path_join_for_final");
                     let heavy_chain_proof = heavy_handle_outer
                         .join()
                         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
@@ -782,17 +679,10 @@ pub(crate) fn prove_block_after_pre(
                     )
                 })
                 .expect("light transaction chain thread must start");
-            #[cfg(feature = "diagnostic_profile")]
-            let _block_lane_wait =
-                plonky2::util::profile::span("wait", "final_block_build_lane_join");
             let (block_target, block_data, block_pending, heavy_chain_proof) =
                 block_circuit_handle
                     .join()
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            #[cfg(feature = "diagnostic_profile")]
-            drop(_block_lane_wait);
-            #[cfg(feature = "diagnostic_profile")]
-            let _light_wait = plonky2::util::profile::span("wait", "light_path_join");
             let light_chain_proof = light_handle
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
@@ -822,11 +712,6 @@ pub(crate) fn prove_block_after_pre(
     // own extensions on top of them.
     circuits.release_finished_circuit_extensions();
 
-    #[cfg(feature = "diagnostic_profile")]
-    let _profile_context =
-        plonky2::util::profile::enter_context("final_block", block.block_number, &[]);
-    #[cfg(feature = "diagnostic_profile")]
-    let _profile_span = plonky2::util::profile::span("orchestration", "final_block_tail");
     let (light_chain_input, heavy_chain_input) =
         final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
     // The final block witness runs on the serial tail with nothing else proving, so it alone
@@ -838,23 +723,15 @@ pub(crate) fn prove_block_after_pre(
     // this phase.
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
     let mut block_pending = block_pending;
-    {
-        #[cfg(feature = "diagnostic_profile")]
-        let _span = plonky2::util::profile::span("witness", "final_light_feed");
-        block_pending
-            .feed(
-                BlockCircuit::witness_inputs_light_chain(&block_target, light_chain_input)
-                    .expect("final block light-chain witness inputs failed"),
-            )
-            .expect("final block light-chain witness feed failed");
-    }
+    block_pending
+        .feed(
+            BlockCircuit::witness_inputs_light_chain(&block_target, light_chain_input)
+                .expect("final block light-chain witness inputs failed"),
+        )
+        .expect("final block light-chain witness feed failed");
     let _ = heavy_chain_input;
-    let final_proof = {
-        #[cfg(feature = "diagnostic_profile")]
-        let _span = plonky2::util::profile::span("orchestration", "final_block_proof");
-        BlockCircuit::prove_prepared(block_pending, block_data)
-            .expect("final block proof failed")
-    };
+    let final_proof = BlockCircuit::prove_prepared(block_pending, block_data)
+        .expect("final block proof failed");
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
     final_proof
 }
@@ -866,15 +743,6 @@ mod tests {
     use crate::api::{
         HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
     };
-
-    #[cfg(feature = "diagnostic_profile")]
-    #[test]
-    fn profile_path_context_names_are_stable() {
-        assert_eq!(profile_path_context(TxPath::Heavy, "witness"), "heavy_tx_witness");
-        assert_eq!(profile_path_context(TxPath::Light, "proof"), "light_tx_proof");
-        assert_eq!(profile_path_context(TxPath::Heavy, "chain"), "heavy_chain");
-        assert_eq!(profile_path_context(TxPath::Light, "chain"), "light_chain");
-    }
 
     #[test]
     fn prove_block_returns_one_final_block_proof() {
