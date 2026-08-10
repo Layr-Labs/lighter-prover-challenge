@@ -46,6 +46,18 @@ inline void sub_epsilon_u32(thread uint& lo, thread uint& hi, uint active) {
 }
 
 // Multiplying by four is two doublings; a doubling is one field add.
+// 4x + limb in one 67-bit fold instead of three full gl_add calls.
+// t is the low 64 bits of 4x and c its high two bits. The limb-add carry makes
+// c at most four; folding c*epsilon can overflow at most once.
+inline ulong gl_quad_add(ulong x, ulong limb) {
+    ulong t = x << 2;
+    uint c = (uint)(x >> 62);
+    ulong s = t + limb;
+    c += (uint)(s < t);
+    ulong f = s + (ulong)c * GOLDILOCKS_EPSILON;
+    return f + (ulong)(f < s) * GOLDILOCKS_EPSILON;
+}
+
 inline ulong gl_add(ulong a, ulong b);
 inline ulong gl_quadruple(ulong a) {
     ulong twice = gl_add(a, a);
@@ -794,7 +806,7 @@ kernel void range_check_gate_quotient(
             for (uint remaining = num_aux - 1u; remaining > 0u; --remaining) {
                 uint j = remaining - 1u;
                 ulong limb = wires[(aux_base + j) * lde_rows + source_row];
-                computed = gl_add(gl_quadruple(computed), limb);
+                computed = gl_quad_add(computed, limb);
             }
             range_check_gate_emit(
                 gl_sub(computed, input),
@@ -900,9 +912,9 @@ kernel void range_check_gate_quotient(
                         gate_accumulators,
                         constraint_index++);
                     if (j < 16u) {
-                        combined_low = gl_add(gl_quadruple(combined_low), x);
+                        combined_low = gl_quad_add(combined_low, x);
                     } else {
-                        combined_high = gl_add(gl_quadruple(combined_high), x);
+                        combined_high = gl_quad_add(combined_high, x);
                     }
                 }
                 range_check_gate_emit(
@@ -951,7 +963,7 @@ kernel void range_check_gate_quotient(
                         alpha_stride,
                         gate_accumulators,
                         constraint_index++);
-                    recomposed = gl_add(gl_quadruple(recomposed), x);
+                    recomposed = gl_quad_add(recomposed, x);
                 }
                 range_check_gate_emit(
                     gl_sub(recomposed, output_result),
@@ -1007,9 +1019,9 @@ kernel void range_check_gate_quotient(
                         gate_accumulators,
                         constraint_index++);
                     if (j < result_limbs) {
-                        combined_result = gl_add(gl_quadruple(combined_result), x);
+                        combined_result = gl_quad_add(combined_result, x);
                     } else {
-                        combined_carry = gl_add(gl_quadruple(combined_carry), x);
+                        combined_carry = gl_quad_add(combined_carry, x);
                     }
                 }
                 range_check_gate_emit(
