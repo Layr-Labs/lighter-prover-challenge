@@ -703,7 +703,8 @@ inline void range_check_gate_emit(
 // then kind (arithmetic=0, subtraction=1, add-many=2, byte-decomposition=3,
 // quintic-multiplication=4, quintic-squaring=5, random-access=6,
 // exponentiation=7, equality=8, reducing=9, base-addition=10, base-sum=11,
-// selection=12), operation or copy count, and
+// selection=12, base-field-arithmetic=13, extension-arithmetic=14,
+// extension-multiplication=15), operation or copy count, and
 // three explicit kind words. Random access uses the final words for index
 // bits, extra constants, and the raw constant-column base; equality carries
 // its constants column and reducing its extension-coefficient flag in the
@@ -1472,6 +1473,80 @@ kernel void range_check_gate_quotient(
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_sub(gl_mul(b, x), temp), result),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 13u) {
+            // ArithmeticGate: four wires per operation, with the two scalar
+            // weights stored in the first two raw gate-constant columns.
+            uint constant_base = num_addends;
+            ulong const_0 = constants[(ulong)constant_base * lde_rows + source_row];
+            ulong const_1 = constants[((ulong)constant_base + 1u) * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong wire_base = (ulong)op * 4u;
+                ulong multiplicand_0 = wires[(wire_base + 0u) * lde_rows + source_row];
+                ulong multiplicand_1 = wires[(wire_base + 1u) * lde_rows + source_row];
+                ulong addend = wires[(wire_base + 2u) * lde_rows + source_row];
+                ulong output_value = wires[(wire_base + 3u) * lde_rows + source_row];
+                ulong computed = gl_mul_add(
+                    const_1,
+                    addend,
+                    gl_mul(const_0, gl_mul(multiplicand_0, multiplicand_1)));
+                range_check_gate_emit(
+                    gl_sub(output_value, computed),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 14u) {
+            // ArithmeticExtensionGate<2>: a0/a1, b0/b1, z0/z1, out0/out1.
+            // Goldilocks uses F[x]/(x^2 - 7), so the extension product is
+            // (a0*b0 + 7*a1*b1, a0*b1 + a1*b0).
+            uint constant_base = num_addends;
+            ulong const_0 = constants[(ulong)constant_base * lde_rows + source_row];
+            ulong const_1 = constants[((ulong)constant_base + 1u) * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong wire_base = (ulong)op * 8u;
+                ulong a0 = wires[(wire_base + 0u) * lde_rows + source_row];
+                ulong a1 = wires[(wire_base + 1u) * lde_rows + source_row];
+                ulong b0 = wires[(wire_base + 2u) * lde_rows + source_row];
+                ulong b1 = wires[(wire_base + 3u) * lde_rows + source_row];
+                ulong z0 = wires[(wire_base + 4u) * lde_rows + source_row];
+                ulong z1 = wires[(wire_base + 5u) * lde_rows + source_row];
+                ulong out0 = wires[(wire_base + 6u) * lde_rows + source_row];
+                ulong out1 = wires[(wire_base + 7u) * lde_rows + source_row];
+                ulong product_0 = gl_mul_add(7, gl_mul(a1, b1), gl_mul(a0, b0));
+                ulong product_1 = gl_mul_add(a1, b0, gl_mul(a0, b1));
+                ulong computed_0 = gl_mul_add(const_1, z0, gl_mul(const_0, product_0));
+                ulong computed_1 = gl_mul_add(const_1, z1, gl_mul(const_0, product_1));
+                range_check_gate_emit(
+                    gl_sub(out0, computed_0),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(out1, computed_1),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 15u) {
+            // MulExtensionGate<2>: a0/a1, b0/b1, out0/out1 and one scalar.
+            uint constant_base = num_addends;
+            ulong const_0 = constants[(ulong)constant_base * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong wire_base = (ulong)op * 6u;
+                ulong a0 = wires[(wire_base + 0u) * lde_rows + source_row];
+                ulong a1 = wires[(wire_base + 1u) * lde_rows + source_row];
+                ulong b0 = wires[(wire_base + 2u) * lde_rows + source_row];
+                ulong b1 = wires[(wire_base + 3u) * lde_rows + source_row];
+                ulong out0 = wires[(wire_base + 4u) * lde_rows + source_row];
+                ulong out1 = wires[(wire_base + 5u) * lde_rows + source_row];
+                ulong product_0 = gl_mul_add(7, gl_mul(a1, b1), gl_mul(a0, b0));
+                ulong product_1 = gl_mul_add(a1, b0, gl_mul(a0, b1));
+                range_check_gate_emit(
+                    gl_sub(out0, gl_mul(const_0, product_0)),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(out1, gl_mul(const_0, product_1)),
                     alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
