@@ -646,7 +646,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // pad), writing straight into `final_poly`'s reusable buffer
             // instead of a division pass + shift pass + add pass.
             let shift = alpha.shift_factor();
-            accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+            accumulate_linear_quotient(&mut final_poly, composition_poly, *point, shift);
         }
 
         // `final_poly` is dead after this point, so pad it in place instead of
@@ -775,11 +775,36 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
 /// slot / `ZERO * shift` on fresh slots, all of which leave values unchanged.
 fn accumulate_linear_quotient<F: Field>(
     final_poly: &mut PolynomialCoeffs<F>,
-    composition_poly: &PolynomialCoeffs<F>,
+    mut composition_poly: PolynomialCoeffs<F>,
     z: F,
     shift: F,
 ) {
     let d = composition_poly.len();
+
+    if final_poly.coeffs.is_empty() {
+        // The first contribution can become `final_poly` in its own allocation.
+        // The reference shifts an empty vector, resizes it with raw zeroes, then
+        // adds the quotient. Store the same quotient coefficients directly:
+        // each source slot is read before being replaced, the Horner recurrence
+        // remains `acc * z + c` in descending order, and coefficient zero is not
+        // read because that final recurrence step computes only the discarded
+        // remainder. For Goldilocks extension limbs, `ZERO + x` is raw-identical
+        // to `x`, so moving these stores also preserves the representative.
+        let coeffs = &mut composition_poly.coeffs;
+        if d != 0 {
+            let mut acc = F::ZERO;
+            for i in (1..d).rev() {
+                let c = coeffs[i];
+                let prev = acc;
+                acc = acc * z + c;
+                coeffs[i] = prev;
+            }
+            coeffs[0] = acc;
+        }
+        *final_poly = composition_poly;
+        return;
+    }
+
     let coeffs = &composition_poly.coeffs;
     let buf = &mut final_poly.coeffs;
     // Entries past the padded quotient's length only see the shift.
@@ -1057,7 +1082,11 @@ mod tests {
             (256, 256),
         ] {
             let initial = PolynomialCoeffs::new(F::rand_vec(old_len));
-            let composition_poly = PolynomialCoeffs::new(F::rand_vec(d));
+            let mut composition_coeffs = Vec::with_capacity(d + 17);
+            composition_coeffs.extend(F::rand_vec(d));
+            let composition_poly = PolynomialCoeffs::new(composition_coeffs);
+            let source_ptr = composition_poly.coeffs.as_ptr();
+            let source_capacity = composition_poly.coeffs.capacity();
             let z = F::rand();
             let shift = F::rand();
 
@@ -1079,10 +1108,16 @@ mod tests {
             expected_in_place += quotient_in_place;
 
             let mut actual = initial;
-            accumulate_linear_quotient(&mut actual, &composition_poly, z, shift);
+            accumulate_linear_quotient(&mut actual, composition_poly, z, shift);
 
             assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
             assert_eq!(raw(&actual.coeffs), raw(&expected_in_place.coeffs));
+            if old_len == 0 {
+                // The first contribution must reuse the composition vector,
+                // not merely reproduce its values through the old allocation.
+                assert_eq!(actual.coeffs.as_ptr(), source_ptr);
+                assert_eq!(actual.coeffs.capacity(), source_capacity);
+            }
         }
     }
 
