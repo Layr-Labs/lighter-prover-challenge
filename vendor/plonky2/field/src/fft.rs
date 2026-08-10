@@ -321,6 +321,59 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
     PolynomialCoeffs { coeffs: buffer }
 }
 
+/// [`ifft_with_options_and_postscale`] with the butterfly stages distributed
+/// across the feature-gated worker pool, for callers not already nested in a
+/// wider parallel phase. The postscale/reversal pass and every multiplication
+/// order are identical to the serial variant, so results are value-identical.
+pub(crate) fn ifft_with_options_and_postscale_parallel<F: Field>(
+    poly: PolynomialValues<F>,
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+    postscale: Option<&[F]>,
+) -> PolynomialCoeffs<F> {
+    let n = poly.len();
+    let lg_n = log2_strict(n);
+    let n_inv = F::inverse_2exp(lg_n);
+    let PolynomialValues { values: mut buffer } = poly;
+    fft_dispatch_parallel(&mut buffer, zero_factor, root_table);
+
+    match postscale {
+        None => {
+            // We reverse all values except the first, and divide each by n.
+            buffer[0] *= n_inv;
+            buffer[n / 2] *= n_inv;
+            for i in 1..(n / 2) {
+                let j = n - i;
+                let coeffs_i = buffer[j] * n_inv;
+                let coeffs_j = buffer[i] * n_inv;
+                buffer[i] = coeffs_i;
+                buffer[j] = coeffs_j;
+            }
+        }
+        Some(scales) => {
+            assert_eq!(scales.len(), n);
+            // Fuse the caller's coefficient scaling into the same writes as
+            // IFFT reversal and normalization, preserving multiplication order.
+            buffer[0] *= n_inv;
+            buffer[n / 2] *= n_inv;
+            buffer[0] *= scales[0];
+            if n > 1 {
+                buffer[n / 2] *= scales[n / 2];
+            }
+            for i in 1..(n / 2) {
+                let j = n - i;
+                let mut coeffs_i = buffer[j] * n_inv;
+                let mut coeffs_j = buffer[i] * n_inv;
+                coeffs_i *= scales[i];
+                coeffs_j *= scales[j];
+                buffer[i] = coeffs_i;
+                buffer[j] = coeffs_j;
+            }
+        }
+    }
+    PolynomialCoeffs { coeffs: buffer }
+}
+
 /// `ifft` of a borrowed column without the caller-side copy: the initial
 /// bit-reversal permutation is applied as an out-of-place gather from
 /// `values` into the fresh buffer (the same permutation `fft_classic`'s

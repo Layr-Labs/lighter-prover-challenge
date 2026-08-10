@@ -761,10 +761,12 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
         quotient_products_1.set_len(product_count);
     }
 
-    vec![
-        z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
-        z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
-    ]
+    // The two per-challenge chains are pure functions of disjoint owned
+    // inputs; an indexed parallel collect preserves their order.
+    vec![quotient_products_0, quotient_products_1]
+        .into_par_iter()
+        .map(|products| z_polynomials_from_quotient_chunk_products(products, num_prods))
+        .collect()
 }
 
 /// Compute the partial products used in the `Z` polynomial.
@@ -2508,14 +2510,21 @@ fn compute_quotient_polys<
             }
         });
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
+    let exclusive_phase = crate::hash::poseidon2::is_exclusive_gpu_phase();
     challenge_columns
         .into_par_iter()
         .map(|column| {
             // Fuse the coset post-scaling into the IFFT instead of walking the
             // whole coefficient vector again afterwards, reusing a
-            // process-global inverse-shift power chain.
-            PolynomialValues::new(column)
-                .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
+            // process-global inverse-shift power chain. In the exclusive GPU
+            // phase only two of these transforms exist to occupy the pool, so
+            // distribute each one's butterfly stages as well.
+            let values = PolynomialValues::new(column);
+            if exclusive_phase {
+                values.coset_ifft_with_powers_parallel(inverse_coset_shift_powers.as_slice())
+            } else {
+                values.coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
+            }
         })
         .collect()
 }

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::extension::{Extendable, FieldExtension};
 use crate::fft::{
     FftRootTable, fft, fft_with_options, ifft, ifft_with_options_and_postscale,
+    ifft_with_options_and_postscale_parallel,
 };
 use crate::types::Field;
 
@@ -78,6 +79,17 @@ impl<F: Field> PolynomialValues<F> {
     /// already has the inverse powers of that coset's shift.
     pub fn coset_ifft_with_powers(self, inverse_shift_powers: &[F]) -> PolynomialCoeffs<F> {
         ifft_with_options_and_postscale(self, None, None, Some(inverse_shift_powers))
+    }
+
+    /// [`Self::coset_ifft_with_powers`] with the butterfly stages distributed
+    /// across the worker pool. Value-identical to the serial variant; callers
+    /// should use this only when the transform is not already nested in a
+    /// wider parallel phase.
+    pub fn coset_ifft_with_powers_parallel(
+        self,
+        inverse_shift_powers: &[F],
+    ) -> PolynomialCoeffs<F> {
+        ifft_with_options_and_postscale_parallel(self, None, None, Some(inverse_shift_powers))
     }
 
     pub fn lde_multiple(polys: Vec<Self>, rate_bits: usize) -> Vec<Self> {
@@ -543,6 +555,38 @@ mod tests {
 
             let expected = evals.clone().coset_ifft(shift);
             let actual = evals.coset_ifft_with_powers(&inverse_powers);
+
+            assert_eq!(
+                actual.coeffs.iter().map(|value| value.0).collect::<Vec<_>>(),
+                expected
+                    .coeffs
+                    .iter()
+                    .map(|value| value.0)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_coset_ifft_with_powers_parallel_matches_serial() {
+        type F = GoldilocksField;
+
+        for k in [1usize, 3, 8, 10, 12, 14] {
+            let n = 1 << k;
+            let evals = PolynomialValues::new(
+                (0..n)
+                    .map(|i| {
+                        F::from_noncanonical_u64(
+                            u64::MAX.wrapping_sub((i as u64 + 1) * 0x9e37_79b9),
+                        )
+                    })
+                    .collect(),
+            );
+            let shift = F::coset_shift();
+            let inverse_powers = shift.inverse().powers().take(n).collect::<Vec<_>>();
+
+            let expected = evals.clone().coset_ifft_with_powers(&inverse_powers);
+            let actual = evals.coset_ifft_with_powers_parallel(&inverse_powers);
 
             assert_eq!(
                 actual.coeffs.iter().map(|value| value.0).collect::<Vec<_>>(),
