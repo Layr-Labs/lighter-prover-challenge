@@ -204,7 +204,8 @@ impl Circuits {
     /// remains, because every reader of these two circuits holds a shared guard
     /// for the whole span in which it may touch them — the heavy path from
     /// before its first witness until after its chain proof, and
-    /// [`Self::build_block_circuit`] for the duration of `BlockCircuit::define`.
+    /// [`Self::build_block_circuit_dynamic`] for the duration of
+    /// `BlockCircuit::define` on the build fallback.
     /// The caller runs this after joining the heavy path's thread, so both
     /// guards are already gone and the acquisition is uncontended.
     ///
@@ -227,10 +228,11 @@ impl Circuits {
     /// extensions as soon as the light path's thread has produced its chain
     /// proof. Same shape and proof obligation as
     /// [`Self::release_heavy_circuit_extensions`]: the light path holds the
-    /// shared guards for its whole run, [`Self::build_block_circuit`] holds a
-    /// light-chain guard for the duration of `define` (which finishes long
-    /// before the light path), and the caller joins the light thread before
-    /// acquiring the exclusive guard, so the acquisition is uncontended. The
+    /// shared guards for its whole run, [`Self::build_block_circuit_dynamic`]
+    /// holds a light-chain guard for the duration of `define` on the build
+    /// fallback (which finishes long before the light path), and the caller
+    /// joins the light thread before acquiring the exclusive guard, so the
+    /// acquisition is uncontended. The
     /// extensions are `2^19 * 88 + 2^17 * 86` field elements = 438 MiB of
     /// CPU-visible Metal shared buffers released seconds before
     /// [`Self::release_finished_circuit_extensions`] would.
@@ -247,10 +249,25 @@ impl Circuits {
         }
     }
 
-    /// Builds the final block circuit, which depends on the pre-execution and
-    /// both chain circuits but is only needed for the final proof. Callers run
-    /// this concurrently with transaction/chain proving.
+    /// Lazily loads the final block circuit in the caller's existing build lane.
+    /// If the compile-time blob is absent, corrupt or incompatible, this keeps
+    /// the exact prior behavior by rebuilding from the live dependency
+    /// circuits. `LIGHTER_BUILD_CIRCUITS=1` also forces that fallback for A/B
+    /// measurements.
     pub fn build_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
+        if !std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1") {
+            match crate::embedded::load_embedded_block_circuit() {
+                Ok(block) => return block,
+                Err(error) => log::warn!(
+                    "embedded final block circuit unavailable ({error:#}); building from scratch"
+                ),
+            }
+        }
+        self.build_block_circuit_dynamic()
+    }
+
+    /// Exact dynamic construction retained as the fallback and equality oracle.
+    pub(crate) fn build_block_circuit_dynamic(&self) -> (BlockTarget, CircuitData<F, C, D>) {
         // `define` reads only `common` and `verifier_only` of its three inputs
         // (`handle_proofs` calls `constant_verifier_data` and `verify_proof`),
         // so the shared guard is needed only for the construction itself and is

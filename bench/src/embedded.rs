@@ -3,17 +3,18 @@
 
 //! Embedded startup circuits.
 //!
-//! `build.rs` constructs the five startup circuits during the untimed compile
-//! job and serializes them (see `circuit::embed`) into OUT_DIR blobs that are
-//! compiled into this binary. [`Circuits::from_embedded`] reconstitutes the
-//! exact `Circuits` value `Circuits::new` builds, several times faster than
-//! rebuilding, moving that work out of the scored worker lifetime.
+//! `build.rs` constructs the five startup circuits and final block circuit
+//! during the untimed compile job and serializes them (see `circuit::embed`)
+//! into OUT_DIR blobs that are compiled into this binary.
+//! [`Circuits::from_embedded`] reconstitutes only the startup set; the final
+//! block blob stays serialized until the existing block-build lane asks for it.
 //!
 //! [`Circuits::load`] is the production entry point: embedded first, build
 //! fallback on any error, `LIGHTER_BUILD_CIRCUITS=1` to force the build path
 //! (measurement A/B). The `embedded_matches_rebuilt` ignored test is the
 //! value-equality oracle between the two paths.
 
+use circuit::block_constraints::BlockTarget;
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
@@ -28,6 +29,7 @@ static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx
 static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
 static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+static BLOCK_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block.embed"));
 
 /// The four startup circuits that do not participate in pre-execution. Keeping
 /// this separate lets the worker start the pre-execution proof from its already
@@ -78,6 +80,13 @@ fn load_blob<T: serde::de::DeserializeOwned>(
     );
     deserialize_embedded::<T>(blob)
         .map_err(|error| error.context(format!("loading embedded circuit {name}")))
+}
+
+/// Deserializes the final block circuit on demand. The caller is deliberately
+/// the existing `block-circuit-build` worker lane, never startup, so the large
+/// decoded circuit does not extend startup latency or lifetime.
+pub(crate) fn load_embedded_block_circuit() -> anyhow::Result<(BlockTarget, CircuitData<F, C, D>)> {
+    load_blob::<BlockTarget>("block", BLOCK_BLOB)
 }
 
 impl Circuits {
@@ -349,6 +358,28 @@ mod tests {
         });
     }
 
+    /// Equality oracle for the lazily loaded sixth blob. This independently
+    /// rebuilds the final block circuit from fresh dependency circuits, then
+    /// checks the same target, digest, verifier and full-data invariants used
+    /// for the startup blobs.
+    #[test]
+    #[ignore = "large final circuit rebuild; run explicitly"]
+    fn embedded_block_matches_rebuilt() {
+        on_big_stack(|| {
+            let circuits = Circuits::new();
+            let rebuilt = circuits.build_block_circuit_dynamic();
+            let embedded = load_embedded_block_circuit()
+                .expect("embedded final block circuit must load when compiled in");
+
+            assert_circuit_pair_identical(
+                "block",
+                (&rebuilt.0, &rebuilt.1),
+                (&embedded.0, &embedded.1),
+            );
+            println!("embedded_block_matches_rebuilt: final block circuit is value-identical");
+        });
+    }
+
     /// Manual timing harness: embedded load vs fresh build, both under the
     /// production overlapped layout and per circuit sequentially. Run:
     /// `cargo test --release -p bench --bin prove -- --ignored embedded_load_timing --nocapture`
@@ -424,6 +455,7 @@ mod tests {
             ("heavy_chain", HEAVY_CHAIN_BLOB),
             ("light_tx", LIGHT_TX_BLOB),
             ("light_chain", LIGHT_CHAIN_BLOB),
+            ("block", BLOCK_BLOB),
         ] {
             assert!(
                 !blob.is_empty(),
