@@ -1,4 +1,4 @@
-// Redraw marker 607-alex-1786376354
+// Redraw marker regiaz-redraw-1786397217210
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
@@ -170,6 +170,8 @@ impl Circuits {
     pub fn release_finished_circuit_extensions(&mut self) {
         self.pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
         self.pre_data.prover_only.constants_sigmas_quotient_cache = None;
+        self.pre_data.prover_only.subgroup = Vec::new();
+        self.pre_data.prover_only.fft_root_table = None;
         for lock in [
             &mut self.light_tx_data,
             &mut self.light_chain_data,
@@ -184,6 +186,16 @@ impl Circuits {
             // as the commitment above, so wherever that is dead this is too.
             // Clearing it is idempotent for a path that already released its own.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            // Backstop for the early-release paths: `sigmas` is dead once the
+            // circuit's last proof is produced. Idempotent for paths that
+            // already cleared it.
+            data.prover_only.sigmas = Vec::new();
+            // `subgroup` and `fft_root_table` are read only during this circuit's
+            // proof (LDE/permutation setup); the exclusive guard above proves no
+            // later read. Together they free the 2^19 group roots and FFT table
+            // (~16 MiB per circuit) at final-block peak RSS.
+            data.prover_only.subgroup = Vec::new();
+            data.prover_only.fft_root_table = None;
         }
     }
 
@@ -220,6 +232,17 @@ impl Circuits {
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            // `sigmas` is read only by proofs of this circuit; once the heavy
+            // path's chain proof is produced it is dead. The exclusive guard
+            // above proves no reader remains. Frees ~345 MiB (2^19 x routed)
+            // per heavy circuit at final-block peak RSS.
+            data.prover_only.sigmas = Vec::new();
+            // `subgroup` and `fft_root_table` are read only during this circuit's
+            // proof (LDE/permutation setup); the exclusive guard above proves no
+            // later read. Together they free the 2^19 group roots and FFT table
+            // (~16 MiB per circuit) at final-block peak RSS.
+            data.prover_only.subgroup = Vec::new();
+            data.prover_only.fft_root_table = None;
         }
     }
 
@@ -244,6 +267,16 @@ impl Circuits {
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            // `sigmas` is dead once the light path's chain proof is produced
+            // (read only by proofs of this circuit). Frees ~345 MiB per light
+            // circuit at final-block peak RSS.
+            data.prover_only.sigmas = Vec::new();
+            // `subgroup` and `fft_root_table` are read only during this circuit's
+            // proof (LDE/permutation setup); the exclusive guard above proves no
+            // later read. Together they free the 2^19 group roots and FFT table
+            // (~16 MiB per circuit) at final-block peak RSS.
+            data.prover_only.subgroup = Vec::new();
+            data.prover_only.fft_root_table = None;
         }
     }
 
