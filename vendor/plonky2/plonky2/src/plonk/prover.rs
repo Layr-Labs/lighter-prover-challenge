@@ -589,6 +589,63 @@ fn divide_chunk_products<F: Field>(
     }
 }
 
+const PERMUTATION_INV_BATCH: usize = 128;
+
+/// A zero-copy view of the existing singleton mask when each production quotient chunk is one
+/// complete byte. No plan is derived or stored: the row-major mask byte is already the exact
+/// chunk classification needed by the prover.
+#[derive(Clone, Copy)]
+struct WidthEightSingletonMask<'a> {
+    bytes: &'a [u8],
+    num_chunks: usize,
+}
+
+impl<'a> WidthEightSingletonMask<'a> {
+    fn new(
+        bytes: &'a [u8],
+        num_rows: usize,
+        num_routed_wires: usize,
+        quotient_degree_factor: usize,
+    ) -> Option<Self> {
+        if quotient_degree_factor != 8
+            || num_routed_wires == 0
+            || num_routed_wires % 8 != 0
+        {
+            return None;
+        }
+        let num_chunks = num_routed_wires / 8;
+        if num_rows.checked_mul(num_chunks)? != bytes.len()
+            || PERMUTATION_INV_BATCH.checked_mul(num_chunks)? > usize::from(u16::MAX) + 1
+        {
+            return None;
+        }
+        Some(Self { bytes, num_chunks })
+    }
+
+    #[inline(always)]
+    fn row(self, row: usize) -> &'a [u8] {
+        let start = row * self.num_chunks;
+        &self.bytes[start..start + self.num_chunks]
+    }
+}
+
+/// Invert one challenge's active chunks and scatter through the shared compact output order.
+/// Keeping the challenge batches independent preserves the promoted path's Montgomery operation
+/// order whenever no identity chunks were removed.
+#[inline]
+fn divide_sparse_chunk_products<F: Field>(
+    numerator_products: &mut [F],
+    denominator_products: &[F],
+    active_outputs: &[u16],
+    inverse_scratch: &mut Vec<F>,
+) {
+    debug_assert_eq!(denominator_products.len(), active_outputs.len());
+    F::batch_multiplicative_inverse_into(denominator_products, inverse_scratch);
+    for (&output, &inverse) in active_outputs.iter().zip(inverse_scratch.iter()) {
+        numerator_products[usize::from(output)] *= inverse;
+    }
+}
+
 /// Accumulate the sequential Z chain directly into the column-major output
 /// polynomials, deleting the per-point row Vec, the row-major intermediate,
 /// and the whole-phase transpose. Values and their order are identical to the
@@ -623,6 +680,98 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
     columns.into_iter().map(PolynomialValues::new).collect()
 }
 
+/// Traverse both challenge Z chains together. A fully singleton chunk has ratio one by symbolic
+/// cancellation, so its existing `0xff` mask byte advances neither accumulator.
+fn paired_z_polynomials_from_quotient_chunk_products<F: Field>(
+    all_quotient_chunk_products_0: Vec<F>,
+    all_quotient_chunk_products_1: Vec<F>,
+    num_prods: usize,
+    fixed_mask: WidthEightSingletonMask<'_>,
+) -> Vec<Vec<PolynomialValues<F>>> {
+    let num_chunks = num_prods + 1;
+    debug_assert_eq!(fixed_mask.num_chunks, num_chunks);
+    debug_assert_eq!(
+        all_quotient_chunk_products_0.len(),
+        all_quotient_chunk_products_1.len()
+    );
+    debug_assert_eq!(all_quotient_chunk_products_0.len() % num_chunks, 0);
+    let n_points = all_quotient_chunk_products_0.len() / num_chunks;
+    debug_assert_eq!(fixed_mask.bytes.len(), n_points * num_chunks);
+
+    let mut columns_0: Vec<Vec<F>> = (0..num_chunks)
+        .map(|_| Vec::with_capacity(n_points))
+        .collect();
+    let mut columns_1: Vec<Vec<F>> = (0..num_chunks)
+        .map(|_| Vec::with_capacity(n_points))
+        .collect();
+    let mut z_0 = F::ONE;
+    let mut z_1 = F::ONE;
+    for (row, (products_0, products_1)) in all_quotient_chunk_products_0
+        .chunks_exact(num_chunks)
+        .zip(all_quotient_chunk_products_1.chunks_exact(num_chunks))
+        .enumerate()
+    {
+        let mut acc_0 = z_0;
+        let mut acc_1 = z_1;
+        let mask_row = fixed_mask.row(row);
+        for chunk in 0..num_chunks {
+            if mask_row[chunk] != u8::MAX {
+                acc_0 *= products_0[chunk];
+                acc_1 *= products_1[chunk];
+            }
+            if chunk == num_prods {
+                columns_0[chunk].push(z_0);
+                columns_1[chunk].push(z_1);
+                z_0 = acc_0;
+                z_1 = acc_1;
+            } else {
+                columns_0[chunk].push(acc_0);
+                columns_1[chunk].push(acc_1);
+            }
+        }
+    }
+
+    vec![
+        columns_0.into_iter().map(PolynomialValues::new).collect(),
+        columns_1.into_iter().map(PolynomialValues::new).collect(),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+#[unroll::unroll_for_loops]
+fn dense_width_eight_permutation_chunk<F: RichField>(
+    witness: &MatrixWitness<F>,
+    row: usize,
+    start: usize,
+    sigmas: &[F],
+    x: F,
+    beta_k_is_0: &[F],
+    beta_k_is_1: &[F],
+    beta_0: F,
+    beta_1: F,
+    gamma_0: F,
+    gamma_1: F,
+) -> ([F; 2], [F; 2]) {
+    let mut numerator_0 = F::ONE;
+    let mut numerator_1 = F::ONE;
+    let mut denominator_0 = F::ONE;
+    let mut denominator_1 = F::ONE;
+    for lane in 0..8 {
+        let j = start + lane;
+        let wire_value = witness.get_wire(row, j);
+        let sigma = sigmas[j];
+        numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
+        numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
+        denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
+        denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+    }
+    (
+        [numerator_0, numerator_1],
+        [denominator_0, denominator_1],
+    )
+}
+
 /// Compute both production permutation challenges in one pass over the witness
 /// and sigma rows.
 ///
@@ -633,12 +782,219 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
 /// Fusing collapses two full traversals of the witness and sigma matrices, and
 /// two Rayon fork/joins over the subgroup, into one.
 ///
-/// Value-exactness: each challenge keeps its own accumulators, its own
-/// numerator/denominator multiplication order (`for j in start..end`), its own
-/// inversion batch in the same push order, and its own Z chain. Only the
-/// memory traversal and the Rayon scheduling are shared, so every output limb
-/// is bit-identical to running the per-challenge path twice.
 fn two_challenge_wires_permutation_partial_products_and_zs<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &MatrixWitness<F>,
+    betas: &[F],
+    beta_k_is: &[F],
+    gammas: &[F],
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+) -> Vec<Vec<PolynomialValues<F>>> {
+    let num_routed_wires = common_data.config.num_routed_wires;
+    let num_chunks = common_data.num_partial_products + 1;
+    if let Some(fixed_mask) = WidthEightSingletonMask::new(
+        &prover_data.fixed_routed_wires,
+        prover_data.subgroup.len(),
+        num_routed_wires,
+        common_data.quotient_degree_factor,
+    )
+    .filter(|fixed_mask| fixed_mask.num_chunks == num_chunks)
+    {
+        return two_challenge_width_eight_singleton_partial_products_and_zs(
+            witness,
+            betas,
+            beta_k_is,
+            gammas,
+            prover_data,
+            common_data,
+            fixed_mask,
+        );
+    }
+    two_challenge_wires_permutation_partial_products_and_zs_generic(
+        witness,
+        betas,
+        beta_k_is,
+        gammas,
+        prover_data,
+        common_data,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn two_challenge_width_eight_singleton_partial_products_and_zs<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &MatrixWitness<F>,
+    betas: &[F],
+    beta_k_is: &[F],
+    gammas: &[F],
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+    fixed_mask: WidthEightSingletonMask<'_>,
+) -> Vec<Vec<PolynomialValues<F>>> {
+    debug_assert_eq!(betas.len(), 2);
+    debug_assert_eq!(gammas.len(), 2);
+    let subgroup = &prover_data.subgroup;
+    let num_prods = common_data.num_partial_products;
+    let num_routed_wires = common_data.config.num_routed_wires;
+    let num_chunks = num_prods + 1;
+    debug_assert_eq!(common_data.quotient_degree_factor, 8);
+    debug_assert_eq!(num_chunks, num_routed_wires / 8);
+    debug_assert_eq!(fixed_mask.num_chunks, num_chunks);
+    debug_assert_eq!(beta_k_is.len(), 2 * num_routed_wires);
+    let (beta_k_is_0, beta_k_is_1) = beta_k_is.split_at(num_routed_wires);
+    let (beta_0, beta_1) = (betas[0], betas[1]);
+    let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
+
+    let product_count = subgroup.len() * num_chunks;
+    let mut quotient_products_0: Vec<F> = Vec::with_capacity(product_count);
+    let mut quotient_products_1: Vec<F> = Vec::with_capacity(product_count);
+    {
+        let product_slots_0 = crate::hash::merkle_tree::capacity_up_to_mut(
+            &mut quotient_products_0,
+            product_count,
+        );
+        let product_slots_1 = crate::hash::merkle_tree::capacity_up_to_mut(
+            &mut quotient_products_1,
+            product_count,
+        );
+        product_slots_0
+            .par_chunks_mut(PERMUTATION_INV_BATCH * num_chunks)
+            .zip(product_slots_1.par_chunks_mut(PERMUTATION_INV_BATCH * num_chunks))
+            .zip(subgroup.par_chunks(PERMUTATION_INV_BATCH))
+            .enumerate()
+            .for_each_init(
+                || {
+                    (
+                        Vec::with_capacity(num_chunks * PERMUTATION_INV_BATCH),
+                        Vec::with_capacity(num_chunks * PERMUTATION_INV_BATCH),
+                        Vec::with_capacity(num_chunks * PERMUTATION_INV_BATCH),
+                        Vec::with_capacity(num_chunks * PERMUTATION_INV_BATCH),
+                    )
+                },
+                |scratch, (chunk_idx, ((products_0, products_1), xs))| {
+                    let base = chunk_idx * PERMUTATION_INV_BATCH;
+                    let (
+                        denominators_0,
+                        denominators_1,
+                        denominator_inverses,
+                        active_outputs,
+                    ) = scratch;
+                    denominators_0.clear();
+                    denominators_1.clear();
+                    active_outputs.clear();
+                    for (t, &x) in xs.iter().enumerate() {
+                        let i = base + t;
+                        let s_sigmas = &prover_data.sigmas[i];
+                        let mask_row = fixed_mask.row(i);
+                        for (chunk, &skip_mask) in mask_row.iter().enumerate() {
+                            let output = t * num_chunks + chunk;
+                            let start = chunk * 8;
+                            let ([mut numerator_0, mut numerator_1], [mut denominator_0, mut denominator_1]);
+                            if skip_mask == 0 {
+                                // The most common active mode stays fixed-width and branch-free.
+                                ([numerator_0, numerator_1], [denominator_0, denominator_1]) =
+                                    dense_width_eight_permutation_chunk(
+                                        witness,
+                                        i,
+                                        start,
+                                        s_sigmas,
+                                        x,
+                                        beta_k_is_0,
+                                        beta_k_is_1,
+                                        beta_0,
+                                        beta_1,
+                                        gamma_0,
+                                        gamma_1,
+                                    );
+                            } else if skip_mask == u8::MAX {
+                                // All eight singleton factors cancel: no witness/sigma access,
+                                // denominator entry, inversion, or later Z multiplication.
+                                products_0[output].write(F::ONE);
+                                products_1[output].write(F::ONE);
+                                continue;
+                            } else {
+                                numerator_0 = F::ONE;
+                                numerator_1 = F::ONE;
+                                denominator_0 = F::ONE;
+                                denominator_1 = F::ONE;
+                                let mut active = !skip_mask;
+                                while active != 0 {
+                                    let lane = active.trailing_zeros() as usize;
+                                    let j = start + lane;
+                                    let wire_value = witness.get_wire(i, j);
+                                    let sigma = s_sigmas[j];
+                                    numerator_0 *=
+                                        wire_value + beta_k_is_0[j] * x + gamma_0;
+                                    numerator_1 *=
+                                        wire_value + beta_k_is_1[j] * x + gamma_1;
+                                    denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
+                                    denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                    active &= active - 1;
+                                }
+                            }
+                            products_0[output].write(numerator_0);
+                            products_1[output].write(numerator_1);
+                            denominators_0.push(denominator_0);
+                            denominators_1.push(denominator_1);
+                            debug_assert!(output <= usize::from(u16::MAX));
+                            active_outputs.push(output as u16);
+                        }
+                    }
+                    // SAFETY: the loop above wrote every slot of both
+                    // sub-slices — `t` covers `0..xs.len()` and `chunk` covers
+                    // `0..num_chunks`, and each sub-slice length is exactly
+                    // `xs.len() * num_chunks` (the `zip`s pair each pair of
+                    // chunks with its own `xs`, so a short final chunk is still
+                    // covered exactly).
+                    let products_0 = unsafe {
+                        &mut *(products_0 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
+                    };
+                    let products_1 = unsafe {
+                        &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
+                    };
+                    divide_sparse_chunk_products(
+                        products_0,
+                        denominators_0,
+                        active_outputs,
+                        denominator_inverses,
+                    );
+                    divide_sparse_chunk_products(
+                        products_1,
+                        denominators_1,
+                        active_outputs,
+                        denominator_inverses,
+                    );
+                },
+            );
+    }
+
+    // SAFETY: the parallel pass above wrote every one of the `product_count`
+    // slots of both buffers and divided every nonidentity slot;
+    // `par_chunks_mut` partitions each buffer exactly, so none is left
+    // uninitialized.
+    unsafe {
+        quotient_products_0.set_len(product_count);
+        quotient_products_1.set_len(product_count);
+    }
+
+    paired_z_polynomials_from_quotient_chunk_products(
+        quotient_products_0,
+        quotient_products_1,
+        num_prods,
+        fixed_mask,
+    )
+}
+
+/// Original fused implementation retained verbatim for non-production widths, unaligned rows,
+/// malformed masks, and unusually wide local batches.
+fn two_challenge_wires_permutation_partial_products_and_zs_generic<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
     const D: usize,
@@ -665,10 +1021,6 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
 
     const INV_BATCH: usize = 128;
     let product_count = subgroup.len() * num_chunks;
-    // Same uninitialised-capacity handling as the per-challenge path: every
-    // slot is written below before anything reads it, so zero-filling first is
-    // dead work (5.2 MiB of serial stores per challenge at the production
-    // shape).
     let mut quotient_products_0: Vec<F> = Vec::with_capacity(product_count);
     let mut quotient_products_1: Vec<F> = Vec::with_capacity(product_count);
     {
@@ -710,11 +1062,6 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             let mut denominator_0 = F::ONE;
                             let mut denominator_1 = F::ONE;
                             for j in start..end {
-                                // A singleton routed copy component maps this position to itself:
-                                // sigma(i,j) = k_j * x. Its numerator and denominator factors are
-                                // therefore identical for both challenges and cancel symbolically,
-                                // including when that common factor evaluates to zero. Check the
-                                // circuit-fixed bit before touching witness, sigma, x, or shifts.
                                 if fixed_routed_wire(
                                     &prover_data.fixed_routed_wires,
                                     routed_base + j,
@@ -735,12 +1082,6 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             denominators_1.push(denominator_1);
                         }
                     }
-                    // SAFETY: the loop above wrote every slot of both
-                    // sub-slices — `t` covers `0..xs.len()` and `chunk` covers
-                    // `0..num_chunks`, and each sub-slice length is exactly
-                    // `xs.len() * num_chunks` (the `zip`s pair each pair of
-                    // chunks with its own `xs`, so a short final chunk is still
-                    // covered exactly).
                     let products_0 = unsafe {
                         &mut *(products_0 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
                     };
@@ -753,9 +1094,6 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
             );
     }
 
-    // SAFETY: the parallel pass above wrote and then divided every one of the
-    // `product_count` slots of both buffers; `par_chunks_mut` partitions each
-    // buffer exactly, so none is left uninitialized.
     unsafe {
         quotient_products_0.set_len(product_count);
         quotient_products_1.set_len(product_count);
@@ -3280,20 +3618,18 @@ mod l_0_table_tests {
     }
 }
 
-/// Value-exactness gate for the fused two-challenge permutation path.
+/// Exactness gates for the fused two-challenge permutation path.
 ///
-/// `two_challenge_wires_permutation_partial_products_and_zs` must be a pure
-/// traversal/scheduling change: for the same witness, sigmas, subgroup and
-/// challenges it has to reproduce, **limb for limb**, what two independent
-/// `wires_permutation_partial_products_and_zs` calls produce. Goldilocks
-/// canonicalises inside `PartialEq`, so field equality would hide a path that
-/// returned a different representative of the same residue; the primary
-/// comparisons here are on the raw `to_noncanonical_u64` limbs instead.
+/// With an all-zero singleton mask, the width-eight specialization retains each challenge's
+/// multiplication, inversion, and Z order and must reproduce two independent general calls limb
+/// for limb. With actual singleton deletion, identity denominators are omitted from Montgomery
+/// batches and identity Z steps are skipped; those transformations preserve field values and the
+/// verifier relation but need not preserve noncanonical Goldilocks representatives.
 #[cfg(all(test, feature = "std"))]
 mod permutation_pairing_tests {
     use crate::field::polynomial::PolynomialValues;
     use crate::field::types::{Field, Field64, PrimeField64};
-    use crate::iop::witness::MatrixWitness;
+    use crate::iop::witness::{MatrixWitness, PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
@@ -3301,7 +3637,7 @@ mod permutation_pairing_tests {
     use super::{
         all_wires_permutation_partial_products, paired_permutation_batch_count,
         two_challenge_wires_permutation_partial_products_and_zs,
-        wires_permutation_partial_products_and_zs,
+        wires_permutation_partial_products_and_zs, WidthEightSingletonMask,
     };
     use crate::plonk::permutation_argument::fixed_routed_wire;
 
@@ -3445,11 +3781,6 @@ mod permutation_pairing_tests {
     #[test]
     fn paired_two_challenge_path_is_limb_identical_to_general_loop() {
         let mut data = build_circuit();
-        // This differential replaces the circuit's subgroup and sigmas with arbitrary values,
-        // so its builder-derived fixed mask no longer describes those injected sigma rows. Keep
-        // this test focused on its original unmasked fused-vs-general limb-identity contract;
-        // dedicated fixed-mask tests exercise the mask/sigma invariant and cancellation path.
-        data.prover_only.fixed_routed_wires.fill(0);
         let num_routed_wires = data.common.config.num_routed_wires;
         let degree = data.common.quotient_degree_factor;
         let num_prods = data.common.num_partial_products;
@@ -3499,6 +3830,16 @@ mod permutation_pairing_tests {
 
             data.prover_only.subgroup = subgroup.clone();
             data.prover_only.sigmas = sigmas.clone();
+            // The injected sigmas have no fixed-point contract, so install an exact-size all-zero
+            // mask. This forces the width-eight specialization while deleting no factor.
+            data.prover_only.fixed_routed_wires = vec![0; n_points * num_chunks];
+            assert!(WidthEightSingletonMask::new(
+                &data.prover_only.fixed_routed_wires,
+                n_points,
+                num_routed_wires,
+                degree,
+            )
+            .is_some());
 
             // Reference: the general per-challenge loop, two complete passes.
             let general: Vec<Vec<PolynomialValues<F>>> = (0..2)
@@ -3534,8 +3875,22 @@ mod permutation_pairing_tests {
             assert_eq!(
                 raw_limbs(&paired),
                 raw_limbs(&general),
-                "fused path diverged from the general loop at {n_points} points"
+                "width-eight path diverged from the general loop at {n_points} points"
             );
+
+            // Truncating the runtime mask must fail closed into the original generic fused path,
+            // which retains the same raw-limb contract.
+            data.prover_only.fixed_routed_wires.pop();
+            let fallback = two_challenge_wires_permutation_partial_products_and_zs(
+                &witness,
+                &betas,
+                &beta_k_is,
+                &gammas,
+                &data.prover_only,
+                &data.common,
+            );
+            assert_eq!(raw_limbs(&fallback), raw_limbs(&general));
+            data.prover_only.fixed_routed_wires = vec![0; n_points * num_chunks];
 
             // The dispatcher must route the production shape to the fused path
             // and return the same thing, and the counter must move — otherwise
@@ -3627,6 +3982,28 @@ mod permutation_pairing_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn width_eight_singleton_path_proves_and_verifies() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let x = builder.add_virtual_target();
+        let square = builder.mul(x, x);
+        builder.register_public_input(square);
+        let data = builder.build::<C>();
+        assert!(WidthEightSingletonMask::new(
+            &data.prover_only.fixed_routed_wires,
+            data.prover_only.subgroup.len(),
+            data.common.config.num_routed_wires,
+            data.common.quotient_degree_factor,
+        )
+        .is_some());
+
+        let mut witness = PartialWitness::new();
+        witness.set_target(x, F::from_canonical_u64(9)).unwrap();
+        let proof = data.prove(witness).unwrap();
+        data.verify(proof).unwrap();
     }
 
     /// Differential for the actual runtime mask seam. It uses the circuit's real sigma oracle,
