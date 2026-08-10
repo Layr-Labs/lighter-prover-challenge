@@ -11,7 +11,12 @@ use anyhow::ensure;
 use plonky2_maybe_rayon::*;
 use serde::{Deserialize, Serialize};
 
+use core::any::TypeId;
+
+use crate::field::extension::quadratic::QuadraticExtension;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::goldilocks_extensions::ext2_base_scalar_dot_product_batch;
+use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::polynomial::PolynomialCoeffs;
 use crate::field::types::Field;
 use crate::fri::oracle::PolynomialBatch;
@@ -373,6 +378,72 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
             }
         }
         let eval_polynomials = |pows: &[F::Extension], polynomials: &[PolynomialCoeffs<F>]| {
+            // Goldilocks quadratic: evaluate a block of polynomials against one
+            // shared powers table with delayed reduction, streaming powers once
+            // per block instead of once per polynomial (same field value as the
+            // independent dots; raw representatives may differ).
+            if TypeId::of::<F>() == TypeId::of::<GoldilocksField>() && D == 2 {
+                // SAFETY: TypeId proves F is GoldilocksField and D is 2, so
+                // F::Extension is QuadraticExtension<GoldilocksField>.
+                let powers = unsafe {
+                    core::slice::from_raw_parts(
+                        pows.as_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
+                        pows.len(),
+                    )
+                };
+                // Parallelize over poly blocks so each worker reuses one powers
+                // stream for BLOCK polys (see batch helper).
+                const PARALLEL_POLYS: usize = 16;
+                if polynomials.len() <= PARALLEL_POLYS {
+                    let slices: Vec<&[GoldilocksField]> = polynomials
+                        .iter()
+                        .map(|p| {
+                            let c = p.coeffs.as_slice();
+                            unsafe {
+                                core::slice::from_raw_parts(
+                                    c.as_ptr().cast::<GoldilocksField>(),
+                                    c.len(),
+                                )
+                            }
+                        })
+                        .collect();
+                    let dots = ext2_base_scalar_dot_product_batch(powers, &slices);
+                    // SAFETY: TypeId proves the extension type identity.
+                    let mut dots = core::mem::ManuallyDrop::new(dots);
+                    return unsafe {
+                        Vec::from_raw_parts(
+                            dots.as_mut_ptr().cast::<F::Extension>(),
+                            dots.len(),
+                            dots.capacity(),
+                        )
+                    };
+                }
+                let mut out = vec![F::Extension::ZERO; polynomials.len()];
+                out.par_chunks_mut(PARALLEL_POLYS)
+                    .enumerate()
+                    .for_each(|(block, out_chunk)| {
+                        let start = block * PARALLEL_POLYS;
+                        let slices: Vec<&[GoldilocksField]> = polynomials
+                            [start..start + out_chunk.len()]
+                            .iter()
+                            .map(|p| {
+                                let c = p.coeffs.as_slice();
+                                unsafe {
+                                    core::slice::from_raw_parts(
+                                        c.as_ptr().cast::<GoldilocksField>(),
+                                        c.len(),
+                                    )
+                                }
+                            })
+                            .collect();
+                        let dots = ext2_base_scalar_dot_product_batch(powers, &slices);
+                        for (dst, src) in out_chunk.iter_mut().zip(dots.iter()) {
+                            // SAFETY: same TypeId layout argument as above.
+                            *dst = unsafe { core::mem::transmute_copy(src) };
+                        }
+                    });
+                return out;
+            }
             polynomials
                 .par_iter()
                 .map(|p| F::extension_base_dot_product(pows, &p.coeffs))

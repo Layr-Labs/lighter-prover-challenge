@@ -279,6 +279,77 @@ fn ext2_base_scalar_dot_product(
     result
 }
 
+/// Cache-blocked multi-polynomial dual of [`ext2_base_scalar_dot_product`]:
+/// for each polynomial `j`,
+/// `out[j] = sum_i powers[i].scalar_mul(polys[j][i])` (shorter length wins),
+/// delaying modular reduction across coefficients while streaming `powers`
+/// once per block of polynomials.
+///
+/// Independent per-poly delayed dots re-read the entire powers table for
+/// every polynomial. OpeningSet evaluates dozens to hundreds of same-degree
+/// polynomials against one powers table per proof; this layout keeps the
+/// powers stream hot and updates a small block of accumulators together.
+///
+/// Safety bound matches the single-poly path: each raw limb product is at
+/// most `(2^64-1)^2`, and for `n <= 2^32 - 1` terms the 160-bit sum satisfies
+/// `reduce160`. Production degrees are far below that. Field-equal to
+/// independent single-poly dots; raw representatives may differ.
+#[inline]
+pub fn ext2_base_scalar_dot_product_batch(
+    powers: &[QuadraticExtension<GoldilocksField>],
+    polys: &[&[GoldilocksField]],
+) -> Vec<QuadraticExtension<GoldilocksField>> {
+    const BLOCK: usize = 8;
+    let mut out = Vec::with_capacity(polys.len());
+    out.resize(polys.len(), QuadraticExtension::ZERO);
+    if polys.is_empty() || powers.is_empty() {
+        return out;
+    }
+
+    let mut block_start = 0usize;
+    while block_start < polys.len() {
+        let block_end = (block_start + BLOCK).min(polys.len());
+        let block = &polys[block_start..block_end];
+        let n = block.len();
+
+        let mut lo0 = [0u128; BLOCK];
+        let mut hi0 = [0u32; BLOCK];
+        let mut lo1 = [0u128; BLOCK];
+        let mut hi1 = [0u32; BLOCK];
+
+        let max_len = block
+            .iter()
+            .map(|p| p.len().min(powers.len()))
+            .max()
+            .unwrap_or(0);
+        debug_assert!(max_len <= u32::MAX as usize);
+
+        for i in 0..max_len {
+            let QuadraticExtension([p0, p1]) = powers[i];
+            let p0 = p0.0;
+            let p1 = p1.0;
+            for j in 0..n {
+                if i < block[j].len() {
+                    let c = block[j][i].0;
+                    u160_add_product(&mut lo0[j], &mut hi0[j], p0, c);
+                    u160_add_product(&mut lo1[j], &mut hi1[j], p1, c);
+                }
+            }
+        }
+
+        for j in 0..n {
+            // SAFETY: max_len is production-bounded well below 2^32, so the
+            // single-poly reduce160 bound applies to each accumulator.
+            out[block_start + j] = QuadraticExtension([
+                unsafe { reduce160(lo0[j], hi0[j]) },
+                unsafe { reduce160(lo1[j], hi1[j]) },
+            ]);
+        }
+        block_start = block_end;
+    }
+    out
+}
+
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction
 /// across the complete production FRI arity. For raw limbs below 2^64,
 ///
@@ -806,6 +877,54 @@ mod tests {
             <GF as Extendable<4>>::extension_base_dot_product(&[], &scalars),
             Q4::ZERO
         );
+    }
+
+    #[test]
+    fn ext2_base_scalar_dot_product_batch_matches_independent_dots() {
+        for n_polys in [1usize, 3, 8, 9, 17] {
+            for degree in [0usize, 1, 7, 64, 257] {
+                let powers: Vec<Q2> = (0..degree)
+                    .map(|i| {
+                        QuadraticExtension([
+                            GoldilocksField(
+                                (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                            ),
+                            GoldilocksField(
+                                (i as u64 + 3).wrapping_mul(0xC2B2_AE3D_27D4_EB4F),
+                            ),
+                        ])
+                    })
+                    .collect();
+                let polys: Vec<Vec<GoldilocksField>> = (0..n_polys)
+                    .map(|j| {
+                        let len = if degree == 0 {
+                            0
+                        } else {
+                            degree - (j % (degree.min(3) + 1))
+                        };
+                        (0..len)
+                            .map(|i| {
+                                GoldilocksField(
+                                    (i as u64 + 1 + j as u64)
+                                        .wrapping_mul(0x85EB_CA77_C2B2_AE63),
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let slices: Vec<&[GoldilocksField]> =
+                    polys.iter().map(|p| p.as_slice()).collect();
+                let batch = super::ext2_base_scalar_dot_product_batch(&powers, &slices);
+                assert_eq!(batch.len(), n_polys);
+                for (j, poly) in polys.iter().enumerate() {
+                    let independent = super::ext2_base_scalar_dot_product(&powers, poly);
+                    assert_eq!(
+                        batch[j], independent,
+                        "mismatch n_polys={n_polys} degree={degree} poly={j}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
