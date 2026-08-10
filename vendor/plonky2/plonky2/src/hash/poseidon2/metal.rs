@@ -21,6 +21,7 @@ use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
 
 use crate::field::types::{Field, PrimeField64};
+use crate::field::goldilocks_field::GoldilocksField;
 use crate::hash::hash_types::{HashOut, RichField};
 use crate::hash::merkle_tree::{DigestStore, LevelOrderDigests};
 use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
@@ -3546,6 +3547,8 @@ impl MetalShared {
             }));
         }
         let output_buffer = set.output.as_ref().unwrap();
+        let cpu_parent_finish =
+            core::any::TypeId::of::<F>() == core::any::TypeId::of::<GoldilocksField>();
 
         let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
@@ -3588,7 +3591,16 @@ impl MetalShared {
             if child_count > cap_count {
                 encoder.set_compute_pipeline_state(&self.parent_pipeline);
             }
-            while child_count > cap_count {
+            // Each parent-level dispatch costs a near-constant ~75-90 us of
+            // barrier drain plus launch overhead regardless of its size, so
+            // for the top levels the fixed latency dwarfs the compute by an
+            // order of magnitude. Encode parent levels on the GPU only while
+            // they are wide; the calling thread — which is about to block in
+            // `wait_until_completed` anyway — finishes the sub-cutoff levels
+            // itself (Goldilocks only; other fields keep the full chain).
+            while child_count > cap_count
+                && (!cpu_parent_finish || child_count / 2 >= GPU_PARENT_MIN_DISPATCH)
+            {
                 // Every parent level reads the output written by the preceding
                 // dispatch. Keep the whole tree in one compute encoder while
                 // preserving the leaf-to-parent and parent-to-parent hazards.
@@ -3640,6 +3652,20 @@ impl MetalShared {
             ));
         }
 
+        if cpu_parent_finish {
+            let gpu_levels = level_offsets.len() - 1;
+            let remaining_children = leaf_count >> gpu_levels;
+            if remaining_children > cap_count {
+                let output_buffer = set.output.as_ref().unwrap();
+                finish_parent_levels_on_cpu(
+                    output_buffer,
+                    &mut level_offsets,
+                    remaining_children,
+                    cap_count,
+                );
+            }
+        }
+
         self.completed_tree_readback(
             set,
             output_len,
@@ -3647,6 +3673,58 @@ impl MetalShared {
             leaf_count,
             cap_height,
         )
+    }
+}
+
+/// Minimum parent-dispatch width kept on the GPU. Below this, the fixed
+/// ~75-90 us barrier-drain + launch latency of one more dispatch exceeds the
+/// CPU cost of hashing the whole remaining sub-tree (~0.17 ms for the 2032
+/// two-to-one hashes under a 2048-wide cutoff at cap height 4).
+const GPU_PARENT_MIN_DISPATCH: usize = 2048;
+
+/// Hashes the top parent levels of a level-order digest buffer on the CPU,
+/// continuing exactly where the truncated GPU chain stopped. Byte-identical
+/// to the deleted GPU dispatches: the parent kernel canonicalizes every
+/// digest limb, the CPU/GPU two-to-one equivalence is covered by this
+/// module's differential tests, and every limb written here is canonicalized
+/// before the store.
+fn finish_parent_levels_on_cpu(
+    output_buffer: &Buffer,
+    level_offsets: &mut Vec<usize>,
+    mut child_count: usize,
+    cap_count: usize,
+) {
+    use crate::hash::poseidon2::hash::Poseidon2Hash;
+    use crate::plonk::config::Hasher;
+
+    // SAFETY: the buffer is `StorageModeShared`, the command buffer completed
+    // (all GPU writes visible), and the caller holds the buffer set, so this
+    // thread has exclusive access. All offsets below stay inside the sized
+    // output allocation (same arithmetic as the GPU encode loop).
+    let base = output_buffer.contents() as *mut u64;
+    let mut level_offset = *level_offsets.last().expect("leaf level present");
+    while child_count > cap_count {
+        let parent_count = child_count / 2;
+        let child_offset = level_offset;
+        level_offset += child_count * 4;
+        level_offsets.push(level_offset);
+        let children =
+            unsafe { slice::from_raw_parts(base.add(child_offset), child_count * 4) };
+        let parents =
+            unsafe { slice::from_raw_parts_mut(base.add(level_offset), parent_count * 4) };
+        for (pair, out) in children.chunks_exact(8).zip(parents.chunks_exact_mut(4)) {
+            let left = HashOut {
+                elements: core::array::from_fn(|k| GoldilocksField(pair[k])),
+            };
+            let right = HashOut {
+                elements: core::array::from_fn(|k| GoldilocksField(pair[4 + k])),
+            };
+            let digest = <Poseidon2Hash as Hasher<GoldilocksField>>::two_to_one(left, right);
+            for (dst, limb) in out.iter_mut().zip(digest.elements) {
+                *dst = limb.to_canonical_u64();
+            }
+        }
+        child_count = parent_count;
     }
 }
 

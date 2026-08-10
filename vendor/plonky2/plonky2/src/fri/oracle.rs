@@ -6,7 +6,10 @@ use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
+use crate::field::extension::quadratic::QuadraticExtension;
 use crate::field::extension::Extendable;
+use crate::field::goldilocks_extensions::ext2_mul_add;
+use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::fft::{
     FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
 };
@@ -796,6 +799,35 @@ fn accumulate_linear_quotient<F: Field>(
     buf[d - 1] *= shift;
     // Synthetic division, highest coefficient first: the quotient's
     // coefficient at `x^i` is the accumulator after absorbing `coeffs[i + 1]`.
+    //
+    // Goldilocks-quadratic fast path: both statements are `a * b + c`, so the
+    // addend folds into the extension multiply's 160-bit accumulators —
+    // one reduction pair per statement, no separate canonicalizing extension
+    // adds. Field-equal to the mul-then-add form; the raw representative may
+    // differ, under the same license as `reduce_polys_base` (these
+    // coefficients are consumed value-wise and every serialized limb is
+    // canonicalized).
+    if core::any::TypeId::of::<F>()
+        == core::any::TypeId::of::<QuadraticExtension<GoldilocksField>>()
+    {
+        type QE = QuadraticExtension<GoldilocksField>;
+        // SAFETY (all casts): the `TypeId` compare proves `F` is exactly
+        // `QuadraticExtension<GoldilocksField>`; only the generic spelling
+        // differs, so the reinterpretations preserve layout exactly.
+        let z = unsafe { *(&z as *const F).cast::<QE>() };
+        let shift = unsafe { *(&shift as *const F).cast::<QE>() };
+        let coeffs =
+            unsafe { core::slice::from_raw_parts(coeffs.as_ptr().cast::<QE>(), coeffs.len()) };
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<QE>(), buf.len())
+        };
+        let mut acc = QE::ZERO;
+        for i in (0..d - 1).rev() {
+            acc = ext2_mul_add(acc, z, coeffs[i + 1]);
+            buf[i] = ext2_mul_add(buf[i], shift, acc);
+        }
+        return;
+    }
     let mut acc = F::ZERO;
     for i in (0..d - 1).rev() {
         acc = acc * z + coeffs[i + 1];
@@ -1039,11 +1071,17 @@ mod tests {
 
         type F = <GoldilocksField as Extendable<2>>::Extension;
 
+        // Canonical-value comparison, not raw: the Goldilocks-quadratic fast
+        // path folds each addend into the multiply's delayed-reduction
+        // accumulators, so its sub-2^64 representatives can differ from the
+        // mul-then-add reference while denoting the same field element (the
+        // `reduce_polys_base` license; consumers are value-wise and
+        // serialization canonicalizes every limb).
         fn raw(values: &[F]) -> Vec<u64> {
             values
                 .iter()
                 .flat_map(|x| FieldExtension::<2>::to_basefield_array(x))
-                .map(|c: GoldilocksField| c.to_noncanonical_u64())
+                .map(|c: GoldilocksField| c.to_canonical_u64())
                 .collect()
         }
 

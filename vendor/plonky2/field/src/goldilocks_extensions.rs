@@ -322,6 +322,47 @@ pub fn ext2_base_scalar_dot_slots(
     }
 }
 
+/// `a * b + c` in GF(p^2), folding the addend into the 160-bit accumulators
+/// so each output limb still costs exactly one `reduce160` — the plain
+/// `ext2_mul` cost, with the two canonicalizing extension adds of a separate
+/// `+ c` deleted.
+///
+/// Bounds (all raw limbs below 2^64): the first-limb accumulator is below
+/// `(1 + 7) * 2^128 + 2^64 < 2^131` after the `u160_times_7` fold, the
+/// second below `2 * 2^128 + 2^64` — both far under `reduce160`'s
+/// `2^160 - 2^128 + 2^96` precondition. Field-equal to `a * b + c`; the raw
+/// representative may differ from the mul-then-add spelling.
+#[inline(always)]
+pub fn ext2_mul_add(
+    a: QuadraticExtension<GoldilocksField>,
+    b: QuadraticExtension<GoldilocksField>,
+    c: QuadraticExtension<GoldilocksField>,
+) -> QuadraticExtension<GoldilocksField> {
+    const_assert!(<GoldilocksField as Extendable<2>>::W.0 == 7u64);
+    let QuadraticExtension([a0, a1]) = a;
+    let QuadraticExtension([b0, b1]) = b;
+    let QuadraticExtension([c0, c1]) = c;
+
+    let (mut plain_lo, mut plain_hi) = (c0.0 as u128, 0u32);
+    let (mut w_lo, mut w_hi) = (0u128, 0u32);
+    let (mut out1_lo, mut out1_hi) = (c1.0 as u128, 0u32);
+    u160_add_product(&mut plain_lo, &mut plain_hi, a0.0, b0.0);
+    u160_add_product(&mut w_lo, &mut w_hi, a1.0, b1.0);
+    u160_add_product(&mut out1_lo, &mut out1_hi, a0.0, b1.0);
+    u160_add_product(&mut out1_lo, &mut out1_hi, a1.0, b0.0);
+
+    let (w_lo, w_hi) = u160_times_7(w_lo, w_hi);
+    let (out0_lo, carry) = plain_lo.overflowing_add(w_lo);
+    let out0_hi = plain_hi + w_hi + carry as u32;
+
+    // SAFETY: the accumulator bounds documented above are far below
+    // reduce160's precondition.
+    QuadraticExtension([
+        unsafe { reduce160(out0_lo, out0_hi) },
+        unsafe { reduce160(out1_lo, out1_hi) },
+    ])
+}
+
 /*
  * Quadratic multiplication and squaring
  */
