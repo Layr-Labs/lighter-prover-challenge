@@ -191,7 +191,13 @@ fn chain_step_proof(
                 feeder,
             )
         })?;
-        BlockTxChainCircuit::prove_prepared(pending, chain_data)
+        if path == TxPath::Light {
+            plonky2::hash::poseidon2::with_light_chain_gpu_routing(|| {
+                BlockTxChainCircuit::prove_prepared(pending, chain_data)
+            })
+        } else {
+            BlockTxChainCircuit::prove_prepared(pending, chain_data)
+        }
     })();
     result.unwrap_or_else(|error| {
         panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")

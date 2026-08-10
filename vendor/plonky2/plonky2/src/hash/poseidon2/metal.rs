@@ -1112,11 +1112,10 @@ pub fn is_exclusive_gpu_phase() -> bool {
     EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Number of Merkle builds currently occupying the serialized GPU stream
-/// (from buffer acquisition through `wait_until_completed`). Routing reads
-/// this to decide whether a small serial-path tree would enqueue behind
-/// in-flight work; the count is a heuristic only — either routing outcome
-/// hashes the identical tree, so races are benign.
+/// Number of guarded Metal jobs occupying or queued on the serialized GPU
+/// stream. Routing reads this to decide whether a serial-path tree would
+/// enqueue behind in-flight work; the count is a heuristic only — either
+/// routing outcome hashes the identical tree, so races are benign.
 static GPU_JOBS_IN_FLIGHT: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
@@ -1161,16 +1160,36 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     // The ~15 ms CPU build beats that queue wait by an order of magnitude
     // for the narrow shapes (width <= 64: the Z/partial-product and quotient
     // trees), so route those to the GPU only while its stream is unoccupied.
-    // The width-135 wires tree stays on the GPU unconditionally: its CPU
-    // build (~17 permutations per leaf) costs about as much as the queue
-    // wait and measurably starves the fold's pure-CPU phases.
+    // Wide wire trees normally stay on the GPU. The fixed light-chain spine
+    // is the exception while another GPU job is live: current traces show its
+    // width-136 tree waiting seconds behind transaction quotient work, while
+    // the same tree completes in roughly 230 ms after the queue drains. Route
+    // only that contended tree to CPU; idle-GPU, heavy-chain, transaction,
+    // pre-execution, and final-block routing remain unchanged.
     let serial_critical_shape = leaf_count == 1 << 17 && leaf_width > 4;
     if serial_critical_shape {
-        return exclusive
-            || leaf_width > 64
-            || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
+        let gpu_idle = GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
+        return super::serial_critical_tree_uses_gpu(
+            exclusive,
+            gpu_idle,
+            super::is_light_chain_gpu_routing(),
+            leaf_width,
+        );
     }
     leaf_permutations + parent_permutations >= min_permutations
+}
+
+/// Retains the promoted allocation policy even when the light chain elects to
+/// hash one contended wide tree on the CPU. The shared wire columns remain
+/// available to the later Metal quotient kernels; only the tree backend moves.
+fn gpu_storage_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bool {
+    let serial_critical_shape = leaf_count == 1 << 17 && leaf_width > 4;
+    if serial_critical_shape {
+        let exclusive = EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed);
+        let gpu_idle = GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
+        return super::serial_critical_storage_uses_gpu(exclusive, gpu_idle, leaf_width);
+    }
+    gpu_worthwhile(leaf_width, leaf_count, cap_height)
 }
 
 fn shared_context() -> Option<&'static MetalShared> {
@@ -1799,7 +1818,7 @@ pub(crate) fn allocate_columns<F: RichField>(
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
         || cap_height > rows.ilog2() as usize
-        || !gpu_worthwhile(cols, rows, cap_height)
+        || !gpu_storage_worthwhile(cols, rows, cap_height)
     {
         return None;
     }
