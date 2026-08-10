@@ -45,6 +45,19 @@ const PARALLEL_WORKLIST_THRESHOLD: usize = 64;
 /// overhead across cheap generators while leaving enough tasks for load balancing.
 const PARALLEL_WORKLIST_CHUNK: usize = 64;
 
+/// Canonical ascending ready set used only for the first generator round.
+/// It avoids materializing `0..generators.len()` on every witness while every
+/// dynamically produced ready set retains the legacy `Vec<usize>` behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InitialAll {
+    len: usize,
+}
+
+enum GeneratorReadyQueue {
+    Dynamic(Vec<usize>),
+    InitialAll(InitialAll),
+}
+
 #[cfg(all(feature = "parallel", feature = "std"))]
 mod parallel_witness_context {
     use core::cell::Cell;
@@ -105,6 +118,143 @@ fn parallel_rounds_enabled() -> bool {
     false
 }
 
+type ParallelGeneratorRoundOutput<'a, F> = (
+    Vec<(usize, bool, usize)>,
+    Vec<(Target, F, Option<&'a [usize]>)>,
+);
+
+/// Runs one ordered parallel chunk against a shared witness snapshot. Both
+/// the materialized worklist and [`InitialAll`] use this exact execution core;
+/// only their source of ascending generator indices differs.
+#[inline]
+fn run_parallel_generator_chunk<'a, F, I, const D: usize>(
+    generator_indices: I,
+    generators: &[WitnessGeneratorRef<F, D>],
+    generator_indices_by_watches: &'a GeneratorWatchIndex,
+    round_witness: &PartitionWitness<F>,
+    round_unresolved_watches: &[usize],
+    round_generator_is_expired: &[bool],
+) -> ParallelGeneratorRoundOutput<'a, F>
+where
+    F: RichField + Extendable<D>,
+    I: ExactSizeIterator<Item = usize>,
+{
+    let mut entries = Vec::with_capacity(generator_indices.len());
+    let mut annotated_values = Vec::new();
+    let mut round_buffer = GeneratedValues::empty();
+    for generator_idx in generator_indices {
+        if round_generator_is_expired[generator_idx] {
+            continue;
+        }
+        let finished = generators[generator_idx].0.run_with_ready_hint(
+            round_witness,
+            &mut round_buffer,
+            round_unresolved_watches[generator_idx] == 0,
+        );
+        entries.push((generator_idx, finished, round_buffer.target_values.len()));
+        for (t, v) in round_buffer.target_values.drain(..) {
+            let rep_index =
+                round_witness.representative_map[round_witness.target_index(t)] as usize;
+            let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
+                generator_indices_by_watches.get(&rep_index)
+            } else {
+                None
+            };
+            annotated_values.push((t, v, watchers));
+        }
+    }
+    (entries, annotated_values)
+}
+
+/// Merges ordered parallel chunks using the legacy per-generator and
+/// per-produced-value order.
+#[inline]
+fn merge_parallel_generator_round<F: Field>(
+    round_outputs: Vec<ParallelGeneratorRoundOutput<'_, F>>,
+    witness: &mut PartitionWitness<F>,
+    unresolved_watches: &mut [usize],
+    generator_is_expired: &mut [bool],
+    remaining_generators: &mut usize,
+    next_pending_generator_indices: &mut Vec<usize>,
+) -> Result<()> {
+    for (entries, annotated_values) in round_outputs {
+        let mut annotated_values = annotated_values.into_iter();
+        for (generator_idx, finished, value_count) in entries {
+            if finished {
+                generator_is_expired[generator_idx] = true;
+                *remaining_generators -= 1;
+            }
+
+            for (t, v, watchers) in annotated_values.by_ref().take(value_count) {
+                if witness.set_target_returning_rep(t, v)?.is_none() {
+                    continue;
+                }
+                if let Some(watchers) = watchers {
+                    for &watching_generator_idx in watchers {
+                        if !generator_is_expired[watching_generator_idx] {
+                            debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
+                            unresolved_watches[watching_generator_idx] -= 1;
+                            next_pending_generator_indices.push(watching_generator_idx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Runs an ordered serial ready set with the legacy immediate merge behavior.
+#[inline]
+fn run_serial_generator_indices<F, C, I, const D: usize>(
+    generator_indices: I,
+    witness: &mut PartitionWitness<F>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    unresolved_watches: &mut [usize],
+    generator_is_expired: &mut [bool],
+    remaining_generators: &mut usize,
+    next_pending_generator_indices: &mut Vec<usize>,
+    buffer: &mut GeneratedValues<F>,
+) -> Result<()>
+where
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    I: IntoIterator<Item = usize>,
+{
+    let generators = &prover_data.generators;
+    let generator_indices_by_watches = &prover_data.generator_indices_by_watches;
+    for generator_idx in generator_indices {
+        if generator_is_expired[generator_idx] {
+            continue;
+        }
+
+        let finished = generators[generator_idx].0.run_with_ready_hint(
+            witness,
+            buffer,
+            unresolved_watches[generator_idx] == 0,
+        );
+        if finished {
+            generator_is_expired[generator_idx] = true;
+            *remaining_generators -= 1;
+        }
+
+        for (t, v) in buffer.target_values.drain(..) {
+            if let Some(watch) = witness.set_target_returning_rep(t, v)? {
+                if let Some(watchers) = generator_indices_by_watches.get(&watch) {
+                    for &watching_generator_idx in watchers {
+                        if !generator_is_expired[watching_generator_idx] {
+                            debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
+                            unresolved_watches[watching_generator_idx] -= 1;
+                            next_pending_generator_indices.push(watching_generator_idx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Runs the given pending generators, and transitively any generator watching a newly populated
 /// representative, until no further progress can be made.
 ///
@@ -124,11 +274,15 @@ fn run_generator_worklist<
     unresolved_watches: &mut [usize],
     generator_is_expired: &mut [bool],
     remaining_generators: &mut usize,
-    mut pending_generator_indices: Vec<usize>,
+    pending_generator_indices: GeneratorReadyQueue,
     parallel_threshold: usize,
 ) -> Result<()> {
     let generators = &prover_data.generators;
     let generator_indices_by_watches = &prover_data.generator_indices_by_watches;
+    let (mut initial_all, mut pending_generator_indices) = match pending_generator_indices {
+        GeneratorReadyQueue::Dynamic(indices) => (None, indices),
+        GeneratorReadyQueue::InitialAll(initial) => (Some(initial), Vec::new()),
+    };
 
     let parallel_rounds = parallel_rounds_enabled();
     let mut buffer = GeneratedValues::empty();
@@ -147,14 +301,21 @@ fn run_generator_worklist<
     let mut next_pending_generator_indices = Vec::new();
 
     // Keep running generators until we fail to make progress.
-    while !pending_generator_indices.is_empty() {
+    loop {
+        let ready_len = initial_all.map_or(pending_generator_indices.len(), |initial| initial.len);
+        if ready_len == 0 {
+            break;
+        }
         next_pending_generator_indices.clear();
 
-        if parallel_rounds && pending_generator_indices.len() >= parallel_threshold {
+        if parallel_rounds && ready_len >= parallel_threshold {
             // A generator can be enqueued once per newly populated watch, and may have expired
-            // in the round that enqueued it; run each remaining generator exactly once.
-            pending_generator_indices.sort_unstable();
-            pending_generator_indices.dedup();
+            // in the round that enqueued it; run each remaining generator exactly once. Only the
+            // canonical initial range can skip the dynamic queue's sort and dedup.
+            if initial_all.is_none() {
+                pending_generator_indices.sort_unstable();
+                pending_generator_indices.dedup();
+            }
 
             // Run phase: every generator reads the same witness snapshot and each chunk writes
             // into its own buffers, so the round is data-parallel while chunking amortizes
@@ -167,70 +328,52 @@ fn run_generator_worklist<
             let round_witness: &PartitionWitness<F> = witness;
             let round_unresolved_watches: &[usize] = unresolved_watches;
             let round_generator_is_expired: &[bool] = generator_is_expired;
-            #[allow(clippy::type_complexity)]
-            let round_outputs: Vec<(
-                Vec<(usize, bool, usize)>,
-                Vec<(Target, F, Option<&[usize]>)>,
-            )> = pending_generator_indices
-                .par_chunks(PARALLEL_WORKLIST_CHUNK)
-                .map(|chunk| {
-                    let mut entries = Vec::with_capacity(chunk.len());
-                    let mut annotated_values = Vec::new();
-                    let mut round_buffer = GeneratedValues::empty();
-                    for &generator_idx in chunk {
-                        if round_generator_is_expired[generator_idx] {
-                            continue;
-                        }
-                        let finished = generators[generator_idx].0.run_with_ready_hint(
-                            round_witness,
-                            &mut round_buffer,
-                            round_unresolved_watches[generator_idx] == 0,
-                        );
-                        entries.push((generator_idx, finished, round_buffer.target_values.len()));
-                        for (t, v) in round_buffer.target_values.drain(..) {
-                            let rep_index = round_witness.representative_map
-                                [round_witness.target_index(t)]
-                                as usize;
-                            let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
-                                generator_indices_by_watches.get(&rep_index)
-                            } else {
-                                // The representative is populated in the snapshot, so the merge
-                                // cannot newly populate it and never needs watchers.
-                                None
-                            };
-                            annotated_values.push((t, v, watchers));
-                        }
-                    }
-                    (entries, annotated_values)
-                })
-                .collect();
+            let round_outputs: Vec<ParallelGeneratorRoundOutput<'_, F>> =
+                if let Some(initial) = initial_all {
+                    let num_chunks = initial.len.div_ceil(PARALLEL_WORKLIST_CHUNK);
+                    (0..num_chunks)
+                        .into_par_iter()
+                        .map(|chunk_index| {
+                            let chunk_start = chunk_index * PARALLEL_WORKLIST_CHUNK;
+                            let chunk_end =
+                                (chunk_start + PARALLEL_WORKLIST_CHUNK).min(initial.len);
+                            run_parallel_generator_chunk(
+                                chunk_start..chunk_end,
+                                generators,
+                                generator_indices_by_watches,
+                                round_witness,
+                                round_unresolved_watches,
+                                round_generator_is_expired,
+                            )
+                        })
+                        .collect()
+                } else {
+                    pending_generator_indices
+                        .par_chunks(PARALLEL_WORKLIST_CHUNK)
+                        .map(|chunk| {
+                            run_parallel_generator_chunk(
+                                chunk.iter().copied(),
+                                generators,
+                                generator_indices_by_watches,
+                                round_witness,
+                                round_unresolved_watches,
+                                round_generator_is_expired,
+                            )
+                        })
+                        .collect()
+                };
 
             // Merge phase: sequential and in ascending generator-index order, exactly like the
             // sequential loop's per-generator merge.
-            for (entries, annotated_values) in round_outputs {
-                let mut annotated_values = annotated_values.into_iter();
-                for (generator_idx, finished, value_count) in entries {
-                    if finished {
-                        generator_is_expired[generator_idx] = true;
-                        *remaining_generators -= 1;
-                    }
-
-                    for (t, v, watchers) in annotated_values.by_ref().take(value_count) {
-                        if witness.set_target_returning_rep(t, v)?.is_none() {
-                            continue;
-                        }
-                        if let Some(watchers) = watchers {
-                            for &watching_generator_idx in watchers {
-                                if !generator_is_expired[watching_generator_idx] {
-                                    debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                                    unresolved_watches[watching_generator_idx] -= 1;
-                                    next_pending_generator_indices.push(watching_generator_idx);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            merge_parallel_generator_round(
+                round_outputs,
+                witness,
+                unresolved_watches,
+                generator_is_expired,
+                remaining_generators,
+                &mut next_pending_generator_indices,
+            )?;
+            initial_all = None;
 
             core::mem::swap(
                 &mut pending_generator_indices,
@@ -239,42 +382,30 @@ fn run_generator_worklist<
             continue;
         }
 
-        for &generator_idx in &pending_generator_indices {
-            if generator_is_expired[generator_idx] {
-                continue;
-            }
-
-            let finished = generators[generator_idx].0.run_with_ready_hint(
+        if let Some(initial) = initial_all {
+            run_serial_generator_indices(
+                0..initial.len,
                 witness,
+                prover_data,
+                unresolved_watches,
+                generator_is_expired,
+                remaining_generators,
+                &mut next_pending_generator_indices,
                 &mut buffer,
-                unresolved_watches[generator_idx] == 0,
-            );
-            if finished {
-                generator_is_expired[generator_idx] = true;
-                *remaining_generators -= 1;
-            }
-
-            // Merge any generated values into our witness and, for each newly populated
-            // target's representative, immediately enqueue the unfinished generators watching
-            // it. The witness merge (`witness`) and the watcher bookkeeping
-            // (`generator_indices_by_watches`, `generator_is_expired`, `unresolved_watches`)
-            // touch disjoint state, so fusing the two passes deletes the per-run intermediate
-            // rep Vec while preserving both the `set_target_returning_rep` call order and the
-            // pending-queue push order exactly.
-            for (t, v) in buffer.target_values.drain(..) {
-                if let Some(watch) = witness.set_target_returning_rep(t, v)? {
-                    if let Some(watchers) = generator_indices_by_watches.get(&watch) {
-                        for &watching_generator_idx in watchers {
-                            if !generator_is_expired[watching_generator_idx] {
-                                debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                                unresolved_watches[watching_generator_idx] -= 1;
-                                next_pending_generator_indices.push(watching_generator_idx);
-                            }
-                        }
-                    }
-                }
-            }
+            )?;
+        } else {
+            run_serial_generator_indices(
+                pending_generator_indices.iter().copied(),
+                witness,
+                prover_data,
+                unresolved_watches,
+                generator_is_expired,
+                remaining_generators,
+                &mut next_pending_generator_indices,
+                &mut buffer,
+            )?;
         }
+        initial_all = None;
 
         core::mem::swap(
             &mut pending_generator_indices,
@@ -283,6 +414,34 @@ fn run_generator_worklist<
     }
 
     Ok(())
+}
+
+/// Runs the canonical first-round ready set without materializing the ascending
+/// generator indices. Subsequent ready sets are still dynamically populated
+/// [`GeneratorReadyQueue::Dynamic`] queues.
+fn run_initial_generator_worklist<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &mut PartitionWitness<F>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    unresolved_watches: &mut [usize],
+    generator_is_expired: &mut [bool],
+    remaining_generators: &mut usize,
+    parallel_threshold: usize,
+) -> Result<()> {
+    run_generator_worklist(
+        witness,
+        prover_data,
+        unresolved_watches,
+        generator_is_expired,
+        remaining_generators,
+        GeneratorReadyQueue::InitialAll(InitialAll {
+            len: prover_data.generators.len(),
+        }),
+        parallel_threshold,
+    )
 }
 
 /// Seeds `inputs` into `witness` and returns, per generator, the number of distinct
@@ -457,6 +616,24 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         common_data: &CommonCircuitData<F, D>,
         parallel_threshold: usize,
     ) -> Result<Self> {
+        Self::start_with_threshold_and_queue(
+            inputs,
+            prover_data,
+            common_data,
+            parallel_threshold,
+            GeneratorReadyQueue::InitialAll(InitialAll {
+                len: prover_data.generators.len(),
+            }),
+        )
+    }
+
+    fn start_with_threshold_and_queue(
+        inputs: PartialWitness<F>,
+        prover_data: &'a ProverOnlyCircuitData<F, C, D>,
+        common_data: &CommonCircuitData<F, D>,
+        parallel_threshold: usize,
+        initial_queue: GeneratorReadyQueue,
+    ) -> Result<Self> {
         let generators = &prover_data.generators;
 
         let mut witness = PartitionWitness::new(
@@ -475,14 +652,15 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
 
-        // Initially, all generators are queued.
+        // Initially, all generators are queued. Production callers always use
+        // the canonical range; the materialized variant is test-only below.
         run_generator_worklist(
             &mut witness,
             prover_data,
             &mut unresolved_watches,
             &mut generator_is_expired,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            initial_queue,
             parallel_threshold,
         )?;
 
@@ -494,6 +672,31 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             prover_data,
             parallel_threshold,
         })
+    }
+
+    #[cfg(test)]
+    fn start_with_threshold_and_initial_range(
+        inputs: PartialWitness<F>,
+        prover_data: &'a ProverOnlyCircuitData<F, C, D>,
+        common_data: &CommonCircuitData<F, D>,
+        parallel_threshold: usize,
+        use_initial_range: bool,
+    ) -> Result<Self> {
+        let generator_count = prover_data.generators.len();
+        let initial_queue = if use_initial_range {
+            GeneratorReadyQueue::InitialAll(InitialAll {
+                len: generator_count,
+            })
+        } else {
+            GeneratorReadyQueue::Dynamic((0..generator_count).collect())
+        };
+        Self::start_with_threshold_and_queue(
+            inputs,
+            prover_data,
+            common_data,
+            parallel_threshold,
+            initial_queue,
+        )
     }
 
     /// Like [`Self::start`], but the initial inputs are written by `seed`
@@ -525,13 +728,12 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         let mut remaining_generators = generators.len();
 
         // Initially, all generators are queued.
-        run_generator_worklist(
+        run_initial_generator_worklist(
             &mut witness,
             prover_data,
             &mut unresolved_watches,
             &mut generator_is_expired,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
             PARALLEL_WORKLIST_THRESHOLD,
         )?;
 
@@ -572,7 +774,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &mut self.unresolved_watches,
             &mut self.generator_is_expired,
             &mut self.remaining_generators,
-            pending_generator_indices,
+            GeneratorReadyQueue::Dynamic(pending_generator_indices),
             self.parallel_threshold,
         )
     }
@@ -601,7 +803,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &mut self.unresolved_watches,
             &mut self.generator_is_expired,
             &mut self.remaining_generators,
-            pending_generator_indices,
+            GeneratorReadyQueue::Dynamic(pending_generator_indices),
             self.parallel_threshold,
         )
     }
@@ -993,6 +1195,7 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D> for Con
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1063,6 +1266,61 @@ mod tests {
         run_calls: Arc<AtomicUsize>,
     }
 
+    #[derive(Debug)]
+    struct InitialRangeTestGenerator {
+        index: usize,
+        dependencies: Vec<Target>,
+        output: Target,
+        addend: u64,
+        invocations: Option<Arc<AtomicUsize>>,
+    }
+
+    impl WitnessGenerator<F, D> for InitialRangeTestGenerator {
+        fn id(&self) -> String {
+            format!("InitialRangeTestGenerator({})", self.index)
+        }
+
+        fn watch_list(&self) -> Vec<Target> {
+            self.dependencies.clone()
+        }
+
+        fn run(
+            &self,
+            witness: &PartitionWitness<F>,
+            out_buffer: &mut GeneratedValues<F>,
+        ) -> bool {
+            if let Some(invocations) = &self.invocations {
+                invocations.fetch_add(1, Ordering::Relaxed);
+            }
+            let Some(value) = self
+                .dependencies
+                .iter()
+                .try_fold(F::from_canonical_u64(self.addend), |sum, &target| {
+                    witness.try_get_target(target).map(|value| sum + value)
+                })
+            else {
+                return false;
+            };
+            out_buffer.set_target(self.output, value).unwrap();
+            true
+        }
+
+        fn serialize(
+            &self,
+            _dst: &mut Vec<u8>,
+            _common_data: &CommonCircuitData<F, D>,
+        ) -> IoResult<()> {
+            unreachable!("test generator is never serialized")
+        }
+
+        fn deserialize(
+            _src: &mut Buffer,
+            _common_data: &CommonCircuitData<F, D>,
+        ) -> IoResult<Self> {
+            unreachable!("test generator is never deserialized")
+        }
+    }
+
     impl WitnessGenerator<F, D> for IncrementalGenerator {
         fn id(&self) -> String {
             "IncrementalGenerator".to_string()
@@ -1099,6 +1357,232 @@ mod tests {
         ) -> IoResult<Self> {
             unreachable!("test generator is never deserialized")
         }
+    }
+
+    fn initial_range_fixture(
+        generator_count: usize,
+    ) -> Result<(
+        crate::plonk::circuit_data::CircuitData<F, C, D>,
+        PartialWitness<F>,
+        Target,
+        Target,
+        Arc<AtomicUsize>,
+    )> {
+        assert!(generator_count >= 2);
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let seed = builder.add_virtual_target();
+        let predecessor = builder.add_virtual_target();
+        let dependent_output = builder.add_virtual_target();
+        let independent_outputs = (2..generator_count)
+            .map(|_| builder.add_virtual_target())
+            .collect::<Vec<_>>();
+        let mut circuit = builder.build::<C>();
+
+        // Generator 0 observes the seed before generator 1 creates its
+        // predecessor. Its first invocation must stay pending, then the
+        // predecessor merge queues it into the ordinary dynamic Vec round.
+        let dependent_invocations = Arc::new(AtomicUsize::new(0));
+        let mut generators = Vec::with_capacity(generator_count);
+        generators.push(WitnessGeneratorRef::new(InitialRangeTestGenerator {
+            index: 0,
+            dependencies: vec![seed, predecessor],
+            output: dependent_output,
+            addend: 3,
+            invocations: Some(Arc::clone(&dependent_invocations)),
+        }));
+        generators.push(WitnessGeneratorRef::new(InitialRangeTestGenerator {
+            index: 1,
+            dependencies: Vec::new(),
+            output: predecessor,
+            addend: 11,
+            invocations: None,
+        }));
+        generators.extend(independent_outputs.into_iter().enumerate().map(
+            |(offset, output)| {
+                let index = offset + 2;
+                WitnessGeneratorRef::new(InitialRangeTestGenerator {
+                    index,
+                    dependencies: Vec::new(),
+                    output,
+                    addend: 100 + index as u64,
+                    invocations: None,
+                })
+            },
+        ));
+
+        let index_witness = PartitionWitness::<F>::new(
+            circuit.common.config.num_wires,
+            circuit.common.degree(),
+            &circuit.prover_only.representative_map,
+        );
+        let mut watch_map = BTreeMap::<usize, Vec<usize>>::new();
+        let mut watch_counts = Vec::with_capacity(generator_count);
+        for (generator_index, generator) in generators.iter().enumerate() {
+            let mut representatives = generator
+                .0
+                .watch_list()
+                .into_iter()
+                .map(|target| {
+                    circuit.prover_only.representative_map[index_witness.target_index(target)]
+                        as usize
+                })
+                .collect::<Vec<_>>();
+            representatives.sort_unstable();
+            representatives.dedup();
+            watch_counts.push(representatives.len());
+            for representative in representatives {
+                watch_map
+                    .entry(representative)
+                    .or_default()
+                    .push(generator_index);
+            }
+        }
+        drop(index_witness);
+        circuit.prover_only.generators = generators;
+        circuit.prover_only.generator_watch_counts = watch_counts;
+        circuit.prover_only.generator_indices_by_watches =
+            GeneratorWatchIndex::from_map(watch_map);
+        assert_eq!(circuit.prover_only.generators.len(), generator_count);
+
+        let mut inputs = PartialWitness::new();
+        inputs.set_target(seed, F::from_canonical_u64(7))?;
+        Ok((
+            circuit,
+            inputs,
+            predecessor,
+            dependent_output,
+            dependent_invocations,
+        ))
+    }
+
+    fn compare_initial_range_control_candidate(
+        circuit: &crate::plonk::circuit_data::CircuitData<F, C, D>,
+        inputs: &PartialWitness<F>,
+        predecessor: Target,
+        dependent_output: Target,
+        dependent_invocations: &AtomicUsize,
+        parallel_threshold: usize,
+        parallel_context: bool,
+        case: &str,
+    ) -> Result<()> {
+        let exercise = || -> Result<()> {
+            let _guard = parallel_context.then(ParallelWitnessGuard::new);
+            let before = dependent_invocations.load(Ordering::Relaxed);
+            let control = PendingPartitionWitness::start_with_threshold_and_initial_range(
+                inputs.clone(),
+                &circuit.prover_only,
+                &circuit.common,
+                parallel_threshold,
+                false,
+            )?;
+            assert_eq!(
+                dependent_invocations.load(Ordering::Relaxed) - before,
+                2,
+                "control did not resume dependent generator: {case}"
+            );
+            let before = dependent_invocations.load(Ordering::Relaxed);
+            let candidate = PendingPartitionWitness::start_with_threshold_and_initial_range(
+                inputs.clone(),
+                &circuit.prover_only,
+                &circuit.common,
+                parallel_threshold,
+                true,
+            )?;
+            assert_eq!(
+                dependent_invocations.load(Ordering::Relaxed) - before,
+                2,
+                "candidate did not resume dependent generator: {case}"
+            );
+
+            assert_eq!(control.witness.values, candidate.witness.values, "{case}");
+            assert_eq!(
+                control.witness.set_bitmap, candidate.witness.set_bitmap,
+                "{case}"
+            );
+            assert_eq!(
+                control.unresolved_watches, candidate.unresolved_watches,
+                "{case}"
+            );
+            assert_eq!(
+                control.generator_is_expired, candidate.generator_is_expired,
+                "{case}"
+            );
+            assert_eq!(
+                control.remaining_generators, candidate.remaining_generators,
+                "{case}"
+            );
+            assert_eq!(candidate.remaining_generators, 0, "{case}");
+            assert_eq!(
+                candidate.witness.get_target(dependent_output),
+                F::from_canonical_u64(21),
+                "seed/predecessor result mismatch: {case}"
+            );
+
+            let mut contradictory = inputs.clone();
+            contradictory.set_target(predecessor, F::from_canonical_u64(99))?;
+            let control_error =
+                PendingPartitionWitness::start_with_threshold_and_initial_range(
+                    contradictory.clone(),
+                    &circuit.prover_only,
+                    &circuit.common,
+                    parallel_threshold,
+                    false,
+                )
+                .unwrap_err()
+                .to_string();
+            let candidate_error =
+                PendingPartitionWitness::start_with_threshold_and_initial_range(
+                    contradictory,
+                    &circuit.prover_only,
+                    &circuit.common,
+                    parallel_threshold,
+                    true,
+                )
+                .unwrap_err()
+                .to_string();
+            assert_eq!(control_error, candidate_error, "{case}");
+            assert!(control_error.contains("set twice with different values"));
+            Ok(())
+        };
+
+        if parallel_context {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()?
+                .install(exercise)
+        } else {
+            exercise()
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "parallel", feature = "std"))]
+    fn initial_all_matches_materialized_queue_at_parallel_boundary() -> Result<()> {
+        for generator_count in [63usize, 64, 65] {
+            let (circuit, inputs, predecessor, dependent_output, dependent_invocations) =
+                initial_range_fixture(generator_count)?;
+            compare_initial_range_control_candidate(
+                &circuit,
+                &inputs,
+                predecessor,
+                dependent_output,
+                &dependent_invocations,
+                usize::MAX,
+                false,
+                &format!("serial count={generator_count}"),
+            )?;
+            compare_initial_range_control_candidate(
+                &circuit,
+                &inputs,
+                predecessor,
+                dependent_output,
+                &dependent_invocations,
+                PARALLEL_WORKLIST_THRESHOLD,
+                true,
+                &format!("adaptive count={generator_count}"),
+            )?;
+        }
+        Ok(())
     }
 
     #[test]
