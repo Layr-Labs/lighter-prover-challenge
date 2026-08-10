@@ -51,6 +51,8 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 }
 
 const LIGHT_TX_PROOF_WINDOW: usize = 4;
+const HEAVY_TX_PROOF_WINDOW: usize = 3;
+const TX_WITNESS_RUN_AHEAD: usize = 2;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
@@ -68,22 +70,17 @@ fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
 /// Whether the calling transaction path may claim the process-global exclusive
 /// GPU phase for its chain tail.
 ///
-/// `set_exclusive_gpu_phase` lowers the CPU/GPU Merkle routing cutoff and makes
-/// the 2^17-leaf narrow commitment trees (the chain steps' Z/partial-product and
-/// quotient trees) bypass the GPU occupancy check entirely. Its documented
-/// contract is that no other proof runs concurrently while it is enabled, because
-/// Metal command buffers execute FIFO on one queue: a fold's ~8 ms tree enqueued
-/// behind a pipelined 2^19-leaf chunk tree waits hundreds of milliseconds instead
-/// of ~15 ms on the CPU.
+/// `set_exclusive_gpu_phase` enables work that is safe only after every sibling
+/// proof has drained, including parallel zero-tail FFT rounds. Its documented
+/// contract is that no other proof runs concurrently while it is enabled.
 ///
 /// The tail-drain condition each path can test locally — "this path spawns no
 /// further chunk work" — is *not* that contract. The heavy path has three chunks
 /// and the light path forty-nine, so the heavy path reaches its drain while the
 /// light pipeline is at full saturation. Claiming the exclusive phase there
-/// disables occupancy-conditional routing process-wide for the light pipeline and
-/// simultaneously force-routes this path's own fold trees behind the light
-/// pipeline's chunk trees — it hurts both sides. The claim is legitimate only for
-/// the path that is the last one still proving, which this counter identifies.
+/// changes exclusive scheduling process-wide while the light pipeline remains
+/// active. The claim is legitimate only for the path that is the last one still
+/// proving, which this counter identifies.
 ///
 /// Routing is a scheduling heuristic: either outcome hashes the identical tree,
 /// so a stale read here is benign and no proof byte depends on the answer.
@@ -375,11 +372,11 @@ fn prove_path(
     );
     let mut jump = JumpState::initial(pre_output.new_state_root, old_account_delta_tree_root);
     let mut chunks = chunks.into_iter();
-    let (mut current_chunk_index, first_txs) =
+    let (first_chunk_index, first_txs) =
         chunks.next().expect("transaction path must not be empty");
-    let (mut current_witness, next_jump) = generate_tx_witness(
+    let (first_witness, next_jump) = generate_tx_witness(
         path,
-        current_chunk_index,
+        first_chunk_index,
         first_txs,
         tx_data,
         tx_target,
@@ -388,7 +385,10 @@ fn prove_path(
         jump,
     );
     jump = next_jump;
-
+    let mut ready_witnesses = std::collections::VecDeque::from([(
+        first_chunk_index,
+        first_witness,
+    )]);
 
     let chain_proof = std::thread::scope(|scope| {
         let base = &base_proof;
@@ -421,16 +421,21 @@ fn prove_path(
                 chain = Some(ChainState::InFlight(handle));
             }
 
-            let witness = current_witness;
+            let (chunk_index, witness) = ready_witnesses
+                .pop_front()
+                .expect("transaction witness queue must not be empty");
             let proof_handle = std::thread::Builder::new()
                 .name(format!("{path:?}-tx-proof-{current_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
-                    prove_tx_witness(path, current_chunk_index, tx_data, witness)
+                    prove_tx_witness(path, chunk_index, tx_data, witness)
                 })
                 .expect("transaction proof pipeline thread must start");
 
-            let next_witness = chunks.next().map(|(chunk_index, txs)| {
+            while ready_witnesses.len() < TX_WITNESS_RUN_AHEAD {
+                let Some((chunk_index, txs)) = chunks.next() else {
+                    break;
+                };
                 let (witness, next_jump) = generate_tx_witness(
                     path,
                     chunk_index,
@@ -442,8 +447,8 @@ fn prove_path(
                     jump,
                 );
                 jump = next_jump;
-                (chunk_index, witness)
-            });
+                ready_witnesses.push_back((chunk_index, witness));
+            }
 
             in_flight.push_back((current_step, proof_handle));
             #[cfg(feature = "diagnostic_profile")]
@@ -452,12 +457,13 @@ fn prove_path(
                 "tx_in_flight",
                 in_flight.len() as u64,
             );
-            let max_in_flight =
-                if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
+            let max_in_flight = match path {
+                TxPath::Heavy => HEAVY_TX_PROOF_WINDOW,
+                TxPath::Light if current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP => {
                     LIGHT_TX_PROOF_WINDOW
-                } else {
-                    1
-                };
+                }
+                TxPath::Light => 1,
+            };
             if in_flight.len() >= max_in_flight {
                 let (proof_step, proof_handle) = in_flight
                     .pop_front()
@@ -471,12 +477,8 @@ fn prove_path(
             }
             current_step += 1;
 
-            match next_witness {
-                Some((chunk_index, witness)) => {
-                    current_chunk_index = chunk_index;
-                    current_witness = witness;
-                }
-                None => break,
+            if ready_witnesses.is_empty() {
+                break;
             }
         }
 
@@ -501,10 +503,9 @@ fn prove_path(
             chain = Some(ChainState::InFlight(handle));
         }
         // Past this point the pipeline spawns no new chunk work: the drain
-        // below is the strictly sequential chain tail, so its mid-size
-        // commitment trees can use the mostly idle GPU exactly like the
-        // pre-execution and final block phases — but only once this path is the
-        // last one proving, since the switch is process-global (see
+        // below is the strictly sequential chain tail, so it can use the
+        // exclusive scheduling mode — but only once this path is the last one
+        // proving, since the switch is process-global (see
         // [`claims_exclusive_gpu_phase`]).
         let exclusive_drain = claims_exclusive_gpu_phase(active_paths);
         #[cfg(feature = "diagnostic_profile")]
@@ -610,8 +611,7 @@ pub(crate) fn prove_pre_execution_parallel(
 #[cfg(test)]
 pub fn prove_block(block: Block<F>, circuits: Circuits) -> Proof {
     // The pre-execution proof runs strictly before any other proving work, so
-    // the serialized GPU stream is otherwise idle: route its mid-size column
-    // trees to the GPU for just this phase.
+    // it can use the exclusive scheduling mode for just this phase.
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
     let pre_proof = prove_pre_execution_parallel(
         &circuits.pre_data,
@@ -833,9 +833,8 @@ pub(crate) fn prove_block_after_pre(
     // opts into parallel worklist rounds; tx-proof and chain witness generation run concurrently
     // with proving and stay sequential.
     let _parallel_block_witness = ParallelWitnessGuard::new();
-    // For the same reason the serialized GPU stream is otherwise idle here:
-    // route the final block proof's mid-size column trees to the GPU for just
-    // this phase.
+    // For the same reason the final block proof can use the exclusive
+    // scheduling mode for just this phase.
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
     let mut block_pending = block_pending;
     {

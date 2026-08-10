@@ -132,26 +132,6 @@ const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
 /// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
 /// window and is treated as contaminated evidence.
 const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
-/// Lower routing threshold used only while an exclusive serial proving phase
-/// is active (see [`set_exclusive_gpu_phase`]). During the pre-execution and
-/// final block proofs nothing else can contend for the serialized GPU stream,
-/// so the mid-size column trees those proofs commit (their Zs/partial-products
-/// tree at 524,272 estimated permutations and quotient tree at 393,200 miss
-/// the default 1<<19 cutoff) hash on an otherwise idle GPU. The global cutoff
-/// stays untouched for the pipelined phases, where lowering it is the
-/// documented priority-inversion regression.
-// Measured head-to-head (equal-output asserted, warm runs, cap height 4):
-// the GPU wins ~2x already at 262,128 permutations (2^17-leaf width-8 trees:
-// CPU 14.9 ms vs GPU 7.8 ms) — the chain-step quotient/FRI commitment shape,
-// which sits 16 permutations BELOW the 1 << 18 gate and was still hashing on
-// the CPU during the exclusive phases. 1 << 17 captures it; the measured
-// GPU/CPU break-even is ~131k permutations.
-// Within an exclusive phase nothing contends for the GPU, so even the
-// measured-parity shapes win: 2^16-leaf width-8 trees (131,056 permutations)
-// measured GPU/CPU 0.88 warm with zero contention. 1 << 16 admits them while
-// still keeping the genuinely CPU-favored tiny shapes (2^15 width-8 measured
-// 1.37) on the CPU.
-const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
 /// Upper bound on concurrently in-flight GPU tree builds. One set serializes
 /// GPU tree builds exactly like the promoted base's global context mutex: a
 /// 3-set experiment measured 13-18% faster locally but scored -21.6% on the
@@ -1098,8 +1078,7 @@ pub fn prewarm() {
 static EXCLUSIVE_GPU_PHASE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Marks the start/end of an exclusive serial proving phase during which the
-/// GPU routing cutoff drops to [`EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS`].
+/// Marks the start/end of an exclusive serial proving phase.
 /// Callers must guarantee no other proof runs concurrently while enabled.
 pub fn set_exclusive_gpu_phase(enabled: bool) {
     EXCLUSIVE_GPU_PHASE.store(enabled, core::sync::atomic::Ordering::Relaxed);
@@ -1142,35 +1121,13 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
         leaf_width.div_ceil(8) * leaf_count
     };
     let parent_permutations = leaf_count - (1usize << cap_height);
-    let exclusive = EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed);
-    let min_permutations = if exclusive {
-        EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS
-    } else {
-        MIN_GPU_PERMUTATIONS
-    };
-    // The 2^17-leaf commitment trees are produced only by the degree-2^14
-    // serial circuits (chain steps and pre-execution; the pipelined chunk
-    // circuits commit at 2^19 leaves and their FRI folds at 2^16 and below).
-    // Those trees sit on the strictly sequential critical path in every
-    // phase and measured ~2x faster on the GPU when the stream is idle
-    // (2^17 width-8: CPU 14.9 ms vs GPU 7.8 ms). But command buffers execute
-    // FIFO per queue, so when a pipelined 2^19-leaf chunk tree is already in
-    // flight the fold tree waits behind it: phase-level spans on an M-series
-    // host measured the fold's commit phases at 200-320 ms under pipeline
-    // load versus 10-50 ms alone, while its pure-CPU phases inflated <1.3x.
-    // The ~15 ms CPU build beats that queue wait by an order of magnitude
-    // for the narrow shapes (width <= 64: the Z/partial-product and quotient
-    // trees), so route those to the GPU only while its stream is unoccupied.
-    // The width-135 wires tree stays on the GPU unconditionally: its CPU
-    // build (~17 permutations per leaf) costs about as much as the queue
-    // wait and measurably starves the fold's pure-CPU phases.
-    let serial_critical_shape = leaf_count == 1 << 17 && leaf_width > 4;
-    if serial_critical_shape {
-        return exclusive
-            || leaf_width > 64
-            || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
-    }
-    leaf_permutations + parent_permutations >= min_permutations
+    let permutations = leaf_permutations + parent_permutations;
+    let large_tree = permutations >= MIN_GPU_PERMUTATIONS;
+    let mid_tree = leaf_count == 1 << 17 && leaf_width > 4;
+    let first_heavy_task = std::thread::current()
+        .name()
+        .is_some_and(|name| name == "Heavy-tx-proof-0");
+    large_tree || (mid_tree && first_heavy_task)
 }
 
 fn shared_context() -> Option<&'static MetalShared> {
