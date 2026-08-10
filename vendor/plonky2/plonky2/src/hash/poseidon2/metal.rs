@@ -1799,8 +1799,15 @@ pub(crate) fn allocate_columns<F: RichField>(
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
         || cap_height > rows.ilog2() as usize
-        || !gpu_worthwhile(cols, rows, cap_height)
     {
+        return None;
+    }
+    // Decouple shared-column allocation from hash routing. The chain-fold
+    // trees at 2^17 rows and narrow widths (5-64) benefit from shared Metal
+    // storage even when the GPU is busy and the hash is CPU-routed, because
+    // the permutation-quotient kernel binds those columns directly.
+    let chain_fold_admit = rows == (1 << 17) && cols >= 5 && cols <= 64;
+    if !chain_fold_admit && !gpu_worthwhile(cols, rows, cap_height) {
         return None;
     }
 
