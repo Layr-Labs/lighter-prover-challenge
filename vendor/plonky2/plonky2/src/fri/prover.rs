@@ -13,9 +13,9 @@ use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQuerySt
 use crate::fri::{FriConfig, FriParams};
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
-use crate::hash::merkle_tree::MerkleTree;
+use crate::hash::merkle_tree::{ColumnStore, MerkleTree};
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
@@ -122,6 +122,76 @@ fn bitrev_flatten<F: RichField + Extendable<D>, const D: usize>(values: &[F::Ext
     flat
 }
 
+/// Fills the natural-order columns whose bit-reversed rows are exactly the
+/// arity-sized leaves produced by [`bitrev_flatten`]. If `A = 2^arity_bits`
+/// and `R = values.len() / A`, column `j * D + k` holds limb `k` of
+/// `values[reverse_bits(j, arity_bits) * R + r]` at row `r`.
+///
+/// A column-backed Merkle tree reverses the `log2(R)` row bits when reading a
+/// leaf. Thus leaf position `i * A + j` addresses
+/// `reverse_bits(j, arity_bits) * R + reverse_bits(i, log2(R))`, equal to the
+/// full-width `reverse_bits(i * A + j, log2(values.len()))` used by the flat
+/// path. Grouping the `D` limb columns also decomposes each extension value
+/// only once.
+fn fill_fri_columns<F: RichField + Extendable<D>, const D: usize>(
+    values: &[F::Extension],
+    arity_bits: usize,
+    columns: &mut ColumnStore<F>,
+) -> bool {
+    let arity = 1 << arity_bits;
+    assert_eq!(values.len() % arity, 0);
+    let rows = values.len() / arity;
+    let Some(mut destinations) = columns.columns_mut() else {
+        return false;
+    };
+    assert_eq!(destinations.len(), arity * D);
+    assert!(destinations.iter().all(|column| column.len() == rows));
+
+    destinations
+        .par_chunks_mut(D)
+        .enumerate()
+        .for_each(|(j, limb_columns)| {
+            let source_start = reverse_bits(j, arity_bits) * rows;
+            for (r, value) in values[source_start..source_start + rows]
+                .iter()
+                .enumerate()
+            {
+                let limbs = value.to_basefield_array();
+                for (column, limb) in limb_columns.iter_mut().zip(limbs) {
+                    column[r] = limb;
+                }
+            }
+        });
+    true
+}
+
+/// Tries the retained shared-column Merkle route used by the Metal Poseidon2
+/// backend. Every declined step returns `None`, allowing the caller to execute
+/// the historical flat construction unchanged.
+fn try_fri_column_merkle_tree<
+    F: RichField + Extendable<D>,
+    H: Hasher<F>,
+    const D: usize,
+>(
+    values: &[F::Extension],
+    arity_bits: usize,
+    cap_height: usize,
+) -> Option<MerkleTree<F, H>> {
+    let arity = 1 << arity_bits;
+    assert_eq!(values.len() % arity, 0);
+    let rows = values.len() / arity;
+    let mut columns = H::try_allocate_merkle_tree_columns(arity * D, rows, cap_height)?;
+    if !fill_fri_columns::<F, D>(values, arity_bits, &mut columns) {
+        return None;
+    }
+    let (level_digests, cap) = H::try_build_merkle_tree_column_store(&columns, cap_height)?;
+    Some(MerkleTree::from_prebuilt_columns(
+        columns,
+        level_digests,
+        cap,
+    ))
+}
+
 fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     mut coeffs: PolynomialCoeffs<F::Extension>,
     mut values: PolynomialValues<F::Extension>,
@@ -137,17 +207,22 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     for (round, arity_bits) in fri_params.reduction_arity_bits.iter().enumerate() {
         let arity = 1 << arity_bits;
 
-        // Fused bit-reversal + flatten: one gather pass writes the flat leaf
-        // buffer directly (leaf `i` is the `arity`-chunk of the bit-reversed
-        // codeword starting at `i * arity`), instead of a random-access
-        // in-place permutation followed by a separate flattening pass with a
-        // heap allocation per element.
-        let flat_values = bitrev_flatten::<F, D>(&values.values);
-        let tree = MerkleTree::<F, C::Hasher>::new_flat(
-            flat_values,
-            arity * D,
+        // GPU-qualified rounds are written directly into the retained shared
+        // column store consumed by Metal. If allocation or the specialized
+        // Merkle build declines, execute the historical flat path exactly.
+        let tree = try_fri_column_merkle_tree::<F, C::Hasher, D>(
+            &values.values,
+            *arity_bits,
             fri_params.config.cap_height,
-        );
+        )
+        .unwrap_or_else(|| {
+            let flat_values = bitrev_flatten::<F, D>(&values.values);
+            MerkleTree::<F, C::Hasher>::new_flat(
+                flat_values,
+                arity * D,
+                fri_params.config.cap_height,
+            )
+        });
 
         challenger.observe_cap(&tree.cap);
         trees.push(tree);
@@ -346,7 +421,8 @@ fn fri_prover_query_round<
         .collect::<Vec<_>>();
     for (i, tree) in trees.iter().enumerate() {
         let arity_bits = fri_params.reduction_arity_bits[i];
-        let evals = unflatten(tree.get(x_index >> arity_bits));
+        let leaf = tree.leaf_vec(x_index >> arity_bits);
+        let evals = unflatten(&leaf);
         let merkle_proof = tree.prove(x_index >> arity_bits);
 
         query_steps.push(FriQueryStep {
@@ -370,6 +446,8 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::hash::poseidon::PoseidonHash;
+    use crate::plonk::config::GenericHashOut;
 
     /// `bitrev_flatten` must be raw-`u64`-identical to the serial
     /// gather-and-extend loop it replaced, for every leaf and every limb.
@@ -396,6 +474,88 @@ mod tests {
             assert_eq!(actual.len(), expected.len(), "length for n = {n}");
             for (k, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
                 assert_eq!(a.0, e.0, "limb {k} of {n}");
+            }
+        }
+    }
+
+    /// Direct FRI columns must expose the exact old row bytes and therefore
+    /// produce identical caps, paths, and cap-derived transcript challenges.
+    /// PoseidonHash has no specialized column backend, keeping this a pure CPU
+    /// differential independent of Metal availability.
+    #[test]
+    fn fri_columns_match_flat_leaves_caps_proofs_and_transcript() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type FE = <F as Extendable<D>>::Extension;
+
+        for (log_n, arity_bits, cap_height) in
+            [(4usize, 1usize, 1usize), (6, 2, 2), (8, 4, 2)]
+        {
+            let n = 1 << log_n;
+            let arity = 1 << arity_bits;
+            let rows = n / arity;
+            let values: Vec<FE> = (0..n).map(|_| FE::rand()).collect();
+
+            let flat = bitrev_flatten::<F, D>(&values);
+            let flat_tree = MerkleTree::<F, PoseidonHash>::new_flat(
+                flat.clone(),
+                arity * D,
+                cap_height,
+            );
+            let mut columns = ColumnStore::Owned(vec![vec![F::ZERO; rows]; arity * D]);
+            assert!(fill_fri_columns::<F, D>(
+                &values,
+                arity_bits,
+                &mut columns
+            ));
+            let column_tree =
+                MerkleTree::<F, PoseidonHash>::new_column_store(columns, cap_height);
+
+            for leaf in 0..rows {
+                let expected = &flat[leaf * arity * D..(leaf + 1) * arity * D];
+                let actual = column_tree.leaf_vec(leaf);
+                for (limb, (a, e)) in actual.iter().zip(expected).enumerate() {
+                    assert_eq!(a.0, e.0, "leaf {leaf}, limb {limb}, arity {arity}");
+                }
+
+                let flat_proof = flat_tree.prove(leaf);
+                let column_proof = column_tree.prove(leaf);
+                assert_eq!(column_proof.siblings.len(), flat_proof.siblings.len());
+                for (level, (a, e)) in column_proof
+                    .siblings
+                    .iter()
+                    .zip(&flat_proof.siblings)
+                    .enumerate()
+                {
+                    for (limb, (a, e)) in a.to_vec().iter().zip(e.to_vec()).enumerate() {
+                        assert_eq!(
+                            a.0, e.0,
+                            "proof level {level}, limb {limb}, leaf {leaf}, arity {arity}"
+                        );
+                    }
+                }
+            }
+
+            for (i, (a, e)) in column_tree
+                .cap
+                .flatten()
+                .iter()
+                .zip(flat_tree.cap.flatten())
+                .enumerate()
+            {
+                assert_eq!(a.0, e.0, "cap limb {i}, arity {arity}");
+            }
+
+            let mut flat_challenger = Challenger::<F, PoseidonHash>::new();
+            flat_challenger.observe_cap(&flat_tree.cap);
+            let flat_beta = flat_challenger.get_extension_challenge::<D>();
+            let mut column_challenger = Challenger::<F, PoseidonHash>::new();
+            column_challenger.observe_cap(&column_tree.cap);
+            let column_beta = column_challenger.get_extension_challenge::<D>();
+            let column_beta_limbs: [F; D] = column_beta.to_basefield_array();
+            let flat_beta_limbs: [F; D] = flat_beta.to_basefield_array();
+            for (limb, (a, e)) in column_beta_limbs.iter().zip(flat_beta_limbs).enumerate() {
+                assert_eq!(a.0, e.0, "transcript limb {limb}, arity {arity}");
             }
         }
     }
