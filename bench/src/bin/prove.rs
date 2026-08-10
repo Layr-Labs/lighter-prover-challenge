@@ -252,4 +252,5 @@ fn main() {
     unsafe { _exit(0) }
 }
 
-// p90-fire-b7-1786376354
+// p90-redraw-r15b-1
+const _REDRAW_TOKEN_R15B: &str = "r15b-20260811-0800";
