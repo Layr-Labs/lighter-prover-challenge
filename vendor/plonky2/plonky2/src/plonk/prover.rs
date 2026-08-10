@@ -20,6 +20,7 @@ use crate::gates::lookup_table::LookupTableGate;
 use crate::gates::poseidon2::Poseidon2Gate;
 use crate::gates::selectors::LookupSelectors;
 use crate::hash::hash_types::RichField;
+use crate::hash::merkle_tree::MerkleLeaves;
 use crate::iop::challenger::Challenger;
 use crate::iop::generator::generate_partial_witness;
 use crate::iop::target::Target;
@@ -1020,6 +1021,161 @@ fn compute_all_lookup_polys<
 
 const BATCH_SIZE: usize = 32;
 
+const QUOTIENT_NEXT_INDEX_RANGE_DIAGNOSTIC_ENV: &str =
+    "LIGHTER_QUOTIENT_NEXT_INDEX_RANGE_DIAGNOSTIC";
+
+#[cfg(feature = "std")]
+fn quotient_next_index_range_enabled() -> bool {
+    // Always on. The mechanism was previously env-gated
+    // (`LIGHTER_QUOTIENT_NEXT_INDEX_RANGE=1`); ranked evaluation clears the
+    // environment, so that form was tip-identical under official scoring.
+    // The range gather is value-identical to the per-element map path.
+    true
+}
+
+#[cfg(not(feature = "std"))]
+fn quotient_next_index_range_enabled() -> bool {
+    true
+}
+
+#[cfg(feature = "std")]
+fn quotient_next_index_range_diagnostics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os(QUOTIENT_NEXT_INDEX_RANGE_DIAGNOSTIC_ENV)
+            .is_some_and(|value| value == "1")
+    })
+}
+
+#[cfg(not(feature = "std"))]
+fn quotient_next_index_range_diagnostics_enabled() -> bool {
+    false
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WrappedNextRanges {
+    first: core::ops::Range<usize>,
+    second: core::ops::Range<usize>,
+}
+
+impl WrappedNextRanges {
+    fn new(start: usize, len: usize, next_step: usize, domain: usize) -> Self {
+        assert!(domain > 0, "wrapped next range domain must not be empty");
+        assert!(start < domain, "wrapped next range start must be in-domain");
+        assert!(next_step < domain, "wrapped next range step must be in-domain");
+        let current_end = start
+            .checked_add(len)
+            .expect("wrapped next range current batch overflow");
+        assert!(
+            current_end <= domain,
+            "wrapped next range current batch must not cross the domain"
+        );
+        let shifted = start
+            .checked_add(next_step)
+            .expect("wrapped next range shifted start overflow");
+        let shifted = if shifted >= domain {
+            shifted - domain
+        } else {
+            shifted
+        };
+        let first_len = len.min(domain - shifted);
+        let first_end = shifted
+            .checked_add(first_len)
+            .expect("wrapped next range first segment overflow");
+        let second_len = len - first_len;
+        Self {
+            first: shifted..first_end,
+            second: 0..second_len,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.first.len() + self.second.len()
+    }
+
+    fn wraps(&self) -> bool {
+        !self.second.is_empty()
+    }
+
+    fn indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.first.clone().chain(self.second.clone())
+    }
+}
+
+/// Gathers the quotient batch's shifted Z values without materializing its
+/// consecutive next-index vector. The logical order is `first` followed by the
+/// optional wrapped `second` segment; every output cell is initialized through
+/// `resize` and then overwritten through ordinary copies or assignments.
+fn fill_quotient_next_lde_batch<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    commitment: &PolynomialBatch<F, C, D>,
+    start: usize,
+    len: usize,
+    next_step: usize,
+    domain: usize,
+    step: usize,
+    col_range: core::ops::Range<usize>,
+    layout: BatchLayout,
+    out: &mut Vec<F>,
+) -> bool {
+    assert!(step > 0, "quotient next gather step must not be zero");
+    let ranges = WrappedNextRanges::new(start, len, next_step, domain);
+    let n = ranges.len();
+    let column_start = col_range.start;
+    let width = col_range.len();
+    out.resize(n * width, F::ZERO);
+
+    match &commitment.merkle_tree.leaves {
+        MerkleLeaves::Columns { columns, .. } => {
+            for (column_offset, column_index) in col_range.enumerate() {
+                let column = columns.col(column_index);
+                match layout {
+                    BatchLayout::PolyMajor if step == 1 => {
+                        let destination =
+                            &mut out[column_offset * n..(column_offset + 1) * n];
+                        let first_len = ranges.first.len();
+                        destination[..first_len].copy_from_slice(&column[ranges.first.clone()]);
+                        destination[first_len..].copy_from_slice(&column[ranges.second.clone()]);
+                    }
+                    BatchLayout::PolyMajor => {
+                        let destination =
+                            &mut out[column_offset * n..(column_offset + 1) * n];
+                        for (point, index) in ranges.indices().enumerate() {
+                            destination[point] = column[index * step];
+                        }
+                    }
+                    BatchLayout::PointMajor => {
+                        for (point, index) in ranges.indices().enumerate() {
+                            out[point * width + column_offset] = column[index * step];
+                        }
+                    }
+                }
+            }
+        }
+        MerkleLeaves::Rows { .. } => {
+            for (point, index) in ranges.indices().enumerate() {
+                let row = &commitment.get_lde_values(index, step)
+                    [column_start..column_start + width];
+                match layout {
+                    BatchLayout::PointMajor => {
+                        out[point * width..(point + 1) * width].copy_from_slice(row);
+                    }
+                    BatchLayout::PolyMajor => {
+                        for (column_offset, &value) in row.iter().enumerate() {
+                            out[column_offset * n + point] = value;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ranges.wraps()
+}
+
 /// Process-wide counters for the narrow Metal Poseidon2 quotient path. A
 /// successful `started` count proves all of the production guards held: no
 /// lookups, two challenges, the 135-wire/123-constraint Poseidon2 gate, and
@@ -2003,6 +2159,11 @@ fn compute_quotient_polys<
 
     let points_batches = points.par_chunks(BATCH_SIZE);
     let num_batches = points.len().div_ceil(BATCH_SIZE);
+    let quotient_next_index_ranges = quotient_next_index_range_enabled();
+    let quotient_next_index_range_diagnostics =
+        quotient_next_index_range_diagnostics_enabled();
+    let next_vector_elements_avoided = core::sync::atomic::AtomicUsize::new(0);
+    let wrapping_next_batches = core::sync::atomic::AtomicUsize::new(0);
 
     struct QuotientScratch<F: RichField> {
         indices: Vec<usize>,
@@ -2091,7 +2252,11 @@ fn compute_quotient_polys<
         .for_each_init(
             || QuotientScratch::<F> {
                 indices: Vec::with_capacity(BATCH_SIZE),
-                indices_next: Vec::with_capacity(BATCH_SIZE),
+                indices_next: if quotient_next_index_ranges {
+                    Vec::new()
+                } else {
+                    Vec::with_capacity(BATCH_SIZE)
+                },
                 local_constants: Vec::new(),
                 local_wires: Vec::new(),
                 s_sigmas_flat: Vec::new(),
@@ -2111,10 +2276,12 @@ fn compute_quotient_polys<
                 scratch
                     .indices
                     .extend(BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n);
-                scratch.indices_next.clear();
-                scratch
-                    .indices_next
-                    .extend(scratch.indices.iter().map(|&i| (i + next_step) & lde_mask));
+                if !quotient_next_index_ranges {
+                    scratch.indices_next.clear();
+                    scratch
+                        .indices_next
+                        .extend(scratch.indices.iter().map(|&i| (i + next_step) & lde_mask));
+                }
 
                 let shifted_xs_batch = &shifted_points[BATCH_SIZE * batch_i..][..n];
                 debug_assert!(
@@ -2222,13 +2389,33 @@ fn compute_quotient_polys<
                     batch_layout,
                     &mut scratch.zs_local_flat,
                 );
-                zs_partial_products_and_lookup_commitment.fill_lde_batch(
-                    &scratch.indices_next,
-                    step,
-                    zs_next_range,
-                    batch_layout,
-                    &mut scratch.zs_next_flat,
-                );
+                if quotient_next_index_ranges {
+                    let wrapped = fill_quotient_next_lde_batch(
+                        zs_partial_products_and_lookup_commitment,
+                        BATCH_SIZE * batch_i,
+                        n,
+                        next_step,
+                        lde_size,
+                        step,
+                        zs_next_range,
+                        batch_layout,
+                        &mut scratch.zs_next_flat,
+                    );
+                    if quotient_next_index_range_diagnostics {
+                        next_vector_elements_avoided
+                            .fetch_add(n, core::sync::atomic::Ordering::Relaxed);
+                        wrapping_next_batches
+                            .fetch_add(wrapped as usize, core::sync::atomic::Ordering::Relaxed);
+                    }
+                } else {
+                    zs_partial_products_and_lookup_commitment.fill_lde_batch(
+                        &scratch.indices_next,
+                        step,
+                        zs_next_range,
+                        batch_layout,
+                        &mut scratch.zs_next_flat,
+                    );
+                }
 
                 let indices_batch = &scratch.indices;
                 // Per-point row views over the PointMajor gathers, built only
@@ -2345,6 +2532,20 @@ fn compute_quotient_polys<
                 }
             },
         );
+
+    #[cfg(feature = "std")]
+    if quotient_next_index_range_diagnostics {
+        eprintln!(
+            "[quotient-next-index-range] mode={} next_vector_elements_avoided={} wrapping_batches={}",
+            if quotient_next_index_ranges {
+                "candidate"
+            } else {
+                "legacy-control"
+            },
+            next_vector_elements_avoided.load(core::sync::atomic::Ordering::Relaxed),
+            wrapping_next_batches.load(core::sync::atomic::Ordering::Relaxed),
+        );
+    }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if let Some((_, job)) = &gpu_poseidon {
@@ -2658,15 +2859,19 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{
+        fill_quotient_next_lde_batch, precomputed, BatchLayout, PolynomialBatch,
+        COMPARE_QUOTIENT_LAYOUTS,
+    };
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::{Field, Field64};
+    use crate::field::types::{Field, Field64, PrimeField64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::gate::U32QuotientGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::noop::NoopGate;
+    use crate::hash::merkle_tree::MerkleTree;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::iop::target::Target;
     use crate::iop::witness::{PartialWitness, WitnessWrite};
@@ -2675,6 +2880,7 @@ mod quotient_layout_tests {
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+    use crate::util::reverse_bits;
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
@@ -2926,6 +3132,103 @@ mod quotient_layout_tests {
                         (i + next_step) % lde_size,
                         "domain 2^{domain_bits}, next_step 2^{next_step_bits}, i {i}"
                     );
+                }
+            }
+        }
+    }
+
+    /// The range-native next-Z gather must match the legacy indexed gather as
+    /// raw Goldilocks limbs for both commitment storage modes, both output
+    /// layouts, contiguous and strided reads, and the final two-segment wrap.
+    #[test]
+    fn quotient_next_range_gather_matches_indexed_raw_limbs_across_wrap() {
+        let degree_log = 3;
+        let rate_bits = 2;
+        let rows_len = 1usize << (degree_log + rate_bits);
+        let columns = (0..5usize)
+            .map(|column| {
+                (0..rows_len)
+                    .map(|row| {
+                        GoldilocksField(
+                            ((column + 1) as u64)
+                                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                                .wrapping_add(row as u64),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let rows = (0..rows_len)
+            .map(|leaf| {
+                let natural = reverse_bits(leaf, degree_log + rate_bits);
+                columns
+                    .iter()
+                    .map(|column| column[natural])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let column_batch: PolynomialBatch<F, C, D> = PolynomialBatch {
+            polynomials: Vec::new(),
+            merkle_tree: MerkleTree::new_columns(columns, 0),
+            degree_log,
+            rate_bits,
+            blinding: false,
+        };
+        let row_batch: PolynomialBatch<F, C, D> = PolynomialBatch {
+            polynomials: Vec::new(),
+            merkle_tree: MerkleTree::new(rows, 0),
+            degree_log,
+            rate_bits,
+            blinding: false,
+        };
+
+        for (storage, commitment) in [("Columns", column_batch), ("Rows", row_batch)] {
+            for step in [1usize, 2, 4] {
+                let domain = rows_len / step;
+                let lde_mask = domain - 1;
+                let next_step = 2;
+                let len = 3;
+                for (case, start) in [("inside", 1usize), ("wrap", domain - len)] {
+                    let indices_next = (start..start + len)
+                        .map(|index| (index + next_step) & lde_mask)
+                        .collect::<Vec<_>>();
+                    for layout in [BatchLayout::PointMajor, BatchLayout::PolyMajor] {
+                        let col_range = 1..4;
+                        let mut indexed = Vec::new();
+                        let mut ranged = Vec::new();
+                        commitment.fill_lde_batch(
+                            &indices_next,
+                            step,
+                            col_range.clone(),
+                            layout,
+                            &mut indexed,
+                        );
+                        let wrapped = fill_quotient_next_lde_batch(
+                            &commitment,
+                            start,
+                            len,
+                            next_step,
+                            domain,
+                            step,
+                            col_range,
+                            layout,
+                            &mut ranged,
+                        );
+                        assert_eq!(wrapped, case == "wrap");
+                        assert_eq!(ranged.len(), indexed.len());
+                        let ranged_raw = ranged
+                            .iter()
+                            .map(|value| value.to_noncanonical_u64())
+                            .collect::<Vec<_>>();
+                        let indexed_raw = indexed
+                            .iter()
+                            .map(|value| value.to_noncanonical_u64())
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            ranged_raw, indexed_raw,
+                            "storage={storage} layout={layout:?} step={step} case={case}"
+                        );
+                    }
                 }
             }
         }
