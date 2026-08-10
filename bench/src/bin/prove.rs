@@ -59,10 +59,6 @@ static MALLOC_CONF: &[u8; 34] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
-    #[cfg(feature = "diagnostic_profile")]
-    let _profile_context = plonky2::util::profile::enter_context("worker", 0, &[]);
-    #[cfg(feature = "diagnostic_profile")]
-    let profile_process = plonky2::util::profile::span("process", "prove_worker");
     // First statement in the process: the Metal shader compile and pipeline
     // lowering behind the GPU hash path cost the better part of a second on a
     // cold OS shader cache, and the benchmark sandbox denies writes to that
@@ -70,11 +66,7 @@ fn main() {
     // price. Starting it here overlaps it with the startup work below instead
     // of stalling the first proving step that wants the GPU. Pure scheduling:
     // the compiled kernels are identical either way.
-    {
-        #[cfg(feature = "diagnostic_profile")]
-        let _span = plonky2::util::profile::span("startup", "metal_prewarm_submit");
-        plonky2::hash::poseidon2::prewarm_gpu();
-    }
+    plonky2::hash::poseidon2::prewarm_gpu();
     // `log` is statically disabled in release builds: the ranked worker has no
     // log consumer, and diagnostics remain available in debug/test builds.
     // Do not link and initialize an unused logger in every scored process.
@@ -82,12 +74,6 @@ fn main() {
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
         .expect("cannot configure prover thread pool");
-    #[cfg(feature = "diagnostic_profile")]
-    plonky2::util::profile::counter(
-        "resources",
-        "rayon_threads",
-        rayon::current_num_threads() as u64,
-    );
 
     let mut args = env::args().skip(1);
     let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
@@ -97,8 +83,6 @@ fn main() {
     // Fixture parse overlaps the pre-execution circuit load; both are fast.
     let (block, pre_circuits) = rayon::join(
         || {
-            #[cfg(feature = "diagnostic_profile")]
-            let _span = plonky2::util::profile::span("startup", "fixture_read_parse");
             let json = fs::read(&fixture).expect("cannot read prover fixture");
             Block::<F>::from_json_with_empty_txs(
                 &json,
@@ -109,19 +93,15 @@ fn main() {
             )
             .expect("invalid prover fixture")
         },
-        || {
-            #[cfg(feature = "diagnostic_profile")]
-            let _span = plonky2::util::profile::span("startup", "pre_circuit_load");
-            match Circuits::load_pre() {
-                Ok(loaded) => loaded,
-                Err(error) => {
-                    log::warn!("embedded pre circuit unavailable ({error:#}); building from scratch");
-                    let pre =
-                        circuit::block_pre_execution_constraints::BlockPreExecutionCircuit::define(
-                            circuit::types::config::CIRCUIT_CONFIG,
-                        );
-                    (pre.target, pre.builder.build::<C>())
-                }
+        || match Circuits::load_pre() {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                log::warn!("embedded pre circuit unavailable ({error:#}); building from scratch");
+                let pre =
+                    circuit::block_pre_execution_constraints::BlockPreExecutionCircuit::define(
+                        circuit::types::config::CIRCUIT_CONFIG,
+                    );
+                (pre.target, pre.builder.build::<C>())
             }
         },
     );
@@ -134,16 +114,10 @@ fn main() {
     // Value-exact: no quantity is computed differently, only in parallel.
     let (pre_handle, remaining) = std::thread::scope(|scope| {
         let remaining_handle = scope.spawn(|| {
-            #[cfg(feature = "diagnostic_profile")]
-            let _span = plonky2::util::profile::span("startup", "remaining_circuit_loads");
             (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1"))
                 .then(Circuits::load_remaining_embedded)
         });
-        let pre_exec = {
-            #[cfg(feature = "diagnostic_profile")]
-            let _span = plonky2::util::profile::span("startup", "pre_execution_native_witness");
-            circuit::block_pre_execution::BlockPreExec::from_block(&block)
-        };
+        let pre_exec = circuit::block_pre_execution::BlockPreExec::from_block(&block);
         let pre_handle = std::thread::Builder::new()
             .name("pre-exec-startup".into())
             .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -175,9 +149,6 @@ fn main() {
                 (pre_target, pre_data, pre_proof)
             })
             .expect("pre-execution startup thread must start");
-        #[cfg(feature = "diagnostic_profile")]
-        let _remaining_wait =
-            plonky2::util::profile::span("wait", "remaining_circuit_loads_join");
         let remaining = remaining_handle
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
@@ -187,13 +158,9 @@ fn main() {
     // the other four blobs are loaded above (loading all five here would
     // deserialize the same pre circuit twice on the scored critical path).
     // Keep the forced-build mode's established behavior unchanged.
-    #[cfg(feature = "diagnostic_profile")]
-    let _pre_wait = plonky2::util::profile::span("wait", "pre_execution_join");
     let (pre_target, pre_data, pre_proof) = pre_handle
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-    #[cfg(feature = "diagnostic_profile")]
-    drop(_pre_wait);
     let circuits = match remaining {
         Some(Ok(remaining)) => remaining.into_circuits((pre_target, pre_data)),
         Some(Err(error)) => {
@@ -204,13 +171,7 @@ fn main() {
         }
         None => Circuits::load(),
     };
-    let proof = {
-        #[cfg(feature = "diagnostic_profile")]
-        let _span = plonky2::util::profile::span("orchestration", "block_pipeline");
-        prover::prove_block_after_pre(block, circuits, pre_proof)
-    };
-    #[cfg(feature = "diagnostic_profile")]
-    let _output_span = plonky2::util::profile::span("output", "serialize_and_flush_proof");
+    let proof = prover::prove_block_after_pre(block, circuits, pre_proof);
     let mut writer = BufWriter::with_capacity(
         PROOF_OUTPUT_BUFFER_BYTES,
         File::create(output).expect("cannot create proof output"),
@@ -226,15 +187,6 @@ fn main() {
     // `fsync` would only add durability latency to the scored process lifetime.
     let file = writer.into_inner().expect("cannot flush proof output");
     drop(file);
-    #[cfg(feature = "diagnostic_profile")]
-    {
-        drop(_output_span);
-        drop(profile_process);
-        if let Some(path) = std::env::var_os("LIGHTER_PROFILE_PATH") {
-            plonky2::util::profile::write_chrome_trace(path)
-                .expect("cannot write diagnostic profile trace");
-        }
-    }
 
     // The score is the sum of worker process lifetimes (spawn -> exit), so the
     // destructor teardown after the proof is written is scored dead work: the
@@ -266,4 +218,4 @@ fn main() {
     unsafe { _exit(0) }
 }
 
-// p90-fire-808-1786266919
+// p90-fire-1195-1786326484
