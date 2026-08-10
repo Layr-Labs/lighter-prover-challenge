@@ -76,6 +76,31 @@ inline ulong gl_add(ulong a, ulong b) {
 #endif
 }
 
+// The second EPSILON correction in gl_add is unreachable when b is canonical.
+// Poseidon2's compile-time round constants all satisfy b < GOLDILOCKS_PRIME.
+inline ulong gl_add_canonical_b(ulong a, ulong b) {
+#if defined(POSEIDON2_NATIVE_ARITHMETIC_REFERENCE)
+    ulong sum = a + b;
+    ulong carry = sum < a;
+    return sum + carry * GOLDILOCKS_EPSILON;
+#else
+    uint a0 = (uint)a;
+    uint a1 = (uint)(a >> 32);
+    uint b0 = (uint)b;
+    uint b1 = (uint)(b >> 32);
+    uint r0 = a0 + b0;
+    uint carry0 = (uint)(r0 < a0);
+    uint r1 = a1 + b1;
+    uint carry1 = (uint)(r1 < a1);
+    uint next = r1 + carry0;
+    carry1 += (uint)(next < r1);
+    uint old0 = r0;
+    r0 -= carry1;
+    r1 = next + (carry1 & (uint)(old0 != 0));
+    return ((ulong)r1 << 32) | (ulong)r0;
+#endif
+}
+
 inline ulong gl_sub(ulong a, ulong b) {
 #if defined(POSEIDON2_NATIVE_ARITHMETIC_REFERENCE)
     ulong diff = a - b;
@@ -404,19 +429,19 @@ inline void poseidon2(thread ulong state[12], constant ulong* /*parameters*/) {
 
     for (uint round = 0; round < 4; ++round) {
         for (uint i = 0; i < 12; ++i) {
-            state[i] = pow7(gl_add(state[i], POSEIDON2_EXTERNAL_RC[round][i]));
+            state[i] = pow7(gl_add_canonical_b(state[i], POSEIDON2_EXTERNAL_RC[round][i]));
         }
         external_linear_layer(state);
     }
 
     for (uint round = 0; round < 22; ++round) {
-        state[0] = pow7(gl_add(state[0], POSEIDON2_INTERNAL_RC[round]));
+        state[0] = pow7(gl_add_canonical_b(state[0], POSEIDON2_INTERNAL_RC[round]));
         internal_linear_layer(state);
     }
 
     for (uint round = 4; round < 8; ++round) {
         for (uint i = 0; i < 12; ++i) {
-            state[i] = pow7(gl_add(state[i], POSEIDON2_EXTERNAL_RC[round][i]));
+            state[i] = pow7(gl_add_canonical_b(state[i], POSEIDON2_EXTERNAL_RC[round][i]));
         }
         external_linear_layer(state);
     }
@@ -510,7 +535,7 @@ kernel void poseidon2_gate_quotient(
 
     for (uint round = 0; round < 4; ++round) {
         for (uint i = 0; i < 12; ++i) {
-            state[i] = gl_add(state[i], POSEIDON2_EXTERNAL_RC[round][i]);
+            state[i] = gl_add_canonical_b(state[i], POSEIDON2_EXTERNAL_RC[round][i]);
         }
         if (round != 0) {
             uint saved_start = 29 + (round - 1) * 12;
@@ -537,7 +562,7 @@ kernel void poseidon2_gate_quotient(
     for (uint round = 0; round < 22; ++round) {
         ulong saved = poseidon2_gate_wire(wires, 65 + round, lde_rows, source_row);
         poseidon2_gate_emit(
-            gl_sub(gl_add(state[0], POSEIDON2_INTERNAL_RC[round]), saved),
+            gl_sub(gl_add_canonical_b(state[0], POSEIDON2_INTERNAL_RC[round]), saved),
             alpha_powers,
             accumulators,
             constraint_index);
@@ -547,7 +572,7 @@ kernel void poseidon2_gate_quotient(
 
     for (uint round = 4; round < 8; ++round) {
         for (uint i = 0; i < 12; ++i) {
-            state[i] = gl_add(state[i], POSEIDON2_EXTERNAL_RC[round][i]);
+            state[i] = gl_add_canonical_b(state[i], POSEIDON2_EXTERNAL_RC[round][i]);
         }
         uint saved_start = 87 + (round - 4) * 12;
         for (uint i = 0; i < 12; ++i) {
