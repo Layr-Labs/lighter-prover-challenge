@@ -1374,14 +1374,14 @@ fn start_gpu_range_check_gate_quotient<
             gate_indices.push(gate_index);
         }
         if let Some(u32_gate) = u32_gate {
-            // A six-bit random access evaluates a 64-entry selection fold for
-            // only ten quotient rows. On the five-worker ranked workload that
-            // data-dependent branch extends the process-shared Range/U32 Metal
-            // command disproportionately. Keep exactly this shape on the
-            // existing CPU direct-accumulation evaluator instead: skipping it
-            // here means it is never added to `gate_indices`, so the generic
-            // CPU quotient pass retains its unchanged selector and alpha work.
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. }) {
+            // The audited four-bit/four-copy and six-bit/single-copy random-access
+            // layouts disproportionately extend the process-shared Range/U32 Metal
+            // command on the five-worker ranked workload. Keep exactly the
+            // `(4, 4, 2)` and `(6, 1, 2)` metadata tuples on the existing CPU
+            // direct-accumulation evaluator instead: skipping them here means they
+            // are never added to `gate_indices`, so the generic CPU quotient pass
+            // retains its unchanged selector and alpha work.
+            if keep_random_access_quotient_on_cpu(u32_gate) {
                 continue;
             }
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
@@ -1741,6 +1741,68 @@ fn start_gpu_range_check_gate_quotient<
         );
     }
     Some((gate_indices, job))
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn keep_random_access_quotient_on_cpu(gate: crate::gates::gate::U32QuotientGate) -> bool {
+    matches!(
+        gate,
+        crate::gates::gate::U32QuotientGate::RandomAccess {
+            bits: 4,
+            num_ops: 4,
+            num_extra_constants: 2,
+        } | crate::gates::gate::U32QuotientGate::RandomAccess {
+            bits: 6,
+            num_ops: 1,
+            num_extra_constants: 2,
+        }
+    )
+}
+
+#[cfg(all(test, feature = "std", target_arch = "aarch64", target_os = "macos"))]
+mod random_access_routing_tests {
+    use super::keep_random_access_quotient_on_cpu;
+    use crate::gates::gate::U32QuotientGate;
+
+    #[test]
+    fn cpu_routing_excludes_only_ra4_and_ra6_from_gpu_owned_indices() {
+        let gates = [
+            U32QuotientGate::RandomAccess {
+                bits: 3,
+                num_ops: 8,
+                num_extra_constants: 0,
+            },
+            U32QuotientGate::RandomAccess {
+                bits: 4,
+                num_ops: 4,
+                num_extra_constants: 2,
+            },
+            U32QuotientGate::RandomAccess {
+                bits: 6,
+                num_ops: 1,
+                num_extra_constants: 2,
+            },
+            U32QuotientGate::RandomAccess {
+                bits: 4,
+                num_ops: 3,
+                num_extra_constants: 2,
+            },
+            U32QuotientGate::RandomAccess {
+                bits: 6,
+                num_ops: 1,
+                num_extra_constants: 1,
+            },
+        ];
+        let gpu_owned_indices = gates
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &gate)| {
+                (!keep_random_access_quotient_on_cpu(gate)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(gpu_owned_indices, vec![0, 3, 4]);
+    }
 }
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
