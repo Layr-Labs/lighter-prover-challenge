@@ -164,7 +164,12 @@ const STAGING_CHUNK: usize = 1 << 19;
 /// block's one-off 32 MiB outputs remain uncached so the pool cannot amplify
 /// peak unified-memory pressure.
 const MAX_CACHED_QUOTIENT_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
+/// Every transaction proof now keeps three <=8 MiB quotient outputs alive
+/// concurrently (poseidon-gate, range-check/U32-union, and no-lookup
+/// permutation kernels), so the cap must cover all three or the pool evicts
+/// one before the merge pass reads it, forcing a fresh 8 MiB shared-buffer
+/// allocation on the next proof.
+const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 3;
 /// Retain the recurring d14/d16 digest buffers, but not the one-off d18 final
 /// tree. These buffers replace equally large CPU digest vectors.
 const MAX_CACHED_DIGEST_OUTPUT_BYTES: u64 = 40 * 1024 * 1024;
@@ -645,7 +650,7 @@ impl QuotientOutputPool {
         Some(self.free.swap_remove(index))
     }
 
-    /// Retains at most the two largest recurring-size buffers. A larger buffer
+    /// Retains at most the three largest recurring-size buffers. A larger buffer
     /// can service every smaller quotient shape, while final-proof outputs are
     /// rejected by the size cap before they reach the cache.
     fn recycle(&mut self, buffer: Buffer) {
@@ -1791,6 +1796,15 @@ pub(crate) fn allocate_columns<F: RichField>(
     rows: usize,
     cap_height: usize,
 ) -> Option<MetalColumns<F>> {
+    // Shared residence is valuable independently of hash routing since the
+    // permutation-quotient kernel binds commitment columns directly: the
+    // serial-critical fold shapes (2^17 rows, narrow) previously lost shared
+    // residence whenever the busy GPU stream routed their HASH to the CPU,
+    // which silently disabled the fold's permutation offload
+    // (start_gpu_permutation_quotient requires shared_columns() on all three
+    // commitments). Admit those shapes unconditionally; gpu_worthwhile still
+    // owns the hash-routing decision.
+    let serial_critical_resident = rows == 1 << 17 && (5..=64).contains(&cols);
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || cols == 0
@@ -1799,7 +1813,7 @@ pub(crate) fn allocate_columns<F: RichField>(
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
         || cap_height > rows.ilog2() as usize
-        || !gpu_worthwhile(cols, rows, cap_height)
+        || !(gpu_worthwhile(cols, rows, cap_height) || serial_critical_resident)
     {
         return None;
     }
@@ -3779,8 +3793,10 @@ mod tests {
         assert_eq!(pool.free.len(), MAX_CACHED_QUOTIENT_OUTPUTS);
         let mut lengths = pool.free.iter().map(|buffer| buffer.length()).collect::<Vec<_>>();
         lengths.sort_unstable();
-        assert_eq!(lengths, vec![4 * mib, 8 * mib]);
+        assert_eq!(lengths, vec![2 * mib, 4 * mib, 8 * mib]);
 
+        let two = pool.take_best_fit(1).expect("2 MiB best fit");
+        assert_eq!(two.length(), 2 * mib);
         let four = pool.take_best_fit(3 * mib).expect("4 MiB best fit");
         assert_eq!(four.length(), 4 * mib);
         let eight = pool.take_best_fit(1).expect("remaining 8 MiB buffer");
@@ -4219,6 +4235,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `start_permutation_quotient` (above) requires `shared_columns()` on all
+    /// three commitments, so the Zs/partial-products fold shape (2^17 rows,
+    /// narrow width) must get shared residence even when a busy GPU stream
+    /// routes its *hash* to the CPU. `allocate_columns` decouples the
+    /// allocation decision from `gpu_worthwhile`'s routing decision for
+    /// exactly this shape; this pins that contract independently of hash
+    /// routing, which must stay unchanged.
+    #[test]
+    fn serial_critical_shapes_get_shared_allocation_when_gpu_busy() {
+        // Forces the Metal context up front (as the neighboring functional
+        // tests do) and doubles as this test's "skip when no Metal device"
+        // guard, so `allocate_columns` below never races the one-shot
+        // startup probe that diverts allocations while the context is still
+        // being built.
+        let Some(_context) = shared_context() else {
+            return; // no Metal device in this environment
+        };
+
+        // The exclusive-phase flag is process-global; restore whatever this
+        // test observed on entry so other tests in this binary are unaffected.
+        struct ExclusivePhaseReset(bool);
+        impl Drop for ExclusivePhaseReset {
+            fn drop(&mut self) {
+                set_exclusive_gpu_phase(self.0);
+            }
+        }
+        let _reset = ExclusivePhaseReset(is_exclusive_gpu_phase());
+
+        // Mid-pipeline conditions: not exclusive, GPU stream occupied.
+        set_exclusive_gpu_phase(false);
+        let _job = GpuJobGuard::begin(); // forces GPU_JOBS_IN_FLIGHT > 0
+        // Zs/partial-products fold shape: 2^17 rows x 20 cols.
+        let columns = allocate_columns::<GoldilocksField>(20, 1 << 17, 4);
+        assert!(
+            columns.is_some(),
+            "serial-critical fold shapes must get shared residence even when hash routing says CPU"
+        );
+        // Routing itself must be unchanged: gpu_worthwhile still says no.
+        assert!(!gpu_worthwhile(20, 1 << 17, 4));
     }
 
     #[test]
