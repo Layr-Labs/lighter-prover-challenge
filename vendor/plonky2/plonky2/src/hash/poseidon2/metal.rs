@@ -5,14 +5,6 @@ use core::slice;
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
-#[cfg(feature = "diagnostic_profile")]
-use block::ConcreteBlock;
-#[cfg(feature = "diagnostic_profile")]
-use metal::CommandBufferRef;
-#[cfg(feature = "diagnostic_profile")]
-use objc::runtime::Sel;
-#[cfg(feature = "diagnostic_profile")]
-use objc::Message;
 use metal::{
     Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
     MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSUInteger,
@@ -22,82 +14,8 @@ use plonky2_maybe_rayon::*;
 
 use crate::field::types::{Field, PrimeField64};
 use crate::hash::hash_types::{HashOut, RichField};
-use crate::hash::merkle_tree::{DigestStore, LevelOrderDigests};
+use crate::hash::merkle_tree::LevelOrderDigests;
 use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
-
-#[cfg(feature = "diagnostic_profile")]
-static PROFILE_COMMAND_SEQUENCE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(feature = "diagnostic_profile")]
-fn profile_command_buffer(
-    command_buffer: &CommandBufferRef,
-    name: &'static str,
-    work_items: u64,
-) {
-    use std::sync::atomic::Ordering;
-
-    let sequence = PROFILE_COMMAND_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    crate::util::profile::counter("metal_submit", "queue_sequence", sequence);
-    crate::util::profile::counter("metal_submit", name, work_items);
-
-    let scheduled = Arc::new(Mutex::new(Some(crate::util::profile::span(
-        "metal_submit_to_scheduled",
-        name,
-    ))));
-    let scheduled_callback = Arc::clone(&scheduled);
-    let scheduled_handler = ConcreteBlock::new(move |_: &CommandBufferRef| {
-        drop(
-            scheduled_callback
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take(),
-        );
-    })
-    .copy();
-    command_buffer.add_scheduled_handler(&scheduled_handler);
-
-    let completed = Arc::new(Mutex::new(Some(crate::util::profile::span(
-        "metal_submit_to_completed",
-        name,
-    ))));
-    let completed_callback = Arc::clone(&completed);
-    let completed_handler = ConcreteBlock::new(move |buffer: &CommandBufferRef| {
-        let mut completed = completed_callback
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(span) = completed.as_ref() {
-            let gpu_start: Result<f64, _> =
-                unsafe { buffer.send_message(Sel::register("GPUStartTime"), ()) };
-            let gpu_end: Result<f64, _> =
-                unsafe { buffer.send_message(Sel::register("GPUEndTime"), ()) };
-            if let (Ok(gpu_start), Ok(gpu_end)) = (gpu_start, gpu_end) {
-                if gpu_start.is_finite() && gpu_end.is_finite() && gpu_end >= gpu_start {
-                    span.counter(
-                        "metal_gpu",
-                        "execution_ns",
-                        ((gpu_end - gpu_start) * 1_000_000_000.0).round() as u64,
-                    );
-                    span.counter(
-                        "metal_gpu",
-                        "start_host_ns",
-                        (gpu_start * 1_000_000_000.0).round() as u64,
-                    );
-                    span.counter(
-                        "metal_gpu",
-                        "end_host_ns",
-                        (gpu_end * 1_000_000_000.0).round() as u64,
-                    );
-                }
-            }
-            span.counter("metal_complete", "queue_sequence", sequence);
-            span.counter("metal_complete", "status", buffer.status() as u64);
-        }
-        drop(completed.take());
-    })
-    .copy();
-    command_buffer.add_completed_handler(&completed_handler);
-}
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 
@@ -109,13 +27,13 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
+    "6a65119780a2645ce0077ef1da44d2774ca31aa1ef5c511162280d1b2f15213f";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
 /// source. This deliberately includes the lazily-built gate-quotient kernels:
 /// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
+const METALLIB_REQUIRED_KERNELS: [&str; 9] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
     "poseidon2_hash_parents",
@@ -125,7 +43,6 @@ const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
     "ifft_finalize",
     "poseidon2_gate_quotient",
     "range_check_gate_quotient",
-    "permutation_quotient",
 ];
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
 /// (6654d43) ranked-validated this raised value inside its composition; my
@@ -165,10 +82,6 @@ const STAGING_CHUNK: usize = 1 << 19;
 /// peak unified-memory pressure.
 const MAX_CACHED_QUOTIENT_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
-/// Retain the recurring d14/d16 digest buffers, but not the one-off d18 final
-/// tree. These buffers replace equally large CPU digest vectors.
-const MAX_CACHED_DIGEST_OUTPUT_BYTES: u64 = 40 * 1024 * 1024;
-const MAX_CACHED_DIGEST_OUTPUTS: usize = 4;
 
 struct MetalShared {
     device: Device,
@@ -185,9 +98,6 @@ struct MetalShared {
     /// Kept separate from the tree pool so quotient allocation never delays
     /// Merkle admission or contends on its condition variable.
     quotient_output_pool: Arc<Mutex<QuotientOutputPool>>,
-    /// Buffers backing live level-order digest stores return here after the
-    /// proof has extracted its sparse Merkle paths.
-    digest_output_pool: Arc<Mutex<DigestOutputPool>>,
     available: Condvar,
     /// Per-`log2(lde_size)` concatenated FFT twiddle rows (canonical u64), with
     /// `offsets[lg_half_m]` giving each stage row's element offset.
@@ -196,9 +106,6 @@ struct MetalShared {
     ntt_shifts: Mutex<HashMap<u32, Buffer>>,
     /// Per-`log2(degree)` all-ones tables (identity "shift" for plain FFTs).
     ntt_ones: Mutex<HashMap<u32, Buffer>>,
-    /// Deterministic shifted quotient-domain points, uploaded once per size and
-    /// reused by every no-lookup permutation job in this worker.
-    permutation_points: Mutex<HashMap<u32, Buffer>>,
 }
 
 struct NttRoots {
@@ -227,18 +134,6 @@ pub(crate) struct RangeCheckGateQuotientJob<F> {
     len: usize,
     #[cfg(test)]
     failure_observer: Option<Arc<RangeQuotientFailureObserver>>,
-    _job: GpuJobGuard,
-    _phantom: PhantomData<F>,
-}
-
-/// An asynchronously submitted no-lookup permutation-argument evaluation.
-/// The kernel emits only the partial-product terms (alpha rows 2 onward);
-/// the two cheap `L_0(x) * (Z_i(x) - 1)` rows stay on the CPU.
-pub(crate) struct PermutationQuotientJob<F> {
-    command_buffer: CommandBuffer,
-    output: Option<Buffer>,
-    output_pool: Arc<Mutex<QuotientOutputPool>>,
-    len: usize,
     _job: GpuJobGuard,
     _phantom: PhantomData<F>,
 }
@@ -356,22 +251,6 @@ impl<F: RichField> RangeCheckGateQuotientJob<F> {
     }
 }
 
-impl<F: RichField> PermutationQuotientJob<F> {
-    pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
-        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(format!(
-                "Permutation quotient command buffer ended with status {:?}",
-                self.command_buffer.status()
-            ));
-        }
-        // SAFETY: construction is restricted to an 8-byte Goldilocks field,
-        // and the completed kernel canonicalized every output word.
-        let output = self.output.as_ref().expect("quotient output present");
-        Ok(unsafe { slice::from_raw_parts(output.contents().cast::<F>(), self.len) })
-    }
-}
-
 fn recycle_completed_quotient_output(
     command_buffer: &CommandBuffer,
     output: &mut Option<Buffer>,
@@ -404,16 +283,6 @@ impl<F> Drop for PoseidonGateQuotientJob<F> {
 }
 
 impl<F> Drop for RangeCheckGateQuotientJob<F> {
-    fn drop(&mut self) {
-        recycle_completed_quotient_output(
-            &self.command_buffer,
-            &mut self.output,
-            &self.output_pool,
-        );
-    }
-}
-
-impl<F> Drop for PermutationQuotientJob<F> {
     fn drop(&mut self) {
         recycle_completed_quotient_output(
             &self.command_buffer,
@@ -670,141 +539,14 @@ impl QuotientOutputPool {
     }
 }
 
-#[derive(Default)]
-struct DigestOutputPool {
-    free: Vec<Buffer>,
-}
-
-impl DigestOutputPool {
-    fn take_best_fit(&mut self, bytes: u64) -> Option<Buffer> {
-        let index = self
-            .free
-            .iter()
-            .enumerate()
-            .filter(|(_, buffer)| buffer.length() >= bytes)
-            .min_by_key(|(_, buffer)| buffer.length())
-            .map(|(index, _)| index)?;
-        Some(self.free.swap_remove(index))
-    }
-
-    fn recycle(&mut self, buffer: Buffer) {
-        let length = buffer.length();
-        if length > MAX_CACHED_DIGEST_OUTPUT_BYTES {
-            return;
-        }
-        if self.free.len() < MAX_CACHED_DIGEST_OUTPUTS {
-            self.free.push(buffer);
-            return;
-        }
-        let (smallest_index, smallest_length) = self
-            .free
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, cached)| cached.length())
-            .map(|(index, cached)| (index, cached.length()))
-            .expect("full digest output pool is nonempty");
-        if length > smallest_length {
-            self.free[smallest_index] = buffer;
-        }
-    }
-}
-
-struct MetalDigestInner {
-    buffer: Buffer,
-    pool: Arc<Mutex<DigestOutputPool>>,
-}
-
-impl Drop for MetalDigestInner {
-    fn drop(&mut self) {
-        if let Ok(mut pool) = self.pool.try_lock() {
-            pool.recycle(self.buffer.clone());
-        }
-    }
-}
-
-/// Immutable level-order digests retained in the CPU-visible Metal output
-/// buffer. The last clone returns the buffer to the bounded size-aware cache.
-pub struct MetalDigests<T> {
-    inner: Arc<MetalDigestInner>,
-    base: usize,
-    len: usize,
-    _phantom: PhantomData<T>,
-}
-
-impl<T> MetalDigests<T> {
-    fn with_buffer(buffer: Buffer, pool: Arc<Mutex<DigestOutputPool>>, len: usize) -> Self {
-        let bytes = len
-            .checked_mul(size_of::<T>())
-            .expect("Metal digest byte length overflow");
-        assert!(bytes as u64 <= buffer.length());
-        let base = buffer.contents() as usize;
-        Self {
-            inner: Arc::new(MetalDigestInner { buffer, pool }),
-            base,
-            len,
-            _phantom: PhantomData,
-        }
-    }
-
-    pub(crate) fn as_slice(&self) -> &[T] {
-        // SAFETY: the only constructor receives a completed shared Metal
-        // buffer whose first `len` slots were fully written as `T`. The buffer
-        // is immutable and retained by `inner` for the returned slice's life.
-        unsafe { slice::from_raw_parts(self.base as *const T, self.len) }
-    }
-}
-
-impl<T> Clone for MetalDigests<T> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-            base: self.base,
-            len: self.len,
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<T> core::fmt::Debug for MetalDigests<T> {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter
-            .debug_struct("MetalDigests")
-            .field("len", &self.len)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<T: PartialEq> PartialEq for MetalDigests<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_slice() == other.as_slice()
-    }
-}
-
-impl<T: Eq> Eq for MetalDigests<T> {}
-
 struct DetachedOutput<'a> {
     owner: &'a MetalShared,
     buffer: Option<Buffer>,
 }
 
 impl DetachedOutput<'_> {
-    #[cfg(test)]
     fn buffer(&self) -> &Buffer {
         self.buffer.as_ref().expect("detached output present")
-    }
-
-    fn into_digests<T>(mut self, len: usize) -> MetalDigests<T> {
-        let buffer = self.buffer.take().expect("detached output present");
-        let digest_pool = Arc::clone(&self.owner.digest_output_pool);
-        let mut pool = self
-            .owner
-            .pool
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        debug_assert!(pool.detached_readback);
-        pool.detached_readback = false;
-        drop(pool);
-        MetalDigests::with_buffer(buffer, digest_pool, len)
     }
 }
 
@@ -837,28 +579,6 @@ enum TreeReadback<'a, F: RichField> {
     },
 }
 
-fn tree_from_metal_digests<F: RichField>(
-    nodes: MetalDigests<HashOut<F>>,
-    level_offsets: &[usize],
-    leaf_count: usize,
-    cap_height: usize,
-) -> (LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>) {
-    let cap_count = 1usize << cap_height;
-    let node_count = 2 * leaf_count - cap_count;
-    assert_eq!(nodes.as_slice().len(), node_count);
-    assert_eq!(size_of::<HashOut<F>>(), 4 * size_of::<u64>());
-    let level_offsets: Vec<usize> = level_offsets.iter().map(|offset| offset / 4).collect();
-    let cap_offset = *level_offsets.last().unwrap();
-    let cap = nodes.as_slice()[cap_offset..cap_offset + cap_count].to_vec();
-    (
-        LevelOrderDigests {
-            nodes: DigestStore::Shared(nodes),
-            level_offsets,
-        },
-        cap,
-    )
-}
-
 impl<F: RichField> TreeReadback<'_, F> {
     fn finish(self) -> (LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>) {
         match self {
@@ -871,14 +591,10 @@ impl<F: RichField> TreeReadback<'_, F> {
                 cap_height,
                 marker: _,
             } => {
-                let node_count = 2 * leaf_count - (1usize << cap_height);
-                assert_eq!(output_len, node_count * 4);
-                tree_from_metal_digests(
-                    output.into_digests::<HashOut<F>>(node_count),
-                    &level_offsets,
-                    leaf_count,
-                    cap_height,
-                )
+                let nodes = unsafe {
+                    slice::from_raw_parts(output.buffer().contents().cast::<u64>(), output_len)
+                };
+                tree_from_levels(nodes, &level_offsets, leaf_count, cap_height)
             }
         }
     }
@@ -927,7 +643,6 @@ impl LazyPipeline {
 
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
-static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
@@ -936,10 +651,6 @@ fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
 
 fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     RANGE_CHECK_GATE_QUOTIENT_PIPELINE.get()
-}
-
-fn permutation_quotient_pipeline() -> Option<&'static ComputePipelineState> {
-    PERMUTATION_QUOTIENT_PIPELINE.get()
 }
 
 fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
@@ -962,7 +673,6 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             "range_check_gate_quotient",
             &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
         ),
-        ("permutation_quotient", &PERMUTATION_QUOTIENT_PIPELINE),
         ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
     ] {
         let device = device.clone();
@@ -1354,107 +1064,6 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
         Ok(job) => Some(job),
         Err(error) => {
             log::warn!("Metal Poseidon2 gate quotient unavailable; using CPU path: {error}");
-            None
-        }
-    }
-}
-
-/// Starts the no-lookup permutation partial-product evaluation over retained
-/// wire, sigma and Z/partial-product LDE columns. The two `L_0` rows remain on
-/// the CPU; this job emits their successors at global alpha powers 2 onward.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn start_permutation_quotient<F: RichField>(
-    wires: &MetalColumns<F>,
-    constants_sigmas: &MetalColumns<F>,
-    zs_partial_products: &MetalColumns<F>,
-    shifted_points: &[F],
-    quotient_rows: usize,
-    step: usize,
-    next_step: usize,
-    sigma_start: usize,
-    num_routed_wires: usize,
-    num_partial_products: usize,
-    chunk_size: usize,
-    betas: &[F],
-    gammas: &[F],
-    beta_k_is: &[F],
-    alphas: &[F],
-) -> Option<PermutationQuotientJob<F>> {
-    const NUM_CHALLENGES: usize = 2;
-    const MAX_INLINE_BYTES: usize = 4096;
-
-    let num_chunks = num_routed_wires.div_ceil(chunk_size.max(1));
-    let alpha_stride = NUM_CHALLENGES.checked_mul(1 + num_chunks)?;
-    if F::ORDER != 0xffff_ffff_0000_0001
-        || size_of::<F>() != size_of::<u64>()
-        || betas.len() != NUM_CHALLENGES
-        || gammas.len() != NUM_CHALLENGES
-        || alphas.len() != NUM_CHALLENGES
-        || beta_k_is.len() != NUM_CHALLENGES.checked_mul(num_routed_wires)?
-        || quotient_rows == 0
-        || !quotient_rows.is_power_of_two()
-        || shifted_points.len() != quotient_rows
-        || step == 0
-        || quotient_rows.checked_mul(step) != Some(wires.rows)
-        || wires.rows != constants_sigmas.rows
-        || wires.rows != zs_partial_products.rows
-        || next_step >= quotient_rows
-        || num_routed_wires == 0
-        || chunk_size == 0
-        || num_chunks != num_partial_products + 1
-        || wires.cols < num_routed_wires
-        || constants_sigmas.cols < sigma_start.checked_add(num_routed_wires)?
-        || zs_partial_products.cols
-            < NUM_CHALLENGES.checked_add(NUM_CHALLENGES.checked_mul(num_partial_products)?)?
-        || quotient_rows > u32::MAX as usize
-        || wires.rows > u32::MAX as usize
-        || step > u32::MAX as usize
-        || next_step > u32::MAX as usize
-        || sigma_start > u32::MAX as usize
-        || num_routed_wires > u32::MAX as usize
-        || num_partial_products > u32::MAX as usize
-        || chunk_size > u32::MAX as usize
-        || alpha_stride.checked_mul(2 * size_of::<u64>())? > MAX_INLINE_BYTES
-        || (4usize.checked_add(beta_k_is.len())?)
-            .checked_mul(size_of::<u64>())?
-            > MAX_INLINE_BYTES
-    {
-        return None;
-    }
-
-    let mut alpha_powers = Vec::with_capacity(2 * alpha_stride);
-    for &alpha in alphas {
-        let mut power = F::ONE;
-        for _ in 0..alpha_stride {
-            alpha_powers.push(power.to_canonical_u64());
-            power *= alpha;
-        }
-    }
-    let mut challenges = Vec::with_capacity(4 + beta_k_is.len());
-    challenges.extend(betas.iter().map(|x| x.to_canonical_u64()));
-    challenges.extend(gammas.iter().map(|x| x.to_canonical_u64()));
-    challenges.extend(beta_k_is.iter().map(|x| x.to_canonical_u64()));
-
-    let context = shared_context()?;
-    match context.start_permutation_quotient(
-        wires,
-        constants_sigmas,
-        zs_partial_products,
-        shifted_points,
-        quotient_rows,
-        step,
-        next_step,
-        sigma_start,
-        num_routed_wires,
-        num_partial_products,
-        chunk_size,
-        &alpha_powers,
-        alpha_stride,
-        &challenges,
-    ) {
-        Ok(job) => Some(job),
-        Err(error) => {
-            log::warn!("Metal permutation quotient unavailable; using CPU path: {error}");
             None
         }
     }
@@ -1887,7 +1496,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             )
         }));
     }
-    let (state_buffer, output_buffer) = buffers.as_mut()?;
+    let (state_buffer, output_buffer) = buffers.as_ref()?;
 
     // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
     // absorption of group g: commands on one queue execute in submission
@@ -1928,8 +1537,6 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 9, (group == groups - 1) as u32);
             dispatch(encoder, pipeline, leaf_count);
             encoder.end_encoding();
-            #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -1970,8 +1577,6 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
 
             child_count = parent_count;
         }
-        #[cfg(feature = "diagnostic_profile")]
-        profile_command_buffer(command_buffer, "merkle_parents", leaf_count as u64);
         command_buffer.commit();
         command_buffer.to_owned()
     });
@@ -1990,26 +1595,10 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         return None;
     }
 
-    let replacement = context
-        .digest_output_pool
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take_best_fit(output_bytes as u64)
-        .unwrap_or_else(|| {
-            autoreleasepool(|| {
-                context
-                    .device
-                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
-            })
-        });
-    let completed = core::mem::replace(output_buffer, replacement);
-    drop(buffers);
-    let nodes = MetalDigests::with_buffer(
-        completed,
-        Arc::clone(&context.digest_output_pool),
-        total_node_count,
-    );
-    Some(tree_from_metal_digests(
+    let nodes = unsafe {
+        slice::from_raw_parts(output_buffer.contents().cast::<u64>(), output_len)
+    };
+    Some(tree_from_levels::<F>(
         nodes,
         &level_offsets,
         leaf_count,
@@ -2326,12 +1915,10 @@ impl MetalShared {
                     detached_readback: false,
                 }),
                 quotient_output_pool: Arc::new(Mutex::new(QuotientOutputPool::default())),
-                digest_output_pool: Arc::new(Mutex::new(DigestOutputPool::default())),
                 available: Condvar::new(),
                 ntt_roots: Mutex::new(HashMap::new()),
                 ntt_shifts: Mutex::new(HashMap::new()),
                 ntt_ones: Mutex::new(HashMap::new()),
-                permutation_points: Mutex::new(HashMap::new()),
             })
         })
     }
@@ -2414,12 +2001,6 @@ impl MetalShared {
             set_u32(encoder, 12, include_unused_selector as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
-            #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(
-                command_buffer,
-                "poseidon_quotient",
-                (quotient_rows * (group.end - group.start)) as u64,
-            );
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -2486,12 +2067,6 @@ impl MetalShared {
             set_u32(encoder, 10, u32_count as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
-            #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(
-                command_buffer,
-                "range_u32_quotient",
-                (quotient_rows * (range_count + u32_count)) as u64,
-            );
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -2512,91 +2087,6 @@ impl MetalShared {
             len,
             #[cfg(test)]
             failure_observer,
-            _job: job_guard,
-            _phantom: PhantomData,
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn start_permutation_quotient<F: RichField>(
-        &self,
-        wires: &MetalColumns<F>,
-        constants_sigmas: &MetalColumns<F>,
-        zs_partial_products: &MetalColumns<F>,
-        shifted_points: &[F],
-        quotient_rows: usize,
-        step: usize,
-        next_step: usize,
-        sigma_start: usize,
-        num_routed_wires: usize,
-        num_partial_products: usize,
-        chunk_size: usize,
-        alpha_powers: &[u64],
-        alpha_stride: usize,
-        challenges: &[u64],
-    ) -> Result<PermutationQuotientJob<F>, String> {
-        let pipeline = permutation_quotient_pipeline()
-            .ok_or("permutation quotient pipeline unavailable")?;
-        let num_chunks = num_partial_products + 1;
-        if alpha_powers.len() != alpha_stride * 2
-            || alpha_stride != 2 * (1 + num_chunks)
-            || challenges.len() != 4 + 2 * num_routed_wires
-        {
-            return Err("invalid permutation quotient metadata".to_string());
-        }
-        let points = self.permutation_points_for(shifted_points)?;
-        let len = quotient_rows
-            .checked_mul(2)
-            .ok_or("permutation quotient output length overflow")?;
-        let bytes = len
-            .checked_mul(size_of::<u64>())
-            .ok_or("permutation quotient output size overflow")?;
-        let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&wires.buffer), 0);
-            encoder.set_buffer(1, Some(&constants_sigmas.buffer), 0);
-            encoder.set_buffer(2, Some(&zs_partial_products.buffer), 0);
-            encoder.set_buffer(3, Some(&points), 0);
-            encoder.set_buffer(4, Some(&output), 0);
-            encoder.set_bytes(
-                5,
-                size_of_val(alpha_powers) as NSUInteger,
-                alpha_powers.as_ptr().cast::<c_void>(),
-            );
-            encoder.set_bytes(
-                6,
-                size_of_val(challenges) as NSUInteger,
-                challenges.as_ptr().cast::<c_void>(),
-            );
-            set_u32(encoder, 7, wires.rows as u32);
-            set_u32(encoder, 8, quotient_rows as u32);
-            set_u32(encoder, 9, step as u32);
-            set_u32(encoder, 10, next_step as u32);
-            set_u32(encoder, 11, sigma_start as u32);
-            set_u32(encoder, 12, num_routed_wires as u32);
-            set_u32(encoder, 13, num_partial_products as u32);
-            set_u32(encoder, 14, chunk_size as u32);
-            set_u32(encoder, 15, alpha_stride as u32);
-            dispatch(encoder, pipeline, quotient_rows);
-            encoder.end_encoding();
-            #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(
-                command_buffer,
-                "permutation_quotient",
-                (quotient_rows * num_routed_wires * 2) as u64,
-            );
-            command_buffer.commit();
-            command_buffer.to_owned()
-        });
-        Ok(PermutationQuotientJob {
-            command_buffer,
-            output: Some(output),
-            output_pool: Arc::clone(&self.quotient_output_pool),
-            len,
             _job: job_guard,
             _phantom: PhantomData,
         })
@@ -2645,25 +2135,16 @@ impl MetalShared {
         output_bytes: usize,
     ) -> Result<Option<DetachedOutput<'_>>, String> {
         let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
-        if pool.detached_readback {
+        if pool.waiters == 0 || pool.detached_readback {
             return Ok(None);
         }
-        let replacement = pool
-            .spare_output
-            .take()
-            .filter(|buffer| buffer.length() >= output_bytes as u64)
-            .or_else(|| {
-                self.digest_output_pool
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take_best_fit(output_bytes as u64)
-            })
-            .unwrap_or_else(|| {
-                autoreleasepool(|| {
-                    self.device
-                        .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
-                })
-            });
+        let replacement = match pool.spare_output.take() {
+            Some(buffer) if buffer.length() >= output_bytes as u64 => buffer,
+            _ => autoreleasepool(|| {
+                self.device
+                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
+            }),
+        };
         let completed = set
             .output
             .replace(replacement)
@@ -2793,30 +2274,6 @@ impl MetalShared {
             )
         });
         cache.insert(log_degree, buffer.clone());
-        Ok(buffer)
-    }
-
-    fn permutation_points_for<F: RichField>(&self, points: &[F]) -> Result<Buffer, String> {
-        if points.is_empty() || !points.len().is_power_of_two() {
-            return Err("permutation point table must have power-of-two length".to_string());
-        }
-        let log_rows = points.len().ilog2();
-        let mut cache = self
-            .permutation_points
-            .lock()
-            .map_err(|_| "permutation point cache poisoned")?;
-        if let Some(buffer) = cache.get(&log_rows) {
-            return Ok(buffer.clone());
-        }
-        let values: Vec<u64> = points.iter().map(|x| x.to_canonical_u64()).collect();
-        let buffer = autoreleasepool(|| {
-            self.device.new_buffer_with_data(
-                values.as_ptr().cast::<c_void>(),
-                size_of_val(values.as_slice()) as u64,
-                MTLResourceOptions::StorageModeShared,
-            )
-        });
-        cache.insert(log_rows, buffer.clone());
         Ok(buffer)
     }
 
@@ -3050,12 +2507,6 @@ impl MetalShared {
                     child_count = parent_count;
                 }
 
-                #[cfg(feature = "diagnostic_profile")]
-                profile_command_buffer(
-                    command_buffer,
-                    "values_ntt_merkle",
-                    (lde_size * cols) as u64,
-                );
                 command_buffer.commit();
                 command_buffer.to_owned()
             });
@@ -3316,12 +2767,6 @@ impl MetalShared {
                 child_count = parent_count;
             }
 
-            #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(
-                command_buffer,
-                "coeff_ntt_merkle",
-                (lde_size * cols) as u64,
-            );
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -3541,12 +2986,6 @@ impl MetalShared {
             }
             encoder.end_encoding();
 
-            #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(
-                command_buffer,
-                "merkle_tree",
-                (leaf_count * leaf_width) as u64,
-            );
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -3586,7 +3025,7 @@ fn dispatch2d(
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(64)
+        .min(128)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
@@ -3610,7 +3049,7 @@ fn dispatch(
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(128)
+        .min(256)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
@@ -3694,7 +3133,7 @@ fn tree_from_levels<F: RichField>(
     let cap = digests[cap_offset..cap_offset + cap_count].to_vec();
     (
         LevelOrderDigests {
-            nodes: digests.into(),
+            nodes: digests,
             level_offsets,
         },
         cap,
@@ -3871,7 +3310,7 @@ mod tests {
     use crate::plonk::vars::EvaluationVarsBaseBatch;
 
     #[test]
-    fn detaches_output_without_a_waiter_for_resident_store() {
+    fn does_not_detach_output_without_a_waiting_build() {
         let context = MetalShared::new().expect("Metal context");
         let mut set = context.acquire_set().expect("buffer set");
         set.output = Some(autoreleasepool(|| {
@@ -3879,18 +3318,14 @@ mod tests {
                 .device
                 .new_buffer(64, MTLResourceOptions::StorageModeShared)
         }));
-        let original = set.output.as_ref().unwrap().contents();
 
         let detached = context
             .try_detach_completed_output(&mut set, 64)
-            .expect("pool state")
-            .expect("resident digest storage always detaches");
-        assert_eq!(detached.buffer().contents(), original);
-        assert_ne!(set.output.as_ref().unwrap().contents(), original);
-        assert!(context.pool.lock().unwrap().detached_readback);
-        drop(detached);
+            .expect("pool state");
+        assert!(detached.is_none());
         let pool = context.pool.lock().unwrap();
-        assert!(pool.spare_output.is_some());
+        assert_eq!(pool.waiters, 0);
+        assert!(pool.spare_output.is_none());
         assert!(!pool.detached_readback);
     }
 
@@ -3967,11 +3402,7 @@ mod tests {
         context.pool.lock().unwrap().waiters = 0;
         context.release_set(set);
 
-        let resident = pending.finish();
-        assert!(resident.0.nodes.is_shared());
-        assert_eq!(resident, expected);
-        drop(resident);
-        assert_eq!(context.digest_output_pool.lock().unwrap().free.len(), 1);
+        assert_eq!(pending.finish(), expected);
     }
 
     fn gpu_duration(command_buffer: &CommandBuffer, wall: Duration) -> Duration {
@@ -4095,127 +3526,6 @@ mod tests {
                     actual.to_canonical_u64(),
                     expected.to_canonical_u64(),
                     "Poseidon2 gate quotient mismatch at word {i}, step {step}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn metal_permutation_quotient_matches_cpu_across_steps_and_wrap() {
-        type F = GoldilocksField;
-        const QUOTIENT_ROWS: usize = 64;
-        const ROUTED: usize = 10;
-        const CHUNK_SIZE: usize = 4;
-        const NUM_PARTIALS: usize = 2;
-        const NUM_CHUNKS: usize = NUM_PARTIALS + 1;
-        const SIGMA_START: usize = 3;
-        const NEXT_STEP: usize = 8;
-
-        let context = shared_context().expect("Metal context must initialize");
-        let alphas = [F::from_canonical_u64(3), F::from_canonical_u64(5)];
-        let betas = [F::from_canonical_u64(7), F::from_canonical_u64(11)];
-        let gammas = [F::from_canonical_u64(13), F::from_canonical_u64(17)];
-        let beta_k_is = (0..2 * ROUTED)
-            .map(|i| F::from_canonical_usize(19 + i * 2))
-            .collect::<Vec<_>>();
-        let shifted_points = F::two_adic_subgroup(QUOTIENT_ROWS.ilog2() as usize)
-            .into_iter()
-            .map(|x| F::coset_shift() * x)
-            .collect::<Vec<_>>();
-
-        for step in [1, 4] {
-            let full_rows = QUOTIENT_ROWS * step;
-            let mut wires = context
-                .allocate_columns::<F>(full_rows, ROUTED)
-                .expect("wire columns");
-            let mut constants = context
-                .allocate_columns::<F>(full_rows, SIGMA_START + ROUTED)
-                .expect("constant/sigma columns");
-            let mut zs = context
-                .allocate_columns::<F>(full_rows, 2 + 2 * NUM_PARTIALS)
-                .expect("Z/partial columns");
-            let mut rng = StdRng::seed_from_u64(0xcafe_5000 + step as u64);
-            for columns in [&mut wires, &mut constants, &mut zs] {
-                for column in columns.columns_mut().expect("unique columns") {
-                    for value in column {
-                        *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
-                    }
-                }
-            }
-
-            let mut expected = vec![F::ZERO; 2 * QUOTIENT_ROWS];
-            for row in 0..QUOTIENT_ROWS {
-                let source = row * step;
-                let next_source = ((row + NEXT_STEP) & (QUOTIENT_ROWS - 1)) * step;
-                for permutation_challenge in 0..2 {
-                    let beta = betas[permutation_challenge];
-                    let gamma = gammas[permutation_challenge];
-                    for chunk in 0..NUM_CHUNKS {
-                        let start = chunk * CHUNK_SIZE;
-                        let end = ((chunk + 1) * CHUNK_SIZE).min(ROUTED);
-                        let factor = |j: usize| {
-                            let wire = wires.col(j)[source];
-                            let numerator = wire.multiply_accumulate(
-                                beta_k_is[permutation_challenge * ROUTED + j],
-                                shifted_points[row],
-                            ) + gamma;
-                            let denominator = wire.multiply_accumulate(
-                                beta,
-                                constants.col(SIGMA_START + j)[source],
-                            ) + gamma;
-                            (numerator, denominator)
-                        };
-                        let (mut numerator, mut denominator) = factor(start);
-                        for j in start + 1..end {
-                            let (n, d) = factor(j);
-                            numerator *= n;
-                            denominator *= d;
-                        }
-                        let previous_column = if chunk == 0 {
-                            permutation_challenge
-                        } else {
-                            2 + permutation_challenge * NUM_PARTIALS + chunk - 1
-                        };
-                        let previous = zs.col(previous_column)[source];
-                        let next = if chunk < NUM_PARTIALS {
-                            zs.col(2 + permutation_challenge * NUM_PARTIALS + chunk)[source]
-                        } else {
-                            zs.col(permutation_challenge)[next_source]
-                        };
-                        let term = previous * numerator - next * denominator;
-                        let alpha_index = 2 + permutation_challenge * NUM_CHUNKS + chunk;
-                        for (out_challenge, &alpha) in alphas.iter().enumerate() {
-                            expected[row * 2 + out_challenge] +=
-                                term * alpha.exp_u64(alpha_index as u64);
-                        }
-                    }
-                }
-            }
-
-            let job = start_permutation_quotient(
-                &wires,
-                &constants,
-                &zs,
-                &shifted_points,
-                QUOTIENT_ROWS,
-                step,
-                NEXT_STEP,
-                SIGMA_START,
-                ROUTED,
-                NUM_PARTIALS,
-                CHUNK_SIZE,
-                &betas,
-                &gammas,
-                &beta_k_is,
-                &alphas,
-            )
-            .expect("Metal permutation job must start");
-            let actual = job.finish().expect("Metal permutation job must finish");
-            for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
-                assert_eq!(
-                    actual.to_canonical_u64(),
-                    expected.to_canonical_u64(),
-                    "permutation quotient mismatch at word {i}, step {step}"
                 );
             }
         }
@@ -6232,45 +5542,6 @@ kernel void goldilocks_mul_bench_native(
     }
 
     #[test]
-    fn streamed_merkle_keeps_digests_resident_and_matches_classic() {
-        type F = GoldilocksField;
-        struct ExclusiveReset;
-        impl Drop for ExclusiveReset {
-            fn drop(&mut self) {
-                set_exclusive_gpu_phase(false);
-            }
-        }
-
-        let context = shared_context().expect("Metal context");
-        let rows = 1usize << 20;
-        let cols = 16;
-        let cap_height = 4;
-        let columns = context
-            .allocate_columns::<F>(rows, cols)
-            .expect("shared columns");
-        set_exclusive_gpu_phase(true);
-        let _reset = ExclusiveReset;
-        assert!(is_exclusive_gpu_phase());
-        assert!(absorb_pass_pipeline().is_some(), "absorb pipeline");
-        let streamed = build_merkle_tree_shared_streamed(
-            &columns,
-            cap_height,
-            &|group, destinations| {
-                for (index, destination) in destinations.iter_mut().enumerate() {
-                    destination.fill(F::from_canonical_usize(group * 8 + index + 1));
-                }
-            },
-        )
-        .expect("streamed tree");
-        assert!(streamed.0.nodes.is_shared());
-
-        let classic = context
-            .build(LeafSource::Shared(&columns), cols, rows, cap_height)
-            .expect("classic tree");
-        assert_eq!(streamed, classic);
-    }
-
-    #[test]
     fn metal_merkle_matches_cpu_across_sponge_boundaries() {
         let mut rng = StdRng::seed_from_u64(0x4d45_5441_4c32);
         for width in [0, 1, 4, 5, 8, 9, 16, 17, 31, 64, 137] {
@@ -6321,10 +5592,6 @@ kernel void goldilocks_mul_bench_native(
                     )
                     .unwrap();
                 let cpu = cpu_tree(&leaves, cap_height);
-                assert!(
-                    gpu.0.nodes.is_shared(),
-                    "completed Metal digest levels must stay resident",
-                );
                 assert_tree_eq(&gpu, &cpu, width, cap_height);
                 assert_all_paths_match_cpu(&gpu, &cpu, leaves.len(), cap_height);
 
