@@ -2006,7 +2006,6 @@ fn compute_quotient_polys<
 
     struct QuotientScratch<F: RichField> {
         indices: Vec<usize>,
-        indices_next: Vec<usize>,
         local_constants: Vec<F>,
         local_wires: Vec<F>,
         s_sigmas_flat: Vec<F>,
@@ -2091,7 +2090,6 @@ fn compute_quotient_polys<
         .for_each_init(
             || QuotientScratch::<F> {
                 indices: Vec::with_capacity(BATCH_SIZE),
-                indices_next: Vec::with_capacity(BATCH_SIZE),
                 local_constants: Vec::new(),
                 local_wires: Vec::new(),
                 s_sigmas_flat: Vec::new(),
@@ -2111,10 +2109,6 @@ fn compute_quotient_polys<
                 scratch
                     .indices
                     .extend(BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n);
-                scratch.indices_next.clear();
-                scratch
-                    .indices_next
-                    .extend(scratch.indices.iter().map(|&i| (i + next_step) & lde_mask));
 
                 let shifted_xs_batch = &shifted_points[BATCH_SIZE * batch_i..][..n];
                 debug_assert!(
@@ -2222,8 +2216,10 @@ fn compute_quotient_polys<
                     batch_layout,
                     &mut scratch.zs_local_flat,
                 );
-                zs_partial_products_and_lookup_commitment.fill_lde_batch(
-                    &scratch.indices_next,
+                zs_partial_products_and_lookup_commitment.fill_lde_batch_wrapping_range(
+                    (BATCH_SIZE * batch_i + next_step) & lde_mask,
+                    n,
+                    lde_size,
                     step,
                     zs_next_range,
                     batch_layout,
@@ -2953,6 +2949,44 @@ mod quotient_layout_tests {
         commitment.fill_lde_batch_contiguous(indices[0], indices.len(), range, &mut contiguous);
 
         assert_eq!(contiguous, indexed);
+    }
+
+    /// The allocation-free next-Z range gather must preserve the generic
+    /// indexed gather on both sides of the logical-domain wrap and in both
+    /// output layouts.
+    #[test]
+    fn wrapping_lde_batch_range_matches_indexed_gather() {
+        let (data, _) = small_circuit();
+        let commitment = &data.prover_only.constants_sigmas_commitment;
+        let range = data.common.sigmas_range();
+        let logical_domain = 32;
+        let start = 29;
+        let n = 7;
+        let indices = [29usize, 30, 31, 0, 1, 2, 3];
+
+        for step in [1, 2] {
+            for layout in [BatchLayout::PointMajor, BatchLayout::PolyMajor] {
+                let mut indexed = Vec::new();
+                let mut wrapping = Vec::new();
+                commitment.fill_lde_batch(
+                    &indices,
+                    step,
+                    range.clone(),
+                    layout,
+                    &mut indexed,
+                );
+                commitment.fill_lde_batch_wrapping_range(
+                    start,
+                    n,
+                    logical_domain,
+                    step,
+                    range.clone(),
+                    layout,
+                    &mut wrapping,
+                );
+                assert_eq!(wrapping, indexed, "step {step}, layout {layout:?}");
+            }
+        }
     }
 
     /// Scratch reuse: `fill_lde_batch` writes every cell of `out` before any
