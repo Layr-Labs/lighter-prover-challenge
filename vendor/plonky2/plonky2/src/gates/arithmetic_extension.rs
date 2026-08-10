@@ -169,6 +169,51 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticExte
             scratch_heap = vec![F::ZERO; scratch_len];
             &mut scratch_heap
         };
+        if D == 2 {
+            for i in 0..self.num_ops {
+                let m0_start = Self::wires_ith_multiplicand_0(i).start;
+                let m1_start = Self::wires_ith_multiplicand_1(i).start;
+                let addend_start = Self::wires_ith_addend(i).start;
+                let output_start = Self::wires_ith_output(i).start;
+                for p in 0..n {
+                    let c0 = const_0[p];
+                    let c1 = const_1[p];
+                    let mut m0_arr = [F::ZERO; D];
+                    m0_arr[0] = wires[m0_start * n + p];
+                    m0_arr[1] = wires[(m0_start + 1) * n + p];
+                    let m0 = F::Extension::from_basefield_array(m0_arr);
+                    let mut m1_arr = [F::ZERO; D];
+                    m1_arr[0] = wires[m1_start * n + p];
+                    m1_arr[1] = wires[(m1_start + 1) * n + p];
+                    let m1 = F::Extension::from_basefield_array(m1_arr);
+                    let mut addend_arr = [F::ZERO; D];
+                    addend_arr[0] = wires[addend_start * n + p];
+                    addend_arr[1] = wires[(addend_start + 1) * n + p];
+                    let addend = F::Extension::from_basefield_array(addend_arr);
+                    let mut output_arr = [F::ZERO; D];
+                    output_arr[0] = wires[output_start * n + p];
+                    output_arr[1] = wires[(output_start + 1) * n + p];
+                    let output = F::Extension::from_basefield_array(output_arr);
+                    let computed_output = (m0 * m1).scalar_mul(c0) + addend.scalar_mul(c1);
+                    // Same operations as the generic path, but written directly to
+                    // the two D <= 2 scratch limbs without the per-point closure.
+                    let arr = (output - computed_output).to_basefield_array();
+                    scratch[0 * n + p] = arr[0];
+                    scratch[1 * n + p] = arr[1];
+                }
+                batch_multiply_add_inplace(
+                    &mut combined_gate_constraints[(i * 2) * n..][..n],
+                    &scratch[0 * n..][..n],
+                    filters,
+                );
+                batch_multiply_add_inplace(
+                    &mut combined_gate_constraints[(i * 2 + 1) * n..][..n],
+                    &scratch[1 * n..][..n],
+                    filters,
+                );
+            }
+            return;
+        }
         for i in 0..self.num_ops {
             let m0_start = Self::wires_ith_multiplicand_0(i).start;
             let m1_start = Self::wires_ith_multiplicand_1(i).start;
