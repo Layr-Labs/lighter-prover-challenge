@@ -374,6 +374,12 @@ pub struct GeneratorWatchIndex {
 
 impl GeneratorWatchIndex {
     pub fn from_map(map: BTreeMap<usize, Vec<usize>>) -> Self {
+        assert!(
+            map.values()
+                .flatten()
+                .all(|&generator| u32::try_from(generator).is_ok()),
+            "generator watch index exceeds u32"
+        );
         let entries = map.values().filter(|watchers| !watchers.is_empty()).count();
         let Some((&max_representative, _)) = map.last_key_value() else {
             return Self {
@@ -424,6 +430,10 @@ impl GeneratorWatchIndex {
         representatives: &[u32],
         generator_watch_counts: &[usize],
     ) -> Self {
+        assert!(
+            u32::try_from(generator_watch_counts.len()).is_ok(),
+            "generator count exceeds u32"
+        );
         debug_assert_eq!(
             generator_watch_counts.iter().sum::<usize>(),
             representatives.len()
@@ -514,6 +524,12 @@ impl GeneratorWatchIndex {
     /// monotonically nondecreasing, start at 0 and end at `watchers.len()`,
     /// exactly as [`Self::from_map`] produces them.
     pub fn from_parts(offsets: Vec<u32>, watchers: Vec<usize>) -> Self {
+        assert!(
+            watchers
+                .iter()
+                .all(|&generator| u32::try_from(generator).is_ok()),
+            "generator watch index exceeds u32"
+        );
         assert!(!offsets.is_empty(), "watch index offsets must be non-empty");
         assert_eq!(offsets[0], 0, "watch index offsets must start at zero");
         assert_eq!(
@@ -964,5 +980,13 @@ mod generator_watch_index_tests {
             .map(|(representative, watchers)| (representative, watchers.to_vec()))
             .collect::<Vec<_>>();
         assert_eq!(entries, vec![(1, vec![2, 5]), (4, vec![3])]);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    #[should_panic(expected = "generator watch index exceeds u32")]
+    fn watch_index_rejects_non_compact_generator_indices() {
+        let map = BTreeMap::from([(0usize, vec![u32::MAX as usize + 1])]);
+        let _ = GeneratorWatchIndex::from_map(map);
     }
 }
