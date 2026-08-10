@@ -101,6 +101,60 @@ fn profile_command_buffer(
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 
+/// K6-only kernel body. At runtime it is prefixed with selected Goldilocks
+/// helpers copied byte-for-byte out of [`SHADER_SOURCE`], so the residual
+/// library cannot silently acquire a different field implementation from the
+/// checked-in monolithic library.
+const K6_RESIDUAL_KERNEL_SOURCE: &str = include_str!("k6_residual.metal");
+
+/// Builds the small runtime source without duplicating Goldilocks arithmetic.
+/// Marker failure is deliberately recoverable: the async compiler publishes
+/// an unavailable pipeline and all six gates stay on the CPU permanently.
+fn k6_residual_shader_source() -> Result<String, String> {
+    fn before(marker: &str) -> Result<&'static str, String> {
+        let end = SHADER_SOURCE
+            .find(marker)
+            .ok_or_else(|| format!("K6 shader marker missing: {marker}"))?;
+        Ok(&SHADER_SOURCE[..end])
+    }
+
+    fn between(start_marker: &str, end_marker: &str) -> Result<&'static str, String> {
+        let start = SHADER_SOURCE
+            .find(start_marker)
+            .ok_or_else(|| format!("K6 shader marker missing: {start_marker}"))?;
+        let tail = &SHADER_SOURCE[start..];
+        let relative_end = tail
+            .find(end_marker)
+            .ok_or_else(|| format!("K6 shader marker missing: {end_marker}"))?;
+        Ok(&tail[..relative_end])
+    }
+
+    let header = before("// Compile-time Poseidon2 round constants")?;
+    let add_sub = between(
+        "inline void add_epsilon_u32",
+        "// Final step of the 128-bit Goldilocks reduction",
+    )?;
+    let multiply = between("inline ulong reduce_top", "// A lazy value is")?;
+    let multiply_add = between(
+        "inline ulong gl_mul_add",
+        "// x^7 by the addition chain",
+    )?;
+    let capacity = header
+        .len()
+        .checked_add(add_sub.len())
+        .and_then(|len| len.checked_add(multiply.len()))
+        .and_then(|len| len.checked_add(multiply_add.len()))
+        .and_then(|len| len.checked_add(K6_RESIDUAL_KERNEL_SOURCE.len()))
+        .ok_or_else(|| "K6 shader source size overflow".to_string())?;
+    let mut source = String::with_capacity(capacity + 4);
+    for segment in [header, add_sub, multiply, multiply_add] {
+        source.push_str(segment);
+        source.push('\n');
+    }
+    source.push_str(K6_RESIDUAL_KERNEL_SOURCE);
+    Ok(source)
+}
+
 /// `poseidon2.metal` precompiled to AIR, so a worker that cannot use the Metal
 /// shader cache does not pay the MSL front end. Regenerate whenever
 /// `poseidon2.metal` changes (see `MetalShared::new`); the
@@ -109,7 +163,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
+    "01c0d7ab6a8355cd404f2ab58acccba515efb92f4e77b824b58d8c9854243846";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -222,6 +276,9 @@ pub(crate) struct PoseidonGateQuotientJob<F> {
 /// challenge values per quotient-domain point.
 pub(crate) struct RangeCheckGateQuotientJob<F> {
     command_buffer: CommandBuffer,
+    /// Optional K6 command committed after `command_buffer` on the same queue.
+    /// If present it is the completion fence for the shared output vector.
+    k6_tail_command_buffer: Option<CommandBuffer>,
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
     len: usize,
@@ -326,12 +383,23 @@ impl<F: RichField> PoseidonGateQuotientJob<F> {
 
 impl<F: RichField> RangeCheckGateQuotientJob<F> {
     pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
+        self.k6_tail_command_buffer
+            .as_ref()
+            .unwrap_or(&self.command_buffer)
+            .wait_until_completed();
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "RangeCheck gate quotient command buffer ended with status {:?}",
                 self.command_buffer.status()
             ));
+        }
+        if let Some(tail) = &self.k6_tail_command_buffer {
+            if tail.status() != MTLCommandBufferStatus::Completed {
+                return Err(format!(
+                    "K6 residual quotient command buffer ended with status {:?}",
+                    tail.status()
+                ));
+            }
         }
         #[cfg(test)]
         if let Some(observer) = &self.failure_observer {
@@ -405,8 +473,15 @@ impl<F> Drop for PoseidonGateQuotientJob<F> {
 
 impl<F> Drop for RangeCheckGateQuotientJob<F> {
     fn drop(&mut self) {
+        let completion = self
+            .k6_tail_command_buffer
+            .as_ref()
+            .unwrap_or(&self.command_buffer);
+        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return;
+        }
         recycle_completed_quotient_output(
-            &self.command_buffer,
+            completion,
             &mut self.output,
             &self.output_pool,
         );
@@ -502,6 +577,30 @@ pub(crate) struct U32QuotientSpec {
     pub include_unused_selector: bool,
     pub num_ops: usize,
     pub kind: U32QuotientKind,
+}
+
+/// The six exact production gate shapes absent from the checked-in monolithic
+/// Range/U32 metallib. They intentionally use the historic 13..18 tags, making
+/// comparison against the previously differential-tested combined kernel
+/// mechanical.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum K6QuotientKind {
+    BaseFieldArithmetic { constant_base: usize },
+    ExtensionArithmetic { constant_base: usize },
+    ExtensionMultiplication { constant_base: usize },
+    CosetInterpolation,
+    Constant { constant_base: usize },
+    PublicInput,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct K6QuotientSpec {
+    pub selector_column: usize,
+    pub gate_index: usize,
+    pub group: core::ops::Range<usize>,
+    pub include_unused_selector: bool,
+    pub num_ops: usize,
+    pub kind: K6QuotientKind,
 }
 
 /// LDE columns computed and retained in a CPU-visible Metal shared buffer.
@@ -923,12 +1022,25 @@ impl LazyPipeline {
         }
         self.built.get()?.as_ref()
     }
+
+    /// A proof-boundary readiness snapshot. Unlike [`Self::get`], this never
+    /// takes the builder mutex and never joins a compiler thread.
+    fn try_get(&self) -> Option<&ComputePipelineState> {
+        self.built.get()?.as_ref()
+    }
 }
 
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
+static K6_RESIDUAL_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
+
+/// Opaque proof-local ownership decision for the K6 path. Once obtained, all
+/// six families use the same pipeline for this quotient computation; if it is
+/// absent at the boundary they all remain on the CPU for that proof.
+#[derive(Clone, Copy)]
+pub(crate) struct K6ResidualPipeline(&'static ComputePipelineState);
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     POSEIDON_GATE_QUOTIENT_PIPELINE.get()
@@ -944,6 +1056,75 @@ fn permutation_quotient_pipeline() -> Option<&'static ComputePipelineState> {
 
 fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.get()
+}
+
+pub(crate) fn k6_residual_pipeline_snapshot() -> Option<K6ResidualPipeline> {
+    K6_RESIDUAL_QUOTIENT_PIPELINE
+        .try_get()
+        .map(K6ResidualPipeline)
+}
+
+/// Compiles and lowers the K6-only library on a detached thread. Every error
+/// is published as `Some(None)`, making CPU fallback permanent and preventing
+/// later proofs from retrying a broken compiler path.
+fn spawn_k6_residual_pipeline(device: &Device) {
+    let device = device.clone();
+    let spawned = std::thread::Builder::new()
+        .name("poseidon2-metal-k6-residual".to_string())
+        .spawn(move || {
+            // Do not contend with any established pipeline lowering. This
+            // thread only polls publication cells; it never takes a builder
+            // mutex or consumes a join handle, so routing retains its exact
+            // baseline wait/fallback behaviour.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while [
+                &POSEIDON_GATE_QUOTIENT_PIPELINE,
+                &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
+                &PERMUTATION_QUOTIENT_PIPELINE,
+                &ABSORB_PASS_PIPELINE,
+            ]
+            .iter()
+            .any(|slot| slot.built.get().is_none())
+            {
+                if std::time::Instant::now() >= deadline {
+                    log::debug!(
+                        "baseline Metal pipelines did not settle; K6 residual gates stay on CPU"
+                    );
+                    let _ = K6_RESIDUAL_QUOTIENT_PIPELINE.built.set(None);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let result = autoreleasepool(|| -> Result<ComputePipelineState, String> {
+                let source = k6_residual_shader_source()?;
+                let options = CompileOptions::new();
+                let library = device
+                    .new_library_with_source(&source, &options)
+                    .map_err(|error| format!("K6 shader compilation failed: {error}"))?;
+                let function = library
+                    .get_function("k6_residual_quotient", None)
+                    .map_err(|error| format!("K6 residual kernel unavailable: {error}"))?;
+                device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .map_err(|error| format!("K6 residual pipeline creation failed: {error}"))
+            });
+            let pipeline = result
+                .map_err(|error| {
+                    log::debug!("{error}; K6 residual gates stay on the CPU");
+                })
+                .ok();
+            let _ = K6_RESIDUAL_QUOTIENT_PIPELINE.built.set(pipeline);
+        });
+    match spawned {
+        Ok(handle) => {
+            if let Ok(mut builder) = K6_RESIDUAL_QUOTIENT_PIPELINE.builder.lock() {
+                *builder = Some(handle);
+            }
+        }
+        Err(_) => {
+            let _ = K6_RESIDUAL_QUOTIENT_PIPELINE.built.set(None);
+        }
+    }
 }
 
 /// Starts the two gate-quotient pipeline builds on detached threads.
@@ -965,6 +1146,7 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
         ("permutation_quotient", &PERMUTATION_QUOTIENT_PIPELINE),
         ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
     ] {
+        let starts_k6_build = name == "range_check_gate_quotient";
         let device = device.clone();
         let library = library.clone();
         let spawned = std::thread::Builder::new()
@@ -981,6 +1163,13 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
                     log::debug!("{name} pipeline unavailable; evaluating those gates on the CPU");
                 }
                 let _ = slot.built.set(pipeline);
+                // Start the MSL front end only after the baseline Range/U32
+                // pipeline is published. This avoids delaying the established
+                // path, while the spawned K6 compiler can never be joined by a
+                // routing decision.
+                if starts_k6_build {
+                    spawn_k6_residual_pipeline(&device);
+                }
             });
         match spawned {
             Ok(handle) => {
@@ -992,6 +1181,9 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             // so readers fall back instead of looking for a build in flight.
             Err(_) => {
                 let _ = slot.built.set(None);
+                if starts_k6_build {
+                    let _ = K6_RESIDUAL_QUOTIENT_PIPELINE.built.set(None);
+                }
             }
         }
     }
@@ -1784,6 +1976,155 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     }
 }
 
+/// Starts the K6 residual kernel only when the caller captured a ready
+/// pipeline at the proof boundary. Metadata acceptance and command submission
+/// are all-or-nothing; callers exclude no K6 gate unless this appends the tail
+/// command to an already-submitted prebuilt Range/U32 job.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_k6_residual_quotient<F: RichField>(
+    pipeline: K6ResidualPipeline,
+    range_job: &mut RangeCheckGateQuotientJob<F>,
+    wires: &MetalColumns<F>,
+    constants: &MetalColumns<F>,
+    quotient_rows: usize,
+    step: usize,
+    specs: &[K6QuotientSpec],
+    public_inputs_hash: &HashOut<F>,
+    alphas: &[F],
+    alpha_offset: usize,
+) -> Option<()> {
+    const SPEC_WORDS: usize = 10;
+    const MAX_INLINE_BYTES: usize = 4096;
+
+    if F::ORDER != 0xffff_ffff_0000_0001
+        || size_of::<F>() != size_of::<u64>()
+        || alphas.len() != 2
+        || specs.is_empty()
+        || specs
+            .len()
+            .checked_mul(SPEC_WORDS * size_of::<u32>())
+            .map_or(true, |bytes| bytes > MAX_INLINE_BYTES)
+        || wires.rows == 0
+        || wires.rows != constants.rows
+        || quotient_rows == 0
+        || step == 0
+        || quotient_rows.checked_mul(step) != Some(wires.rows)
+        || wires.rows > u32::MAX as usize
+        || quotient_rows > u32::MAX as usize
+        || step > u32::MAX as usize
+    {
+        return None;
+    }
+
+    let mut alpha_stride = 0usize;
+    let mut metadata = Vec::with_capacity(specs.len() * SPEC_WORDS);
+    for spec in specs {
+        if spec.num_ops == 0 {
+            return None;
+        }
+        let (kind, constant_base, constant_width, wire_count, num_constraints) = match spec.kind {
+            K6QuotientKind::BaseFieldArithmetic { constant_base } => (
+                13usize,
+                constant_base,
+                2usize,
+                spec.num_ops.checked_mul(4)?,
+                spec.num_ops,
+            ),
+            K6QuotientKind::ExtensionArithmetic { constant_base } => (
+                14usize,
+                constant_base,
+                2usize,
+                spec.num_ops.checked_mul(8)?,
+                spec.num_ops.checked_mul(2)?,
+            ),
+            K6QuotientKind::ExtensionMultiplication { constant_base } => (
+                15usize,
+                constant_base,
+                1usize,
+                spec.num_ops.checked_mul(6)?,
+                spec.num_ops.checked_mul(2)?,
+            ),
+            K6QuotientKind::CosetInterpolation if spec.num_ops == 2 => {
+                (16usize, 0usize, 0usize, 47usize, 12usize)
+            }
+            K6QuotientKind::Constant { constant_base } if spec.num_ops == 2 => {
+                (17usize, constant_base, 2usize, 2usize, 2usize)
+            }
+            K6QuotientKind::PublicInput if spec.num_ops == 4 => {
+                (18usize, 0usize, 0usize, 4usize, 4usize)
+            }
+            _ => return None,
+        };
+        if wire_count > wires.cols
+            || constant_base.checked_add(constant_width)? > constants.cols
+            || spec.selector_column >= constants.cols
+            || spec.group.start > spec.gate_index
+            || spec.gate_index >= spec.group.end
+            || spec.selector_column > u32::MAX as usize
+            || spec.gate_index > u32::MAX as usize
+            || spec.group.end > u32::MAX as usize
+            || spec.num_ops > u32::MAX as usize
+            || constant_base > u32::MAX as usize
+        {
+            return None;
+        }
+        alpha_stride = alpha_stride.max(num_constraints);
+        metadata.extend([
+            spec.selector_column as u32,
+            spec.gate_index as u32,
+            spec.group.start as u32,
+            spec.group.end as u32,
+            spec.include_unused_selector as u32,
+            kind as u32,
+            spec.num_ops as u32,
+            constant_base as u32,
+            0,
+            0,
+        ]);
+    }
+    if alpha_stride == 0
+        || alpha_stride > u32::MAX as usize
+        || alpha_stride
+            .checked_mul(2 * size_of::<u64>())
+            .map_or(true, |bytes| bytes > MAX_INLINE_BYTES)
+    {
+        return None;
+    }
+
+    let mut alpha_powers = Vec::with_capacity(2 * alpha_stride);
+    for &alpha in alphas {
+        let mut power = alpha.exp_u64(alpha_offset as u64);
+        for _ in 0..alpha_stride {
+            alpha_powers.push(power.to_canonical_u64());
+            power *= alpha;
+        }
+    }
+    let public_inputs_hash = public_inputs_hash
+        .elements
+        .map(|value| value.to_canonical_u64());
+
+    let context = shared_context()?;
+    match context.append_k6_residual_quotient(
+        pipeline,
+        range_job,
+        wires,
+        constants,
+        quotient_rows,
+        step,
+        &metadata,
+        specs.len(),
+        &alpha_powers,
+        alpha_stride,
+        &public_inputs_hash,
+    ) {
+        Ok(()) => Some(()),
+        Err(error) => {
+            log::warn!("Metal K6 residual quotient unavailable; using CPU path: {error}");
+            None
+        }
+    }
+}
+
 /// Allocates the final retained column store before the CPU LDE is computed,
 /// so the same shared buffer can be bound directly as the Metal leaf input.
 pub(crate) fn allocate_columns<F: RichField>(
@@ -2507,6 +2848,7 @@ impl MetalShared {
         });
         Ok(RangeCheckGateQuotientJob {
             command_buffer,
+            k6_tail_command_buffer: None,
             output: Some(output),
             output_pool: Arc::clone(&self.quotient_output_pool),
             len,
@@ -2515,6 +2857,74 @@ impl MetalShared {
             _job: job_guard,
             _phantom: PhantomData,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_k6_residual_quotient<F: RichField>(
+        &self,
+        pipeline: K6ResidualPipeline,
+        range_job: &mut RangeCheckGateQuotientJob<F>,
+        wires: &MetalColumns<F>,
+        constants: &MetalColumns<F>,
+        quotient_rows: usize,
+        step: usize,
+        metadata: &[u32],
+        k6_count: usize,
+        alpha_powers: &[u64],
+        alpha_stride: usize,
+        public_inputs_hash: &[u64; 4],
+    ) -> Result<(), String> {
+        if k6_count.checked_mul(10) != Some(metadata.len())
+            || alpha_stride.checked_mul(2) != Some(alpha_powers.len())
+            || range_job.k6_tail_command_buffer.is_some()
+            || quotient_rows.checked_mul(2) != Some(range_job.len)
+        {
+            return Err("invalid K6 residual quotient metadata".to_string());
+        }
+        let output = range_job
+            .output
+            .as_ref()
+            .ok_or("Range/U32 quotient output is unavailable")?;
+        let command_buffer = autoreleasepool(|| -> CommandBuffer {
+            let command_buffer = self.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(pipeline.0);
+            encoder.set_buffer(0, Some(&wires.buffer), 0);
+            encoder.set_buffer(1, Some(&constants.buffer), 0);
+            encoder.set_buffer(2, Some(&output), 0);
+            encoder.set_bytes(
+                3,
+                size_of_val(alpha_powers) as NSUInteger,
+                alpha_powers.as_ptr().cast::<c_void>(),
+            );
+            encoder.set_bytes(
+                4,
+                size_of_val(metadata) as NSUInteger,
+                metadata.as_ptr().cast::<c_void>(),
+            );
+            set_u32(encoder, 5, wires.rows as u32);
+            set_u32(encoder, 6, quotient_rows as u32);
+            set_u32(encoder, 7, step as u32);
+            set_u32(encoder, 8, alpha_stride as u32);
+            set_u32(encoder, 9, k6_count as u32);
+            encoder.set_bytes(
+                10,
+                size_of_val(public_inputs_hash) as NSUInteger,
+                public_inputs_hash.as_ptr().cast::<c_void>(),
+            );
+            dispatch(encoder, pipeline.0, quotient_rows);
+            encoder.end_encoding();
+            #[cfg(feature = "diagnostic_profile")]
+            profile_command_buffer(
+                command_buffer,
+                "k6_residual_quotient",
+                (quotient_rows * k6_count) as u64,
+            );
+            command_buffer.commit();
+            command_buffer.to_owned()
+        });
+        range_job.k6_tail_command_buffer = Some(command_buffer);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3712,6 +4122,7 @@ mod tests {
     use rand::{RngCore, SeedableRng};
 
     use super::*;
+    use super::super::COSET_16_WEIGHTS_U64;
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field64, PrimeField64};
     use crate::gates::gate::Gate;
@@ -3739,6 +4150,342 @@ mod tests {
              xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib\n\
              then update SHADER_SOURCE_SHA256 to {digest}."
         );
+    }
+
+    #[test]
+    fn k6_runtime_source_is_bounded_and_reuses_field_helpers() {
+        let source = k6_residual_shader_source().expect("K6 source markers must remain valid");
+        assert!(
+            source.len() <= 23 * 1024,
+            "K6 runtime source grew unexpectedly: {} bytes",
+            source.len()
+        );
+        assert_eq!(source.matches("kernel void ").count(), 1);
+        assert!(source.contains("kernel void k6_residual_quotient"));
+        for helper in [
+            "inline ulong gl_add(",
+            "inline ulong gl_sub(",
+            "inline ulong gl_mul(",
+            "inline ulong gl_mul_add(",
+            "inline ulong gl_canonicalize(",
+        ] {
+            assert!(source.contains(helper), "missing shared helper {helper}");
+        }
+        for excluded in [
+            "POSEIDON2_EXTERNAL_RC",
+            "kernel void poseidon2_",
+            "kernel void ntt_",
+            "kernel void permutation_quotient",
+            "kernel void range_check_gate_quotient",
+        ] {
+            assert!(!source.contains(excluded), "unexpected K6 source item {excluded}");
+        }
+        assert_eq!(COSET_16_WEIGHTS_U64.len(), 16);
+        assert!(source.contains("0xefffffff10000001UL"));
+        assert!(source.contains("0xfffeffff00010001UL"));
+    }
+
+    fn cpu_k6_gate_contribution<G>(
+        gate: &G,
+        spec: &K6QuotientSpec,
+        wires: &MetalColumns<GoldilocksField>,
+        constants: &MetalColumns<GoldilocksField>,
+        quotient_rows: usize,
+        step: usize,
+        public_inputs_hash: &HashOut<GoldilocksField>,
+        alphas: &[GoldilocksField; 2],
+        alpha_offset: usize,
+    ) -> Vec<GoldilocksField>
+    where
+        G: Gate<GoldilocksField, 2>,
+    {
+        type F = GoldilocksField;
+        let wire_count = <G as Gate<F, 2>>::num_wires(gate);
+        let constant_count = <G as Gate<F, 2>>::num_constants(gate);
+        let constraint_count = <G as Gate<F, 2>>::num_constraints(gate);
+        let constant_base = match spec.kind {
+            K6QuotientKind::BaseFieldArithmetic { constant_base }
+            | K6QuotientKind::ExtensionArithmetic { constant_base }
+            | K6QuotientKind::ExtensionMultiplication { constant_base }
+            | K6QuotientKind::Constant { constant_base } => constant_base,
+            K6QuotientKind::CosetInterpolation | K6QuotientKind::PublicInput => 0,
+        };
+        let mut local_wires = Vec::with_capacity(wire_count * quotient_rows);
+        for column in 0..wire_count {
+            local_wires.extend(
+                (0..quotient_rows).map(|row| wires.col(column)[row * step]),
+            );
+        }
+        let mut local_constants = Vec::with_capacity(constant_count * quotient_rows);
+        for column in constant_base..constant_base + constant_count {
+            local_constants.extend(
+                (0..quotient_rows).map(|row| constants.col(column)[row * step]),
+            );
+        }
+        let filters = (0..quotient_rows)
+            .map(|row| {
+                let selector = constants.col(spec.selector_column)[row * step];
+                spec.group
+                    .clone()
+                    .filter(|&index| index != spec.gate_index)
+                    .chain(spec.include_unused_selector.then_some(UNUSED_SELECTOR))
+                    .fold(F::ONE, |filter, index| {
+                        filter * (F::from_canonical_usize(index) - selector)
+                    })
+            })
+            .collect::<Vec<_>>();
+        let vars = EvaluationVarsBaseBatch::new(
+            quotient_rows,
+            &local_constants,
+            &local_wires,
+            public_inputs_hash,
+        );
+        let mut constraints = vec![F::ZERO; constraint_count * quotient_rows];
+        <G as Gate<F, 2>>::eval_unfiltered_base_batch_accumulate(
+            gate,
+            vars,
+            &filters,
+            &mut constraints,
+        );
+        let mut output = vec![F::ZERO; quotient_rows * 2];
+        for row in 0..quotient_rows {
+            for (challenge, &alpha) in alphas.iter().enumerate() {
+                let mut power = alpha.exp_u64(alpha_offset as u64);
+                for constraint in 0..constraint_count {
+                    output[row * 2 + challenge] +=
+                        constraints[constraint * quotient_rows + row] * power;
+                    power *= alpha;
+                }
+            }
+        }
+        output
+    }
+
+    /// Differential contract for shared-output ownership: each K6 family and
+    /// their union equal the production CPU gate evaluator, while subtracting
+    /// the residual from the accumulated vector recovers the byte-identical
+    /// prebuilt Range/U32 result.
+    #[test]
+    fn metal_k6_shared_output_matches_cpu_and_preserves_range() {
+        type F = GoldilocksField;
+        const QUOTIENT_ROWS: usize = 64;
+        const WIRE_COLUMNS: usize = 47;
+        const CONSTANT_COLUMNS: usize = 3;
+        const ALPHA_OFFSET: usize = 11;
+        let step = 4;
+        let full_rows = QUOTIENT_ROWS * step;
+        let context = shared_context().expect("Metal context must initialize");
+        let mut wires = context
+            .allocate_columns::<F>(full_rows, WIRE_COLUMNS)
+            .expect("wire columns must allocate");
+        let mut constants = context
+            .allocate_columns::<F>(full_rows, CONSTANT_COLUMNS)
+            .expect("constant columns must allocate");
+        let mut rng = StdRng::seed_from_u64(0x6b36_5a4e_6765_0001);
+        for column in wires.columns_mut().expect("unique wire columns") {
+            for value in column {
+                *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
+            }
+        }
+        for column in constants.columns_mut().expect("unique constant columns") {
+            for value in column {
+                *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
+            }
+        }
+        let alphas = [F::from_canonical_u64(3), F::from_canonical_u64(5)];
+        let public_inputs_hash = HashOut {
+            elements: [
+                F::from_canonical_u64(29),
+                F::from_canonical_u64(31),
+                F::from_canonical_u64(37),
+                F::from_canonical_u64(41),
+            ],
+        };
+        let range_specs = [RangeCheckQuotientSpec {
+            selector_column: 0,
+            gate_index: 0,
+            group: 0..7,
+            include_unused_selector: true,
+            num_ops: 1,
+            bit_size: 2,
+        }];
+        let make_spec = |gate_index, num_ops, kind| K6QuotientSpec {
+            selector_column: 0,
+            gate_index,
+            group: 0..7,
+            include_unused_selector: true,
+            num_ops,
+            kind,
+        };
+        let specs = vec![
+            make_spec(
+                1,
+                2,
+                K6QuotientKind::BaseFieldArithmetic { constant_base: 1 },
+            ),
+            make_spec(
+                2,
+                2,
+                K6QuotientKind::ExtensionArithmetic { constant_base: 1 },
+            ),
+            make_spec(
+                3,
+                2,
+                K6QuotientKind::ExtensionMultiplication { constant_base: 1 },
+            ),
+            make_spec(4, 2, K6QuotientKind::CosetInterpolation),
+            make_spec(5, 2, K6QuotientKind::Constant { constant_base: 1 }),
+            make_spec(6, 4, K6QuotientKind::PublicInput),
+        ];
+
+        let start_range = || {
+            start_range_check_gate_quotient(
+                &wires,
+                &constants,
+                QUOTIENT_ROWS,
+                step,
+                &range_specs,
+                &[],
+                &alphas,
+                ALPHA_OFFSET,
+            )
+            .expect("prebuilt Range/U32 job must start")
+        };
+        let baseline = {
+            let job = start_range();
+            job.finish().expect("baseline Range job must finish").to_vec()
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let pipeline = loop {
+            if let Some(pipeline) = k6_residual_pipeline_snapshot() {
+                break pipeline;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "K6 runtime pipeline did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let run = |selected: &[K6QuotientSpec]| {
+            let mut job = start_range();
+            start_k6_residual_quotient(
+                pipeline,
+                &mut job,
+                &wires,
+                &constants,
+                QUOTIENT_ROWS,
+                step,
+                selected,
+                &public_inputs_hash,
+                &alphas,
+                ALPHA_OFFSET,
+            )
+            .expect("K6 tail must append");
+            job.finish().expect("Range + K6 job must finish").to_vec()
+        };
+        let cpu = |spec: &K6QuotientSpec| match spec.kind {
+            K6QuotientKind::BaseFieldArithmetic { .. } => cpu_k6_gate_contribution(
+                &ArithmeticGate {
+                    num_ops: spec.num_ops,
+                },
+                spec,
+                &wires,
+                &constants,
+                QUOTIENT_ROWS,
+                step,
+                &public_inputs_hash,
+                &alphas,
+                ALPHA_OFFSET,
+            ),
+            K6QuotientKind::ExtensionArithmetic { .. } => cpu_k6_gate_contribution(
+                &ArithmeticExtensionGate::<2> {
+                    num_ops: spec.num_ops,
+                },
+                spec,
+                &wires,
+                &constants,
+                QUOTIENT_ROWS,
+                step,
+                &public_inputs_hash,
+                &alphas,
+                ALPHA_OFFSET,
+            ),
+            K6QuotientKind::ExtensionMultiplication { .. } => cpu_k6_gate_contribution(
+                &MulExtensionGate::<2> {
+                    num_ops: spec.num_ops,
+                },
+                spec,
+                &wires,
+                &constants,
+                QUOTIENT_ROWS,
+                step,
+                &public_inputs_hash,
+                &alphas,
+                ALPHA_OFFSET,
+            ),
+            K6QuotientKind::CosetInterpolation => cpu_k6_gate_contribution(
+                &CosetInterpolationGate::<F, 2>::with_max_degree(4, 6),
+                spec,
+                &wires,
+                &constants,
+                QUOTIENT_ROWS,
+                step,
+                &public_inputs_hash,
+                &alphas,
+                ALPHA_OFFSET,
+            ),
+            K6QuotientKind::Constant { .. } => cpu_k6_gate_contribution(
+                &ConstantGate::new(2),
+                spec,
+                &wires,
+                &constants,
+                QUOTIENT_ROWS,
+                step,
+                &public_inputs_hash,
+                &alphas,
+                ALPHA_OFFSET,
+            ),
+            K6QuotientKind::PublicInput => cpu_k6_gate_contribution(
+                &PublicInputGate,
+                spec,
+                &wires,
+                &constants,
+                QUOTIENT_ROWS,
+                step,
+                &public_inputs_hash,
+                &alphas,
+                ALPHA_OFFSET,
+            ),
+        };
+
+        for spec in &specs {
+            let residual = cpu(spec);
+            let actual = run(core::slice::from_ref(spec));
+            for index in 0..actual.len() {
+                assert_eq!(
+                    actual[index] - residual[index],
+                    baseline[index],
+                    "shared-output mismatch for {:?} at output {index}",
+                    spec.kind
+                );
+            }
+        }
+
+        let mut residual = vec![F::ZERO; baseline.len()];
+        for spec in &specs {
+            for (sum, value) in residual.iter_mut().zip(cpu(spec)) {
+                *sum += value;
+            }
+        }
+        let actual = run(&specs);
+        for index in 0..actual.len() {
+            assert_eq!(
+                actual[index] - residual[index],
+                baseline[index],
+                "combined K6 tail changed baseline Range/U32 output at {index}"
+            );
+        }
     }
 
     /// The fallback in `MetalShared::new` hides a broken artifact behind a
@@ -3849,6 +4596,7 @@ mod tests {
         let completed_output_ptr = completed_output.contents();
         drop(RangeCheckGateQuotientJob::<F> {
             command_buffer: completed,
+            k6_tail_command_buffer: None,
             output: Some(completed_output),
             output_pool: Arc::clone(&pool),
             len: 8,
@@ -3864,6 +4612,12 @@ mod tests {
         assert_eq!(reused.contents(), completed_output_ptr);
         assert!(pool.lock().unwrap().free.is_empty());
     }
+    use crate::gates::arithmetic_base::ArithmeticGate;
+    use crate::gates::arithmetic_extension::ArithmeticExtensionGate;
+    use crate::gates::constant::ConstantGate;
+    use crate::gates::coset_interpolation::CosetInterpolationGate;
+    use crate::gates::multiplication_extension::MulExtensionGate;
+    use crate::gates::public_input::PublicInputGate;
     use crate::gates::selectors::UNUSED_SELECTOR;
     use crate::hash::hash_types::HashOut;
     use crate::hash::merkle_tree::{capacity_up_to_mut, fill_digests_buf, merkle_tree_prove};

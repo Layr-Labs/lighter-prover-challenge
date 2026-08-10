@@ -1734,6 +1734,215 @@ fn start_gpu_range_check_gate_quotient<
     Some((gate_indices, job))
 }
 
+/// Starts the six K6-only gate families against one proof-boundary readiness
+/// snapshot. Before the runtime pipeline is published this function is never
+/// called, so the exact same gates remain in the ordinary CPU evaluator.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn start_gpu_k6_residual_quotient<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    pipeline: crate::hash::poseidon2::metal::K6ResidualPipeline,
+    range_job: &mut crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
+    common_data: &CommonCircuitData<F, D>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    wires_commitment: &PolynomialBatch<F, C, D>,
+    quotient_rows: usize,
+    step: usize,
+    public_inputs_hash: &crate::hash::hash_types::HashOut<F>,
+    alphas: &[F],
+) -> Option<Vec<usize>> {
+    use crate::field::types::PrimeField64;
+    use crate::gates::arithmetic_base::ArithmeticGate;
+    use crate::gates::arithmetic_extension::ArithmeticExtensionGate;
+    use crate::gates::constant::ConstantGate;
+    use crate::gates::coset_interpolation::CosetInterpolationGate;
+    use crate::gates::multiplication_extension::MulExtensionGate;
+    use crate::gates::public_input::PublicInputGate;
+    use crate::hash::poseidon2::metal::{K6QuotientKind, K6QuotientSpec};
+    use crate::hash::poseidon2::COSET_16_WEIGHTS_U64;
+
+    if D != 2
+        || common_data.num_lookup_polys != 0
+        || common_data.num_lookup_selectors != 0
+        || common_data.config.num_challenges != 2
+    {
+        return None;
+    }
+    let include_unused_selector = common_data.selectors_info.num_selectors() > 1;
+    let raw_constant_base = common_data
+        .selectors_info
+        .num_selectors()
+        .checked_add(common_data.num_lookup_selectors)?;
+    if raw_constant_base > common_data.num_constants {
+        return None;
+    }
+
+    let mut gate_indices = Vec::new();
+    let mut specs = Vec::new();
+    for (gate_index, gate) in common_data.gates.iter().enumerate() {
+        let candidate = if let Some(coset) = gate
+            .0
+            .as_any()
+            .downcast_ref::<CosetInterpolationGate<F, D>>()
+        {
+            let weights_match = coset
+                .barycentric_weights
+                .iter()
+                .map(PrimeField64::to_canonical_u64)
+                .eq(COSET_16_WEIGHTS_U64);
+            if coset.subgroup_bits == 4
+                && coset.degree == 6
+                && weights_match
+                && gate.0.num_constants() == 0
+            {
+                Some((K6QuotientKind::CosetInterpolation, 2usize, 47usize, 12usize))
+            } else {
+                None
+            }
+        } else if gate.0.as_any().downcast_ref::<ConstantGate>().is_some() {
+            if gate.0.num_constants() == 2
+                && raw_constant_base.checked_add(2)? <= common_data.num_constants
+            {
+                Some((
+                    K6QuotientKind::Constant {
+                        constant_base: raw_constant_base,
+                    },
+                    2usize,
+                    2usize,
+                    2usize,
+                ))
+            } else {
+                None
+            }
+        } else if gate.0.as_any().downcast_ref::<PublicInputGate>().is_some() {
+            (gate.0.num_constants() == 0)
+                .then_some((K6QuotientKind::PublicInput, 4usize, 4usize, 4usize))
+        } else if let Some(arithmetic) = gate.0.as_any().downcast_ref::<ArithmeticGate>() {
+            if gate.0.num_constants() == 2
+                && raw_constant_base.checked_add(2)? <= common_data.num_constants
+            {
+                Some((
+                    K6QuotientKind::BaseFieldArithmetic {
+                        constant_base: raw_constant_base,
+                    },
+                    arithmetic.num_ops,
+                    arithmetic.num_ops.checked_mul(4)?,
+                    arithmetic.num_ops,
+                ))
+            } else {
+                None
+            }
+        } else if let Some(arithmetic) = gate
+            .0
+            .as_any()
+            .downcast_ref::<ArithmeticExtensionGate<D>>()
+        {
+            if gate.0.num_constants() == 2
+                && raw_constant_base.checked_add(2)? <= common_data.num_constants
+            {
+                Some((
+                    K6QuotientKind::ExtensionArithmetic {
+                        constant_base: raw_constant_base,
+                    },
+                    arithmetic.num_ops,
+                    arithmetic.num_ops.checked_mul(8)?,
+                    arithmetic.num_ops.checked_mul(2)?,
+                ))
+            } else {
+                None
+            }
+        } else if let Some(multiplication) =
+            gate.0.as_any().downcast_ref::<MulExtensionGate<D>>()
+        {
+            if gate.0.num_constants() == 1
+                && raw_constant_base.checked_add(1)? <= common_data.num_constants
+            {
+                Some((
+                    K6QuotientKind::ExtensionMultiplication {
+                        constant_base: raw_constant_base,
+                    },
+                    multiplication.num_ops,
+                    multiplication.num_ops.checked_mul(6)?,
+                    multiplication.num_ops.checked_mul(2)?,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let Some((kind, num_ops, expected_wires, expected_constraints)) = candidate else {
+            continue;
+        };
+        // A future gate must not be owned by both the prebuilt Range/U32 job
+        // and this residual job. Refuse the whole K6 launch on conflict so the
+        // CPU remains the single source of truth for every candidate.
+        if gate.0.range_check_quotient_gate().is_some()
+            || gate.0.u32_quotient_gate().is_some()
+            || num_ops == 0
+            || gate.0.num_wires() != expected_wires
+            || gate.0.num_constraints() != expected_constraints
+        {
+            if gpu_poseidon_quotient_diagnostics_enabled() {
+                eprintln!(
+                    "[gpu-k6-quotient] layout/conflict rejected gate={gate_index} kind={kind:?} \
+                     wires={} constraints={} expected_wires={expected_wires} \
+                     expected_constraints={expected_constraints}",
+                    gate.0.num_wires(),
+                    gate.0.num_constraints(),
+                );
+            }
+            return None;
+        }
+        let selector_column = common_data.selectors_info.selector_indices[gate_index];
+        specs.push(K6QuotientSpec {
+            selector_column,
+            gate_index,
+            group: common_data.selectors_info.groups[selector_column].clone(),
+            include_unused_selector,
+            num_ops,
+            kind,
+        });
+        gate_indices.push(gate_index);
+    }
+    if specs.is_empty() {
+        return None;
+    }
+
+    let wires = wires_commitment.merkle_tree.shared_columns()?;
+    let constants = prover_data
+        .constants_sigmas_commitment
+        .merkle_tree
+        .shared_columns()?;
+    let alpha_offset = common_data.config.num_challenges * (common_data.num_partial_products + 2);
+    crate::hash::poseidon2::metal::start_k6_residual_quotient(
+        pipeline,
+        range_job,
+        wires,
+        constants,
+        quotient_rows,
+        step,
+        &specs,
+        public_inputs_hash,
+        alphas,
+        alpha_offset,
+    )?;
+    log::info!(
+        "Metal K6 residual quotient active: gates={gate_indices:?}, rows={quotient_rows}, \
+         step={step}, shared_columns=true"
+    );
+    if gpu_poseidon_quotient_diagnostics_enabled() {
+        eprintln!(
+            "[gpu-k6-quotient] active gates={gate_indices:?} rows={quotient_rows} \
+             step={step} shared_columns=true"
+        );
+    }
+    Some(gate_indices)
+}
+
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn start_gpu_permutation_quotient<
     F: RichField + Extendable<D>,
@@ -1863,6 +2072,13 @@ fn compute_quotient_polys<
     );
     let lde_mask = lde_size - 1;
 
+    // One monotonic, nonblocking snapshot fixes K6 ownership for this whole
+    // proof. Becoming ready after this line affects only the next proof.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let k6_pipeline_snapshot = allow_gpu_poseidon
+        .then(crate::hash::poseidon2::metal::k6_residual_pipeline_snapshot)
+        .flatten();
+
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let gpu_poseidon = allow_gpu_poseidon
         .then(|| {
@@ -1877,7 +2093,7 @@ fn compute_quotient_polys<
         })
         .flatten();
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_range = allow_gpu_poseidon
+    let mut gpu_range = allow_gpu_poseidon
         .then(|| {
             start_gpu_range_check_gate_quotient(
                 common_data,
@@ -1889,6 +2105,21 @@ fn compute_quotient_polys<
             )
         })
         .flatten();
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_k6 = match (k6_pipeline_snapshot, gpu_range.as_mut()) {
+        (Some(pipeline), Some((_, range_job))) => start_gpu_k6_residual_quotient(
+            pipeline,
+            range_job,
+            common_data,
+            prover_data,
+            wires_commitment,
+            lde_size,
+            step,
+            public_inputs_hash,
+            alphas,
+        ),
+        _ => None,
+    };
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let gpu_permutation = (allow_gpu_poseidon && col_major_perm)
         .then(|| {
@@ -1933,6 +2164,13 @@ fn compute_quotient_polys<
             gpu_range
                 .as_ref()
                 .map(|(gate_indices, _)| gate_indices.iter().copied())
+                .into_iter()
+                .flatten(),
+        )
+        .chain(
+            gpu_k6
+                .as_ref()
+                .map(|gate_indices| gate_indices.iter().copied())
                 .into_iter()
                 .flatten(),
         )
