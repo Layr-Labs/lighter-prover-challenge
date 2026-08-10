@@ -109,15 +109,16 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
+    "dd7a9e501728c718997b15117dbc78009501daac2a12ce0f37c7ab4b875e31ee";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
 /// source. This deliberately includes the lazily-built gate-quotient kernels:
 /// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
+const METALLIB_REQUIRED_KERNELS: [&str; 11] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
+    "poseidon2_hash_leaves_colmajor_hot",
     "poseidon2_hash_parents",
     "poseidon2_absorb_pass",
     "ntt_prepare",
@@ -1012,15 +1013,32 @@ impl LazyPipeline {
         }
         self.built.get()?.as_ref()
     }
+
+    /// Returns immediately; an in-flight optional build uses the generic path.
+    fn ready(&self) -> Option<&ComputePipelineState> {
+        self.built.get()?.as_ref()
+    }
 }
 
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
+static LEAF_COLMAJOR_HOT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     POSEIDON_GATE_QUOTIENT_PIPELINE.get()
+}
+
+fn leaf_colmajor_hot_pipeline() -> Option<&'static ComputePipelineState> {
+    #[cfg(test)]
+    {
+        return LEAF_COLMAJOR_HOT_PIPELINE.get();
+    }
+    #[cfg(not(test))]
+    {
+        LEAF_COLMAJOR_HOT_PIPELINE.ready()
+    }
 }
 
 fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
@@ -1047,6 +1065,10 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
 fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
     for (name, slot) in [
         ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
+        (
+            "poseidon2_hash_leaves_colmajor_hot",
+            &LEAF_COLMAJOR_HOT_PIPELINE,
+        ),
         (
             "range_check_gate_quotient",
             &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
@@ -3554,6 +3576,9 @@ impl MetalShared {
             let log_leaf_count_u32 = leaf_count.ilog2();
             let leaf_pipeline = match &source {
                 LeafSource::Rows(_) => &self.leaf_pipeline,
+                LeafSource::Columns(_) | LeafSource::Shared(_) if matches!(leaf_width, 20 | 136) => {
+                    leaf_colmajor_hot_pipeline().unwrap_or(&self.leaf_colmajor_pipeline)
+                }
                 LeafSource::Columns(_) | LeafSource::Shared(_) => &self.leaf_colmajor_pipeline,
             };
             let command_buffer = self.queue.new_command_buffer();
