@@ -623,7 +623,7 @@ impl<T: Witness<F>, F: PrimeField64> BaseRegisterInfoTargetWitness<F> for T {
         )?;
         self.set_target(
             register_target.pending_expiry,
-            F::from_canonical_i64(register.pending_expiry),
+            F::from_noncanonical_i64(register.pending_expiry),
         )?;
         self.set_target(
             register_target.generic_field_0,
@@ -659,7 +659,7 @@ impl<T: Witness<F>, F: PrimeField64> BaseRegisterInfoTargetWitness<F> for T {
         )?;
         self.set_target(
             register_target.generic_field_3,
-            F::from_canonical_i64(register.generic_field_3),
+            F::from_noncanonical_i64(register.generic_field_3),
         )?;
 
         Ok(())

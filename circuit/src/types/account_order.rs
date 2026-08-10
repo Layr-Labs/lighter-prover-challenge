@@ -414,7 +414,7 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
         )?;
         self.set_target(
             a.integrator_taker_fee,
-            F::from_canonical_i64(b.integrator_taker_fee),
+            F::from_noncanonical_i64(b.integrator_taker_fee),
         )?;
         self.set_target(
             a.integrator_maker_fee,

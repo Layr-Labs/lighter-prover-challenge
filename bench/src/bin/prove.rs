@@ -7,6 +7,16 @@
 mod api;
 #[path = "../embedded.rs"]
 mod embedded;
+#[path = "../phantom_materialize.rs"]
+mod phantom_materialize;
+#[path = "../phantom_native.rs"]
+mod phantom_native;
+#[path = "../phantom_rechunk.rs"]
+mod phantom_rechunk;
+#[path = "../phantom_runtime.rs"]
+mod phantom_runtime;
+#[path = "../phantom_spot.rs"]
+mod phantom_spot;
 #[path = "../prover.rs"]
 mod prover;
 
@@ -18,8 +28,9 @@ use api::{
     Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
     PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
 };
-use circuit::block_pre_execution_constraints::Circuit as _;
 use circuit::block::Block;
+use circuit::block_pre_execution::BlockPreExecWitness;
+use circuit::block_pre_execution_constraints::Circuit as _;
 use circuit::types::config::{C, F};
 use plonky2::fri::oracle::PolynomialBatch;
 
@@ -95,7 +106,7 @@ fn main() {
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
     // Fixture parse overlaps the pre-execution circuit load; both are fast.
-    let (block, pre_circuits) = rayon::join(
+    let (mut block, pre_circuits) = rayon::join(
         || {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "fixture_read_parse");
@@ -194,6 +205,13 @@ fn main() {
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     #[cfg(feature = "diagnostic_profile")]
     drop(_pre_wait);
+    let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
+    let state_metadata_hash = pre_output.new_state_metadata.hash();
+    #[cfg(feature = "diagnostic_profile")]
+    let _phantom_span = plonky2::util::profile::span("orchestration", "phantom_splice");
+    let _phantom_outcome = phantom_runtime::try_apply_best(&mut block, state_metadata_hash);
+    #[cfg(feature = "diagnostic_profile")]
+    drop(_phantom_span);
     let circuits = match remaining {
         Some(Ok(remaining)) => remaining.into_circuits((pre_target, pre_data)),
         Some(Err(error)) => {

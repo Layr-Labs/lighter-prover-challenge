@@ -345,7 +345,7 @@ impl<T: Witness<F>, F: PrimeField64 + RichField> MarketTargetWitness<F> for T {
         )?;
         self.set_target(
             a.order_quote_limit,
-            F::from_canonical_i64(b.order_quote_limit),
+            F::from_noncanonical_i64(b.order_quote_limit),
         )?;
 
         self.set_hash_target(a.order_book_root, b.order_book_root)?;
