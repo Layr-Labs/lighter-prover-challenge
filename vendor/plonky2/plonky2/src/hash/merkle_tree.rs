@@ -76,6 +76,14 @@ impl<F: RichField> ColumnStore<F> {
         }
     }
 
+    pub(crate) fn contiguous_span(&self, range: core::ops::Range<usize>) -> Option<&[F]> {
+        match self {
+            ColumnStore::Owned(_) => None,
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            ColumnStore::Shared(columns) => Some(columns.column_span(range)),
+        }
+    }
+
     pub(crate) fn columns_mut(&mut self) -> Option<Vec<&mut [F]>> {
         match self {
             ColumnStore::Owned(columns) => {

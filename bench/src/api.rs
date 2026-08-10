@@ -274,6 +274,19 @@ impl Circuits {
         drop(heavy_chain_data);
         (block.target, block.builder.build::<C>())
     }
+
+    /// The final block circuit, from the compile-time blob when present.
+    ///
+    /// Value-identical to [`Self::build_block_circuit`], which remains the
+    /// fallback: `deserialize_embedded` validates the recomputed
+    /// constants/sigmas cap against the embedded verifier data, which
+    /// transitively pins the circuit digest.
+    pub fn load_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
+        match Self::load_block() {
+            Ok(loaded) => loaded,
+            Err(_error) => self.build_block_circuit(),
+        }
+    }
 }
 
 #[cfg(test)]

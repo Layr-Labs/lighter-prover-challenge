@@ -15,9 +15,16 @@ use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::fri::oracle::{BatchLayout, PolynomialBatch};
+use crate::gates::arithmetic_base::ArithmeticGate;
+use crate::gates::arithmetic_extension::ArithmeticExtensionGate;
+use crate::gates::constant::ConstantGate;
+use crate::gates::coset_interpolation::CosetInterpolationGate;
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
+use crate::gates::multiplication_extension::MulExtensionGate;
+use crate::gates::noop::NoopGate;
 use crate::gates::poseidon2::Poseidon2Gate;
+use crate::gates::public_input::PublicInputGate;
 use crate::gates::selectors::LookupSelectors;
 use crate::hash::hash_types::RichField;
 use crate::iop::challenger::Challenger;
@@ -2032,6 +2039,36 @@ fn compute_quotient_polys<
             num_routed_wires
         });
     debug_assert!(cpu_num_wires <= common_data.config.num_wires);
+    // A retained wire commitment is one flat natural-order column allocation,
+    // so contiguous step-1 quotient batches can read their columns in place.
+    // Keep this fail-closed: several specialized batch overrides still assume
+    // compact `wire * batch_size` storage, and a partially accepted set of GPU
+    // jobs may leave any of them on the CPU. The exact production survivors
+    // below either use strided views/columns or the joint interleave evaluator.
+    // The recursive GPU-completion fallback calls this function with
+    // `allow_gpu_poseidon = false`, which also forces the ordinary gather.
+    let strided_wire_survivors = cpu_gate_indices.iter().all(|&i| {
+        let gate = &common_data.gates[i].0;
+        gate.as_any().is::<NoopGate>()
+            || gate.as_any().is::<ConstantGate>()
+            || gate.as_any().is::<PublicInputGate>()
+            || gate.as_any().is::<ArithmeticGate>()
+            || gate.as_any().is::<MulExtensionGate<D>>()
+            || gate.as_any().is::<ArithmeticExtensionGate<D>>()
+            || gate.as_any().is::<CosetInterpolationGate<F, D>>()
+            || (interleave_pair.is_some() && gate.interleave_pair_gate().is_some())
+    });
+    let direct_wire_columns = if allow_gpu_poseidon
+        && step == 1
+        && col_major_perm
+        && permutation_products_offloaded
+        && !excluded_gate_indices.is_empty()
+        && strided_wire_survivors
+    {
+        wires_commitment.borrow_lde_columns(0..cpu_num_wires)
+    } else {
+        None
+    };
     // Same argument, applied to the shared constraint rows instead of the wire
     // gather: an excluded gate's rows stay zero, so the CPU only ever writes
     // the prefix below and the per-batch memset and Horner reduction can stop
@@ -2044,8 +2081,13 @@ fn compute_quotient_polys<
     debug_assert!(cpu_num_gate_constraints <= common_data.num_gate_constraints);
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if gpu_poseidon_quotient_diagnostics_enabled() && !excluded_gate_indices.is_empty() {
+        let wire_source = if direct_wire_columns.is_some() {
+            "retained-strided"
+        } else {
+            "scratch-gather"
+        };
         eprintln!(
-            "[gpu-gate-quotient] CPU wire gather width {cpu_num_wires}/{}; \
+            "[gpu-gate-quotient] CPU wire source={wire_source} width {cpu_num_wires}/{}; \
              constraint rows {cpu_num_gate_constraints}/{}; excluded={excluded_gate_indices:?}",
             common_data.config.num_wires,
             common_data.num_gate_constraints,
@@ -2199,13 +2241,15 @@ fn compute_quotient_polys<
                 } else {
                     (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
                 };
-                wires_commitment.fill_lde_batch(
-                    &scratch.indices,
-                    step,
-                    0..cpu_num_wires,
-                    BatchLayout::PolyMajor,
-                    &mut scratch.local_wires,
-                );
+                if direct_wire_columns.is_none() {
+                    wires_commitment.fill_lde_batch(
+                        &scratch.indices,
+                        step,
+                        0..cpu_num_wires,
+                        BatchLayout::PolyMajor,
+                        &mut scratch.local_wires,
+                    );
+                }
                 zs_partial_products_and_lookup_commitment.fill_lde_batch(
                     &scratch.indices,
                     step,
@@ -2293,12 +2337,30 @@ fn compute_quotient_polys<
                     }
                 };
 
-                let vars_batch = EvaluationVarsBaseBatch::new(
-                    n,
-                    &scratch.local_constants,
-                    &scratch.local_wires,
-                    public_inputs_hash,
-                );
+                let vars_batch = if let Some((wire_columns, wire_stride)) = direct_wire_columns {
+                    debug_assert!(
+                        scratch
+                            .indices
+                            .iter()
+                            .enumerate()
+                            .all(|(offset, &index)| index == cache_start + offset)
+                    );
+                    EvaluationVarsBaseBatch::new_strided_wires(
+                        n,
+                        &scratch.local_constants,
+                        wire_columns,
+                        wire_stride,
+                        cache_start,
+                        public_inputs_hash,
+                    )
+                } else {
+                    EvaluationVarsBaseBatch::new(
+                        n,
+                        &scratch.local_constants,
+                        &scratch.local_wires,
+                        public_inputs_hash,
+                    )
+                };
 
                 let quotient_values_batch = &mut quotient_values_batch[..n * num_challenges];
                 eval_vanishing_poly_base_batch::<F, D>(
