@@ -2516,15 +2516,16 @@ fn compute_quotient_polys<
                 }
             }
         });
-    let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
+    let inverse_coset_final_scale =
+        precomputed::inverse_coset_shift_final_scale::<F>(points.len());
     challenge_columns
         .into_par_iter()
         .map(|column| {
-            // Fuse the coset post-scaling into the IFFT instead of walking the
-            // whole coefficient vector again afterwards, reusing a
-            // process-global inverse-shift power chain.
+            // The cached table already contains n^-1 * shift^-i. The IFFT
+            // merges its final butterfly, index reversal and this scale into
+            // the same writes, deleting the former whole-array post-pass.
             PolynomialValues::new(column)
-                .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
+                .coset_ifft_with_final_scale(inverse_coset_final_scale.as_slice())
         })
         .collect()
 }
@@ -2551,7 +2552,7 @@ pub(crate) mod precomputed {
         static SUBGROUPS: OnceLock<Map> = OnceLock::new();
         static COSET_POWERS: OnceLock<Map> = OnceLock::new();
         static SHIFTED_SUBGROUPS: OnceLock<Map> = OnceLock::new();
-        static INVERSE_COSET_POWERS: OnceLock<Map> = OnceLock::new();
+        static INVERSE_COSET_FINAL_SCALES: OnceLock<Map> = OnceLock::new();
 
         fn get_or_compute<F: Field>(
             cache: &'static OnceLock<Map>,
@@ -2603,12 +2604,18 @@ pub(crate) mod precomputed {
             })
         }
 
-        /// Cached `F::coset_shift().inverse().powers().take(degree)`. The
-        /// quotient columns' coset IFFT post-scaling uses the same power chain
-        /// on every proof of a given size, so build it once per process.
-        pub(crate) fn inverse_coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
-            get_or_compute(&INVERSE_COSET_POWERS, degree, || {
-                F::coset_shift().inverse().powers().take(degree).collect()
+        /// Cached `n^-1 * F::coset_shift()^-i`. Precombining the two fixed
+        /// factors once removes one field multiplication per quotient
+        /// coefficient in every subsequent proof of this degree.
+        pub(crate) fn inverse_coset_shift_final_scale<F: Field>(degree: usize) -> Arc<Vec<F>> {
+            get_or_compute(&INVERSE_COSET_FINAL_SCALES, degree, || {
+                let n_inv = F::inverse_2exp(crate::util::log2_strict(degree));
+                F::coset_shift()
+                    .inverse()
+                    .powers()
+                    .take(degree)
+                    .map(|power| n_inv * power)
+                    .collect()
             })
         }
     }
@@ -2635,19 +2642,21 @@ pub(crate) mod precomputed {
             Arc::new(F::two_adic_subgroup(n_log).into_iter().map(|x| shift * x).collect::<Vec<F>>())
         }
 
-        pub(crate) fn inverse_coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
+        pub(crate) fn inverse_coset_shift_final_scale<F: Field>(degree: usize) -> Arc<Vec<F>> {
+            let n_inv = F::inverse_2exp(crate::util::log2_strict(degree));
             Arc::new(
                 F::coset_shift()
                     .inverse()
                     .powers()
                     .take(degree)
+                    .map(|power| n_inv * power)
                     .collect::<Vec<F>>(),
             )
         }
     }
 
     pub(crate) use imp::{
-        coset_shift_powers, inverse_coset_shift_powers, shifted_two_adic_subgroup,
+        coset_shift_powers, inverse_coset_shift_final_scale, shifted_two_adic_subgroup,
         two_adic_subgroup,
     };
 }
@@ -3004,6 +3013,18 @@ mod quotient_layout_tests {
             let direct: Vec<F> = F::coset_shift().powers().take(degree).collect();
             assert_eq!(*precomputed::coset_shift_powers::<F>(degree), direct);
             assert_eq!(*precomputed::coset_shift_powers::<F>(degree), direct);
+
+            let inverse: Vec<F> = F::coset_shift().inverse().powers().take(degree).collect();
+            let n_inv = F::inverse_2exp(crate::util::log2_strict(degree));
+            let final_scale: Vec<F> = inverse.iter().map(|&power| n_inv * power).collect();
+            assert_eq!(
+                *precomputed::inverse_coset_shift_final_scale::<F>(degree),
+                final_scale
+            );
+            assert_eq!(
+                *precomputed::inverse_coset_shift_final_scale::<F>(degree),
+                final_scale
+            );
         }
     }
 

@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::extension::{Extendable, FieldExtension};
 use crate::fft::{
-    FftRootTable, fft, fft_with_options, ifft, ifft_with_options_and_postscale,
+    FftRootTable, fft, fft_with_options, ifft, ifft_with_options_and_final_scale,
+    ifft_with_options_and_postscale,
 };
 use crate::types::Field;
 
@@ -78,6 +79,13 @@ impl<F: Field> PolynomialValues<F> {
     /// already has the inverse powers of that coset's shift.
     pub fn coset_ifft_with_powers(self, inverse_shift_powers: &[F]) -> PolynomialCoeffs<F> {
         ifft_with_options_and_postscale(self, None, None, Some(inverse_shift_powers))
+    }
+
+    /// Coset IFFT with a table whose entries already include the transform's
+    /// `n^-1` normalization. This lets the implementation merge the final FFT
+    /// layer, coefficient reversal, normalization, and coset scaling.
+    pub fn coset_ifft_with_final_scale(self, final_scale: &[F]) -> PolynomialCoeffs<F> {
+        ifft_with_options_and_final_scale(self, None, final_scale)
     }
 
     pub fn lde_multiple(polys: Vec<Self>, rate_bits: usize) -> Vec<Self> {
@@ -453,7 +461,7 @@ mod tests {
 
     use super::*;
     use crate::goldilocks_field::GoldilocksField;
-    use crate::types::Sample;
+    use crate::types::{PrimeField64, Sample};
 
     #[test]
     fn test_trimmed() {
@@ -551,6 +559,49 @@ mod tests {
                     .iter()
                     .map(|value| value.0)
                     .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_coset_ifft_final_layer_scale_matches_reference() {
+        type F = GoldilocksField;
+
+        for k in [1usize, 2, 3, 8, 12] {
+            let n = 1 << k;
+            let evals = PolynomialValues::new(
+                (0..n)
+                    .map(|i| {
+                        F::from_noncanonical_u64(
+                            u64::MAX.wrapping_sub((i as u64 + 3) * 0x9e37_79b9),
+                        )
+                    })
+                    .collect(),
+            );
+            let shift = F::coset_shift();
+            let n_inv = F::inverse_2exp(k);
+            let final_scale = shift
+                .inverse()
+                .powers()
+                .take(n)
+                .map(|power| n_inv * power)
+                .collect::<Vec<_>>();
+
+            let expected = evals.clone().coset_ifft(shift);
+            let actual = evals.coset_ifft_with_final_scale(&final_scale);
+
+            assert_eq!(
+                actual
+                    .coeffs
+                    .iter()
+                    .map(|value| value.to_canonical_u64())
+                    .collect::<Vec<_>>(),
+                expected
+                    .coeffs
+                    .iter()
+                    .map(|value| value.to_canonical_u64())
+                    .collect::<Vec<_>>(),
+                "log_n={k}"
             );
         }
     }

@@ -321,6 +321,80 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
     PolynomialCoeffs { coeffs: buffer }
 }
 
+/// IFFT whose final coefficient scale already includes `n^-1`.
+///
+/// The quotient prover needs
+/// `FFT(values)[-i] * n^-1 * coset_shift^-i`.  Its scale table is fixed for a
+/// given degree, so the two scalar multiplications can be precombined once.
+/// For transforms larger than the packed prefix, this also folds the final FFT
+/// butterfly, the IFFT index reversal, and the final scale into one set of
+/// writes.  The old path wrote the last butterfly output, read the whole array
+/// again to reverse it, then wrote every coefficient again.
+pub(crate) fn ifft_with_options_and_final_scale<F: Field>(
+    poly: PolynomialValues<F>,
+    root_table: Option<&FftRootTable<F>>,
+    final_scale: &[F],
+) -> PolynomialCoeffs<F> {
+    let n = poly.len();
+    let lg_n = log2_strict(n);
+    assert_eq!(final_scale.len(), n);
+    let PolynomialValues { values: mut buffer } = poly;
+
+    let run = |buffer: &mut [F], table: &FftRootTable<F>| {
+        let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
+        let outer_layers = lg_n.saturating_sub(lg_packed_width);
+
+        // The outer driver already fuses adjacent stages. Split out the last
+        // stage only when it was the unpaired tail; otherwise preserving the
+        // two-stage kernel is cheaper than eliminating the post-pass.
+        if lg_n < 2 || outer_layers % 2 == 0 {
+            fft_classic(buffer, 0, table);
+            apply_precombined_ifft_scale(buffer, final_scale);
+        } else {
+            fft_classic_before_last(buffer, table);
+            ifft_final_layer_scaled(buffer, final_scale, table);
+        }
+    };
+
+    if let Some(table) = root_table {
+        run(&mut buffer, table);
+    } else {
+        #[cfg(feature = "std")]
+        {
+            let table = root_table_cache::get::<F>(lg_n);
+            run(&mut buffer, &table);
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let table = fft_root_table::<F>(n);
+            run(&mut buffer, &table);
+        }
+    }
+
+    PolynomialCoeffs { coeffs: buffer }
+}
+
+/// Apply a scale table that already contains the IFFT normalization, while
+/// reversing every FFT output except index zero. This fallback preserves an
+/// existing two-stage FFT pair when separating its final layer would regress
+/// the accepted schedule.
+fn apply_precombined_ifft_scale<F: Field>(buffer: &mut [F], scales: &[F]) {
+    let n = buffer.len();
+    if n == 1 {
+        buffer[0] *= scales[0];
+        return;
+    }
+    buffer[0] *= scales[0];
+    buffer[n / 2] *= scales[n / 2];
+    for i in 1..(n / 2) {
+        let j = n - i;
+        let coeff_i = buffer[j] * scales[i];
+        let coeff_j = buffer[i] * scales[j];
+        buffer[i] = coeff_i;
+        buffer[j] = coeff_j;
+    }
+}
+
 /// `ifft` of a borrowed column without the caller-side copy: the initial
 /// bit-reversal permutation is applied as an out-of-place gather from
 /// `values` into the fresh buffer (the same permutation `fft_classic`'s
@@ -371,6 +445,23 @@ fn fft_classic_simd_with<P, M>(
     P: PackedField,
     M: FftTwiddleMul<P>,
 {
+    fft_classic_simd_with_end::<P, M>(values, r, lg_n, lg_n, root_table);
+}
+
+/// `fft_classic_simd_with` restricted to stages `r..end`. The physical input
+/// still has size `2^lg_n`; only the stage boundary changes.
+#[unroll_for_loops]
+fn fft_classic_simd_with_end<P, M>(
+    values: &mut [P::Scalar],
+    r: usize,
+    lg_n: usize,
+    end: usize,
+    root_table: &FftRootTable<P::Scalar>,
+) where
+    P: PackedField,
+    M: FftTwiddleMul<P>,
+{
+    debug_assert!(end <= lg_n);
     let lg_packed_width = log2_strict(P::WIDTH); // 0 when P is a scalar.
     let packed_values = P::pack_slice_mut(values);
     let packed_n = packed_values.len();
@@ -380,7 +471,7 @@ fn fft_classic_simd_with<P, M>(
     // This loop will not run when P is a scalar.
     assert!(lg_packed_width <= 4);
     for lg_half_m in 0..4 {
-        if (r..min(lg_n, lg_packed_width)).contains(&lg_half_m) {
+        if (r..min(end, lg_packed_width)).contains(&lg_half_m) {
             // Intuitively, we split values into m slices: subarr[0], ..., subarr[m - 1]. Each of
             // those slices is split into two halves: subarr[j].left, subarr[j].right. We do
             // (subarr[j].left[k], subarr[j].right[k])
@@ -407,7 +498,7 @@ fn fft_classic_simd_with<P, M>(
 
     // We've already done the first lg_packed_width (if they were required) iterations.
     let s = max(r, lg_packed_width);
-    fft_classic_simd_layers::<P, M>(packed_values, s, lg_n, root_table);
+    fft_classic_simd_layers::<P, M>(packed_values, s, end, root_table);
 }
 
 /// Parallel sibling of `fft_classic_simd_with`. The packed-width prefix is
@@ -466,6 +557,137 @@ fn fft_classic_simd<P: PackedField>(
     }
 }
 
+/// Execute every FFT stage except the last one. The input bit reversal and
+/// packed prefix are identical to `fft_classic`; only the end boundary passed
+/// to the outer-stage driver is one smaller.
+fn fft_classic_before_last<F: Field>(values: &mut [F], root_table: &FftRootTable<F>) {
+    let lg_n = log2_strict(values.len());
+    debug_assert!(lg_n >= 2);
+    assert_eq!(root_table.len(), lg_n);
+    reverse_index_bits_in_place(values);
+
+    let end = lg_n - 1;
+    let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
+    if lg_n == F::TWO_ADICITY {
+        if lg_n <= lg_packed_width {
+            fft_classic_simd_with_end::<F, GeneralTwiddle>(
+                values, 0, lg_n, end, root_table,
+            );
+        } else {
+            fft_classic_simd_with_end::<<F as Packable>::Packing, GeneralTwiddle>(
+                values, 0, lg_n, end, root_table,
+            );
+        }
+    } else if lg_n <= lg_packed_width {
+        fft_classic_simd_with_end::<F, BaseSubfieldTwiddle>(
+            values, 0, lg_n, end, root_table,
+        );
+    } else {
+        fft_classic_simd_with_end::<<F as Packable>::Packing, BaseSubfieldTwiddle>(
+            values, 0, lg_n, end, root_table,
+        );
+    }
+}
+
+/// Final FFT layer with its stores redirected to the IFFT-reversed coefficient
+/// indices and multiplied by a table that already contains `n^-1`.
+fn ifft_final_layer_scaled<F: Field>(
+    values: &mut [F],
+    scales: &[F],
+    root_table: &FftRootTable<F>,
+) {
+    let lg_n = log2_strict(values.len());
+    if lg_n == F::TWO_ADICITY {
+        ifft_final_layer_scaled_with::<F, GeneralTwiddle>(values, scales, root_table);
+    } else {
+        ifft_final_layer_scaled_with::<F, BaseSubfieldTwiddle>(values, scales, root_table);
+    }
+}
+
+fn ifft_final_layer_scaled_with<F, M>(
+    values: &mut [F],
+    scales: &[F],
+    root_table: &FftRootTable<F>,
+) where
+    F: Field,
+    M: FftTwiddleMul<F>,
+{
+    #[cfg(target_arch = "aarch64")]
+    if core::any::TypeId::of::<F>()
+        == core::any::TypeId::of::<crate::goldilocks_field::GoldilocksField>()
+    {
+        // SAFETY: the TypeId equality proves that every `F` element in these
+        // equally sized slices is a GoldilocksField. The root row is borrowed
+        // for the duration of the call, and the mutable values slice is unique.
+        let concrete_values = unsafe {
+            core::slice::from_raw_parts_mut(
+                values
+                    .as_mut_ptr()
+                    .cast::<crate::goldilocks_field::GoldilocksField>(),
+                values.len(),
+            )
+        };
+        let concrete_scales = unsafe {
+            core::slice::from_raw_parts(
+                scales
+                    .as_ptr()
+                    .cast::<crate::goldilocks_field::GoldilocksField>(),
+                scales.len(),
+            )
+        };
+        let concrete_roots = unsafe {
+            let row = root_table.last().unwrap();
+            core::slice::from_raw_parts(
+                row.as_ptr()
+                    .cast::<crate::goldilocks_field::GoldilocksField>(),
+                row.len(),
+            )
+        };
+        ifft_final_layer_scaled_goldilocks(concrete_values, concrete_scales, concrete_roots);
+        return;
+    }
+
+    let n = values.len();
+    let half = n / 2;
+    let middle = half / 2;
+    let roots = root_table.last().unwrap();
+    debug_assert_eq!(scales.len(), n);
+    debug_assert_eq!(roots.len(), half);
+
+    let u0 = values[0];
+    let t0 = M::mul(roots[0], values[half]);
+    values[0] = (u0 + t0) * scales[0];
+    values[half] = (u0 - t0) * scales[half];
+
+    // Pair butterfly j with butterfly half-j. Their four source slots are
+    // exactly their four IFFT-reversed destinations, so all sources can be
+    // loaded before any destination is overwritten.
+    for j in 1..middle {
+        let paired = half - j;
+        let u_a = values[j];
+        let v_a = values[half + j];
+        let u_b = values[paired];
+        let v_b = values[half + paired];
+        let t_a = M::mul(roots[j], v_a);
+        let t_b = M::mul(roots[paired], v_b);
+        let a_lo = u_a + t_a;
+        let a_hi = u_a - t_a;
+        let b_lo = u_b + t_b;
+        let b_hi = u_b - t_b;
+
+        values[n - j] = a_lo * scales[n - j];
+        values[paired] = a_hi * scales[paired];
+        values[half + j] = b_lo * scales[half + j];
+        values[j] = b_hi * scales[j];
+    }
+
+    // The middle butterfly is self-paired under index reversal.
+    let u = values[middle];
+    let t = M::mul(roots[middle], values[half + middle]);
+    values[middle] = (u - t) * scales[middle];
+    values[half + middle] = (u + t) * scales[half + middle];
+}
+
 /// Goldilocks `x + y` on two lanes, reproducing `impl Add for GoldilocksField`
 /// word for word:
 ///     (sum, over)  = x.overflowing_add(y)
@@ -507,6 +729,73 @@ unsafe fn gl_sub_neon(
     let diff2 = vsubq_u64(diff, adj);
     let under2 = vcltq_u64(diff, adj);
     vsubq_u64(diff2, vandq_u64(under2, eps))
+}
+
+/// AArch64 implementation of the fused final IFFT layer. Two symmetric
+/// butterflies share one paired twiddle multiplication; their four final
+/// scales use two more paired multiplications. This preserves the established
+/// scalar-GPR multiply schedule while the butterfly reductions stay in NEON.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn ifft_final_layer_scaled_goldilocks(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    scales: &[crate::goldilocks_field::GoldilocksField],
+    roots: &[crate::goldilocks_field::GoldilocksField],
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    let n = values.len();
+    let half = n / 2;
+    let middle = half / 2;
+    debug_assert_eq!(scales.len(), n);
+    debug_assert_eq!(roots.len(), half);
+
+    let u0 = values[0];
+    let t0 = roots[0] * values[half];
+    values[0] = (u0 + t0) * scales[0];
+    values[half] = (u0 - t0) * scales[half];
+
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        for j in 1..middle {
+            let paired = half - j;
+            let twiddles = NeonGoldilocksField([roots[j], roots[paired]]);
+            let highs = NeonGoldilocksField([values[half + j], values[half + paired]]);
+            let products = twiddles * highs;
+
+            let uv = vcombine_u64(
+                vcreate_u64(values[j].0),
+                vcreate_u64(values[paired].0),
+            );
+            let tv = vcombine_u64(
+                vcreate_u64(products.0[0].0),
+                vcreate_u64(products.0[1].0),
+            );
+            let sums = gl_add_neon(uv, tv, eps);
+            let differences = gl_sub_neon(uv, tv, eps);
+
+            let a_outputs = NeonGoldilocksField([
+                crate::goldilocks_field::GoldilocksField(vgetq_lane_u64(sums, 0)),
+                crate::goldilocks_field::GoldilocksField(vgetq_lane_u64(differences, 0)),
+            ]) * NeonGoldilocksField([scales[n - j], scales[paired]]);
+            let b_outputs = NeonGoldilocksField([
+                crate::goldilocks_field::GoldilocksField(vgetq_lane_u64(sums, 1)),
+                crate::goldilocks_field::GoldilocksField(vgetq_lane_u64(differences, 1)),
+            ]) * NeonGoldilocksField([scales[half + j], scales[j]]);
+
+            values[n - j] = a_outputs.0[0];
+            values[paired] = a_outputs.0[1];
+            values[half + j] = b_outputs.0[0];
+            values[j] = b_outputs.0[1];
+        }
+    }
+
+    let u = values[middle];
+    let t = roots[middle] * values[half + middle];
+    values[middle] = (u - t) * scales[middle];
+    values[half + middle] = (u + t) * scales[half + middle];
 }
 
 /// One butterfly layer over base-field scalars, with the modular reduction in
