@@ -1825,10 +1825,22 @@ static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
 
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
-/// the GPU absorbs each group while the CPU fills the next. Only used inside
-/// exclusive proving phases (nothing else contends for the GPU stream) and
-/// for large wide trees, where the overlap converts the previously serial
-/// CPU-FFT-then-GPU-hash commitment into max(FFT, hash) + one pass.
+/// the GPU absorbs each group while the CPU fills the next. Converts the
+/// previously serial CPU-FFT-then-GPU-hash commitment into max(FFT, hash).
+///
+/// Eligibility (production-ranked shapes):
+/// - **Exclusive serial phases** (pre-exec / chain drain): any tree with
+///   `leaf_count >= 2^17` and `leaf_width >= 16` — covers the 2^17 Z/quotient
+///   chain commits that used to miss the old 2^20 floor entirely.
+/// - **Wide wire commits** (`leaf_width > 64`, `leaf_count >= 2^19`): the
+///   production light/heavy tx wire oracle (≈135 × 2^19). The previous floor
+///   of `2^20` left this path dead on ranked fixtures; the wires tree is
+///   already routed to the GPU hasher unconditionally (see `gpu_worthwhile`),
+///   so overlapping its LDE FFTs with absorb is pure schedule win.
+///
+/// Concurrent callers must not block on the single streamed buffer pair: use
+/// `try_lock` and fall back to the classic path if another streamed build is
+/// live (bit-identical either way).
 ///
 /// Value-exact: the fill closure runs the same `batch_multiply_into` +
 /// zero-padded FFT as `fill_lde_column_store`, and each absorb pass performs
@@ -1846,21 +1858,28 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
+    let exclusive = EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed);
+    // Production wire LDE is 2^19; chain/pre-exec commits are 2^17. The old
+    // 2^20 floor matched no ranked shape and left streaming permanently cold.
+    let wide_wire_tree = leaf_width > 64 && leaf_count >= (1 << 19);
+    let exclusive_serial_tree = exclusive && leaf_count >= (1 << 17);
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || leaf_width < 16
-        || leaf_count < 1 << 20
+        || leaf_count < (1 << 17)
         || !leaf_count.is_power_of_two()
         || leaf_count > u32::MAX as usize
         || leaf_width > u32::MAX as usize
         || cap_height > leaf_count.ilog2() as usize
-        || !EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
+        || !(exclusive_serial_tree || wide_wire_tree)
     {
         return None;
     }
     let context = ready_context(leaf_width, leaf_count)?;
     let pipeline = absorb_pass_pipeline()?;
-    log::debug!("streamed sponge build: {leaf_width} cols x {leaf_count} leaves");
+    log::debug!(
+        "streamed sponge build: {leaf_width} cols x {leaf_count} leaves exclusive={exclusive}"
+    );
 
     let cap_count = 1usize << cap_height;
     let total_node_count = 2 * leaf_count - cap_count;
@@ -1869,7 +1888,10 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let state_bytes = leaf_count.checked_mul(12)?.checked_mul(size_of::<u64>())?;
 
     let job = GpuJobGuard::begin();
-    let mut buffers = STREAMED_BUFFERS.lock().ok()?;
+    // Non-blocking: a second concurrent streamed build must not park behind
+    // the first (that would serialize independent light-tx proofs). Classic
+    // path is always available and bit-identical.
+    let mut buffers = STREAMED_BUFFERS.try_lock().ok()?;
     let needs_new = buffers.as_ref().map_or(true, |(state, output)| {
         state.length() < state_bytes as u64 || output.length() < output_bytes as u64
     });
