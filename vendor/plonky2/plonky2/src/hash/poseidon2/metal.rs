@@ -109,7 +109,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
+    "01c0d7ab6a8355cd404f2ab58acccba515efb92f4e77b824b58d8c9854243846";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -1791,6 +1791,13 @@ pub(crate) fn allocate_columns<F: RichField>(
     rows: usize,
     cap_height: usize,
 ) -> Option<MetalColumns<F>> {
+    // Shared residence is useful independently of hash routing because the
+    // permutation-quotient kernel binds commitment columns directly. The
+    // serial-critical fold shapes previously lost shared residence whenever
+    // a busy GPU stream routed their hash to the CPU, silently disabling the
+    // fold's permutation offload. Admit those shapes here; gpu_worthwhile
+    // still owns the separate hash-routing decision.
+    let serial_critical_resident = rows == 1 << 17 && (5..=64).contains(&cols);
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || cols == 0
@@ -1799,7 +1806,7 @@ pub(crate) fn allocate_columns<F: RichField>(
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
         || cap_height > rows.ilog2() as usize
-        || !gpu_worthwhile(cols, rows, cap_height)
+        || !(gpu_worthwhile(cols, rows, cap_height) || serial_critical_resident)
     {
         return None;
     }
@@ -4219,6 +4226,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The permutation-quotient kernel requires shared columns on all three
+    /// commitments. A narrow 2^17-row fold commitment must therefore retain
+    /// shared residence even when a busy GPU routes its hash to the CPU.
+    #[test]
+    fn serial_critical_shapes_get_shared_allocation_when_gpu_busy() {
+        let Some(_context) = shared_context() else {
+            return; // No Metal device in this environment.
+        };
+
+        // Restore the process-global exclusive-phase flag for neighboring tests.
+        struct ExclusivePhaseReset(bool);
+        impl Drop for ExclusivePhaseReset {
+            fn drop(&mut self) {
+                set_exclusive_gpu_phase(self.0);
+            }
+        }
+        let _reset = ExclusivePhaseReset(is_exclusive_gpu_phase());
+
+        set_exclusive_gpu_phase(false);
+        let _job = GpuJobGuard::begin();
+        let columns = allocate_columns::<GoldilocksField>(20, 1 << 17, 4);
+        assert!(
+            columns.is_some(),
+            "serial-critical fold shapes must retain shared residence"
+        );
+        assert!(!gpu_worthwhile(20, 1 << 17, 4));
     }
 
     #[test]
