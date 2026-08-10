@@ -2033,31 +2033,41 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         let mut level_offset = 0usize;
         let mut child_count = leaf_count;
         level_offsets.push(level_offset);
-        while child_count > cap_count {
-            let parent_count = child_count / 2;
-            let child_offset = level_offset;
-            level_offset += child_count * 4;
-            level_offsets.push(level_offset);
-
-            let parent_count_u32 = parent_count as u32;
+        if child_count > cap_count {
             let parent_encoder = command_buffer.new_compute_command_encoder();
             parent_encoder.set_compute_pipeline_state(&context.parent_pipeline);
-            parent_encoder.set_buffer(
-                0,
-                Some(output_buffer),
-                (child_offset * size_of::<u64>()) as NSUInteger,
-            );
-            parent_encoder.set_buffer(
-                1,
-                Some(output_buffer),
-                (level_offset * size_of::<u64>()) as NSUInteger,
-            );
-            parent_encoder.set_buffer(2, Some(&context.parameters), 0);
-            set_u32(parent_encoder, 3, parent_count_u32);
-            dispatch(parent_encoder, &context.parent_pipeline, parent_count);
-            parent_encoder.end_encoding();
+            let output_resource: &metal::ResourceRef = output_buffer;
+            while child_count > cap_count {
+                if child_count != leaf_count {
+                    // Each level consumes digests written by the preceding
+                    // dispatch. Keep all parent levels in one encoder, with a
+                    // whole-output barrier at every parent-to-parent hazard.
+                    parent_encoder.memory_barrier_with_resources(&[output_resource]);
+                }
 
-            child_count = parent_count;
+                let parent_count = child_count / 2;
+                let child_offset = level_offset;
+                level_offset += child_count * 4;
+                level_offsets.push(level_offset);
+
+                let parent_count_u32 = parent_count as u32;
+                parent_encoder.set_buffer(
+                    0,
+                    Some(output_buffer),
+                    (child_offset * size_of::<u64>()) as NSUInteger,
+                );
+                parent_encoder.set_buffer(
+                    1,
+                    Some(output_buffer),
+                    (level_offset * size_of::<u64>()) as NSUInteger,
+                );
+                parent_encoder.set_buffer(2, Some(&context.parameters), 0);
+                set_u32(parent_encoder, 3, parent_count_u32);
+                dispatch(parent_encoder, &context.parent_pipeline, parent_count);
+
+                child_count = parent_count;
+            }
+            parent_encoder.end_encoding();
         }
         #[cfg(feature = "diagnostic_profile")]
         profile_command_buffer(command_buffer, "merkle_parents", leaf_count as u64);
