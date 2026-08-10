@@ -1374,14 +1374,19 @@ fn start_gpu_range_check_gate_quotient<
             gate_indices.push(gate_index);
         }
         if let Some(u32_gate) = u32_gate {
-            // A six-bit random access evaluates a 64-entry selection fold for
-            // only ten quotient rows. On the five-worker ranked workload that
-            // data-dependent branch extends the process-shared Range/U32 Metal
-            // command disproportionately. Keep exactly this shape on the
-            // existing CPU direct-accumulation evaluator instead: skipping it
-            // here means it is never added to `gate_indices`, so the generic
-            // CPU quotient pass retains its unchanged selector and alpha work.
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. }) {
+            // Every random-access shape evaluates a data-dependent selection
+            // fold (a 64-entry fold for six bits, 16 entries for four, 8 for
+            // three) for a small number of quotient rows. On the five-worker
+            // ranked workload those divergent branches extend the
+            // process-shared Range/U32 Metal command disproportionately, the
+            // same property that already moved the six-bit shape (and the
+            // 67-bit exponentiation loop) onto the existing CPU
+            // direct-accumulation evaluator. Skip all of them here: a skipped
+            // gate is never added to `gate_indices`, so the generic CPU
+            // quotient pass retains its unchanged selector and alpha work and
+            // the proof bytes are produced by the same code path the control
+            // uses for every unadmitted gate.
+            if matches!(u32_gate, U32QuotientGate::RandomAccess { .. }) {
                 continue;
             }
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
