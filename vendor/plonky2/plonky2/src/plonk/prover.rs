@@ -1581,16 +1581,15 @@ fn start_gpu_range_check_gate_quotient<
         // the production circuits and are pure arithmetic, so they are matched
         // by type here instead of through the downstream-crate trait hooks
         // (those hooks exist only to avoid a `plonky2` -> circuit-crate dep).
-        let native = if let Some(exponentiation) =
-            gate.0.as_any().downcast_ref::<ExponentiationGate<F, D>>()
-        {
-            let num_power_bits = exponentiation.num_power_bits;
-            Some((
-                U32QuotientKind::Exponentiation,
-                num_power_bits,
-                num_power_bits.checked_mul(2)?.checked_add(2)?,
-                num_power_bits.checked_add(1)?,
-            ))
+        let native = if gate.0.as_any().is::<ExponentiationGate<F, D>>() {
+            // The transaction circuits' 67-bit exponentiation loop is the
+            // most divergent native branch in the shared Range/U32 command.
+            // Leave this one family on the existing CPU quotient evaluator:
+            // it stays out of `gate_indices`, so it is not CPU-excluded and
+            // its selector/alpha contribution remains byte-for-byte the
+            // ordinary generic path. This trades a small parallel CPU span
+            // for a shorter process-shared Metal queue tail.
+            None
         } else if let Some(equality) = gate.0.as_any().downcast_ref::<EqualityGate>() {
             // The gate reads its single constant (the "one" value) as local
             // constant 0, i.e. the column immediately after the selector
