@@ -1519,7 +1519,7 @@ kernel void poseidon2_hash_leaves(
     for (uint offset = 0; offset < leaf_width; offset += 8) {
         uint chunk_size = min(8u, leaf_width - offset);
         for (uint i = 0; i < chunk_size; ++i) {
-            state[i] = gl_canonicalize(input[offset + i]);
+            state[i] = input[offset + i];
         }
         poseidon2(state, parameters);
     }
@@ -1642,7 +1642,7 @@ kernel void poseidon2_hash_leaves_colmajor(
     for (uint offset = 0; offset < leaf_width; offset += 8) {
         uint chunk_size = min(8u, leaf_width - offset);
         for (uint i = 0; i < chunk_size; ++i) {
-            state[i] = gl_canonicalize(leaves[(ulong)(offset + i) * leaf_count + gid]);
+            state[i] = leaves[(ulong)(offset + i) * leaf_count + gid];
         }
         poseidon2(state, parameters);
     }
@@ -1704,7 +1704,7 @@ kernel void poseidon2_absorb_pass(
         }
     }
     for (uint i = 0; i < chunk_size; ++i) {
-        st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
+        st[i] = leaves[(ulong)(col_start + i) * leaf_count + gid];
     }
     poseidon2(st, parameters);
     if (final_pass != 0u) {
