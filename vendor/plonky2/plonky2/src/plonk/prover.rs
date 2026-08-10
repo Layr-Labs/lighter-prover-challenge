@@ -2005,7 +2005,6 @@ fn compute_quotient_polys<
     let num_batches = points.len().div_ceil(BATCH_SIZE);
 
     struct QuotientScratch<F: RichField> {
-        indices: Vec<usize>,
         indices_next: Vec<usize>,
         local_constants: Vec<F>,
         local_wires: Vec<F>,
@@ -2090,7 +2089,6 @@ fn compute_quotient_polys<
         .enumerate()
         .for_each_init(
             || QuotientScratch::<F> {
-                indices: Vec::with_capacity(BATCH_SIZE),
                 indices_next: Vec::with_capacity(BATCH_SIZE),
                 local_constants: Vec::new(),
                 local_wires: Vec::new(),
@@ -2107,14 +2105,11 @@ fn compute_quotient_polys<
                 );
 
                 let n = xs_batch.len();
-                scratch.indices.clear();
-                scratch
-                    .indices
-                    .extend(BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n);
+                let index_start = BATCH_SIZE * batch_i;
                 scratch.indices_next.clear();
                 scratch
                     .indices_next
-                    .extend(scratch.indices.iter().map(|&i| (i + next_step) & lde_mask));
+                    .extend((0..n).map(|k| (index_start + k + next_step) & lde_mask));
 
                 let shifted_xs_batch = &shifted_points[BATCH_SIZE * batch_i..][..n];
                 debug_assert!(
@@ -2162,8 +2157,9 @@ fn compute_quotient_polys<
                         }
                     }
                 } else {
-                    prover_data.constants_sigmas_commitment.fill_lde_batch(
-                        &scratch.indices,
+                    prover_data.constants_sigmas_commitment.fill_lde_batch_range(
+                        index_start,
+                        n,
                         step,
                         common_data.constants_range(),
                         BatchLayout::PolyMajor,
@@ -2182,8 +2178,9 @@ fn compute_quotient_polys<
                     if permutation_products_offloaded {
                         scratch.s_sigmas_flat.clear();
                     } else {
-                        prover_data.constants_sigmas_commitment.fill_lde_batch(
-                            &scratch.indices,
+                        prover_data.constants_sigmas_commitment.fill_lde_batch_range(
+                            index_start,
+                            n,
                             step,
                             common_data.sigmas_range(),
                             batch_layout,
@@ -2208,15 +2205,17 @@ fn compute_quotient_polys<
                 } else {
                     (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
                 };
-                wires_commitment.fill_lde_batch(
-                    &scratch.indices,
+                wires_commitment.fill_lde_batch_range(
+                    index_start,
+                    n,
                     step,
                     0..cpu_num_wires,
                     BatchLayout::PolyMajor,
                     &mut scratch.local_wires,
                 );
-                zs_partial_products_and_lookup_commitment.fill_lde_batch(
-                    &scratch.indices,
+                zs_partial_products_and_lookup_commitment.fill_lde_batch_range(
+                    index_start,
+                    n,
                     step,
                     zs_local_range,
                     batch_layout,
@@ -2230,7 +2229,6 @@ fn compute_quotient_polys<
                     &mut scratch.zs_next_flat,
                 );
 
-                let indices_batch = &scratch.indices;
                 // Per-point row views over the PointMajor gathers, built only
                 // for the per-point path; the column path passes the flat
                 // buffers straight through, so these four allocations vanish
@@ -2312,7 +2310,7 @@ fn compute_quotient_polys<
                 let quotient_values_batch = &mut quotient_values_batch[..n * num_challenges];
                 eval_vanishing_poly_base_batch::<F, D>(
                     common_data,
-                    indices_batch,
+                    index_start,
                     shifted_xs_batch,
                     vars_batch,
                     perm,
@@ -2334,11 +2332,11 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
+                for (k, quotient_values) in quotient_values_batch
+                    .chunks_exact_mut(num_challenges)
+                    .enumerate()
                 {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    let denominator_inv = z_h_on_coset.eval_inverse(index_start + k);
                     quotient_values
                         .iter_mut()
                         .for_each(|v| *v *= denominator_inv);
@@ -2953,6 +2951,42 @@ mod quotient_layout_tests {
         commitment.fill_lde_batch_contiguous(indices[0], indices.len(), range, &mut contiguous);
 
         assert_eq!(contiguous, indexed);
+    }
+
+    /// The allocation-free quotient range gather is value-identical to the
+    /// generic indexed gather for both output layouts and both contiguous and
+    /// strided source domains.
+    #[test]
+    fn range_lde_batch_matches_indexed_gather() {
+        let (data, _) = small_circuit();
+        let commitment = &data.prover_only.constants_sigmas_commitment;
+        let range = data.common.sigmas_range();
+        let index_start = 3usize;
+        let n = 7usize;
+        let indices = (index_start..index_start + n).collect::<Vec<_>>();
+
+        for step in [1, 2] {
+            for layout in [BatchLayout::PointMajor, BatchLayout::PolyMajor] {
+                let mut indexed = Vec::new();
+                let mut ranged = Vec::new();
+                commitment.fill_lde_batch(
+                    &indices,
+                    step,
+                    range.clone(),
+                    layout,
+                    &mut indexed,
+                );
+                commitment.fill_lde_batch_range(
+                    index_start,
+                    n,
+                    step,
+                    range.clone(),
+                    layout,
+                    &mut ranged,
+                );
+                assert_eq!(ranged, indexed, "step={step}, layout={layout:?}");
+            }
+        }
     }
 
     /// Scratch reuse: `fill_lde_batch` writes every cell of `out` before any

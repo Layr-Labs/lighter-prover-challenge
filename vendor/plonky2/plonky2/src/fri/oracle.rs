@@ -460,6 +460,72 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         }
     }
 
+    /// Gathers a consecutive logical-index range without first materializing
+    /// `index_start..index_start + n` in a scratch vector. Quotient batches
+    /// always have this shape; keeping it explicit lets the strided column
+    /// path advance one source cursor per output instead of reloading and
+    /// multiplying an index from memory for every column.
+    pub(crate) fn fill_lde_batch_range(
+        &self,
+        index_start: usize,
+        n: usize,
+        step: usize,
+        col_range: core::ops::Range<usize>,
+        layout: BatchLayout,
+        out: &mut Vec<F>,
+    ) {
+        if layout == BatchLayout::PolyMajor && step == 1 {
+            self.fill_lde_batch_contiguous(index_start, n, col_range, out);
+            return;
+        }
+
+        let start = col_range.start;
+        let w = col_range.len();
+        out.resize(n * w, F::ZERO);
+        match &self.merkle_tree.leaves {
+            MerkleLeaves::Columns { columns, .. } => {
+                let source_start = index_start
+                    .checked_mul(step)
+                    .expect("LDE batch source offset overflow");
+                for (ci, c) in col_range.enumerate() {
+                    let column = columns.col(c);
+                    match layout {
+                        BatchLayout::PolyMajor => {
+                            let destination = &mut out[ci * n..(ci + 1) * n];
+                            let mut source = source_start;
+                            for value in destination {
+                                *value = column[source];
+                                source += step;
+                            }
+                        }
+                        BatchLayout::PointMajor => {
+                            let mut source = source_start;
+                            for k in 0..n {
+                                out[k * w + ci] = column[source];
+                                source += step;
+                            }
+                        }
+                    }
+                }
+            }
+            MerkleLeaves::Rows { .. } => {
+                for k in 0..n {
+                    let row = &self.get_lde_values(index_start + k, step)[start..start + w];
+                    match layout {
+                        BatchLayout::PointMajor => {
+                            out[k * w..(k + 1) * w].copy_from_slice(row);
+                        }
+                        BatchLayout::PolyMajor => {
+                            for (ci, &value) in row.iter().enumerate() {
+                                out[ci * n + k] = value;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Copies consecutive LDE points into a PolyMajor output buffer.
     ///
     /// Column-backed commitments use one contiguous slice copy per column,
