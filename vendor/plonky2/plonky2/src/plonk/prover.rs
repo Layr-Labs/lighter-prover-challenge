@@ -1381,7 +1381,15 @@ fn start_gpu_range_check_gate_quotient<
             // existing CPU direct-accumulation evaluator instead: skipping it
             // here means it is never added to `gate_indices`, so the generic
             // CPU quotient pass retains its unchanged selector and alpha work.
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. }) {
+            // The four-bit random access is the same shape family with the same
+            // poor constraint-row-to-fold ratio (16 entry-wide selection fold
+            // for only 26 quotient rows). It is a divergent low-row record on
+            // the shared Metal queue tail, so it is kept on the CPU evaluator
+            // alongside the six-bit shape. Both remain value-exact.
+            if matches!(
+                u32_gate,
+                U32QuotientGate::RandomAccess { bits: 4 | 6, .. }
+            ) {
                 continue;
             }
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
