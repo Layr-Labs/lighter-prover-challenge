@@ -1,3 +1,13 @@
+#[cfg(target_arch = "aarch64")]
+use core::any::TypeId;
+
+#[cfg(target_arch = "aarch64")]
+use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+#[cfg(target_arch = "aarch64")]
+use crate::extension::quadratic::QuadraticExtension;
+use crate::extension::FieldExtension;
+#[cfg(target_arch = "aarch64")]
+use crate::goldilocks_field::GoldilocksField;
 use crate::packable::Packable;
 use crate::packed::PackedField;
 use crate::types::Field;
@@ -102,6 +112,64 @@ pub fn batch_multiply_add_inplace<F: Field>(out: &mut [F], a: &[F], b: &[F]) {
     }
 }
 
+/// Accumulates `out[i] += factor * scalars[i]` where `factor` and `out` are
+/// extension-field elements and each input scalar is in their base field.
+///
+/// Performing `FieldExtension::scalar_mul` and then adding would reduce every
+/// base-field product before reducing the addition. This spelling delegates
+/// each limb to [`Field::multiply_accumulate`], allowing one widened product
+/// plus accumulator to share a single reduction. On ranked AArch64 Goldilocks
+/// quadratic extensions, both independent limbs are issued through the
+/// existing two-lane assembly block so their multiply latency overlaps.
+pub fn batch_extension_scalar_multiply_add_inplace<BF, FE, const D: usize>(
+    out: &mut [FE],
+    factor: FE,
+    scalars: &[BF],
+) where
+    BF: Field,
+    FE: FieldExtension<D, BaseField = BF>,
+{
+    assert_eq!(out.len(), scalars.len(), "output and scalar lengths differ");
+
+    #[cfg(target_arch = "aarch64")]
+    if D == 2
+        && TypeId::of::<BF>() == TypeId::of::<GoldilocksField>()
+        && TypeId::of::<FE>() == TypeId::of::<QuadraticExtension<GoldilocksField>>()
+    {
+        // SAFETY: both TypeId comparisons establish the exact concrete slice
+        // element types. Slice lengths are unchanged, and both concrete types
+        // retain their ordinary alignment and layout through the cast.
+        let factor =
+            unsafe { *(&factor as *const FE).cast::<QuadraticExtension<GoldilocksField>>() };
+        let out = unsafe {
+            core::slice::from_raw_parts_mut(
+                out.as_mut_ptr()
+                    .cast::<QuadraticExtension<GoldilocksField>>(),
+                out.len(),
+            )
+        };
+        let scalars = unsafe {
+            core::slice::from_raw_parts(scalars.as_ptr().cast::<GoldilocksField>(), scalars.len())
+        };
+        let factor = NeonGoldilocksField(factor.0);
+        for (acc, &scalar) in out.iter_mut().zip(scalars) {
+            acc.0 = NeonGoldilocksField(acc.0)
+                .multiply_accumulate(factor, NeonGoldilocksField::from(scalar))
+                .0;
+        }
+        return;
+    }
+
+    let factor_limbs = factor.to_basefield_array();
+    for (acc, &scalar) in out.iter_mut().zip(scalars) {
+        let mut limbs = acc.to_basefield_array();
+        for i in 0..D {
+            limbs[i] = limbs[i].multiply_accumulate(factor_limbs[i], scalar);
+        }
+        *acc = FE::from_basefield_array(limbs);
+    }
+}
+
 /// Elementwise inplace addition of two slices of field elements.
 /// Implementation be faster than the trivial for loop.
 pub fn batch_add_inplace<F: Field>(out: &mut [F], a: &[F]) {
@@ -125,7 +193,9 @@ pub fn batch_add_inplace<F: Field>(out: &mut [F], a: &[F]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extension::{Extendable, FieldExtension};
     use crate::goldilocks_field::GoldilocksField;
+    use crate::types::Field64;
 
     #[test]
     fn batch_multiply_add_matches_scalar_with_packed_leftovers() {
@@ -149,5 +219,54 @@ mod tests {
 
         assert_eq!(out, expected);
     }
-}
 
+    #[test]
+    fn extension_scalar_multiply_add_matches_limb_fma() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type FE = <F as Extendable<D>>::Extension;
+
+        let words = [
+            0,
+            1,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let factor =
+            FE::from_basefield_array([GoldilocksField(words[5]), GoldilocksField(words[3])]);
+        let scalars = words
+            .iter()
+            .copied()
+            .map(GoldilocksField)
+            .collect::<Vec<_>>();
+        let mut actual = words
+            .iter()
+            .enumerate()
+            .map(|(i, &word)| {
+                FE::from_basefield_array([
+                    GoldilocksField(word),
+                    GoldilocksField(words[words.len() - 1 - i]),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let factor_limbs: [F; D] = factor.to_basefield_array();
+        let expected = actual
+            .iter()
+            .zip(&scalars)
+            .map(|(acc, &scalar)| {
+                let mut limbs: [F; D] = acc.to_basefield_array();
+                for i in 0..D {
+                    limbs[i] = Field::multiply_accumulate(&limbs[i], factor_limbs[i], scalar);
+                }
+                FE::from_basefield_array(limbs)
+            })
+            .collect::<Vec<_>>();
+
+        batch_extension_scalar_multiply_add_inplace::<F, FE, D>(&mut actual, factor, &scalars);
+
+        assert_eq!(actual, expected);
+    }
+}
