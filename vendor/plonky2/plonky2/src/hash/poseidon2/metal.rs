@@ -1174,6 +1174,21 @@ pub fn prewarm() {
     std::thread::Builder::new()
         .name("poseidon2-metal-prewarm".to_owned())
         .spawn(|| {
+            // Match chain-spine threads: pipeline lowering is serial on every
+            // cold ranked worker; keep the compile thread on P-cores.
+            #[cfg(target_os = "macos")]
+            {
+                #[allow(non_camel_case_types)]
+                type qos_class_t = u32;
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(
+                        qos_class: qos_class_t,
+                        relative_priority: i32,
+                    ) -> i32;
+                }
+                // QOS_CLASS_USER_INTERACTIVE == 0x21
+                let _ = unsafe { pthread_set_qos_class_self_np(0x21, 0) };
+            }
             let _ = force_context();
         })
         .ok();
