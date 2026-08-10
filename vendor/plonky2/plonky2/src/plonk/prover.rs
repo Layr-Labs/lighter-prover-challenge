@@ -1384,6 +1384,14 @@ fn start_gpu_range_check_gate_quotient<
             if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. }) {
                 continue;
             }
+            // SelectionGate{20} is the same class of bad Metal admission: a
+            // data-dependent mux fold with only forty constraints, present
+            // on the chain spine. Keeping it on the shared Range/U32 command
+            // lengthens the process-shared queue tail while five workers
+            // wait; leave it on the ordinary CPU direct-accumulation path.
+            if matches!(u32_gate, U32QuotientGate::Selection { .. }) {
+                continue;
+            }
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
                 U32QuotientGate::Arithmetic { num_ops } => (
                     U32QuotientKind::Arithmetic,
