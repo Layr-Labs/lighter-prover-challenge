@@ -1,4 +1,3 @@
-use alloc::vec::Vec;
 use core::ops::Mul;
 
 use static_assertions::const_assert;
@@ -248,78 +247,6 @@ fn ext2_dot_product_arity16(
     let c0 = unsafe { reduce160(c0_lo, c0_hi) };
     let c1 = unsafe { reduce160(c1_lo, c1_hi) };
     QuadraticExtension([c0, c1])
-}
-
-/// For each output slot `i`, compute
-/// `out[i] = sum_j powers[j].scalar_mul(polys[j][start + i])`
-/// over every polynomial long enough to reach that slot, delaying modular
-/// reduction across the whole polynomial batch: one `reduce160` per extension
-/// limb per slot instead of one `reduce128` per limb per *term* plus a
-/// canonicalizing extension add per term.
-///
-/// Scalar multiplication by a base-field coefficient never mixes the two
-/// extension limbs, so each limb is a plain dot product of 64-bit raw
-/// representatives:
-///
-/// - `limb0 = sum_j powers[j].0[0] * c_j`
-/// - `limb1 = sum_j powers[j].0[1] * c_j`
-///
-/// Each 64x64 product is below `2^128`, so after `n` terms the 160-bit
-/// accumulator holds less than `n * 2^128`: its high limb stays below `n`,
-/// and `reduce160`'s `2^160 - 2^128 + 2^96` precondition holds for any
-/// `n <= 2^32 - 2`. The asserted bound below is far stricter than either
-/// limit and covers every production batch (a few hundred polynomials).
-///
-/// The result is the same field element as the reduce-per-term form; the raw
-/// representative may differ (both forms produce sub-2^64 representatives
-/// that later consumers treat value-wise, and proof serialization
-/// canonicalizes every limb).
-pub fn ext2_base_scalar_dot_slots(
-    out: &mut [QuadraticExtension<GoldilocksField>],
-    start: usize,
-    polys: &[&[GoldilocksField]],
-    powers: &[QuadraticExtension<GoldilocksField>],
-) {
-    assert_eq!(polys.len(), powers.len());
-    assert!(polys.len() < 1 << 24);
-    let end = start + out.len();
-    // Split once so the dense inner loop over fully-covering polynomials
-    // runs without per-slot bounds checks; only boundary-length polynomials
-    // take the checked loop.
-    let mut full: Vec<(&[GoldilocksField], QuadraticExtension<GoldilocksField>)> =
-        Vec::with_capacity(polys.len());
-    let mut partial: Vec<(&[GoldilocksField], QuadraticExtension<GoldilocksField>)> = Vec::new();
-    for (&p, &pw) in polys.iter().zip(powers) {
-        if p.len() >= end {
-            full.push((&p[start..end], pw));
-        } else if p.len() > start {
-            partial.push((&p[start..], pw));
-        }
-    }
-    for (i, o) in out.iter_mut().enumerate() {
-        let (mut lo0, mut hi0) = (0u128, 0u32);
-        let (mut lo1, mut hi1) = (0u128, 0u32);
-        for &(p, QuadraticExtension([b0, b1])) in &full {
-            // SAFETY: every slice in `full` has length exactly `out.len()`.
-            let c = unsafe { p.get_unchecked(i).0 };
-            u160_add_product(&mut lo0, &mut hi0, b0.0, c);
-            u160_add_product(&mut lo1, &mut hi1, b1.0, c);
-        }
-        for &(p, QuadraticExtension([b0, b1])) in &partial {
-            if i < p.len() {
-                let c = p[i].0;
-                u160_add_product(&mut lo0, &mut hi0, b0.0, c);
-                u160_add_product(&mut lo1, &mut hi1, b1.0, c);
-            }
-        }
-        // SAFETY: the accumulator bound documented above — below
-        // `polys.len() * 2^128 < 2^152` — is far under reduce160's
-        // precondition.
-        *o = QuadraticExtension([
-            unsafe { reduce160(lo0, hi0) },
-            unsafe { reduce160(lo1, hi1) },
-        ]);
-    }
 }
 
 /*
