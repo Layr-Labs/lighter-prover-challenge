@@ -1600,17 +1600,14 @@ fn start_gpu_range_check_gate_quotient<
             // ordinary generic path. This trades a small parallel CPU span
             // for a shorter process-shared Metal queue tail.
             None
-        } else if let Some(equality) = gate.0.as_any().downcast_ref::<EqualityGate>() {
-            // The gate reads its single constant (the "one" value) as local
-            // constant 0, i.e. the column immediately after the selector
-            // prefix of the constants/sigmas commitment.
-            let constant_column = common_data.selectors_info.num_selectors();
-            Some((
-                U32QuotientKind::Equality { constant_column },
-                equality.num_ops,
-                equality.num_ops.checked_mul(6)?,
-                equality.num_ops.checked_mul(4)?,
-            ))
+        } else if gate.0.as_any().is::<EqualityGate>() {
+            // EqualityGate{22} is another divergent native branch on the
+            // shared Range/U32 Metal command (constant-column lookup +
+            // per-op equality fold). Same trade as the promoted
+            // Exponentiation ablation: leave it on the ordinary CPU
+            // direct-accumulation evaluator so it stays out of
+            // `gate_indices` and shortens the process-shared queue tail.
+            None
         } else if let Some(reducing) = gate.0.as_any().downcast_ref::<ReducingGate<D>>() {
             // The kernel's extension arithmetic is specialised to the
             // quadratic Goldilocks extension.
