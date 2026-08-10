@@ -167,8 +167,18 @@ const MAX_CACHED_QUOTIENT_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
 /// Retain the recurring d14/d16 digest buffers, but not the one-off d18 final
 /// tree. These buffers replace equally large CPU digest vectors.
+///
+/// The light path keeps four transaction proofs in flight plus the chain-step
+/// thread, and the heavy and block lanes run alongside, so roughly twenty
+/// 33.5 MiB level-order digest buffers are alive at once (three trees per
+/// in-flight proof). A pool capped at a small *count* is therefore almost
+/// always full: every Merkle build falls through to a fresh shared buffer
+/// whose pages the GPU kernel zero-faults again - the exact cost the
+/// ColumnStorePool eliminates for column stores. Budget by bytes instead
+/// (same discipline as COLUMN_STORE_POOL), keeping the per-buffer cap so
+/// the one-off d18 buffers stay out.
 const MAX_CACHED_DIGEST_OUTPUT_BYTES: u64 = 40 * 1024 * 1024;
-const MAX_CACHED_DIGEST_OUTPUTS: usize = 4;
+const MAX_DIGEST_OUTPUT_POOL_BYTES: u64 = 640 * 1024 * 1024;
 
 struct MetalShared {
     device: Device,
@@ -762,6 +772,7 @@ impl QuotientOutputPool {
 #[derive(Default)]
 struct DigestOutputPool {
     free: Vec<Buffer>,
+    total_bytes: u64,
 }
 
 impl DigestOutputPool {
@@ -773,6 +784,8 @@ impl DigestOutputPool {
             .filter(|(_, buffer)| buffer.length() >= bytes)
             .min_by_key(|(_, buffer)| buffer.length())
             .map(|(index, _)| index)?;
+        let length = self.free[index].length();
+        self.total_bytes -= length;
         Some(self.free.swap_remove(index))
     }
 
@@ -781,20 +794,13 @@ impl DigestOutputPool {
         if length > MAX_CACHED_DIGEST_OUTPUT_BYTES {
             return;
         }
-        if self.free.len() < MAX_CACHED_DIGEST_OUTPUTS {
-            self.free.push(buffer);
+        // Budget by bytes, not count: the live set is ~20 recurring 33.5 MiB
+        // buffers, so a count cap of 4 makes the pool a near-permanent miss.
+        if self.total_bytes + length > MAX_DIGEST_OUTPUT_POOL_BYTES {
             return;
         }
-        let (smallest_index, smallest_length) = self
-            .free
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, cached)| cached.length())
-            .map(|(index, cached)| (index, cached.length()))
-            .expect("full digest output pool is nonempty");
-        if length > smallest_length {
-            self.free[smallest_index] = buffer;
-        }
+        self.total_bytes += length;
+        self.free.push(buffer);
     }
 }
 
