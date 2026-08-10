@@ -107,6 +107,36 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// `metallib_matches_shader_source` test enforces it.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
+/// Historical ranked artifacts whose selected kernels are ABI-compatible with
+/// the current shader. They are loaded as secondary libraries only: NTT and
+/// permutation-quotient pipelines always come from [`SHADER_METALLIB`].
+///
+/// `poseidon2_squaring.metallib` comes from validation commit
+/// `7a13d82389b7c6cfd1f6625577a35a56236ae559` and specializes the two
+/// squarings in `pow7`, including the parent permutation.
+/// `poseidon2_alpha.metallib` comes from validation commit
+/// `b794726bcb76e0458803d918dc935552208d73bb` and batches the exact wide alpha
+/// reduction once per gate in the Poseidon and Range quotient kernels.
+const SQUARING_METALLIB: &[u8] = include_bytes!("poseidon2_squaring.metallib");
+const ALPHA_METALLIB: &[u8] = include_bytes!("poseidon2_alpha.metallib");
+#[cfg(test)]
+const SQUARING_METALLIB_SHA256: &str =
+    "882cee1f396f7fcb6240ae90084189eafb200bb72de810f7ab7fb590b61ac16f";
+#[cfg(test)]
+const ALPHA_METALLIB_SHA256: &str =
+    "c3493a72d8b36e8041d6e8fff3c01bfb6f150f04e2477c6c0d7ad6e0e1649be8";
+
+const SQUARING_COMPATIBLE_KERNELS: [&str; 4] = [
+    "poseidon2_hash_leaves",
+    "poseidon2_hash_leaves_colmajor",
+    "poseidon2_hash_parents",
+    "poseidon2_absorb_pass",
+];
+const ALPHA_QUOTIENT_KERNELS: [&str; 2] = [
+    "poseidon2_gate_quotient",
+    "range_check_gate_quotient",
+];
+
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
     "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
@@ -955,15 +985,33 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
 /// Scheduling only. The pipelines are the same objects the blocking build
 /// produced, lowered from the same library, so nothing they later compute can
 /// differ; only the instant at which they become available does.
-fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
-    for (name, slot) in [
-        ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
+fn spawn_optional_pipelines(
+    device: &Device,
+    library: &metal::Library,
+    squaring_library: Option<&metal::Library>,
+    alpha_library: Option<&metal::Library>,
+) {
+    for (name, slot, preferred) in [
+        (
+            "poseidon2_gate_quotient",
+            &POSEIDON_GATE_QUOTIENT_PIPELINE,
+            alpha_library.cloned(),
+        ),
         (
             "range_check_gate_quotient",
             &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
+            alpha_library.cloned(),
         ),
-        ("permutation_quotient", &PERMUTATION_QUOTIENT_PIPELINE),
-        ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
+        (
+            "permutation_quotient",
+            &PERMUTATION_QUOTIENT_PIPELINE,
+            None,
+        ),
+        (
+            "poseidon2_absorb_pass",
+            &ABSORB_PASS_PIPELINE,
+            squaring_library.cloned(),
+        ),
     ] {
         let device = device.clone();
         let library = library.clone();
@@ -971,11 +1019,17 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             .name(format!("poseidon2-metal-{name}"))
             .spawn(move || {
                 let pipeline = autoreleasepool(|| {
-                    library.get_function(name, None).ok().and_then(|function| {
-                        device
-                            .new_compute_pipeline_state_with_function(&function)
-                            .ok()
-                    })
+                    let build = |source: &metal::Library| {
+                        source.get_function(name, None).ok().and_then(|function| {
+                            device
+                                .new_compute_pipeline_state_with_function(&function)
+                                .ok()
+                        })
+                    };
+                    preferred
+                        .as_ref()
+                        .and_then(build)
+                        .or_else(|| build(&library))
                 });
                 if pipeline.is_none() {
                     log::debug!("{name} pipeline unavailable; evaluating those gates on the CPU");
@@ -1791,6 +1845,15 @@ pub(crate) fn allocate_columns<F: RichField>(
     rows: usize,
     cap_height: usize,
 ) -> Option<MetalColumns<F>> {
+    // Shared residence is valuable independently of hash routing since the
+    // permutation-quotient kernel binds commitment columns directly: the
+    // serial-critical fold shapes (2^17 rows, narrow) previously lost shared
+    // residence whenever the busy GPU stream routed their HASH to the CPU,
+    // which silently disabled the fold's permutation offload
+    // (start_gpu_permutation_quotient requires shared_columns() on all three
+    // commitments). Admit those shapes unconditionally; gpu_worthwhile still
+    // owns the hash-routing decision.
+    let serial_critical_resident = rows == 1 << 17 && (5..=64).contains(&cols);
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || cols == 0
@@ -1799,7 +1862,7 @@ pub(crate) fn allocate_columns<F: RichField>(
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
         || cap_height > rows.ilog2() as usize
-        || !gpu_worthwhile(cols, rows, cap_height)
+        || !(gpu_worthwhile(cols, rows, cap_height) || serial_critical_resident)
     {
         return None;
     }
@@ -2152,6 +2215,10 @@ enum LeafSource<'a, F> {
 
 impl MetalShared {
     fn new() -> Result<Self, String> {
+        Self::new_with_historical_artifacts(true)
+    }
+
+    fn new_with_historical_artifacts(use_historical_artifacts: bool) -> Result<Self, String> {
         autoreleasepool(|| {
             let device = Device::system_default().ok_or("no Metal device")?;
             let options = CompileOptions::new();
@@ -2194,6 +2261,25 @@ impl MetalShared {
                     },
                     Ok,
                 )?;
+
+            // Reuse two already-ranked AIR artifacts only for functions whose
+            // buffer ABI and body are unchanged apart from their intended
+            // Poseidon arithmetic. Keeping them secondary is important: their
+            // older sources do not contain the current permutation quotient,
+            // which remains pinned to the current library.
+            let optional_library = |bytes: &[u8], kernels: &[&str]| {
+                device.new_library_with_data(bytes).ok().filter(|library| {
+                    kernels
+                        .iter()
+                        .all(|name| library.get_function(name, None).is_ok())
+                })
+            };
+            let squaring_library = use_historical_artifacts
+                .then(|| optional_library(SQUARING_METALLIB, &SQUARING_COMPATIBLE_KERNELS))
+                .flatten();
+            let alpha_library = use_historical_artifacts
+                .then(|| optional_library(ALPHA_METALLIB, &ALPHA_QUOTIENT_KERNELS))
+                .flatten();
             // Build the compute pipelines concurrently, one thread each.
             //
             // Every `newComputePipelineStateWithFunction:` lowers that kernel's
@@ -2215,15 +2301,30 @@ impl MetalShared {
             // that created them rather than leaking.
             let device_ref = &device;
             let library_ref = &library;
-            let required = |name: &'static str, kind: &'static str| {
+            let required = |preferred_library: Option<metal::Library>,
+                            name: &'static str,
+                            kind: &'static str| {
                 move || -> Result<ComputePipelineState, String> {
                     autoreleasepool(|| {
-                        let function = library_ref
-                            .get_function(name, None)
-                            .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
-                        device_ref
-                            .new_compute_pipeline_state_with_function(&function)
-                            .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
+                        let build = |source: &metal::Library| {
+                            let function = source
+                                .get_function(name, None)
+                                .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
+                            device_ref
+                                .new_compute_pipeline_state_with_function(&function)
+                                .map_err(|error| {
+                                    format!("{kind} pipeline creation failed: {error}")
+                                })
+                        };
+                        if let Some(preferred) = preferred_library {
+                            match build(&preferred) {
+                                Ok(pipeline) => return Ok(pipeline),
+                                Err(error) => log::warn!(
+                                    "historical {kind} Metal artifact failed; using current kernel: {error}"
+                                ),
+                            }
+                        }
+                        build(library_ref)
                     })
                 }
             };
@@ -2256,13 +2357,24 @@ impl MetalShared {
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
             ) = std::thread::scope(|scope| {
-                let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
-                let leaf_colmajor =
-                    scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
-                let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
-                let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
-                let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
-                let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
+                let leaf = scope.spawn(required(
+                    squaring_library.clone(),
+                    "poseidon2_hash_leaves",
+                    "leaf",
+                ));
+                let leaf_colmajor = scope.spawn(required(
+                    squaring_library.clone(),
+                    "poseidon2_hash_leaves_colmajor",
+                    "col-major leaf",
+                ));
+                let parent = scope.spawn(required(
+                    squaring_library.clone(),
+                    "poseidon2_hash_parents",
+                    "parent",
+                ));
+                let ntt_prepare = scope.spawn(required(None, "ntt_prepare", "ntt prepare"));
+                let ntt_stage = scope.spawn(required(None, "ntt_stage", "ntt stage"));
+                let ifft_finalize = scope.spawn(required(None, "ifft_finalize", "ifft finalize"));
                 // A panic inside a pipeline build is a bug, not a runtime
                 // condition; propagate it rather than papering over it.
                 (
@@ -2295,7 +2407,12 @@ impl MetalShared {
             let ntt_stage_pipeline = ntt_stage_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
-            spawn_optional_pipelines(&device, &library);
+            spawn_optional_pipelines(
+                &device,
+                &library,
+                squaring_library.as_ref(),
+                alpha_library.as_ref(),
+            );
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -3741,6 +3858,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn historical_tree_metallibs_match_pinned_artifacts() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
+        for (file, expected) in [
+            ("poseidon2_squaring.metallib", SQUARING_METALLIB_SHA256),
+            ("poseidon2_alpha.metallib", ALPHA_METALLIB_SHA256),
+        ] {
+            let output = std::process::Command::new("/usr/bin/shasum")
+                .args(["-a", "256", &format!("{dir}/{file}")])
+                .output()
+                .unwrap_or_else(|error| panic!("shasum must verify {file}: {error}"));
+            assert!(output.status.success(), "shasum failed for {file}");
+            let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
+            let digest = digest
+                .split_whitespace()
+                .next()
+                .expect("empty shasum output");
+            assert_eq!(digest, expected, "historical Metal artifact {file} changed");
+        }
+    }
+
     /// The fallback in `MetalShared::new` hides a broken artifact behind a
     /// source compile, which would silently give back the cost this exists to
     /// remove. Assert the fast path is actually live on this machine.
@@ -3757,6 +3895,83 @@ mod tests {
                 library.get_function(name, None).is_ok(),
                 "prebuilt metallib is missing kernel {name}"
             );
+        }
+
+        // Loading a function does not fully validate its AIR on every Metal
+        // runtime. Lower the six selected historical kernels as well, so a
+        // committed artifact that this host cannot execute fails this test
+        // instead of being mistaken for an active optimization.
+        for (artifact, kernels) in [
+            (
+                SQUARING_METALLIB,
+                SQUARING_COMPATIBLE_KERNELS.as_slice(),
+            ),
+            (ALPHA_METALLIB, ALPHA_QUOTIENT_KERNELS.as_slice()),
+        ] {
+            let historical = device
+                .new_library_with_data(artifact)
+                .expect("historical metallib must load");
+            for name in kernels {
+                let function = historical.get_function(name, None).unwrap_or_else(|error| {
+                    panic!("historical kernel {name} unavailable: {error}")
+                });
+                device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .unwrap_or_else(|error| {
+                        panic!("historical kernel {name} failed to lower: {error}")
+                    });
+            }
+        }
+    }
+
+    #[test]
+    fn historical_tree_metallibs_match_current_tree_execution() {
+        let mixed = MetalShared::new_with_historical_artifacts(true).expect("mixed Metal context");
+        let current =
+            MetalShared::new_with_historical_artifacts(false).expect("current Metal context");
+        let mut rng = StdRng::seed_from_u64(0x4849_5354_4d49_5845);
+        let rows = 64;
+
+        for width in [1, 4, 5, 8, 9, 16, 17, 31, 64, 80, 136] {
+            let flat = (0..rows * width)
+                .map(|index| {
+                    let raw = match index & 7 {
+                        0 => 0,
+                        1 => 1,
+                        2 => GoldilocksField::ORDER - 1,
+                        3 => GoldilocksField::ORDER,
+                        4 => GoldilocksField::ORDER + 1,
+                        5 => u64::MAX,
+                        _ => rng.next_u64(),
+                    };
+                    GoldilocksField(raw)
+                })
+                .collect::<Vec<_>>();
+            let columns = (0..width)
+                .map(|column| {
+                    (0..rows)
+                        .map(|row| flat[row * width + column])
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+
+            for cap_height in [0, 3, 6] {
+                let mixed_rows = mixed
+                    .build(LeafSource::Rows(&flat), width, rows, cap_height)
+                    .expect("mixed row-major tree");
+                let current_rows = current
+                    .build(LeafSource::Rows(&flat), width, rows, cap_height)
+                    .expect("current row-major tree");
+                assert_tree_raw_eq(&mixed_rows, &current_rows, width, cap_height);
+
+                let mixed_columns = mixed
+                    .build(LeafSource::Columns(&columns), width, rows, cap_height)
+                    .expect("mixed column-major tree");
+                let current_columns = current
+                    .build(LeafSource::Columns(&columns), width, rows, cap_height)
+                    .expect("current column-major tree");
+                assert_tree_raw_eq(&mixed_columns, &current_columns, width, cap_height);
+            }
         }
     }
 
@@ -4219,6 +4434,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `start_permutation_quotient` (above) requires `shared_columns()` on all
+    /// three commitments, so the Zs/partial-products fold shape (2^17 rows,
+    /// narrow width) must get shared residence even when a busy GPU stream
+    /// routes its *hash* to the CPU. `allocate_columns` decouples the
+    /// allocation decision from `gpu_worthwhile`'s routing decision for
+    /// exactly this shape; this pins that contract independently of hash
+    /// routing, which must stay unchanged.
+    #[test]
+    fn serial_critical_shapes_get_shared_allocation_when_gpu_busy() {
+        // Forces the Metal context up front (as the neighboring functional
+        // tests do) and doubles as this test's "skip when no Metal device"
+        // guard, so `allocate_columns` below never races the one-shot
+        // startup probe that diverts allocations while the context is still
+        // being built.
+        let Some(_context) = shared_context() else {
+            return; // no Metal device in this environment
+        };
+
+        // The exclusive-phase flag is process-global; restore whatever this
+        // test observed on entry so other tests in this binary are unaffected.
+        struct ExclusivePhaseReset(bool);
+        impl Drop for ExclusivePhaseReset {
+            fn drop(&mut self) {
+                set_exclusive_gpu_phase(self.0);
+            }
+        }
+        let _reset = ExclusivePhaseReset(is_exclusive_gpu_phase());
+
+        // Mid-pipeline conditions: not exclusive, GPU stream occupied.
+        set_exclusive_gpu_phase(false);
+        let _job = GpuJobGuard::begin(); // forces GPU_JOBS_IN_FLIGHT > 0
+        // Zs/partial-products fold shape: 2^17 rows x 20 cols.
+        let columns = allocate_columns::<GoldilocksField>(20, 1 << 17, 4);
+        assert!(
+            columns.is_some(),
+            "serial-critical fold shapes must get shared residence even when hash routing says CPU"
+        );
+        // Routing itself must be unchanged: gpu_worthwhile still says no.
+        assert!(!gpu_worthwhile(20, 1 << 17, 4));
     }
 
     #[test]
