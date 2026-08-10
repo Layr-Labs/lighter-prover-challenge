@@ -174,6 +174,36 @@ inline void mul_128(
     h1 = q1 + (uint)(h0 < q0) + carry;
 }
 
+// Squaring-specific 128-bit product: exploits a == b to use 3 multiplies
+// instead of 4 (p01 == p10, so the cross term is 2*p01 instead of p01+p10).
+// Value-exact: the 128-bit product a*a is identical either way.
+inline void sqr_128(
+    ulong a,
+    thread uint& l0,
+    thread uint& l1,
+    thread uint& h0,
+    thread uint& h1) {
+    uint2 av = as_type<uint2>(a);
+    uint a0 = av.x;
+    uint a1 = av.y;
+    ulong p00 = (ulong)a0 * (ulong)a0;
+    ulong p01 = (ulong)a0 * (ulong)a1;
+    ulong p11 = (ulong)a1 * (ulong)a1;
+
+    ulong t = p01 + (p00 >> 32);
+    ulong m = t + p01;
+    uint carry = (uint)(m < t);
+
+    l0 = (uint)p00;
+    l1 = (uint)m;
+
+    uint q0 = (uint)p11;
+    uint q1 = (uint)(p11 >> 32);
+    uint mh = (uint)(m >> 32);
+    h0 = q0 + mh;
+    h1 = q1 + (uint)(h0 < q0) + carry;
+}
+
 // Goldilocks multiplication with 32-bit reduction after the native product.
 // If low = l0 + l1*B and high = h0 + h1*B for B = 2^32, then
 //   low + high*B^2 = (l0 - h0 - h1) + (l1 + h0)*B  (mod p).
@@ -319,6 +349,30 @@ inline ulong gl_mul_add(ulong a, ulong b, ulong addend) {
     return reduce_top(r0, r1, (int)carry - (int)under);
 }
 
+// Squaring with 32-bit reduction: uses sqr_128 (3 multiplies) instead of
+// mul_128 (4 multiplies). Value-exact: a*a mod p is the same either way.
+inline ulong gl_sqr(ulong a) {
+    uint l0;
+    uint l1;
+    uint h0;
+    uint h1;
+    sqr_128(a, l0, l1, h0, h1);
+
+    uint r0 = l0 - h0;
+    uint borrow = (uint)(r0 > l0);
+    uint next = r0 - h1;
+    borrow += (uint)(next > r0);
+    r0 = next;
+
+    uint r1 = l1 + h0;
+    uint carry = (uint)(r1 < l1);
+    next = r1 - borrow;
+    uint under = (uint)(next > r1);
+    r1 = next;
+
+    return reduce_top(r0, r1, (int)carry - (int)under);
+}
+
 // x^7 by the addition chain 1 -> 2 -> 3 -> 6 -> 7. Every length-four chain for
 // x^7 costs the same four multiplies, but this one keeps only `value` and one
 // running power live at a time, and three of the four multiplies take `value`
@@ -326,9 +380,9 @@ inline ulong gl_mul_add(ulong a, ulong b, ulong addend) {
 // instead of re-splitting a fresh pair. The 2/4/3/7 chain is one step shallower
 // and measured consistently slower for both reasons.
 inline ulong pow7(ulong value) {
-    ulong value2 = gl_mul(value, value);
+    ulong value2 = gl_sqr(value);
     ulong value3 = gl_mul(value, value2);
-    ulong value6 = gl_mul(value3, value3);
+    ulong value6 = gl_sqr(value3);
     return gl_mul(value, value6);
 }
 

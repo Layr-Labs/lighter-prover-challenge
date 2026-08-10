@@ -105,11 +105,13 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// shader cache does not pay the MSL front end. Regenerate whenever
 /// `poseidon2.metal` changes (see `MetalShared::new`); the
 /// `metallib_matches_shader_source` test enforces it.
-const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
+const SHADER_METALLIB: &[u8] = &[];
+// Source-compiled path: metallib emptied to force new_library_with_source
+// so the gl_sqr squaring optimization in poseidon2.metal takes effect.
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
+    "1f9f581ec3b1b9ceed57eee795b86a633d3a25d15d1acfcda4690291a28af2b3";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
