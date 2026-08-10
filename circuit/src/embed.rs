@@ -347,6 +347,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let section = read_compressed_section(bytes, &mut pos)?;
     let target: T =
         bincode::deserialize(&section).context("deserializing circuit target struct")?;
+    drop(section);
 
     // public inputs
     let section = read_compressed_section(bytes, &mut pos)?;
@@ -354,6 +355,8 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let public_inputs = reader
         .read_target_vec()
         .map_err(|e| anyhow::anyhow!("deserializing public inputs: {e:?}"))?;
+    drop(reader);
+    drop(section);
 
     // lookups
     let section = read_section(bytes, &mut pos)?;
@@ -399,6 +402,8 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
                 .map_err(|e| anyhow::anyhow!("deserializing generator: {e:?}"))?,
         );
     }
+    drop(reader);
+    drop(section);
 
     // watch index
     let section = read_compressed_section(bytes, &mut pos)?;
@@ -410,6 +415,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         running += read_uvarint(&section, &mut vpos)?;
         offsets.push(u32::try_from(running).context("watch index offset exceeds u32")?);
     }
+    drop(section);
     let section = read_compressed_section(bytes, &mut pos)?;
     let mut vpos = 0usize;
     let watchers_len = read_uvarint(&section, &mut vpos)? as usize;
@@ -423,6 +429,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         ensure!(watcher < generator_count, "watcher index out of range");
         watchers.push(watcher);
     }
+    drop(section);
     // Watch counts are a pure function of the (deduplicated) watcher lists;
     // this mirrors `read_prover_only_circuit_data`'s reconstruction.
     let mut generator_watch_counts = vec![0usize; generator_count];
@@ -456,6 +463,8 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
                 .map_err(|e| anyhow::anyhow!("deserializing constant polynomials: {e:?}"))?,
         ));
     }
+    drop(reader);
+    drop(section);
 
     // representative map
     let section = read_compressed_section(bytes, &mut pos)?;
@@ -468,6 +477,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         representative_map
             .push(u32::try_from(parent).context("representative map entry out of range")?);
     }
+    drop(section);
     ensure!(pos == bytes.len(), "trailing bytes in embedded circuit blob");
 
     // ---- recompute the derived prover-only components ----
@@ -495,6 +505,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let mut forest = Forest::from_parents(representative_map, num_wires, num_routed, degree);
     let wire_partition = forest.wire_partition();
     let sigma_vecs = wire_partition.get_sigma_polys(degree_bits, &common.k_is, &subgroup);
+    drop(wire_partition);
     let representative_map = forest.into_parents();
     let fixed_routed_wires =
         fixed_routed_wire_mask(&representative_map, num_wires, num_routed, degree)
