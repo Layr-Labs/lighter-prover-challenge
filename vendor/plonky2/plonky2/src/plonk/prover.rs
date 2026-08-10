@@ -589,6 +589,47 @@ fn divide_chunk_products<F: Field>(
     }
 }
 
+#[inline]
+fn divide_two_challenge_chunk_products<F: Field>(
+    numerator_products_0: &mut [F],
+    numerator_products_1: &mut [F],
+    denominator_products: &[F],
+    inverse_scratch: &mut Vec<F>,
+    has_zero_denominator: bool,
+) {
+    let challenge_0_len = numerator_products_0.len();
+    debug_assert_eq!(numerator_products_1.len(), challenge_0_len);
+    debug_assert_eq!(denominator_products.len(), 2 * challenge_0_len);
+    let (denominator_products_0, denominator_products_1) =
+        denominator_products.split_at(challenge_0_len);
+
+    // Preserve the old two-call failure semantics exactly. In particular, a
+    // zero in challenge 1 must leave challenge 0 divided before panicking,
+    // while a zero in challenge 0 must leave both numerator slices untouched.
+    if has_zero_denominator {
+        divide_chunk_products(
+            numerator_products_0,
+            denominator_products_0,
+            inverse_scratch,
+        );
+        divide_chunk_products(
+            numerator_products_1,
+            denominator_products_1,
+            inverse_scratch,
+        );
+        return;
+    }
+
+    F::batch_multiplicative_inverse_into(denominator_products, inverse_scratch);
+    let (inverses_0, inverses_1) = inverse_scratch.split_at(challenge_0_len);
+    for (product, &inverse) in numerator_products_0.iter_mut().zip(inverses_0) {
+        *product *= inverse;
+    }
+    for (product, &inverse) in numerator_products_1.iter_mut().zip(inverses_1) {
+        *product *= inverse;
+    }
+}
+
 /// Accumulate the sequential Z chain directly into the column-major output
 /// polynomials, deleting the per-point row Vec, the row-major intermediate,
 /// and the whole-phase transpose. Values and their order are identical to the
@@ -688,16 +729,20 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
             .for_each_init(
                 || {
                     (
-                        Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
                     let base = chunk_idx * INV_BATCH;
-                    let (denominators_0, denominators_1, denominator_inverses) = scratch;
-                    denominators_0.clear();
-                    denominators_1.clear();
+                    let (denominators, denominator_inverses) = scratch;
+                    denominators.clear();
+                    let denominator_count = products_0.len();
+                    let denominator_slots = crate::hash::merkle_tree::capacity_up_to_mut(
+                        denominators,
+                        2 * denominator_count,
+                    );
+                    let mut has_zero_denominator = false;
                     for (t, &x) in xs.iter().enumerate() {
                         let i = base + t;
                         let s_sigmas = &prover_data.sigmas[i];
@@ -731,8 +776,10 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
                             products_1[output].write(numerator_1);
-                            denominators_0.push(denominator_0);
-                            denominators_1.push(denominator_1);
+                            denominator_slots[output].write(denominator_0);
+                            denominator_slots[denominator_count + output].write(denominator_1);
+                            has_zero_denominator |=
+                                denominator_0.is_zero() || denominator_1.is_zero();
                         }
                     }
                     // SAFETY: the loop above wrote every slot of both
@@ -747,8 +794,16 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     let products_1 = unsafe {
                         &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
                     };
-                    divide_chunk_products(products_0, denominators_0, denominator_inverses);
-                    divide_chunk_products(products_1, denominators_1, denominator_inverses);
+                    // SAFETY: each challenge writes `denominator_count` slots
+                    // in its fixed half of the contiguous 2N allocation.
+                    unsafe { denominators.set_len(2 * denominator_count) };
+                    divide_two_challenge_chunk_products(
+                        products_0,
+                        products_1,
+                        denominators,
+                        denominator_inverses,
+                        has_zero_denominator,
+                    );
                 },
             );
     }
@@ -3077,11 +3132,11 @@ mod l_0_table_cache {
 #[cfg(test)]
 mod flat_chunk_products_tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
-    use plonky2_field::types::{Field, PrimeField64};
+    use plonky2_field::types::{Field, Field64, PrimeField64};
 
     use crate::util::partial_products::quotient_chunk_products_into;
 
-    use super::divide_chunk_products;
+    use super::{divide_chunk_products, divide_two_challenge_chunk_products};
 
     type F = GoldilocksField;
 
@@ -3118,6 +3173,113 @@ mod flat_chunk_products_tests {
             divide_chunk_products(&mut actual, &denominator_products, &mut scratch);
             assert_eq!(actual, expected, "width={width}, chunk_size={chunk_size}");
             assert_eq!(scratch.len(), actual.len());
+        }
+    }
+
+    #[test]
+    fn fused_two_challenge_division_matches_two_independent_batches_raw() {
+        for &len in &[10usize, 50, 1270, 1280] {
+            let numerators_0 = noncanonical_vec(len, 11 + len as u64);
+            let numerators_1 = noncanonical_vec(len, 23 + len as u64);
+            let denominators_0 = noncanonical_vec(len, 37 + len as u64);
+            let denominators_1 = noncanonical_vec(len, 53 + len as u64);
+
+            let mut expected_0 = numerators_0.clone();
+            let mut expected_1 = numerators_1.clone();
+            let mut expected_scratch = vec![F::ZERO; 2 * len + 3];
+            divide_chunk_products(
+                &mut expected_0,
+                &denominators_0,
+                &mut expected_scratch,
+            );
+            divide_chunk_products(
+                &mut expected_1,
+                &denominators_1,
+                &mut expected_scratch,
+            );
+
+            let mut actual_0 = numerators_0;
+            let mut actual_1 = numerators_1;
+            let denominator_products = denominators_0
+                .into_iter()
+                .chain(denominators_1.iter().copied())
+                .collect::<Vec<_>>();
+            let mut actual_scratch = vec![F::ZERO; 2 * len + 3];
+            divide_two_challenge_chunk_products(
+                &mut actual_0,
+                &mut actual_1,
+                &denominator_products,
+                &mut actual_scratch,
+                false,
+            );
+
+            assert_eq!(raw(&actual_0), raw(&expected_0), "challenge 0, len={len}");
+            assert_eq!(raw(&actual_1), raw(&expected_1), "challenge 1, len={len}");
+            assert_eq!(actual_scratch.len(), 2 * len);
+        }
+    }
+
+    #[test]
+    fn fused_two_challenge_zero_fallback_matches_old_partial_mutation() {
+        for zero_challenge in 0..2 {
+            let len = 50;
+            let numerators_0 = noncanonical_vec(len, 71);
+            let numerators_1 = noncanonical_vec(len, 83);
+            let mut denominators_0 = noncanonical_vec(len, 97);
+            let mut denominators_1 = noncanonical_vec(len, 109);
+            let noncanonical_zero = F::from_noncanonical_u64(F::ORDER);
+            if zero_challenge == 0 {
+                denominators_0[len / 2] = noncanonical_zero;
+            } else {
+                denominators_1[len / 2] = noncanonical_zero;
+            }
+
+            let mut expected_0 = numerators_0.clone();
+            let mut expected_1 = numerators_1.clone();
+            let mut expected_scratch = vec![F::ZERO; 2 * len + 3];
+            let old_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                divide_chunk_products(
+                    &mut expected_0,
+                    &denominators_0,
+                    &mut expected_scratch,
+                );
+                divide_chunk_products(
+                    &mut expected_1,
+                    &denominators_1,
+                    &mut expected_scratch,
+                );
+            }));
+
+            let mut actual_0 = numerators_0;
+            let mut actual_1 = numerators_1;
+            let denominator_products = denominators_0
+                .into_iter()
+                .chain(denominators_1.iter().copied())
+                .collect::<Vec<_>>();
+            let has_zero_denominator = denominator_products.iter().any(Field::is_zero);
+            let mut actual_scratch = vec![F::ZERO; 2 * len + 3];
+            let fused_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                divide_two_challenge_chunk_products(
+                    &mut actual_0,
+                    &mut actual_1,
+                    &denominator_products,
+                    &mut actual_scratch,
+                    has_zero_denominator,
+                );
+            }));
+
+            assert!(old_result.is_err(), "old path did not panic, challenge={zero_challenge}");
+            assert!(
+                fused_result.is_err(),
+                "fused path did not panic, challenge={zero_challenge}"
+            );
+            assert_eq!(raw(&actual_0), raw(&expected_0), "challenge 0 products");
+            assert_eq!(raw(&actual_1), raw(&expected_1), "challenge 1 products");
+            assert_eq!(
+                raw(&actual_scratch),
+                raw(&expected_scratch),
+                "inverse scratch, zero challenge={zero_challenge}"
+            );
         }
     }
 
@@ -3470,10 +3632,9 @@ mod permutation_pairing_tests {
         assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
         assert_eq!(data.common.k_is.len(), num_routed_wires);
 
-        // Point counts spanning: a single point, a short first batch, the
-        // inversion batch boundary (INV_BATCH = 128) exactly, one past it, and
-        // several batches with a short tail.
-        for &n_points in &[1usize, 5, 127, 128, 129, 300] {
+        // PolynomialValues requires power-of-two point counts. These span a
+        // single point, short batches, the inversion boundary, and two batches.
+        for &n_points in &[1usize, 4, 64, 128, 256] {
             let mut rng = Rng::new(0x9e37_79b9_7f4a_7c15 ^ ((n_points as u64) << 8));
 
             let subgroup: Vec<F> = (0..n_points).map(|_| rng.next_field()).collect();
