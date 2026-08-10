@@ -1326,9 +1326,6 @@ fn start_gpu_range_check_gate_quotient<
         return None;
     }
     let mut gate_indices = Vec::new();
-    // Random-access gates are excluded from the CPU quotient only after the
-    // combined Metal command has accepted and submitted every metadata record.
-    let mut random_access_gate_indices = Vec::new();
     let mut specs = Vec::new();
     let mut u32_specs = Vec::new();
     for (gate_index, gate) in common_data.gates.iter().enumerate() {
@@ -1374,14 +1371,16 @@ fn start_gpu_range_check_gate_quotient<
             gate_indices.push(gate_index);
         }
         if let Some(u32_gate) = u32_gate {
-            // A six-bit random access evaluates a 64-entry selection fold for
-            // only ten quotient rows. On the five-worker ranked workload that
-            // data-dependent branch extends the process-shared Range/U32 Metal
-            // command disproportionately. Keep exactly this shape on the
-            // existing CPU direct-accumulation evaluator instead: skipping it
-            // here means it is never added to `gate_indices`, so the generic
-            // CPU quotient pass retains its unchanged selector and alpha work.
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. }) {
+            // Random-access gates evaluate a data-dependent selection fold over
+            // the full quotient domain regardless of how many trace rows use the
+            // gate: the kernel's selector filter is a multiply, not a skip, so
+            // every surviving variant costs the whole 2^19-row dispatch. The d16
+            // shapes advertise {bits:3, copies:8} and {bits:4, copies:4}; keep the
+            // entire family on the existing CPU direct-accumulation evaluator
+            // instead. Skipping it here means it is never added to `gate_indices`,
+            // so the generic CPU quotient pass retains its unchanged selector and
+            // alpha work.
+            if matches!(u32_gate, U32QuotientGate::RandomAccess { .. }) {
                 continue;
             }
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
@@ -1581,11 +1580,7 @@ fn start_gpu_range_check_gate_quotient<
                 num_ops,
                 kind,
             });
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { .. }) {
-                random_access_gate_indices.push(gate_index);
-            } else {
-                gate_indices.push(gate_index);
-            }
+            gate_indices.push(gate_index);
         }
         // These vendored gates sit at the top of the surviving wire span in
         // the production circuits and are pure arithmetic, so they are matched
@@ -1728,7 +1723,6 @@ fn start_gpu_range_check_gate_quotient<
         }
         return None;
     };
-    gate_indices.extend(random_access_gate_indices);
     let started = GPU_RANGE_QUOTIENT_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
     log::info!(
         "Metal RangeCheck quotient active: started={started}, gates={gate_indices:?}, \
