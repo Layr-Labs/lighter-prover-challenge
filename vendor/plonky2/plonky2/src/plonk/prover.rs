@@ -11,15 +11,20 @@ use plonky2_maybe_rayon::*;
 use super::circuit_builder::{LookupChallenges, LookupWire};
 use crate::field::extension::Extendable;
 use crate::field::fft::ifft_borrowed;
+use crate::field::ops::Square;
+use crate::field::packable::Packable;
+use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::fri::oracle::{BatchLayout, PolynomialBatch};
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
+use crate::gates::exponentiation::ExponentiationGate;
 use crate::gates::poseidon2::Poseidon2Gate;
-use crate::gates::selectors::LookupSelectors;
+use crate::gates::selectors::{LookupSelectors, UNUSED_SELECTOR};
 use crate::hash::hash_types::RichField;
+use crate::hash::merkle_tree::{ColumnStore, MerkleLeaves};
 use crate::iop::challenger::Challenger;
 use crate::iop::generator::generate_partial_witness;
 use crate::iop::target::Target;
@@ -1188,6 +1193,171 @@ fn gate_census_once<F: RichField + Extendable<D>, const D: usize>(
     }
 }
 
+/// Exact CPU-owned exponentiation shape whose high wire columns can be read
+/// directly from the retained column store. Removing it from the generic gate
+/// pass lets that pass gather only the narrower surviving wire prefix.
+struct ExponentiationColumnPlan<F: Field> {
+    gate_index: usize,
+    selector_index: usize,
+    filter_constants: Vec<F>,
+}
+
+fn exponentiation_column_plan<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    wires_commitment: &PolynomialBatch<F, C, D>,
+    step: usize,
+    col_major_perm: bool,
+    cpu_gate_indices: &[usize],
+) -> Option<ExponentiationColumnPlan<F>> {
+    if !col_major_perm || step != 1 || common_data.config.num_challenges != 2 {
+        return None;
+    }
+    let MerkleLeaves::Columns { columns, .. } = &wires_commitment.merkle_tree.leaves else {
+        return None;
+    };
+    if columns.num_cols() < common_data.config.num_wires {
+        return None;
+    }
+
+    let mut matches = cpu_gate_indices.iter().filter_map(|&gate_index| {
+        common_data.gates[gate_index]
+            .0
+            .as_any()
+            .downcast_ref::<ExponentiationGate<F, D>>()
+            .map(|gate| (gate_index, gate))
+    });
+    let (gate_index, gate) = matches.next()?;
+    if matches.next().is_some()
+        || gate.num_power_bits != 67
+        || common_data.gates[gate_index].0.num_wires() != 136
+        || common_data.gates[gate_index].0.num_constraints() != 68
+    {
+        return None;
+    }
+
+    let selector_index = common_data.selectors_info.selector_indices[gate_index];
+    let filter_constants = common_data.selectors_info.groups[selector_index]
+        .clone()
+        .filter(|&index| index != gate_index)
+        .chain((common_data.selectors_info.num_selectors() > 1).then_some(UNUSED_SELECTOR))
+        .map(F::from_canonical_usize)
+        .collect();
+    Some(ExponentiationColumnPlan {
+        gate_index,
+        selector_index,
+        filter_constants,
+    })
+}
+
+/// Reduces the 68 exponentiation constraints straight into the two alpha
+/// accumulators while reading the column-major commitment in place. The gate
+/// filter is constant across its constraint rows, so applying it once after
+/// Horner reduction is field-identical to multiplying every row first.
+fn eval_exponentiation_column_contribution<F: RichField + Extendable<D>, const D: usize>(
+    common_data: &CommonCircuitData<F, D>,
+    plan: &ExponentiationColumnPlan<F>,
+    columns: &ColumnStore<F>,
+    index_start: usize,
+    batch_size: usize,
+    local_constants: &[F],
+    alphas: &[F],
+    output: &mut Vec<F>,
+) {
+    const NUM_POWER_BITS: usize = 67;
+    const OUTPUT_WIRE: usize = 1 + NUM_POWER_BITS;
+    const INTERMEDIATE_START: usize = 2 + NUM_POWER_BITS;
+
+    debug_assert_eq!(alphas.len(), 2);
+    debug_assert!(batch_size > 0);
+    debug_assert!(columns.num_cols() >= 2 + 2 * NUM_POWER_BITS);
+    debug_assert!(columns.num_rows() >= index_start + batch_size);
+    debug_assert!(
+        local_constants.len()
+            >= common_data.constants_range().len() * batch_size
+    );
+    output.resize(batch_size * 2, F::ZERO);
+
+    type Packing<F> = <F as Packable>::Packing;
+    let width = Packing::<F>::WIDTH;
+    let packed_end = batch_size / width * width;
+    let alpha_0 = Packing::<F>::from(alphas[0]);
+    let alpha_1 = Packing::<F>::from(alphas[1]);
+
+    for offset in (0..packed_end).step_by(width) {
+        let row = index_start + offset;
+        let load_wire = |wire: usize| {
+            *Packing::<F>::from_slice(&columns.col(wire)[row..row + width])
+        };
+        let selector_start = plan.selector_index * batch_size + offset;
+        let selector = *Packing::<F>::from_slice(
+            &local_constants[selector_start..selector_start + width],
+        );
+        let mut factors = plan.filter_constants.iter().copied();
+        let mut filter = factors
+            .next()
+            .map_or(Packing::<F>::ONES, |constant| {
+                Packing::<F>::from(constant) - selector
+            });
+        for constant in factors {
+            filter *= Packing::<F>::from(constant) - selector;
+        }
+
+        let base = load_wire(0);
+        let mut acc_0 = load_wire(OUTPUT_WIRE) - load_wire(INTERMEDIATE_START + NUM_POWER_BITS - 1);
+        let mut acc_1 = acc_0;
+        for i in (0..NUM_POWER_BITS).rev() {
+            let previous = if i == 0 {
+                Packing::<F>::ONES
+            } else {
+                load_wire(INTERMEDIATE_START + i - 1).square()
+            };
+            let bit = load_wire(1 + NUM_POWER_BITS - i - 1);
+            let intermediate = load_wire(INTERMEDIATE_START + i);
+            let constraint = previous * (bit * base + (Packing::<F>::ONES - bit)) - intermediate;
+            acc_0 = constraint.multiply_accumulate(acc_0, alpha_0);
+            acc_1 = constraint.multiply_accumulate(acc_1, alpha_1);
+        }
+        acc_0 *= filter;
+        acc_1 *= filter;
+        for lane in 0..width {
+            output[(offset + lane) * 2] = acc_0.as_slice()[lane];
+            output[(offset + lane) * 2 + 1] = acc_1.as_slice()[lane];
+        }
+    }
+
+    for offset in packed_end..batch_size {
+        let row = index_start + offset;
+        let selector = local_constants[plan.selector_index * batch_size + offset];
+        let mut factors = plan.filter_constants.iter().copied();
+        let mut filter = factors.next().map_or(F::ONE, |constant| constant - selector);
+        for constant in factors {
+            filter *= constant - selector;
+        }
+        let load_wire = |wire: usize| columns.col(wire)[row];
+        let base = load_wire(0);
+        let mut acc_0 = load_wire(OUTPUT_WIRE) - load_wire(INTERMEDIATE_START + NUM_POWER_BITS - 1);
+        let mut acc_1 = acc_0;
+        for i in (0..NUM_POWER_BITS).rev() {
+            let previous = if i == 0 {
+                F::ONE
+            } else {
+                load_wire(INTERMEDIATE_START + i - 1).square()
+            };
+            let bit = load_wire(1 + NUM_POWER_BITS - i - 1);
+            let intermediate = load_wire(INTERMEDIATE_START + i);
+            let constraint = previous * (bit * base + (F::ONE - bit)) - intermediate;
+            acc_0 = constraint.multiply_accumulate(acc_0, alphas[0]);
+            acc_1 = constraint.multiply_accumulate(acc_1, alphas[1]);
+        }
+        output[offset * 2] = acc_0 * filter;
+        output[offset * 2 + 1] = acc_1 * filter;
+    }
+}
+
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn start_gpu_poseidon_gate_quotient<
     F: RichField + Extendable<D>,
@@ -2012,6 +2182,7 @@ fn compute_quotient_polys<
         s_sigmas_flat: Vec<F>,
         zs_local_flat: Vec<F>,
         zs_next_flat: Vec<F>,
+        exponentiation_contribution: Vec<F>,
         vanishing: VanishingScratch<F>,
     }
 
@@ -2023,9 +2194,19 @@ fn compute_quotient_polys<
     // prefix. Do not gather dead high columns for offloaded Poseidon/Range
     // gates into every 32-point CPU scratch batch.
     // survivor-list once per proof v4-17.76
-    let cpu_gate_indices = (0..common_data.gates.len())
+    let mut cpu_gate_indices = (0..common_data.gates.len())
         .filter(|gate_index| !excluded_gate_indices.contains(gate_index))
         .collect::<Vec<_>>();
+    let exponentiation_plan = exponentiation_column_plan(
+        common_data,
+        wires_commitment,
+        step,
+        col_major_perm,
+        &cpu_gate_indices,
+    );
+    if let Some(plan) = &exponentiation_plan {
+        cpu_gate_indices.retain(|&gate_index| gate_index != plan.gate_index);
+    }
     // Detect the exact pair only after GPU ownership is fixed. If either gate
     // has been offloaded, the plan is absent and the remaining CPU gate keeps
     // its ordinary evaluator.
@@ -2097,6 +2278,7 @@ fn compute_quotient_polys<
                 s_sigmas_flat: Vec::new(),
                 zs_local_flat: Vec::new(),
                 zs_next_flat: Vec::new(),
+                exponentiation_contribution: Vec::new(),
                 vanishing: VanishingScratch::default(),
             },
             |scratch, (batch_i, (quotient_values_batch, xs_batch))| {
@@ -2302,6 +2484,26 @@ fn compute_quotient_polys<
                     }
                 };
 
+                if let Some(plan) = &exponentiation_plan {
+                    let MerkleLeaves::Columns { columns, .. } =
+                        &wires_commitment.merkle_tree.leaves
+                    else {
+                        unreachable!("exponentiation column plan requires column-backed wires")
+                    };
+                    eval_exponentiation_column_contribution::<F, D>(
+                        common_data,
+                        plan,
+                        columns,
+                        scratch.indices[0],
+                        n,
+                        &scratch.local_constants,
+                        alphas,
+                        &mut scratch.exponentiation_contribution,
+                    );
+                } else {
+                    scratch.exponentiation_contribution.clear();
+                }
+
                 let vars_batch = EvaluationVarsBaseBatch::new(
                     n,
                     &scratch.local_constants,
@@ -2326,6 +2528,9 @@ fn compute_quotient_polys<
                     &cpu_gate_indices,
                     cpu_num_gate_constraints,
                     interleave_pair.as_ref(),
+                    exponentiation_plan
+                        .as_ref()
+                        .map(|_| scratch.exponentiation_contribution.as_slice()),
                     permutation_products_offloaded,
                     &permutation_gate_scales,
                     &z_h_on_coset,
