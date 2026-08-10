@@ -2338,11 +2338,11 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
+    let gpu_poseidon_values: Option<&[F]> = if let Some((_, job)) = &gpu_poseidon {
+        match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
+                Some(values)
             }
             Err(error) => {
                 GPU_POSEIDON_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2369,26 +2369,17 @@ fn compute_quotient_polys<
                     false,
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        }
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
+    let gpu_range_values: Option<&[F]> = if let Some((_, job)) = &gpu_range {
+        match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
+                Some(values)
             }
             Err(error) => {
                 GPU_RANGE_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2418,24 +2409,15 @@ fn compute_quotient_polys<
                 job.mark_cpu_recompute_completed_for_tests();
                 return result;
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        }
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some(job) = &gpu_permutation {
-        let gpu_values = match job.finish() {
-            Ok(values) => values,
+    let gpu_permutation_values: Option<&[F]> = if let Some(job) = &gpu_permutation {
+        match job.finish() {
+            Ok(values) => Some(values),
             Err(error) => {
                 log::warn!(
                     "Metal permutation quotient failed; recomputing quotient on CPU: {error}"
@@ -2455,16 +2437,60 @@ fn compute_quotient_polys<
                     false,
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
+        }
+    } else {
+        None
+    };
+
+    // Single fused merge pass over whichever GPU jobs finished successfully.
+    // The three `finish()` calls above preserve the original control flow
+    // exactly: a failed job still triggers its existing CPU-recompute
+    // fallback and returns immediately, so a fallback for one job can never
+    // reach a later job's `finish()` (matching the prior early-return
+    // semantics call-for-call), and a job that was never dispatched (`None`,
+    // e.g. no permutation offload without a column-major layout) simply
+    // contributes nothing here because `eval_vanishing_poly_base_batch`
+    // above already accounted for it on the CPU.
+    //
+    // For jobs that did finish, sum their per-point contributions in the base
+    // field before multiplying by the shared `z_h_on_coset` inverse:
+    // Goldilocks addition is exact, so
+    // `(g1[i] + g2[i] + g3[i]) * z_h_inv(i) == g1[i] * z_h_inv(i) +
+    // g2[i] * z_h_inv(i) + g3[i] * z_h_inv(i)`, the value the three separate
+    // passes computed. This also derives `z_h_on_coset.eval_inverse(i)` once
+    // per point instead of once per surviving job, and walks the
+    // `2 * rows`-long `quotient_values` vector once instead of up to three
+    // times.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    if gpu_poseidon_values.is_some() || gpu_range_values.is_some() || gpu_permutation_values.is_some()
+    {
+        if let Some(values) = gpu_poseidon_values {
+            debug_assert_eq!(values.len(), quotient_values.len());
+        }
+        if let Some(values) = gpu_range_values {
+            debug_assert_eq!(values.len(), quotient_values.len());
+        }
+        if let Some(values) = gpu_permutation_values {
+            debug_assert_eq!(values.len(), quotient_values.len());
+        }
         quotient_values
             .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
             .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
+            .for_each(|(i, cpu_values)| {
+                let base = i * num_challenges;
                 let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                for (c, cpu) in cpu_values.iter_mut().enumerate() {
+                    let mut sum = F::ZERO;
+                    if let Some(values) = gpu_poseidon_values {
+                        sum += values[base + c];
+                    }
+                    if let Some(values) = gpu_range_values {
+                        sum += values[base + c];
+                    }
+                    if let Some(values) = gpu_permutation_values {
+                        sum += values[base + c];
+                    }
+                    *cpu += sum * denominator_inv;
                 }
             });
     }
