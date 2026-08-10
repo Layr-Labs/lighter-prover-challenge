@@ -1374,14 +1374,20 @@ fn start_gpu_range_check_gate_quotient<
             gate_indices.push(gate_index);
         }
         if let Some(u32_gate) = u32_gate {
-            // A six-bit random access evaluates a 64-entry selection fold for
-            // only ten quotient rows. On the five-worker ranked workload that
-            // data-dependent branch extends the process-shared Range/U32 Metal
-            // command disproportionately. Keep exactly this shape on the
-            // existing CPU direct-accumulation evaluator instead: skipping it
-            // here means it is never added to `gate_indices`, so the generic
-            // CPU quotient pass retains its unchanged selector and alpha work.
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. }) {
+            // The six-bit random access evaluates a 64-entry selection fold
+            // for only ten quotient rows and the four-bit shape evaluates a
+            // 16-entry fold four times (64 selections per row). Both are
+            // data-dependent branches that extend the process-shared
+            // Range/U32 Metal command disproportionately on the five-worker
+            // ranked workload. Keep exactly these two shapes on the existing
+            // CPU direct-accumulation evaluator: skipping them here means
+            // they are never added to `gate_indices`, so the generic CPU
+            // quotient pass retains its unchanged selector and alpha work.
+            // The three-bit shape (8 entries x 8 ops, 24 selections per row)
+            // stays on Metal: it is the cheapest random-access record and
+            // its CPU fallback was the most likely reason an all-shapes
+            // ablation drew below the bar.
+            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 4 | 6, .. }) {
                 continue;
             }
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
