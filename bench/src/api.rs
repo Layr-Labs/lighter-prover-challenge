@@ -1,4 +1,4 @@
-// Redraw marker 701-claude-fable-r2
+// Metal idleness on tip delayed-dot — marker 615-idle-1786402880
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
