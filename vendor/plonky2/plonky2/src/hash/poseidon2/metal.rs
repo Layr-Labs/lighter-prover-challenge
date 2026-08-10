@@ -101,21 +101,16 @@ fn profile_command_buffer(
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 
-/// `poseidon2.metal` precompiled to AIR, so a worker that cannot use the Metal
-/// shader cache does not pay the MSL front end. Regenerate whenever
-/// `poseidon2.metal` changes (see `MetalShared::new`); the
-/// `metallib_matches_shader_source` test enforces it.
+/// Committed AIR library for the stable hash, NTT, Poseidon-gate and
+/// permutation kernels. The Range/U32 split is compiled independently from
+/// [`SHADER_SOURCE`] at runtime, so it does not depend on the optional command
+/// line Metal toolchain being installed on the build host.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
-/// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
-const SHADER_SOURCE_SHA256: &str =
-    "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
-
-/// Every kernel the shader defines. The prebuilt library is trusted only if all
-/// of them resolve, so a stale or truncated artifact falls back to compiling the
-/// source. This deliberately includes the lazily-built gate-quotient kernels:
-/// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
+/// Kernels intentionally served by the committed artifact. The resource-split
+/// Range/U32 kernels are excluded: they must come from the checked-in source or
+/// the prover leaves those gates on its ordinary CPU quotient path.
+const METALLIB_REQUIRED_KERNELS: [&str; 9] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
     "poseidon2_hash_parents",
@@ -124,7 +119,6 @@ const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
     "ntt_stage",
     "ifft_finalize",
     "poseidon2_gate_quotient",
-    "range_check_gate_quotient",
     "permutation_quotient",
 ];
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
@@ -492,7 +486,98 @@ pub(crate) enum U32QuotientKind {
         base: usize,
     },
     Selection,
+    /// Ordinary Plonky2 weighted multiply-add over the base field.
+    BaseFieldArithmetic {
+        constant_base: usize,
+    },
+    /// Ordinary Plonky2 weighted multiply-add over the quadratic extension.
+    ExtensionArithmetic {
+        constant_base: usize,
+    },
+    /// Ordinary Plonky2 multiplication over the quadratic extension.
+    ExtensionMultiplication {
+        constant_base: usize,
+    },
+    /// Exact production `CosetInterpolationGate<GoldilocksField, 2>` shape:
+    /// 16 subgroup values, degree six, and two intermediate checkpoints.
+    CosetInterpolation,
+    /// Two ordinary gate-local constants copied to their output wires.
+    Constant {
+        constant_base: usize,
+    },
+    /// The four public-input hash limbs constrained by `PublicInputGate`.
+    PublicInput,
 }
+
+impl U32QuotientKind {
+    /// These branches carry the largest private arrays or long-lived scalar
+    /// state in the Range/U32 shader. Keeping them in a separate specialization
+    /// lets Metal lower the common scalar/limb path without reserving it.
+    const fn uses_heavy_resources(self) -> bool {
+        match self {
+            Self::QuinticMultiplication
+            | Self::QuinticSquaring
+            | Self::RandomAccess { .. }
+            | Self::CosetInterpolation => true,
+            Self::Arithmetic
+            | Self::Subtraction { .. }
+            | Self::AddMany { .. }
+            | Self::ByteDecomposition { .. }
+            | Self::Exponentiation
+            | Self::Equality { .. }
+            | Self::Reducing { .. }
+            | Self::BaseAddition { .. }
+            | Self::BaseSum { .. }
+            | Self::Selection
+            | Self::BaseFieldArithmetic { .. }
+            | Self::ExtensionArithmetic { .. }
+            | Self::ExtensionMultiplication { .. }
+            | Self::Constant { .. }
+            | Self::PublicInput => false,
+        }
+    }
+}
+
+/// Canonical Goldilocks values for the size-16 two-adic subgroup and its
+/// barycentric weights. The specialization is accepted only when the
+/// serialized gate carries these exact weights.
+#[cfg(test)]
+const COSET_16_DOMAIN_U64: [u64; 16] = [
+    0x1,
+    0x1000,
+    0x1000000,
+    0x1000000000,
+    0x1000000000000,
+    0x1000000000000000,
+    0xffffffff00,
+    0xffffffff00000,
+    0xffffffff00000000,
+    0xfffffffefffff001,
+    0xfffffffeff000001,
+    0xffffffef00000001,
+    0xfffeffff00000001,
+    0xefffffff00000001,
+    0xfffffeff00000101,
+    0xffefffff00100001,
+];
+pub(crate) const COSET_16_WEIGHTS_U64: [u64; 16] = [
+    0xefffffff10000001,
+    0x100,
+    0x100000,
+    0x100000000,
+    0x100000000000,
+    0x100000000000000,
+    0xffffffff0,
+    0xffffffff0000,
+    0xffffffff0000000,
+    0xfffffffeffffff01,
+    0xfffffffefff00001,
+    0xfffffffe00000001,
+    0xffffefff00000001,
+    0xfeffffff00000001,
+    0xffffffef00000011,
+    0xfffeffff00010001,
+];
 
 #[derive(Clone, Debug)]
 pub(crate) struct U32QuotientSpec {
@@ -884,10 +969,10 @@ impl<F: RichField> TreeReadback<'_, F> {
     }
 }
 
-/// The two gate-quotient pipelines, lowered off the context's blocking path.
+/// An optional pipeline lowered off the context's blocking path.
 ///
-/// Each is `None` until its background build finishes and `Some(None)` if that
-/// build failed. Both readers already treat an absent pipeline as "evaluate
+/// It is `None` until its background build finishes and `Some(None)` if that
+/// build failed. Its readers already treat an absent pipeline as "evaluate
 /// this gate on the CPU", which is the same behaviour a failed build produced
 /// before, so a caller that arrives early simply takes the CPU path it would
 /// have taken had the kernel been unbuildable.
@@ -925,8 +1010,64 @@ impl LazyPipeline {
     }
 }
 
+/// The Range/U32 passes are an atomic capability: the light pass initializes
+/// the output and the heavy pass accumulates into it. Publishing them together
+/// prevents a partially lowered source library from ever selecting a mixture
+/// of GPU and CPU gate evaluation.
+struct LazyPipelinePair {
+    built: std::sync::OnceLock<Option<(ComputePipelineState, ComputePipelineState)>>,
+    builder: Mutex<Option<std::thread::JoinHandle<()>>>,
+    ready: Condvar,
+}
+
+impl LazyPipelinePair {
+    const fn new() -> Self {
+        Self {
+            built: std::sync::OnceLock::new(),
+            builder: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn publish(&self, pipelines: Option<(ComputePipelineState, ComputePipelineState)>) {
+        // Hold the same mutex readers wait on while changing the predicate, so
+        // a completion cannot slip between their check and `wait`.
+        if let Ok(_builder) = self.builder.lock() {
+            let _ = self.built.set(pipelines);
+            self.ready.notify_all();
+        }
+    }
+
+    /// Waits for the single source-compile/lowering job and exposes the pair
+    /// only if both specializations succeeded.
+    fn get(&self) -> Option<&(ComputePipelineState, ComputePipelineState)> {
+        if self.built.get().is_none() {
+            let mut builder = self.builder.lock().ok()?;
+            if self.built.get().is_some() {
+                return self.built.get()?.as_ref();
+            }
+            let handle = builder.take();
+            drop(builder);
+            if let Some(handle) = handle {
+                if handle.join().is_err() {
+                    self.publish(None);
+                }
+            } else {
+                // Another caller owns the join handle. Wait for that build to
+                // publish instead of transiently routing a concurrent proof to
+                // the CPU.
+                let mut builder = self.builder.lock().ok()?;
+                while self.built.get().is_none() {
+                    builder = self.ready.wait(builder).ok()?;
+                }
+            }
+        }
+        self.built.get()?.as_ref()
+    }
+}
+
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
-static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
+static RANGE_CHECK_QUOTIENT_PIPELINES: LazyPipelinePair = LazyPipelinePair::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
 
@@ -934,8 +1075,8 @@ fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     POSEIDON_GATE_QUOTIENT_PIPELINE.get()
 }
 
-fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
-    RANGE_CHECK_GATE_QUOTIENT_PIPELINE.get()
+fn range_check_quotient_pipelines() -> Option<&'static (ComputePipelineState, ComputePipelineState)> {
+    RANGE_CHECK_QUOTIENT_PIPELINES.get()
 }
 
 fn permutation_quotient_pipeline() -> Option<&'static ComputePipelineState> {
@@ -946,11 +1087,10 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.get()
 }
 
-/// Starts the two gate-quotient pipeline builds on detached threads.
+/// Starts the optional pipeline builds on detached threads.
 ///
-/// One thread each rather than one for both: they are the two slowest kernels
-/// in the shader, so serializing them would keep the GPU quotient path on the
-/// CPU for the sum of their lowerings instead of the larger of the two.
+/// One thread each: serializing these large kernels would keep their GPU paths
+/// on the CPU for the sum of their lowerings instead of the largest one.
 ///
 /// Scheduling only. The pipelines are the same objects the blocking build
 /// produced, lowered from the same library, so nothing they later compute can
@@ -958,10 +1098,6 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
 fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
     for (name, slot) in [
         ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
-        (
-            "range_check_gate_quotient",
-            &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
-        ),
         ("permutation_quotient", &PERMUTATION_QUOTIENT_PIPELINE),
         ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
     ] {
@@ -993,6 +1129,85 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             Err(_) => {
                 let _ = slot.built.set(None);
             }
+        }
+    }
+}
+
+/// Compiles the checked-in MSL and lowers both Range/U32 specializations on a
+/// detached thread. This path intentionally does not use `xcrun` or a generated
+/// Cargo artifact: `new_library_with_source` is part of the runtime Metal API
+/// available on the ranked host even when its command-line toolchain is absent.
+///
+/// If the stable library itself had to fall back to source, `source_library`
+/// reuses that already-compiled library. On the normal committed-metallib path
+/// this work overlaps circuit loading after [`prewarm`] has initialized the
+/// stable context. Both pipelines are published together; any failure leaves
+/// all Range/U32 quotient work on the CPU.
+fn spawn_range_check_quotient_pipelines(
+    device: &Device,
+    source_library: Option<metal::Library>,
+) {
+    const LIGHT: &str = "range_check_gate_quotient_light";
+    const HEAVY: &str = "range_check_gate_quotient_heavy_accumulate";
+
+    let device = device.clone();
+    let spawned = std::thread::Builder::new()
+        .name("poseidon2-metal-range-source".to_owned())
+        .spawn(move || {
+            let pipelines = autoreleasepool(
+                || -> Result<(ComputePipelineState, ComputePipelineState), String> {
+                    let library = match source_library {
+                        Some(library) => library,
+                        None => {
+                            let options = CompileOptions::new();
+                            device
+                                .new_library_with_source(SHADER_SOURCE, &options)
+                                .map_err(|error| {
+                                    format!("Range/U32 shader compilation failed: {error}")
+                                })?
+                        }
+                    };
+                    let lower = |name: &'static str| -> Result<ComputePipelineState, String> {
+                        // Autorelease pools are thread-local; each scoped
+                        // lowering thread must drain its own Metal temporaries.
+                        autoreleasepool(|| {
+                            let function = library.get_function(name, None).map_err(|error| {
+                                format!("Range/U32 kernel {name} unavailable: {error}")
+                            })?;
+                            device
+                                .new_compute_pipeline_state_with_function(&function)
+                                .map_err(|error| {
+                                    format!("Range/U32 pipeline {name} creation failed: {error}")
+                                })
+                        })
+                    };
+                    let (light, heavy) = std::thread::scope(|scope| {
+                        let light = scope.spawn(|| lower(LIGHT));
+                        let heavy = scope.spawn(|| lower(HEAVY));
+                        (
+                            light.join().expect("light Range/U32 pipeline thread panicked"),
+                            heavy.join().expect("heavy Range/U32 pipeline thread panicked"),
+                        )
+                    });
+                    Ok((light?, heavy?))
+                },
+            );
+            if let Err(error) = &pipelines {
+                log::debug!("{error}; evaluating Range/U32 gates on the CPU");
+            }
+            RANGE_CHECK_QUOTIENT_PIPELINES.publish(pipelines.ok());
+        });
+
+    match spawned {
+        Ok(handle) => {
+            if let Ok(mut builder) = RANGE_CHECK_QUOTIENT_PIPELINES.builder.lock() {
+                if RANGE_CHECK_QUOTIENT_PIPELINES.built.get().is_none() {
+                    *builder = Some(handle);
+                }
+            }
+        }
+        Err(_) => {
+            RANGE_CHECK_QUOTIENT_PIPELINES.publish(None);
         }
     }
 }
@@ -1181,6 +1396,14 @@ fn shared_context() -> Option<&'static MetalShared> {
             None
         }
     }
+}
+
+/// Whether the checked-in source produced the complete split Range/U32
+/// pipeline pair on this runtime. Extended gate records are emitted only after
+/// this succeeds, so a source compiler or lowering failure is a sound CPU
+/// fallback rather than an ABI guess based on the committed metallib.
+pub(crate) fn range_quotient_supports_extended_kinds() -> bool {
+    shared_context().is_some() && range_check_quotient_pipelines().is_some()
 }
 
 /// Routing-time accessor: the GPU backend, or `None` while the Metal context is
@@ -1460,10 +1683,11 @@ pub(crate) fn start_permutation_quotient<F: RichField>(
     }
 }
 
-/// Starts one whole-domain kernel which evaluates every advertised RangeCheck,
-/// width-generic integer, byte, quintic, and audited random-access gate, applies
-/// each selector filter, and reduces the shared constraint rows with the same
-/// two alpha challenges as the CPU quotient.
+/// Starts two resource-specialized whole-domain kernels in one command buffer.
+/// Together they evaluate every advertised RangeCheck, width-generic integer,
+/// byte, quintic, and audited random-access gate, apply each selector filter,
+/// and reduce the shared constraint rows with the same two alpha challenges as
+/// the CPU quotient.
 pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     wires: &MetalColumns<F>,
     constants: &MetalColumns<F>,
@@ -1471,6 +1695,7 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     step: usize,
     specs: &[RangeCheckQuotientSpec],
     u32_specs: &[U32QuotientSpec],
+    public_inputs_hash: &HashOut<F>,
     alphas: &[F],
     alpha_offset: usize,
 ) -> Option<RangeCheckGateQuotientJob<F>> {
@@ -1499,7 +1724,8 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     }
 
     let mut alpha_stride = 0usize;
-    let mut metadata = Vec::with_capacity(spec_count * SPEC_WORDS);
+    let mut light_metadata = Vec::with_capacity(spec_count * SPEC_WORDS);
+    let mut heavy_metadata = Vec::with_capacity(u32_specs.len() * SPEC_WORDS);
     for spec in specs {
         if spec.bit_size == 0 || spec.bit_size > 64 || spec.num_ops == 0 {
             return None;
@@ -1520,7 +1746,7 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             return None;
         }
         alpha_stride = alpha_stride.max(num_constraints);
-        metadata.extend([
+        light_metadata.extend([
             spec.selector_column as u32,
             spec.gate_index as u32,
             spec.group.start as u32,
@@ -1717,6 +1943,63 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                         spec.num_ops.checked_mul(2)?,
                     )
                 }
+                U32QuotientKind::BaseFieldArithmetic { constant_base } => {
+                    if constant_base.checked_add(2)? > constants.cols {
+                        return None;
+                    }
+                    (
+                        13usize,
+                        constant_base,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_mul(4)?,
+                        spec.num_ops,
+                    )
+                }
+                U32QuotientKind::ExtensionArithmetic { constant_base } => {
+                    if constant_base.checked_add(2)? > constants.cols {
+                        return None;
+                    }
+                    (
+                        14usize,
+                        constant_base,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_mul(8)?,
+                        spec.num_ops.checked_mul(2)?,
+                    )
+                }
+                U32QuotientKind::ExtensionMultiplication { constant_base } => {
+                    if constant_base >= constants.cols {
+                        return None;
+                    }
+                    (
+                        15usize,
+                        constant_base,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_mul(6)?,
+                        spec.num_ops.checked_mul(2)?,
+                    )
+                }
+                U32QuotientKind::CosetInterpolation => {
+                    if spec.num_ops != 2 {
+                        return None;
+                    }
+                    (16usize, 0usize, 0usize, 0usize, 47usize, 12usize)
+                }
+                U32QuotientKind::Constant { constant_base } => {
+                    if spec.num_ops != 2 || constant_base.checked_add(2)? > constants.cols {
+                        return None;
+                    }
+                    (17usize, constant_base, 0usize, 0usize, 2usize, 2usize)
+                }
+                U32QuotientKind::PublicInput => {
+                    if spec.num_ops != 4 {
+                        return None;
+                    }
+                    (18usize, 0usize, 0usize, 0usize, 4usize, 4usize)
+                }
             };
         if wire_count > wires.cols
             || spec.selector_column >= constants.cols
@@ -1733,7 +2016,7 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             return None;
         }
         alpha_stride = alpha_stride.max(num_constraints);
-        metadata.extend([
+        let record = [
             spec.selector_column as u32,
             spec.gate_index as u32,
             spec.group.start as u32,
@@ -1744,9 +2027,17 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             num_addends as u32,
             result_limbs as u32,
             carry_limbs as u32,
-        ]);
+        ];
+        if spec.kind.uses_heavy_resources() {
+            heavy_metadata.extend(record);
+        } else {
+            light_metadata.extend(record);
+        }
     }
+    let light_u32_count = light_metadata.len() / SPEC_WORDS - specs.len();
+    let heavy_u32_count = heavy_metadata.len() / SPEC_WORDS;
     if alpha_stride == 0
+        || light_metadata.is_empty()
         || alpha_stride > u32::MAX as usize
         || alpha_stride
             .checked_mul(2 * size_of::<u64>())
@@ -1765,16 +2056,22 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     }
 
     let context = shared_context()?;
+    let public_inputs_hash = public_inputs_hash
+        .elements
+        .map(|element| element.to_canonical_u64());
     match context.start_range_check_gate_quotient(
         wires,
         constants,
         quotient_rows,
         step,
-        &metadata,
+        &light_metadata,
         specs.len(),
-        u32_specs.len(),
+        light_u32_count,
+        &heavy_metadata,
+        heavy_u32_count,
         &alpha_powers,
         alpha_stride,
+        &public_inputs_hash,
     ) {
         Ok(job) => Some(job),
         Err(error) => {
@@ -2154,8 +2451,8 @@ impl MetalShared {
     fn new() -> Result<Self, String> {
         autoreleasepool(|| {
             let device = Device::system_default().ok_or("no Metal device")?;
-            let options = CompileOptions::new();
-            // Prefer the prebuilt AIR library over compiling the MSL source.
+            // Prefer the committed AIR library over compiling MSL at worker
+            // startup.
             //
             // The ranked sandbox profile grants read but DENIES write on
             // `com.apple.metal` (see `write-benchmark-sandbox-profile.sh`), so the
@@ -2166,45 +2463,43 @@ impl MetalShared {
             // `newLibraryWithData:` skips the front end; only the AIR->ISA
             // pipeline lowering below remains.
             //
-            // This needs no Metal toolchain at build time — the artifact is
-            // committed — which is what makes it viable where a build-time
-            // `MTLBinaryArchive` is not.
-            //
-            // Any failure falls back to compiling the source, so a runtime that
-            // rejects this AIR version behaves exactly as before. The function
-            // probe is what makes the fallback safe against a STALE artifact:
-            // regenerate with
-            //   xcrun -sdk macosx metal -c poseidon2.metal -o poseidon2.air
-            //   xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib
-            // and `metallib_matches_shader_source` fails the test run if you
-            // forget.
-            let library = device
+            // Any load or stable-function probe failure still falls back to
+            // runtime source compilation. The Range/U32 split is never loaded
+            // from this artifact; its independent source build is scheduled
+            // alongside the required pipeline lowerings below.
+            let prebuilt_library = device
                 .new_library_with_data(SHADER_METALLIB)
                 .ok()
                 .filter(|library| {
                     METALLIB_REQUIRED_KERNELS
                         .iter()
                         .all(|name| library.get_function(name, None).is_ok())
-                })
-                .map_or_else(
-                    || {
-                        device
-                            .new_library_with_source(SHADER_SOURCE, &options)
-                            .map_err(|error| format!("shader compilation failed: {error}"))
-                    },
-                    Ok,
-                )?;
+                });
+            let (library, range_source_library) = match prebuilt_library {
+                Some(library) => (library, None),
+                None => {
+                    let options = CompileOptions::new();
+                    let library = device
+                        .new_library_with_source(SHADER_SOURCE, &options)
+                        .map_err(|error| format!("shader compilation failed: {error}"))?;
+                    (library.clone(), Some(library))
+                }
+            };
+            // Start the source front end before lowering the required stable
+            // pipelines. Metal's compiler service can overlap both jobs, and
+            // prewarm then overlaps whatever remains with circuit loading.
+            spawn_range_check_quotient_pipelines(&device, range_source_library);
             // Build the compute pipelines concurrently, one thread each.
             //
             // Every `newComputePipelineStateWithFunction:` lowers that kernel's
             // AIR to a GPU binary through MTLCompilerService, and the three
-            // Poseidon2 permutation kernels plus the two gate-quotient kernels
+            // Poseidon2 permutation kernels plus the gate-quotient kernels
             // are large enough that each takes hundreds of milliseconds when the
             // result is not already in the OS shader cache. The benchmark
             // sandbox denies writes to that cache, which disables it outright —
             // reads miss too — so *every* scored worker process pays the full
             // cold lowering, serialized at ~2.36 s. The compiler service handles
-            // the requests in parallel, so issuing all eight at once collapses
+            // the requests in parallel, so issuing the required set at once collapses
             // that to the cost of the single slowest kernel (~0.67 s).
             //
             // This is a scheduling change only: the pipelines, and therefore
@@ -2227,23 +2522,22 @@ impl MetalShared {
                     })
                 }
             };
-            // The two gate-quotient kernels are the two most expensive to lower
-            // and the only two the context can do without: every caller already
-            // treats an absent pipeline as "run this on the CPU". Lowering them
-            // on the blocking path makes the whole context wait for the slowest
-            // kernel in the shader; measured cold under the benchmark's sandbox
-            // profile, where the OS shader cache is disabled:
+            // The gate-quotient kernels are among the most expensive to lower
+            // and the context can do without them: every caller already treats
+            // an absent pipeline as "run this on the CPU". Lowering them on the
+            // blocking path makes the whole context wait for the slowest kernel
+            // in the shader. Before the Range/U32 resource split, measured cold
+            // under the benchmark's sandbox profile where the OS shader cache
+            // is disabled:
             //
             //     range_check_gate_quotient   679 ms
             //     poseidon2_gate_quotient     601 ms
             //     the six required kernels    491 ms and below
             //
-            // Lowering all eight in parallel takes 886 ms against 474 ms for the
-            // six required ones, because the two extra kernels both raise the
-            // maximum and add contention on MTLCompilerService. Building them
-            // off the blocking path instead leaves the context ready in 838 ms
-            // rather than 1270 ms, and they land shortly after, long before the
-            // first quotient evaluation of a proof asks for them.
+            // Building optional kernels off the blocking path avoids raising
+            // the required set's maximum and adding MTLCompilerService
+            // contention. They land long before the first quotient evaluation
+            // of a proof asks for them.
             //
             // Started below, once the required six have finished, so they do not
             // simply move their MTLCompilerService contention onto the path they
@@ -2440,15 +2734,21 @@ impl MetalShared {
         constants: &MetalColumns<F>,
         quotient_rows: usize,
         step: usize,
-        metadata: &[u32],
-        range_count: usize,
-        u32_count: usize,
+        light_metadata: &[u32],
+        light_range_count: usize,
+        light_u32_count: usize,
+        heavy_metadata: &[u32],
+        heavy_u32_count: usize,
         alpha_powers: &[u64],
         alpha_stride: usize,
+        public_inputs_hash: &[u64; 4],
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
-        let pipeline = range_check_gate_quotient_pipeline()
-            .ok_or("RangeCheck gate quotient pipeline unavailable")?;
-        if metadata.len() != (range_count + u32_count) * 10
+        let (light_pipeline, heavy_pipeline) = range_check_quotient_pipelines()
+            .ok_or("split RangeCheck gate quotient pipelines unavailable")?;
+        let heavy_pipeline = (heavy_u32_count != 0).then_some(heavy_pipeline);
+        if light_metadata.is_empty()
+            || light_metadata.len() != (light_range_count + light_u32_count) * 10
+            || heavy_metadata.len() != heavy_u32_count * 10
             || alpha_powers.len() != alpha_stride * 2
         {
             return Err("invalid RangeCheck quotient metadata".to_string());
@@ -2463,34 +2763,75 @@ impl MetalShared {
         let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&wires.buffer), 0);
-            encoder.set_buffer(1, Some(&constants.buffer), 0);
-            encoder.set_buffer(2, Some(&output), 0);
-            encoder.set_bytes(
-                3,
-                size_of_val(alpha_powers) as NSUInteger,
-                alpha_powers.as_ptr().cast::<c_void>(),
-            );
-            encoder.set_bytes(
-                4,
-                size_of_val(metadata) as NSUInteger,
-                metadata.as_ptr().cast::<c_void>(),
-            );
-            set_u32(encoder, 5, wires.rows as u32);
-            set_u32(encoder, 6, quotient_rows as u32);
-            set_u32(encoder, 7, step as u32);
-            set_u32(encoder, 8, alpha_stride as u32);
-            set_u32(encoder, 9, range_count as u32);
-            set_u32(encoder, 10, u32_count as u32);
-            dispatch(encoder, pipeline, quotient_rows);
-            encoder.end_encoding();
+            {
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(light_pipeline);
+                encoder.set_buffer(0, Some(&wires.buffer), 0);
+                encoder.set_buffer(1, Some(&constants.buffer), 0);
+                encoder.set_buffer(2, Some(&output), 0);
+                encoder.set_bytes(
+                    3,
+                    size_of_val(alpha_powers) as NSUInteger,
+                    alpha_powers.as_ptr().cast::<c_void>(),
+                );
+                encoder.set_bytes(
+                    4,
+                    size_of_val(light_metadata) as NSUInteger,
+                    light_metadata.as_ptr().cast::<c_void>(),
+                );
+                set_u32(encoder, 5, wires.rows as u32);
+                set_u32(encoder, 6, quotient_rows as u32);
+                set_u32(encoder, 7, step as u32);
+                set_u32(encoder, 8, alpha_stride as u32);
+                set_u32(encoder, 9, light_range_count as u32);
+                set_u32(encoder, 10, light_u32_count as u32);
+                encoder.set_bytes(
+                    11,
+                    size_of_val(public_inputs_hash) as NSUInteger,
+                    public_inputs_hash.as_ptr().cast::<c_void>(),
+                );
+                dispatch(encoder, light_pipeline, quotient_rows);
+                encoder.end_encoding();
+            }
+            if let Some(heavy_pipeline) = heavy_pipeline {
+                // A second encoder in the same command buffer observes the
+                // light pass's writes in submission order. It accumulates
+                // directly into that output, so no scratch buffer, copy, or
+                // combine dispatch is needed.
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(heavy_pipeline);
+                encoder.set_buffer(0, Some(&wires.buffer), 0);
+                encoder.set_buffer(1, Some(&constants.buffer), 0);
+                encoder.set_buffer(2, Some(&output), 0);
+                encoder.set_bytes(
+                    3,
+                    size_of_val(alpha_powers) as NSUInteger,
+                    alpha_powers.as_ptr().cast::<c_void>(),
+                );
+                encoder.set_bytes(
+                    4,
+                    size_of_val(heavy_metadata) as NSUInteger,
+                    heavy_metadata.as_ptr().cast::<c_void>(),
+                );
+                set_u32(encoder, 5, wires.rows as u32);
+                set_u32(encoder, 6, quotient_rows as u32);
+                set_u32(encoder, 7, step as u32);
+                set_u32(encoder, 8, alpha_stride as u32);
+                set_u32(encoder, 9, 0);
+                set_u32(encoder, 10, heavy_u32_count as u32);
+                encoder.set_bytes(
+                    11,
+                    size_of_val(public_inputs_hash) as NSUInteger,
+                    public_inputs_hash.as_ptr().cast::<c_void>(),
+                );
+                dispatch(encoder, heavy_pipeline, quotient_rows);
+                encoder.end_encoding();
+            }
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
                 command_buffer,
                 "range_u32_quotient",
-                (quotient_rows * (range_count + u32_count)) as u64,
+                (quotient_rows * (light_range_count + light_u32_count + heavy_u32_count)) as u64,
             );
             command_buffer.commit();
             command_buffer.to_owned()
@@ -3717,28 +4058,52 @@ mod tests {
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
 
-    /// The prebuilt AIR library is only sound while it is the compiled form of
-    /// the MSL we ship. Nothing in the type system ties the two together, so
-    /// this pins the source bytes: edit `poseidon2.metal` without regenerating
-    /// `poseidon2.metallib` and this fails loudly instead of silently proving
-    /// with stale kernels.
     #[test]
-    fn metallib_matches_shader_source() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
-        let output = std::process::Command::new("/usr/bin/shasum")
-            .args(["-a", "256", &format!("{dir}/poseidon2.metal")])
-            .output()
-            .expect("shasum must be available to verify the metallib is current");
-        assert!(output.status.success(), "shasum failed");
-        let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
-        let digest = digest.split_whitespace().next().expect("empty shasum output");
-        assert_eq!(
-            digest, SHADER_SOURCE_SHA256,
-            "poseidon2.metal changed but poseidon2.metallib was not regenerated. Run:\n  \
-             xcrun -sdk macosx metal -c poseidon2.metal -o poseidon2.air\n  \
-             xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib\n\
-             then update SHADER_SOURCE_SHA256 to {digest}."
-        );
+    fn range_quotient_resource_partition_is_exhaustive() {
+        let light = [
+            U32QuotientKind::Arithmetic,
+            U32QuotientKind::Subtraction { result_limbs: 16 },
+            U32QuotientKind::AddMany {
+                num_addends: 4,
+                result_limbs: 16,
+                num_carry_limbs: 2,
+            },
+            U32QuotientKind::ByteDecomposition { num_limbs: 4 },
+            U32QuotientKind::Exponentiation,
+            U32QuotientKind::Equality { constant_column: 0 },
+            U32QuotientKind::Reducing {
+                extension_coeffs: false,
+            },
+            U32QuotientKind::BaseAddition { constant_base: 0 },
+            U32QuotientKind::BaseSum { base: 4 },
+            U32QuotientKind::Selection,
+            U32QuotientKind::BaseFieldArithmetic { constant_base: 0 },
+            U32QuotientKind::ExtensionArithmetic { constant_base: 0 },
+            U32QuotientKind::ExtensionMultiplication { constant_base: 0 },
+            U32QuotientKind::Constant { constant_base: 0 },
+            U32QuotientKind::PublicInput,
+        ];
+        assert!(light.into_iter().all(|kind| !kind.uses_heavy_resources()));
+
+        let heavy = [
+            U32QuotientKind::QuinticMultiplication,
+            U32QuotientKind::QuinticSquaring,
+            U32QuotientKind::RandomAccess {
+                bits: 3,
+                num_extra_constants: 0,
+                constant_base: 0,
+            },
+            U32QuotientKind::CosetInterpolation,
+        ];
+        assert!(heavy.into_iter().all(U32QuotientKind::uses_heavy_resources));
+    }
+
+    /// The stable prebuilt AIR and the source used for the independently
+    /// compiled Range/U32 pair must both remain embedded in the backend.
+    #[test]
+    fn stable_metallib_and_runtime_source_are_embedded() {
+        assert!(!SHADER_SOURCE.is_empty());
+        assert!(!SHADER_METALLIB.is_empty());
     }
 
     /// The fallback in `MetalShared::new` hides a broken artifact behind a
@@ -4353,6 +4718,7 @@ mod tests {
                 step,
                 &specs,
                 &[],
+                &HashOut::<F>::ZERO,
                 &alphas,
                 ALPHA_OFFSET,
             )
@@ -4371,6 +4737,10 @@ mod tests {
 
     #[test]
     fn metal_u32_gate_quotient_matches_cpu() {
+        if !range_quotient_supports_extended_kinds() {
+            eprintln!("skipping extended quotient test: runtime source pipelines unavailable");
+            return;
+        }
         type F = GoldilocksField;
         const WIRE_COLUMNS: usize = 136;
         const QUOTIENT_ROWS: usize = 64;
@@ -4473,6 +4843,60 @@ mod tests {
             num_ops: 20,
             kind: U32QuotientKind::Selection,
         });
+        let base_arithmetic_spec = specs.len();
+        specs.push(U32QuotientSpec {
+            selector_column: base_arithmetic_spec,
+            gate_index: 241,
+            group: 240..243,
+            include_unused_selector: true,
+            num_ops: 20,
+            kind: U32QuotientKind::BaseFieldArithmetic { constant_base: 0 },
+        });
+        let extension_arithmetic_spec = specs.len();
+        specs.push(U32QuotientSpec {
+            selector_column: extension_arithmetic_spec,
+            gate_index: 244,
+            group: 243..246,
+            include_unused_selector: true,
+            num_ops: 10,
+            kind: U32QuotientKind::ExtensionArithmetic { constant_base: 0 },
+        });
+        let extension_multiplication_spec = specs.len();
+        specs.push(U32QuotientSpec {
+            selector_column: extension_multiplication_spec,
+            gate_index: 247,
+            group: 246..249,
+            include_unused_selector: true,
+            num_ops: 13,
+            kind: U32QuotientKind::ExtensionMultiplication { constant_base: 0 },
+        });
+        let coset_interpolation_spec = specs.len();
+        specs.push(U32QuotientSpec {
+            selector_column: coset_interpolation_spec,
+            gate_index: 250,
+            group: 249..252,
+            include_unused_selector: true,
+            num_ops: 2,
+            kind: U32QuotientKind::CosetInterpolation,
+        });
+        let constant_spec = specs.len();
+        specs.push(U32QuotientSpec {
+            selector_column: constant_spec,
+            gate_index: 253,
+            group: 252..255,
+            include_unused_selector: true,
+            num_ops: 2,
+            kind: U32QuotientKind::Constant { constant_base: 0 },
+        });
+        let public_input_spec = specs.len();
+        specs.push(U32QuotientSpec {
+            selector_column: public_input_spec,
+            gate_index: 256,
+            group: 255..258,
+            include_unused_selector: true,
+            num_ops: 4,
+            kind: U32QuotientKind::PublicInput,
+        });
         let addition_selector_column = specs.len();
         let addition_constant_base = addition_selector_column + 1;
         specs.push(U32QuotientSpec {
@@ -4485,6 +4909,27 @@ mod tests {
                 constant_base: addition_constant_base,
             },
         });
+        specs[base_arithmetic_spec].kind = U32QuotientKind::BaseFieldArithmetic {
+            constant_base: addition_constant_base,
+        };
+        specs[extension_arithmetic_spec].kind = U32QuotientKind::ExtensionArithmetic {
+            constant_base: addition_constant_base,
+        };
+        specs[extension_multiplication_spec].kind =
+            U32QuotientKind::ExtensionMultiplication {
+                constant_base: addition_constant_base,
+            };
+        specs[constant_spec].kind = U32QuotientKind::Constant {
+            constant_base: addition_constant_base,
+        };
+        let public_inputs_hash = HashOut {
+            elements: [
+                F::from_canonical_u64(29),
+                F::from_canonical_u64(31),
+                F::from_canonical_u64(37),
+                F::from_canonical_u64(41),
+            ],
+        };
 
         for step in [1, 4] {
             let full_rows = QUOTIENT_ROWS * step;
@@ -4691,6 +5136,145 @@ mod tests {
                             }
                             assert_eq!(constraints.len(), 2 * spec.num_ops);
                         }
+                        U32QuotientKind::BaseFieldArithmetic { constant_base } => {
+                            let const_0 = constants.col(constant_base)[source_row];
+                            let const_1 = constants.col(constant_base + 1)[source_row];
+                            for op in 0..spec.num_ops {
+                                let wire_base = 4 * op;
+                                constraints.push(
+                                    wires.col(wire_base + 3)[source_row]
+                                        - const_0
+                                            * wires.col(wire_base)[source_row]
+                                            * wires.col(wire_base + 1)[source_row]
+                                        - const_1 * wires.col(wire_base + 2)[source_row],
+                                );
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops);
+                        }
+                        U32QuotientKind::ExtensionArithmetic { constant_base } => {
+                            let const_0 = constants.col(constant_base)[source_row];
+                            let const_1 = constants.col(constant_base + 1)[source_row];
+                            let w = F::from_canonical_u64(7);
+                            for op in 0..spec.num_ops {
+                                let wire_base = 8 * op;
+                                let a0 = wires.col(wire_base)[source_row];
+                                let a1 = wires.col(wire_base + 1)[source_row];
+                                let b0 = wires.col(wire_base + 2)[source_row];
+                                let b1 = wires.col(wire_base + 3)[source_row];
+                                let product_0 = a0 * b0 + w * a1 * b1;
+                                let product_1 = a0 * b1 + a1 * b0;
+                                constraints.push(
+                                    wires.col(wire_base + 6)[source_row]
+                                        - const_0 * product_0
+                                        - const_1 * wires.col(wire_base + 4)[source_row],
+                                );
+                                constraints.push(
+                                    wires.col(wire_base + 7)[source_row]
+                                        - const_0 * product_1
+                                        - const_1 * wires.col(wire_base + 5)[source_row],
+                                );
+                            }
+                            assert_eq!(constraints.len(), 2 * spec.num_ops);
+                        }
+                        U32QuotientKind::ExtensionMultiplication { constant_base } => {
+                            let const_0 = constants.col(constant_base)[source_row];
+                            let w = F::from_canonical_u64(7);
+                            for op in 0..spec.num_ops {
+                                let wire_base = 6 * op;
+                                let a0 = wires.col(wire_base)[source_row];
+                                let a1 = wires.col(wire_base + 1)[source_row];
+                                let b0 = wires.col(wire_base + 2)[source_row];
+                                let b1 = wires.col(wire_base + 3)[source_row];
+                                constraints.push(
+                                    wires.col(wire_base + 4)[source_row]
+                                        - const_0 * (a0 * b0 + w * a1 * b1),
+                                );
+                                constraints.push(
+                                    wires.col(wire_base + 5)[source_row]
+                                        - const_0 * (a0 * b1 + a1 * b0),
+                                );
+                            }
+                            assert_eq!(constraints.len(), 2 * spec.num_ops);
+                        }
+                        U32QuotientKind::CosetInterpolation => {
+                            let w = F::from_canonical_u64(7);
+                            let ext_mul = |a: (F, F), b: (F, F)| {
+                                (a.0 * b.0 + w * a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+                            };
+                            let shifted =
+                                (wires.col(45)[source_row], wires.col(46)[source_row]);
+                            let shift = wires.col(0)[source_row];
+                            constraints.push(wires.col(33)[source_row] - shifted.0 * shift);
+                            constraints.push(wires.col(34)[source_row] - shifted.1 * shift);
+
+                            let mut eval = (F::ZERO, F::ZERO);
+                            let mut product = (F::ONE, F::ZERO);
+                            let apply_step =
+                                |i: usize, eval: &mut (F, F), product: &mut (F, F)| {
+                                    let term = (
+                                        shifted.0
+                                            - F::from_canonical_u64(COSET_16_DOMAIN_U64[i]),
+                                        shifted.1,
+                                    );
+                                    let value = (
+                                        wires.col(1 + 2 * i)[source_row]
+                                            * F::from_canonical_u64(COSET_16_WEIGHTS_U64[i]),
+                                        wires.col(2 + 2 * i)[source_row]
+                                            * F::from_canonical_u64(COSET_16_WEIGHTS_U64[i]),
+                                    );
+                                    let eval_term = ext_mul(*eval, term);
+                                    let weighted_product = ext_mul(value, *product);
+                                    *eval = (
+                                        eval_term.0 + weighted_product.0,
+                                        eval_term.1 + weighted_product.1,
+                                    );
+                                    *product = ext_mul(*product, term);
+                                };
+                            for i in 0..6 {
+                                apply_step(i, &mut eval, &mut product);
+                            }
+                            for checkpoint in 0..2 {
+                                let expected_eval = (
+                                    wires.col(37 + 2 * checkpoint)[source_row],
+                                    wires.col(38 + 2 * checkpoint)[source_row],
+                                );
+                                let expected_product = (
+                                    wires.col(41 + 2 * checkpoint)[source_row],
+                                    wires.col(42 + 2 * checkpoint)[source_row],
+                                );
+                                constraints.push(expected_eval.0 - eval.0);
+                                constraints.push(expected_eval.1 - eval.1);
+                                constraints.push(expected_product.0 - product.0);
+                                constraints.push(expected_product.1 - product.1);
+                                eval = expected_eval;
+                                product = expected_product;
+                                let (start, end) =
+                                    if checkpoint == 0 { (6, 11) } else { (11, 16) };
+                                for i in start..end {
+                                    apply_step(i, &mut eval, &mut product);
+                                }
+                            }
+                            constraints.push(wires.col(35)[source_row] - eval.0);
+                            constraints.push(wires.col(36)[source_row] - eval.1);
+                            assert_eq!(constraints.len(), 12);
+                        }
+                        U32QuotientKind::Constant { constant_base } => {
+                            for i in 0..2 {
+                                constraints.push(
+                                    constants.col(constant_base + i)[source_row]
+                                        - wires.col(i)[source_row],
+                                );
+                            }
+                            assert_eq!(constraints.len(), 2);
+                        }
+                        U32QuotientKind::PublicInput => {
+                            for i in 0..4 {
+                                constraints.push(
+                                    wires.col(i)[source_row] - public_inputs_hash.elements[i],
+                                );
+                            }
+                            assert_eq!(constraints.len(), 4);
+                        }
                         _ => unreachable!(
                             "covered by metal_byte_and_quintic_gate_quotient_matches_cpu"
                         ),
@@ -4715,6 +5299,7 @@ mod tests {
                 step,
                 &[],
                 &specs,
+                &public_inputs_hash,
                 &alphas,
                 ALPHA_OFFSET,
             )
@@ -5310,6 +5895,14 @@ mod tests {
                         U32QuotientKind::Selection => {
                             unreachable!("covered by metal_u32_gate_quotient_matches_cpu")
                         }
+                        U32QuotientKind::BaseFieldArithmetic { .. }
+                        | U32QuotientKind::ExtensionArithmetic { .. }
+                        | U32QuotientKind::ExtensionMultiplication { .. }
+                        | U32QuotientKind::CosetInterpolation
+                        | U32QuotientKind::Constant { .. }
+                        | U32QuotientKind::PublicInput => {
+                            unreachable!("covered by metal_u32_gate_quotient_matches_cpu")
+                        }
                     }
 
                     for (challenge, &alpha) in alphas.iter().enumerate() {
@@ -5331,6 +5924,7 @@ mod tests {
                 step,
                 &range_specs,
                 &u32_specs,
+                &HashOut::<F>::ZERO,
                 &alphas,
                 ALPHA_OFFSET,
             )

@@ -466,47 +466,48 @@ fn fft_classic_simd<P: PackedField>(
     }
 }
 
-/// Goldilocks `x + y` on two lanes, reproducing `impl Add for GoldilocksField`
-/// word for word:
-///     (sum, over)  = x.overflowing_add(y)
-///     (sum, over2) = sum.overflowing_add(over as u64 * EPSILON)
-///     if over2 { sum += EPSILON }
-/// The scalar form branch-hints that second correction as rare; here it is an
-/// unconditional masked add, so the vector form *removes* a branch. Because
-/// `Add` is pure arithmetic -- no assembly, no lookup -- the result is a pure
-/// function of the inputs and these words are identical, not merely congruent.
+/// Goldilocks butterfly on two lanes.
+///
+/// A general non-canonical add/sub needs a second carry/borrow correction.
+/// Both outputs share the same right-hand side, so canonicalise it once and
+/// use the cheaper canonical-RHS operations for both arms. For
+/// `P = 2^64 - EPSILON`, adding `EPSILON` to a representative `>= P` is the
+/// wrapped subtraction of `P`. Once `t < P`, the carry correction in `u + t`
+/// cannot overflow again and the borrow correction in `u - t` cannot
+/// underflow again. This is the same invariant used by GoldilocksField's
+/// `add_canonical_u64` / `sub_canonical_u64` and the AVX2 packed backend.
+///
+/// The returned representatives may differ from the scalar operator's raw
+/// words, but are exactly equal as field elements. All downstream arithmetic
+/// and transcript hashing accepts non-canonical representatives. The standard
+/// proof writer canonicalises them; bincode may preserve a raw representative,
+/// which the verifier deserialises as the same field element.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn gl_add_neon(
-    x: core::arch::aarch64::uint64x2_t,
-    y: core::arch::aarch64::uint64x2_t,
+unsafe fn gl_butterfly_neon(
+    u: core::arch::aarch64::uint64x2_t,
+    t: core::arch::aarch64::uint64x2_t,
+    order: core::arch::aarch64::uint64x2_t,
     eps: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
     use core::arch::aarch64::*;
-    let sum = vaddq_u64(x, y);
-    // Unsigned carry: the wrapped sum is below the addend exactly on overflow.
-    let over = vcltq_u64(sum, x);
-    let sum2 = vaddq_u64(sum, vandq_u64(over, eps));
-    let over2 = vcltq_u64(sum2, sum);
-    vaddq_u64(sum2, vandq_u64(over2, eps))
-}
 
-/// Goldilocks `x - y` on two lanes, reproducing `impl Sub for GoldilocksField`.
-/// Borrow is `x < y`.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn gl_sub_neon(
-    x: core::arch::aarch64::uint64x2_t,
-    y: core::arch::aarch64::uint64x2_t,
-    eps: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    use core::arch::aarch64::*;
-    let diff = vsubq_u64(x, y);
-    let under = vcltq_u64(x, y);
-    let adj = vandq_u64(under, eps);
-    let diff2 = vsubq_u64(diff, adj);
-    let under2 = vcltq_u64(diff, adj);
-    vsubq_u64(diff2, vandq_u64(under2, eps))
+    // Canonicalise t with one conditional subtraction of P. Every u64 is at
+    // most one P above its canonical Goldilocks representative.
+    let noncanonical = vcgeq_u64(t, order);
+    let t = vaddq_u64(t, vandq_u64(noncanonical, eps));
+
+    let sum_wrapped = vaddq_u64(u, t);
+    let carry = vcltq_u64(sum_wrapped, u);
+    let sum = vaddq_u64(sum_wrapped, vandq_u64(carry, eps));
+
+    let diff_wrapped = vsubq_u64(u, t);
+    let borrow = vcltq_u64(u, t);
+    let diff = vsubq_u64(diff_wrapped, vandq_u64(borrow, eps));
+    (sum, diff)
 }
 
 /// One butterfly layer over base-field scalars, with the modular reduction in
@@ -529,15 +530,51 @@ fn fft_classic_simd_single_layer_neon(
     use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
 
     const EPSILON: u64 = (1 << 32) - 1;
+    const ORDER: u64 = 0xFFFF_FFFF_0000_0001;
     let half = 1usize << lg_half_m;
     let m = half << 1;
     debug_assert!(omega_row.len() >= half);
     let base = values.as_mut_ptr().cast::<u64>();
     unsafe {
         let eps = vdupq_n_u64(EPSILON);
+        let order = vdupq_n_u64(ORDER);
         let mut k = 0;
         while k + m <= values.len() {
             let mut j = 0;
+            // Four elements per iteration: two independent paired multiplies
+            // issue back-to-back, then two independent NEON butterflies hide
+            // their reduction latency and halve loop/index overhead.
+            while j + 4 <= half {
+                let v01 = NeonGoldilocksField([
+                    *values.get_unchecked(k + half + j),
+                    *values.get_unchecked(k + half + j + 1),
+                ]);
+                let v23 = NeonGoldilocksField([
+                    *values.get_unchecked(k + half + j + 2),
+                    *values.get_unchecked(k + half + j + 3),
+                ]);
+                let w01 = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j),
+                    *omega_row.get_unchecked(j + 1),
+                ]);
+                let w23 = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j + 2),
+                    *omega_row.get_unchecked(j + 3),
+                ]);
+                let t01 = w01 * v01;
+                let t23 = w23 * v23;
+                let tv01 = vcombine_u64(vcreate_u64(t01.0[0].0), vcreate_u64(t01.0[1].0));
+                let tv23 = vcombine_u64(vcreate_u64(t23.0[0].0), vcreate_u64(t23.0[1].0));
+                let u01 = vld1q_u64(base.add(k + j));
+                let u23 = vld1q_u64(base.add(k + j + 2));
+                let (sum01, diff01) = gl_butterfly_neon(u01, tv01, order, eps);
+                let (sum23, diff23) = gl_butterfly_neon(u23, tv23, order, eps);
+                vst1q_u64(base.add(k + j), sum01);
+                vst1q_u64(base.add(k + half + j), diff01);
+                vst1q_u64(base.add(k + j + 2), sum23);
+                vst1q_u64(base.add(k + half + j + 2), diff23);
+                j += 4;
+            }
             while j + 2 <= half {
                 let v = NeonGoldilocksField([
                     *values.get_unchecked(k + half + j),
@@ -551,8 +588,9 @@ fn fft_classic_simd_single_layer_neon(
                 // The only register-file crossing in the loop: two fmovs.
                 let tv = vcombine_u64(vcreate_u64(t.0[0].0), vcreate_u64(t.0[1].0));
                 let u = vld1q_u64(base.add(k + j));
-                vst1q_u64(base.add(k + j), gl_add_neon(u, tv, eps));
-                vst1q_u64(base.add(k + half + j), gl_sub_neon(u, tv, eps));
+                let (sum, diff) = gl_butterfly_neon(u, tv, order, eps);
+                vst1q_u64(base.add(k + j), sum);
+                vst1q_u64(base.add(k + half + j), diff);
                 j += 2;
             }
             // `half` is a power of two and at least 2 whenever this path is
@@ -578,10 +616,10 @@ fn fft_classic_simd_single_layer_neon(
 /// `lg_half_m + 1` then pairs (A[j], C[j]) with `w2_row[j]` and (B[j], D[j])
 /// with `w2_row[q + j]`. Those are exactly the butterflies, twiddles and
 /// per-element order of running `fft_classic_simd_single_layer_neon` for the
-/// two layers back to back, through the same primitives — paired
-/// `NeonGoldilocksField` multiplies, `gl_add_neon`/`gl_sub_neon` (each
-/// documented word-for-word identical to scalar `Add`/`Sub`) and the scalar
-/// operators themselves — so every raw `GoldilocksField.0` word is identical.
+/// two layers back to back, through the same paired
+/// `NeonGoldilocksField` multiplies and field-equivalent butterfly reductions.
+/// The butterfly canonicalises each shared product once, so raw representatives
+/// can differ from scalar `Add`/`Sub` while the field elements remain equal.
 /// Each element is loaded and stored once per layer PAIR instead of once per
 /// layer, halving whole-array passes for the fused layers.
 ///
@@ -610,12 +648,14 @@ fn fft_classic_simd_two_layers_neon(
     use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
 
     const EPSILON: u64 = (1 << 32) - 1;
+    const ORDER: u64 = 0xFFFF_FFFF_0000_0001;
     debug_assert!(lg_half_m >= 1);
     let q = 1usize << lg_half_m;
     let w1_row = &w1_row[..q];
     let (w2_lo, w2_hi) = w2_row[..2 * q].split_at(q);
 
     let eps = unsafe { vdupq_n_u64(EPSILON) };
+    let order = unsafe { vdupq_n_u64(ORDER) };
     for block in values.chunks_exact_mut(4 * q) {
         let (ab, cd) = block.split_at_mut(2 * q);
         let (quarter_a, quarter_b) = ab.split_at_mut(q);
@@ -648,14 +688,15 @@ fn fft_classic_simd_two_layers_neon(
             unsafe {
                 let av = vld1q_u64(a2.as_ptr().cast::<u64>());
                 let t1v = vcombine_u64(vcreate_u64(t1.0[0].0), vcreate_u64(t1.0[1].0));
-                let ab0 = gl_add_neon(av, t1v, eps);
-                let ab1 = gl_sub_neon(av, t1v, eps);
+                let (ab0, ab1) = gl_butterfly_neon(av, t1v, order, eps);
                 let t3v = vcombine_u64(vcreate_u64(t3.0[0].0), vcreate_u64(t3.0[1].0));
                 let t4v = vcombine_u64(vcreate_u64(t4.0[0].0), vcreate_u64(t4.0[1].0));
-                vst1q_u64(a2.as_mut_ptr().cast::<u64>(), gl_add_neon(ab0, t3v, eps));
-                vst1q_u64(c2.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab0, t3v, eps));
-                vst1q_u64(b2.as_mut_ptr().cast::<u64>(), gl_add_neon(ab1, t4v, eps));
-                vst1q_u64(d2.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab1, t4v, eps));
+                let (a_out, c_out) = gl_butterfly_neon(ab0, t3v, order, eps);
+                let (b_out, d_out) = gl_butterfly_neon(ab1, t4v, order, eps);
+                vst1q_u64(a2.as_mut_ptr().cast::<u64>(), a_out);
+                vst1q_u64(c2.as_mut_ptr().cast::<u64>(), c_out);
+                vst1q_u64(b2.as_mut_ptr().cast::<u64>(), b_out);
+                vst1q_u64(d2.as_mut_ptr().cast::<u64>(), d_out);
             }
         }
     }
@@ -671,9 +712,8 @@ fn fft_classic_simd_two_layers_neon(
 /// instead of four. A single row-level scan picks that fast path (one paired
 /// `NeonGoldilocksField` mul hides the scalar latency); otherwise the general
 /// four-product form runs. The butterfly `u + t` / `u - t` reductions always
-/// run as two-lane vector adds/subs reproducing `impl Add/Sub for
-/// GoldilocksField` word for word. Same blocks, same pairing, same twiddles,
-/// same order as the generic body.
+/// run as two-lane vector operations, canonicalising the shared product once.
+/// Same field values, blocks, pairing, twiddles and order as the generic body.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn fft_classic_simd_single_layer_neon_ext(
@@ -691,6 +731,7 @@ fn fft_classic_simd_single_layer_neon_ext(
     use crate::goldilocks_field::GoldilocksField;
 
     const EPSILON: u64 = (1 << 32) - 1;
+    const ORDER: u64 = 0xFFFF_FFFF_0000_0001;
     const W: u64 = 7;
     let half = 1usize << lg_half_m;
     let m = half << 1;
@@ -700,6 +741,7 @@ fn fft_classic_simd_single_layer_neon_ext(
         .all(|w| w.0[1].0 == 0);
     unsafe {
         let eps = vdupq_n_u64(EPSILON);
+        let order = vdupq_n_u64(ORDER);
         let mut k = 0;
         while k + m <= values.len() {
             let mut j = 0;
@@ -725,8 +767,7 @@ fn fft_classic_simd_single_layer_neon_ext(
 
                 let u = *values.get_unchecked(k + j);
                 let uv = vcombine_u64(vcreate_u64(u.0[0].0), vcreate_u64(u.0[1].0));
-                let sum = gl_add_neon(uv, tv, eps);
-                let diff = gl_sub_neon(uv, tv, eps);
+                let (sum, diff) = gl_butterfly_neon(uv, tv, order, eps);
                 *values.get_unchecked_mut(k + j) = QuadraticExtension([
                     GoldilocksField(vgetq_lane_u64(sum, 0)),
                     GoldilocksField(vgetq_lane_u64(sum, 1)),
@@ -936,7 +977,7 @@ const FUSED_PAIR_MIN_SCALARS: usize = 1 << 19;
 /// Goldilocks multiply ran in scalar registers.
 ///
 /// Full-array passes are a different regime. Measured per element-layer
-/// (min of >=500 interleaved reps, bit-identical arms), the single-layer
+/// (min of >=500 interleaved reps, field-identical arms), the single-layer
 /// kernel costs 0.50 ns on a cache-resident 2^13 slice but 0.57-0.59 ns on
 /// 2^19/2^21 full arrays — deep layers pair elements across multi-MiB
 /// strides and stream multi-MiB twiddle rows, and every pass repays that.
@@ -2428,6 +2469,72 @@ mod tests {
     };
     use crate::goldilocks_field::GoldilocksField;
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_canonical_rhs_butterfly_matches_scalar_field() {
+        use core::arch::aarch64::*;
+
+        use super::gl_butterfly_neon;
+        use crate::types::PrimeField64;
+
+        const EPSILON: u64 = (1 << 32) - 1;
+        const ORDER: u64 = 0xFFFF_FFFF_0000_0001;
+        let specials = [
+            0,
+            1,
+            EPSILON - 1,
+            EPSILON,
+            ORDER - 1,
+            ORDER,
+            ORDER + 1,
+            u64::MAX,
+        ];
+
+        let check = |us: [u64; 2], ts: [u64; 2]| unsafe {
+            let u = vld1q_u64(us.as_ptr());
+            let t = vld1q_u64(ts.as_ptr());
+            let (sum, diff) = gl_butterfly_neon(
+                u,
+                t,
+                vdupq_n_u64(ORDER),
+                vdupq_n_u64(EPSILON),
+            );
+            let mut sums = [0u64; 2];
+            let mut diffs = [0u64; 2];
+            vst1q_u64(sums.as_mut_ptr(), sum);
+            vst1q_u64(diffs.as_mut_ptr(), diff);
+            for lane in 0..2 {
+                let got_sum = GoldilocksField(sums[lane]);
+                let got_diff = GoldilocksField(diffs[lane]);
+                let u = GoldilocksField(us[lane]);
+                let t = GoldilocksField(ts[lane]);
+                assert_eq!(got_sum.to_canonical_u64(), (u + t).to_canonical_u64());
+                assert_eq!(got_diff.to_canonical_u64(), (u - t).to_canonical_u64());
+            }
+        };
+
+        for &u0 in &specials {
+            for &u1 in &specials {
+                for &t0 in &specials {
+                    for &t1 in &specials {
+                        check([u0, u1], [t0, t1]);
+                    }
+                }
+            }
+        }
+
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..100_000 {
+            check([next(), next()], [next(), next()]);
+        }
+    }
+
     /// Portable copy of the general extension-butterfly product used by the
     /// NEON path: `(a0 + a1*u) * (b0 + b1*u)` with `u^2 = 7`, reduced
     /// component-wise exactly like the generic `QuadraticExtension` mul.
@@ -2537,12 +2644,11 @@ mod tests {
     }
 
 
-    /// Driving the layers as single stages must be **bit**-identical to the
-    /// radix-4 fused traversal it replaced on the production path, not
-    /// merely congruent: the two perform the same butterflies on the same
-    /// values with the same twiddles in the same per-element order, so the
-    /// raw `GoldilocksField.0` words must match exactly. Every start stage
-    /// at each size is covered, so both stage-count parities are exercised.
+    /// Driving the layers as single stages must be field-identical to the
+    /// radix-4 fused traversal it replaced on the production path. The NEON
+    /// butterfly canonicalises its shared product and may choose a different
+    /// raw representative; every start stage at each size is covered, so both
+    /// stage-count parities are exercised.
     #[test]
     fn single_layer_driver_matches_fused_reference_raw_words() {
         use crate::fft::{
@@ -2555,7 +2661,7 @@ mod tests {
         /// before the twiddle specialization, while the arm under test runs the
         /// marker production selects. The comparison therefore still isolates
         /// the defusion and additionally pins the base-field marker choice to
-        /// the same raw words.
+        /// the same field values.
         fn drive_fused<P: PackedField>(
             packed_values: &mut [P],
             start: usize,
@@ -2601,8 +2707,8 @@ mod tests {
                 );
                 for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
                     assert_eq!(
-                        a.0, e.0,
-                        "raw word mismatch at 2^{lg_n} start {start} index {i}"
+                        a, e,
+                        "field mismatch at 2^{lg_n} start {start} index {i}"
                     );
                 }
             }
@@ -2610,12 +2716,10 @@ mod tests {
     }
 
 
-    /// The NEON base-field layer must be **bit**-identical to the generic body
-    /// it specialises: same butterflies, same twiddles, same order, so the raw
-    /// `GoldilocksField.0` words must match exactly rather than merely be
-    /// congruent. Seeded with values above ORDER and within 97 of 2^64 so the
-    /// rare double-overflow and double-underflow corrections actually fire --
-    /// a differential that never exercises its corrections cannot catch them.
+    /// The NEON base-field layer must be field-identical to the generic body it
+    /// specialises. Seeded with values above ORDER and within 97 of 2^64 so
+    /// canonicalisation and carry/borrow correction paths actually fire -- a
+    /// differential that never exercises those corrections cannot catch them.
     ///
     /// The quadratic extension is included deliberately: it is `WIDTH == 1` and
     /// must take the generic fallback, so the fallback being exercised is as
@@ -2626,7 +2730,7 @@ mod tests {
     /// sizes. The extension half is therefore simultaneously the fallback
     /// differential it always was and a twiddle-specialization differential.
     #[test]
-    fn neon_single_layer_matches_generic_raw_words() {
+    fn neon_single_layer_matches_generic_field_values() {
         use crate::fft::fft_classic_simd_single_layer_with;
         use crate::types::{Field64, PrimeField64};
 
@@ -2685,8 +2789,8 @@ mod tests {
                 );
                 for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
                     assert_eq!(
-                        a.0, e.0,
-                        "raw word mismatch at 2^{lg_n} layer {lg_half_m} index {i}"
+                        a, e,
+                        "field mismatch at 2^{lg_n} layer {lg_half_m} index {i}"
                     );
                 }
             }
@@ -2977,8 +3081,8 @@ mod tests {
 
     /// The fused-pair gate fires only at >= 2^19 scalars, above every other
     /// test size in this module. Cover the gated shapes through the
-    /// production `fft_classic` entry against the stage-major reference, on
-    /// raw limbs: r=0 at 2^19 (non-blocked 2..19, seventeen layers — eight
+    /// production `fft_classic` entry against the stage-major reference, as
+    /// field values: r=0 at 2^19 (non-blocked 2..19, seventeen layers — eight
     /// fused pairs plus the trailing odd single at 18), r=3 at 2^20 (blocked
     /// in-block layers unfused, tail 13..20 — three pairs plus the odd
     /// single at 19), r=3 at 2^19 (even tail, no leftover), and r=0 at 2^18
@@ -2998,11 +3102,7 @@ mod tests {
             fft_classic_reference(&mut expected, r, &roots);
             let mut actual = padded;
             fft_classic(&mut actual, r, &roots);
-            assert_eq!(
-                actual.iter().map(|x| x.0).collect::<Vec<_>>(),
-                expected.iter().map(|x| x.0).collect::<Vec<_>>(),
-                "raw limb mismatch at 2^{lg_n}, r={r}"
-            );
+            assert_eq!(actual, expected, "field mismatch at 2^{lg_n}, r={r}");
         }
     }
 

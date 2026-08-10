@@ -4,6 +4,21 @@ using namespace metal;
 constant ulong GOLDILOCKS_PRIME = 0xffffffff00000001UL;
 constant ulong GOLDILOCKS_EPSILON = 0xffffffffUL;
 
+constant ulong COSET_16_DOMAIN[16] = {
+    0x1UL, 0x1000UL, 0x1000000UL, 0x1000000000UL,
+    0x1000000000000UL, 0x1000000000000000UL, 0xffffffff00UL,
+    0xffffffff00000UL, 0xffffffff00000000UL, 0xfffffffefffff001UL,
+    0xfffffffeff000001UL, 0xffffffef00000001UL, 0xfffeffff00000001UL,
+    0xefffffff00000001UL, 0xfffffeff00000101UL, 0xffefffff00100001UL,
+};
+constant ulong COSET_16_WEIGHTS[16] = {
+    0xefffffff10000001UL, 0x100UL, 0x100000UL, 0x100000000UL,
+    0x100000000000UL, 0x100000000000000UL, 0xffffffff0UL,
+    0xffffffff0000UL, 0xffffffff0000000UL, 0xfffffffeffffff01UL,
+    0xfffffffefff00001UL, 0xfffffffe00000001UL, 0xffffefff00000001UL,
+    0xfeffffff00000001UL, 0xffffffef00000011UL, 0xfffeffff00010001UL,
+};
+
 // Compile-time Poseidon2 round constants (same values as config.rs).
 // File-scope constant arrays keep the round loops compact so register
 // pressure stays near the tip kernels, while still removing device-buffer
@@ -683,6 +698,50 @@ kernel void permutation_quotient(
     output[(ulong)gid * 2u + 1u] = gl_canonicalize(totals[1]);
 }
 
+inline void gl_ext2_mul(
+    ulong a0,
+    ulong a1,
+    ulong b0,
+    ulong b1,
+    thread ulong& output0,
+    thread ulong& output1) {
+    output0 = gl_mul_add(7, gl_mul(a1, b1), gl_mul(a0, b0));
+    output1 = gl_mul_add(a1, b0, gl_mul(a0, b1));
+}
+
+inline void coset16_interpolation_step(
+    ulong point0,
+    ulong point1,
+    ulong value0,
+    ulong value1,
+    uint domain_index,
+    thread ulong& eval0,
+    thread ulong& eval1,
+    thread ulong& product0,
+    thread ulong& product1) {
+    ulong term0 = gl_sub(point0, COSET_16_DOMAIN[domain_index]);
+    ulong term1 = point1;
+    ulong eval_term0;
+    ulong eval_term1;
+    ulong weighted_product0;
+    ulong weighted_product1;
+    ulong next_product0;
+    ulong next_product1;
+    gl_ext2_mul(eval0, eval1, term0, term1, eval_term0, eval_term1);
+    gl_ext2_mul(
+        gl_mul(value0, COSET_16_WEIGHTS[domain_index]),
+        gl_mul(value1, COSET_16_WEIGHTS[domain_index]),
+        product0,
+        product1,
+        weighted_product0,
+        weighted_product1);
+    gl_ext2_mul(product0, product1, term0, term1, next_product0, next_product1);
+    eval0 = gl_add(eval_term0, weighted_product0);
+    eval1 = gl_add(eval_term1, weighted_product1);
+    product0 = next_product0;
+    product1 = next_product1;
+}
+
 inline void range_check_gate_emit(
     ulong constraint,
     constant ulong* alpha_powers,
@@ -703,7 +762,9 @@ inline void range_check_gate_emit(
 // then kind (arithmetic=0, subtraction=1, add-many=2, byte-decomposition=3,
 // quintic-multiplication=4, quintic-squaring=5, random-access=6,
 // exponentiation=7, equality=8, reducing=9, base-addition=10, base-sum=11,
-// selection=12), operation or copy count, and
+// selection=12, base-field-arithmetic=13, extension-arithmetic=14,
+// extension-multiplication=15, coset-interpolation=16, constant=17,
+// public-input=18), operation or copy count, and
 // three explicit kind words. Random access uses the final words for index
 // bits, extra constants, and the raw constant-column base; equality carries
 // its constants column and reducing its extension-coefficient flag in the
@@ -744,26 +805,29 @@ inline ulong random_access_select_8(
     return items[0];
 }
 
-kernel void range_check_gate_quotient(
-    const device ulong* wires [[buffer(0)]],
-    const device ulong* constants [[buffer(1)]],
-    device ulong* output [[buffer(2)]],
-    constant ulong* alpha_powers [[buffer(3)]],
-    constant uint* metadata [[buffer(4)]],
-    constant uint& lde_rows [[buffer(5)]],
-    constant uint& quotient_rows [[buffer(6)]],
-    constant uint& step [[buffer(7)]],
-    constant uint& alpha_stride [[buffer(8)]],
-    constant uint& range_count [[buffer(9)]],
-    constant uint& u32_count [[buffer(10)]],
-    uint gid [[thread_position_in_grid]]) {
+template <bool HEAVY_RESOURCE>
+inline void range_check_gate_quotient_impl(
+    const device ulong* wires,
+    const device ulong* constants,
+    device ulong* output,
+    constant ulong* alpha_powers,
+    constant uint* metadata,
+    uint lde_rows,
+    uint quotient_rows,
+    uint step,
+    uint alpha_stride,
+    uint range_count,
+    uint u32_count,
+    constant ulong* public_inputs_hash,
+    uint gid) {
     if (gid >= quotient_rows) {
         return;
     }
 
     uint source_row = gid * step;
     ulong total[2] = { 0, 0 };
-    for (uint range_index = 0; range_index < range_count; ++range_index) {
+    if (!HEAVY_RESOURCE) {
+        for (uint range_index = 0; range_index < range_count; ++range_index) {
         constant uint* spec = metadata + range_index * 10u;
         uint selector_column = spec[0];
         uint gate_index = spec[1];
@@ -825,6 +889,7 @@ kernel void range_check_gate_quotient(
 
         total[0] = gl_mul_add(filter, gate_accumulators[0], total[0]);
         total[1] = gl_mul_add(filter, gate_accumulators[1], total[1]);
+        }
     }
 
     constant uint* u32_metadata = metadata + range_count * 10u;
@@ -840,6 +905,10 @@ kernel void range_check_gate_quotient(
         uint num_addends = spec[7];
         uint result_limbs = spec[8];
         uint num_carry_limbs = spec[9];
+        // The host partitions records by resource footprint. Combining each
+        // kind check with the specialization constant strips the other class's
+        // branch bodies instead of reserving their registers and code size. A
+        // wrong-class record reaches the final unsatisfiable branch below.
         // Overflow weight of the recomposed word: 2^16, 2^32 or 2^48.
         ulong word_base = 1UL << (2u * result_limbs);
 
@@ -856,7 +925,7 @@ kernel void range_check_gate_quotient(
 
         ulong gate_accumulators[2] = { 0, 0 };
         uint constraint_index = 0;
-        if (kind == 0u) {
+        if (!HEAVY_RESOURCE && kind == 0u) {
             // U32ArithmeticGate: six routed words followed by 32 base-4
             // output limbs per operation.
             for (uint op = 0; op < num_ops; ++op) {
@@ -918,7 +987,7 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 1u) {
+        } else if (!HEAVY_RESOURCE && kind == 1u) {
             // U16/U32/U48 SubtractionGate: five routed words followed by
             // `result_limbs` base-4 result limbs per operation.
             for (uint op = 0; op < num_ops; ++op) {
@@ -966,7 +1035,7 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 2u) {
+        } else if (!HEAVY_RESOURCE && kind == 2u) {
             // U16/U32 AddManyGate: num_addends inputs, carry/result/output-carry,
             // then `result_limbs` result and `num_carry_limbs` carry base-4
             // limbs per operation.
@@ -1025,7 +1094,7 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 3u) {
+        } else if (!HEAVY_RESOURCE && kind == 3u) {
             // ByteDecompositionGate: per operation, one routed sum wire and
             // `num_addends` routed byte wires (the metadata word carries the
             // byte count for this kind), then four base-4 aux limbs per
@@ -1083,7 +1152,7 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 4u) {
+        } else if (HEAVY_RESOURCE && kind == 4u) {
             // QuinticMultiplicationGate: fifteen routed words per operation
             // (five limbs each for a, b and the claimed product c). The five
             // constraints are the schoolbook product limbs reduced by
@@ -1116,7 +1185,7 @@ kernel void range_check_gate_quotient(
                         constraint_index++);
                 }
             }
-        } else if (kind == 5u) {
+        } else if (HEAVY_RESOURCE && kind == 5u) {
             // QuinticSquaringGate: ten routed words per operation (input
             // limbs a then output limbs c) plus ten temporary wires. Each
             // constraint checks one accumulation step of the squaring
@@ -1206,7 +1275,7 @@ kernel void range_check_gate_quotient(
                     alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 6u) {
+        } else if (HEAVY_RESOURCE && kind == 6u) {
             uint bits = num_addends;
             uint num_extra_constants = result_limbs;
             uint constant_base = num_carry_limbs;
@@ -1291,7 +1360,7 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 7u) {
+        } else if (!HEAVY_RESOURCE && kind == 7u) {
             // ExponentiationGate: wire 0 is the base, wires 1..=n the power
             // bits in little-endian order, wire 1+n the output and wires
             // 2+n..2+2n the running intermediate values; `num_ops` carries n.
@@ -1326,7 +1395,7 @@ kernel void range_check_gate_quotient(
                 gl_sub(output_value, final_intermediate),
                 alpha_powers, alpha_stride, gate_accumulators,
                 constraint_index++);
-        } else if (kind == 8u) {
+        } else if (!HEAVY_RESOURCE && kind == 8u) {
             // EqualityGate: three routed words per operation (x, y, equal)
             // followed by three unrouted temporaries (diff, invdiff, prod).
             // The addend slot carries the constants column holding the gate's
@@ -1360,7 +1429,7 @@ kernel void range_check_gate_quotient(
                     alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 9u) {
+        } else if (!HEAVY_RESOURCE && kind == 9u) {
             // ReducingGate / ReducingExtensionGate at D == 2. Wires 0..2 are
             // the output, 2..4 alpha, 4..6 the incoming accumulator, then one
             // (base) or two (extension) wires per coefficient, then one
@@ -1407,7 +1476,7 @@ kernel void range_check_gate_quotient(
                 acc_0 = next_0;
                 acc_1 = next_1;
             }
-        } else if (kind == 10u) {
+        } else if (!HEAVY_RESOURCE && kind == 10u) {
             // AdditionGate: three routed words per operation (x, y, output).
             // The addend-count slot carries the first of its two raw constant
             // columns, immediately after the selector prefix.
@@ -1427,7 +1496,7 @@ kernel void range_check_gate_quotient(
                     alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 11u) {
+        } else if (!HEAVY_RESOURCE && kind == 11u) {
             // BaseSumGate: wire 0 is the sum and the next `num_ops` wires are
             // little-endian limbs. The addend-count slot carries base 2 or 4.
             ulong base = num_addends;
@@ -1456,7 +1525,7 @@ kernel void range_check_gate_quotient(
                     alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
-        } else if (kind == 12u) {
+        } else if (!HEAVY_RESOURCE && kind == 12u) {
             // SelectionGate: four routed wires per operation followed by one
             // temporary wire per operation.
             for (uint op = 0; op < num_ops; ++op) {
@@ -1475,6 +1544,185 @@ kernel void range_check_gate_quotient(
                     alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
+        } else if (!HEAVY_RESOURCE && kind == 13u) {
+            // ArithmeticGate: four wires per operation, with the two scalar
+            // weights stored in the first two raw gate-constant columns.
+            uint constant_base = num_addends;
+            ulong const_0 = constants[(ulong)constant_base * lde_rows + source_row];
+            ulong const_1 = constants[((ulong)constant_base + 1u) * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong wire_base = (ulong)op * 4u;
+                ulong multiplicand_0 = wires[(wire_base + 0u) * lde_rows + source_row];
+                ulong multiplicand_1 = wires[(wire_base + 1u) * lde_rows + source_row];
+                ulong addend = wires[(wire_base + 2u) * lde_rows + source_row];
+                ulong output_value = wires[(wire_base + 3u) * lde_rows + source_row];
+                ulong computed = gl_mul_add(
+                    const_1,
+                    addend,
+                    gl_mul(const_0, gl_mul(multiplicand_0, multiplicand_1)));
+                range_check_gate_emit(
+                    gl_sub(output_value, computed),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (!HEAVY_RESOURCE && kind == 14u) {
+            // ArithmeticExtensionGate<2>: a0/a1, b0/b1, z0/z1, out0/out1.
+            // Goldilocks uses F[x]/(x^2 - 7), so the extension product is
+            // (a0*b0 + 7*a1*b1, a0*b1 + a1*b0).
+            uint constant_base = num_addends;
+            ulong const_0 = constants[(ulong)constant_base * lde_rows + source_row];
+            ulong const_1 = constants[((ulong)constant_base + 1u) * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong wire_base = (ulong)op * 8u;
+                ulong a0 = wires[(wire_base + 0u) * lde_rows + source_row];
+                ulong a1 = wires[(wire_base + 1u) * lde_rows + source_row];
+                ulong b0 = wires[(wire_base + 2u) * lde_rows + source_row];
+                ulong b1 = wires[(wire_base + 3u) * lde_rows + source_row];
+                ulong z0 = wires[(wire_base + 4u) * lde_rows + source_row];
+                ulong z1 = wires[(wire_base + 5u) * lde_rows + source_row];
+                ulong out0 = wires[(wire_base + 6u) * lde_rows + source_row];
+                ulong out1 = wires[(wire_base + 7u) * lde_rows + source_row];
+                ulong product_0 = gl_mul_add(7, gl_mul(a1, b1), gl_mul(a0, b0));
+                ulong product_1 = gl_mul_add(a1, b0, gl_mul(a0, b1));
+                ulong computed_0 = gl_mul_add(const_1, z0, gl_mul(const_0, product_0));
+                ulong computed_1 = gl_mul_add(const_1, z1, gl_mul(const_0, product_1));
+                range_check_gate_emit(
+                    gl_sub(out0, computed_0),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(out1, computed_1),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (!HEAVY_RESOURCE && kind == 15u) {
+            // MulExtensionGate<2>: a0/a1, b0/b1, out0/out1 and one scalar.
+            uint constant_base = num_addends;
+            ulong const_0 = constants[(ulong)constant_base * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong wire_base = (ulong)op * 6u;
+                ulong a0 = wires[(wire_base + 0u) * lde_rows + source_row];
+                ulong a1 = wires[(wire_base + 1u) * lde_rows + source_row];
+                ulong b0 = wires[(wire_base + 2u) * lde_rows + source_row];
+                ulong b1 = wires[(wire_base + 3u) * lde_rows + source_row];
+                ulong out0 = wires[(wire_base + 4u) * lde_rows + source_row];
+                ulong out1 = wires[(wire_base + 5u) * lde_rows + source_row];
+                ulong product_0 = gl_mul_add(7, gl_mul(a1, b1), gl_mul(a0, b0));
+                ulong product_1 = gl_mul_add(a1, b0, gl_mul(a0, b1));
+                range_check_gate_emit(
+                    gl_sub(out0, gl_mul(const_0, product_0)),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(out1, gl_mul(const_0, product_1)),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (HEAVY_RESOURCE && kind == 16u) {
+            // CosetInterpolationGate<GoldilocksField, 2>, subgroup_bits=4,
+            // degree=6. Wire layout: shift; 16 extension values; evaluation
+            // point/value; two evaluation checkpoints; two product
+            // checkpoints; shifted evaluation point.
+            ulong shift = wires[source_row];
+            ulong point0 = wires[(ulong)33u * lde_rows + source_row];
+            ulong point1 = wires[(ulong)34u * lde_rows + source_row];
+            ulong shifted0 = wires[(ulong)45u * lde_rows + source_row];
+            ulong shifted1 = wires[(ulong)46u * lde_rows + source_row];
+            range_check_gate_emit(
+                gl_sub(point0, gl_mul(shifted0, shift)),
+                alpha_powers, alpha_stride, gate_accumulators,
+                constraint_index++);
+            range_check_gate_emit(
+                gl_sub(point1, gl_mul(shifted1, shift)),
+                alpha_powers, alpha_stride, gate_accumulators,
+                constraint_index++);
+
+            ulong eval0 = 0;
+            ulong eval1 = 0;
+            ulong product0 = 1;
+            ulong product1 = 0;
+            for (uint i = 0; i < 6u; ++i) {
+                ulong value_base = 1u + 2u * i;
+                coset16_interpolation_step(
+                    shifted0,
+                    shifted1,
+                    wires[value_base * lde_rows + source_row],
+                    wires[(value_base + 1u) * lde_rows + source_row],
+                    i,
+                    eval0,
+                    eval1,
+                    product0,
+                    product1);
+            }
+            for (uint checkpoint = 0; checkpoint < 2u; ++checkpoint) {
+                ulong expected_eval0 = wires[((ulong)37u + 2u * checkpoint) * lde_rows + source_row];
+                ulong expected_eval1 = wires[((ulong)38u + 2u * checkpoint) * lde_rows + source_row];
+                ulong expected_product0 = wires[((ulong)41u + 2u * checkpoint) * lde_rows + source_row];
+                ulong expected_product1 = wires[((ulong)42u + 2u * checkpoint) * lde_rows + source_row];
+                range_check_gate_emit(
+                    gl_sub(expected_eval0, eval0),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(expected_eval1, eval1),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(expected_product0, product0),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(expected_product1, product1),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                eval0 = expected_eval0;
+                eval1 = expected_eval1;
+                product0 = expected_product0;
+                product1 = expected_product1;
+
+                uint start = checkpoint == 0u ? 6u : 11u;
+                uint end = checkpoint == 0u ? 11u : 16u;
+                for (uint i = start; i < end; ++i) {
+                    ulong value_base = 1u + 2u * i;
+                    coset16_interpolation_step(
+                        shifted0,
+                        shifted1,
+                        wires[value_base * lde_rows + source_row],
+                        wires[(value_base + 1u) * lde_rows + source_row],
+                        i,
+                        eval0,
+                        eval1,
+                        product0,
+                        product1);
+                }
+            }
+            range_check_gate_emit(
+                gl_sub(wires[(ulong)35u * lde_rows + source_row], eval0),
+                alpha_powers, alpha_stride, gate_accumulators,
+                constraint_index++);
+            range_check_gate_emit(
+                gl_sub(wires[(ulong)36u * lde_rows + source_row], eval1),
+                alpha_powers, alpha_stride, gate_accumulators,
+                constraint_index++);
+        } else if (!HEAVY_RESOURCE && kind == 17u) {
+            uint constant_base = num_addends;
+            for (uint i = 0; i < 2u; ++i) {
+                range_check_gate_emit(
+                    gl_sub(
+                        constants[((ulong)constant_base + i) * lde_rows + source_row],
+                        wires[(ulong)i * lde_rows + source_row]),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (!HEAVY_RESOURCE && kind == 18u) {
+            for (uint i = 0; i < 4u; ++i) {
+                range_check_gate_emit(
+                    gl_sub(
+                        wires[(ulong)i * lde_rows + source_row],
+                        public_inputs_hash[i]),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
         } else {
             // The Rust encoder rejects unknown discriminants; if a malformed
             // record reaches the shader, make its selected row unsatisfiable.
@@ -1487,8 +1735,55 @@ kernel void range_check_gate_quotient(
         total[1] = gl_mul_add(filter, gate_accumulators[1], total[1]);
     }
 
-    output[(ulong)gid * 2] = gl_canonicalize(total[0]);
-    output[(ulong)gid * 2 + 1] = gl_canonicalize(total[1]);
+    ulong output_index = (ulong)gid * 2u;
+    if (HEAVY_RESOURCE) {
+        output[output_index] = gl_canonicalize(gl_add(output[output_index], total[0]));
+        output[output_index + 1u] =
+            gl_canonicalize(gl_add(output[output_index + 1u], total[1]));
+    } else {
+        output[output_index] = gl_canonicalize(total[0]);
+        output[output_index + 1u] = gl_canonicalize(total[1]);
+    }
+}
+
+kernel void range_check_gate_quotient_light(
+    const device ulong* wires [[buffer(0)]],
+    const device ulong* constants [[buffer(1)]],
+    device ulong* output [[buffer(2)]],
+    constant ulong* alpha_powers [[buffer(3)]],
+    constant uint* metadata [[buffer(4)]],
+    constant uint& lde_rows [[buffer(5)]],
+    constant uint& quotient_rows [[buffer(6)]],
+    constant uint& step [[buffer(7)]],
+    constant uint& alpha_stride [[buffer(8)]],
+    constant uint& range_count [[buffer(9)]],
+    constant uint& u32_count [[buffer(10)]],
+    constant ulong* public_inputs_hash [[buffer(11)]],
+    uint gid [[thread_position_in_grid]]) {
+    range_check_gate_quotient_impl<false>(
+        wires, constants, output, alpha_powers, metadata, lde_rows,
+        quotient_rows, step, alpha_stride, range_count, u32_count,
+        public_inputs_hash, gid);
+}
+
+kernel void range_check_gate_quotient_heavy_accumulate(
+    const device ulong* wires [[buffer(0)]],
+    const device ulong* constants [[buffer(1)]],
+    device ulong* output [[buffer(2)]],
+    constant ulong* alpha_powers [[buffer(3)]],
+    constant uint* metadata [[buffer(4)]],
+    constant uint& lde_rows [[buffer(5)]],
+    constant uint& quotient_rows [[buffer(6)]],
+    constant uint& step [[buffer(7)]],
+    constant uint& alpha_stride [[buffer(8)]],
+    constant uint& range_count [[buffer(9)]],
+    constant uint& u32_count [[buffer(10)]],
+    constant ulong* public_inputs_hash [[buffer(11)]],
+    uint gid [[thread_position_in_grid]]) {
+    range_check_gate_quotient_impl<true>(
+        wires, constants, output, alpha_powers, metadata, lde_rows,
+        quotient_rows, step, alpha_stride, range_count, u32_count,
+        public_inputs_hash, gid);
 }
 
 kernel void poseidon2_hash_leaves(

@@ -1285,19 +1285,27 @@ fn start_gpu_range_check_gate_quotient<
     wires_commitment: &PolynomialBatch<F, C, D>,
     quotient_rows: usize,
     step: usize,
+    public_inputs_hash: &crate::hash::hash_types::HashOut<F>,
     alphas: &[F],
 ) -> Option<(
     Vec<usize>,
     crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
 )> {
     use core::sync::atomic::Ordering;
+    use crate::gates::arithmetic_base::ArithmeticGate;
+    use crate::gates::arithmetic_extension::ArithmeticExtensionGate;
+    use crate::gates::constant::ConstantGate;
+    use crate::gates::coset_interpolation::CosetInterpolationGate;
     use crate::gates::equality_base::EqualityGate;
     use crate::gates::exponentiation::ExponentiationGate;
     use crate::gates::gate::U32QuotientGate;
+    use crate::gates::multiplication_extension::MulExtensionGate;
+    use crate::gates::public_input::PublicInputGate;
     use crate::gates::reducing::ReducingGate;
     use crate::gates::reducing_extension::ReducingExtensionGate;
     use crate::hash::poseidon2::metal::{
-        RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec,
+        range_quotient_supports_extended_kinds, RangeCheckQuotientSpec, U32QuotientKind,
+        U32QuotientSpec, COSET_16_WEIGHTS_U64,
     };
 
     GPU_RANGE_QUOTIENT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
@@ -1325,6 +1333,11 @@ fn start_gpu_range_check_gate_quotient<
     if raw_constant_base > common_data.num_constants {
         return None;
     }
+    // The split pipeline pair is compiled from the checked-in MSL at runtime.
+    // Joining it here lets the prewarm thread overlap compilation with circuit
+    // loading while making every extended-kind routing decision depend on the
+    // actual pipelines that will execute it.
+    let extended_metal_quotient = range_quotient_supports_extended_kinds();
     let mut gate_indices = Vec::new();
     // Random-access gates are excluded from the CPU quotient only after the
     // combined Metal command has accepted and submitted every metadata record.
@@ -1581,7 +1594,108 @@ fn start_gpu_range_check_gate_quotient<
         // the production circuits and are pure arithmetic, so they are matched
         // by type here instead of through the downstream-crate trait hooks
         // (those hooks exist only to avoid a `plonky2` -> circuit-crate dep).
-        let native = if let Some(exponentiation) =
+        let native = if let Some(coset) = gate
+            .0
+            .as_any()
+            .downcast_ref::<CosetInterpolationGate<F, D>>()
+        {
+            let weights_match = coset
+                .barycentric_weights
+                .iter()
+                .map(|weight| weight.to_canonical_u64())
+                .eq(COSET_16_WEIGHTS_U64);
+            if !extended_metal_quotient
+                || D != 2
+                || coset.subgroup_bits != 4
+                || coset.degree != 6
+                || !weights_match
+                || gate.0.num_constants() != 0
+            {
+                None
+            } else {
+                Some((U32QuotientKind::CosetInterpolation, 2, 47, 12))
+            }
+        } else if gate.0.as_any().downcast_ref::<ConstantGate>().is_some() {
+            if !extended_metal_quotient
+                || gate.0.num_constants() != 2
+                || raw_constant_base.checked_add(2)? > common_data.num_constants
+            {
+                None
+            } else {
+                Some((
+                    U32QuotientKind::Constant {
+                        constant_base: raw_constant_base,
+                    },
+                    2,
+                    2,
+                    2,
+                ))
+            }
+        } else if gate.0.as_any().downcast_ref::<PublicInputGate>().is_some() {
+            if !extended_metal_quotient || gate.0.num_constants() != 0 {
+                None
+            } else {
+                Some((U32QuotientKind::PublicInput, 4, 4, 4))
+            }
+        } else if let Some(arithmetic) = gate.0.as_any().downcast_ref::<ArithmeticGate>() {
+            if !extended_metal_quotient
+                || gate.0.num_constants() != 2
+                || raw_constant_base.checked_add(2)? > common_data.num_constants
+            {
+                None
+            } else {
+                Some((
+                    U32QuotientKind::BaseFieldArithmetic {
+                        constant_base: raw_constant_base,
+                    },
+                    arithmetic.num_ops,
+                    arithmetic.num_ops.checked_mul(4)?,
+                    arithmetic.num_ops,
+                ))
+            }
+        } else if let Some(arithmetic) = gate
+            .0
+            .as_any()
+            .downcast_ref::<ArithmeticExtensionGate<D>>()
+        {
+            if !extended_metal_quotient
+                || D != 2
+                || gate.0.num_constants() != 2
+                || raw_constant_base.checked_add(2)? > common_data.num_constants
+            {
+                None
+            } else {
+                Some((
+                    U32QuotientKind::ExtensionArithmetic {
+                        constant_base: raw_constant_base,
+                    },
+                    arithmetic.num_ops,
+                    arithmetic.num_ops.checked_mul(8)?,
+                    arithmetic.num_ops.checked_mul(2)?,
+                ))
+            }
+        } else if let Some(multiplication) = gate
+            .0
+            .as_any()
+            .downcast_ref::<MulExtensionGate<D>>()
+        {
+            if !extended_metal_quotient
+                || D != 2
+                || gate.0.num_constants() != 1
+                || raw_constant_base.checked_add(1)? > common_data.num_constants
+            {
+                None
+            } else {
+                Some((
+                    U32QuotientKind::ExtensionMultiplication {
+                        constant_base: raw_constant_base,
+                    },
+                    multiplication.num_ops,
+                    multiplication.num_ops.checked_mul(6)?,
+                    multiplication.num_ops.checked_mul(2)?,
+                ))
+            }
+        } else if let Some(exponentiation) =
             gate.0.as_any().downcast_ref::<ExponentiationGate<F, D>>()
         {
             let num_power_bits = exponentiation.num_power_bits;
@@ -1704,6 +1818,7 @@ fn start_gpu_range_check_gate_quotient<
         step,
         &specs,
         &u32_specs,
+        public_inputs_hash,
         alphas,
         alpha_offset,
     ) else {
@@ -1885,6 +2000,7 @@ fn compute_quotient_polys<
                 wires_commitment,
                 lde_size,
                 step,
+                public_inputs_hash,
                 alphas,
             )
         })
@@ -1953,6 +2069,7 @@ fn compute_quotient_polys<
         l_0_table_cache::l_0_denominator_inverses::<F>(
             common_data.degree_bits(),
             quotient_degree_bits,
+            shifted_points.as_slice(),
         ),
     );
 
@@ -2015,7 +2132,10 @@ fn compute_quotient_polys<
     // gates into every 32-point CPU scratch batch.
     // survivor-list once per proof v4-17.76
     let cpu_gate_indices = (0..common_data.gates.len())
-        .filter(|gate_index| !excluded_gate_indices.contains(gate_index))
+        .filter(|gate_index| {
+            !excluded_gate_indices.contains(gate_index)
+                && common_data.gates[*gate_index].0.num_constraints() != 0
+        })
         .collect::<Vec<_>>();
     // Detect the exact pair only after GPU ownership is fixed. If either gate
     // has been offloaded, the plan is absent and the remaining CPU gate keeps
@@ -2134,11 +2254,15 @@ fn compute_quotient_polys<
                     );
                     let cc = common_data.constants_range().len();
                     let q = prover_data.constants_sigmas_quotient_domain;
-                    scratch.local_constants.resize(cc * n, F::ZERO);
-                    for ci in 0..cc {
-                        scratch.local_constants[ci * n..(ci + 1) * n].copy_from_slice(
-                            &cache[ci * q + cache_start..ci * q + cache_start + n],
-                        );
+                    if cpu_gate_indices.is_empty() {
+                        scratch.local_constants.clear();
+                    } else {
+                        scratch.local_constants.resize(cc * n, F::ZERO);
+                        for ci in 0..cc {
+                            scratch.local_constants[ci * n..(ci + 1) * n].copy_from_slice(
+                                &cache[ci * q + cache_start..ci * q + cache_start + n],
+                            );
+                        }
                     }
                     if permutation_products_offloaded {
                         scratch.s_sigmas_flat.clear();
@@ -2153,13 +2277,17 @@ fn compute_quotient_polys<
                         }
                     }
                 } else {
-                    prover_data.constants_sigmas_commitment.fill_lde_batch(
-                        &scratch.indices,
-                        step,
-                        common_data.constants_range(),
-                        BatchLayout::PolyMajor,
-                        &mut scratch.local_constants,
-                    );
+                    if cpu_gate_indices.is_empty() {
+                        scratch.local_constants.clear();
+                    } else {
+                        prover_data.constants_sigmas_commitment.fill_lde_batch(
+                            &scratch.indices,
+                            step,
+                            common_data.constants_range(),
+                            BatchLayout::PolyMajor,
+                            &mut scratch.local_constants,
+                        );
+                    }
                     // Layout seam: the no-lookup column evaluator consumes the
                     // PolyMajor gathers as-is (and the "next" gather narrows to
                     // the Z columns, the only ones it reads); the per-point path
@@ -3032,31 +3160,47 @@ mod l_0_table_cache {
     static CACHE: OnceLock<Mutex<HashMap<(TypeId, usize, usize), Arc<dyn Any + Send + Sync>>>> =
         OnceLock::new();
 
-    /// Builds the table with, per entry, exactly the operations of the uncached
-    /// `eval_l_0(i, g * w^i)` path: `x = g * w^i` from the same `two_adic_subgroup` points the
-    /// prover feeds it, then `(n * (x - ONE)).inverse()` — the same inverse of the same
-    /// product, so every entry is bit-identical to the value it replaces. Entries are
-    /// independent, so the parallel map changes nothing.
-    fn build<F: Field>(degree_bits: usize, quotient_degree_bits: usize) -> Vec<F> {
+    /// Builds the table from the exact shifted domain entries already consumed
+    /// by the quotient loop. Per entry this preserves the uncached
+    /// `(n * (x - ONE)).inverse()` operation sequence and indexed parallel
+    /// collection preserves the domain order.
+    fn build<F: Field>(
+        degree_bits: usize,
+        quotient_degree_bits: usize,
+        shifted_points: &[F],
+    ) -> Vec<F> {
+        let expected_len = 1usize << (degree_bits + quotient_degree_bits);
+        assert_eq!(
+            shifted_points.len(),
+            expected_len,
+            "shifted quotient domain does not match L_0 cache key"
+        );
         let n = F::from_canonical_usize(1 << degree_bits);
-        F::two_adic_subgroup(degree_bits + quotient_degree_bits)
-            .into_par_iter()
-            .map(|x| (n * (F::coset_shift() * x - F::ONE)).inverse())
+        shifted_points
+            .par_iter()
+            .map(|&x| (n * (x - F::ONE)).inverse())
             .collect()
     }
 
     pub(super) fn l_0_denominator_inverses<F: Field>(
         degree_bits: usize,
         quotient_degree_bits: usize,
+        shifted_points: &[F],
     ) -> Arc<Vec<F>> {
         let key = (TypeId::of::<F>(), degree_bits, quotient_degree_bits);
         let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        // A hit already contains the table for the complete key. Deliberately do
+        // not inspect the supplied slice unless this call has to build a miss.
         if let Some(entry) = cache.lock().unwrap().get(&key) {
             return Arc::clone(entry).downcast::<Vec<F>>().unwrap();
         }
         // Built outside the lock so a slow build never serializes other keys; concurrent
         // builders of the same key produce identical tables and the first insert wins.
-        let table: Arc<Vec<F>> = Arc::new(build::<F>(degree_bits, quotient_degree_bits));
+        let table: Arc<Vec<F>> = Arc::new(build::<F>(
+            degree_bits,
+            quotient_degree_bits,
+            shifted_points,
+        ));
         let mut guard = cache.lock().unwrap();
         let entry = guard
             .entry(key)
@@ -3225,7 +3369,7 @@ mod l_0_table_tests {
     use plonky2_field::types::Field;
     use plonky2_field::zero_poly_coset::ZeroPolyOnCoset;
 
-    use super::l_0_table_cache::l_0_denominator_inverses;
+    use super::{l_0_table_cache::l_0_denominator_inverses, precomputed};
 
     type F = GoldilocksField;
 
@@ -3237,7 +3381,13 @@ mod l_0_table_tests {
     #[test]
     fn table_entries_match_legacy_per_point_inversion() {
         for (degree_bits, quotient_degree_bits) in COMBOS {
-            let table = l_0_denominator_inverses::<F>(degree_bits, quotient_degree_bits);
+            let shifted_points =
+                precomputed::shifted_two_adic_subgroup::<F>(degree_bits + quotient_degree_bits);
+            let table = l_0_denominator_inverses::<F>(
+                degree_bits,
+                quotient_degree_bits,
+                shifted_points.as_slice(),
+            );
             let points = F::two_adic_subgroup(degree_bits + quotient_degree_bits);
             assert_eq!(table.len(), points.len());
             let n = F::from_canonical_usize(1 << degree_bits);
@@ -3254,22 +3404,44 @@ mod l_0_table_tests {
         }
     }
 
+    /// Positive control for both cache paths. A miss must consume the supplied
+    /// entries (the first is deliberately changed); after insertion, a hit must
+    /// not inspect even an empty supplied slice and must return the same allocation.
+    #[test]
+    fn cache_miss_reads_shifted_points_and_hit_ignores_them() {
+        let degree_bits = 10;
+        let quotient_degree_bits = 0;
+        let shifted_points =
+            precomputed::shifted_two_adic_subgroup::<F>(degree_bits + quotient_degree_bits);
+        let n = F::from_canonical_usize(1 << degree_bits);
+        let original_first = (n * (shifted_points[0] - F::ONE)).inverse();
+        let mut supplied = shifted_points.as_ref().clone();
+        supplied[0] = supplied[0] + F::ONE;
+        let supplied_first = (n * (supplied[0] - F::ONE)).inverse();
+        assert_ne!(supplied_first.0, original_first.0);
+
+        let miss = l_0_denominator_inverses::<F>(degree_bits, quotient_degree_bits, &supplied);
+        assert_eq!(miss[0].0, supplied_first.0);
+        let hit = l_0_denominator_inverses::<F>(degree_bits, quotient_degree_bits, &[]);
+        assert!(std::sync::Arc::ptr_eq(&miss, &hit));
+        assert_eq!(hit[0].0, supplied_first.0);
+    }
+
     /// `eval_l_0` with the table attached must return raw-identical values to the uncached
     /// path at every LDE point.
     #[test]
     fn eval_l_0_with_table_matches_uncached() {
         for (degree_bits, quotient_degree_bits) in COMBOS {
+            let shifted_points =
+                precomputed::shifted_two_adic_subgroup::<F>(degree_bits + quotient_degree_bits);
             let plain = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits);
             let cached = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits)
                 .with_l_0_denominator_inverses(l_0_denominator_inverses::<F>(
                     degree_bits,
                     quotient_degree_bits,
+                    shifted_points.as_slice(),
                 ));
-            for (i, point) in F::two_adic_subgroup(degree_bits + quotient_degree_bits)
-                .into_iter()
-                .enumerate()
-            {
-                let x = F::coset_shift() * point;
+            for (i, &x) in shifted_points.iter().enumerate() {
                 assert_eq!(
                     cached.eval_l_0(i, x).0,
                     plain.eval_l_0(i, x).0,
