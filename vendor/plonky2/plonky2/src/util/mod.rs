@@ -12,8 +12,6 @@ use crate::field::types::Field;
 
 pub(crate) mod context_tree;
 pub(crate) mod partial_products;
-#[cfg(feature = "diagnostic_profile")]
-pub mod profile;
 pub mod reducing;
 pub mod serialization;
 pub mod strided_view;
