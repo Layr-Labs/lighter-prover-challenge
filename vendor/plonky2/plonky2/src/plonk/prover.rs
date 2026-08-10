@@ -12,7 +12,7 @@ use super::circuit_builder::{LookupChallenges, LookupWire};
 use crate::field::extension::Extendable;
 use crate::field::fft::ifft_borrowed;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
-use crate::field::types::Field;
+use crate::field::types::{Field, PrimeField64};
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::fri::oracle::{BatchLayout, PolynomialBatch};
 use crate::gates::lookup::LookupGate;
@@ -576,16 +576,79 @@ pub fn paired_permutation_batch_count() -> usize {
     PAIRED_PERMUTATION_BATCHES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Montgomery batch inversion specialized for permutation chunk products.
+///
+/// Fixed routed-wire chunks produce a denominator of one. Keeping those identities out of
+/// each of the four cumulative-product chains removes field multiplications while preserving
+/// the input order and the single inversion used by `Field::batch_multiplicative_inverse_into`.
+fn batch_multiplicative_inverse_skipping_ones_into<F: PrimeField64>(x: &[F], buf: &mut Vec<F>) {
+    const WIDTH: usize = 4;
+
+    let n = x.len();
+    if n < WIDTH {
+        F::batch_multiplicative_inverse_into(x, buf);
+        return;
+    }
+
+    buf.clear();
+    buf.reserve(n);
+
+    // All-fixed chunks retain the canonical `F::ONE` accumulator representation. Other
+    // representations of one safely take the ordinary multiplication path.
+    let mut cumul_prod: [F; WIDTH] = x[..WIDTH].try_into().unwrap();
+    buf.extend(cumul_prod);
+    for (i, &xi) in x[WIDTH..].iter().enumerate() {
+        if xi.to_noncanonical_u64() != 1 {
+            cumul_prod[i % WIDTH] *= xi;
+        }
+        buf.push(cumul_prod[i % WIDTH]);
+    }
+    debug_assert_eq!(buf.len(), n);
+
+    let mut a_inv = {
+        let c01 = cumul_prod[0] * cumul_prod[1];
+        let c23 = cumul_prod[2] * cumul_prod[3];
+        let c0123 = c01 * c23;
+        let c0123inv = c0123.inverse();
+        let c01inv = c0123inv * c23;
+        let c23inv = c0123inv * c01;
+        [
+            c01inv * cumul_prod[1],
+            c01inv * cumul_prod[0],
+            c23inv * cumul_prod[3],
+            c23inv * cumul_prod[2],
+        ]
+    };
+
+    for i in (WIDTH..n).rev() {
+        if x[i].to_noncanonical_u64() == 1 {
+            buf[i] = F::ONE;
+        } else {
+            buf[i] = buf[i - WIDTH] * a_inv[i % WIDTH];
+            a_inv[i % WIDTH] *= x[i];
+        }
+    }
+    for i in (0..WIDTH).rev() {
+        buf[i] = if x[i].to_noncanonical_u64() == 1 { F::ONE } else { a_inv[i] };
+    }
+
+    for (&bi, &xi) in buf.iter().zip(x) {
+        debug_assert_eq!(bi * xi, F::ONE);
+    }
+}
+
 #[inline]
-fn divide_chunk_products<F: Field>(
+fn divide_chunk_products<F: PrimeField64>(
     numerator_products: &mut [F],
     denominator_products: &[F],
     inverse_scratch: &mut Vec<F>,
 ) {
     debug_assert_eq!(numerator_products.len(), denominator_products.len());
-    F::batch_multiplicative_inverse_into(denominator_products, inverse_scratch);
+    batch_multiplicative_inverse_skipping_ones_into(denominator_products, inverse_scratch);
     for (product, &inverse) in numerator_products.iter_mut().zip(inverse_scratch.iter()) {
-        *product *= inverse;
+        if inverse.to_noncanonical_u64() != 1 {
+            *product *= inverse;
+        }
     }
 }
 
@@ -594,7 +657,7 @@ fn divide_chunk_products<F: Field>(
 /// and the whole-phase transpose. Values and their order are identical to the
 /// swap-based version: for each point, column k receives the k-th running
 /// product, and the last column receives the previous Z(x).
-fn z_polynomials_from_quotient_chunk_products<F: Field>(
+fn z_polynomials_from_quotient_chunk_products<F: PrimeField64>(
     all_quotient_chunk_products: Vec<F>,
     num_prods: usize,
 ) -> Vec<PolynomialValues<F>> {
@@ -608,7 +671,9 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
     for quotient_chunk_products in all_quotient_chunk_products.chunks_exact(num_chunks) {
         let mut acc = z_x;
         for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
-            acc *= quotient_chunk_product;
+            if quotient_chunk_product.to_noncanonical_u64() != 1 {
+                acc *= quotient_chunk_product;
+            }
             if k == num_prods {
                 // The last term is Z(gx), but we store Z(x) in its place,
                 // otherwise Z would end up shifted.
@@ -3077,13 +3142,73 @@ mod l_0_table_cache {
 #[cfg(test)]
 mod flat_chunk_products_tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
-    use plonky2_field::types::{Field, PrimeField64};
+    use plonky2_field::types::{Field, Field64, PrimeField64};
 
     use crate::util::partial_products::quotient_chunk_products_into;
 
-    use super::divide_chunk_products;
+    use super::{
+        batch_multiplicative_inverse_skipping_ones_into, divide_chunk_products,
+        z_polynomials_from_quotient_chunk_products,
+    };
 
     type F = GoldilocksField;
+
+    #[test]
+    fn identity_aware_batch_inverse_matches_field_implementation() {
+        for &len in &[0usize, 1, 2, 3, 4, 5, 7, 8, 17, 128, 1280] {
+            for pattern in 0..7 {
+                let mut values = noncanonical_vec(len, pattern as u64 + 11);
+                for (i, value) in values.iter_mut().enumerate() {
+                    if *value == F::ZERO || (i + pattern) % 5 == 0 {
+                        *value = if i % 2 == 0 {
+                            F::ONE
+                        } else {
+                            GoldilocksField(GoldilocksField::ORDER + 1)
+                        };
+                    }
+                }
+
+                let mut expected = Vec::new();
+                F::batch_multiplicative_inverse_into(&values, &mut expected);
+                let mut actual = vec![F::ZERO; len + 3];
+                batch_multiplicative_inverse_skipping_ones_into(&values, &mut actual);
+                assert_eq!(actual, expected, "len={len}, pattern={pattern}");
+            }
+
+            let values = vec![F::ONE; len];
+            let mut actual = Vec::new();
+            batch_multiplicative_inverse_skipping_ones_into(&values, &mut actual);
+            assert_eq!(actual, values, "all identities, len={len}");
+        }
+    }
+
+    #[test]
+    fn identity_aware_z_chain_matches_unconditional_accumulation() {
+        let num_chunks = 10;
+        let num_prods = num_chunks - 1;
+        let n_points = 16;
+        let mut products = noncanonical_vec(n_points * num_chunks, 41);
+        for (i, product) in products.iter_mut().enumerate() {
+            if i % 3 == 0 {
+                *product = F::ONE;
+            } else if i % 7 == 0 {
+                *product = GoldilocksField(GoldilocksField::ORDER + 1);
+            }
+        }
+
+        let mut expected = (0..num_chunks)
+            .map(|_| Vec::with_capacity(n_points))
+            .collect::<Vec<_>>();
+        let mut z_x = F::ONE;
+        for point_products in products.chunks_exact(num_chunks) {
+            accumulate_point(&mut expected, &mut z_x, point_products);
+        }
+
+        let actual = z_polynomials_from_quotient_chunk_products(products, num_prods);
+        for (column, expected_column) in actual.iter().zip(expected) {
+            assert_eq!(column.values, expected_column);
+        }
+    }
 
     #[test]
     fn chunk_before_inversion_matches_individual_ratios() {
