@@ -3326,7 +3326,15 @@ impl MetalShared {
             command_buffer.to_owned()
         });
 
+        // LOCAL INSTRUMENTATION ONLY
+        let gpu_wait_start = std::time::Instant::now();
         command_buffer.wait_until_completed();
+        if std::env::var_os("LIGHTER_GPU_WAIT_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "gpu-wait {cols}x{lde_size} {}ms",
+                gpu_wait_start.elapsed().as_millis()
+            );
+        }
         if command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "command buffer ended with status {:?}",
@@ -3551,7 +3559,15 @@ impl MetalShared {
             command_buffer.to_owned()
         });
 
+        // LOCAL INSTRUMENTATION ONLY
+        let gpu_wait_start = std::time::Instant::now();
         command_buffer.wait_until_completed();
+        if std::env::var_os("LIGHTER_GPU_WAIT_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "gpu-wait {leaf_width}x{leaf_count} {}ms",
+                gpu_wait_start.elapsed().as_millis()
+            );
+        }
         if command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "command buffer ended with status {:?}",
