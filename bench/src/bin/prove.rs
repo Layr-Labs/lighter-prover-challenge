@@ -79,6 +79,7 @@ fn main() {
     // log consumer, and diagnostics remain available in debug/test builds.
     // Do not link and initialize an unused logger in every scored process.
     rayon::ThreadPoolBuilder::new()
+        .num_threads(3)
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
         .expect("cannot configure prover thread pool");
