@@ -51,8 +51,8 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 }
 
 const LIGHT_TX_PROOF_WINDOW: usize = 4;
-// Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
-const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
+// Keep the initial light proofs serial while the early heavy path is active.
+const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 2;
 
 fn chunk_is_light(txs: &[Arc<Tx<F>>]) -> bool {
     txs.first()
