@@ -77,6 +77,28 @@ pub trait Extendable<const D: usize>: Field + Sized {
     /// with the base field which implies that the FFT commutes with field inclusion.
     const EXT_POWER_OF_TWO_GENERATOR: [Self; D];
 
+    /// Compute the dot product of extension-field values and base-field
+    /// scalars. The slices are zipped, matching the usual iterator behavior
+    /// when their lengths differ.
+    ///
+    /// The default preserves the reduce-per-product implementation. A base
+    /// field may specialize this when it can safely delay modular reduction
+    /// across several products.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_product(
+        extension_values: &[Self::Extension],
+        base_scalars: &[Self],
+    ) -> Self::Extension {
+        extension_values
+            .iter()
+            .zip(base_scalars)
+            .map(|(&value, &scalar)| {
+                <Self::Extension as FieldExtension<D>>::scalar_mul(&value, scalar)
+            })
+            .sum()
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.

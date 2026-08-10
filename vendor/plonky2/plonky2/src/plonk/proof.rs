@@ -329,7 +329,9 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         // into a degree-sized extension vector (one allocation plus a full
         // conversion pass per polynomial) before running extension-by-
         // extension Horner. The dot product reads the base coefficients in
-        // place, and multiplies each by a table entry via `scalar_mul`.
+        // place; `Extendable::extension_base_dot_product` defaults to the old
+        // scalar-multiply-and-sum loop and lets concrete fields delay
+        // reductions where their representation makes that safe.
         // Value-exactness: the field is exact, `powers()` produces exactly
         // `z^i`, and `sum c_i z^i` under any association equals Horner's
         // `(..(c_{n-1} z + c_{n-2}) z + ..)`, so every opening is the
@@ -373,13 +375,7 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         let eval_polynomials = |pows: &[F::Extension], polynomials: &[PolynomialCoeffs<F>]| {
             polynomials
                 .par_iter()
-                .map(|p| {
-                    p.coeffs
-                        .iter()
-                        .zip(pows)
-                        .map(|(&coeff, zp)| zp.scalar_mul(coeff))
-                        .sum::<F::Extension>()
-                })
+                .map(|p| F::extension_base_dot_product(pows, &p.coeffs))
                 .collect::<Vec<_>>()
         };
         let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
