@@ -576,6 +576,25 @@ pub fn paired_permutation_batch_count() -> usize {
     PAIRED_PERMUTATION_BATCHES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// Test-only differential switch. The dispatch decision happens before entering Rayon, so a
+    /// caller-thread-local flag cannot leak between concurrently running tests or worker jobs.
+    static FORCE_DENSE_PERMUTATION_PRODUCTS: core::cell::Cell<bool> = const {
+        core::cell::Cell::new(false)
+    };
+}
+
+#[inline]
+fn force_dense_permutation_products() -> bool {
+    #[cfg(test)]
+    {
+        return FORCE_DENSE_PERMUTATION_PRODUCTS.with(core::cell::Cell::get);
+    }
+    #[cfg(not(test))]
+    false
+}
+
 #[inline]
 fn divide_chunk_products<F: Field>(
     numerator_products: &mut [F],
@@ -623,6 +642,99 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
     columns.into_iter().map(PolynomialValues::new).collect()
 }
 
+/// Build one compact-product offset per inversion batch. At the production shape, one mask byte
+/// describes exactly one quotient-degree chunk: all bits set means all eight permutation factors
+/// cancel symbolically and the chunk ratio is the multiplicative identity. Such a ratio need not
+/// be materialized in the temporary stream, although its committed partial-product column remains.
+fn compact_chunk_product_offsets(
+    fixed_chunk_mask: &[u8],
+    n_points: usize,
+    num_chunks: usize,
+    batch_size: usize,
+) -> Option<Vec<u32>> {
+    if batch_size == 0 || fixed_chunk_mask.len() != n_points.checked_mul(num_chunks)? {
+        return None;
+    }
+
+    let mut offsets = Vec::with_capacity(n_points.div_ceil(batch_size) + 1);
+    offsets.push(0u32);
+    for mask_batch in fixed_chunk_mask.chunks(batch_size.checked_mul(num_chunks)?) {
+        let active = mask_batch.iter().filter(|&&mask| mask != u8::MAX).count();
+        let next = offsets
+            .last()
+            .copied()
+            .and_then(|offset| offset.checked_add(u32::try_from(active).ok()?))?;
+        offsets.push(next);
+    }
+    Some(offsets)
+}
+
+/// Split uninitialized vector capacity into the disjoint slices owned by Rayon jobs. Constructing
+/// the slices sequentially keeps the unsafe boundary identical to the existing capacity helper;
+/// the parallel pass itself uses ordinary exclusive slices, not shared pointer arithmetic or an
+/// atomic allocation cursor.
+fn split_uninit_at_offsets<'a, T>(
+    mut slots: &'a mut [core::mem::MaybeUninit<T>],
+    offsets: &[u32],
+) -> Vec<&'a mut [core::mem::MaybeUninit<T>]> {
+    debug_assert_eq!(offsets.first(), Some(&0));
+    debug_assert_eq!(
+        offsets.last().copied().map(|x| x as usize),
+        Some(slots.len())
+    );
+    let mut batches = Vec::with_capacity(offsets.len().saturating_sub(1));
+    for window in offsets.windows(2) {
+        let len = (window[1] - window[0]) as usize;
+        let (batch, remaining) = slots.split_at_mut(len);
+        batches.push(batch);
+        slots = remaining;
+    }
+    debug_assert!(slots.is_empty());
+    batches
+}
+
+/// Expand the compact active-ratio stream back into the exact dense Z recurrence. Identity chunks
+/// skip the temporary read and multiplication, but every partial-product and Z column is still
+/// written at every row.
+fn z_polynomials_from_compact_quotient_chunk_products<F: Field>(
+    quotient_chunk_products: Vec<F>,
+    fixed_chunk_mask: &[u8],
+    n_points: usize,
+    num_prods: usize,
+) -> Vec<PolynomialValues<F>> {
+    let num_chunks = num_prods + 1;
+    debug_assert_eq!(fixed_chunk_mask.len(), n_points * num_chunks);
+    let mut products = quotient_chunk_products.into_iter();
+    let mut columns: Vec<Vec<F>> = (0..num_chunks)
+        .map(|_| Vec::with_capacity(n_points))
+        .collect();
+    let mut z_x = F::ONE;
+
+    for mask_row in fixed_chunk_mask.chunks_exact(num_chunks) {
+        let mut acc = z_x;
+        for (chunk, &mask) in mask_row.iter().enumerate() {
+            if mask != u8::MAX {
+                acc *= products
+                    .next()
+                    .expect("compact quotient-product stream ended early");
+            }
+            if chunk == num_prods {
+                // The last term is Z(gx), but the committed last column stores Z(x).
+                columns[chunk].push(z_x);
+                z_x = acc;
+            } else {
+                columns[chunk].push(acc);
+            }
+        }
+    }
+    assert!(
+        products.next().is_none(),
+        "compact quotient-product stream has trailing values"
+    );
+
+    columns.into_iter().map(PolynomialValues::new).collect()
+}
+
 /// Compute both production permutation challenges in one pass over the witness
 /// and sigma rows.
 ///
@@ -633,11 +745,12 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
 /// Fusing collapses two full traversals of the witness and sigma matrices, and
 /// two Rayon fork/joins over the subgroup, into one.
 ///
-/// Value-exactness: each challenge keeps its own accumulators, its own
+/// Field-exactness: each challenge keeps its own accumulators, its own
 /// numerator/denominator multiplication order (`for j in start..end`), its own
-/// inversion batch in the same push order, and its own Z chain. Only the
-/// memory traversal and the Rayon scheduling are shared, so every output limb
-/// is bit-identical to running the per-challenge path twice.
+/// inversion batch in the same push order, and its own Z chain. Fully fixed
+/// chunks omit a multiplication by one, so masked outputs are field-identical
+/// but are not required to preserve noncanonical raw limbs. The all-active
+/// dense fallback remains limb-identical to the per-challenge path.
 fn two_challenge_wires_permutation_partial_products_and_zs<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -650,6 +763,39 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
 ) -> Vec<Vec<PolynomialValues<F>>> {
+    let degree = common_data.quotient_degree_factor;
+    let num_routed_wires = common_data.config.num_routed_wires;
+    let num_chunks = common_data.num_partial_products + 1;
+
+    // Only the production width-eight layout maps one mask byte to one complete quotient chunk.
+    // Any other layout, malformed mask length, or compact-offset overflow retains the exact dense
+    // implementation below.
+    if !force_dense_permutation_products()
+        && degree == 8
+        && num_routed_wires % 8 == 0
+        && num_chunks == num_routed_wires / 8
+    {
+        if let Some(offsets) = compact_chunk_product_offsets(
+            &prover_data.fixed_routed_wires,
+            prover_data.subgroup.len(),
+            num_chunks,
+            128,
+        ) {
+            let dense_count = prover_data.subgroup.len() * num_chunks;
+            if offsets.last().copied().unwrap_or(0) as usize != dense_count {
+                return two_challenge_compact_wires_permutation_partial_products_and_zs(
+                    witness,
+                    betas,
+                    beta_k_is,
+                    gammas,
+                    prover_data,
+                    common_data,
+                    &offsets,
+                );
+            }
+        }
+    }
+
     debug_assert_eq!(betas.len(), 2);
     debug_assert_eq!(gammas.len(), 2);
     let degree = common_data.quotient_degree_factor;
@@ -764,6 +910,182 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     vec![
         z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
         z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
+    ]
+}
+
+#[cfg(test)]
+fn two_challenge_dense_wires_permutation_partial_products_and_zs<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &MatrixWitness<F>,
+    betas: &[F],
+    beta_k_is: &[F],
+    gammas: &[F],
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+) -> Vec<Vec<PolynomialValues<F>>> {
+    FORCE_DENSE_PERMUTATION_PRODUCTS.with(|force_dense| {
+        let previous = force_dense.replace(true);
+        let output = two_challenge_wires_permutation_partial_products_and_zs(
+            witness,
+            betas,
+            beta_k_is,
+            gammas,
+            prover_data,
+            common_data,
+        );
+        force_dense.set(previous);
+        output
+    })
+}
+
+/// Production-only compact temporary stream. Batch offsets preserve the dense row/chunk order,
+/// while disjoint slices preserve Rayon parallelism without any shared write cursor.
+fn two_challenge_compact_wires_permutation_partial_products_and_zs<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &MatrixWitness<F>,
+    betas: &[F],
+    beta_k_is: &[F],
+    gammas: &[F],
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+    offsets: &[u32],
+) -> Vec<Vec<PolynomialValues<F>>> {
+    debug_assert_eq!(betas.len(), 2);
+    debug_assert_eq!(gammas.len(), 2);
+    let degree = common_data.quotient_degree_factor;
+    let subgroup = &prover_data.subgroup;
+    let num_prods = common_data.num_partial_products;
+    let num_routed_wires = common_data.config.num_routed_wires;
+    let num_chunks = num_prods + 1;
+    debug_assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
+    debug_assert_eq!(beta_k_is.len(), 2 * num_routed_wires);
+    let (beta_k_is_0, beta_k_is_1) = beta_k_is.split_at(num_routed_wires);
+    let (beta_0, beta_1) = (betas[0], betas[1]);
+    let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
+
+    const INV_BATCH: usize = 128;
+    let fixed_chunk_mask = &prover_data.fixed_routed_wires;
+    let product_count = offsets.last().copied().unwrap_or(0) as usize;
+    assert_eq!(offsets.len(), subgroup.len().div_ceil(INV_BATCH) + 1);
+    let mut quotient_products_0: Vec<F> = Vec::with_capacity(product_count);
+    let mut quotient_products_1: Vec<F> = Vec::with_capacity(product_count);
+    {
+        let product_slots_0 = crate::hash::merkle_tree::capacity_up_to_mut(
+            &mut quotient_products_0,
+            product_count,
+        );
+        let product_slots_1 = crate::hash::merkle_tree::capacity_up_to_mut(
+            &mut quotient_products_1,
+            product_count,
+        );
+        let product_batches_0 = split_uninit_at_offsets(product_slots_0, offsets);
+        let product_batches_1 = split_uninit_at_offsets(product_slots_1, offsets);
+        product_batches_0
+            .into_par_iter()
+            .zip(product_batches_1.into_par_iter())
+            .zip(subgroup.par_chunks(INV_BATCH))
+            .zip(fixed_chunk_mask.par_chunks(INV_BATCH * num_chunks))
+            .enumerate()
+            .for_each_init(
+                || {
+                    (
+                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(num_chunks * INV_BATCH),
+                    )
+                },
+                |scratch, (chunk_idx, (((products_0, products_1), xs), mask_batch))| {
+                    let base = chunk_idx * INV_BATCH;
+                    let (denominators_0, denominators_1, denominator_inverses) = scratch;
+                    denominators_0.clear();
+                    denominators_1.clear();
+                    let mut output = 0;
+                    for (t, &x) in xs.iter().enumerate() {
+                        let i = base + t;
+                        let s_sigmas = &prover_data.sigmas[i];
+                        let routed_base = i * num_routed_wires;
+                        for chunk in 0..num_chunks {
+                            if mask_batch[t * num_chunks + chunk] == u8::MAX {
+                                continue;
+                            }
+                            let start = chunk * degree;
+                            let end = min(start + degree, num_routed_wires);
+                            let mut numerator_0 = F::ONE;
+                            let mut numerator_1 = F::ONE;
+                            let mut denominator_0 = F::ONE;
+                            let mut denominator_1 = F::ONE;
+                            for j in start..end {
+                                // A singleton routed copy component maps this position to itself:
+                                // sigma(i,j) = k_j * x. Its numerator and denominator factors are
+                                // therefore identical for both challenges and cancel symbolically,
+                                // including when that common factor evaluates to zero. Check the
+                                // circuit-fixed bit before touching witness, sigma, x, or shifts.
+                                if fixed_routed_wire(
+                                    &prover_data.fixed_routed_wires,
+                                    routed_base + j,
+                                ) {
+                                    continue;
+                                }
+                                let wire_value = witness.get_wire(i, j);
+                                let sigma = s_sigmas[j];
+                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
+                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
+                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
+                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                            }
+                            products_0[output].write(numerator_0);
+                            products_1[output].write(numerator_1);
+                            denominators_0.push(denominator_0);
+                            denominators_1.push(denominator_1);
+                            output += 1;
+                        }
+                    }
+                    // These checks are part of the initialization proof, so keep them in release
+                    // builds: a future change to either mask traversal must fail before the cast.
+                    assert_eq!(output, products_0.len());
+                    assert_eq!(output, products_1.len());
+                    // SAFETY: the loop above wrote every slot of both
+                    // compact sub-slices in row/chunk order. Their lengths came
+                    // from the same mask batch's checked prefix count.
+                    let products_0 = unsafe {
+                        &mut *(products_0 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
+                    };
+                    let products_1 = unsafe {
+                        &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
+                    };
+                    divide_chunk_products(products_0, denominators_0, denominator_inverses);
+                    divide_chunk_products(products_1, denominators_1, denominator_inverses);
+                },
+            );
+    }
+
+    // SAFETY: the parallel pass above wrote and then divided every one of the
+    // `product_count` slots of both buffers; the prefix-derived disjoint slices
+    // partition each buffer exactly, so none is left uninitialized.
+    unsafe {
+        quotient_products_0.set_len(product_count);
+        quotient_products_1.set_len(product_count);
+    }
+
+    vec![
+        z_polynomials_from_compact_quotient_chunk_products(
+            quotient_products_0,
+            fixed_chunk_mask,
+            subgroup.len(),
+            num_prods,
+        ),
+        z_polynomials_from_compact_quotient_chunk_products(
+            quotient_products_1,
+            fixed_chunk_mask,
+            subgroup.len(),
+            num_prods,
+        ),
     ]
 }
 
@@ -3072,7 +3394,11 @@ mod flat_chunk_products_tests {
 
     use crate::util::partial_products::quotient_chunk_products_into;
 
-    use super::divide_chunk_products;
+    use super::{
+        compact_chunk_product_offsets, divide_chunk_products,
+        z_polynomials_from_compact_quotient_chunk_products,
+        z_polynomials_from_quotient_chunk_products,
+    };
 
     type F = GoldilocksField;
 
@@ -3217,6 +3543,101 @@ mod flat_chunk_products_tests {
             }
         }
     }
+
+    #[test]
+    fn compact_offsets_cover_batch_boundaries_and_reject_malformed_masks() {
+        const CHUNKS: usize = 10;
+        const BATCH: usize = 128;
+        for &n_points in &[1usize, 127, 128, 129, 300] {
+            let mask = (0..n_points * CHUNKS)
+                .map(|i| if i % 5 == 0 || i % 17 == 0 { u8::MAX } else { 0 })
+                .collect::<Vec<_>>();
+            let offsets = compact_chunk_product_offsets(&mask, n_points, CHUNKS, BATCH)
+                .expect("valid production-shaped mask");
+            assert_eq!(offsets.len(), n_points.div_ceil(BATCH) + 1);
+            assert_eq!(offsets[0], 0);
+            for (batch, window) in offsets.windows(2).enumerate() {
+                let row_start = batch * BATCH;
+                let row_end = core::cmp::min(row_start + BATCH, n_points);
+                let expected = mask[row_start * CHUNKS..row_end * CHUNKS]
+                    .iter()
+                    .filter(|&&byte| byte != u8::MAX)
+                    .count();
+                assert_eq!((window[1] - window[0]) as usize, expected);
+            }
+            assert_eq!(
+                offsets.last().copied().unwrap() as usize,
+                mask.iter().filter(|&&byte| byte != u8::MAX).count()
+            );
+
+            assert!(compact_chunk_product_offsets(
+                &mask[..mask.len() - 1],
+                n_points,
+                CHUNKS,
+                BATCH
+            )
+            .is_none());
+        }
+        assert!(compact_chunk_product_offsets(&[], 0, CHUNKS, 0).is_none());
+    }
+
+    #[test]
+    fn compact_z_stream_preserves_every_dense_column() {
+        const CHUNKS: usize = 10;
+        let n_points = 128;
+        for pattern in 0..4 {
+            let mask = (0..n_points * CHUNKS)
+                .map(|i| match pattern {
+                    0 => 0,
+                    1 => u8::MAX,
+                    2 if i % CHUNKS == CHUNKS - 1 => u8::MAX,
+                    2 => 0,
+                    _ if i % 7 == 0 || i % 13 == 0 => u8::MAX,
+                    _ => (i as u8).wrapping_mul(37),
+                })
+                .collect::<Vec<_>>();
+            let dense = noncanonical_vec(n_points * CHUNKS, 0xabc0 + pattern);
+            let compact = dense
+                .iter()
+                .zip(&mask)
+                .filter_map(|(&value, &byte)| (byte != u8::MAX).then_some(value))
+                .collect::<Vec<_>>();
+            let dense_with_identities = dense
+                .iter()
+                .zip(&mask)
+                .map(|(&value, &byte)| if byte == u8::MAX { F::ONE } else { value })
+                .collect::<Vec<_>>();
+
+            let expected =
+                z_polynomials_from_quotient_chunk_products(dense_with_identities, CHUNKS - 1);
+            let actual = z_polynomials_from_compact_quotient_chunk_products(
+                compact,
+                &mask,
+                n_points,
+                CHUNKS - 1,
+            );
+            assert_eq!(actual.len(), CHUNKS);
+            for column in 0..CHUNKS {
+                assert_eq!(
+                    actual[column].values, expected[column].values,
+                    "field-value mismatch in pattern {pattern}, column {column}"
+                );
+            }
+            if pattern == 0 {
+                assert_eq!(
+                    actual
+                        .iter()
+                        .flat_map(|poly| raw(&poly.values))
+                        .collect::<Vec<_>>(),
+                    expected
+                        .iter()
+                        .flat_map(|poly| raw(&poly.values))
+                        .collect::<Vec<_>>(),
+                    "all-active compact stream must preserve raw limbs"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -3282,13 +3703,10 @@ mod l_0_table_tests {
 
 /// Value-exactness gate for the fused two-challenge permutation path.
 ///
-/// `two_challenge_wires_permutation_partial_products_and_zs` must be a pure
-/// traversal/scheduling change: for the same witness, sigmas, subgroup and
-/// challenges it has to reproduce, **limb for limb**, what two independent
-/// `wires_permutation_partial_products_and_zs` calls produce. Goldilocks
-/// canonicalises inside `PartialEq`, so field equality would hide a path that
-/// returned a different representative of the same residue; the primary
-/// comparisons here are on the raw `to_noncanonical_u64` limbs instead.
+/// With an all-active mask, `two_challenge_wires_permutation_partial_products_and_zs` is a pure
+/// traversal/scheduling change and must reproduce two independent calls limb for limb. With fully
+/// fixed chunks compacted away, skipping `acc *= ONE` is required only to preserve field values;
+/// dedicated mask tests therefore use an independent symbolic reference and field equality.
 #[cfg(all(test, feature = "std"))]
 mod permutation_pairing_tests {
     use crate::field::polynomial::PolynomialValues;
@@ -3300,6 +3718,7 @@ mod permutation_pairing_tests {
 
     use super::{
         all_wires_permutation_partial_products, paired_permutation_batch_count,
+        two_challenge_dense_wires_permutation_partial_products_and_zs,
         two_challenge_wires_permutation_partial_products_and_zs,
         wires_permutation_partial_products_and_zs,
     };
@@ -3461,10 +3880,9 @@ mod permutation_pairing_tests {
         assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
         assert_eq!(data.common.k_is.len(), num_routed_wires);
 
-        // Point counts spanning: a single point, a short first batch, the
-        // inversion batch boundary (INV_BATCH = 128) exactly, one past it, and
-        // several batches with a short tail.
-        for &n_points in &[1usize, 5, 127, 128, 129, 300] {
+        // PolynomialValues requires a power-of-two domain. Exact short-batch offset coverage is
+        // tested separately by `compact_offsets_cover_batch_boundaries_and_reject_malformed_masks`.
+        for &n_points in &[1usize, 128, 256] {
             let mut rng = Rng::new(0x9e37_79b9_7f4a_7c15 ^ ((n_points as u64) << 8));
 
             let subgroup: Vec<F> = (0..n_points).map(|_| rng.next_field()).collect();
@@ -3650,6 +4068,13 @@ mod permutation_pairing_tests {
             data.prover_only.fixed_routed_wires.len(),
             (n * num_routed_wires).div_ceil(8)
         );
+        assert!(
+            data.prover_only
+                .fixed_routed_wires
+                .iter()
+                .any(|&byte| byte == u8::MAX),
+            "test circuit has no fully fixed quotient chunk"
+        );
 
         // Same field value as subgroup[0] = 1, deliberately different raw Goldilocks limb.
         assert_eq!(data.prover_only.subgroup[0], F::ONE);
@@ -3708,6 +4133,14 @@ mod permutation_pairing_tests {
             &data.prover_only,
             &data.common,
         );
+        let dense = two_challenge_dense_wires_permutation_partial_products_and_zs(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            &data.prover_only,
+            &data.common,
+        );
         for challenge in 0..2 {
             let reference = naive_reference(
                 &witness,
@@ -3724,7 +4157,107 @@ mod permutation_pairing_tests {
             );
             for column in 0..=num_prods {
                 assert_eq!(paired[challenge][column].values, reference[column]);
+                assert_eq!(paired[challenge][column].values, dense[challenge][column].values);
             }
         }
     }
+
+    #[test]
+    fn paired_all_identity_chunks_use_empty_stream_and_match_dense() {
+        let mut data = build_circuit();
+        let n = data.prover_only.subgroup.len();
+        let num_routed_wires = data.common.config.num_routed_wires;
+        assert_eq!(num_routed_wires, 80);
+        assert_eq!(data.common.quotient_degree_factor, 8);
+        data.prover_only.fixed_routed_wires.fill(u8::MAX);
+        for i in 0..n {
+            let x = data.prover_only.subgroup[i];
+            for j in 0..num_routed_wires {
+                data.prover_only.sigmas[i][j] = data.common.k_is[j] * x;
+            }
+        }
+
+        let mut rng = Rng::new(0xe11d_e11d_5eed_0001);
+        let witness = MatrixWitness {
+            wire_values: (0..num_routed_wires)
+                .map(|_| (0..n).map(|_| rng.next_field()).collect())
+                .collect(),
+        };
+        let betas = [F::from_canonical_u64(17), F::from_canonical_u64(29)];
+        let gammas = [F::from_canonical_u64(41), F::from_canonical_u64(53)];
+        let beta_k_is = betas
+            .iter()
+            .flat_map(|&beta| data.common.k_is.iter().map(move |&k_i| beta * k_i))
+            .collect::<Vec<_>>();
+
+        let compact = two_challenge_wires_permutation_partial_products_and_zs(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            &data.prover_only,
+            &data.common,
+        );
+        let dense = two_challenge_dense_wires_permutation_partial_products_and_zs(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            &data.prover_only,
+            &data.common,
+        );
+        assert_eq!(compact.len(), 2);
+        for challenge in 0..2 {
+            for column in 0..=data.common.num_partial_products {
+                assert_eq!(compact[challenge][column].values, dense[challenge][column].values);
+                assert!(compact[challenge][column]
+                    .values
+                    .iter()
+                    .all(|&value| value == F::ONE));
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_chunk_mask_falls_back_to_exact_dense_path() {
+        let mut data = build_circuit();
+        data.prover_only.fixed_routed_wires.pop();
+        let n = data.prover_only.subgroup.len();
+        let num_routed_wires = data.common.config.num_routed_wires;
+        assert_ne!(
+            data.prover_only.fixed_routed_wires.len(),
+            n * (data.common.num_partial_products + 1)
+        );
+        let mut rng = Rng::new(0xfa11_bacc_5eed_0001);
+        let witness = MatrixWitness {
+            wire_values: (0..num_routed_wires)
+                .map(|_| (0..n).map(|_| rng.next_field()).collect())
+                .collect(),
+        };
+        let betas = [F::from_canonical_u64(17), F::from_canonical_u64(29)];
+        let gammas = [F::from_canonical_u64(41), F::from_canonical_u64(53)];
+        let beta_k_is = betas
+            .iter()
+            .flat_map(|&beta| data.common.k_is.iter().map(move |&k_i| beta * k_i))
+            .collect::<Vec<_>>();
+
+        let dispatched = two_challenge_wires_permutation_partial_products_and_zs(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            &data.prover_only,
+            &data.common,
+        );
+        let dense = two_challenge_dense_wires_permutation_partial_products_and_zs(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            &data.prover_only,
+            &data.common,
+        );
+        assert_eq!(raw_limbs(&dispatched), raw_limbs(&dense));
+    }
+
 }

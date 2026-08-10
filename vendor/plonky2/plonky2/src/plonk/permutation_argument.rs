@@ -271,6 +271,77 @@ impl Forest {
 
         WirePartition { sigma }
     }
+
+    /// Builds the sigma cycles and the routed fixed-point mask in the same
+    /// routed-position traversal.
+    ///
+    /// The first member of a component starts as a sigma self-loop and sets
+    /// its bit. Seeing a second member both splices it into the sigma cycle and
+    /// clears that first bit; later members leave the already-clear bit alone.
+    /// This is exactly the saturated-cardinality rule in
+    /// [`fixed_routed_wire_mask`], without its two additional representative-
+    /// map passes or cardinality scratch allocation.
+    ///
+    /// Stored maps must already be compressed. Invalid dimensions, indices or
+    /// non-root representatives return `None`, preserving the loader's
+    /// malformed-map fallback rather than indexing unchecked storage.
+    pub fn wire_partition_with_fixed_routed_wire_mask(
+        &mut self,
+    ) -> Option<(WirePartition, Vec<u8>)> {
+        if self.num_routed_wires > self.num_wires {
+            return None;
+        }
+        let wire_targets = self.degree.checked_mul(self.num_wires)?;
+        if wire_targets > self.parents.len() {
+            return None;
+        }
+        let routed_positions = self.degree.checked_mul(self.num_routed_wires)?;
+        let mut sigma = vec![0u32; routed_positions];
+        let mut last = vec![u32::MAX; self.parents.len()];
+        let mut fixed = vec![0u8; routed_positions.div_ceil(8)];
+        let power_of_two_degree = self.degree.is_power_of_two();
+        let degree_shift = self.degree.trailing_zeros() as usize;
+        let degree_mask = self.degree.wrapping_sub(1);
+
+        for row in 0..self.degree {
+            let target_base = row * self.num_wires;
+            let routed_base = row * self.num_routed_wires;
+            for column in 0..self.num_routed_wires {
+                let parent = self.parents[target_base + column] as usize;
+                if parent >= self.parents.len() || self.parents[parent] as usize != parent {
+                    return None;
+                }
+                let index = (column * self.degree + row) as u32;
+                let old_tail = last[parent];
+                if old_tail == u32::MAX {
+                    sigma[index as usize] = index;
+                    let routed_index = routed_base + column;
+                    fixed[routed_index >> 3] |= 1 << (routed_index & 7);
+                } else {
+                    sigma[index as usize] = sigma[old_tail as usize];
+                    sigma[old_tail as usize] = index;
+
+                    // A second routed member turns the class from a sigma
+                    // fixed point into a nontrivial cycle. `old_tail` is
+                    // column-major; convert it back to the row-major bit
+                    // position set when that member was first observed.
+                    // Clearing again for a third or later member is a harmless
+                    // no-op because those members were never set.
+                    let old_tail = old_tail as usize;
+                    let (old_column, old_row) = if power_of_two_degree {
+                        (old_tail >> degree_shift, old_tail & degree_mask)
+                    } else {
+                        (old_tail / self.degree, old_tail % self.degree)
+                    };
+                    let old_routed_index = old_row * self.num_routed_wires + old_column;
+                    fixed[old_routed_index >> 3] &= !(1 << (old_routed_index & 7));
+                }
+                last[parent] = index;
+            }
+        }
+
+        Some((WirePartition { sigma }, fixed))
+    }
 }
 
 #[derive(Debug)]
@@ -924,6 +995,11 @@ mod tests {
             degree,
         )
         .expect("valid compressed representative map");
+        let (fused_partition, fused_mask) = forest
+            .wire_partition_with_fixed_routed_wire_mask()
+            .expect("valid compressed representative map");
+        assert_eq!(fused_partition.sigma, sigma);
+        assert_eq!(fused_mask, mask);
         assert_eq!(mask.len(), (degree * num_routed_wires).div_ceil(8));
 
         for row in 0..degree {
@@ -941,5 +1017,64 @@ mod tests {
         assert!(fixed_routed_wire(&mask, 1));
         assert!(!fixed_routed_wire(&mask, 2));
         assert!(!fixed_routed_wire(&mask, num_routed_wires));
+    }
+
+    #[test]
+    fn fused_partition_mask_matches_two_pass_derivation() {
+        let num_wires = 11;
+        let num_routed_wires = 8;
+        let num_virtual_targets = 37;
+        for degree in [1usize, 2, 7, 16, 64] {
+            let mut rng = Lcg(0xf17e_d000 + degree as u64);
+            let merges = random_merges(
+                &mut rng,
+                num_wires,
+                degree,
+                num_virtual_targets,
+                5 * degree + 23,
+            );
+            let mut forest = build_forest(
+                num_wires,
+                num_routed_wires,
+                degree,
+                num_virtual_targets,
+                &merges,
+            );
+            forest.compress_paths();
+
+            let expected_partition = forest.wire_partition();
+            let expected_mask = fixed_routed_wire_mask(
+                &forest.parents,
+                num_wires,
+                num_routed_wires,
+                degree,
+            )
+            .expect("generated compressed map is valid");
+            let (actual_partition, actual_mask) = forest
+                .wire_partition_with_fixed_routed_wire_mask()
+                .expect("generated compressed map is valid");
+            assert_eq!(actual_partition.sigma, expected_partition.sigma);
+            assert_eq!(actual_mask, expected_mask);
+        }
+    }
+
+    #[test]
+    fn fused_partition_mask_rejects_malformed_maps() {
+        let invalid_dimensions = Forest::from_parents(vec![0; 4], 1, 2, 2)
+            .wire_partition_with_fixed_routed_wire_mask();
+        assert!(invalid_dimensions.is_none());
+
+        let truncated = Forest::from_parents(vec![0, 1, 2], 2, 1, 2)
+            .wire_partition_with_fixed_routed_wire_mask();
+        assert!(truncated.is_none());
+
+        let out_of_range = Forest::from_parents(vec![0, 1, 9, 3], 2, 1, 2)
+            .wire_partition_with_fixed_routed_wire_mask();
+        assert!(out_of_range.is_none());
+
+        // Routed cell zero names representative one, but one is not a root.
+        let uncompressed = Forest::from_parents(vec![1, 2, 2, 3], 2, 1, 2)
+            .wire_partition_with_fixed_routed_wire_mask();
+        assert!(uncompressed.is_none());
     }
 }
