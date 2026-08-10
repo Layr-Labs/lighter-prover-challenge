@@ -2338,7 +2338,11 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
+    // Consume each completed job at its existing merge point. This preserves
+    // the command-buffer finish order and scaled addition exactly, while
+    // letting the job's Drop return its output to the Metal pool as soon as
+    // the borrowed output slice is no longer needed.
+    if let Some((_, job)) = gpu_poseidon {
         let gpu_values = match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2384,7 +2388,7 @@ fn compute_quotient_polys<
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
+    if let Some((_, job)) = gpu_range {
         let gpu_values = match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2433,7 +2437,7 @@ fn compute_quotient_polys<
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some(job) = &gpu_permutation {
+    if let Some(job) = gpu_permutation {
         let gpu_values = match job.finish() {
             Ok(values) => values,
             Err(error) => {
@@ -2482,12 +2486,10 @@ fn compute_quotient_polys<
     unsafe impl<T> Sync for ColPtr<T> {}
     let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
         .map(|_| {
-            let mut column = Vec::with_capacity(points.len());
-            // SAFETY: the disjoint parallel scatter below writes every element
-            // exactly once before any read; `F` is plain data. Same idiom as
-            // the zero-tail fast path in `fri/oracle.rs`.
-            unsafe { column.set_len(points.len()) };
-            column
+            // Keep the logical length at zero until every raw-pointer write
+            // succeeds, so unwinding a panicked Rayon worker cannot make a
+            // partially initialized column visible to Vec's drop glue.
+            Vec::with_capacity(points.len())
         })
         .collect();
     let column_ptrs: Vec<ColPtr<F>> = challenge_columns
@@ -2503,10 +2505,20 @@ fn compute_quotient_polys<
             for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
                 for (column, &value) in column_ptrs.iter().zip(point_values) {
                     // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
+                    unsafe { column.0.add(base + k).write(value) };
                 }
             }
         });
+    for column in &mut challenge_columns {
+        // SAFETY: the scatter above returned successfully, so every one of the
+        // `points.len()` slots in each column was initialized exactly once by
+        // a disjoint raw-pointer write.
+        unsafe { column.set_len(points.len()) };
+    }
+    // The point-major source is dead after the ordinary scatter. Releasing it
+    // before the two in-place IFFTs lowers their live CPU-memory footprint
+    // without changing the scatter layout or either transform.
+    drop(quotient_values);
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
