@@ -646,7 +646,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // pad), writing straight into `final_poly`'s reusable buffer
             // instead of a division pass + shift pass + add pass.
             let shift = alpha.shift_factor();
-            accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+            accumulate_linear_quotient::<F, D>(
+                &mut final_poly,
+                &composition_poly,
+                *point,
+                shift,
+            );
         }
 
         // `final_poly` is dead after this point, so pad it in place instead of
@@ -773,11 +778,11 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
 /// only dropped work is the recurrence's final step (the remainder `p(z)`,
 /// which the division discards) and the reference's `+ ZERO` on the pad
 /// slot / `ZERO * shift` on fresh slots, all of which leave values unchanged.
-fn accumulate_linear_quotient<F: Field>(
-    final_poly: &mut PolynomialCoeffs<F>,
-    composition_poly: &PolynomialCoeffs<F>,
-    z: F,
-    shift: F,
+fn accumulate_linear_quotient<F: Extendable<D>, const D: usize>(
+    final_poly: &mut PolynomialCoeffs<F::Extension>,
+    composition_poly: &PolynomialCoeffs<F::Extension>,
+    z: F::Extension,
+    shift: F::Extension,
 ) {
     let d = composition_poly.len();
     let coeffs = &composition_poly.coeffs;
@@ -787,7 +792,7 @@ fn accumulate_linear_quotient<F: Field>(
         *l *= shift;
     }
     if buf.len() < d {
-        buf.resize(d, F::ZERO);
+        buf.resize(d, F::Extension::ZERO);
     }
     if d == 0 {
         return;
@@ -796,10 +801,10 @@ fn accumulate_linear_quotient<F: Field>(
     buf[d - 1] *= shift;
     // Synthetic division, highest coefficient first: the quotient's
     // coefficient at `x^i` is the accumulator after absorbing `coeffs[i + 1]`.
-    let mut acc = F::ZERO;
+    let mut acc = F::Extension::ZERO;
     for i in (0..d - 1).rev() {
-        acc = acc * z + coeffs[i + 1];
-        buf[i] = buf[i] * shift + acc;
+        acc = F::extension_multiply_accumulate(coeffs[i + 1], acc, z);
+        buf[i] = F::extension_multiply_accumulate(acc, buf[i], shift);
     }
 }
 
@@ -1026,26 +1031,15 @@ mod tests {
         check::<<GoldilocksField as Extendable<2>>::Extension>();
     }
 
-    /// The fused quotient accumulation must be bit-identical (raw u64
-    /// representation) to the pre-fusion op sequences it replaces: both the
+    /// The fused quotient accumulation must be field-value-identical to the
+    /// pre-fusion op sequences it replaces: both the
     /// classic reference (`divide_by_linear` + explicit zero pad +
     /// `shift_poly` + add) and this tree's in-place variant
     /// (`divide_by_linear_padded_in_place` + `shift_poly` + add), including
     /// the empty-accumulator first batch and mismatched lengths.
     #[test]
     fn fused_quotient_accumulation_matches_reference() {
-        use crate::field::extension::FieldExtension;
-        use crate::field::types::PrimeField64;
-
         type F = <GoldilocksField as Extendable<2>>::Extension;
-
-        fn raw(values: &[F]) -> Vec<u64> {
-            values
-                .iter()
-                .flat_map(|x| FieldExtension::<2>::to_basefield_array(x))
-                .map(|c: GoldilocksField| c.to_noncanonical_u64())
-                .collect()
-        }
 
         for &(old_len, d) in &[
             (0usize, 1usize),
@@ -1079,10 +1073,14 @@ mod tests {
             expected_in_place += quotient_in_place;
 
             let mut actual = initial;
-            accumulate_linear_quotient(&mut actual, &composition_poly, z, shift);
-
-            assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
-            assert_eq!(raw(&actual.coeffs), raw(&expected_in_place.coeffs));
+            accumulate_linear_quotient::<GoldilocksField, 2>(
+                &mut actual,
+                &composition_poly,
+                z,
+                shift,
+            );
+            assert_eq!(actual.coeffs, expected.coeffs);
+            assert_eq!(actual.coeffs, expected_in_place.coeffs);
         }
     }
 

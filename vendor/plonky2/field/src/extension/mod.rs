@@ -99,6 +99,20 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    /// Compute `addend + lhs * rhs` in the extension field. The default keeps
+    /// the historical multiply-then-add sequence exactly. A base field may
+    /// specialize this when the addend can be folded into the multiplication's
+    /// wide accumulator before its final modular reduction.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn extension_multiply_accumulate(
+        addend: Self::Extension,
+        lhs: Self::Extension,
+        rhs: Self::Extension,
+    ) -> Self::Extension {
+        addend + lhs * rhs
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.

@@ -36,6 +36,22 @@ impl Extendable<2> for GoldilocksField {
     }
 
     #[inline(always)]
+    fn extension_multiply_accumulate(
+        addend: QuadraticExtension<Self>,
+        lhs: QuadraticExtension<Self>,
+        rhs: QuadraticExtension<Self>,
+    ) -> QuadraticExtension<Self> {
+        let QuadraticExtension([c0, c1]) = addend;
+        let QuadraticExtension([a0, a1]) = lhs;
+        let QuadraticExtension([b0, b1]) = rhs;
+        QuadraticExtension(ext2_mul_add(
+            [c0.0, c1.0],
+            [a0.0, a1.0],
+            [b0.0, b1.0],
+        ))
+    }
+
+    #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
         // contain [w, 0], so scalar-multiply the two value limbs. Each limb
@@ -441,6 +457,46 @@ pub(crate) fn ext2_mul(a: [u64; 2], b: [u64; 2]) -> [GoldilocksField; 2] {
     let c0 = ext2_add_prods0(&a, &b);
     let c1 = ext2_add_prods1(&a, &b);
     [c0, c1]
+}
+
+/// Compute `addend + a * b` in GF(p^2), inserting each addend limb into the
+/// existing 160-bit product accumulator before its sole reduction.
+///
+/// For arbitrary raw `u64` representatives the real-part accumulator is less
+/// than `8 * 2^128 + 2^64`, and the imaginary-part accumulator is less than
+/// `2 * 2^128 + 2^64`. Both are far below `reduce160`'s precondition.
+#[inline(always)]
+fn ext2_mul_add(
+    addend: [u64; 2],
+    a: [u64; 2],
+    b: [u64; 2],
+) -> [GoldilocksField; 2] {
+    const_assert!(<GoldilocksField as Extendable<2>>::W.0 == 7u64);
+
+    let [c0, c1] = addend;
+    let [a0, a1] = a;
+    let [b0, b1] = b;
+
+    let (mut real_lo, mut real_hi) =
+        u160_times_7((a1 as u128) * (b1 as u128), 0u32);
+    u160_add_product(&mut real_lo, &mut real_hi, a0, b0);
+    let (next_real_lo, real_carry) = real_lo.overflowing_add(c0 as u128);
+    real_lo = next_real_lo;
+    real_hi += real_carry as u32;
+
+    let (mut imag_lo, mut imag_hi) = (0u128, 0u32);
+    u160_add_product(&mut imag_lo, &mut imag_hi, a0, b1);
+    u160_add_product(&mut imag_lo, &mut imag_hi, a1, b0);
+    let (next_imag_lo, imag_carry) = imag_lo.overflowing_add(c1 as u128);
+    imag_lo = next_imag_lo;
+    imag_hi += imag_carry as u32;
+
+    // SAFETY: the worst-case bounds documented above are far below
+    // `2^160 - 2^128 + 2^96`.
+    [
+        unsafe { reduce160(real_lo, real_hi) },
+        unsafe { reduce160(imag_lo, imag_hi) },
+    ]
 }
 
 /*
@@ -897,6 +953,71 @@ mod tests {
         let first_unsafe_worst_case = BigUint::from(u64::from(u32::MAX) + 1) * max_product;
         assert!(max_safe_sum < reduce160_limit);
         assert!(first_unsafe_worst_case >= reduce160_limit);
+    }
+
+    #[test]
+    fn ext2_extension_multiply_accumulate_matches_generic() {
+        let canonical = |x: Q2| {
+            [x.0[0].to_canonical_u64(), x.0[1].to_canonical_u64()]
+        };
+        let check = |addend: Q2, lhs: Q2, rhs: Q2| {
+            let expected = addend + lhs * rhs;
+            let actual = <GF as Extendable<2>>::extension_multiply_accumulate(
+                addend, lhs, rhs,
+            );
+            assert_eq!(
+                canonical(actual),
+                canonical(expected),
+                "addend={addend:?}, lhs={lhs:?}, rhs={rhs:?}"
+            );
+        };
+
+        let p = GF::ORDER;
+        let specials = [0u64, 1, 2, p - 1, p, p + 1, u64::MAX];
+        for i in 0..specials.len() {
+            for j in 0..specials.len() {
+                for k in 0..specials.len() {
+                    check(
+                        QuadraticExtension([
+                            GoldilocksField(specials[i]),
+                            GoldilocksField(specials[(i + 3) % specials.len()]),
+                        ]),
+                        QuadraticExtension([
+                            GoldilocksField(specials[j]),
+                            GoldilocksField(specials[(j + 5) % specials.len()]),
+                        ]),
+                        QuadraticExtension([
+                            GoldilocksField(specials[k]),
+                            GoldilocksField(specials[(k + 1) % specials.len()]),
+                        ]),
+                    );
+                }
+            }
+        }
+
+        let mut state = 0x243F_6A88_85A3_08D3u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let addend = QuadraticExtension(core::array::from_fn(|_| GoldilocksField(next())));
+            let lhs = QuadraticExtension(core::array::from_fn(|_| GoldilocksField(next())));
+            let rhs = QuadraticExtension(core::array::from_fn(|_| GoldilocksField(next())));
+            check(addend, lhs, rhs);
+        }
+
+        // The generic hook remains the exact historical expression for other
+        // extension degrees.
+        let addend = Q4::from_noncanonical_u64(u64::MAX);
+        let lhs = Q4::from_noncanonical_u64(p + 1);
+        let rhs = Q4::from_noncanonical_u64(p - 1);
+        assert_eq!(
+            <GF as Extendable<4>>::extension_multiply_accumulate(addend, lhs, rhs),
+            addend + lhs * rhs
+        );
     }
 
     #[test]
