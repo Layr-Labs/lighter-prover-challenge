@@ -319,6 +319,48 @@ inline ulong gl_mul_add(ulong a, ulong b, ulong addend) {
     return reduce_top(r0, r1, (int)carry - (int)under);
 }
 
+// Reduce a*b + addend0 + addend1 once. The exact integer sum fits in 128 bits:
+// (2^64-1)^2 + 2*(2^64-1) = 2^128-1. `addend_carry` is the 65th addend bit;
+// the same final reduction as gl_mul_add then applies without a field add.
+inline ulong gl_mul_add2(ulong a, ulong b, ulong addend0, ulong addend1) {
+    uint l0;
+    uint l1;
+    uint h0;
+    uint h1;
+    mul_128(a, b, l0, l1, h0, h1);
+
+    ulong addend = addend0 + addend1;
+    uint addend_carry = (uint)(addend < addend0);
+    uint d0 = (uint)addend;
+    uint d1 = (uint)(addend >> 32);
+    uint s0 = l0 + d0;
+    uint c0 = (uint)(s0 < l0);
+    uint s1 = l1 + d1;
+    uint c1 = (uint)(s1 < l1);
+    uint s1b = s1 + c0;
+    c1 += (uint)(s1b < s1);
+    l0 = s0;
+    l1 = s1b;
+    uint total_carry = c1 + addend_carry;
+    uint hh0 = h0 + total_carry;
+    h1 += (uint)(hh0 < h0);
+    h0 = hh0;
+
+    uint r0 = l0 - h0;
+    uint borrow = (uint)(r0 > l0);
+    uint next = r0 - h1;
+    borrow += (uint)(next > r0);
+    r0 = next;
+
+    uint r1 = l1 + h0;
+    uint carry = (uint)(r1 < l1);
+    next = r1 - borrow;
+    uint under = (uint)(next > r1);
+    r1 = next;
+
+    return reduce_top(r0, r1, (int)carry - (int)under);
+}
+
 // x^7 by the addition chain 1 -> 2 -> 3 -> 6 -> 7. Every length-four chain for
 // x^7 costs the same four multiplies, but this one keeps only `value` and one
 // running power live at a time, and three of the four multiplies take `value`
@@ -623,10 +665,10 @@ kernel void permutation_quotient(
             (ulong)(sigma_start + j_start) * lde_rows + source_row];
         ulong beta_k0 = challenges[4u + j_start];
         ulong beta_k1 = challenges[4u + num_routed_wires + j_start];
-        ulong numerator0 = gl_add(gl_mul_add(beta_k0, x, wire), gamma0);
-        ulong denominator0 = gl_add(gl_mul_add(beta0, sigma, wire), gamma0);
-        ulong numerator1 = gl_add(gl_mul_add(beta_k1, x, wire), gamma1);
-        ulong denominator1 = gl_add(gl_mul_add(beta1, sigma, wire), gamma1);
+        ulong numerator0 = gl_mul_add2(beta_k0, x, wire, gamma0);
+        ulong denominator0 = gl_mul_add2(beta0, sigma, wire, gamma0);
+        ulong numerator1 = gl_mul_add2(beta_k1, x, wire, gamma1);
+        ulong denominator1 = gl_mul_add2(beta1, sigma, wire, gamma1);
         for (uint j = j_start + 1u; j < j_end; ++j) {
             wire = wires[(ulong)j * lde_rows + source_row];
             sigma = constants_sigmas[
@@ -634,13 +676,13 @@ kernel void permutation_quotient(
             beta_k0 = challenges[4u + j];
             beta_k1 = challenges[4u + num_routed_wires + j];
             numerator0 = gl_mul(
-                numerator0, gl_add(gl_mul_add(beta_k0, x, wire), gamma0));
+                numerator0, gl_mul_add2(beta_k0, x, wire, gamma0));
             denominator0 = gl_mul(
-                denominator0, gl_add(gl_mul_add(beta0, sigma, wire), gamma0));
+                denominator0, gl_mul_add2(beta0, sigma, wire, gamma0));
             numerator1 = gl_mul(
-                numerator1, gl_add(gl_mul_add(beta_k1, x, wire), gamma1));
+                numerator1, gl_mul_add2(beta_k1, x, wire, gamma1));
             denominator1 = gl_mul(
-                denominator1, gl_add(gl_mul_add(beta1, sigma, wire), gamma1));
+                denominator1, gl_mul_add2(beta1, sigma, wire, gamma1));
         }
 
         uint previous_column0 = chunk == 0u ? 0u : 1u + chunk;

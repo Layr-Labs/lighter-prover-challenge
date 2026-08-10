@@ -109,7 +109,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
+    "f6873aa9f87ef749cbdfab6ee3fe2bb4bb49973794484fbf8a2324a659c97bff";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -4114,7 +4114,8 @@ mod tests {
         let context = shared_context().expect("Metal context must initialize");
         let alphas = [F::from_canonical_u64(3), F::from_canonical_u64(5)];
         let betas = [F::from_canonical_u64(7), F::from_canonical_u64(11)];
-        let gammas = [F::from_canonical_u64(13), F::from_canonical_u64(17)];
+        // Challenge zero forces the 65th bit of `wire + gamma` on almost every row.
+        let gammas = [GoldilocksField(u64::MAX), F::from_canonical_u64(17)];
         let beta_k_is = (0..2 * ROUTED)
             .map(|i| F::from_canonical_usize(19 + i * 2))
             .collect::<Vec<_>>();
