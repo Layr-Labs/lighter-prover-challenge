@@ -100,6 +100,22 @@ inline ulong gl_sub(ulong a, ulong b) {
 #endif
 }
 
+// Second operand is a known literal < 2^32. One native 64-bit op + one epsilon
+// fold; the second correction of full gl_add/gl_sub is unreachable.
+inline ulong gl_add_small(ulong x, uint c) {
+    ulong s = x + (ulong)c;
+    bool carry = s < x;
+    return s + (ulong)carry * GOLDILOCKS_EPSILON;
+}
+
+inline ulong gl_sub_small(ulong x, uint c) {
+    ulong r = x - (ulong)c;
+    bool borrow = r > x;
+    return r - (ulong)borrow * GOLDILOCKS_EPSILON;
+}
+
+
+
 // Final step of the 128-bit Goldilocks reduction shared by gl_mul and
 // gl_mul_add. On entry (r0, r1) are the low and high 32-bit limbs of the
 // residue and `top` is its 2^64 weight, one of -1, 0, +1, so the value is
@@ -484,7 +500,7 @@ kernel void poseidon2_gate_quotient(
 
     ulong swap = poseidon2_gate_wire(wires, 24, lde_rows, source_row);
     poseidon2_gate_emit(
-        gl_mul(swap, gl_sub(swap, 1)),
+        gl_mul(swap, gl_sub_small(swap, 1u)),
         alpha_powers,
         accumulators,
         constraint_index);
@@ -807,12 +823,12 @@ kernel void range_check_gate_quotient(
                 ulong x = wires[(aux_base + j) * lde_rows + source_row];
                 ulong constraint;
                 if (j + 1u == num_aux && final_limb_range == 2u) {
-                    constraint = gl_mul(x, gl_sub(x, 1));
+                    constraint = gl_mul(x, gl_sub_small(x, 1u));
                 } else {
                     // x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3),
                     // exactly the production CPU specialization.
-                    ulong y = gl_mul(x, gl_sub(x, 3));
-                    constraint = gl_mul(y, gl_add(y, 2));
+                    ulong y = gl_mul(x, gl_sub_small(x, 3u));
+                    constraint = gl_mul(y, gl_add_small(y, 2u));
                 }
                 range_check_gate_emit(
                     constraint,
@@ -869,7 +885,7 @@ kernel void range_check_gate_quotient(
                 ulong inverse = wires[(routed_base + 5u) * lde_rows + source_row];
 
                 ulong high_diff = gl_sub(0xffffffffUL, output_high);
-                ulong high_not_max = gl_sub(gl_mul(inverse, high_diff), 1);
+                ulong high_not_max = gl_sub_small(gl_mul(inverse, high_diff), 1u);
                 range_check_gate_emit(
                     gl_mul(high_not_max, output_low),
                     alpha_powers,
@@ -892,9 +908,9 @@ kernel void range_check_gate_quotient(
                 for (uint remaining = 32u; remaining > 0u; --remaining) {
                     uint j = remaining - 1u;
                     ulong x = wires[(limb_base + j) * lde_rows + source_row];
-                    ulong y = gl_mul(x, gl_sub(x, 3));
+                    ulong y = gl_mul(x, gl_sub_small(x, 3u));
                     range_check_gate_emit(
-                        gl_mul(y, gl_add(y, 2)),
+                        gl_mul(y, gl_add_small(y, 2u)),
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
@@ -944,9 +960,9 @@ kernel void range_check_gate_quotient(
                 for (uint remaining = result_limbs; remaining > 0u; --remaining) {
                     uint j = remaining - 1u;
                     ulong x = wires[(limb_base + j) * lde_rows + source_row];
-                    ulong y = gl_mul(x, gl_sub(x, 3));
+                    ulong y = gl_mul(x, gl_sub_small(x, 3u));
                     range_check_gate_emit(
-                        gl_mul(y, gl_add(y, 2)),
+                        gl_mul(y, gl_add_small(y, 2u)),
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
@@ -999,9 +1015,9 @@ kernel void range_check_gate_quotient(
                 for (uint remaining = total_limbs; remaining > 0u; --remaining) {
                     uint j = remaining - 1u;
                     ulong x = wires[(limb_base + j) * lde_rows + source_row];
-                    ulong y = gl_mul(x, gl_sub(x, 3));
+                    ulong y = gl_mul(x, gl_sub_small(x, 3u));
                     range_check_gate_emit(
-                        gl_mul(y, gl_add(y, 2)),
+                        gl_mul(y, gl_add_small(y, 2u)),
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
@@ -1041,9 +1057,9 @@ kernel void range_check_gate_quotient(
                     (ulong)routed_per_op * num_ops + (ulong)op * aux_per_op;
                 for (uint j = 0; j < aux_per_op; ++j) {
                     ulong x = wires[(aux_base + j) * lde_rows + source_row];
-                    ulong y = gl_mul(x, gl_sub(x, 3));
+                    ulong y = gl_mul(x, gl_sub_small(x, 3u));
                     range_check_gate_emit(
-                        gl_mul(y, gl_add(y, 2)),
+                        gl_mul(y, gl_add_small(y, 2u)),
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
@@ -1224,7 +1240,7 @@ kernel void range_check_gate_quotient(
                     ulong b = wires[(bit_base + (ulong)copy * bits + i)
                         * lde_rows + source_row];
                     range_check_gate_emit(
-                        gl_mul(b, gl_sub(b, 1)),
+                        gl_mul(b, gl_sub_small(b, 1u)),
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
@@ -1446,10 +1462,10 @@ kernel void range_check_gate_quotient(
                 ulong x = wires[((ulong)1u + limb) * lde_rows + source_row];
                 ulong constraint;
                 if (base == 2u) {
-                    constraint = gl_mul(x, gl_sub(x, 1));
+                    constraint = gl_mul(x, gl_sub_small(x, 1u));
                 } else {
-                    ulong y = gl_mul(x, gl_sub(x, 3));
-                    constraint = gl_mul(y, gl_add(y, 2));
+                    ulong y = gl_mul(x, gl_sub_small(x, 3u));
+                    constraint = gl_mul(y, gl_add_small(y, 2u));
                 }
                 range_check_gate_emit(
                     constraint,
