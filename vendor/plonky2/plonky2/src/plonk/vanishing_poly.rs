@@ -547,6 +547,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     cpu_gate_indices: &[usize],
     cpu_num_gate_constraints: usize,
     interleave_pair: Option<&InterleavePairPlan>,
+    extra_gate_contribution: Option<&[F]>,
     permutation_products_offloaded: bool,
     permutation_gate_scales: &[F],
     z_h_on_coset: &ZeroPolyOnCoset<F>,
@@ -594,6 +595,12 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
     reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out, true);
+    if let Some(extra) = extra_gate_contribution {
+        debug_assert_eq!(extra.len(), res_out.len());
+        for (value, &term) in res_out.iter_mut().zip(extra) {
+            *value += term;
+        }
+    }
 
     if permutation_products_offloaded {
         assert!(!has_lookup, "lookup permutation products stay on the CPU");
