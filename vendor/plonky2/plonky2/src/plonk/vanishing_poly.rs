@@ -322,17 +322,17 @@ fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
 /// MACs. The second half lands on the same row and uses one packed MAC with the
 /// pre-summed filters. No range column survives past the current bit.
 fn eval_interleave_pair_dense_fused<F: Field>(
-    wires: &[F],
-    batch_size: usize,
+    vars_batch: EvaluationVarsBaseBatch<F>,
     interleave_filter: &[F],
     uninterleave_filter: &[F],
     summed_filter: &[F],
     combined: &mut [F],
 ) {
+    let batch_size = vars_batch.len();
     debug_assert_eq!(interleave_filter.len(), batch_size);
     debug_assert_eq!(uninterleave_filter.len(), batch_size);
     debug_assert_eq!(summed_filter.len(), batch_size);
-    debug_assert!(wires.len() >= INTERLEAVE_PAIR_WIRES * batch_size);
+    debug_assert!(vars_batch.num_wire_columns() >= INTERLEAVE_PAIR_WIRES);
     debug_assert!(combined.len() >= INTERLEAVE_PAIR_CONSTRAINTS * batch_size);
 
     const STACK_COLS: usize = 10;
@@ -362,7 +362,7 @@ fn eval_interleave_pair_dense_fused<F: Field>(
 
         for bit_index in 0..32 {
             let bit_number = bit_offset + bit_index;
-            let bit_col = &wires[(8 + bit_number) * batch_size..][..batch_size];
+            let bit_col = vars_batch.wire_column(8 + bit_number);
             let parity_index = 2 * (operation / 2) + bit_index % 2;
             let parity = &mut parity_accumulators
                 [parity_index * batch_size..(parity_index + 1) * batch_size];
@@ -387,7 +387,7 @@ fn eval_interleave_pair_dense_fused<F: Field>(
             }
         }
 
-        let x_col = &wires[(2 * operation) * batch_size..][..batch_size];
+        let x_col = vars_batch.wire_column(2 * operation);
         for point in 0..batch_size {
             range[point] = x[point] - x_col[point];
         }
@@ -395,7 +395,7 @@ fn eval_interleave_pair_dense_fused<F: Field>(
             [interleave_row * batch_size..(interleave_row + 1) * batch_size];
         batch_multiply_add_inplace(output, range, interleave_filter);
 
-        let spread_col = &wires[(2 * operation + 1) * batch_size..][..batch_size];
+        let spread_col = vars_batch.wire_column(2 * operation + 1);
         for point in 0..batch_size {
             range[point] = base4_accumulator[point] - spread_col[point];
         }
@@ -415,10 +415,10 @@ fn eval_interleave_pair_dense_fused<F: Field>(
             &parity_accumulators[(2 * operation) * batch_size..(2 * operation + 1) * batch_size];
         let odds = &parity_accumulators
             [(2 * operation + 1) * batch_size..(2 * operation + 2) * batch_size];
-        let interleaved = &wires[(4 * operation) * batch_size..][..batch_size];
-        let x_evens = &wires[(4 * operation + 1) * batch_size..][..batch_size];
-        let x_odds = &wires[(4 * operation + 2) * batch_size..][..batch_size];
-        let inverse = &wires[(4 * operation + 3) * batch_size..][..batch_size];
+        let interleaved = vars_batch.wire_column(4 * operation);
+        let x_evens = vars_batch.wire_column(4 * operation + 1);
+        let x_odds = vars_batch.wire_column(4 * operation + 2);
+        let inverse = vars_batch.wire_column(4 * operation + 3);
 
         for point in 0..batch_size {
             range[point] =
@@ -672,7 +672,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         assert_eq!(zs_next_cols.len(), num_challenges * n);
         assert_eq!(s_sigmas_cols.len(), num_routed_wires * n);
 
-        let wires = vars_batch.local_wires;
         let chunk_size = max_degree;
         let num_chunks = num_routed_wires.div_ceil(chunk_size);
         debug_assert_eq!(num_chunks, num_prods + 1);
@@ -744,7 +743,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 num_prod_second.clear();
                 den_prod_second.clear();
                 {
-                    let wire_col = &wires[j_start * n..][..n];
+                    let wire_col = vars_batch.wire_column(j_start);
                     let sigma_col = &s_sigmas_cols[j_start * n..][..n];
                     let beta_k_0 = beta_k_is[j_start];
                     let beta_k_1 = beta_k_is[num_routed_wires + j_start];
@@ -759,7 +758,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     }
                 }
                 for j in j_start + 1..j_end {
-                    let wire_col = &wires[j * n..][..n];
+                    let wire_col = vars_batch.wire_column(j);
                     let sigma_col = &s_sigmas_cols[j * n..][..n];
                     let beta_k_0 = beta_k_is[j];
                     let beta_k_1 = beta_k_is[num_routed_wires + j];
@@ -803,7 +802,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     num_prod.clear();
                     den_prod.clear();
                     {
-                        let wire_col = &wires[j_start * n..][..n];
+                        let wire_col = vars_batch.wire_column(j_start);
                         let sigma_col = &s_sigmas_cols[j_start * n..][..n];
                         let beta_k_i = beta_k_is[i * num_routed_wires + j_start];
                         for k in 0..n {
@@ -812,7 +811,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                         }
                     }
                     for j in j_start + 1..j_end {
-                        let wire_col = &wires[j * n..][..n];
+                        let wire_col = vars_batch.wire_column(j);
                         let sigma_col = &s_sigmas_cols[j * n..][..n];
                         let beta_k_i = beta_k_is[i * num_routed_wires + j];
                         for k in 0..n {
@@ -1490,8 +1489,7 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
                     summed_filter[point] = interleave_filter[point] + uninterleave_filter[point];
                 }
                 eval_interleave_pair_dense_fused(
-                    vars_batch.local_wires,
-                    vars_batch.len(),
+                    vars_batch,
                     interleave_filter,
                     uninterleave_filter,
                     summed_filter,
@@ -1870,9 +1868,15 @@ mod tests {
             }
 
             let mut actual_rows = initial_rows;
-            eval_interleave_pair_dense_fused(
-                &wires,
+            let public_inputs_hash = crate::hash::hash_types::HashOut::default();
+            let vars_batch = EvaluationVarsBaseBatch::new(
                 batch_size,
+                &[],
+                &wires,
+                &public_inputs_hash,
+            );
+            eval_interleave_pair_dense_fused(
+                vars_batch,
                 &interleave_filter,
                 &uninterleave_filter,
                 &summed_filter,

@@ -575,6 +575,16 @@ impl<F: RichField> MetalColumns<F> {
         }
     }
 
+    pub(crate) fn column_span(&self, range: core::ops::Range<usize>) -> &[F] {
+        assert!(range.start <= range.end);
+        assert!(range.end <= self.cols);
+        let start = range.start * self.rows;
+        let len = range.len() * self.rows;
+        // SAFETY: `MetalColumns` is one contiguous column-major allocation;
+        // the checked column range is initialized and immutable.
+        unsafe { slice::from_raw_parts((self.base as *const F).add(start), len) }
+    }
+
     pub(crate) fn columns_mut(&mut self) -> Option<Vec<&mut [F]>> {
         if Arc::strong_count(&self.uniqueness) != 1 {
             return None;

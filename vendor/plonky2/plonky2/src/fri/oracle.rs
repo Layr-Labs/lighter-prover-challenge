@@ -371,6 +371,22 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         self.merkle_tree.leaf_width() - if self.blinding { SALT_SIZE } else { 0 }
     }
 
+    /// Borrows a contiguous natural-order column span when the commitment is
+    /// retained in one shared column-major allocation. Returns the span and
+    /// its full column stride. Row-backed and separately-owned columns keep
+    /// using the ordinary gather path.
+    pub(crate) fn borrow_lde_columns(
+        &self,
+        col_range: core::ops::Range<usize>,
+    ) -> Option<(&[F], usize)> {
+        match &self.merkle_tree.leaves {
+            MerkleLeaves::Columns { columns, .. } => columns
+                .contiguous_span(col_range)
+                .map(|span| (span, columns.num_rows())),
+            MerkleLeaves::Rows { .. } => None,
+        }
+    }
+
     /// Fetches LDE values at the `index * step`th point. Only available for
     /// row-major leaf storage; column-major oracles use [`Self::fill_lde_batch`].
     pub fn get_lde_values(&self, index: usize, step: usize) -> &[F] {

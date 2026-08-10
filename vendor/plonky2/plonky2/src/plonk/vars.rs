@@ -25,6 +25,8 @@ pub struct EvaluationVarsBaseBatch<'a, F: Field> {
     batch_size: usize,
     pub local_constants: &'a [F],
     pub local_wires: &'a [F],
+    wire_stride: usize,
+    wire_offset: usize,
     pub public_inputs_hash: &'a HashOut<F>,
 }
 
@@ -74,6 +76,33 @@ impl<'a, F: Field> EvaluationVarsBaseBatch<'a, F> {
             batch_size,
             local_constants,
             local_wires,
+            wire_stride: batch_size,
+            wire_offset: 0,
+            public_inputs_hash,
+        }
+    }
+
+    /// Constructs a batch whose wire columns remain in their retained LDE
+    /// storage. Column `c`, point `p` is read at
+    /// `local_wires[c * wire_stride + wire_offset + p]`.
+    pub fn new_strided_wires(
+        batch_size: usize,
+        local_constants: &'a [F],
+        local_wires: &'a [F],
+        wire_stride: usize,
+        wire_offset: usize,
+        public_inputs_hash: &'a HashOut<F>,
+    ) -> Self {
+        assert_eq!(local_constants.len() % batch_size, 0);
+        assert!(wire_stride >= batch_size);
+        assert!(wire_offset + batch_size <= wire_stride);
+        assert_eq!(local_wires.len() % wire_stride, 0);
+        Self {
+            batch_size,
+            local_constants,
+            local_wires,
+            wire_stride,
+            wire_offset,
             public_inputs_hash,
         }
     }
@@ -94,12 +123,31 @@ impl<'a, F: Field> EvaluationVarsBaseBatch<'a, F> {
         // We cannot implement `Index` as `EvaluationVarsBase` is a struct, not a reference.
         assert!(index < self.len());
         let local_constants = PackedStridedView::new(self.local_constants, self.len(), index);
-        let local_wires = PackedStridedView::new(self.local_wires, self.len(), index);
+        let local_wires =
+            PackedStridedView::new(self.local_wires, self.wire_stride, self.wire_offset + index);
         EvaluationVarsBase {
             local_constants,
             local_wires,
             public_inputs_hash: self.public_inputs_hash,
         }
+    }
+
+    #[inline(always)]
+    pub fn wire_column(&self, index: usize) -> &'a [F] {
+        let start = index
+            .checked_mul(self.wire_stride)
+            .and_then(|start| start.checked_add(self.wire_offset))
+            .expect("wire column offset overflow");
+        let end = start
+            .checked_add(self.batch_size)
+            .expect("wire column end overflow");
+        assert!(end <= self.local_wires.len(), "wire column out of bounds");
+        &self.local_wires[start..end]
+    }
+
+    #[inline]
+    pub fn num_wire_columns(&self) -> usize {
+        self.local_wires.len() / self.wire_stride
     }
 
     pub const fn iter(&self) -> EvaluationVarsBaseBatchIter<'a, F> {
@@ -190,8 +238,11 @@ impl<'a, P: PackedField> Iterator for EvaluationVarsBaseBatchIterPacked<'a, P> {
                 self.vars_batch.len(),
                 self.i,
             );
-            let local_wires =
-                PackedStridedView::new(self.vars_batch.local_wires, self.vars_batch.len(), self.i);
+            let local_wires = PackedStridedView::new(
+                self.vars_batch.local_wires,
+                self.vars_batch.wire_stride,
+                self.vars_batch.wire_offset + self.i,
+            );
             let res = EvaluationVarsBasePacked {
                 local_constants,
                 local_wires,
@@ -218,6 +269,105 @@ impl<P: PackedField> ExactSizeIterator for EvaluationVarsBaseBatchIterPacked<'_,
 impl<const D: usize> EvaluationTargets<'_, D> {
     pub fn remove_prefix(&mut self, num_selectors: usize) {
         self.local_constants = &self.local_constants[num_selectors..];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EvaluationVarsBaseBatch;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::packable::Packable;
+    use crate::field::packed::PackedField;
+    use crate::field::types::{Field, Field64, PrimeField64};
+    use crate::hash::hash_types::HashOut;
+
+    type F = GoldilocksField;
+    type P = <F as Packable>::Packing;
+
+    fn raw_words(values: &[F]) -> Vec<u64> {
+        values
+            .iter()
+            .map(|value| value.to_noncanonical_u64())
+            .collect()
+    }
+
+    #[test]
+    fn compact_and_retained_strided_wire_views_are_raw_identical() {
+        let mut sizes = vec![1, P::WIDTH.saturating_sub(1).max(1), P::WIDTH, P::WIDTH + 1, 31, 32];
+        sizes.sort_unstable();
+        sizes.dedup();
+
+        const COLS: usize = 7;
+        const STRIDE: usize = 64;
+        let hash = HashOut::<F>::default();
+        let retained = (0..COLS * STRIDE)
+            .map(|i| {
+                let limb = i as u64 + 17;
+                GoldilocksField(if i % 3 == 0 { F::ORDER + limb } else { limb })
+            })
+            .collect::<Vec<_>>();
+
+        for n in sizes {
+            let offset = STRIDE - n;
+            let compact = (0..COLS)
+                .flat_map(|column| {
+                    retained[column * STRIDE + offset..column * STRIDE + offset + n]
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>();
+            let constants = (0..2 * n)
+                .map(|i| F::from_canonical_usize(10_000 + i))
+                .collect::<Vec<_>>();
+            let compact_vars = EvaluationVarsBaseBatch::new(n, &constants, &compact, &hash);
+            let strided_vars = EvaluationVarsBaseBatch::new_strided_wires(
+                n,
+                &constants,
+                &retained,
+                STRIDE,
+                offset,
+                &hash,
+            );
+
+            assert_eq!(compact_vars.num_wire_columns(), COLS);
+            assert_eq!(strided_vars.num_wire_columns(), COLS);
+            for column in 0..COLS {
+                assert_eq!(
+                    raw_words(compact_vars.wire_column(column)),
+                    raw_words(strided_vars.wire_column(column)),
+                    "wire column mismatch for n={n}, column={column}"
+                );
+            }
+            for point in 0..n {
+                let compact_view = compact_vars.view(point);
+                let strided_view = strided_vars.view(point);
+                let compact_raw = compact_view
+                    .local_wires
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>();
+                let strided_raw = strided_view
+                    .local_wires
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>();
+                assert_eq!(compact_raw, strided_raw, "scalar view mismatch for n={n}, point={point}");
+            }
+
+            let (compact_packed, _) = compact_vars.pack::<P>();
+            let (strided_packed, _) = strided_vars.pack::<P>();
+            for (pack_index, (compact_pack, strided_pack)) in
+                compact_packed.zip(strided_packed).enumerate()
+            {
+                for column in 0..COLS {
+                    assert_eq!(
+                        raw_words(compact_pack.local_wires[column].as_slice()),
+                        raw_words(strided_pack.local_wires[column].as_slice()),
+                        "packed view mismatch for n={n}, pack={pack_index}, column={column}"
+                    );
+                }
+            }
+        }
     }
 }
 

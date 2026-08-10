@@ -118,16 +118,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for MulExtensionGa
         assert_eq!(filters.len(), n);
         assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
 
-        let wires = vars_base.local_wires;
         let const_0 = &vars_base.local_constants[..n];
-        let ext = |start: usize, p: usize| {
-            let mut arr = [F::ZERO; D];
-            for (d, a) in arr.iter_mut().enumerate() {
-                *a = wires[(start + d) * n + p];
-            }
-            F::Extension::from_basefield_array(arr)
-        };
-
         // One `D x n` constraint block, reused across the `num_ops` operations.
         // Every slot is assigned by the point loop below before the
         // `batch_multiply_add_inplace` read: `to_basefield_array()` yields exactly
@@ -162,10 +153,22 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for MulExtensionGa
             let m0_start = Self::wires_ith_multiplicand_0(i).start;
             let m1_start = Self::wires_ith_multiplicand_1(i).start;
             let output_start = Self::wires_ith_output(i).start;
+            let m0_cols: [&[F]; D] =
+                core::array::from_fn(|d| vars_base.wire_column(m0_start + d));
+            let m1_cols: [&[F]; D] =
+                core::array::from_fn(|d| vars_base.wire_column(m1_start + d));
+            let output_cols: [&[F]; D] =
+                core::array::from_fn(|d| vars_base.wire_column(output_start + d));
             for p in 0..n {
-                let multiplicand_0 = ext(m0_start, p);
-                let multiplicand_1 = ext(m1_start, p);
-                let output = ext(output_start, p);
+                let multiplicand_0 = F::Extension::from_basefield_array(
+                    core::array::from_fn(|d| m0_cols[d][p]),
+                );
+                let multiplicand_1 = F::Extension::from_basefield_array(
+                    core::array::from_fn(|d| m1_cols[d][p]),
+                );
+                let output = F::Extension::from_basefield_array(core::array::from_fn(|d| {
+                    output_cols[d][p]
+                }));
                 let computed_output = (multiplicand_0 * multiplicand_1).scalar_mul(const_0[p]);
                 let arr = (output - computed_output).to_basefield_array();
                 for (d, a) in arr.iter().enumerate() {
