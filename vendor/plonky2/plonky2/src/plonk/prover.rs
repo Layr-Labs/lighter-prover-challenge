@@ -383,9 +383,9 @@ where
                 actual.coeffs.iter().zip(expected.coeffs.iter()).enumerate()
             {
                 assert_eq!(
-                    actual.to_canonical_u64(),
-                    expected.to_canonical_u64(),
-                    "GPU Poseidon2 quotient divergence: poly {p}, coeff {i}"
+                    actual.to_noncanonical_u64(),
+                    expected.to_noncanonical_u64(),
+                    "GPU quotient divergence: poly {p}, coeff {i}"
                 );
             }
         }
@@ -446,13 +446,14 @@ where
     let quotient_polys_commitment = timed!(
         timing,
         "commit to quotient polys",
-        PolynomialBatch::<F, C, D>::from_coeffs(
+        PolynomialBatch::<F, C, D>::from_coeffs_with_gpu_ntt(
             all_quotient_poly_chunks,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
             config.fri_config.cap_height,
             timing,
             prover_data.fft_root_table.as_ref(),
+            true,
         )
     );
 
@@ -1129,6 +1130,45 @@ fn gpu_poseidon_quotient_differential_enabled() -> bool {
 pub(crate) static COMPARE_GPU_QUOTIENT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+#[cfg(all(test, feature = "std", target_arch = "aarch64", target_os = "macos"))]
+std::thread_local! {
+    static QUOTIENT_ACCUMULATOR_TEST_MASK: core::cell::Cell<u8> = const {
+        core::cell::Cell::new(0b111)
+    };
+    static QUOTIENT_ACCUMULATOR_LAST_ADMITTED_MASK: core::cell::Cell<u8> = const {
+        core::cell::Cell::new(0)
+    };
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn quotient_accumulator_job_enabled(bit: u8) -> bool {
+    #[cfg(test)]
+    {
+        return QUOTIENT_ACCUMULATOR_TEST_MASK.with(|mask| mask.get() & bit != 0);
+    }
+    #[cfg(not(test))]
+    {
+        let _ = bit;
+        true
+    }
+}
+
+#[cfg(all(test, feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn set_quotient_accumulator_test_mask(mask: u8) {
+    assert!(mask <= 0b111);
+    QUOTIENT_ACCUMULATOR_TEST_MASK.with(|value| value.set(mask));
+}
+
+#[cfg(all(test, feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn record_quotient_accumulator_admitted_mask(mask: u8) {
+    QUOTIENT_ACCUMULATOR_LAST_ADMITTED_MASK.with(|value| value.set(mask));
+}
+
+#[cfg(all(test, feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn quotient_accumulator_last_admitted_mask() -> u8 {
+    QUOTIENT_ACCUMULATOR_LAST_ADMITTED_MASK.with(core::cell::Cell::get)
+}
+
 /// Test-only switch: when set, `compute_quotient_polys` evaluates the quotient
 /// values twice — once through the default column-major (`PolyMajor`)
 /// permutation path and once through the per-point (`PointMajor`) reference
@@ -1200,6 +1240,10 @@ fn start_gpu_poseidon_gate_quotient<
     quotient_rows: usize,
     step: usize,
     alphas: &[F],
+    accumulator: Option<(
+        &crate::hash::poseidon2::metal::QuotientAccumulator<F>,
+        bool,
+    )>,
 ) -> Option<(
     usize,
     crate::hash::poseidon2::metal::PoseidonGateQuotientJob<F>,
@@ -1243,6 +1287,7 @@ fn start_gpu_poseidon_gate_quotient<
         common_data.selectors_info.num_selectors() > 1,
         alphas,
         alpha_offset,
+        accumulator,
     )?;
     let started = GPU_POSEIDON_QUOTIENT_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
     log::info!(
@@ -1286,6 +1331,10 @@ fn start_gpu_range_check_gate_quotient<
     quotient_rows: usize,
     step: usize,
     alphas: &[F],
+    accumulator: Option<(
+        &crate::hash::poseidon2::metal::QuotientAccumulator<F>,
+        bool,
+    )>,
 ) -> Option<(
     Vec<usize>,
     crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
@@ -1706,6 +1755,7 @@ fn start_gpu_range_check_gate_quotient<
         &u32_specs,
         alphas,
         alpha_offset,
+        accumulator,
     ) else {
         if gpu_poseidon_quotient_diagnostics_enabled() {
             eprintln!(
@@ -1752,6 +1802,10 @@ fn start_gpu_permutation_quotient<
     gammas: &[F],
     beta_k_is: &[F],
     alphas: &[F],
+    accumulator: Option<(
+        &crate::hash::poseidon2::metal::QuotientAccumulator<F>,
+        bool,
+    )>,
 ) -> Option<crate::hash::poseidon2::metal::PermutationQuotientJob<F>> {
     if common_data.num_lookup_polys != 0 || common_data.config.num_challenges != 2 {
         return None;
@@ -1780,6 +1834,7 @@ fn start_gpu_permutation_quotient<
         gammas,
         beta_k_is,
         alphas,
+        accumulator,
     )?;
     if gpu_poseidon_quotient_diagnostics_enabled() {
         eprintln!(
@@ -1864,50 +1919,84 @@ fn compute_quotient_polys<
     let lde_mask = lde_size - 1;
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_poseidon = allow_gpu_poseidon
-        .then(|| {
-            start_gpu_poseidon_gate_quotient(
-                common_data,
-                prover_data,
-                wires_commitment,
-                lde_size,
-                step,
-                alphas,
-            )
-        })
+    let gpu_accumulator = allow_gpu_poseidon
+        .then(|| crate::hash::poseidon2::metal::new_quotient_accumulator::<F>(lde_size))
         .flatten();
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_range = allow_gpu_poseidon
-        .then(|| {
-            start_gpu_range_check_gate_quotient(
-                common_data,
-                prover_data,
-                wires_commitment,
-                lde_size,
-                step,
-                alphas,
-            )
-        })
-        .flatten();
+    let mut gpu_accumulator_jobs = 0usize;
+
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_permutation = (allow_gpu_poseidon && col_major_perm)
-        .then(|| {
-            start_gpu_permutation_quotient(
-                common_data,
-                prover_data,
-                wires_commitment,
-                zs_partial_products_and_lookup_commitment,
-                &shifted_points,
-                lde_size,
-                step,
-                next_step,
-                betas,
-                gammas,
-                beta_k_is,
-                alphas,
-            )
-        })
-        .flatten();
+    let gpu_poseidon = if allow_gpu_poseidon && quotient_accumulator_job_enabled(0b001) {
+        let job = start_gpu_poseidon_gate_quotient(
+            common_data,
+            prover_data,
+            wires_commitment,
+            lde_size,
+            step,
+            alphas,
+            gpu_accumulator
+                .as_ref()
+                .map(|accumulator| (accumulator, gpu_accumulator_jobs != 0)),
+        );
+        gpu_accumulator_jobs += job.is_some() as usize;
+        job
+    } else {
+        None
+    };
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_range = if allow_gpu_poseidon && quotient_accumulator_job_enabled(0b010) {
+        let job = start_gpu_range_check_gate_quotient(
+            common_data,
+            prover_data,
+            wires_commitment,
+            lde_size,
+            step,
+            alphas,
+            gpu_accumulator
+                .as_ref()
+                .map(|accumulator| (accumulator, gpu_accumulator_jobs != 0)),
+        );
+        gpu_accumulator_jobs += job.is_some() as usize;
+        job
+    } else {
+        None
+    };
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_permutation = if allow_gpu_poseidon
+        && col_major_perm
+        && quotient_accumulator_job_enabled(0b100)
+    {
+        let job = start_gpu_permutation_quotient(
+            common_data,
+            prover_data,
+            wires_commitment,
+            zs_partial_products_and_lookup_commitment,
+            &shifted_points,
+            lde_size,
+            step,
+            next_step,
+            betas,
+            gammas,
+            beta_k_is,
+            alphas,
+            gpu_accumulator
+                .as_ref()
+                .map(|accumulator| (accumulator, gpu_accumulator_jobs != 0)),
+        );
+        gpu_accumulator_jobs += job.is_some() as usize;
+        job
+    } else {
+        None
+    };
+    #[cfg(all(test, feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    if allow_gpu_poseidon {
+        record_quotient_accumulator_admitted_mask(
+            (gpu_poseidon.is_some() as u8)
+                | ((gpu_range.is_some() as u8) << 1)
+                | ((gpu_permutation.is_some() as u8) << 2),
+        );
+    }
+
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let permutation_products_offloaded = gpu_permutation.is_some();
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
@@ -2339,7 +2428,7 @@ fn compute_quotient_polys<
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
+        let gpu_values = match job.finish_shared(gpu_accumulator.is_some()) {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2370,22 +2459,24 @@ fn compute_quotient_polys<
                 );
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        if let Some(gpu_values) = gpu_values {
+            debug_assert_eq!(gpu_values.len(), quotient_values.len());
+            quotient_values
+                .par_chunks_exact_mut(num_challenges)
+                .zip(gpu_values.par_chunks_exact(num_challenges))
+                .enumerate()
+                .for_each(|(i, (cpu_values, gpu_values))| {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                        *cpu += gpu * denominator_inv;
+                    }
+                });
+        }
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
+        let gpu_values = match job.finish_shared(gpu_accumulator.is_some()) {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2419,22 +2510,24 @@ fn compute_quotient_polys<
                 return result;
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        if let Some(gpu_values) = gpu_values {
+            debug_assert_eq!(gpu_values.len(), quotient_values.len());
+            quotient_values
+                .par_chunks_exact_mut(num_challenges)
+                .zip(gpu_values.par_chunks_exact(num_challenges))
+                .enumerate()
+                .for_each(|(i, (cpu_values, gpu_values))| {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                        *cpu += gpu * denominator_inv;
+                    }
+                });
+        }
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if let Some(job) = &gpu_permutation {
-        let gpu_values = match job.finish() {
+        let gpu_values = match job.finish_shared(gpu_accumulator.is_some()) {
             Ok(values) => values,
             Err(error) => {
                 log::warn!(
@@ -2456,17 +2549,30 @@ fn compute_quotient_polys<
                 );
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        if let Some(gpu_values) = gpu_values {
+            debug_assert_eq!(gpu_values.len(), quotient_values.len());
+            quotient_values
+                .par_chunks_exact_mut(num_challenges)
+                .zip(gpu_values.par_chunks_exact(num_challenges))
+                .enumerate()
+                .for_each(|(i, (cpu_values, gpu_values))| {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                        *cpu += gpu * denominator_inv;
+                    }
+                });
+        }
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let accumulated_gpu_values = gpu_accumulator
+        .as_ref()
+        .filter(|_| gpu_accumulator_jobs != 0)
+        .map(|accumulator| accumulator.finish());
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let accumulated_gpu_values: Option<&[F]> = None;
+    if let Some(values) = accumulated_gpu_values {
+        debug_assert_eq!(values.len(), quotient_values.len());
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
@@ -2495,18 +2601,44 @@ fn compute_quotient_polys<
         .map(|column| ColPtr(column.as_mut_ptr()))
         .collect();
     let column_ptrs = &column_ptrs;
-    quotient_values
-        .par_chunks(BATCH_SIZE * num_challenges)
-        .enumerate()
-        .for_each(|(chunk_i, chunk)| {
-            let base = BATCH_SIZE * chunk_i;
-            for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                for (column, &value) in column_ptrs.iter().zip(point_values) {
-                    // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
+    if let Some(gpu_values) = accumulated_gpu_values {
+        quotient_values
+            .par_chunks(BATCH_SIZE * num_challenges)
+            .zip(gpu_values.par_chunks(BATCH_SIZE * num_challenges))
+            .enumerate()
+            .for_each(|(chunk_i, (cpu_chunk, gpu_chunk))| {
+                let base = BATCH_SIZE * chunk_i;
+                for (k, (cpu_point, gpu_point)) in cpu_chunk
+                    .chunks_exact(num_challenges)
+                    .zip(gpu_chunk.chunks_exact(num_challenges))
+                    .enumerate()
+                {
+                    let point = base + k;
+                    let denominator_inv = z_h_on_coset.eval_inverse(point);
+                    for ((column, &cpu), &gpu) in
+                        column_ptrs.iter().zip(cpu_point).zip(gpu_point)
+                    {
+                        // SAFETY: `point` lies in this chunk's disjoint range.
+                        unsafe {
+                            *column.0.add(point) = cpu + gpu * denominator_inv;
+                        }
+                    }
                 }
-            }
-        });
+            });
+    } else {
+        quotient_values
+            .par_chunks(BATCH_SIZE * num_challenges)
+            .enumerate()
+            .for_each(|(chunk_i, chunk)| {
+                let base = BATCH_SIZE * chunk_i;
+                for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                    for (column, &value) in column_ptrs.iter().zip(point_values) {
+                        // SAFETY: `base + k` lies in this chunk's disjoint range.
+                        unsafe { *column.0.add(base + k) = value };
+                    }
+                }
+            });
+    }
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
@@ -2727,7 +2859,7 @@ mod quotient_layout_tests {
     /// the resulting proof.
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     #[test]
-    fn metal_combined_gate_quotient_matches_cpu_and_verifies() -> Result<()> {
+    fn metal_shared_quotient_accumulator_all_seven_subsets_matches_cpu_and_verifies() -> Result<()> {
         crate::hash::poseidon2::metal::force_context_for_tests();
         let config = CircuitConfig::standard_recursion_config();
         let addition_gate = crate::gates::addition_base::AdditionGate::new_from_config(&config);
@@ -2797,9 +2929,10 @@ mod quotient_layout_tests {
                 Target::wire(selection_row, selection_gate.wire_ith_output(op)),
             );
         }
-        // A 2^16-point LDE retains both wire and constants/sigmas commitments
-        // in shared Metal columns, exercising the production full-domain seam.
-        while builder.num_gates() <= (1 << 12) {
+        // A 2^19-point LDE retains wires, constants/sigmas, and Z/partial
+        // products in shared Metal columns, exercising all three production
+        // quotient jobs through the common accumulator.
+        while builder.num_gates() <= (1 << 15) {
             builder.add_gate(NoopGate, vec![]);
         }
         let data = builder.build::<Poseidon2GoldilocksConfig>();
@@ -2853,13 +2986,21 @@ mod quotient_layout_tests {
 
         let before = gpu_poseidon_quotient_stats();
         COMPARE_GPU_QUOTIENT.store(true, Ordering::SeqCst);
-        let proof = data.prove(PartialWitness::new());
+        for mask in 1..=0b111 {
+            super::set_quotient_accumulator_test_mask(mask);
+            let proof = data.prove(PartialWitness::new())?;
+            assert_eq!(
+                super::quotient_accumulator_last_admitted_mask(),
+                mask,
+                "all jobs selected by subset {mask:03b} must be admitted",
+            );
+            data.verify(proof)?;
+        }
+        super::set_quotient_accumulator_test_mask(0b111);
         COMPARE_GPU_QUOTIENT.store(false, Ordering::SeqCst);
-        let proof = proof?;
         let after = gpu_poseidon_quotient_stats();
         assert!(after.range_started > before.range_started);
         assert!(after.range_completed > before.range_completed);
-        data.verify(proof)?;
 
         let fault = crate::hash::poseidon2::metal::force_range_quotient_finish_failure_for_tests();
         let fallback_proof = data.prove(PartialWitness::new())?;

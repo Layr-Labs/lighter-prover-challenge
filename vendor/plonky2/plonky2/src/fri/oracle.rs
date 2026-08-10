@@ -134,9 +134,33 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
+        Self::from_coeffs_with_gpu_ntt(
+            polynomials,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+            GPU_NTT_COMMITMENTS,
+        )
+    }
+
+    /// The same commitment constructor with an explicit, call-site-scoped GPU
+    /// NTT attempt. This keeps large wire commitments on the proven streamed
+    /// CPU path while allowing the much narrower quotient commitment to be
+    /// evaluated as an isolated residency experiment.
+    pub(crate) fn from_coeffs_with_gpu_ntt(
+        polynomials: Vec<PolynomialCoeffs<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+        try_gpu_ntt: bool,
+    ) -> Self {
         let degree = polynomials[0].len();
 
-        if GPU_NTT_COMMITMENTS && !blinding {
+        if try_gpu_ntt && !blinding {
             let coeff_columns: Vec<&[F]> = polynomials
                 .iter()
                 .map(|p| p.coeffs.as_slice())

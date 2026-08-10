@@ -109,7 +109,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
+    "9062463ccf67b8dc361dd28dd3c62f87fa63811c63f7f344e0234d269f013dfb";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -212,6 +212,7 @@ pub(crate) struct PoseidonGateQuotientJob<F> {
     command_buffer: CommandBuffer,
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
+    recycle_output: bool,
     len: usize,
     _job: GpuJobGuard,
     _phantom: PhantomData<F>,
@@ -224,6 +225,7 @@ pub(crate) struct RangeCheckGateQuotientJob<F> {
     command_buffer: CommandBuffer,
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
+    recycle_output: bool,
     len: usize,
     #[cfg(test)]
     failure_observer: Option<Arc<RangeQuotientFailureObserver>>,
@@ -238,9 +240,53 @@ pub(crate) struct PermutationQuotientJob<F> {
     command_buffer: CommandBuffer,
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
+    recycle_output: bool,
     len: usize,
     _job: GpuJobGuard,
     _phantom: PhantomData<F>,
+}
+
+/// One shared point-major quotient output written by the first admitted Metal
+/// evaluator and accumulated by every later evaluator for the same proof.
+pub(crate) struct QuotientAccumulator<F> {
+    output: Option<Buffer>,
+    output_pool: Arc<Mutex<QuotientOutputPool>>,
+    len: usize,
+    completed: core::sync::atomic::AtomicBool,
+    _phantom: PhantomData<F>,
+}
+
+impl<F: RichField> QuotientAccumulator<F> {
+    fn output(&self) -> &Buffer {
+        self.output.as_ref().expect("quotient accumulator output present")
+    }
+
+    /// Exposes the completed sum after the caller has joined every encoder.
+    pub(crate) fn finish(&self) -> &[F] {
+        self.completed
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+        let output = self.output();
+        // SAFETY: construction is restricted to an 8-byte Goldilocks field,
+        // and every admitted kernel writes both words for every row.
+        unsafe { slice::from_raw_parts(output.contents().cast::<F>(), self.len) }
+    }
+}
+
+impl<F> Drop for QuotientAccumulator<F> {
+    fn drop(&mut self) {
+        if !self
+            .completed
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let Some(output) = self.output.take() else {
+            return;
+        };
+        if let Ok(mut pool) = self.output_pool.try_lock() {
+            pool.recycle(output);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -309,7 +355,7 @@ impl Drop for ForceRangeQuotientFinishFailureGuard {
     }
 }
 impl<F: RichField> PoseidonGateQuotientJob<F> {
-    pub(crate) fn finish(&self) -> Result<&[F], String> {
+    pub(crate) fn finish_status(&self) -> Result<(), String> {
         self.command_buffer.wait_until_completed();
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
@@ -317,15 +363,27 @@ impl<F: RichField> PoseidonGateQuotientJob<F> {
                 self.command_buffer.status()
             ));
         }
-        // SAFETY: construction is restricted to an 8-byte Goldilocks field,
-        // and the completed kernel canonicalized every output word.
+        Ok(())
+    }
+
+    pub(crate) fn finish(&self) -> Result<&[F], String> {
+        self.finish_status()?;
         let output = self.output.as_ref().expect("quotient output present");
         Ok(unsafe { slice::from_raw_parts(output.contents().cast::<F>(), self.len) })
+    }
+
+    pub(crate) fn finish_shared(&self, shared: bool) -> Result<Option<&[F]>, String> {
+        if shared {
+            self.finish_status()?;
+            Ok(None)
+        } else {
+            self.finish().map(Some)
+        }
     }
 }
 
 impl<F: RichField> RangeCheckGateQuotientJob<F> {
-    pub(crate) fn finish(&self) -> Result<&[F], String> {
+    pub(crate) fn finish_status(&self) -> Result<(), String> {
         self.command_buffer.wait_until_completed();
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
@@ -340,10 +398,22 @@ impl<F: RichField> RangeCheckGateQuotientJob<F> {
                 .store(true, core::sync::atomic::Ordering::Relaxed);
             return Err("forced RangeCheck quotient completion failure".to_string());
         }
-        // SAFETY: construction is restricted to an 8-byte Goldilocks field,
-        // and the completed kernel canonicalized every output word.
+        Ok(())
+    }
+
+    pub(crate) fn finish(&self) -> Result<&[F], String> {
+        self.finish_status()?;
         let output = self.output.as_ref().expect("quotient output present");
         Ok(unsafe { slice::from_raw_parts(output.contents().cast::<F>(), self.len) })
+    }
+
+    pub(crate) fn finish_shared(&self, shared: bool) -> Result<Option<&[F]>, String> {
+        if shared {
+            self.finish_status()?;
+            Ok(None)
+        } else {
+            self.finish().map(Some)
+        }
     }
 
     #[cfg(test)]
@@ -357,7 +427,7 @@ impl<F: RichField> RangeCheckGateQuotientJob<F> {
 }
 
 impl<F: RichField> PermutationQuotientJob<F> {
-    pub(crate) fn finish(&self) -> Result<&[F], String> {
+    pub(crate) fn finish_status(&self) -> Result<(), String> {
         self.command_buffer.wait_until_completed();
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
@@ -365,10 +435,22 @@ impl<F: RichField> PermutationQuotientJob<F> {
                 self.command_buffer.status()
             ));
         }
-        // SAFETY: construction is restricted to an 8-byte Goldilocks field,
-        // and the completed kernel canonicalized every output word.
+        Ok(())
+    }
+
+    pub(crate) fn finish(&self) -> Result<&[F], String> {
+        self.finish_status()?;
         let output = self.output.as_ref().expect("quotient output present");
         Ok(unsafe { slice::from_raw_parts(output.contents().cast::<F>(), self.len) })
+    }
+
+    pub(crate) fn finish_shared(&self, shared: bool) -> Result<Option<&[F]>, String> {
+        if shared {
+            self.finish_status()?;
+            Ok(None)
+        } else {
+            self.finish().map(Some)
+        }
     }
 }
 
@@ -395,31 +477,37 @@ fn recycle_completed_quotient_output(
 
 impl<F> Drop for PoseidonGateQuotientJob<F> {
     fn drop(&mut self) {
-        recycle_completed_quotient_output(
-            &self.command_buffer,
-            &mut self.output,
-            &self.output_pool,
-        );
+        if self.recycle_output {
+            recycle_completed_quotient_output(
+                &self.command_buffer,
+                &mut self.output,
+                &self.output_pool,
+            );
+        }
     }
 }
 
 impl<F> Drop for RangeCheckGateQuotientJob<F> {
     fn drop(&mut self) {
-        recycle_completed_quotient_output(
-            &self.command_buffer,
-            &mut self.output,
-            &self.output_pool,
-        );
+        if self.recycle_output {
+            recycle_completed_quotient_output(
+                &self.command_buffer,
+                &mut self.output,
+                &self.output_pool,
+            );
+        }
     }
 }
 
 impl<F> Drop for PermutationQuotientJob<F> {
     fn drop(&mut self) {
-        recycle_completed_quotient_output(
-            &self.command_buffer,
-            &mut self.output,
-            &self.output_pool,
-        );
+        if self.recycle_output {
+            recycle_completed_quotient_output(
+                &self.command_buffer,
+                &mut self.output,
+                &self.output_pool,
+            );
+        }
     }
 }
 
@@ -1289,6 +1377,30 @@ pub(crate) fn build_merkle_tree_columns<F: RichField>(
     }
 }
 
+/// Allocates one shared two-challenge quotient accumulator. If no evaluator
+/// is admitted or a command fails, dropping it does not return the possibly
+/// in-flight buffer to the reuse pool.
+pub(crate) fn new_quotient_accumulator<F: RichField>(
+    quotient_rows: usize,
+) -> Option<QuotientAccumulator<F>> {
+    if F::ORDER != 0xffff_ffff_0000_0001
+        || size_of::<F>() != size_of::<u64>()
+        || quotient_rows == 0
+    {
+        return None;
+    }
+    let len = quotient_rows.checked_mul(2)?;
+    let bytes = len.checked_mul(size_of::<u64>())?;
+    let context = shared_context()?;
+    Some(QuotientAccumulator {
+        output: Some(context.acquire_quotient_output(bytes as u64)),
+        output_pool: Arc::clone(&context.quotient_output_pool),
+        len,
+        completed: core::sync::atomic::AtomicBool::new(false),
+        _phantom: PhantomData,
+    })
+}
+
 /// Starts a whole-domain Poseidon2Gate evaluation over retained natural-order
 /// LDE columns. `alpha_offset` is the number of non-gate vanishing terms that
 /// precede the gate constraints in the global alpha reduction.
@@ -1304,6 +1416,7 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
     include_unused_selector: bool,
     alphas: &[F],
     alpha_offset: usize,
+    accumulator: Option<(&QuotientAccumulator<F>, bool)>,
 ) -> Option<PoseidonGateQuotientJob<F>> {
     const POSEIDON_GATE_WIRES: usize = 135;
     const POSEIDON_GATE_CONSTRAINTS: usize = 123;
@@ -1350,6 +1463,7 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
         group,
         include_unused_selector,
         &alpha_powers,
+        accumulator,
     ) {
         Ok(job) => Some(job),
         Err(error) => {
@@ -1379,6 +1493,7 @@ pub(crate) fn start_permutation_quotient<F: RichField>(
     gammas: &[F],
     beta_k_is: &[F],
     alphas: &[F],
+    accumulator: Option<(&QuotientAccumulator<F>, bool)>,
 ) -> Option<PermutationQuotientJob<F>> {
     const NUM_CHALLENGES: usize = 2;
     const MAX_INLINE_BYTES: usize = 4096;
@@ -1451,6 +1566,7 @@ pub(crate) fn start_permutation_quotient<F: RichField>(
         &alpha_powers,
         alpha_stride,
         &challenges,
+        accumulator,
     ) {
         Ok(job) => Some(job),
         Err(error) => {
@@ -1473,6 +1589,7 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     u32_specs: &[U32QuotientSpec],
     alphas: &[F],
     alpha_offset: usize,
+    accumulator: Option<(&QuotientAccumulator<F>, bool)>,
 ) -> Option<RangeCheckGateQuotientJob<F>> {
     const SPEC_WORDS: usize = 10;
     const MAX_INLINE_BYTES: usize = 4096;
@@ -1775,6 +1892,7 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
         u32_specs.len(),
         &alpha_powers,
         alpha_stride,
+        accumulator,
     ) {
         Ok(job) => Some(job),
         Err(error) => {
@@ -2380,6 +2498,7 @@ impl MetalShared {
         group: core::ops::Range<usize>,
         include_unused_selector: bool,
         alpha_powers: &[u64],
+        accumulator: Option<(&QuotientAccumulator<F>, bool)>,
     ) -> Result<PoseidonGateQuotientJob<F>, String> {
         let pipeline = poseidon_gate_quotient_pipeline()
             .ok_or("Poseidon2 gate quotient pipeline unavailable")?;
@@ -2389,7 +2508,15 @@ impl MetalShared {
         let bytes = len
             .checked_mul(size_of::<u64>())
             .ok_or("Poseidon2 gate quotient output size overflow")?;
-        let output = self.acquire_quotient_output(bytes as u64);
+        let (output, recycle_output, accumulate_output) = match accumulator {
+            Some((accumulator, accumulate)) => {
+                if accumulator.len != len || accumulator.output().length() < bytes as u64 {
+                    return Err("Poseidon2 quotient accumulator shape mismatch".to_string());
+                }
+                (accumulator.output().to_owned(), false, accumulate)
+            }
+            None => (self.acquire_quotient_output(bytes as u64), true, false),
+        };
         let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
@@ -2412,6 +2539,7 @@ impl MetalShared {
             set_u32(encoder, 10, group.start as u32);
             set_u32(encoder, 11, group.end as u32);
             set_u32(encoder, 12, include_unused_selector as u32);
+            set_u32(encoder, 13, accumulate_output as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
@@ -2427,6 +2555,7 @@ impl MetalShared {
             command_buffer,
             output: Some(output),
             output_pool: Arc::clone(&self.quotient_output_pool),
+            recycle_output,
             len,
             _job: job_guard,
             _phantom: PhantomData,
@@ -2445,6 +2574,7 @@ impl MetalShared {
         u32_count: usize,
         alpha_powers: &[u64],
         alpha_stride: usize,
+        accumulator: Option<(&QuotientAccumulator<F>, bool)>,
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
         let pipeline = range_check_gate_quotient_pipeline()
             .ok_or("RangeCheck gate quotient pipeline unavailable")?;
@@ -2459,7 +2589,15 @@ impl MetalShared {
         let bytes = len
             .checked_mul(size_of::<u64>())
             .ok_or("RangeCheck gate quotient output size overflow")?;
-        let output = self.acquire_quotient_output(bytes as u64);
+        let (output, recycle_output, accumulate_output) = match accumulator {
+            Some((accumulator, accumulate)) => {
+                if accumulator.len != len || accumulator.output().length() < bytes as u64 {
+                    return Err("RangeCheck quotient accumulator shape mismatch".to_string());
+                }
+                (accumulator.output().to_owned(), false, accumulate)
+            }
+            None => (self.acquire_quotient_output(bytes as u64), true, false),
+        };
         let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
@@ -2484,6 +2622,7 @@ impl MetalShared {
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
+            set_u32(encoder, 11, accumulate_output as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
@@ -2509,6 +2648,7 @@ impl MetalShared {
             command_buffer,
             output: Some(output),
             output_pool: Arc::clone(&self.quotient_output_pool),
+            recycle_output,
             len,
             #[cfg(test)]
             failure_observer,
@@ -2534,6 +2674,7 @@ impl MetalShared {
         alpha_powers: &[u64],
         alpha_stride: usize,
         challenges: &[u64],
+        accumulator: Option<(&QuotientAccumulator<F>, bool)>,
     ) -> Result<PermutationQuotientJob<F>, String> {
         let pipeline = permutation_quotient_pipeline()
             .ok_or("permutation quotient pipeline unavailable")?;
@@ -2551,7 +2692,15 @@ impl MetalShared {
         let bytes = len
             .checked_mul(size_of::<u64>())
             .ok_or("permutation quotient output size overflow")?;
-        let output = self.acquire_quotient_output(bytes as u64);
+        let (output, recycle_output, accumulate_output) = match accumulator {
+            Some((accumulator, accumulate)) => {
+                if accumulator.len != len || accumulator.output().length() < bytes as u64 {
+                    return Err("permutation quotient accumulator shape mismatch".to_string());
+                }
+                (accumulator.output().to_owned(), false, accumulate)
+            }
+            None => (self.acquire_quotient_output(bytes as u64), true, false),
+        };
         let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
@@ -2581,6 +2730,7 @@ impl MetalShared {
             set_u32(encoder, 13, num_partial_products as u32);
             set_u32(encoder, 14, chunk_size as u32);
             set_u32(encoder, 15, alpha_stride as u32);
+            set_u32(encoder, 16, accumulate_output as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
@@ -2596,6 +2746,7 @@ impl MetalShared {
             command_buffer,
             output: Some(output),
             output_pool: Arc::clone(&self.quotient_output_pool),
+            recycle_output,
             len,
             _job: job_guard,
             _phantom: PhantomData,
@@ -3808,6 +3959,7 @@ mod tests {
             command_buffer: not_enqueued,
             output: Some(output()),
             output_pool: Arc::clone(&pool),
+            recycle_output: true,
             len: 8,
             _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
@@ -3827,6 +3979,7 @@ mod tests {
             command_buffer: completed,
             output: Some(completed_output),
             output_pool: Arc::clone(&pool),
+            recycle_output: true,
             len: 8,
             _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
@@ -3851,6 +4004,7 @@ mod tests {
             command_buffer: completed,
             output: Some(completed_output),
             output_pool: Arc::clone(&pool),
+            recycle_output: true,
             len: 8,
             failure_observer: None,
             _job: GpuJobGuard::begin(),
@@ -4086,6 +4240,7 @@ mod tests {
                 true,
                 &alphas,
                 ALPHA_OFFSET,
+                None,
             )
             .expect("Metal quotient job must start");
             let actual = job.finish().expect("Metal quotient job must finish");
@@ -4208,6 +4363,7 @@ mod tests {
                 &gammas,
                 &beta_k_is,
                 &alphas,
+                None,
             )
             .expect("Metal permutation job must start");
             let actual = job.finish().expect("Metal permutation job must finish");
@@ -4355,6 +4511,7 @@ mod tests {
                 &[],
                 &alphas,
                 ALPHA_OFFSET,
+                None,
             )
             .expect("Metal RangeCheck quotient job must start");
             let actual = job.finish().expect("Metal RangeCheck quotient job must finish");
@@ -4717,6 +4874,7 @@ mod tests {
                 &specs,
                 &alphas,
                 ALPHA_OFFSET,
+                None,
             )
             .expect("Metal U32 quotient job must start");
             let actual = job.finish().expect("Metal U32 quotient job must finish");
@@ -5333,6 +5491,7 @@ mod tests {
                 &u32_specs,
                 &alphas,
                 ALPHA_OFFSET,
+                None,
             )
             .expect("Metal byte/quintic quotient job must start");
             let actual = job
