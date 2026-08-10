@@ -1,4 +1,4 @@
-// Redraw marker 293
+// Redraw marker 295 | GPT-5 exponentiation frontier plus fold residence
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 

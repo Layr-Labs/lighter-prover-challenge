@@ -1880,6 +1880,11 @@ pub(crate) fn allocate_columns<F: RichField>(
     rows: usize,
     cap_height: usize,
 ) -> Option<MetalColumns<F>> {
+    // Column residence and hash routing have separate consumers. Keep the
+    // narrow, serial-critical 2^17-row fold stores shared so the permutation
+    // quotient can bind them even while a busy Metal queue correctly leaves
+    // their Merkle hash on CPU.
+    let serial_critical_resident = rows == 1 << 17 && (5..=64).contains(&cols);
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || cols == 0
@@ -1888,7 +1893,7 @@ pub(crate) fn allocate_columns<F: RichField>(
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
         || cap_height > rows.ilog2() as usize
-        || !gpu_worthwhile(cols, rows, cap_height)
+        || !(gpu_worthwhile(cols, rows, cap_height) || serial_critical_resident)
     {
         return None;
     }
@@ -4300,6 +4305,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn serial_critical_shapes_get_shared_allocation_when_gpu_busy() {
+        let Some(_context) = shared_context() else {
+            return;
+        };
+
+        struct ExclusivePhaseReset(bool);
+        impl Drop for ExclusivePhaseReset {
+            fn drop(&mut self) {
+                set_exclusive_gpu_phase(self.0);
+            }
+        }
+        let _reset = ExclusivePhaseReset(is_exclusive_gpu_phase());
+
+        set_exclusive_gpu_phase(false);
+        let _job = GpuJobGuard::begin();
+        let columns = allocate_columns::<GoldilocksField>(20, 1 << 17, 4);
+        assert!(columns.is_some());
+        assert!(!gpu_worthwhile(20, 1 << 17, 4));
     }
 
     #[test]
