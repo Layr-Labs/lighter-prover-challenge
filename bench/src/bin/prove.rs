@@ -15,8 +15,8 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 
 use api::{
-    Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
-    PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
+    release_finished_sigma_transpose, Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF,
+    PROVER_THREAD_STACK_BYTES, PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
 };
 use circuit::block_pre_execution_constraints::Circuit as _;
 use circuit::block::Block;
@@ -172,6 +172,7 @@ fn main() {
                 // quantity is computed differently and no work is added — storage
                 // that no subsequent read can reach is returned earlier.
                 pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+                release_finished_sigma_transpose(&mut pre_data.prover_only.sigmas);
                 (pre_target, pre_data, pre_proof)
             })
             .expect("pre-execution startup thread must start");

@@ -26,6 +26,10 @@ pub const PUBLIC_HEAVY_TX_COUNT: usize = 10;
 pub const PUBLIC_LIGHT_TX_COUNT: usize = 490;
 pub const PROVER_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
 
+pub(crate) fn release_finished_sigma_transpose<T>(sigmas: &mut Vec<Vec<T>>) {
+    drop(std::mem::take(sigmas));
+}
+
 pub struct Circuits {
     pub heavy_tx_target: BlockTxTarget,
     /// The heavy transaction and chain circuits are the only two whose proving
@@ -133,8 +137,8 @@ impl Circuits {
         }
     }
 
-    /// Releases the extended (LDE) constants/sigmas commitment of every circuit
-    /// whose proving has already finished when the final block proof starts.
+    /// Releases the constants/sigmas proof caches of every circuit whose proving
+    /// has already finished when the final block proof starts.
     ///
     /// `ProverOnlyCircuitData::constants_sigmas_commitment` holds a rate-`2^3`
     /// low-degree extension of that circuit's preprocessed columns, built once
@@ -154,8 +158,9 @@ impl Circuits {
     /// every retained extension — so releasing these first takes 1.01 GB
     /// straight off the high-water mark.
     ///
-    /// Nothing else is released here. Generators, representative maps and
-    /// witness buffers are CPU-heap objects whose recursive drop is not free.
+    /// The same last-use proof covers their base-domain sigma transposes:
+    /// `2 * 2^16 * 80 + 3 * 2^14 * 80` fields = 110 MiB, plus 4.125 MiB
+    /// of row headers. Recursive generator objects remain untouched.
     ///
     /// The heavy pair and light pair are normally already empty by the time this
     /// runs — see [`Self::release_heavy_circuit_extensions`] and
@@ -170,6 +175,7 @@ impl Circuits {
     pub fn release_finished_circuit_extensions(&mut self) {
         self.pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
         self.pre_data.prover_only.constants_sigmas_quotient_cache = None;
+        release_finished_sigma_transpose(&mut self.pre_data.prover_only.sigmas);
         for lock in [
             &mut self.light_tx_data,
             &mut self.light_chain_data,
@@ -184,6 +190,7 @@ impl Circuits {
             // as the commitment above, so wherever that is dead this is too.
             // Clearing it is idempotent for a path that already released its own.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            release_finished_sigma_transpose(&mut data.prover_only.sigmas);
         }
     }
 
@@ -220,6 +227,7 @@ impl Circuits {
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            release_finished_sigma_transpose(&mut data.prover_only.sigmas);
         }
     }
 
@@ -244,6 +252,7 @@ impl Circuits {
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            release_finished_sigma_transpose(&mut data.prover_only.sigmas);
         }
     }
 
