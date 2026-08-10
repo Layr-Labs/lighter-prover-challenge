@@ -26,6 +26,7 @@ use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _}
 use circuit::embed::serialize_embedded;
 use circuit::types::config::{C, CIRCUIT_CONFIG};
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
+use sha2::{Digest, Sha256};
 
 // Mirrors of the `src/api.rs` constants (a build script cannot import from
 // the crate it builds). Divergence is caught by `embedded_matches_rebuilt`:
@@ -35,6 +36,12 @@ const HEAVY_TX_PER_PROOF: usize = 4;
 const LIGHT_TX_PER_PROOF: usize = 10;
 const ON_CHAIN_OPERATIONS_LIMIT: usize = 1;
 const PROVER_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
+const K6_DYLIB_NAME: &str = "liblighter_k6.metallib";
+const K6_DYLIB_META_NAME: &str = "k6_dynamic_library_meta.rs";
+const K6_DYLIB_HELPER_MODE: &str = "LIGHTER_K6_DYLIB_HELPER";
+const K6_DYLIB_HELPER_PATH: &str = "LIGHTER_K6_DYLIB_PATH";
+const K6_DYLIB_HELPER_FORCE_ABORT: &str = "LIGHTER_K6_DYLIB_HELPER_FORCE_ABORT";
+const K6_DYLIB_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 const BLOB_NAMES: [&str; 5] = [
     "pre.embed",
@@ -55,6 +62,99 @@ fn write_blob(out_dir: &Path, name: &str, bytes: &[u8]) {
     );
 }
 
+fn write_k6_dynamic_library_metadata(out_dir: &Path, bytes: &[u8]) {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(bytes);
+    let mut source = String::from("pub const K6_DYNAMIC_LIBRARY_SHA256: [u8; 32] = [\n    ");
+    for (index, byte) in digest.iter().enumerate() {
+        if index != 0 && index % 8 == 0 {
+            source.push_str("\n    ");
+        }
+        write!(&mut source, "0x{byte:02x}, ").expect("writing generated K6 digest source");
+    }
+    source.push_str("\n];\n");
+    std::fs::write(out_dir.join(K6_DYLIB_META_NAME), source)
+        .expect("write generated K6 dynamic-library metadata");
+}
+
+fn wait_for_k6_dynamic_library_helper(
+    mut child: std::process::Child,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let deadline = std::time::Instant::now() + K6_DYLIB_HELPER_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn build_k6_dynamic_library(out_dir: &Path) {
+    let path = out_dir.join(K6_DYLIB_NAME);
+    let _ = std::fs::remove_file(&path);
+
+    let bytes = if std::env::var_os("LIGHTER_SKIP_K6_DYLIB").is_some_and(|value| value == "1") {
+        println!("cargo:warning=LIGHTER_SKIP_K6_DYLIB=1: K6 dynamic library is an empty stub");
+        Vec::new()
+    } else {
+        // The official build bridge has previously SIGSEGV'd inside Metal
+        // archive calls. Keep every GPU-touching API in a copy of this build
+        // script so a signal, denial, or hang degrades to an empty payload
+        // without terminating Cargo or retaining a partial artifact.
+        let child = std::env::current_exe().and_then(|executable| {
+            std::process::Command::new(executable)
+                .env(K6_DYLIB_HELPER_MODE, "1")
+                .env(K6_DYLIB_HELPER_PATH, &path)
+                .spawn()
+        });
+        let status = child.and_then(wait_for_k6_dynamic_library_helper);
+        match status {
+            Ok(Some(status)) if status.success() => std::fs::read(&path).unwrap_or_default(),
+            Ok(None) => {
+                println!("cargo:warning=K6 Metal helper timed out; embedding empty fallback");
+                Vec::new()
+            }
+            _ => {
+                println!("cargo:warning=K6 Metal helper unavailable; embedding empty fallback");
+                Vec::new()
+            }
+        }
+    };
+
+    // Overwrite any partial child output. The include_bytes! consumer and its
+    // sentinel metadata therefore always describe the same exact payload.
+    std::fs::write(&path, &bytes).expect("write embedded K6 dynamic library");
+    write_k6_dynamic_library_metadata(out_dir, &bytes);
+    println!(
+        "cargo:warning=build-host K6 dynamic library: {} bytes{}",
+        bytes.len(),
+        if bytes.is_empty() { " (runtime-source fallback)" } else { "" }
+    );
+}
+
+fn run_k6_dynamic_library_helper() -> ! {
+    if std::env::var_os(K6_DYLIB_HELPER_FORCE_ABORT).is_some_and(|value| value == "1") {
+        std::process::abort();
+    }
+    let path = PathBuf::from(
+        std::env::var_os(K6_DYLIB_HELPER_PATH)
+            .expect("K6 dynamic-library helper requires LIGHTER_K6_DYLIB_PATH"),
+    );
+    match plonky2::hash::poseidon2::write_k6_dynamic_library(&path) {
+        Ok(_) => std::process::exit(0),
+        Err(error) => {
+            eprintln!("K6 dynamic-library helper failed: {error}");
+            std::process::exit(1)
+        }
+    }
+}
+
 fn build_path_blobs(tx_per_proof: usize, tx_mode: u8) -> (Vec<u8>, Vec<u8>) {
     // Same construction as `PathCircuits::new`.
     let tx = BlockTxCircuit::define(CIRCUIT_CONFIG, tx_per_proof, CHAIN_ID, tx_mode);
@@ -73,14 +173,24 @@ fn build_path_blobs(tx_per_proof: usize, tx_mode: u8) -> (Vec<u8>, Vec<u8>) {
 }
 
 fn main() {
+    if std::env::var_os(K6_DYLIB_HELPER_MODE).is_some_and(|value| value == "1") {
+        run_k6_dynamic_library_helper();
+    }
+
     // A dependency change (circuit/, vendor/plonky2/) rebuilds this script and
     // re-runs it regardless of these directives; bench's own sources do not
     // affect the blobs, so they are deliberately not tracked.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=LIGHTER_SKIP_EMBED");
+    println!("cargo:rerun-if-env-changed=LIGHTER_SKIP_K6_DYLIB");
+    println!("cargo:rerun-if-env-changed=LIGHTER_K6_DYLIB_HELPER_FORCE_ABORT");
+    println!("cargo:rerun-if-changed=../vendor/plonky2/plonky2/src/hash/poseidon2/k6_residual.metal");
+    println!("cargo:rerun-if-changed=../vendor/plonky2/plonky2/src/hash/poseidon2/k6_residual_wrapper.metal");
 
     let out_dir =
         PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR must be set for build scripts"));
+
+    build_k6_dynamic_library(&out_dir);
 
     if std::env::var_os("LIGHTER_SKIP_EMBED").is_some_and(|v| v == "1") {
         for name in BLOB_NAMES {

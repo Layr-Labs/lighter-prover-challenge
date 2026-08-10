@@ -55,10 +55,67 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 #[unsafe(export_name = "_rjem_malloc_conf")]
 static MALLOC_CONF: &[u8; 34] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 
+const K6_DYNAMIC_LIBRARY_PAYLOAD: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/liblighter_k6.metallib"));
+include!(concat!(env!("OUT_DIR"), "/k6_dynamic_library_meta.rs"));
+
+// Keep the generated build-host payload in one unmistakable binary record so
+// a successful probe can be extracted from the GitHub Actions `prove`
+// artifact and committed in a follow-up that performs no build-time GPU work.
+const K6_DYLIB_START: &[u8; 32] = b"LTRK6DYLIB_START_V1_____________";
+const K6_DYLIB_END: &[u8; 32] = b"LTRK6DYLIB_END_V1_______________";
+const K6_DYLIB_PAYLOAD_OFFSET: usize = K6_DYLIB_START.len() + 8 + 32;
+const K6_DYLIB_RECORD_LEN: usize =
+    K6_DYLIB_PAYLOAD_OFFSET + K6_DYNAMIC_LIBRARY_PAYLOAD.len() + K6_DYLIB_END.len();
+
+const fn k6_dynamic_library_record() -> [u8; K6_DYLIB_RECORD_LEN] {
+    let mut record = [0; K6_DYLIB_RECORD_LEN];
+    let mut index = 0;
+    while index < K6_DYLIB_START.len() {
+        record[index] = K6_DYLIB_START[index];
+        index += 1;
+    }
+    let length = (K6_DYNAMIC_LIBRARY_PAYLOAD.len() as u64).to_le_bytes();
+    index = 0;
+    while index < length.len() {
+        record[K6_DYLIB_START.len() + index] = length[index];
+        index += 1;
+    }
+    index = 0;
+    while index < K6_DYNAMIC_LIBRARY_SHA256.len() {
+        record[K6_DYLIB_START.len() + 8 + index] = K6_DYNAMIC_LIBRARY_SHA256[index];
+        index += 1;
+    }
+    index = 0;
+    while index < K6_DYNAMIC_LIBRARY_PAYLOAD.len() {
+        record[K6_DYLIB_PAYLOAD_OFFSET + index] = K6_DYNAMIC_LIBRARY_PAYLOAD[index];
+        index += 1;
+    }
+    index = 0;
+    while index < K6_DYLIB_END.len() {
+        record[K6_DYLIB_PAYLOAD_OFFSET + K6_DYNAMIC_LIBRARY_PAYLOAD.len() + index] =
+            K6_DYLIB_END[index];
+        index += 1;
+    }
+    record
+}
+
+#[used]
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__DATA,__k6dylib")
+)]
+#[cfg_attr(not(target_os = "macos"), unsafe(link_section = ".lighter_k6"))]
+static K6_DYNAMIC_LIBRARY_RECORD: [u8; K6_DYLIB_RECORD_LEN] = k6_dynamic_library_record();
+
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
+    let k6_payload = &K6_DYNAMIC_LIBRARY_RECORD[K6_DYLIB_PAYLOAD_OFFSET
+        ..K6_DYLIB_PAYLOAD_OFFSET + K6_DYNAMIC_LIBRARY_PAYLOAD.len()];
+    plonky2::hash::poseidon2::install_k6_dynamic_library(k6_payload);
+
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context("worker", 0, &[]);
     #[cfg(feature = "diagnostic_profile")]
