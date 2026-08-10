@@ -17,7 +17,7 @@ gate_testing = []
 parallel = ["hashbrown/rayon", "plonky2_field/parallel", "plonky2_maybe_rayon/parallel"]
 std = ["anyhow/std", "rand/std", "itertools/use_std", "plonky2_field/std"]
 timing = ["std", "dep:web-time"]
-diagnostic_profile = ["std", "dep:serde_json", "dep:block"]
+diagnostic_profile = ["std", "dep:serde_json"]
 
 [dependencies]
 ahash = { workspace = true }
@@ -52,7 +52,7 @@ getrandom = { version = "0.2", default-features = false, features = ["js"] }
 [target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
 metal = "0.33.0"
 objc = "0.2.7"
-block = { version = "0.1.6", optional = true }
+block = "0.1.6"
 
 [dev-dependencies]
 criterion = { version = "0.5.1", default-features = false }
