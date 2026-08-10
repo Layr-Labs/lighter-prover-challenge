@@ -1027,6 +1027,41 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         }
     }
 
+    /// Copy a batch of leaves into caller-owned, pre-sized vectors.
+    ///
+    /// The destination at query slot `q` receives the leaf at `indices[q]`.
+    /// Column-backed trees traverse one column at a time so all query slots
+    /// reuse that column access before moving to the next column. Row-backed
+    /// trees retain their contiguous row copies. The caller can move these
+    /// vectors directly into the proof without an intermediate per-leaf
+    /// allocation.
+    pub fn fill_leaf_vecs(&self, indices: &[usize], leaves: &mut [Vec<F>]) {
+        assert_eq!(indices.len(), leaves.len());
+        let width = self.leaf_width();
+        assert!(leaves.iter().all(|leaf| leaf.len() == width));
+        assert!(indices.iter().all(|&index| index < self.num_leaves));
+
+        match &self.leaves {
+            MerkleLeaves::Rows { data, width } => {
+                for (&index, leaf) in indices.iter().zip(leaves) {
+                    leaf.copy_from_slice(&data[index * width..(index + 1) * width]);
+                }
+            }
+            MerkleLeaves::Columns { columns, log_rows } => {
+                let natural_indices = indices
+                    .iter()
+                    .map(|&index| crate::util::reverse_bits(index, *log_rows))
+                    .collect::<Vec<_>>();
+                for column_index in 0..columns.num_cols() {
+                    let column = columns.col(column_index);
+                    for (&natural_index, leaf) in natural_indices.iter().zip(leaves.iter_mut()) {
+                        leaf[column_index] = column[natural_index];
+                    }
+                }
+            }
+        }
+    }
+
     /// Create a Merkle proof from a leaf index.
     pub fn prove(&self, leaf_index: usize) -> MerkleProof<F, H> {
         let cap_height = log2_strict(self.cap.len());
@@ -1120,6 +1155,47 @@ pub(crate) mod tests {
         verify_all_leaves::<F, C, D>(leaves, 1)?;
 
         Ok(())
+    }
+
+    #[test]
+    fn batched_leaf_gather_matches_individual_reads() {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        let log_n = 4;
+        let n = 1 << log_n;
+        let width = 7;
+        let cap_height = 2;
+        let indices = [7usize, 0, 7, 3, 15, 1];
+        let columns: Vec<Vec<F>> = (0..width).map(|_| F::rand_vec(n)).collect();
+        let flat = crate::util::transpose_to_bitrev_flat(&columns);
+        let row_tree = MerkleTree::<F, H>::new_flat(flat, width, cap_height);
+        let column_tree = MerkleTree::<F, H>::new_columns(columns, cap_height);
+
+        for tree in [&row_tree, &column_tree] {
+            let expected = indices
+                .iter()
+                .map(|&index| tree.leaf_vec(index))
+                .collect::<Vec<_>>();
+            let mut gathered = (0..indices.len())
+                .map(|_| F::rand_vec(width))
+                .collect::<Vec<_>>();
+            tree.fill_leaf_vecs(&indices, &mut gathered);
+
+            for (expected_leaf, gathered_leaf) in expected.iter().zip(&gathered) {
+                let expected_raw = expected_leaf
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>();
+                let gathered_raw = gathered_leaf
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>();
+                assert_eq!(expected_raw, gathered_raw);
+            }
+        }
     }
 
     /// Differential: the gathering CPU build must reproduce the materializing

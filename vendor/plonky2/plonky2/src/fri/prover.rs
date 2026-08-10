@@ -319,12 +319,46 @@ fn fri_prover_query_rounds<
     n: usize,
     fri_params: &FriParams,
 ) -> Vec<FriQueryRound<F, C::Hasher, D>> {
-    challenger
+    let query_indices = challenger
         .get_n_challenges(fri_params.config.num_query_rounds)
+        .into_iter()
+        .map(|rand| rand.to_canonical_u64() as usize % n)
+        .collect::<Vec<_>>();
+
+    // Gather each initial tree once. For column-backed leaves this changes the
+    // traversal from query-major strided reads to column-major batched reads;
+    // the pre-sized leaf vectors are then moved directly into the proof.
+    let leaves_by_tree = initial_merkle_trees
+        .par_iter()
+        .map(|tree| {
+            let mut leaves = vec![vec![F::ZERO; tree.leaf_width()]; query_indices.len()];
+            tree.fill_leaf_vecs(&query_indices, &mut leaves);
+            leaves
+        })
+        .collect::<Vec<_>>();
+
+    // Transpose tree-major scratch into query-major proof ownership without
+    // copying any leaf payload, preserving challenger/query order exactly.
+    let mut leaves_by_query = (0..query_indices.len())
+        .map(|_| Vec::with_capacity(initial_merkle_trees.len()))
+        .collect::<Vec<_>>();
+    for tree_leaves in leaves_by_tree {
+        for (query_leaves, leaf) in leaves_by_query.iter_mut().zip(tree_leaves) {
+            query_leaves.push(leaf);
+        }
+    }
+
+    query_indices
         .into_par_iter()
-        .map(|rand| {
-            let x_index = rand.to_canonical_u64() as usize % n;
-            fri_prover_query_round::<F, C, D>(initial_merkle_trees, trees, x_index, fri_params)
+        .zip(leaves_by_query.into_par_iter())
+        .map(|(x_index, initial_leaves)| {
+            fri_prover_query_round::<F, C, D>(
+                initial_merkle_trees,
+                trees,
+                initial_leaves,
+                x_index,
+                fri_params,
+            )
         })
         .collect()
 }
@@ -336,13 +370,15 @@ fn fri_prover_query_round<
 >(
     initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
     trees: &[MerkleTree<F, C::Hasher>],
+    initial_leaves: Vec<Vec<F>>,
     mut x_index: usize,
     fri_params: &FriParams,
 ) -> FriQueryRound<F, C::Hasher, D> {
     let mut query_steps = Vec::new();
-    let initial_proof = initial_merkle_trees
-        .iter()
-        .map(|t| (t.leaf_vec(x_index), t.prove(x_index)))
+    let initial_proof = initial_leaves
+        .into_iter()
+        .zip(initial_merkle_trees)
+        .map(|(leaf, tree)| (leaf, tree.prove(x_index)))
         .collect::<Vec<_>>();
     for (i, tree) in trees.iter().enumerate() {
         let arity_bits = fri_params.reduction_arity_bits[i];
