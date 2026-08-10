@@ -46,6 +46,22 @@ inline void sub_epsilon_u32(thread uint& lo, thread uint& hi, uint active) {
 }
 
 // Multiplying by four is two doublings; a doubling is one field add.
+
+// 4x + limb in one 67-bit fold instead of three full gl_add calls (~42 ops).
+// t = x<<2 (low 64 bits of 4x), c = x>>62 (high 2 bits, 0-3).
+// After adding limb: c += carry, c <= 4. Since c*EPSILON < 2^34 and
+// s < 2^64, the sum f = s + c*EPSILON < 2^65, so at most one more fold.
+// If f overflowed (f < s), the wrapped f < c*EPSILON < 2^34, so
+// f + EPSILON < 2^34 + 2^32 < 2^64 — no second overflow.
+inline ulong gl_quad_add(ulong x, ulong limb) {
+    ulong t = x << 2;
+    uint c = (uint)(x >> 62);
+    ulong s = t + limb;
+    c += (uint)(s < t);
+    ulong f = s + (ulong)c * GOLDILOCKS_EPSILON;
+    return f + (ulong)(f < s) * GOLDILOCKS_EPSILON;
+}
+
 inline ulong gl_add(ulong a, ulong b);
 inline ulong gl_quadruple(ulong a) {
     ulong twice = gl_add(a, a);
@@ -98,6 +114,25 @@ inline ulong gl_sub(ulong a, ulong b) {
     sub_epsilon_u32(r0, r1, under);
     return ((ulong)r1 << 32) | (ulong)r0;
 #endif
+}
+
+
+// Small-constant Goldilocks add: c < 2^32. On carry the wrapped sum < c,
+// so s + EPSILON < c + 2^32 < 2^64 — the second correction round is
+// unreachable. ~4 ops vs ~14 for the full 32-bit-limb gl_add.
+inline ulong gl_add_small(ulong x, uint c) {
+    ulong s = x + (ulong)c;
+    bool carry = s < x;
+    return s + (ulong)carry * GOLDILOCKS_EPSILON;
+}
+
+// Small-constant Goldilocks sub: c < 2^32. On borrow the wrapped difference
+// is >= 2^64 - c, so r - EPSILON >= 2^64 - c - 2^32 + 1 > 0 — the second
+// correction round is unreachable. ~4 ops vs ~14 for gl_sub.
+inline ulong gl_sub_small(ulong x, uint c) {
+    ulong r = x - (ulong)c;
+    bool borrow = r > x;
+    return r - (ulong)borrow * GOLDILOCKS_EPSILON;
 }
 
 // Final step of the 128-bit Goldilocks reduction shared by gl_mul and
@@ -162,6 +197,36 @@ inline void mul_128(
 
     ulong t = p01 + (p00 >> 32);
     ulong m = t + p10;
+    uint carry = (uint)(m < t);
+
+    l0 = (uint)p00;
+    l1 = (uint)m;
+
+    uint q0 = (uint)p11;
+    uint q1 = (uint)(p11 >> 32);
+    uint mh = (uint)(m >> 32);
+    h0 = q0 + mh;
+    h1 = q1 + (uint)(h0 < q0) + carry;
+}
+
+// Squaring-specific 128-bit product: exploits a == b to use 3 multiplies
+// instead of 4 (p01 == p10, so the cross term is 2*p01 instead of p01+p10).
+// Value-exact: the 128-bit product a*a is identical either way.
+inline void sqr_128(
+    ulong a,
+    thread uint& l0,
+    thread uint& l1,
+    thread uint& h0,
+    thread uint& h1) {
+    uint2 av = as_type<uint2>(a);
+    uint a0 = av.x;
+    uint a1 = av.y;
+    ulong p00 = (ulong)a0 * (ulong)a0;
+    ulong p01 = (ulong)a0 * (ulong)a1;
+    ulong p11 = (ulong)a1 * (ulong)a1;
+
+    ulong t = p01 + (p00 >> 32);
+    ulong m = t + p01;
     uint carry = (uint)(m < t);
 
     l0 = (uint)p00;
@@ -319,6 +384,88 @@ inline ulong gl_mul_add(ulong a, ulong b, ulong addend) {
     return reduce_top(r0, r1, (int)carry - (int)under);
 }
 
+
+// r = a * b + addend1 + addend2 (mod p): absorbs both addends into the
+// 128-bit product before one shared reduction. The 128-bit product of two
+// 64-bit operands is at most 2^128 - 2^65 + 1, and the two addends add at
+// most 2^65 - 2, so the total is at most 2^128 - 1 — it never overflows
+// 128 bits, so h1 cannot wrap.
+inline ulong gl_mul_add2(ulong a, ulong b, ulong addend1, ulong addend2) {
+    uint l0;
+    uint l1;
+    uint h0;
+    uint h1;
+    mul_128(a, b, l0, l1, h0, h1);
+
+    // Absorb addend1 into the low limbs.
+    uint d0 = (uint)addend1;
+    uint d1 = (uint)(addend1 >> 32);
+    uint s0 = l0 + d0;
+    uint c0 = (uint)(s0 < l0);
+    uint s1 = l1 + d1;
+    uint c1 = (uint)(s1 < l1);
+    uint s1b = s1 + c0;
+    c1 += (uint)(s1b < s1);
+    l0 = s0;
+    l1 = s1b;
+    uint hh0 = h0 + c1;
+    h1 += (uint)(hh0 < h0);
+    h0 = hh0;
+
+    // Absorb addend2 into the low limbs.
+    uint e0 = (uint)addend2;
+    uint e1 = (uint)(addend2 >> 32);
+    uint t0 = l0 + e0;
+    uint c2 = (uint)(t0 < l0);
+    uint t1 = l1 + e1;
+    uint c3 = (uint)(t1 < l1);
+    uint t1b = t1 + c2;
+    c3 += (uint)(t1b < t1);
+    l0 = t0;
+    l1 = t1b;
+    uint hhh0 = h0 + c3;
+    h1 += (uint)(hhh0 < h0);
+    h0 = hhh0;
+
+    uint r0 = l0 - h0;
+    uint borrow = (uint)(r0 > l0);
+    uint next = r0 - h1;
+    borrow += (uint)(next > r0);
+    r0 = next;
+
+    uint r1 = l1 + h0;
+    uint carry = (uint)(r1 < l1);
+    next = r1 - borrow;
+    uint under = (uint)(next > r1);
+    r1 = next;
+
+    return reduce_top(r0, r1, (int)carry - (int)under);
+}
+
+// Squaring with 32-bit reduction: uses sqr_128 (3 multiplies) instead of
+// mul_128 (4 multiplies). Value-exact: a*a mod p is the same either way.
+inline ulong gl_sqr(ulong a) {
+    uint l0;
+    uint l1;
+    uint h0;
+    uint h1;
+    sqr_128(a, l0, l1, h0, h1);
+
+    uint r0 = l0 - h0;
+    uint borrow = (uint)(r0 > l0);
+    uint next = r0 - h1;
+    borrow += (uint)(next > r0);
+    r0 = next;
+
+    uint r1 = l1 + h0;
+    uint carry = (uint)(r1 < l1);
+    next = r1 - borrow;
+    uint under = (uint)(next > r1);
+    r1 = next;
+
+    return reduce_top(r0, r1, (int)carry - (int)under);
+}
+
 // x^7 by the addition chain 1 -> 2 -> 3 -> 6 -> 7. Every length-four chain for
 // x^7 costs the same four multiplies, but this one keeps only `value` and one
 // running power live at a time, and three of the four multiplies take `value`
@@ -326,9 +473,9 @@ inline ulong gl_mul_add(ulong a, ulong b, ulong addend) {
 // instead of re-splitting a fresh pair. The 2/4/3/7 chain is one step shallower
 // and measured consistently slower for both reasons.
 inline ulong pow7(ulong value) {
-    ulong value2 = gl_mul(value, value);
+    ulong value2 = gl_sqr(value);
     ulong value3 = gl_mul(value, value2);
-    ulong value6 = gl_mul(value3, value3);
+    ulong value6 = gl_sqr(value3);
     return gl_mul(value, value6);
 }
 
@@ -365,6 +512,33 @@ inline void external_linear_layer(thread ulong state[12]) {
     }
 }
 
+// External linear layer with round constants folded into the lazy accumulator.
+// RC enters with coefficient 1, so the lazy coefficient sum rises from 28 to 29,
+// still < 32 = 2^5, so lazy_materialize's bound is untouched. This replaces
+// 12 full gl_add calls (12 * ~14 = ~168 uint ops) with 12 lazy_add calls
+// (12 * 2 = 24 uint ops) — saves ~144 uint ops per external-linear+RC pair.
+inline void external_linear_layer_rc(
+    thread ulong state[12],
+    constant ulong* rc) {
+    lazy_t lazy[12];
+    for (uint i = 0; i < 12; ++i) {
+        lazy[i] = lazy_of(state[i]);
+    }
+    mat4(lazy);
+    mat4(lazy + 4);
+    mat4(lazy + 8);
+
+    lazy_t sums[4];
+    for (uint i = 0; i < 4; ++i) {
+        sums[i] = lazy_add(lazy_add(lazy[i], lazy[i + 4]), lazy[i + 8]);
+    }
+    for (uint i = 0; i < 12; ++i) {
+        lazy_t v = lazy_add(lazy[i], sums[i & 3]);
+        v = lazy_add(v, lazy_of(rc[i]));
+        state[i] = lazy_materialize(v);
+    }
+}
+
 // Same carry-free split as lazy_t: twelve operands keep both halves below
 // 12 * (2^32 - 1) < 2^36.
 inline ulong sum_state(thread const ulong state[12]) {
@@ -377,10 +551,28 @@ inline ulong sum_state(thread const ulong state[12]) {
 
 inline void internal_linear_layer(thread ulong state[12]) {
     ulong sum = sum_state(state);
-    // Poseidon2's internal diagonal is fixed by the hash configuration. Spell
-    // it as immediates so the Metal compiler can specialize the constant
-    // operand of all 264 internal-round multiplications per permutation.
     state[0] = gl_mul_add(state[0], 0xc3b6c08e23ba9300UL, sum);
+    state[1] = gl_mul_add(state[1], 0xd84b5de94a324fb6UL, sum);
+    state[2] = gl_mul_add(state[2], 0x0d0c371c5b35b84fUL, sum);
+    state[3] = gl_mul_add(state[3], 0x7964f570e7188037UL, sum);
+    state[4] = gl_mul_add(state[4], 0x5daf18bbd996604bUL, sum);
+    state[5] = gl_mul_add(state[5], 0x6743bc47b9595257UL, sum);
+    state[6] = gl_mul_add(state[6], 0x5528b9362c59bb70UL, sum);
+    state[7] = gl_mul_add(state[7], 0xac45e25b7127b68bUL, sum);
+    state[8] = gl_mul_add(state[8], 0xa2077d7dfbb606b5UL, sum);
+    state[9] = gl_mul_add(state[9], 0xf3faac6faee378aeUL, sum);
+    state[10] = gl_mul_add(state[10], 0x0c6388b51545e883UL, sum);
+    state[11] = gl_mul_add(state[11], 0xd27dbb6944917b60UL, sum);
+}
+
+// Internal linear layer with the next round's RC folded into lane 0.
+// product + a1 + a2 <= 2^128 - 1, so gl_mul_add2 absorbs both addends
+// without overflow. Saves one gl_add per internal round.
+inline void internal_linear_layer_rc(
+    thread ulong state[12],
+    ulong next_rc) {
+    ulong sum = sum_state(state);
+    state[0] = gl_mul_add2(state[0], 0xc3b6c08e23ba9300UL, sum, next_rc);
     state[1] = gl_mul_add(state[1], 0xd84b5de94a324fb6UL, sum);
     state[2] = gl_mul_add(state[2], 0x0d0c371c5b35b84fUL, sum);
     state[3] = gl_mul_add(state[3], 0x7964f570e7188037UL, sum);
@@ -400,26 +592,48 @@ inline void internal_linear_layer(thread ulong state[12]) {
 // compile-time constant tables so RC adds do not depend on device buffer loads.
 // Round loops stay compact (unlike full unroll) to preserve occupancy.
 inline void poseidon2(thread ulong state[12], constant ulong* /*parameters*/) {
+    // RC fold: fold each round's RC constants into the preceding linear layer's
+    // lazy accumulator, eliminating ~105 of ~118 full gl_add calls per permutation.
+    // The RC enters the lazy accumulator with coefficient 1, raising the max
+    // coefficient sum from 28 to 29 < 32 = 2^5, so lazy_materialize's bound is untouched.
+    // Transitions between layer types keep their gl_add (13 total).
+
+    // First external half: fold RC[0]..RC[3] into the linear layers.
+    external_linear_layer_rc(state, POSEIDON2_EXTERNAL_RC[0]);
+    for (uint round = 0; round < 3; ++round) {
+        for (uint i = 0; i < 12; ++i) {
+            state[i] = pow7(state[i]);
+        }
+        external_linear_layer_rc(state, POSEIDON2_EXTERNAL_RC[round + 1]);
+    }
+    // Last round of first external half (no next external RC).
+    for (uint i = 0; i < 12; ++i) {
+        state[i] = pow7(state[i]);
+    }
     external_linear_layer(state);
 
-    for (uint round = 0; round < 4; ++round) {
-        for (uint i = 0; i < 12; ++i) {
-            state[i] = pow7(gl_add(state[i], POSEIDON2_EXTERNAL_RC[round][i]));
-        }
-        external_linear_layer(state);
+    // Transition: add internal RC[0] to state[0] (not folded — layer type changes).
+    state[0] = pow7(gl_add(state[0], POSEIDON2_INTERNAL_RC[0]));
+    // Internal rounds: fold RC[1]..RC[21] into the linear layers.
+    for (uint round = 0; round < 21; ++round) {
+        internal_linear_layer_rc(state, POSEIDON2_INTERNAL_RC[round + 1]);
+        state[0] = pow7(state[0]);
     }
+    // Last internal round (no next internal RC).
+    internal_linear_layer(state);
 
-    for (uint round = 0; round < 22; ++round) {
-        state[0] = pow7(gl_add(state[0], POSEIDON2_INTERNAL_RC[round]));
-        internal_linear_layer(state);
+    // Transition: add external RC[4] to all lanes (not folded — layer type changes).
+    for (uint i = 0; i < 12; ++i) {
+        state[i] = pow7(gl_add(state[i], POSEIDON2_EXTERNAL_RC[4][i]));
     }
-
-    for (uint round = 4; round < 8; ++round) {
+    // Second external half: fold RC[5]..RC[7] into the linear layers.
+    for (uint round = 5; round < 8; ++round) {
+        external_linear_layer_rc(state, POSEIDON2_EXTERNAL_RC[round]);
         for (uint i = 0; i < 12; ++i) {
-            state[i] = pow7(gl_add(state[i], POSEIDON2_EXTERNAL_RC[round][i]));
+            state[i] = pow7(state[i]);
         }
-        external_linear_layer(state);
     }
+    external_linear_layer(state);
 }
 
 inline ulong poseidon2_gate_wire(
@@ -484,7 +698,7 @@ kernel void poseidon2_gate_quotient(
 
     ulong swap = poseidon2_gate_wire(wires, 24, lde_rows, source_row);
     poseidon2_gate_emit(
-        gl_mul(swap, gl_sub(swap, 1)),
+        gl_mul(swap, gl_sub_small(swap, 1)),
         alpha_powers,
         accumulators,
         constraint_index);
@@ -794,7 +1008,7 @@ kernel void range_check_gate_quotient(
             for (uint remaining = num_aux - 1u; remaining > 0u; --remaining) {
                 uint j = remaining - 1u;
                 ulong limb = wires[(aux_base + j) * lde_rows + source_row];
-                computed = gl_add(gl_quadruple(computed), limb);
+                computed = gl_quad_add(computed, limb);
             }
             range_check_gate_emit(
                 gl_sub(computed, input),
@@ -807,12 +1021,12 @@ kernel void range_check_gate_quotient(
                 ulong x = wires[(aux_base + j) * lde_rows + source_row];
                 ulong constraint;
                 if (j + 1u == num_aux && final_limb_range == 2u) {
-                    constraint = gl_mul(x, gl_sub(x, 1));
+                    constraint = gl_mul(x, gl_sub_small(x, 1));
                 } else {
-                    // x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3),
-                    // exactly the production CPU specialization.
-                    ulong y = gl_mul(x, gl_sub(x, 3));
-                    constraint = gl_mul(y, gl_add(y, 2));
+                    // x(x-1)(x-2)(x-3) = (y+1)^2 - 1, y = x(x-3),
+                    // one fewer multiply via gl_sqr.
+                    ulong y = gl_mul(x, gl_sub_small(x, 3));
+                    constraint = gl_sub_small(gl_sqr(gl_add_small(y, 1)), 1);
                 }
                 range_check_gate_emit(
                     constraint,
@@ -892,17 +1106,17 @@ kernel void range_check_gate_quotient(
                 for (uint remaining = 32u; remaining > 0u; --remaining) {
                     uint j = remaining - 1u;
                     ulong x = wires[(limb_base + j) * lde_rows + source_row];
-                    ulong y = gl_mul(x, gl_sub(x, 3));
+                    ulong y = gl_mul(x, gl_sub_small(x, 3));
                     range_check_gate_emit(
-                        gl_mul(y, gl_add(y, 2)),
+                        gl_sub_small(gl_sqr(gl_add_small(y, 1)), 1),
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
                         constraint_index++);
                     if (j < 16u) {
-                        combined_low = gl_add(gl_quadruple(combined_low), x);
+                        combined_low = gl_quad_add(combined_low, x);
                     } else {
-                        combined_high = gl_add(gl_quadruple(combined_high), x);
+                        combined_high = gl_quad_add(combined_high, x);
                     }
                 }
                 range_check_gate_emit(
@@ -944,14 +1158,14 @@ kernel void range_check_gate_quotient(
                 for (uint remaining = result_limbs; remaining > 0u; --remaining) {
                     uint j = remaining - 1u;
                     ulong x = wires[(limb_base + j) * lde_rows + source_row];
-                    ulong y = gl_mul(x, gl_sub(x, 3));
+                    ulong y = gl_mul(x, gl_sub_small(x, 3));
                     range_check_gate_emit(
-                        gl_mul(y, gl_add(y, 2)),
+                        gl_sub_small(gl_sqr(gl_add_small(y, 1)), 1),
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
                         constraint_index++);
-                    recomposed = gl_add(gl_quadruple(recomposed), x);
+                    recomposed = gl_quad_add(recomposed, x);
                 }
                 range_check_gate_emit(
                     gl_sub(recomposed, output_result),
@@ -999,17 +1213,17 @@ kernel void range_check_gate_quotient(
                 for (uint remaining = total_limbs; remaining > 0u; --remaining) {
                     uint j = remaining - 1u;
                     ulong x = wires[(limb_base + j) * lde_rows + source_row];
-                    ulong y = gl_mul(x, gl_sub(x, 3));
+                    ulong y = gl_mul(x, gl_sub_small(x, 3));
                     range_check_gate_emit(
-                        gl_mul(y, gl_add(y, 2)),
+                        gl_sub_small(gl_sqr(gl_add_small(y, 1)), 1),
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
                         constraint_index++);
                     if (j < result_limbs) {
-                        combined_result = gl_add(gl_quadruple(combined_result), x);
+                        combined_result = gl_quad_add(combined_result, x);
                     } else {
-                        combined_carry = gl_add(gl_quadruple(combined_carry), x);
+                        combined_carry = gl_quad_add(combined_carry, x);
                     }
                 }
                 range_check_gate_emit(
@@ -1041,9 +1255,9 @@ kernel void range_check_gate_quotient(
                     (ulong)routed_per_op * num_ops + (ulong)op * aux_per_op;
                 for (uint j = 0; j < aux_per_op; ++j) {
                     ulong x = wires[(aux_base + j) * lde_rows + source_row];
-                    ulong y = gl_mul(x, gl_sub(x, 3));
+                    ulong y = gl_mul(x, gl_sub_small(x, 3));
                     range_check_gate_emit(
-                        gl_mul(y, gl_add(y, 2)),
+                        gl_sub_small(gl_sqr(gl_add_small(y, 1)), 1),
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
@@ -1224,7 +1438,7 @@ kernel void range_check_gate_quotient(
                     ulong b = wires[(bit_base + (ulong)copy * bits + i)
                         * lde_rows + source_row];
                     range_check_gate_emit(
-                        gl_mul(b, gl_sub(b, 1)),
+                        gl_mul(b, gl_sub_small(b, 1)),
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
@@ -1446,10 +1660,10 @@ kernel void range_check_gate_quotient(
                 ulong x = wires[((ulong)1u + limb) * lde_rows + source_row];
                 ulong constraint;
                 if (base == 2u) {
-                    constraint = gl_mul(x, gl_sub(x, 1));
+                    constraint = gl_mul(x, gl_sub_small(x, 1));
                 } else {
-                    ulong y = gl_mul(x, gl_sub(x, 3));
-                    constraint = gl_mul(y, gl_add(y, 2));
+                    ulong y = gl_mul(x, gl_sub_small(x, 3));
+                    constraint = gl_sub_small(gl_sqr(gl_add_small(y, 1)), 1);
                 }
                 range_check_gate_emit(
                     constraint,
@@ -1519,7 +1733,7 @@ kernel void poseidon2_hash_leaves(
     for (uint offset = 0; offset < leaf_width; offset += 8) {
         uint chunk_size = min(8u, leaf_width - offset);
         for (uint i = 0; i < chunk_size; ++i) {
-            state[i] = gl_canonicalize(input[offset + i]);
+            state[i] = input[offset + i];
         }
         poseidon2(state, parameters);
     }
@@ -1642,7 +1856,7 @@ kernel void poseidon2_hash_leaves_colmajor(
     for (uint offset = 0; offset < leaf_width; offset += 8) {
         uint chunk_size = min(8u, leaf_width - offset);
         for (uint i = 0; i < chunk_size; ++i) {
-            state[i] = gl_canonicalize(leaves[(ulong)(offset + i) * leaf_count + gid]);
+            state[i] = leaves[(ulong)(offset + i) * leaf_count + gid];
         }
         poseidon2(state, parameters);
     }
@@ -1704,7 +1918,7 @@ kernel void poseidon2_absorb_pass(
         }
     }
     for (uint i = 0; i < chunk_size; ++i) {
-        st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
+        st[i] = leaves[(ulong)(col_start + i) * leaf_count + gid];
     }
     poseidon2(st, parameters);
     if (final_pass != 0u) {
