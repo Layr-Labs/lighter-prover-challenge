@@ -1801,6 +1801,107 @@ fn start_gpu_permutation_quotient<
     Some(job)
 }
 
+#[cfg(any(
+    test,
+    all(feature = "std", target_arch = "aarch64", target_os = "macos")
+))]
+fn merge_gpu_quotient_contributions<F: Field>(
+    quotient_values: &mut [F],
+    gpu_family_values: [Option<&[F]>; 3],
+    num_challenges: usize,
+    denominator_inverse: impl Fn(usize) -> F + Sync,
+) {
+    debug_assert!(num_challenges > 0);
+    for values in gpu_family_values.iter().flatten() {
+        debug_assert_eq!(values.len(), quotient_values.len());
+    }
+    if gpu_family_values.iter().all(Option::is_none) {
+        return;
+    }
+
+    quotient_values
+        .par_chunks_exact_mut(num_challenges)
+        .enumerate()
+        .for_each(|(i, cpu_values)| {
+            let denominator_inv = denominator_inverse(i);
+            let offset = i * num_challenges;
+            for (challenge, cpu) in cpu_values.iter_mut().enumerate() {
+                let mut gpu_sum = F::ZERO;
+                for values in gpu_family_values.iter().flatten() {
+                    gpu_sum += values[offset + challenge];
+                }
+                *cpu += gpu_sum * denominator_inv;
+            }
+        });
+}
+
+#[cfg(test)]
+mod gpu_quotient_merge_tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::merge_gpu_quotient_contributions;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::Field;
+
+    #[test]
+    fn single_sweep_matches_separate_family_sweeps() {
+        type F = GoldilocksField;
+
+        let num_challenges = 2;
+        let rows = 5;
+        let cpu = (0..rows * num_challenges)
+            .map(|i| F::from_canonical_usize(10 + i))
+            .collect::<Vec<_>>();
+        let families = core::array::from_fn::<_, 3, _>(|family| {
+            (0..rows * num_challenges)
+                .map(|i| F::from_canonical_usize(100 * (family + 1) + i))
+                .collect::<Vec<_>>()
+        });
+        let denominators = (0..rows)
+            .map(|i| F::from_canonical_usize(3 + i))
+            .collect::<Vec<_>>();
+
+        for mask in 0..8usize {
+            let mut expected = cpu.clone();
+            for (family, values) in families.iter().enumerate() {
+                if mask & (1 << family) == 0 {
+                    continue;
+                }
+                for (i, cpu_values) in expected.chunks_exact_mut(num_challenges).enumerate() {
+                    for (cpu, &gpu) in cpu_values
+                        .iter_mut()
+                        .zip(values[i * num_challenges..][..num_challenges].iter())
+                    {
+                        *cpu += gpu * denominators[i];
+                    }
+                }
+            }
+
+            let active = core::array::from_fn(|family| {
+                (mask & (1 << family) != 0).then_some(families[family].as_slice())
+            });
+            let denominator_evaluations = AtomicUsize::new(0);
+            let mut actual = cpu.clone();
+            merge_gpu_quotient_contributions(
+                &mut actual,
+                active,
+                num_challenges,
+                |i| {
+                    denominator_evaluations.fetch_add(1, Ordering::Relaxed);
+                    denominators[i]
+                },
+            );
+
+            assert_eq!(actual, expected, "active family mask {mask:#05b}");
+            assert_eq!(
+                denominator_evaluations.load(Ordering::Relaxed),
+                if mask == 0 { 0 } else { rows },
+                "active family mask {mask:#05b}"
+            );
+        }
+    }
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2347,14 +2448,22 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
-            Ok(values) => {
-                GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
+    {
+        // Finish every active command before touching the CPU quotient buffer.
+        let gpu_poseidon_result = gpu_poseidon.as_ref().map(|(_, job)| job.finish());
+        let gpu_range_result = gpu_range.as_ref().map(|(_, job)| job.finish());
+        let gpu_permutation_result = gpu_permutation.as_ref().map(|job| job.finish());
+
+        let mut gpu_failed = false;
+        match &gpu_poseidon_result {
+            Some(Ok(_)) => {
+                GPU_POSEIDON_QUOTIENT_COMPLETED
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
-            Err(error) => {
-                GPU_POSEIDON_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Some(Err(error)) => {
+                gpu_failed = true;
+                GPU_POSEIDON_QUOTIENT_FALLBACKS
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 log::warn!(
                     "Metal Poseidon2 gate quotient failed; recomputing quotient on CPU: {error}"
                 );
@@ -2363,44 +2472,20 @@ fn compute_quotient_polys<
                         "[gpu-poseidon-quotient] runtime failure; falling back to CPU: {error}"
                     );
                 }
-                return compute_quotient_polys(
-                    common_data,
-                    prover_data,
-                    public_inputs_hash,
-                    wires_commitment,
-                    zs_partial_products_and_lookup_commitment,
-                    betas,
-                    gammas,
-                    beta_k_is,
-                    deltas,
-                    alphas,
-                    col_major_perm,
-                    false,
-                );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
-
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
-            Ok(values) => {
-                GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
+            None => {}
+        }
+        #[cfg(test)]
+        let range_failed = matches!(&gpu_range_result, Some(Err(_)));
+        match &gpu_range_result {
+            Some(Ok(_)) => {
+                GPU_RANGE_QUOTIENT_COMPLETED
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
-            Err(error) => {
-                GPU_RANGE_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Some(Err(error)) => {
+                gpu_failed = true;
+                GPU_RANGE_QUOTIENT_FALLBACKS
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 log::warn!(
                     "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
                 );
@@ -2409,73 +2494,80 @@ fn compute_quotient_polys<
                         "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
                     );
                 }
-                let result = compute_quotient_polys(
-                    common_data,
-                    prover_data,
-                    public_inputs_hash,
-                    wires_commitment,
-                    zs_partial_products_and_lookup_commitment,
-                    betas,
-                    gammas,
-                    beta_k_is,
-                    deltas,
-                    alphas,
-                    col_major_perm,
-                    false,
-                );
-                #[cfg(test)]
-                job.mark_cpu_recompute_completed_for_tests();
-                return result;
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+            None => {}
+        }
+        if let Some(Err(error)) = &gpu_permutation_result {
+            gpu_failed = true;
+            log::warn!(
+                "Metal permutation quotient failed; recomputing quotient on CPU: {error}"
+            );
+        }
 
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some(job) = &gpu_permutation {
-        let gpu_values = match job.finish() {
-            Ok(values) => values,
-            Err(error) => {
-                log::warn!(
-                    "Metal permutation quotient failed; recomputing quotient on CPU: {error}"
-                );
-                return compute_quotient_polys(
-                    common_data,
-                    prover_data,
-                    public_inputs_hash,
-                    wires_commitment,
-                    zs_partial_products_and_lookup_commitment,
-                    betas,
-                    gammas,
-                    beta_k_is,
-                    deltas,
-                    alphas,
-                    col_major_perm,
-                    false,
-                );
-            }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+        if gpu_failed {
+            // Discard every GPU output and recompute the full quotient through
+            // the unchanged CPU path; no partial contribution has been merged.
+            let result = compute_quotient_polys(
+                common_data,
+                prover_data,
+                public_inputs_hash,
+                wires_commitment,
+                zs_partial_products_and_lookup_commitment,
+                betas,
+                gammas,
+                beta_k_is,
+                deltas,
+                alphas,
+                col_major_perm,
+                false,
+            );
+            #[cfg(test)]
+            if range_failed {
+                if let Some((_, job)) = &gpu_range {
+                    job.mark_cpu_recompute_completed_for_tests();
                 }
-            });
+            }
+            return result;
+        }
+
+        let gpu_poseidon_values = gpu_poseidon_result.map(|result| result.unwrap());
+        let gpu_range_values = gpu_range_result.map(|result| result.unwrap());
+        let gpu_permutation_values = gpu_permutation_result.map(|result| result.unwrap());
+        let gpu_family_values = [
+            gpu_poseidon_values.as_deref(),
+            gpu_range_values.as_deref(),
+            gpu_permutation_values.as_deref(),
+        ];
+        if gpu_family_values
+            .iter()
+            .flatten()
+            .any(|values| values.len() != quotient_values.len())
+        {
+            log::warn!(
+                "Metal quotient output length mismatch; recomputing full quotient on CPU"
+            );
+            return compute_quotient_polys(
+                common_data,
+                prover_data,
+                public_inputs_hash,
+                wires_commitment,
+                zs_partial_products_and_lookup_commitment,
+                betas,
+                gammas,
+                beta_k_is,
+                deltas,
+                alphas,
+                col_major_perm,
+                false,
+            );
+        }
+
+        merge_gpu_quotient_contributions(
+            &mut quotient_values,
+            gpu_family_values,
+            num_challenges,
+            |i| z_h_on_coset.eval_inverse(i),
+        );
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
