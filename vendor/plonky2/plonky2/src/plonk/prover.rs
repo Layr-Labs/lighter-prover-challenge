@@ -31,7 +31,7 @@ use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::permutation_argument::fixed_routed_wire;
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{
-    eval_vanishing_poly_base_batch, get_lut_poly, interleave_pair_plan, PermutationBatch,
+    eval_vanishing_poly_base_batch, interleave_pair_plan, PermutationBatch,
     VanishingScratch,
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
@@ -898,39 +898,48 @@ fn compute_lookup_polys<
         first_lut_gate: first_lut_row,
     } in prover_data.lookup_rows.clone()
     {
+        // Pre-allocate scratch buffers reused across rows to avoid per-row
+        // heap allocations in the hot lookup polynomial loop.
+        let mut looked_combos = Vec::with_capacity(num_lut_slots);
+        let mut minus_looked_combos = Vec::with_capacity(num_lut_slots);
+        let mut lookup_combos = Vec::with_capacity(num_lut_slots);
+        let mut looking_combos = Vec::with_capacity(num_lu_slots);
+        let mut minus_looking_combos = Vec::with_capacity(num_lu_slots);
+        // Reused for the output of batch_multiplicative_inverse_into in both
+        // the LUT and LU row loops (they are sequential, never overlapping).
+        let mut inverse_scratch =
+            Vec::with_capacity(num_lut_slots.max(num_lu_slots));
+
         // Set values for partial Sums and RE.
+        let delta_a = deltas[LookupChallenges::ChallengeA as usize];
+        let delta_b = deltas[LookupChallenges::ChallengeB as usize];
+        let delta_alpha = deltas[LookupChallenges::ChallengeAlpha as usize];
+        let delta_delta = deltas[LookupChallenges::ChallengeDelta as usize];
         for row in (last_lut_row..(first_lut_row + 1)).rev() {
-            // Get combos for Sum.
-            let looked_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| {
-                    let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
-                    let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
-
-                    looked_inp + deltas[LookupChallenges::ChallengeA as usize] * looked_out
-                })
-                .collect();
+            // Fused: compute looked_combos (ChallengeA) and lookup_combos (ChallengeB)
+            // in a single pass to avoid reading each witness wire twice.
+            looked_combos.clear();
+            lookup_combos.clear();
+            for s in 0..num_lut_slots {
+                let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
+                let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
+                looked_combos.push(looked_inp + delta_a * looked_out);
+                lookup_combos.push(looked_inp + delta_b * looked_out);
+            }
             // Get (alpha - combo).
-            let minus_looked_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| deltas[LookupChallenges::ChallengeAlpha as usize] - looked_combos[s])
-                .collect();
+            minus_looked_combos.clear();
+            for s in 0..num_lut_slots {
+                minus_looked_combos.push(delta_alpha - looked_combos[s]);
+            }
             // Get 1/(alpha - combo).
-            let looked_combo_inverses = F::batch_multiplicative_inverse(&minus_looked_combos);
-
-            // Get lookup combos, used to check the well formation of the LUT.
-            let lookup_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| {
-                    let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
-                    let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
-
-                    looked_inp + deltas[LookupChallenges::ChallengeB as usize] * looked_out
-                })
-                .collect();
+            F::batch_multiplicative_inverse_into(&minus_looked_combos, &mut inverse_scratch);
+            let looked_combo_inverses = &inverse_scratch;
 
             // Compute next row's first value of RE.
             // If `row == first_lut_row`, then `final_poly_vecs[0].values[row + 1] == 0`.
             let mut new_re = final_poly_vecs[0].values[row + 1];
             for elt in &lookup_combos {
-                new_re = new_re * deltas[LookupChallenges::ChallengeDelta as usize] + *elt
+                new_re = new_re * delta_delta + *elt
             }
             final_poly_vecs[0].values[row] = new_re;
 
@@ -954,20 +963,20 @@ fn compute_lookup_polys<
         // Set values for partial LDCs.
         for row in (last_lu_row..last_lut_row).rev() {
             // Get looking combos.
-            let looking_combos: Vec<F> = (0..num_lu_slots)
-                .map(|s| {
-                    let looking_in = witness.get_wire(row, LookupGate::wire_ith_looking_inp(s));
-                    let looking_out = witness.get_wire(row, LookupGate::wire_ith_looking_out(s));
-
-                    looking_in + deltas[LookupChallenges::ChallengeA as usize] * looking_out
-                })
-                .collect();
+            looking_combos.clear();
+            for s in 0..num_lu_slots {
+                let looking_in = witness.get_wire(row, LookupGate::wire_ith_looking_inp(s));
+                let looking_out = witness.get_wire(row, LookupGate::wire_ith_looking_out(s));
+                looking_combos.push(looking_in + delta_a * looking_out);
+            }
             // Get (alpha - combo).
-            let minus_looking_combos: Vec<F> = (0..num_lu_slots)
-                .map(|s| deltas[LookupChallenges::ChallengeAlpha as usize] - looking_combos[s])
-                .collect();
+            minus_looking_combos.clear();
+            for s in 0..num_lu_slots {
+                minus_looking_combos.push(delta_alpha - looking_combos[s]);
+            }
             // Get 1 / (alpha - combo).
-            let looking_combo_inverses = F::batch_multiplicative_inverse(&minus_looking_combos);
+            F::batch_multiplicative_inverse_into(&minus_looking_combos, &mut inverse_scratch);
+            let looking_combo_inverses = &inverse_scratch;
 
             for slot in 0..num_partial_lookups {
                 let prev = if slot == 0 {
@@ -1000,8 +1009,8 @@ fn compute_all_lookup_polys<
     lookup: bool,
 ) -> Vec<PolynomialValues<F>> {
     if lookup {
-        let polys: Vec<Vec<PolynomialValues<F>>> = (0..common_data.config.num_challenges)
-            .map(|c| {
+        (0..common_data.config.num_challenges)
+            .flat_map(|c| {
                 compute_lookup_polys(
                     witness,
                     &deltas[c * NUM_COINS_LOOKUP..(c + 1) * NUM_COINS_LOOKUP]
@@ -1011,8 +1020,7 @@ fn compute_all_lookup_polys<
                     common_data,
                 )
             })
-            .collect();
-        polys.into_iter().flatten().collect()
+            .collect()
     } else {
         vec![]
     }
@@ -1962,25 +1970,55 @@ fn compute_quotient_polys<
     // lut_poly_evals[i][j] gives the eval for the i'th challenge and the j'th lookup table
     let lut_re_poly_evals: Vec<Vec<F>> = if has_lookup {
         let num_lut_slots = LookupTableGate::num_slots(&common_data.config);
+
+        // Precompute input and output coefficient arrays for each LUT selector.
+        // These don't depend on the challenge-specific delta_b, so we compute them
+        // once and reuse across all challenges. This avoids constructing the full
+        // combined polynomial (with zero extension and reverse) per challenge.
+        let precomputed: Vec<(Vec<F>, Vec<F>)> =
+            (LookupSelectors::StartEnd as usize..common_data.num_lookup_selectors)
+                .map(|r| {
+                    let lut = &common_data.luts[r - LookupSelectors::StartEnd as usize];
+                    let n = lut.len();
+                    let nb_padded_elts = (num_lut_slots - n % num_lut_slots) % num_lut_slots;
+                    let (padding_inp, padding_out) = lut[0];
+
+                    let mut input_coeffs = Vec::with_capacity(n + nb_padded_elts);
+                    let mut output_coeffs = Vec::with_capacity(n + nb_padded_elts);
+                    for &(input, output) in lut.iter() {
+                        input_coeffs.push(F::from_canonical_u16(input));
+                        output_coeffs.push(F::from_canonical_u16(output));
+                    }
+                    for _ in 0..nb_padded_elts {
+                        input_coeffs.push(F::from_canonical_u16(padding_inp));
+                        output_coeffs.push(F::from_canonical_u16(padding_out));
+                    }
+                    (input_coeffs, output_coeffs)
+                })
+                .collect();
+
         (0..num_challenges)
-            .map(move |i| {
+            .map(|i| {
                 let cur_deltas = &deltas[NUM_COINS_LOOKUP * i..NUM_COINS_LOOKUP * (i + 1)];
-                let cur_challenge_delta = cur_deltas[LookupChallenges::ChallengeDelta as usize];
+                let cur_challenge_delta =
+                    cur_deltas[LookupChallenges::ChallengeDelta as usize];
+                let b = cur_deltas[LookupChallenges::ChallengeB as usize];
 
-                (LookupSelectors::StartEnd as usize..common_data.num_lookup_selectors)
-                    .map(|r| {
-                        let lut_row_number = common_data.luts
-                            [r - LookupSelectors::StartEnd as usize]
-                            .len()
-                            .div_ceil(num_lut_slots);
-
-                        get_lut_poly(
-                            common_data,
-                            r - LookupSelectors::StartEnd as usize,
-                            cur_deltas,
-                            num_lut_slots * lut_row_number,
-                        )
-                        .eval(cur_challenge_delta)
+                precomputed
+                    .iter()
+                    .map(|(input_coeffs, output_coeffs)| {
+                        // P(delta) = I(delta) + b * O(delta), where I and O are the
+                        // input and output coefficient polynomials. This avoids
+                        // constructing the combined polynomial per challenge.
+                        let i_eval = input_coeffs
+                            .iter()
+                            .rev()
+                            .fold(F::ZERO, |acc, &c| acc * cur_challenge_delta + c);
+                        let o_eval = output_coeffs
+                            .iter()
+                            .rev()
+                            .fold(F::ZERO, |acc, &c| acc * cur_challenge_delta + c);
+                        i_eval + b * o_eval
                     })
                     .collect()
             })
