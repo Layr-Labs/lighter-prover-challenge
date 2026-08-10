@@ -3658,17 +3658,22 @@ fn set_u32(encoder: &metal::ComputeCommandEncoderRef, index: u64, value: u32) {
     );
 }
 
+/// Threadgroup width for `dispatch_threads`: pipeline ceiling rounded down to
+/// a multiple of the SIMD width. Avoids historical artificial caps (64/128)
+/// that under-occupied Apple Silicon for high-`maxTotalThreads` kernels.
+fn threadgroup_width(pipeline: &ComputePipelineState) -> NSUInteger {
+    let execution_width = pipeline.thread_execution_width().max(1);
+    let max_tg = pipeline.max_total_threads_per_threadgroup().max(execution_width);
+    (max_tg / execution_width) * execution_width
+}
+
 fn dispatch2d(
     encoder: &metal::ComputeCommandEncoderRef,
     pipeline: &ComputePipelineState,
     width: usize,
     height: usize,
 ) {
-    let execution_width = pipeline.thread_execution_width();
-    let group_width = pipeline
-        .max_total_threads_per_threadgroup()
-        .min(64)
-        .max(execution_width);
+    let group_width = threadgroup_width(pipeline);
     encoder.dispatch_threads(
         MTLSize {
             width: width as NSUInteger,
@@ -3688,11 +3693,7 @@ fn dispatch(
     pipeline: &ComputePipelineState,
     thread_count: usize,
 ) {
-    let execution_width = pipeline.thread_execution_width();
-    let group_width = pipeline
-        .max_total_threads_per_threadgroup()
-        .min(128)
-        .max(execution_width);
+    let group_width = threadgroup_width(pipeline);
     encoder.dispatch_threads(
         MTLSize {
             width: thread_count as NSUInteger,
