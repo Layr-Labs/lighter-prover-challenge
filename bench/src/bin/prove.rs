@@ -94,22 +94,28 @@ fn main() {
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
-    // Fixture parse overlaps the pre-execution circuit load; both are fast.
-    let (block, pre_circuits) = rayon::join(
-        || {
-            #[cfg(feature = "diagnostic_profile")]
-            let _span = plonky2::util::profile::span("startup", "fixture_read_parse");
-            let json = fs::read(&fixture).expect("cannot read prover fixture");
-            Block::<F>::from_json_with_empty_txs(
-                &json,
-                HEAVY_TX_PER_PROOF,
-                LIGHT_TX_PER_PROOF,
-                PUBLIC_HEAVY_TX_COUNT,
-                PUBLIC_LIGHT_TX_COUNT,
-            )
-            .expect("invalid prover fixture")
-        },
-        || {
+    // Keep the pre-circuit load on the main thread while a scoped thread
+    // reads and parses the fixture. As soon as the pre load returns, start the
+    // remaining circuit loads before waiting for the fixture.
+    let (block, pre_handle, remaining) = std::thread::scope(|scope| {
+        let fixture_handle = std::thread::Builder::new()
+            .name("fixture-read-parse".into())
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, || {
+                #[cfg(feature = "diagnostic_profile")]
+                let _span = plonky2::util::profile::span("startup", "fixture_read_parse");
+                let json = fs::read(&fixture).expect("cannot read prover fixture");
+                Block::<F>::from_json_with_empty_txs(
+                    &json,
+                    HEAVY_TX_PER_PROOF,
+                    LIGHT_TX_PER_PROOF,
+                    PUBLIC_HEAVY_TX_COUNT,
+                    PUBLIC_LIGHT_TX_COUNT,
+                )
+                .expect("invalid prover fixture")
+            })
+            .expect("fixture read/parse thread must start");
+        let pre_circuits = {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "pre_circuit_load");
             match Circuits::load_pre() {
@@ -123,22 +129,23 @@ fn main() {
                     (pre.target, pre.builder.build::<C>())
                 }
             }
-        },
-    );
-    // The pre-execution witness is pure block-derived data (no circuit
-    // dependency), and the remaining four circuit blobs take ~5x longer to
-    // load than it takes to compute. Load the blobs on a scoped thread while
-    // the main thread derives the pre-execution witness, then start the pre
-    // proof the moment its witness exists — the pre proof runs underneath the
-    // tail of the blob loads instead of waiting for them to finish first.
-    // Value-exact: no quantity is computed differently, only in parallel.
-    let (pre_handle, remaining) = std::thread::scope(|scope| {
+        };
         let remaining_handle = scope.spawn(|| {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "remaining_circuit_loads");
             (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1"))
                 .then(Circuits::load_remaining_embedded)
         });
+        let block = fixture_handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        // The pre-execution witness is pure block-derived data (no circuit
+        // dependency), and the remaining four circuit blobs take ~5x longer to
+        // load than it takes to compute. Load the blobs while the main thread
+        // derives the pre-execution witness, then start the pre proof the moment
+        // its witness exists — the pre proof runs underneath the tail of the blob
+        // loads instead of waiting for them to finish first. Value-exact: no
+        // quantity is computed differently, only in parallel.
         let pre_exec = {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "pre_execution_native_witness");
@@ -181,7 +188,7 @@ fn main() {
         let remaining = remaining_handle
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        (pre_handle, remaining)
+        (block, pre_handle, remaining)
     });
     // The pre circuit is owned by the startup proof until it completes; only
     // the other four blobs are loaded above (loading all five here would
