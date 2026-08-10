@@ -430,19 +430,45 @@ fn prove_path(
                 })
                 .expect("transaction proof pipeline thread must start");
 
-            let next_witness = chunks.next().map(|(chunk_index, txs)| {
-                let (witness, next_jump) = generate_tx_witness(
-                    path,
-                    chunk_index,
-                    txs,
-                    tx_data,
-                    tx_target,
-                    created_at,
-                    state_metadata_hash,
-                    jump,
-                );
-                jump = next_jump;
-                (chunk_index, witness)
+            // Generate the next chunk's witness on its own thread rather than
+            // here, and join it only after the window wait below.
+            //
+            // The tip already generates one chunk ahead, but synchronously on
+            // this thread, so the path thread alternates between building a
+            // witness and waiting for a proof and never does both. The tip's own
+            // profiler makes that exact: over its 21,364 ms this thread spends
+            // 7,106 ms in `generate_tx_witness` and 14,253 ms blocked in the two
+            // joins, with **5 ms unaccounted** — the spans abut, they never
+            // overlap.
+            //
+            // Witness generation is pure CPU and touches no GPU resource, so
+            // moving it into the window wait adds no contention for anything the
+            // rest of the pipeline is competing over. The `jump` chain stays
+            // strictly sequential — chunk i+1's witness still starts from chunk
+            // i's `next_jump`, one generation is ever in flight, and the value
+            // is threaded back out of the thread rather than captured by
+            // reference — so the witnesses produced are the ones the tip
+            // produces, in the same order.
+            let next_chunk = chunks.next();
+            let witness_handle = next_chunk.map(|(chunk_index, txs)| {
+                let jump_in = jump;
+                std::thread::Builder::new()
+                    .name(format!("{path:?}-tx-witness-{chunk_index}"))
+                    .stack_size(PROVER_THREAD_STACK_BYTES)
+                    .spawn_scoped(scope, move || {
+                        let (witness, next_jump) = generate_tx_witness(
+                            path,
+                            chunk_index,
+                            txs,
+                            tx_data,
+                            tx_target,
+                            created_at,
+                            state_metadata_hash,
+                            jump_in,
+                        );
+                        (chunk_index, witness, next_jump)
+                    })
+                    .expect("transaction witness pipeline thread must start")
             });
 
             in_flight.push_back((current_step, proof_handle));
@@ -470,6 +496,16 @@ fn prove_path(
                 pending_tx = Some((proof_step, tx_proof));
             }
             current_step += 1;
+
+            // Joined here, after the wait above, which is the whole point: the
+            // generation ran inside that wait instead of before it.
+            let next_witness = witness_handle.map(|handle| {
+                let (chunk_index, witness, next_jump) = handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                jump = next_jump;
+                (chunk_index, witness)
+            });
 
             match next_witness {
                 Some((chunk_index, witness)) => {
