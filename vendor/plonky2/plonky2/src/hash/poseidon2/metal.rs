@@ -14,8 +14,9 @@ use objc::runtime::Sel;
 #[cfg(feature = "diagnostic_profile")]
 use objc::Message;
 use metal::{
-    Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSUInteger,
+    BinaryArchive, BinaryArchiveDescriptor, Buffer, CommandBuffer, CommandQueue, CompileOptions,
+    ComputePipelineDescriptor, ComputePipelineState, Device, MTLCommandBufferStatus,
+    MTLResourceOptions, MTLSize, NSUInteger, URL,
 };
 use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
@@ -106,6 +107,22 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// `poseidon2.metal` changes (see `MetalShared::new`); the
 /// `metallib_matches_shader_source` test enforces it.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
+
+/// Pre-lowered compute pipelines for the exact [`SHADER_METALLIB`] bytes above.
+///
+/// `MTLBinaryArchive` is device/driver specific, so every runtime failure is a
+/// soft miss. The archive is attached only when the prebuilt metallib loaded;
+/// the source fallback has different Metal function keys and must not use it.
+const PIPELINE_ARCHIVE: &[u8] = include_bytes!("poseidon2_pipelines.metalar");
+
+/// Artifact provenance. The tests below pin all three inputs and exercise every
+/// archive entry with `FailOnBinaryArchiveMiss`; update these only after running
+/// the standalone generator and its same-name mutation control.
+const PIPELINE_ARCHIVE_BASE: &str = "2f2951e14d077d76792d2e01fa0d432547dfd29d";
+const PIPELINE_ARCHIVE_SHA256: &str =
+    "9bcfbb602a3324a8bf752f3b8f235f283be7018fa2d2a041563b8c98e6ae8b47";
+const PIPELINE_ARCHIVE_METALLIB_SHA256: &str =
+    "b21f90022d75c1145eae432e02b0f04e15d99975ec4280d81362a03e14ab2164";
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
@@ -946,6 +963,84 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.get()
 }
 
+/// Materializes an embedded archive in the worker's sandbox-writable TMPDIR.
+///
+/// `MTLBinaryArchiveDescriptor` accepts a URL rather than bytes. Ranked clears
+/// the environment except for TMPDIR, which names its private scratch directory;
+/// every error here is a soft miss and leaves normal pipeline compilation intact.
+fn load_pipeline_archive_bytes(
+    device: &Device,
+    bytes: &[u8],
+    label: &str,
+) -> Option<BinaryArchive> {
+    let path = std::env::temp_dir().join(format!(
+        "lighter-poseidon2-{label}-{}.metalar",
+        std::process::id()
+    ));
+    if let Err(error) = std::fs::write(&path, bytes) {
+        log::debug!("Metal pipeline archive materialization failed: {error}");
+        return None;
+    }
+
+    // `metal::URL::new_with_string` wraps Foundation's autoreleased
+    // `+[NSURL URLWithString:]` result as though it were +1 owned. Letting that
+    // wrapper drop releases it once, then the autorelease pool releases the
+    // already-freed object again. Retain a genuinely owned clone while
+    // suppressing only the wrapper's incorrect release. Build the descriptor
+    // inside a nested pool and return it across the pool boundary: this also
+    // exercises `MTLBinaryArchiveDescriptor`'s required retention of its URL.
+    let descriptor = autoreleasepool(|| {
+        let autoreleased_url = std::mem::ManuallyDrop::new(URL::new_with_string(&format!(
+            "file://{}",
+            path.display()
+        )));
+        let owned_url = (&*autoreleased_url).clone();
+        let descriptor = BinaryArchiveDescriptor::new();
+        descriptor.set_url(&owned_url);
+        descriptor
+    });
+    match device.new_binary_archive_with_descriptor(&descriptor) {
+        Ok(archive) => Some(archive),
+        Err(error) => {
+            log::debug!("Metal pipeline archive unavailable: {error}");
+            None
+        }
+    }
+}
+
+fn load_pipeline_archive(device: &Device) -> Option<BinaryArchive> {
+    load_pipeline_archive_bytes(device, PIPELINE_ARCHIVE, &PIPELINE_ARCHIVE_SHA256[..16])
+}
+
+/// Builds exactly the descriptor archived by the standalone generator.
+///
+/// Production deliberately omits `FailOnBinaryArchiveMiss`: an artifact built
+/// for another OS/GPU, or a stale entry that escaped the shipping gate, simply
+/// compiles normally instead of disabling the Metal path.
+fn build_compute_pipeline(
+    device: &Device,
+    library: &metal::Library,
+    archive: Option<&BinaryArchive>,
+    name: &str,
+    kind: &str,
+) -> Result<ComputePipelineState, String> {
+    autoreleasepool(|| {
+        let function = library
+            .get_function(name, None)
+            .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
+        let pipeline = match archive {
+            Some(archive) => {
+                let descriptor = ComputePipelineDescriptor::new();
+                descriptor.set_compute_function(Some(&function));
+                descriptor.set_binary_archives(&[archive]);
+                device.new_compute_pipeline_state(&descriptor)
+            }
+            None => device.new_compute_pipeline_state_with_function(&function),
+        };
+        pipeline.map_err(|error| format!("{kind} pipeline creation failed: {error}"))
+    })
+}
+
 /// Starts the two gate-quotient pipeline builds on detached threads.
 ///
 /// One thread each rather than one for both: they are the two slowest kernels
@@ -955,7 +1050,11 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
 /// Scheduling only. The pipelines are the same objects the blocking build
 /// produced, lowered from the same library, so nothing they later compute can
 /// differ; only the instant at which they become available does.
-fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
+fn spawn_optional_pipelines(
+    device: &Device,
+    library: &metal::Library,
+    archive: Option<&BinaryArchive>,
+) {
     for (name, slot) in [
         ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
         (
@@ -967,16 +1066,14 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
     ] {
         let device = device.clone();
         let library = library.clone();
+        // Detached builders must own their archive reference until lowering
+        // finishes; a borrowed local would be dropped when MetalShared::new returns.
+        let archive = archive.cloned();
         let spawned = std::thread::Builder::new()
             .name(format!("poseidon2-metal-{name}"))
             .spawn(move || {
-                let pipeline = autoreleasepool(|| {
-                    library.get_function(name, None).ok().and_then(|function| {
-                        device
-                            .new_compute_pipeline_state_with_function(&function)
-                            .ok()
-                    })
-                });
+                let pipeline =
+                    build_compute_pipeline(&device, &library, archive.as_ref(), name, name).ok();
                 if pipeline.is_none() {
                     log::debug!("{name} pipeline unavailable; evaluating those gates on the CPU");
                 }
@@ -997,7 +1094,34 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
     }
 }
 
-static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShared::new);
+/// Cargo build scripts construct the embedded circuits, but must never enter
+/// Metal: GPU/Objective-C initialization is not safe in that host process and
+/// a correct CPU construction is untimed build work. Require both independent
+/// signals so a normally named worker, or an unrelated process with `OUT_DIR`,
+/// cannot silently lose the GPU path.
+fn is_cargo_build_script_process(executable: Option<&std::path::Path>, has_out_dir: bool) -> bool {
+    has_out_dir
+        && executable
+            .and_then(std::path::Path::file_name)
+            .is_some_and(|name| name == std::ffi::OsStr::new("build-script-build"))
+}
+
+fn metal_disabled_in_current_process() -> bool {
+    let executable = std::env::current_exe().ok();
+    is_cargo_build_script_process(
+        executable.as_deref(),
+        std::env::var_os("OUT_DIR").is_some(),
+    )
+}
+
+static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(|| {
+    if metal_disabled_in_current_process() {
+        // Build scripts construct circuit blobs on the CPU and must not initialize Metal.
+        Err("Metal is disabled inside Cargo build scripts".to_owned())
+    } else {
+        MetalShared::new()
+    }
+});
 
 /// Largest tree, in field elements, the readiness probe below will divert to
 /// the CPU while the Metal context is still being built.
@@ -2178,22 +2302,29 @@ impl MetalShared {
             //   xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib
             // and `metallib_matches_shader_source` fails the test run if you
             // forget.
-            let library = device
+            let prebuilt_library = device
                 .new_library_with_data(SHADER_METALLIB)
                 .ok()
                 .filter(|library| {
                     METALLIB_REQUIRED_KERNELS
                         .iter()
                         .all(|name| library.get_function(name, None).is_ok())
-                })
-                .map_or_else(
-                    || {
-                        device
-                            .new_library_with_source(SHADER_SOURCE, &options)
-                            .map_err(|error| format!("shader compilation failed: {error}"))
-                    },
-                    Ok,
-                )?;
+                });
+            let (library, pipeline_archive) = match prebuilt_library {
+                Some(library) => {
+                    // Archive keys differ between newLibraryWithData and the
+                    // source compiler. Attach this artifact only to the exact
+                    // prebuilt-metallib branch from which it was generated.
+                    let archive = load_pipeline_archive(&device);
+                    (library, archive)
+                }
+                None => (
+                    device
+                        .new_library_with_source(SHADER_SOURCE, &options)
+                        .map_err(|error| format!("shader compilation failed: {error}"))?,
+                    None,
+                ),
+            };
             // Build the compute pipelines concurrently, one thread each.
             //
             // Every `newComputePipelineStateWithFunction:` lowers that kernel's
@@ -2215,16 +2346,10 @@ impl MetalShared {
             // that created them rather than leaking.
             let device_ref = &device;
             let library_ref = &library;
+            let archive_ref = pipeline_archive.as_ref();
             let required = |name: &'static str, kind: &'static str| {
                 move || -> Result<ComputePipelineState, String> {
-                    autoreleasepool(|| {
-                        let function = library_ref
-                            .get_function(name, None)
-                            .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
-                        device_ref
-                            .new_compute_pipeline_state_with_function(&function)
-                            .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
-                    })
+                    build_compute_pipeline(device_ref, library_ref, archive_ref, name, kind)
                 }
             };
             // The two gate-quotient kernels are the two most expensive to lower
@@ -2295,7 +2420,7 @@ impl MetalShared {
             let ntt_stage_pipeline = ntt_stage_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
-            spawn_optional_pipelines(&device, &library);
+            spawn_optional_pipelines(&device, &library, pipeline_archive.as_ref());
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -3758,6 +3883,165 @@ mod tests {
                 "prebuilt metallib is missing kernel {name}"
             );
         }
+    }
+
+    fn artifact_sha256(dir: &str, name: &str) -> String {
+        let output = std::process::Command::new("/usr/bin/shasum")
+            .args(["-a", "256", &format!("{dir}/{name}")])
+            .output()
+            .unwrap_or_else(|error| panic!("shasum failed for {name}: {error}"));
+        assert!(output.status.success(), "shasum failed for {name}");
+        String::from_utf8(output.stdout)
+            .expect("shasum output is not utf-8")
+            .split_whitespace()
+            .next()
+            .expect("empty shasum output")
+            .to_owned()
+    }
+
+    #[test]
+    fn pipeline_archive_provenance_matches_files() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
+        assert_eq!(artifact_sha256(dir, "poseidon2.metal"), SHADER_SOURCE_SHA256);
+        assert_eq!(
+            artifact_sha256(dir, "poseidon2.metallib"),
+            PIPELINE_ARCHIVE_METALLIB_SHA256
+        );
+        assert_eq!(
+            artifact_sha256(dir, "poseidon2_pipelines.metalar"),
+            PIPELINE_ARCHIVE_SHA256
+        );
+        assert_eq!(PIPELINE_ARCHIVE_BASE.len(), 40, "base must be a full commit id");
+    }
+
+    #[test]
+    fn cargo_build_script_detector_requires_both_independent_signals() {
+        let build_script = std::path::Path::new("/tmp/hash/build-script-build");
+        let worker = std::path::Path::new("/tmp/candidate/target/release/prove");
+
+        assert!(is_cargo_build_script_process(Some(build_script), true));
+        assert!(!is_cargo_build_script_process(Some(build_script), false));
+        assert!(!is_cargo_build_script_process(Some(worker), true));
+        assert!(!is_cargo_build_script_process(Some(worker), false));
+        assert!(!is_cargo_build_script_process(None, true));
+        assert!(
+            !metal_disabled_in_current_process(),
+            "the plonky2 test executable must remain a Metal-capable worker control"
+        );
+    }
+
+    /// `metal::URL::new_with_string` returns an autoreleased NSURL despite its
+    /// owning Rust type. Exercise the candidate helper across an explicit pool
+    /// boundary: both the descriptor's URL retention and the returned archive
+    /// must remain valid after every temporary autorelease has been drained.
+    #[test]
+    fn pipeline_archive_url_ownership_survives_autorelease_pool_pop() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let archive = autoreleasepool(|| {
+            load_pipeline_archive_bytes(&device, PIPELINE_ARCHIVE, "autorelease-regression")
+                .expect("pipeline archive must load before the pool drains")
+        });
+        let library = device
+            .new_library_with_data(SHADER_METALLIB)
+            .expect("prebuilt metallib must load");
+        let function = library
+            .get_function(METALLIB_REQUIRED_KERNELS[0], None)
+            .expect("archived function must resolve");
+        let descriptor = ComputePipelineDescriptor::new();
+        descriptor.set_compute_function(Some(&function));
+        descriptor.set_binary_archives(&[&archive]);
+        device
+            .new_compute_pipeline_state_with_reflection(
+                &descriptor,
+                metal::MTLPipelineOption::FailOnBinaryArchiveMiss,
+            )
+            .expect("archive must remain usable after the autorelease pool drains");
+    }
+
+    #[test]
+    fn pipeline_archive_hits_every_metallib_kernel_and_misses_holdout() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let library = device
+            .new_library_with_data(SHADER_METALLIB)
+            .expect("prebuilt metallib must load");
+        let archive = load_pipeline_archive(&device).expect("pipeline archive must load");
+        let fail_on_miss = metal::MTLPipelineOption::ArgumentInfo
+            | metal::MTLPipelineOption::FailOnBinaryArchiveMiss;
+
+        for name in METALLIB_REQUIRED_KERNELS {
+            let function = library
+                .get_function(name, None)
+                .unwrap_or_else(|error| panic!("{name} unavailable: {error}"));
+            let descriptor = ComputePipelineDescriptor::new();
+            descriptor.set_compute_function(Some(&function));
+            descriptor.set_binary_archives(&[&archive]);
+            device
+                .new_compute_pipeline_state_with_reflection(&descriptor, fail_on_miss)
+                .unwrap_or_else(|error| panic!("archive MISS for {name}: {error}"));
+        }
+
+        let holdout_source = r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void lighter_archive_holdout(
+                device uint* out [[buffer(0)]],
+                uint gid [[thread_position_in_grid]]) {
+                if (gid == 0) out[0] += 1;
+            }
+        "#;
+        let holdout_library = device
+            .new_library_with_source(holdout_source, &CompileOptions::new())
+            .expect("holdout shader must compile");
+        let holdout = holdout_library
+            .get_function("lighter_archive_holdout", None)
+            .expect("holdout function unavailable");
+        let descriptor = ComputePipelineDescriptor::new();
+        descriptor.set_compute_function(Some(&holdout));
+        descriptor.set_binary_archives(&[&archive]);
+        assert!(
+            device
+                .new_compute_pipeline_state_with_reflection(&descriptor, fail_on_miss)
+                .is_err(),
+            "held-out function unexpectedly hit the archive"
+        );
+    }
+
+    #[test]
+    fn pipeline_archive_failures_fall_back_to_normal_compilation() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        assert!(
+            load_pipeline_archive_bytes(&device, b"not a Metal archive", "corrupt-test")
+                .is_none(),
+            "corrupt archive unexpectedly loaded"
+        );
+
+        let archive = load_pipeline_archive(&device).expect("pipeline archive must load");
+        let source = r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void lighter_wrong_archive_control(
+                device uint* out [[buffer(0)]],
+                uint gid [[thread_position_in_grid]]) {
+                if (gid == 0) out[0] += 1;
+            }
+        "#;
+        let library = device
+            .new_library_with_source(source, &CompileOptions::new())
+            .expect("control shader must compile");
+        build_compute_pipeline(
+            &device,
+            &library,
+            Some(&archive),
+            "lighter_wrong_archive_control",
+            "wrong-archive control",
+        )
+        .expect("production no-Fail path must compile an archive miss normally");
     }
 
     #[test]
