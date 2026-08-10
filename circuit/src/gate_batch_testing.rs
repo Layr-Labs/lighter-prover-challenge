@@ -424,8 +424,9 @@ where
     let num_constants = gate.num_constants();
     let num_constraints = gate.num_constraints();
 
-    let mut rand_f =
-        |rng: &mut rand::rngs::ThreadRng| F::from_canonical_u64(rng.gen_range(0..GoldilocksField::ORDER));
+    let mut rand_f = |rng: &mut rand::rngs::ThreadRng| {
+        F::from_canonical_u64(rng.gen_range(0..GoldilocksField::ORDER))
+    };
     let wires_batch: Vec<F> = (0..num_wires * n).map(|_| rand_f(&mut rng)).collect();
     let constants_batch: Vec<F> = (0..num_constants * n).map(|_| rand_f(&mut rng)).collect();
     let filters: Vec<F> = (0..n).map(|_| rand_f(&mut rng)).collect();
@@ -445,7 +446,12 @@ where
             combined[p] += filters[p] * res_row[p];
         }
     }
-    assert_eq!(actual, expected, "accumulate mismatch for gate {}", gate.id());
+    assert_eq!(
+        actual,
+        expected,
+        "accumulate mismatch for gate {}",
+        gate.id()
+    );
 }
 
 #[cfg(test)]
@@ -454,8 +460,6 @@ mod added_gate_tests {
     use plonky2::plonk::circuit_data::CircuitConfig;
 
     use super::assert_accumulate_matches_default;
-
-
 
     #[test]
     fn quintic_square_accumulate_matches_default() {

@@ -7,9 +7,9 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
+use core::any::Any;
 
 use anyhow::Result;
-use core::any::Any;
 use plonky2::field::extension::quintic::QuinticExtension;
 use plonky2::field::extension::{Extendable, FieldExtension};
 use plonky2::field::goldilocks_field::GoldilocksField;

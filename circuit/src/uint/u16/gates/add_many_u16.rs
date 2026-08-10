@@ -564,8 +564,10 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         }
         let mut carry_val = output_carry_u64;
         for j in 0..num_carry_limbs {
-            let wire =
-                local_wire(self.gate.wire_ith_output_jth_limb(self.i, num_result_limbs + j));
+            let wire = local_wire(
+                self.gate
+                    .wire_ith_output_jth_limb(self.i, num_result_limbs + j),
+            );
             out_buffer.set_wire(wire, F::from_canonical_u64(carry_val % limb_base))?;
             carry_val /= limb_base;
         }
@@ -593,4 +595,3 @@ mod batch_tests {
         }
     }
 }
-

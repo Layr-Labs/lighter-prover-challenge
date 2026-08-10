@@ -36,12 +36,12 @@
 use anyhow::{Context, Result, bail, ensure};
 use plonky2::field::fft::{cached_fft_root_table, cached_two_adic_subgroup};
 use plonky2::field::polynomial::PolynomialValues;
-use plonky2::field::types::Field;
 use plonky2::fri::oracle::PolynomialBatch;
+use plonky2::iop::generator::WitnessGeneratorRef;
 use plonky2::plonk::circuit_data::{
     CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
 };
-use plonky2::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
+use plonky2::plonk::permutation_argument::{Forest, fixed_routed_wire_mask};
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
 use plonky2::util::{log2_ceil, transpose_poly_values_ref};
@@ -136,8 +136,8 @@ fn write_compressed_section(out: &mut Vec<u8>, raw: &[u8]) {
     // section directly with zstd avoids the former runtime double decode
     // (whole-blob zstd followed by per-section LZ4) while retaining bounded
     // per-section peak memory during parallel circuit loading.
-    let compressed = zstd::bulk::compress(raw, 19)
-        .expect("zstd-compressing embedded circuit section");
+    let compressed =
+        zstd::bulk::compress(raw, 19).expect("zstd-compressing embedded circuit section");
     out.extend_from_slice(&(raw.len() as u64).to_le_bytes());
     write_section(out, &compressed);
 }
@@ -169,7 +169,10 @@ fn read_compressed_section(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
 
 /// Serializes a built circuit (target struct + [`CircuitData`]) into an
 /// embeddable blob. Companion of [`deserialize_embedded`].
-pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>) -> Result<Vec<u8>> {
+pub fn serialize_embedded<T: Serialize>(
+    target: &T,
+    data: &CircuitData<F, C, D>,
+) -> Result<Vec<u8>> {
     let gate_serializer = BlockGateSerializer;
     let generator_serializer = embed_generator_serializer();
     let common = &data.common;
@@ -294,16 +297,136 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
 // Read side (runtime)
 // ---------------------------------------------------------------------------
 
-/// Reconstructs the target struct and the full [`CircuitData`] from a blob
-/// produced by [`serialize_embedded`].
+/// The deferred half of an embedded load: the parsed constant and sigma
+/// column values needed to recompute the constants/sigmas commitment.
 ///
-/// The returned `CircuitData` is value-identical to the freshly built one:
-/// deserialized components are byte round trips, and every recomputed
-/// component (subgroup, FFT root table, sigma values/transpose, watch counts,
-/// constants/sigmas commitment) is derived by the same code paths the builder
-/// itself runs, from the same inputs. The recomputed commitment cap is checked
-/// against the embedded verifier data before returning.
-pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, CircuitData<F, C, D>)> {
+/// That recompute (IFFT + LDE + Merkle) is the expensive half of
+/// [`parse_embedded`], and nothing on the witness-generation path reads its
+/// result — only a proof *of this circuit* does. [`parse_embedded`] therefore
+/// returns it separately so callers can finish it on a background thread while
+/// the proving pipeline starts; [`PendingEmbeddedCommitment::finalize_into`]
+/// installs the identical value the eager path would have produced, including
+/// the same cap validation against the embedded verifier data.
+pub struct PendingEmbeddedCommitment {
+    constant_values: Vec<PolynomialValues<F>>,
+    sigma_vecs: Vec<PolynomialValues<F>>,
+}
+
+impl PendingEmbeddedCommitment {
+    /// Recomputes the constants/sigmas commitment (the builder's own
+    /// `PolynomialBatch::from_values` path) and installs it, plus the derived
+    /// quotient-domain cache, into `data`. Errors — exactly like the eager
+    /// path — if the recomputed cap diverges from the embedded verifier data.
+    pub fn finalize_into(self, data: &mut CircuitData<F, C, D>) -> Result<()> {
+        let common = &data.common;
+        let rate_bits = common.config.fri_config.rate_bits;
+        let cap_height = common.config.fri_config.cap_height;
+
+        // The builder's commitment path: values in, IFFT inside, LDE + Merkle.
+        // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).
+        let mut constants_sigmas_vecs = self.constant_values;
+        constants_sigmas_vecs.extend(self.sigma_vecs);
+        let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
+            constants_sigmas_vecs,
+            rate_bits,
+            false,
+            cap_height,
+            &mut TimingTree::default(),
+            data.prover_only.fft_root_table.as_ref(),
+        );
+        if constants_sigmas_commitment.merkle_tree.cap != data.verifier_only.constants_sigmas_cap {
+            bail!(
+                "recomputed constants/sigmas commitment cap diverges from the embedded verifier data \
+                 (stale or corrupt embedded circuit blob)"
+            );
+        }
+
+        // Mirror the builder's quotient-domain constants/sigmas cache (added by the
+        // Metal quotient-gate union frontier). It is a pure derivation from the
+        // freshly recomputed column-backed commitment — the same extraction the
+        // builder performs — and the documented `None` fallback keeps the quotient
+        // path correct if extraction declines.
+        // Skipped entirely at `step == 1`, where the cache cannot pay for itself:
+        // it exists to turn a strided gather into a contiguous copy, and at stride
+        // one the gather is *already* contiguous. Concretely,
+        // `extract_lde_batch_columns(1, range, domain)` memcpys
+        // `columns.col(c)[..domain]` per column, while the uncached quotient path
+        // reaches `fill_lde_batch` with `BatchLayout::PolyMajor`, `step == 1` and
+        // consecutive indices — which routes to `fill_lde_batch_contiguous` and
+        // copies `columns.col(c)[start..end]`. Same bytes out of the same buffer,
+        // one `copy_from_slice` per column either way. So the cache is a bit-exact
+        // duplicate of storage the commitment already retains, and building it
+        // costs one extra full-LDE allocation plus copy per circuit and holds that
+        // duplicate resident for the rest of the process.
+        let quotient_degree_bits = log2_ceil(common.quotient_degree_factor);
+        let step = 1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
+        let domain = 1 << (common.degree_bits() + quotient_degree_bits);
+        let cols = common.constants_range().len() + common.sigmas_range().len();
+        let constants_sigmas_quotient_cache =
+            if step != 1 && cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
+                match (
+                    constants_sigmas_commitment.extract_lde_batch_columns(
+                        step,
+                        common.constants_range(),
+                        domain,
+                    ),
+                    constants_sigmas_commitment.extract_lde_batch_columns(
+                        step,
+                        common.sigmas_range(),
+                        domain,
+                    ),
+                ) {
+                    (Some(constants), Some(sigmas_cache)) => {
+                        let mut cache: Vec<F> = constants;
+                        cache.extend(sigmas_cache);
+                        Some(cache)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+        data.prover_only.constants_sigmas_commitment = constants_sigmas_commitment;
+        data.prover_only.constants_sigmas_quotient_cache = constants_sigmas_quotient_cache;
+        data.prover_only.constants_sigmas_quotient_step = step;
+        data.prover_only.constants_sigmas_quotient_domain = domain;
+        Ok(())
+    }
+}
+
+/// The result of [`parse_embedded`]: a fully usable [`CircuitData`] whose only
+/// incomplete component is the constants/sigmas commitment (carried separately
+/// in `commitment`), plus optionally a witness-generation facade.
+pub struct ParsedEmbedded<T> {
+    pub target: T,
+    /// Complete except `constants_sigmas_commitment` (a `PolynomialBatch::default`
+    /// placeholder) and `constants_sigmas_quotient_cache` (`None`). Every field
+    /// the witness-generation path reads — generators, representative map, watch
+    /// index, public inputs — is final.
+    pub circuit: CircuitData<F, C, D>,
+    pub commitment: PendingEmbeddedCommitment,
+    /// Present only when requested: a second `CircuitData` whose prover-only data
+    /// shares nothing mutable with `circuit` (generators are parsed from the blob
+    /// twice) and whose `sigmas`/commitment fields are empty. Witness generation
+    /// reads exactly the fields this facade *does* carry, so the proving pipeline
+    /// can start on it while `commitment` finalizes elsewhere, with no lock held.
+    pub witness_facade: Option<CircuitData<F, C, D>>,
+}
+
+/// Parses an embedded blob into a [`CircuitData`] that is complete except for
+/// the constants/sigmas commitment, which is returned deferred as a
+/// [`PendingEmbeddedCommitment`]. When `duplicate_for_facade` is set, a
+/// witness-generation facade is produced as well (see [`ParsedEmbedded`]).
+///
+/// Everything else is identical to [`deserialize_embedded`]: deserialized
+/// components are byte round trips, and every recomputed component (subgroup,
+/// FFT root table, sigma values/transpose, watch counts) is derived by the
+/// same code paths the builder itself runs, from the same inputs.
+pub fn parse_embedded<T: DeserializeOwned>(
+    bytes: &[u8],
+    duplicate_for_facade: bool,
+) -> Result<ParsedEmbedded<T>> {
     let gate_serializer = BlockGateSerializer;
     let generator_serializer = embed_generator_serializer();
 
@@ -312,8 +435,8 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // the wrap disabled degrades to the previous format instead of failing.
     let unwrapped;
     let bytes = if bytes.len() >= 4 && bytes[0..4] == [0x28, 0xB5, 0x2F, 0xFD] {
-        unwrapped = zstd::stream::decode_all(bytes)
-            .context("embedded circuit blob failed zstd unwrap")?;
+        unwrapped =
+            zstd::stream::decode_all(bytes).context("embedded circuit blob failed zstd unwrap")?;
         &unwrapped[..]
     } else {
         bytes
@@ -387,18 +510,30 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
 
     // generators
     let section = read_compressed_section(bytes, &mut pos)?;
-    let mut reader = Buffer::new(&section);
-    let generator_count = reader
-        .read_usize()
-        .map_err(|e| anyhow::anyhow!("deserializing generators: {e:?}"))?;
-    let mut generators = Vec::with_capacity(generator_count);
-    for _ in 0..generator_count {
-        generators.push(
-            reader
-                .read_generator::<F, D>(&generator_serializer, &common)
-                .map_err(|e| anyhow::anyhow!("deserializing generator: {e:?}"))?,
-        );
-    }
+    let parse_generators = |section: &[u8]| -> Result<Vec<WitnessGeneratorRef<F, D>>> {
+        let mut reader = Buffer::new(section);
+        let generator_count = reader
+            .read_usize()
+            .map_err(|e| anyhow::anyhow!("deserializing generators: {e:?}"))?;
+        let mut generators = Vec::with_capacity(generator_count);
+        for _ in 0..generator_count {
+            generators.push(
+                reader
+                    .read_generator::<F, D>(&generator_serializer, &common)
+                    .map_err(|e| anyhow::anyhow!("deserializing generator: {e:?}"))?,
+            );
+        }
+        Ok(generators)
+    };
+    let generators = parse_generators(&section)?;
+    // The facade needs its own generator set: `WitnessGeneratorRef` boxes trait
+    // objects and cannot be cloned, and the facade must share nothing mutable
+    // with the slot circuit. Re-reading the same section bytes yields the
+    // identical generator stream (deterministic function of the blob).
+    let facade_generators = duplicate_for_facade
+        .then(|| parse_generators(&section))
+        .transpose()?;
+    let generator_count = generators.len();
 
     // watch index
     let section = read_compressed_section(bytes, &mut pos)?;
@@ -425,10 +560,19 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     }
     // Watch counts are a pure function of the (deduplicated) watcher lists;
     // this mirrors `read_prover_only_circuit_data`'s reconstruction.
-    let mut generator_watch_counts = vec![0usize; generator_count];
+    let mut generator_watch_counts = vec![0usize; generators.len()];
     for &watcher in &watchers {
         generator_watch_counts[watcher] += 1;
     }
+    let facade_watch_parts = if duplicate_for_facade {
+        Some((
+            offsets.clone(),
+            watchers.clone(),
+            generator_watch_counts.clone(),
+        ))
+    } else {
+        None
+    };
     let generator_indices_by_watches = GeneratorWatchIndex::from_parts(offsets, watchers);
 
     // constant polynomial values
@@ -468,12 +612,14 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         representative_map
             .push(u32::try_from(parent).context("representative map entry out of range")?);
     }
-    ensure!(pos == bytes.len(), "trailing bytes in embedded circuit blob");
+    ensure!(
+        pos == bytes.len(),
+        "trailing bytes in embedded circuit blob"
+    );
 
     // ---- recompute the derived prover-only components ----
     let degree_bits = common.degree_bits();
     let rate_bits = common.config.fri_config.rate_bits;
-    let cap_height = common.config.fri_config.cap_height;
     let num_wires = common.config.num_wires;
     let num_routed = common.config.num_routed_wires;
 
@@ -501,89 +647,65 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
             .context("embedded circuit has an invalid compressed representative map")?;
 
     // `prover_only.sigmas` is the transpose of the sigma *values*, and the
-    // commitment below consumes those same values. Transposing first reads the
-    // columns in place, so they can then be moved into the commitment instead
-    // of cloned; the clone was one extra full copy of the sigma columns
+    // deferred commitment consumes those same values. Transposing first reads the
+    // columns in place, so they can then be moved into the pending commitment
+    // instead of cloned; the clone was one extra full copy of the sigma columns
     // (`num_routed_wires * degree` field elements) per circuit. Only the order
     // of two independent reads changes — no quantity is computed differently.
     let sigmas = transpose_poly_values_ref(&sigma_vecs);
 
-    // The builder's commitment path: values in, IFFT inside, LDE + Merkle.
-    // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).
-    let mut constants_sigmas_vecs = constant_values;
-    constants_sigmas_vecs.extend(sigma_vecs);
-    let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
-        constants_sigmas_vecs,
-        rate_bits,
-        false,
-        cap_height,
-        &mut TimingTree::default(),
-        Some(&root_table),
-    );
-    if constants_sigmas_commitment.merkle_tree.cap != verifier_only.constants_sigmas_cap {
-        bail!(
-            "recomputed constants/sigmas commitment cap diverges from the embedded verifier data \
-             (stale or corrupt embedded circuit blob)"
-        );
-    }
-
     let circuit_digest = verifier_only.circuit_digest;
 
-    // Mirror the builder's quotient-domain constants/sigmas cache (added by the
-    // Metal quotient-gate union frontier). It is a pure derivation from the
-    // freshly recomputed column-backed commitment — the same extraction the
-    // builder performs — and the documented `None` fallback keeps the quotient
-    // path correct if extraction declines.
-    // Skipped entirely at `step == 1`, where the cache cannot pay for itself:
-    // it exists to turn a strided gather into a contiguous copy, and at stride
-    // one the gather is *already* contiguous. Concretely,
-    // `extract_lde_batch_columns(1, range, domain)` memcpys
-    // `columns.col(c)[..domain]` per column, while the uncached quotient path
-    // reaches `fill_lde_batch` with `BatchLayout::PolyMajor`, `step == 1` and
-    // consecutive indices — which routes to `fill_lde_batch_contiguous` and
-    // copies `columns.col(c)[start..end]`. Same bytes out of the same buffer,
-    // one `copy_from_slice` per column either way. So the cache is a bit-exact
-    // duplicate of storage the commitment already retains, and building it
-    // costs one extra full-LDE allocation plus copy per circuit and holds that
-    // duplicate resident for the rest of the process.
     let quotient_degree_bits = plonky2::util::log2_ceil(common.quotient_degree_factor);
-    let (constants_sigmas_quotient_cache, constants_sigmas_quotient_step, constants_sigmas_quotient_domain) = {
-        let step = 1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
-        let domain = 1 << (common.degree_bits() + quotient_degree_bits);
-        let cols = common.constants_range().len() + common.sigmas_range().len();
-        if step != 1 && cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
-            match (
-                constants_sigmas_commitment.extract_lde_batch_columns(
-                    step,
-                    common.constants_range(),
-                    domain,
+    let constants_sigmas_quotient_step =
+        1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
+    let constants_sigmas_quotient_domain = 1 << (common.degree_bits() + quotient_degree_bits);
+
+    let witness_facade = if duplicate_for_facade {
+        let (facade_offsets, facade_watchers, facade_watch_counts) =
+            facade_watch_parts.expect("facade watch parts are built when duplicating");
+        Some(CircuitData {
+            prover_only: ProverOnlyCircuitData::<F, C, D> {
+                constants_sigmas_quotient_cache: None,
+                constants_sigmas_quotient_step,
+                constants_sigmas_quotient_domain,
+                generators: facade_generators
+                    .expect("facade generators are parsed when duplicating"),
+                generator_indices_by_watches: GeneratorWatchIndex::from_parts(
+                    facade_offsets,
+                    facade_watchers,
                 ),
-                constants_sigmas_commitment.extract_lde_batch_columns(
-                    step,
-                    common.sigmas_range(),
-                    domain,
-                ),
-            ) {
-                (Some(constants), Some(sigmas_cache)) => {
-                    let mut cache: Vec<F> = constants;
-                    cache.extend(sigmas_cache);
-                    (Some(cache), step, domain)
-                }
-                _ => (None, step, domain),
-            }
-        } else {
-            (None, step, domain)
-        }
+                generator_watch_counts: facade_watch_counts,
+                constants_sigmas_commitment: PolynomialBatch::default(),
+                // Witness generation never reads `sigmas` (only generators, the
+                // representative map and the watch index), so the facade skips
+                // the transpose's full second copy of the sigma columns.
+                sigmas: Vec::new(),
+                subgroup: subgroup.clone(),
+                public_inputs: public_inputs.clone(),
+                representative_map: representative_map.clone(),
+                fixed_routed_wires: fixed_routed_wires.clone(),
+                fft_root_table: Some(root_table.clone()),
+                circuit_digest,
+                lookup_rows: lookup_rows.clone(),
+                lut_to_lookups: lut_to_lookups.clone(),
+            },
+            verifier_only: verifier_only.clone(),
+            common: common.clone(),
+        })
+    } else {
+        None
     };
 
     let prover_only = ProverOnlyCircuitData::<F, C, D> {
-        constants_sigmas_quotient_cache,
+        constants_sigmas_quotient_cache: None,
         constants_sigmas_quotient_step,
         constants_sigmas_quotient_domain,
         generators,
         generator_indices_by_watches,
         generator_watch_counts,
-        constants_sigmas_commitment,
+        // Placeholder: installed by `PendingEmbeddedCommitment::finalize_into`.
+        constants_sigmas_commitment: PolynomialBatch::default(),
         sigmas,
         subgroup,
         public_inputs,
@@ -595,14 +717,42 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         lut_to_lookups,
     };
 
-    Ok((
+    Ok(ParsedEmbedded {
         target,
-        CircuitData {
+        circuit: CircuitData {
             prover_only,
             verifier_only,
             common,
         },
-    ))
+        commitment: PendingEmbeddedCommitment {
+            constant_values,
+            sigma_vecs,
+        },
+        witness_facade,
+    })
+}
+
+/// Reconstructs the target struct and the full [`CircuitData`] from a blob
+/// produced by [`serialize_embedded`].
+///
+/// The returned `CircuitData` is value-identical to the freshly built one:
+/// deserialized components are byte round trips, and every recomputed
+/// component (subgroup, FFT root table, sigma values/transpose, watch counts,
+/// constants/sigmas commitment) is derived by the same code paths the builder
+/// itself runs, from the same inputs. The recomputed commitment cap is checked
+/// against the embedded verifier data before returning.
+pub fn deserialize_embedded<T: DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<(T, CircuitData<F, C, D>)> {
+    let ParsedEmbedded {
+        target,
+        mut circuit,
+        commitment,
+        witness_facade,
+    } = parse_embedded(bytes, false)?;
+    debug_assert!(witness_facade.is_none());
+    commitment.finalize_into(&mut circuit)?;
+    Ok((target, circuit))
 }
 
 #[cfg(test)]

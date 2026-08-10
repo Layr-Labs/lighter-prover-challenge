@@ -170,7 +170,6 @@ impl BlockCircuit {
         pre_exec_proof: &ProofWithPublicInputs<F, C, D>,
         pw: &mut W,
     ) -> Result<()> {
-
         pw.set_proof_with_pis_target(&target.pre_exec_proof, pre_exec_proof)?;
 
         let block_witness = BlockWitness::from_block(block, 1);
@@ -242,7 +241,6 @@ impl BlockCircuit {
 
         Ok(())
     }
-
 
     /// Block witness inputs that do not depend on the chain proofs, so they can be seeded and
     /// their generators run while the transaction chains are still proving.

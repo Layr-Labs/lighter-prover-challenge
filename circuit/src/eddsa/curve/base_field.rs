@@ -267,9 +267,7 @@ mod tests {
 
     /// The exact pre-optimization square root, byte-for-byte the old body with
     /// the inverse-carrying head restored.
-    fn legacy_sqrt_quintic_ext_goldilocks(
-        x: QuinticExtension<F>,
-    ) -> Option<QuinticExtension<F>> {
+    fn legacy_sqrt_quintic_ext_goldilocks(x: QuinticExtension<F>) -> Option<QuinticExtension<F>> {
         let d = legacy_sqrt_head(x);
         let e = (d * d.repeated_frobenius(2)).frobenius();
         let f = e.square();
@@ -306,10 +304,10 @@ mod tests {
         let mut checked = 0usize;
 
         let check = |x: QuinticExtension<F>,
-                         some_cases: &mut usize,
-                         none_cases: &mut usize,
-                         raw_mismatches: &mut usize,
-                         checked: &mut usize| {
+                     some_cases: &mut usize,
+                     none_cases: &mut usize,
+                     raw_mismatches: &mut usize,
+                     checked: &mut usize| {
             *checked += 1;
 
             // 1) The intermediate that actually changed.
@@ -372,9 +370,7 @@ mod tests {
             );
         };
 
-        let from_raw = |limbs: [u64; 5]| {
-            QuinticExtension::<F>(limbs.map(F::from_noncanonical_u64))
-        };
+        let from_raw = |limbs: [u64; 5]| QuinticExtension::<F>(limbs.map(F::from_noncanonical_u64));
 
         // Edges: zero, one, minus one, the modulus boundaries, and per-limb
         // extremes, including noncanonical encodings (raw >= ORDER).
@@ -495,7 +491,10 @@ mod tests {
         );
         assert!(checked >= 15_000, "differential too small: {checked}");
         assert!(some_cases >= 5_000, "too few roots exercised: {some_cases}");
-        assert!(none_cases >= 1_000, "too few non-squares exercised: {none_cases}");
+        assert!(
+            none_cases >= 1_000,
+            "too few non-squares exercised: {none_cases}"
+        );
         // Raw (pre-canonicalization) u64 equality is not asserted as a hard
         // invariant because Goldilocks `reduce128` may emit the noncanonical
         // representative `ORDER` for zero; it holds for every case here, and

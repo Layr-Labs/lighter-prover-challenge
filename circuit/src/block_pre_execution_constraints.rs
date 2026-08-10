@@ -7,8 +7,8 @@ use log::Level;
 use plonky2::field::extension::Extendable;
 use plonky2::field::types::{Field, Field64};
 use plonky2::hash::hash_types::{HashOutTarget, RichField};
-use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::iop::generator::PendingPartitionWitness;
+use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::iop::witness::{PartialWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_data::{CircuitConfig, CircuitData};
 use plonky2::plonk::config::GenericConfig;
@@ -118,10 +118,10 @@ pub struct BlockPreExecutionTarget {
 
     #[serde_as(as = "[_; POSITION_LIST_SIZE]")]
     pub all_market_risk_details_after: [MarketRiskDetailsTarget; POSITION_LIST_SIZE], // Public
-    pub all_margined_assets_after: [MarginedAssetTarget; MARGINED_ASSET_LIST_SIZE],   // Public
-    pub new_state_metadata_target: StateMetadataTarget,                               // Public
-    pub new_state_root: HashOutTarget,                                                // Public
-    pub new_validium_root: HashOutTarget,                                             // Public
+    pub all_margined_assets_after: [MarginedAssetTarget; MARGINED_ASSET_LIST_SIZE], // Public
+    pub new_state_metadata_target: StateMetadataTarget,                             // Public
+    pub new_state_root: HashOutTarget,                                              // Public
+    pub new_validium_root: HashOutTarget,                                           // Public
 
     // Helpers
     all_assets_hash: HashOutTarget,
@@ -165,9 +165,11 @@ impl Circuit<C, F, D> for BlockPreExecutionCircuit {
         // `PartialWitness` map and replaying it; same values, same watch-count
         // decrements, no transport map.
         let pending = timed!(timing, "witness", {
-            PendingPartitionWitness::start_seeded(&circuit.prover_only, &circuit.common, |seeder| {
-                Self::seed_witness_into(block, target, seeder)
-            })?
+            PendingPartitionWitness::start_seeded(
+                &circuit.prover_only,
+                &circuit.common,
+                |seeder| Self::seed_witness_into(block, target, seeder),
+            )?
         });
         let partition_witness = pending.finish()?;
         let proof = prove_with_partition_witness::<F, C, D>(
@@ -184,7 +186,6 @@ impl Circuit<C, F, D> for BlockPreExecutionCircuit {
         Ok(proof)
     }
 
-
     fn generate_witness(
         block: &BlockPreExec<F>,
         target: &BlockPreExecutionTarget,
@@ -197,13 +198,14 @@ impl Circuit<C, F, D> for BlockPreExecutionCircuit {
 
 impl BlockPreExecutionCircuit {
     /// Seeded form of [`Circuit::generate_witness`]: writes the same targets directly
-    /// through `pw` (any partition seeder or map).
-    fn seed_witness_into<W: Witness<F> + WitnessWrite<F>>(
+    /// through `pw` (any partition seeder or map). Public so the prover can run the
+    /// witness phase natively — without proving — to read the computed pre-execution
+    /// outputs; those values are the proof's public inputs by construction.
+    pub fn seed_witness_into<W: Witness<F> + WitnessWrite<F>>(
         block: &BlockPreExec<F>,
         target: &BlockPreExecutionTarget,
         pw: &mut W,
     ) -> Result<()> {
-
         pw.set_target(target.created_at, F::from_canonical_i64(block.created_at))?;
         pw.set_target(
             target.block_number,

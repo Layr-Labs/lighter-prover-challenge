@@ -47,7 +47,10 @@ const BLOB_NAMES: [&str; 5] = [
 fn write_blob(out_dir: &Path, name: &str, bytes: &[u8]) {
     let path = out_dir.join(name);
     std::fs::write(&path, bytes).unwrap_or_else(|error| {
-        panic!("cannot write embedded circuit blob {}: {error}", path.display())
+        panic!(
+            "cannot write embedded circuit blob {}: {error}",
+            path.display()
+        )
     });
     println!(
         "cargo:warning=embedded circuit blob {name}: {:.2} MiB",

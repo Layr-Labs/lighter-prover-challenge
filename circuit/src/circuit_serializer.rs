@@ -766,10 +766,16 @@ mod tests {
             serializer
                 .write_generator(&mut bytes2, &restored, &data.common)
                 .expect("write_generator after round-trip failed");
-            assert_eq!(bytes, bytes2, "round-tripped generator serialized differently");
+            assert_eq!(
+                bytes, bytes2,
+                "round-tripped generator serialized differently"
+            );
         }
         assert!(seen_per_slot, "no EqualityBaseGenerator in circuit");
-        assert!(seen_row_inverse, "no EqualityRowInverseGenerator in circuit");
+        assert!(
+            seen_row_inverse,
+            "no EqualityRowInverseGenerator in circuit"
+        );
     }
 
     /// Both equality generators must round-trip through every generator serializer

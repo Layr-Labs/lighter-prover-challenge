@@ -315,8 +315,8 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ComparisonGate
             for p in 0..n {
                 out[p] += filters[p]
                     * (intermediate_value[p] - chunks_equal[p] * most_significant_diff_so_far[p]);
-                most_significant_diff_so_far[p] = intermediate_value[p]
-                    + (F::ONE - chunks_equal[p]) * (second[p] - first[p]);
+                most_significant_diff_so_far[p] =
+                    intermediate_value[p] + (F::ONE - chunks_equal[p]) * (second[p] - first[p]);
             }
         }
 

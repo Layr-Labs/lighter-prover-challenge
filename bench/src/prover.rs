@@ -1,8 +1,8 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
@@ -14,22 +14,57 @@ use circuit::block_tx::{BlockTx, JumpState, JumpStateTarget};
 use circuit::block_tx_chain_constraints::{
     BlockTxChainCircuit, BlockTxChainTarget, cyclic_base_witness,
 };
-use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget};
 #[cfg(test)]
 use circuit::block_tx_constraints::Circuit as _;
+use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget};
 use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
-use plonky2::iop::generator::{ParallelWitnessGuard, PendingPartitionWitness};
 #[cfg(test)]
 use plonky2::iop::generator::generate_partial_witness;
+use plonky2::iop::generator::{ParallelWitnessGuard, PendingPartitionWitness};
 use plonky2::iop::witness::{PartitionWitness, Witness};
 use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::util::timing::TimingTree;
 
-use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
+use crate::api::{CircuitSlot, Circuits, PROVER_THREAD_STACK_BYTES, Proof};
+
+/// Where a path's circuit reads come from.
+///
+/// On the scored (deferred embedded load) path every circuit has a leaked
+/// witness-generation facade, and proving waits for the slot's background
+/// commitment finalization. On from-scratch builds and eager loads there is no
+/// facade and the slot is ready from creation, so the top-of-path read guard
+/// supplies the circuit for both witness generation and proving, exactly like
+/// the pre-deferral code.
+///
+/// Invariant enforced by `Circuits` construction: facades are either all
+/// `Some` (deferred load) or all `None` (eager build / eager load after
+/// `from_embedded` has settled every commitment — in that case the facade may
+/// also be `Some` with an already-ready slot, which this enum treats as the
+/// deferred case; `wait_ready` then returns immediately).
+#[derive(Clone, Copy)]
+enum CircuitSource<'a> {
+    /// Witness generation reads the leaked facade (no lock ever held);
+    /// proving reads the slot after `wait_ready`.
+    Facade(&'static CircuitData<F, C, D>),
+    /// Witness generation and proving both read the top-of-path guard's
+    /// circuit; the slot was ready from creation.
+    Eager(&'a CircuitData<F, C, D>),
+}
+
+impl<'a> CircuitSource<'a> {
+    /// The circuit to run witness generation against: complete in every field
+    /// that path reads (generators, representative map, watch index).
+    fn witness_data(self) -> &'a CircuitData<F, C, D> {
+        match self {
+            CircuitSource::Facade(facade) => facade,
+            CircuitSource::Eager(data) => data,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxPath {
@@ -146,7 +181,8 @@ impl ChainState<'_> {
 fn chain_step_proof(
     path: TxPath,
     chain_target: &BlockTxChainTarget,
-    chain_data: &CircuitData<F, C, D>,
+    chain_slot: &Arc<CircuitSlot>,
+    chain_source: CircuitSource<'_>,
     chain_step: u64,
     previous: Option<ChainState<'_>>,
     base_proof: &Proof,
@@ -166,14 +202,17 @@ fn chain_step_proof(
         // Phase 1: run every generator that does not depend on the previous chain proof while
         // that proof may still be in flight. Inputs are written directly into
         // the partition's representative slots — no PartialWitness map, no
-        // per-path template clone, no replay pass.
+        // per-path template clone, no replay pass. On the deferred path this
+        // runs against the facade and holds no lock, so the commitment
+        // finalizer is never blocked.
+        let witness_data = chain_source.witness_data();
         let mut pending = PendingPartitionWitness::start_seeded(
-            &chain_data.prover_only,
-            &chain_data.common,
+            &witness_data.prover_only,
+            &witness_data.common,
             |seeder| {
                 BlockTxChainCircuit::witness_inputs_early_into(
                     chain_target,
-                    chain_data,
+                    witness_data,
                     chain_step,
                     dummy_proof,
                     tx_proof,
@@ -191,7 +230,20 @@ fn chain_step_proof(
                 feeder,
             )
         })?;
-        BlockTxChainCircuit::prove_prepared(pending, chain_data)
+        // Proving reads the commitment. On the deferred path no slot guard is
+        // held here (phase 1 ran on the facade), so this wait cannot deadlock
+        // the finalizer; on the eager path the slot was ready from creation
+        // and this returns immediately.
+        chain_slot.wait_ready();
+        match chain_source {
+            CircuitSource::Facade(_) => {
+                let chain_data = chain_slot.read();
+                BlockTxChainCircuit::prove_prepared(pending, &chain_data)
+            }
+            CircuitSource::Eager(chain_data) => {
+                BlockTxChainCircuit::prove_prepared(pending, chain_data)
+            }
+        }
     })();
     result.unwrap_or_else(|error| {
         panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")
@@ -223,7 +275,7 @@ fn generate_tx_witness<'a>(
     path: TxPath,
     chunk_index: usize,
     txs: Vec<Arc<Tx<F>>>,
-    tx_data: &'a CircuitData<F, C, D>,
+    tx_source: CircuitSource<'a>,
     tx_target: &BlockTxTarget,
     created_at: i64,
     state_metadata_hash: HashOut<F>,
@@ -246,15 +298,21 @@ fn generate_tx_witness<'a>(
     // Write witness values directly into the partition's representative
     // slots (array-indexed), bypassing the PartialWitness hash map and its
     // per-target hashing for the ~10^5 inputs of every transaction chunk,
-    // while maintaining the same unresolved-watch counters.
+    // while maintaining the same unresolved-watch counters. On the deferred
+    // path this reads the facade: generators, representative map and watch
+    // index are final from the moment the load parses, so this never waits
+    // on the background commitment finalization.
+    let witness_data = tx_source.witness_data();
     let partition_witness = PendingPartitionWitness::start_seeded(
-        &tx_data.prover_only,
-        &tx_data.common,
+        &witness_data.prover_only,
+        &witness_data.common,
         |seeder| BlockTxCircuit::generate_witness_into(&block_tx, tx_target, seeder),
     )
     .and_then(PendingPartitionWitness::finish)
     .unwrap_or_else(|error| {
-        panic!("{path:?} block transaction chunk #{chunk_index} witness generation failed: {error:?}")
+        panic!(
+            "{path:?} block transaction chunk #{chunk_index} witness generation failed: {error:?}"
+        )
     });
     let new_jump = jump_from_witness(&partition_witness, &tx_target.new_jump);
     (partition_witness, new_jump)
@@ -263,7 +321,8 @@ fn generate_tx_witness<'a>(
 fn prove_tx_witness(
     path: TxPath,
     chunk_index: usize,
-    tx_data: &CircuitData<F, C, D>,
+    tx_slot: &Arc<CircuitSlot>,
+    tx_source: CircuitSource<'_>,
     partition_witness: PartitionWitness<'_, F>,
 ) -> Proof {
     #[cfg(feature = "diagnostic_profile")]
@@ -274,6 +333,18 @@ fn prove_tx_witness(
     );
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "prove_tx_witness");
+    // On the deferred path no slot guard is held here (witness generation ran
+    // on the facade), so this wait cannot deadlock the finalizer; on the eager
+    // path the slot was ready from creation and this returns immediately.
+    tx_slot.wait_ready();
+    let prove_guard;
+    let tx_data: &CircuitData<F, C, D> = match tx_source {
+        CircuitSource::Facade(_) => {
+            prove_guard = tx_slot.read();
+            &prove_guard
+        }
+        CircuitSource::Eager(data) => data,
+    };
     let proof = prove_with_partition_witness::<F, C, D>(
         &tx_data.prover_only,
         &tx_data.common,
@@ -317,53 +388,75 @@ fn prove_path(
     );
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "prove_path");
-    // The heavy pair's shared guards are held for exactly as long as this path
-    // may read them — from here to the `return`, which is after its chain proof
-    // exists — so the exclusive acquisition in
-    // `Circuits::release_heavy_circuit_extensions` is a proof that the heavy
-    // path is finished with them. Shared guards never block one another, so
-    // this neither serializes the two paths nor delays the concurrent block
-    // circuit construction, which takes its own shared guard.
+    // Facade-or-eager source selection (see `CircuitSource`). On the deferred
+    // path no guards are held at all: witness generation reads the facades and
+    // proving takes short read guards after `wait_ready`. On eager builds the
+    // guards below are held for exactly as long as this path may read them —
+    // from here to the `return`, which is after its chain proof exists — so
+    // the exclusive acquisition in `Circuits::release_heavy_circuit_extensions`
+    // remains a proof that the path is finished with them. Shared guards never
+    // block one another, so this neither serializes the two paths nor delays
+    // the concurrent block circuit construction, which takes its own shared
+    // guard.
     let heavy_tx_guard;
     let heavy_chain_guard;
     let light_tx_guard;
     let light_chain_guard;
-    let (tx_data, tx_target, chain_data, chain_target, dummy_proof) = match path {
-        TxPath::Light => {
-            light_tx_guard = circuits
-                .light_tx_data
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            light_chain_guard = circuits
-                .light_chain_data
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                &*light_tx_guard,
-                &circuits.light_tx_target,
-                &*light_chain_guard,
-                &circuits.light_chain_target,
-                &circuits.dummy_light_proof,
-            )
-        }
-        TxPath::Heavy => {
-            heavy_tx_guard = circuits
-                .heavy_tx_data
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            heavy_chain_guard = circuits
-                .heavy_chain_data
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                &*heavy_tx_guard,
-                &circuits.heavy_tx_target,
-                &*heavy_chain_guard,
-                &circuits.heavy_chain_target,
-                &circuits.dummy_heavy_proof,
-            )
-        }
-    };
+    let (tx_slot, tx_source, tx_target, chain_slot, chain_source, chain_target, dummy_proof) =
+        match path {
+            TxPath::Light => {
+                let (tx_source, chain_source) =
+                    match (circuits.light_tx_facade, circuits.light_chain_facade) {
+                        (Some(tx_facade), Some(chain_facade)) => (
+                            CircuitSource::Facade(tx_facade),
+                            CircuitSource::Facade(chain_facade),
+                        ),
+                        _ => {
+                            light_tx_guard = circuits.light_tx_data.read();
+                            light_chain_guard = circuits.light_chain_data.read();
+                            (
+                                CircuitSource::Eager(&light_tx_guard),
+                                CircuitSource::Eager(&light_chain_guard),
+                            )
+                        }
+                    };
+                (
+                    &circuits.light_tx_data,
+                    tx_source,
+                    &circuits.light_tx_target,
+                    &circuits.light_chain_data,
+                    chain_source,
+                    &circuits.light_chain_target,
+                    &circuits.dummy_light_proof,
+                )
+            }
+            TxPath::Heavy => {
+                let (tx_source, chain_source) =
+                    match (circuits.heavy_tx_facade, circuits.heavy_chain_facade) {
+                        (Some(tx_facade), Some(chain_facade)) => (
+                            CircuitSource::Facade(tx_facade),
+                            CircuitSource::Facade(chain_facade),
+                        ),
+                        _ => {
+                            heavy_tx_guard = circuits.heavy_tx_data.read();
+                            heavy_chain_guard = circuits.heavy_chain_data.read();
+                            (
+                                CircuitSource::Eager(&heavy_tx_guard),
+                                CircuitSource::Eager(&heavy_chain_guard),
+                            )
+                        }
+                    };
+                (
+                    &circuits.heavy_tx_data,
+                    tx_source,
+                    &circuits.heavy_tx_target,
+                    &circuits.heavy_chain_data,
+                    chain_source,
+                    &circuits.heavy_chain_target,
+                    &circuits.dummy_heavy_proof,
+                )
+            }
+        };
 
     let base_proof = cyclic_base_witness(
         dummy_proof,
@@ -381,14 +474,13 @@ fn prove_path(
         path,
         current_chunk_index,
         first_txs,
-        tx_data,
+        tx_source,
         tx_target,
         created_at,
         state_metadata_hash,
         jump,
     );
     jump = next_jump;
-
 
     let chain_proof = std::thread::scope(|scope| {
         let base = &base_proof;
@@ -409,7 +501,8 @@ fn prove_path(
                         chain_step_proof(
                             path,
                             chain_target,
-                            chain_data,
+                            chain_slot,
+                            chain_source,
                             chain_step,
                             previous,
                             base,
@@ -426,7 +519,7 @@ fn prove_path(
                 .name(format!("{path:?}-tx-proof-{current_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
-                    prove_tx_witness(path, current_chunk_index, tx_data, witness)
+                    prove_tx_witness(path, current_chunk_index, tx_slot, tx_source, witness)
                 })
                 .expect("transaction proof pipeline thread must start");
 
@@ -435,7 +528,7 @@ fn prove_path(
                     path,
                     chunk_index,
                     txs,
-                    tx_data,
+                    tx_source,
                     tx_target,
                     created_at,
                     state_metadata_hash,
@@ -447,11 +540,7 @@ fn prove_path(
 
             in_flight.push_back((current_step, proof_handle));
             #[cfg(feature = "diagnostic_profile")]
-            plonky2::util::profile::counter(
-                "scheduler",
-                "tx_in_flight",
-                in_flight.len() as u64,
-            );
+            plonky2::util::profile::counter("scheduler", "tx_in_flight", in_flight.len() as u64);
             let max_in_flight =
                 if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
                     LIGHT_TX_PROOF_WINDOW
@@ -489,7 +578,8 @@ fn prove_path(
                     chain_step_proof(
                         path,
                         chain_target,
-                        chain_data,
+                        chain_slot,
+                        chain_source,
                         chain_step,
                         previous,
                         base,
@@ -533,7 +623,8 @@ fn prove_path(
             chain = Some(ChainState::Ready(chain_step_proof(
                 path,
                 chain_target,
-                chain_data,
+                chain_slot,
+                chain_source,
                 chain_step,
                 previous,
                 base,
@@ -586,15 +677,44 @@ pub(crate) fn prove_pre_execution_parallel(
     pre_exec: &BlockPreExec<F>,
 ) -> Proof {
     #[cfg(feature = "diagnostic_profile")]
-    let _profile_context = plonky2::util::profile::enter_context(
-        "pre_execution",
-        0,
-        &[("proof_kind", 0)],
-    );
+    let _profile_context =
+        plonky2::util::profile::enter_context("pre_execution", 0, &[("proof_kind", 0)]);
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "pre_execution_proof");
     BlockPreExecutionCircuit::prove(pre_data, pre_exec, pre_target)
         .expect("block pre-execution proof failed")
+}
+
+/// Computes the pre-execution outputs natively — witness generation only, no
+/// proving. The values are exactly the pre proof's public inputs: the same
+/// generators run on the same inputs deterministically, and the final block
+/// circuit verifies the pre proof against these roots in-circuit, so any
+/// divergence would surface as a loud witness-generation failure in the block
+/// proof rather than as a bad proof.
+///
+/// This is what removes the pre proof from the startup critical path: the
+/// transaction/chain pipeline consumes only these outputs, while the proof
+/// itself is not needed until the final block circuit's witness.
+fn native_pre_outputs(
+    pre_data: &CircuitData<F, C, D>,
+    pre_target: &BlockPreExecutionTarget,
+    pre_exec: &BlockPreExec<F>,
+) -> BlockPreExecWitness<F> {
+    #[cfg(feature = "diagnostic_profile")]
+    let _span = plonky2::util::profile::span("witness", "native_pre_outputs");
+    let witness =
+        PendingPartitionWitness::start_seeded(&pre_data.prover_only, &pre_data.common, |seeder| {
+            BlockPreExecutionCircuit::seed_witness_into(pre_exec, pre_target, seeder)
+        })
+        .and_then(PendingPartitionWitness::finish)
+        .expect("native pre-execution witness generation failed");
+    let values: Vec<F> = pre_data
+        .prover_only
+        .public_inputs
+        .iter()
+        .map(|&target| witness.get_target(target))
+        .collect();
+    BlockPreExecWitness::from_public_inputs(&values)
 }
 
 /// The fully serial entry point: pre-execution proof first, then the pipeline.
@@ -612,36 +732,42 @@ pub fn prove_block(block: Block<F>, circuits: Circuits) -> Proof {
     // The pre-execution proof runs strictly before any other proving work, so
     // the serialized GPU stream is otherwise idle: route its mid-size column
     // trees to the GPU for just this phase.
+    let pre_exec: &'static BlockPreExec<F> = Box::leak(Box::new(BlockPreExec::from_block(&block)));
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-    let pre_proof = prove_pre_execution_parallel(
-        &circuits.pre_data,
-        &circuits.pre_target,
-        &BlockPreExec::from_block(&block),
-    );
+    let pre_proof = {
+        let pre_data = circuits.pre_data.read();
+        prove_pre_execution_parallel(&pre_data, circuits.pre_target, pre_exec)
+    };
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
-    prove_block_after_pre(block, circuits, pre_proof)
+    let pre_handle = std::thread::spawn(move || pre_proof);
+    prove_block_after_pre(block, circuits, pre_exec, pre_handle)
 }
 
-/// The pipeline after the pre-execution proof. The startup-overlap path calls
-/// this once both the pre-execution proof and the remaining circuit loads have
-/// completed.
+/// The transaction/chain pipeline. It consumes only the *native* pre-execution
+/// outputs (`pre_exec`, expanded by [`native_pre_outputs`]); the pre proof
+/// itself arrives later through `pre_proof_handle` and is joined only by the
+/// final-block lane, which needs it for the in-circuit recursive verification
+/// — long after the proof has completed on its startup thread.
 pub(crate) fn prove_block_after_pre(
     mut block: Block<F>,
     mut circuits: Circuits,
-    pre_proof: Proof,
+    pre_exec: &'static BlockPreExec<F>,
+    pre_proof_handle: std::thread::JoinHandle<Proof>,
 ) -> Proof {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context =
         plonky2::util::profile::enter_context("block_pipeline", block.block_number, &[]);
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "prove_block_after_pre");
-    let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
+    let pre_output = {
+        let pre_data = circuits.pre_data.read();
+        native_pre_outputs(&pre_data, circuits.pre_target, pre_exec)
+    };
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
     let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
     let mut heavy_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> = Vec::new();
-    let mut light_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> =
-        Vec::with_capacity(tx_chunks.len());
+    let mut light_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> = Vec::with_capacity(tx_chunks.len());
     for (chunk_index, txs) in tx_chunks.drain(..).enumerate() {
         if chunk_is_light(&txs) {
             light_chunks.push((chunk_index, txs));
@@ -700,7 +826,6 @@ pub(crate) fn prove_block_after_pre(
                 })
                 .expect("heavy transaction chain thread must start");
             let block_ref = &block;
-            let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -720,14 +845,19 @@ pub(crate) fn prove_block_after_pre(
                             plonky2::util::profile::span("orchestration", "build_block_circuit");
                         circuits.build_block_circuit()
                     };
-                    let block_data: &'static CircuitData<F, C, D> =
-                        Box::leak(Box::new(block_data));
-                    let early = BlockCircuit::witness_inputs_early(
-                        &block_target,
-                        block_ref,
-                        pre_proof_ref,
-                    )
-                    .expect("final block early witness inputs failed");
+                    let block_data: &'static CircuitData<F, C, D> = Box::leak(Box::new(block_data));
+                    // The pre proof finished long ago on its startup thread
+                    // (this lane's circuit build dwarfs it); it is needed only
+                    // here, for the in-circuit recursive verification.
+                    #[cfg(feature = "diagnostic_profile")]
+                    let _pre_wait =
+                        plonky2::util::profile::span("wait", "pre_proof_join_for_final");
+                    let pre_proof = pre_proof_handle
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    let early =
+                        BlockCircuit::witness_inputs_early(&block_target, block_ref, &pre_proof)
+                            .expect("final block early witness inputs failed");
                     let mut pending = PendingPartitionWitness::start(
                         early,
                         &block_data.prover_only,
@@ -785,10 +915,9 @@ pub(crate) fn prove_block_after_pre(
             #[cfg(feature = "diagnostic_profile")]
             let _block_lane_wait =
                 plonky2::util::profile::span("wait", "final_block_build_lane_join");
-            let (block_target, block_data, block_pending, heavy_chain_proof) =
-                block_circuit_handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let (block_target, block_data, block_pending, heavy_chain_proof) = block_circuit_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             #[cfg(feature = "diagnostic_profile")]
             drop(_block_lane_wait);
             #[cfg(feature = "diagnostic_profile")]
@@ -852,8 +981,7 @@ pub(crate) fn prove_block_after_pre(
     let final_proof = {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("orchestration", "final_block_proof");
-        BlockCircuit::prove_prepared(block_pending, block_data)
-            .expect("final block proof failed")
+        BlockCircuit::prove_prepared(block_pending, block_data).expect("final block proof failed")
     };
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
     final_proof
@@ -867,11 +995,113 @@ mod tests {
         HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
     };
 
+    /// Local stand-in for the trusted verifier's scoring check: rebuilds every
+    /// circuit from source (the harness's recipe), verifies the proof
+    /// cryptographically against that verifier data, and compares every public
+    /// block output the harness checks against the fixture-derived witness.
+    /// Run:
+    /// `PROOF_TO_VERIFY=/path/proof.bin cargo test --release -p bench --bin prove -- --ignored verify_produced_proof --nocapture`
+    #[test]
+    #[ignore = "rebuilds every circuit from scratch; run explicitly"]
+    fn verify_produced_proof() {
+        std::thread::Builder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(|| {
+                let proof_path =
+                    std::env::var("PROOF_TO_VERIFY").expect("PROOF_TO_VERIFY must be set");
+                let bytes = std::fs::read(&proof_path).expect("proof file must read");
+                let proof: Proof = bincode::deserialize(&bytes).expect("proof must deserialize");
+                let block = Block::<F>::from_json_with_pruned_identity_runs(
+                    include_bytes!("../bench_test.json"),
+                    HEAVY_TX_PER_PROOF,
+                    LIGHT_TX_PER_PROOF,
+                    PUBLIC_HEAVY_TX_COUNT,
+                    PUBLIC_LIGHT_TX_COUNT,
+                )
+                .expect("public fixture must parse");
+                let circuits = Circuits::new();
+                let (_block_target, block_data) = circuits.build_block_circuit();
+                block_data
+                    .verify(proof.clone())
+                    .expect("proof must verify against rebuilt verifier data");
+                let actual = circuit::block::BlockWitness::from_public_inputs(
+                    &proof.public_inputs,
+                    crate::api::ON_CHAIN_OPERATIONS_LIMIT,
+                    1,
+                );
+                let expected = circuit::block::BlockWitness::from_block(
+                    &block,
+                    crate::api::ON_CHAIN_OPERATIONS_LIMIT,
+                );
+                assert_eq!(actual.block_number, expected.block_number, "block_number");
+                assert_eq!(actual.created_at, expected.created_at, "created_at");
+                assert_eq!(
+                    actual.old_state_root, expected.old_state_root,
+                    "old_state_root"
+                );
+                assert_eq!(
+                    actual.new_validium_root, expected.new_validium_root,
+                    "new_validium_root"
+                );
+                assert_eq!(
+                    actual.new_state_root, expected.new_state_root,
+                    "new_state_root"
+                );
+                assert_eq!(
+                    actual.old_account_delta_tree_root, expected.old_account_delta_tree_root,
+                    "old_account_delta_tree_root"
+                );
+                assert_eq!(
+                    actual.new_account_delta_tree_root, expected.new_account_delta_tree_root,
+                    "new_account_delta_tree_root"
+                );
+                assert_eq!(
+                    actual.on_chain_operations_count, expected.on_chain_operations_count,
+                    "on_chain_operations_count"
+                );
+                assert_eq!(
+                    actual.on_chain_operations_pub_data, expected.on_chain_operations_pub_data,
+                    "on_chain_operations_pub_data"
+                );
+                assert_eq!(
+                    actual.priority_operations_count, expected.priority_operations_count,
+                    "priority_operations_count"
+                );
+                assert_eq!(
+                    actual.old_prefix_priority_operation_hash,
+                    expected.old_prefix_priority_operation_hash,
+                    "old_prefix_priority_operation_hash"
+                );
+                assert_eq!(
+                    actual.new_prefix_priority_operation_hash,
+                    expected.new_prefix_priority_operation_hash,
+                    "new_prefix_priority_operation_hash"
+                );
+                assert_eq!(
+                    actual.new_public_market_details, expected.new_public_market_details,
+                    "new_public_market_details"
+                );
+                println!(
+                    "verify_produced_proof: proof verifies and every harness-checked public \
+                     output matches the fixture witness"
+                );
+            })
+            .expect("verify thread must start")
+            .join()
+            .expect("verify thread must finish");
+    }
+
     #[cfg(feature = "diagnostic_profile")]
     #[test]
     fn profile_path_context_names_are_stable() {
-        assert_eq!(profile_path_context(TxPath::Heavy, "witness"), "heavy_tx_witness");
-        assert_eq!(profile_path_context(TxPath::Light, "proof"), "light_tx_proof");
+        assert_eq!(
+            profile_path_context(TxPath::Heavy, "witness"),
+            "heavy_tx_witness"
+        );
+        assert_eq!(
+            profile_path_context(TxPath::Light, "proof"),
+            "light_tx_proof"
+        );
         assert_eq!(profile_path_context(TxPath::Heavy, "chain"), "heavy_chain");
         assert_eq!(profile_path_context(TxPath::Light, "chain"), "light_chain");
     }
@@ -937,18 +1167,22 @@ mod tests {
                     .flatten()
                     .find(|tx| tx.tx_circuit_type == TX_LIGHT)
                     .expect("light padding must exist");
-                assert!(block
-                    .tx_chunks
-                    .iter()
-                    .flatten()
-                    .filter(|tx| tx.tx_circuit_type != TX_LIGHT)
-                    .all(|tx| Arc::ptr_eq(tx, heavy)));
-                assert!(block
-                    .tx_chunks
-                    .iter()
-                    .flatten()
-                    .filter(|tx| tx.tx_circuit_type == TX_LIGHT)
-                    .all(|tx| Arc::ptr_eq(tx, light)));
+                assert!(
+                    block
+                        .tx_chunks
+                        .iter()
+                        .flatten()
+                        .filter(|tx| tx.tx_circuit_type != TX_LIGHT)
+                        .all(|tx| Arc::ptr_eq(tx, heavy))
+                );
+                assert!(
+                    block
+                        .tx_chunks
+                        .iter()
+                        .flatten()
+                        .filter(|tx| tx.tx_circuit_type == TX_LIGHT)
+                        .all(|tx| Arc::ptr_eq(tx, light))
+                );
                 assert!(!Arc::ptr_eq(heavy, light));
             })
             .expect("padding sharing test thread must start")
@@ -1031,7 +1265,7 @@ mod tests {
             .flatten()
             .find(|tx| tx.tx_type == TX_TYPE_EMPTY)
             .expect("fixture must contain an empty padding tx"))
-            .clone();
+        .clone();
         empty_tx.tx_circuit_type = TX_LIGHT;
         empty_tx.tx_index = F::NEG_ONE.to_canonical_u64();
 
@@ -1057,7 +1291,7 @@ mod tests {
             TxPath::Light,
             0,
             light_chunk,
-            &circuits.tx_data,
+            CircuitSource::Eager(&circuits.tx_data),
             &circuits.tx_target,
             block.created_at,
             state_metadata_hash,
@@ -1083,6 +1317,14 @@ mod tests {
             new_state_root,
             old_delta_root,
         );
+
+        // Eager-only manual harness: readiness must return immediately, so the
+        // slot is constructed ready around a second, value-identical chain
+        // circuit build. Never used for proving — `CircuitSource::Eager`
+        // supplies the data — it exists only to satisfy the signature.
+        let manual_harness_slot = std::sync::Arc::new(CircuitSlot::ready(
+            PathCircuits::new(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE).chain_data,
+        ));
 
         let mut previous: Option<Proof> = None;
         for chain_step in 0..CHAIN_STEPS {
@@ -1155,10 +1397,14 @@ mod tests {
             // path. The reference above keeps the old PartialWitness map
             // path solely for this manual timing harness.
             let direct_start = Instant::now();
+            // The manual harness has no deferred slot; proving reads the eager
+            // source, so a never-finalizing placeholder slot satisfies the
+            // readiness call without duplicating the chain circuit build.
             let direct_proof = chain_step_proof(
                 TxPath::Light,
                 &circuits.chain_target,
-                &circuits.chain_data,
+                &manual_harness_slot,
+                CircuitSource::Eager(&circuits.chain_data),
                 chain_step,
                 previous.clone().map(ChainState::Ready),
                 &base_proof,

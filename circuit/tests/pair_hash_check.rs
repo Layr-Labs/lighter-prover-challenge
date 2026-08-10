@@ -69,10 +69,13 @@ fn quad_hash_matches_individual_across_widths() {
         let ins: Vec<Vec<F>> = (0..4)
             .map(|_| (0..width).map(|_| F::rand()).collect())
             .collect();
-        let (h0, h1, h2, h3) =
-            Poseidon2Hash::hash_or_noop_quad(&ins[0], &ins[1], &ins[2], &ins[3]);
+        let (h0, h1, h2, h3) = Poseidon2Hash::hash_or_noop_quad(&ins[0], &ins[1], &ins[2], &ins[3]);
         let expect = |i: usize| <Poseidon2Hash as Hasher<F>>::hash_or_noop(&ins[i]);
-        assert_eq!((h0, h1, h2, h3), (expect(0), expect(1), expect(2), expect(3)), "width {width}");
+        assert_eq!(
+            (h0, h1, h2, h3),
+            (expect(0), expect(1), expect(2), expect(3)),
+            "width {width}"
+        );
     }
 }
 
@@ -247,7 +250,8 @@ fn time_pair_vs_quad_compress() {
             (core::hint::black_box(h[4]), core::hint::black_box(h[5])),
             (core::hint::black_box(h[6]), core::hint::black_box(h[7])),
         ]);
-        sink_quad += outs[0].elements[0] + outs[1].elements[0] + outs[2].elements[0] + outs[3].elements[0];
+        sink_quad +=
+            outs[0].elements[0] + outs[1].elements[0] + outs[2].elements[0] + outs[3].elements[0];
     }
     let quad_time = t1.elapsed();
 
