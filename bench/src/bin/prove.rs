@@ -100,7 +100,7 @@ fn main() {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "fixture_read_parse");
             let json = fs::read(&fixture).expect("cannot read prover fixture");
-            Block::<F>::from_json_with_empty_txs(
+            Block::<F>::from_json_with_pruned_identity_runs(
                 &json,
                 HEAVY_TX_PER_PROOF,
                 LIGHT_TX_PER_PROOF,
