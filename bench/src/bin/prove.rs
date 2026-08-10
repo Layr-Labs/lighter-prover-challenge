@@ -253,3 +253,4 @@ fn main() {
 }
 
 // p90-fire-b7-1786376354
+// Codex frontier redraw 2026-08-10 B; executable behavior is unchanged.
