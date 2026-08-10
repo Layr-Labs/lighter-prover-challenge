@@ -6,6 +6,7 @@ use plonky2_field::polynomial::PolynomialCoeffs;
 
 use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
+#[cfg(test)]
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
@@ -184,6 +185,10 @@ pub(crate) struct VanishingScratch<F> {
     pub constraint_terms_batch: Vec<F>,
     /// Reused selector-filter buffer across batches (survivor-list package).
     pub gate_filters: Vec<F>,
+    /// Filters, state and gate-factored alpha accumulators for the direct
+    /// final-block pair reduction. Every live cell is overwritten or reset
+    /// before use, so a stable batch pays no repeated allocation.
+    pub interleave_pair_scratch: Vec<F>,
 }
 
 /// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
@@ -221,6 +226,7 @@ const INTERLEAVE_PAIR_WIRES: usize = 136;
 const INTERLEAVE_PAIR_CONSTRAINTS: usize = 136;
 const INTERLEAVE_OPS: usize = 4;
 const UNINTERLEAVE_OPS: usize = 2;
+#[cfg(test)]
 const INTERLEAVE_PAIR_STACK_BATCH: usize = 32;
 
 /// Proof-local recognition of the exact CPU-owned pair used by the ranked
@@ -237,6 +243,12 @@ pub(crate) fn interleave_pair_plan<F: RichField + Extendable<D>, const D: usize>
     common_data: &CommonCircuitData<F, D>,
     cpu_gate_indices: &[usize],
 ) -> Option<InterleavePairPlan> {
+    // The direct kernel below is deliberately specialized for the production
+    // two-challenge layout. Other configurations retain the ordinary gate
+    // evaluators and generic alpha reducer.
+    if common_data.config.num_challenges != 2 {
+        return None;
+    }
     let mut tagged = cpu_gate_indices.iter().filter_map(|&index| {
         common_data.gates[index]
             .0
@@ -321,6 +333,7 @@ fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
 /// the corresponding interleave range row, so those values use two packed
 /// MACs. The second half lands on the same row and uses one packed MAC with the
 /// pre-summed filters. No range column survives past the current bit.
+#[cfg(test)]
 fn eval_interleave_pair_dense_fused<F: Field>(
     wires: &[F],
     batch_size: usize,
@@ -329,12 +342,6 @@ fn eval_interleave_pair_dense_fused<F: Field>(
     summed_filter: &[F],
     combined: &mut [F],
 ) {
-    debug_assert_eq!(interleave_filter.len(), batch_size);
-    debug_assert_eq!(uninterleave_filter.len(), batch_size);
-    debug_assert_eq!(summed_filter.len(), batch_size);
-    debug_assert!(wires.len() >= INTERLEAVE_PAIR_WIRES * batch_size);
-    debug_assert!(combined.len() >= INTERLEAVE_PAIR_CONSTRAINTS * batch_size);
-
     const STACK_COLS: usize = 10;
     let required = STACK_COLS * batch_size;
     let mut stack = [F::ZERO; STACK_COLS * INTERLEAVE_PAIR_STACK_BATCH];
@@ -345,6 +352,40 @@ fn eval_interleave_pair_dense_fused<F: Field>(
         heap = vec![F::ZERO; required];
         &mut heap
     };
+    eval_interleave_pair_dense_fused_with_scratch(
+        wires,
+        batch_size,
+        interleave_filter,
+        uninterleave_filter,
+        summed_filter,
+        combined,
+        scratch,
+    );
+}
+
+/// Scratch-injected dense pair evaluator. Every live cell is assigned or
+/// explicitly reset before it is read, so callers may safely reuse dirty
+/// proof-local storage across quotient batches.
+#[cfg(test)]
+fn eval_interleave_pair_dense_fused_with_scratch<F: Field>(
+    wires: &[F],
+    batch_size: usize,
+    interleave_filter: &[F],
+    uninterleave_filter: &[F],
+    summed_filter: &[F],
+    combined: &mut [F],
+    scratch: &mut [F],
+) {
+    debug_assert_eq!(interleave_filter.len(), batch_size);
+    debug_assert_eq!(uninterleave_filter.len(), batch_size);
+    debug_assert_eq!(summed_filter.len(), batch_size);
+    debug_assert!(wires.len() >= INTERLEAVE_PAIR_WIRES * batch_size);
+    debug_assert!(combined.len() >= INTERLEAVE_PAIR_CONSTRAINTS * batch_size);
+
+    const STACK_COLS: usize = 10;
+    let required = STACK_COLS * batch_size;
+    debug_assert!(scratch.len() >= required);
+    let scratch = &mut scratch[..required];
     let (x_accumulators, rest) = scratch.split_at_mut(INTERLEAVE_OPS * batch_size);
     let (parity_accumulators, rest) = rest.split_at_mut(4 * batch_size);
     let (base4_accumulator, range) = rest.split_at_mut(batch_size);
@@ -447,6 +488,242 @@ fn eval_interleave_pair_dense_fused<F: Field>(
     }
 }
 
+/// Challenge-major powers `1, alpha, ..., alpha^135`, built once per proof for
+/// the direct reduction of the recognized 136-row gate pair.
+pub(crate) fn interleave_pair_alpha_powers<F: Field>(alphas: &[F]) -> Vec<F> {
+    let mut powers = Vec::with_capacity(alphas.len() * INTERLEAVE_PAIR_CONSTRAINTS);
+    for &alpha in alphas {
+        let mut power = F::ONE;
+        for _ in 0..INTERLEAVE_PAIR_CONSTRAINTS {
+            powers.push(power);
+            power *= alpha;
+        }
+    }
+    powers
+}
+
+/// Adds the recognized Interleave(4) + Uninterleave(2) pair directly to an
+/// already-reduced point-major gate accumulator. The pair is linear in its
+/// selector filters, so it need not occupy the shared dense row matrix.
+///
+/// The 32 Boolean range constraints of each operation are first reduced as
+/// `P(alpha) = sum_b range_b * alpha^b`. Each unfiltered gate polynomial is
+/// accumulated at its exact row powers; the two selector filters are applied
+/// only once per challenge and point after all 136 rows have been accounted
+/// for.
+fn eval_interleave_pair_direct_reduced<F: Field>(
+    wires: &[F],
+    batch_size: usize,
+    interleave_filter: &[F],
+    uninterleave_filter: &[F],
+    alpha_powers: &[F],
+    res_out: &mut [F],
+    scratch: &mut [F],
+) {
+    const STATE_COLS: usize = INTERLEAVE_OPS + 4 + 1;
+    const NUM_CHALLENGES: usize = 2;
+    // One range polynomial plus the unfiltered interleave and uninterleave
+    // gate polynomials for each challenge.
+    let required = (STATE_COLS + 3 * NUM_CHALLENGES) * batch_size;
+    debug_assert_eq!(interleave_filter.len(), batch_size);
+    debug_assert_eq!(uninterleave_filter.len(), batch_size);
+    debug_assert!(wires.len() >= INTERLEAVE_PAIR_WIRES * batch_size);
+    debug_assert_eq!(
+        alpha_powers.len(),
+        NUM_CHALLENGES * INTERLEAVE_PAIR_CONSTRAINTS
+    );
+    debug_assert_eq!(res_out.len(), batch_size * NUM_CHALLENGES);
+    debug_assert!(scratch.len() >= required);
+
+    let scratch = &mut scratch[..required];
+    let (x_accumulators, rest) = scratch.split_at_mut(INTERLEAVE_OPS * batch_size);
+    let (parity_accumulators, rest) = rest.split_at_mut(4 * batch_size);
+    let (base4_accumulator, rest) = rest.split_at_mut(batch_size);
+    let (range_accumulators, pair_accumulators) =
+        rest.split_at_mut(NUM_CHALLENGES * batch_size);
+    let (interleave_accumulators, uninterleave_accumulators) =
+        pair_accumulators.split_at_mut(NUM_CHALLENGES * batch_size);
+    parity_accumulators.fill(F::ZERO);
+    uninterleave_accumulators.fill(F::ZERO);
+
+    let base2 = F::from_canonical_usize(2);
+    let base4 = F::from_canonical_usize(4);
+    for operation in 0..INTERLEAVE_OPS {
+        let interleave_row = operation * 34;
+        let bit_offset = operation * 32;
+        let x = &mut x_accumulators[operation * batch_size..(operation + 1) * batch_size];
+        x.fill(F::ZERO);
+        base4_accumulator.fill(F::ZERO);
+
+        for bit_index in 0..32 {
+            let bit_col = &wires[(8 + bit_offset + bit_index) * batch_size..][..batch_size];
+            let parity_index = 2 * (operation / 2) + bit_index % 2;
+            let parity = &mut parity_accumulators
+                [parity_index * batch_size..(parity_index + 1) * batch_size];
+            for point in 0..batch_size {
+                let bit = bit_col[point];
+                x[point] = x[point] * base2 + bit;
+                base4_accumulator[point] = base4_accumulator[point] * base4 + bit;
+                parity[point] = parity[point] * base2 + bit;
+                let range = bit * (bit - F::ONE);
+                for challenge in 0..NUM_CHALLENGES {
+                    let accumulator =
+                        &mut range_accumulators[challenge * batch_size + point];
+                    if bit_index == 0 {
+                        // alpha^0 is one. Assignment is field-identical and
+                        // deletes one vacuous multiply per operation/challenge.
+                        *accumulator = range;
+                    } else {
+                        let power = alpha_powers
+                            [challenge * INTERLEAVE_PAIR_CONSTRAINTS + bit_index];
+                        *accumulator = accumulator.multiply_accumulate(range, power);
+                    }
+                }
+            }
+        }
+
+        let x_col = &wires[(2 * operation) * batch_size..][..batch_size];
+        let spread_col = &wires[(2 * operation + 1) * batch_size..][..batch_size];
+        for point in 0..batch_size {
+            let x_constraint = x[point] - x_col[point];
+            let spread_constraint = base4_accumulator[point] - spread_col[point];
+            for challenge in 0..NUM_CHALLENGES {
+                let powers = &alpha_powers[challenge * INTERLEAVE_PAIR_CONSTRAINTS..]
+                    [..INTERLEAVE_PAIR_CONSTRAINTS];
+                let interleave =
+                    &mut interleave_accumulators[challenge * batch_size + point];
+                if interleave_row == 0 {
+                    // This is the first contribution to every QI slot and
+                    // alpha^0 is one, so assignment also initializes dirty
+                    // reused scratch without a preceding memset.
+                    *interleave = x_constraint;
+                } else {
+                    *interleave =
+                        interleave.multiply_accumulate(x_constraint, powers[interleave_row]);
+                }
+                *interleave = interleave
+                    .multiply_accumulate(spread_constraint, powers[interleave_row + 1]);
+                let range_polynomial =
+                    range_accumulators[challenge * batch_size + point];
+                let uninterleave =
+                    &mut uninterleave_accumulators[challenge * batch_size + point];
+                if operation % 2 == 0 {
+                    *interleave = interleave
+                        .multiply_accumulate(range_polynomial, powers[interleave_row + 2]);
+                    *uninterleave = uninterleave
+                        .multiply_accumulate(range_polynomial, powers[interleave_row + 4]);
+                } else {
+                    // Both gates place this range block at the same rows. Form
+                    // the alpha-weighted value once, then add it to each
+                    // unfiltered gate polynomial before selector factoring.
+                    let weighted_range = range_polynomial * powers[interleave_row + 2];
+                    *interleave += weighted_range;
+                    *uninterleave += weighted_range;
+                }
+            }
+        }
+    }
+
+    let split = F::from_canonical_u64(1 << 32u64);
+    let u32_max = F::from_canonical_u32(u32::MAX);
+    for operation in 0..UNINTERLEAVE_OPS {
+        let row = operation * 68;
+        let high = &x_accumulators[(2 * operation) * batch_size..(2 * operation + 1) * batch_size];
+        let low =
+            &x_accumulators[(2 * operation + 1) * batch_size..(2 * operation + 2) * batch_size];
+        let evens =
+            &parity_accumulators[(2 * operation) * batch_size..(2 * operation + 1) * batch_size];
+        let odds = &parity_accumulators
+            [(2 * operation + 1) * batch_size..(2 * operation + 2) * batch_size];
+        let interleaved = &wires[(4 * operation) * batch_size..][..batch_size];
+        let x_evens = &wires[(4 * operation + 1) * batch_size..][..batch_size];
+        let x_odds = &wires[(4 * operation + 2) * batch_size..][..batch_size];
+        let inverse = &wires[(4 * operation + 3) * batch_size..][..batch_size];
+
+        for point in 0..batch_size {
+            let constraints = [
+                (inverse[point] * (u32_max - high[point]) - F::ONE) * low[point],
+                high[point] * split + low[point] - interleaved[point],
+                evens[point] - x_evens[point],
+                odds[point] - x_odds[point],
+            ];
+            for challenge in 0..NUM_CHALLENGES {
+                let powers = &alpha_powers[challenge * INTERLEAVE_PAIR_CONSTRAINTS..]
+                    [..INTERLEAVE_PAIR_CONSTRAINTS];
+                let uninterleave =
+                    &mut uninterleave_accumulators[challenge * batch_size + point];
+                for (offset, &constraint) in constraints.iter().enumerate() {
+                    if row == 0 && offset == 0 {
+                        // alpha^0 is one; range terms may already be present,
+                        // so add rather than assign.
+                        *uninterleave += constraint;
+                    } else {
+                        *uninterleave =
+                            uninterleave.multiply_accumulate(constraint, powers[row + offset]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Selector filters factor out of each gate's entire constraint polynomial.
+    // Apply each exactly once per point/challenge after all unfiltered rows have
+    // been accumulated.
+    for point in 0..batch_size {
+        for challenge in 0..NUM_CHALLENGES {
+            let result = &mut res_out[point * NUM_CHALLENGES + challenge];
+            let interleave = interleave_accumulators[challenge * batch_size + point];
+            let uninterleave = uninterleave_accumulators[challenge * batch_size + point];
+            *result = result.multiply_accumulate(interleave, interleave_filter[point]);
+            *result = result.multiply_accumulate(uninterleave, uninterleave_filter[point]);
+        }
+    }
+}
+
+fn eval_interleave_pair_plan_direct_reduced<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    vars_batch: EvaluationVarsBaseBatch<F>,
+    plan: &InterleavePairPlan,
+    alphas: &[F],
+    alpha_powers: &[F],
+    scratch: &mut Vec<F>,
+    res_out: &mut [F],
+) {
+    const FILTER_COLS: usize = 2;
+    const STATE_COLS: usize = INTERLEAVE_OPS + 4 + 1;
+    const NUM_CHALLENGES: usize = 2;
+    let n = vars_batch.len();
+    debug_assert_eq!(alphas.len(), NUM_CHALLENGES);
+    let direct_cols = STATE_COLS + 3 * NUM_CHALLENGES;
+    scratch.resize((FILTER_COLS + direct_cols) * n, F::ZERO);
+    let (filters, direct_scratch) = scratch.split_at_mut(FILTER_COLS * n);
+    let (interleave_filter, uninterleave_filter) = filters.split_at_mut(n);
+    fill_interleave_gate_filter(
+        common_data,
+        vars_batch,
+        plan.interleave_index,
+        interleave_filter,
+    );
+    fill_interleave_gate_filter(
+        common_data,
+        vars_batch,
+        plan.uninterleave_index,
+        uninterleave_filter,
+    );
+    eval_interleave_pair_direct_reduced(
+        vars_batch.local_wires,
+        n,
+        interleave_filter,
+        uninterleave_filter,
+        alpha_powers,
+        res_out,
+        direct_scratch,
+    );
+}
+
 fn reduce_gate_constraints_base_batch<F: Field>(
     constraint_terms_batch: &[F],
     batch_size: usize,
@@ -547,6 +824,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     cpu_gate_indices: &[usize],
     cpu_num_gate_constraints: usize,
     interleave_pair: Option<&InterleavePairPlan>,
+    interleave_pair_alpha_powers: &[F],
     permutation_products_offloaded: bool,
     permutation_gate_scales: &[F],
     z_h_on_coset: &ZeroPolyOnCoset<F>,
@@ -594,6 +872,19 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
     reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out, true);
+    if let Some(plan) = interleave_pair {
+        eval_interleave_pair_plan_direct_reduced(
+            common_data,
+            vars_batch,
+            plan,
+            alphas,
+            interleave_pair_alpha_powers,
+            &mut scratch.interleave_pair_scratch,
+            res_out,
+        );
+    } else {
+        debug_assert!(interleave_pair_alpha_powers.is_empty());
+    }
 
     if permutation_products_offloaded {
         assert!(!has_lookup, "lookup permutation products stay on the CPU");
@@ -1469,37 +1760,7 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
     constraints_batch.resize(num_constraint_rows * vars_batch.len(), F::ZERO);
     for &i in cpu_gate_indices {
         if let Some(plan) = interleave_pair {
-            if i == plan.interleave_index {
-                filters.clear();
-                filters.resize(3 * vars_batch.len(), F::ZERO);
-                let (interleave_filter, rest) = filters.split_at_mut(vars_batch.len());
-                let (uninterleave_filter, summed_filter) = rest.split_at_mut(vars_batch.len());
-                fill_interleave_gate_filter(
-                    common_data,
-                    vars_batch,
-                    plan.interleave_index,
-                    interleave_filter,
-                );
-                fill_interleave_gate_filter(
-                    common_data,
-                    vars_batch,
-                    plan.uninterleave_index,
-                    uninterleave_filter,
-                );
-                for point in 0..vars_batch.len() {
-                    summed_filter[point] = interleave_filter[point] + uninterleave_filter[point];
-                }
-                eval_interleave_pair_dense_fused(
-                    vars_batch.local_wires,
-                    vars_batch.len(),
-                    interleave_filter,
-                    uninterleave_filter,
-                    summed_filter,
-                    constraints_batch,
-                );
-                continue;
-            }
-            if i == plan.uninterleave_index {
+            if i == plan.interleave_index || i == plan.uninterleave_index {
                 continue;
             }
         }
@@ -1795,7 +2056,7 @@ mod tests {
             GoldilocksField(state)
         };
 
-        for batch_size in [1usize, 7, 32] {
+        for batch_size in [1usize, 7, 32, 33] {
             let wires = (0..INTERLEAVE_PAIR_WIRES * batch_size)
                 .map(|_| next())
                 .collect::<Vec<_>>();
@@ -1869,7 +2130,7 @@ mod tests {
                 }
             }
 
-            let mut actual_rows = initial_rows;
+            let mut actual_rows = initial_rows.clone();
             eval_interleave_pair_dense_fused(
                 &wires,
                 batch_size,
@@ -1878,6 +2139,31 @@ mod tests {
                 &summed_filter,
                 &mut actual_rows,
             );
+
+            // Reusing arbitrary old scratch must remain raw-limb identical to
+            // the baseline stack/heap path. This catches any temporary cell
+            // that is read before being initialized by the current batch.
+            let mut reusable_scratch = (0..10 * batch_size)
+                .map(|_| next())
+                .collect::<Vec<_>>();
+            let mut reused_rows = initial_rows;
+            eval_interleave_pair_dense_fused_with_scratch(
+                &wires,
+                batch_size,
+                &interleave_filter,
+                &uninterleave_filter,
+                &summed_filter,
+                &mut reused_rows,
+                &mut reusable_scratch,
+            );
+            for (index, (&reused, &baseline)) in
+                reused_rows.iter().zip(&actual_rows).enumerate()
+            {
+                assert_eq!(
+                    reused.0, baseline.0,
+                    "reused scratch raw mismatch at {index}, batch={batch_size}"
+                );
+            }
 
             for (index, (&actual, &expected)) in
                 actual_rows.iter().zip(&expected_rows).enumerate()
@@ -1920,6 +2206,433 @@ mod tests {
                     "alpha reduction mismatch at {index}, batch={batch_size}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn direct_interleave_pair_matches_dense_rows_with_adversarial_overlays() {
+        type F = GoldilocksField;
+        const NUM_CHALLENGES: usize = 2;
+
+        let mut state = 0x510e_527f_ade6_82d1u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Preserve arbitrary raw representatives rather than masking into
+            // the canonical range.
+            GoldilocksField(state)
+        };
+
+        for batch_size in [1usize, 7, 32, 33] {
+            let wires = (0..INTERLEAVE_PAIR_WIRES * batch_size)
+                .map(|_| next())
+                .collect::<Vec<_>>();
+            let random_interleave_filter =
+                (0..batch_size).map(|_| next()).collect::<Vec<_>>();
+            let random_uninterleave_filter =
+                (0..batch_size).map(|_| next()).collect::<Vec<_>>();
+            let overlay = (0..INTERLEAVE_PAIR_CONSTRAINTS * batch_size)
+                .map(|_| next())
+                .collect::<Vec<_>>();
+            let random_alphas = [next(), next()];
+            let alpha_cases = [
+                random_alphas,
+                [F::ZERO, F::ONE],
+                [F::ONE, F::ZERO],
+                [F::ONE, F::ONE],
+            ];
+
+            for filter_case in 0..5 {
+                let (interleave_filter, uninterleave_filter) = match filter_case {
+                    0 => (
+                        random_interleave_filter.clone(),
+                        random_uninterleave_filter.clone(),
+                    ),
+                    1 => (
+                        vec![F::ZERO; batch_size],
+                        vec![F::ZERO; batch_size],
+                    ),
+                    2 => (vec![F::ONE; batch_size], vec![F::ZERO; batch_size]),
+                    3 => (vec![F::ZERO; batch_size], vec![F::ONE; batch_size]),
+                    4 => (vec![F::ONE; batch_size], vec![F::ONE; batch_size]),
+                    _ => unreachable!(),
+                };
+                let summed_filter = interleave_filter
+                    .iter()
+                    .zip(&uninterleave_filter)
+                    .map(|(&interleave, &uninterleave)| interleave + uninterleave)
+                    .collect::<Vec<_>>();
+
+                for &alphas in &alpha_cases {
+                    let alpha_powers = interleave_pair_alpha_powers(&alphas);
+                    for other_rows in [0usize, 1, 17, 88, 135, 136] {
+                        let other_len = other_rows * batch_size;
+                        let mut dense_rows = vec![F::ZERO; INTERLEAVE_PAIR_CONSTRAINTS * batch_size];
+                        dense_rows[..other_len].copy_from_slice(&overlay[..other_len]);
+                        let mut dense_scratch = (0..10 * batch_size)
+                            .map(|_| next())
+                            .collect::<Vec<_>>();
+                        eval_interleave_pair_dense_fused_with_scratch(
+                            &wires,
+                            batch_size,
+                            &interleave_filter,
+                            &uninterleave_filter,
+                            &summed_filter,
+                            &mut dense_rows,
+                            &mut dense_scratch,
+                        );
+                        let mut expected = vec![F::ZERO; batch_size * NUM_CHALLENGES];
+                        reduce_gate_constraints_base_batch(
+                            &dense_rows,
+                            batch_size,
+                            &alphas,
+                            &mut expected,
+                            true,
+                        );
+
+                        let mut actual = vec![F::ZERO; batch_size * NUM_CHALLENGES];
+                        reduce_gate_constraints_base_batch(
+                            &overlay[..other_len],
+                            batch_size,
+                            &alphas,
+                            &mut actual,
+                            true,
+                        );
+                        let mut direct_scratch = (0..15 * batch_size)
+                            .map(|_| next())
+                            .collect::<Vec<_>>();
+                        eval_interleave_pair_direct_reduced(
+                            &wires,
+                            batch_size,
+                            &interleave_filter,
+                            &uninterleave_filter,
+                            &alpha_powers,
+                            &mut actual,
+                            &mut direct_scratch,
+                        );
+
+                        for (index, (&direct, &dense)) in
+                            actual.iter().zip(&expected).enumerate()
+                        {
+                            assert_eq!(
+                                direct.to_canonical_u64(),
+                                dense.to_canonical_u64(),
+                                "direct mismatch index={index} batch={batch_size} \
+                                 filters={filter_case} other_rows={other_rows} alphas={alphas:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn time_interleave_pair_scratch_path(
+        iterations: usize,
+        reuse: bool,
+        wires: &[GoldilocksField],
+        first_filter_seed: &[GoldilocksField],
+        second_filter_seed: &[GoldilocksField],
+    ) -> std::time::Duration {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        type F = GoldilocksField;
+        let batch_size = first_filter_seed.len();
+        let mut rows = vec![F::ZERO; INTERLEAVE_PAIR_CONSTRAINTS * batch_size];
+        let mut baseline_filters = Vec::with_capacity(3 * batch_size);
+        let mut reusable = vec![F::ZERO; 13 * batch_size];
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            // The production caller clears the dense constraint rows for each
+            // 32-point quotient batch before accumulating gate constraints.
+            rows.fill(F::ZERO);
+            if reuse {
+                let (filters, dense_scratch) = reusable.split_at_mut(3 * batch_size);
+                let (first_filter, rest) = filters.split_at_mut(batch_size);
+                let (second_filter, summed_filter) = rest.split_at_mut(batch_size);
+                first_filter.copy_from_slice(first_filter_seed);
+                second_filter.copy_from_slice(second_filter_seed);
+                for point in 0..batch_size {
+                    summed_filter[point] = first_filter[point] + second_filter[point];
+                }
+                eval_interleave_pair_dense_fused_with_scratch(
+                    wires,
+                    batch_size,
+                    first_filter,
+                    second_filter,
+                    summed_filter,
+                    &mut rows,
+                    dense_scratch,
+                );
+            } else {
+                // Mirrors the old `clear` + `resize` sequence exactly: capacity
+                // survives, but the full 3*n prefix is zeroed before overwrite.
+                baseline_filters.clear();
+                baseline_filters.resize(3 * batch_size, F::ZERO);
+                let (first_filter, rest) = baseline_filters.split_at_mut(batch_size);
+                let (second_filter, summed_filter) = rest.split_at_mut(batch_size);
+                first_filter.copy_from_slice(first_filter_seed);
+                second_filter.copy_from_slice(second_filter_seed);
+                for point in 0..batch_size {
+                    summed_filter[point] = first_filter[point] + second_filter[point];
+                }
+                eval_interleave_pair_dense_fused(
+                    wires,
+                    batch_size,
+                    first_filter,
+                    second_filter,
+                    summed_filter,
+                    &mut rows,
+                );
+            }
+            black_box(&mut rows);
+        }
+        start.elapsed()
+    }
+
+    /// Production-shape falsifier for scratch hoisting: one final-block proof
+    /// executes 2^21 / 32 = 65,536 fused gate-pair batches. Run with
+    /// `cargo test --release benchmark_interleave_pair_reusable_scratch_production_shape -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn benchmark_interleave_pair_reusable_scratch_production_shape() {
+        type F = GoldilocksField;
+        const BATCH_SIZE: usize = INTERLEAVE_PAIR_STACK_BATCH;
+        const PRODUCTION_BATCHES: usize = (1 << 21) / BATCH_SIZE;
+        const SAMPLES: usize = 7;
+
+        let mut state = 0xbb67_ae85_84ca_a73bu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            F::from_canonical_u64(state >> 1)
+        };
+        let wires = (0..INTERLEAVE_PAIR_WIRES * BATCH_SIZE)
+            .map(|_| next())
+            .collect::<Vec<_>>();
+        let first_filter = (0..BATCH_SIZE).map(|_| next()).collect::<Vec<_>>();
+        let second_filter = (0..BATCH_SIZE).map(|_| next()).collect::<Vec<_>>();
+
+        // Untimed warmup ensures allocation, code pages, and data pages are hot.
+        let warm_batches = 1024;
+        let _ = time_interleave_pair_scratch_path(
+            warm_batches,
+            false,
+            &wires,
+            &first_filter,
+            &second_filter,
+        );
+        let _ = time_interleave_pair_scratch_path(
+            warm_batches,
+            true,
+            &wires,
+            &first_filter,
+            &second_filter,
+        );
+
+        let mut baseline = Vec::with_capacity(SAMPLES);
+        let mut reused = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let measure = |reuse| {
+                time_interleave_pair_scratch_path(
+                    PRODUCTION_BATCHES,
+                    reuse,
+                    &wires,
+                    &first_filter,
+                    &second_filter,
+                )
+            };
+            let (baseline_time, reused_time) = if sample % 2 == 0 {
+                (measure(false), measure(true))
+            } else {
+                let reused_time = measure(true);
+                (measure(false), reused_time)
+            };
+            eprintln!(
+                "sample {sample}: baseline={baseline_time:?} reused={reused_time:?} ratio={:.4}",
+                reused_time.as_secs_f64() / baseline_time.as_secs_f64()
+            );
+            baseline.push(baseline_time);
+            reused.push(reused_time);
+        }
+        baseline.sort_unstable();
+        reused.sort_unstable();
+        let baseline_median = baseline[SAMPLES / 2];
+        let reused_median = reused[SAMPLES / 2];
+        eprintln!(
+            "production-shape median: baseline={baseline_median:?} reused={reused_median:?} ratio={:.4}",
+            reused_median.as_secs_f64() / baseline_median.as_secs_f64()
+        );
+    }
+
+    fn time_interleave_pair_direct_reduction_path(
+        iterations: usize,
+        direct: bool,
+        other_rows: usize,
+        wires: &[GoldilocksField],
+        interleave_filter: &[GoldilocksField],
+        uninterleave_filter: &[GoldilocksField],
+        alphas: &[GoldilocksField; 2],
+        alpha_powers: &[GoldilocksField],
+        overlay: &[GoldilocksField],
+    ) -> std::time::Duration {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        type F = GoldilocksField;
+        let batch_size = interleave_filter.len();
+        let other_len = other_rows * batch_size;
+        let summed_filter = interleave_filter
+            .iter()
+            .zip(uninterleave_filter)
+            .map(|(&interleave, &uninterleave)| interleave + uninterleave)
+            .collect::<Vec<_>>();
+        let mut dense_seed = vec![F::ZERO; INTERLEAVE_PAIR_CONSTRAINTS * batch_size];
+        dense_seed[..other_len].copy_from_slice(&overlay[..other_len]);
+        let mut dense_rows = dense_seed.clone();
+        let mut other = overlay[..other_len].to_vec();
+        let mut output = vec![F::ZERO; 2 * batch_size];
+        let mut dense_scratch = vec![F::ZERO; 10 * batch_size];
+        let mut direct_scratch = vec![F::ZERO; 15 * batch_size];
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            if direct {
+                other.copy_from_slice(&overlay[..other_len]);
+                reduce_gate_constraints_base_batch(
+                    &other,
+                    batch_size,
+                    alphas,
+                    &mut output,
+                    true,
+                );
+                eval_interleave_pair_direct_reduced(
+                    wires,
+                    batch_size,
+                    interleave_filter,
+                    uninterleave_filter,
+                    alpha_powers,
+                    &mut output,
+                    &mut direct_scratch,
+                );
+            } else {
+                dense_rows.copy_from_slice(&dense_seed);
+                eval_interleave_pair_dense_fused_with_scratch(
+                    wires,
+                    batch_size,
+                    interleave_filter,
+                    uninterleave_filter,
+                    &summed_filter,
+                    &mut dense_rows,
+                    &mut dense_scratch,
+                );
+                reduce_gate_constraints_base_batch(
+                    &dense_rows,
+                    batch_size,
+                    alphas,
+                    &mut output,
+                    true,
+                );
+            }
+            black_box(&mut output);
+        }
+        start.elapsed()
+    }
+
+    /// Exact final-domain call-count comparison of the promoted scratch-dense
+    /// pair plus 136-row Horner against direct pair reduction plus the dense
+    /// survivor prefix. Width 88 is the final circuit's post-GPU survivor
+    /// ceiling (EqualityGate: 22 operations x 4 constraints).
+    #[test]
+    #[ignore]
+    fn benchmark_interleave_pair_direct_reduction_production_shape() {
+        type F = GoldilocksField;
+        const BATCH_SIZE: usize = INTERLEAVE_PAIR_STACK_BATCH;
+        const PRODUCTION_BATCHES: usize = (1 << 21) / BATCH_SIZE;
+        const SAMPLES: usize = 5;
+
+        let mut state = 0x1f83_d9ab_fb41_bd6bu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            F::from_canonical_u64(state >> 1)
+        };
+        let wires = (0..INTERLEAVE_PAIR_WIRES * BATCH_SIZE)
+            .map(|_| next())
+            .collect::<Vec<_>>();
+        let interleave_filter = (0..BATCH_SIZE).map(|_| next()).collect::<Vec<_>>();
+        let uninterleave_filter = (0..BATCH_SIZE).map(|_| next()).collect::<Vec<_>>();
+        let alphas = [next(), next()];
+        let alpha_powers = interleave_pair_alpha_powers(&alphas);
+        let overlay = (0..INTERLEAVE_PAIR_CONSTRAINTS * BATCH_SIZE)
+            .map(|_| next())
+            .collect::<Vec<_>>();
+
+        let widths = std::env::var("PLONKY2_INTERLEAVE_BENCH_ROWS")
+            .ok()
+            .map(|value| {
+                vec![value
+                    .parse::<usize>()
+                    .expect("PLONKY2_INTERLEAVE_BENCH_ROWS must be an integer")]
+            })
+            .unwrap_or_else(|| vec![0usize, 40, 68, 88, 123, 136]);
+        for other_rows in widths {
+            for direct in [false, true] {
+                let _ = time_interleave_pair_direct_reduction_path(
+                    512,
+                    direct,
+                    other_rows,
+                    &wires,
+                    &interleave_filter,
+                    &uninterleave_filter,
+                    &alphas,
+                    &alpha_powers,
+                    &overlay,
+                );
+            }
+
+            let mut dense_samples = Vec::with_capacity(SAMPLES);
+            let mut direct_samples = Vec::with_capacity(SAMPLES);
+            for sample in 0..SAMPLES {
+                let measure = |direct| {
+                    time_interleave_pair_direct_reduction_path(
+                        PRODUCTION_BATCHES,
+                        direct,
+                        other_rows,
+                        &wires,
+                        &interleave_filter,
+                        &uninterleave_filter,
+                        &alphas,
+                        &alpha_powers,
+                        &overlay,
+                    )
+                };
+                let (dense, direct) = if sample % 2 == 0 {
+                    (measure(false), measure(true))
+                } else {
+                    let direct = measure(true);
+                    (measure(false), direct)
+                };
+                eprintln!(
+                    "rows={other_rows:>3} sample={sample}: dense={dense:?} direct={direct:?} ratio={:.4}",
+                    direct.as_secs_f64() / dense.as_secs_f64()
+                );
+                dense_samples.push(dense);
+                direct_samples.push(direct);
+            }
+            dense_samples.sort_unstable();
+            direct_samples.sort_unstable();
+            let dense = dense_samples[SAMPLES / 2];
+            let direct = direct_samples[SAMPLES / 2];
+            eprintln!(
+                "rows={other_rows:>3} median: dense={dense:?} direct={direct:?} ratio={:.4}",
+                direct.as_secs_f64() / dense.as_secs_f64()
+            );
         }
     }
 
