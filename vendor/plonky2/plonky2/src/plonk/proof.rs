@@ -312,6 +312,29 @@ pub struct OpeningSet<F: RichField + Extendable<D>, const D: usize> {
     pub lookup_zs_next: Vec<F::Extension>,
 }
 
+/// Evaluates a base-field polynomial against a precomputed extension powers
+/// table. Accumulating each extension limb with the base field's fused
+/// multiply-accumulate avoids constructing and then adding one temporary
+/// extension value per coefficient.
+#[inline]
+fn eval_base_poly_with_extension_powers<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
+    coeffs: &[F],
+    pows: &[F::Extension],
+) -> F::Extension {
+    debug_assert!(coeffs.len() <= pows.len());
+    let mut accumulators = [F::ZERO; D];
+    for (&coeff, power) in coeffs.iter().zip(pows) {
+        let limbs = power.to_basefield_array();
+        for j in 0..D {
+            accumulators[j] = accumulators[j].multiply_accumulate(coeff, limbs[j]);
+        }
+    }
+    F::Extension::from_basefield_array(accumulators)
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
     pub fn new<C: GenericConfig<D, F = F>>(
         zeta: F::Extension,
@@ -373,13 +396,7 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         let eval_polynomials = |pows: &[F::Extension], polynomials: &[PolynomialCoeffs<F>]| {
             polynomials
                 .par_iter()
-                .map(|p| {
-                    p.coeffs
-                        .iter()
-                        .zip(pows)
-                        .map(|(&coeff, zp)| zp.scalar_mul(coeff))
-                        .sum::<F::Extension>()
-                })
+                .map(|p| eval_base_poly_with_extension_powers::<F, D>(&p.coeffs, pows))
                 .collect::<Vec<_>>()
         };
         let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
@@ -525,7 +542,7 @@ mod tests {
 
     use anyhow::Result;
     use itertools::Itertools;
-    use plonky2_field::types::Sample;
+    use plonky2_field::types::{PrimeField64, Sample};
 
     use super::*;
     use crate::fri::reduction_strategies::FriReductionStrategy;
@@ -536,6 +553,40 @@ mod tests {
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::PoseidonGoldilocksConfig;
     use crate::plonk::verifier::verify;
+
+    #[test]
+    fn opening_power_dot_product_fma_matches_extension_sum() {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type EF = <F as Extendable<D>>::Extension;
+
+        let z = EF::from_basefield_array([
+            F::from_canonical_u64(0x1234_5678),
+            F::from_canonical_u64(0x9abc_def0),
+        ]);
+        let powers = z.powers().take(257).collect::<Vec<_>>();
+        let coefficients = (0..257)
+            .map(|i| F::from_canonical_usize(i * i + 17 * i + 3))
+            .collect::<Vec<_>>();
+
+        for n in [0usize, 1, 2, 31, 256, 257] {
+            let legacy = coefficients[..n]
+                .iter()
+                .zip(&powers)
+                .map(|(&coefficient, power)| {
+                    <EF as FieldExtension<D>>::scalar_mul(power, coefficient)
+                })
+                .sum::<EF>();
+            let fused =
+                eval_base_poly_with_extension_powers::<F, D>(&coefficients[..n], &powers);
+            let legacy = <EF as FieldExtension<D>>::to_basefield_array(&legacy)
+                .map(|limb| limb.to_canonical_u64());
+            let fused = <EF as FieldExtension<D>>::to_basefield_array(&fused)
+                .map(|limb| limb.to_canonical_u64());
+            assert_eq!(fused, legacy, "coefficient count {n}");
+        }
+    }
 
     #[test]
     fn test_proof_compression() -> Result<()> {
