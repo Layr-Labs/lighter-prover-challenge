@@ -107,6 +107,28 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// `metallib_matches_shader_source` test enforces it.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
+/// Historical ranked artifacts whose tree kernels are ABI-compatible with
+/// the current shader. They are loaded as secondary libraries only: quotient,
+/// NTT, and absorb pipelines always come from [`SHADER_METALLIB`].
+///
+/// `poseidon2_squaring.metallib` comes from validation commit
+/// `7a13d82389b7c6cfd1f6625577a35a56236ae559` and specializes the two
+/// squarings in `pow7`. `poseidon2_a5.metallib` comes from validation commit
+/// `cd7dc82aee1a4cc0abe02137607fa1929f71ee4b` (whose parent is this ranked
+/// base) and skips the parent hash's terminal lanes that cannot affect its
+/// four-word digest.
+const SQUARING_METALLIB: &[u8] = include_bytes!("poseidon2_squaring.metallib");
+const A5_METALLIB: &[u8] = include_bytes!("poseidon2_a5.metallib");
+#[cfg(test)]
+const SQUARING_METALLIB_SHA256: &str =
+    "882cee1f396f7fcb6240ae90084189eafb200bb72de810f7ab7fb590b61ac16f";
+#[cfg(test)]
+const A5_METALLIB_SHA256: &str = "4befcef9fc62f932b759a5c211e165bc779930b9a6708baf0ea569dea43c958f";
+
+const SQUARING_TREE_KERNELS: [&str; 2] =
+    ["poseidon2_hash_leaves", "poseidon2_hash_leaves_colmajor"];
+const A5_TREE_KERNELS: [&str; 1] = ["poseidon2_hash_parents"];
+
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
     "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
@@ -2152,6 +2174,10 @@ enum LeafSource<'a, F> {
 
 impl MetalShared {
     fn new() -> Result<Self, String> {
+        Self::new_with_tree_artifacts(true)
+    }
+
+    fn new_with_tree_artifacts(use_historical_tree_artifacts: bool) -> Result<Self, String> {
         autoreleasepool(|| {
             let device = Device::system_default().ok_or("no Metal device")?;
             let options = CompileOptions::new();
@@ -2194,6 +2220,25 @@ impl MetalShared {
                     },
                     Ok,
                 )?;
+
+            // Reuse two already-ranked AIR artifacts only for the tree kernels
+            // whose buffer ABI is unchanged. Keeping them as secondary
+            // libraries is important: their older sources do not contain the
+            // current quotient kernels, while the current library remains the
+            // single source of every non-tree pipeline.
+            let optional_library = |bytes: &[u8], kernels: &[&str]| {
+                device.new_library_with_data(bytes).ok().filter(|library| {
+                    kernels
+                        .iter()
+                        .all(|name| library.get_function(name, None).is_ok())
+                })
+            };
+            let squaring_library = use_historical_tree_artifacts
+                .then(|| optional_library(SQUARING_METALLIB, &SQUARING_TREE_KERNELS))
+                .flatten();
+            let a5_library = use_historical_tree_artifacts
+                .then(|| optional_library(A5_METALLIB, &A5_TREE_KERNELS))
+                .flatten();
             // Build the compute pipelines concurrently, one thread each.
             //
             // Every `newComputePipelineStateWithFunction:` lowers that kernel's
@@ -2215,15 +2260,30 @@ impl MetalShared {
             // that created them rather than leaking.
             let device_ref = &device;
             let library_ref = &library;
-            let required = |name: &'static str, kind: &'static str| {
+            let required = |preferred_library: Option<metal::Library>,
+                            name: &'static str,
+                            kind: &'static str| {
                 move || -> Result<ComputePipelineState, String> {
                     autoreleasepool(|| {
-                        let function = library_ref
-                            .get_function(name, None)
-                            .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
-                        device_ref
-                            .new_compute_pipeline_state_with_function(&function)
-                            .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
+                        let build = |source: &metal::Library| {
+                            let function = source
+                                .get_function(name, None)
+                                .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
+                            device_ref
+                                .new_compute_pipeline_state_with_function(&function)
+                                .map_err(|error| {
+                                    format!("{kind} pipeline creation failed: {error}")
+                                })
+                        };
+                        if let Some(preferred) = preferred_library {
+                            match build(&preferred) {
+                                Ok(pipeline) => return Ok(pipeline),
+                                Err(error) => log::warn!(
+                                    "historical {kind} Metal artifact failed; using current kernel: {error}"
+                                ),
+                            }
+                        }
+                        build(library_ref)
                     })
                 }
             };
@@ -2256,13 +2316,24 @@ impl MetalShared {
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
             ) = std::thread::scope(|scope| {
-                let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
-                let leaf_colmajor =
-                    scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
-                let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
-                let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
-                let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
-                let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
+                let leaf = scope.spawn(required(
+                    squaring_library.clone(),
+                    "poseidon2_hash_leaves",
+                    "leaf",
+                ));
+                let leaf_colmajor = scope.spawn(required(
+                    squaring_library.clone(),
+                    "poseidon2_hash_leaves_colmajor",
+                    "col-major leaf",
+                ));
+                let parent = scope.spawn(required(
+                    a5_library.clone(),
+                    "poseidon2_hash_parents",
+                    "parent",
+                ));
+                let ntt_prepare = scope.spawn(required(None, "ntt_prepare", "ntt prepare"));
+                let ntt_stage = scope.spawn(required(None, "ntt_stage", "ntt stage"));
+                let ifft_finalize = scope.spawn(required(None, "ifft_finalize", "ifft finalize"));
                 // A panic inside a pipeline build is a bug, not a runtime
                 // condition; propagate it rather than papering over it.
                 (
@@ -3741,6 +3812,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn historical_tree_metallibs_match_pinned_artifacts() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
+        for (file, expected) in [
+            ("poseidon2_squaring.metallib", SQUARING_METALLIB_SHA256),
+            ("poseidon2_a5.metallib", A5_METALLIB_SHA256),
+        ] {
+            let output = std::process::Command::new("/usr/bin/shasum")
+                .args(["-a", "256", &format!("{dir}/{file}")])
+                .output()
+                .unwrap_or_else(|error| panic!("shasum must verify {file}: {error}"));
+            assert!(output.status.success(), "shasum failed for {file}");
+            let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
+            let digest = digest
+                .split_whitespace()
+                .next()
+                .expect("empty shasum output");
+            assert_eq!(digest, expected, "historical Metal artifact {file} changed");
+        }
+    }
+
     /// The fallback in `MetalShared::new` hides a broken artifact behind a
     /// source compile, which would silently give back the cost this exists to
     /// remove. Assert the fast path is actually live on this machine.
@@ -3757,6 +3849,79 @@ mod tests {
                 library.get_function(name, None).is_ok(),
                 "prebuilt metallib is missing kernel {name}"
             );
+        }
+
+        // Loading a function does not fully validate its AIR on every Metal
+        // runtime. Lower the three selected historical kernels as well, so a
+        // committed artifact that this host cannot execute fails this test
+        // instead of being mistaken for an active optimization.
+        for (artifact, kernels) in [
+            (SQUARING_METALLIB, SQUARING_TREE_KERNELS.as_slice()),
+            (A5_METALLIB, A5_TREE_KERNELS.as_slice()),
+        ] {
+            let historical = device
+                .new_library_with_data(artifact)
+                .expect("historical tree metallib must load");
+            for name in kernels {
+                let function = historical.get_function(name, None).unwrap_or_else(|error| {
+                    panic!("historical kernel {name} unavailable: {error}")
+                });
+                device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .unwrap_or_else(|error| {
+                        panic!("historical kernel {name} failed to lower: {error}")
+                    });
+            }
+        }
+    }
+
+    #[test]
+    fn historical_tree_metallibs_match_current_tree_execution() {
+        let mixed = MetalShared::new_with_tree_artifacts(true).expect("mixed Metal context");
+        let current = MetalShared::new_with_tree_artifacts(false).expect("current Metal context");
+        let mut rng = StdRng::seed_from_u64(0x4849_5354_4d49_5845);
+        let rows = 64;
+
+        for width in [1, 4, 5, 8, 9, 16, 17, 31, 64, 80, 136] {
+            let flat = (0..rows * width)
+                .map(|index| {
+                    let raw = match index & 7 {
+                        0 => 0,
+                        1 => 1,
+                        2 => GoldilocksField::ORDER - 1,
+                        3 => GoldilocksField::ORDER,
+                        4 => GoldilocksField::ORDER + 1,
+                        5 => u64::MAX,
+                        _ => rng.next_u64(),
+                    };
+                    GoldilocksField(raw)
+                })
+                .collect::<Vec<_>>();
+            let columns = (0..width)
+                .map(|column| {
+                    (0..rows)
+                        .map(|row| flat[row * width + column])
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+
+            for cap_height in [0, 3, 6] {
+                let mixed_rows = mixed
+                    .build(LeafSource::Rows(&flat), width, rows, cap_height)
+                    .expect("mixed row-major tree");
+                let current_rows = current
+                    .build(LeafSource::Rows(&flat), width, rows, cap_height)
+                    .expect("current row-major tree");
+                assert_tree_raw_eq(&mixed_rows, &current_rows, width, cap_height);
+
+                let mixed_columns = mixed
+                    .build(LeafSource::Columns(&columns), width, rows, cap_height)
+                    .expect("mixed column-major tree");
+                let current_columns = current
+                    .build(LeafSource::Columns(&columns), width, rows, cap_height)
+                    .expect("current column-major tree");
+                assert_tree_raw_eq(&mixed_columns, &current_columns, width, cap_height);
+            }
         }
     }
 
