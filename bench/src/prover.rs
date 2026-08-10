@@ -53,6 +53,13 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 const LIGHT_TX_PROOF_WINDOW: usize = 4;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
+// The ranked M4 has four performance cores. Keep the serial light-chain
+// spine's parallel proof work on a small USER_INTERACTIVE pool instead of
+// competing, at default QoS, with the hideable transaction-proof window on
+// the global Rayon pool. The predecessor wait stays outside this pool (see
+// `chain_step_proof`), so the dependency chain cannot occupy all four workers
+// while waiting for itself.
+const LIGHT_CHAIN_RAYON_THREADS: usize = 4;
 
 fn chunk_is_light(txs: &[Arc<Tx<F>>]) -> bool {
     txs.first()
@@ -124,6 +131,25 @@ fn mark_spine_thread_latency_critical() {
 #[cfg(not(target_os = "macos"))]
 fn mark_spine_thread_latency_critical() {}
 
+/// Builds the light-chain-only Rayon pool.
+///
+/// Construction is best-effort: a thread-creation failure retains the
+/// established global-pool path. On non-macOS targets the workers use the same
+/// four-thread topology but the QoS marker is a no-op, allowing ordinary
+/// builds to type-check and exercise the ownership/scheduling seam.
+fn build_light_chain_pool(path: TxPath) -> Option<rayon::ThreadPool> {
+    if path != TxPath::Light {
+        return None;
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(LIGHT_CHAIN_RAYON_THREADS)
+        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .thread_name(|index| format!("light-chain-rayon-{index}"))
+        .start_handler(|_| mark_spine_thread_latency_critical())
+        .build()
+        .ok()
+}
+
 enum ChainState<'scope> {
     Ready(Proof),
     InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
@@ -145,6 +171,7 @@ impl ChainState<'_> {
 #[allow(clippy::too_many_arguments)]
 fn chain_step_proof(
     path: TxPath,
+    chain_pool: Option<&rayon::ThreadPool>,
     chain_target: &BlockTxChainTarget,
     chain_data: &CircuitData<F, C, D>,
     chain_step: u64,
@@ -191,7 +218,17 @@ fn chain_step_proof(
                 feeder,
             )
         })?;
-        BlockTxChainCircuit::prove_prepared(pending, chain_data)
+        // Do not enter the dedicated pool until the predecessor proof is
+        // available and its witness feed has completed. Many chain-step OS
+        // threads exist concurrently; entering before `previous.wait()` would
+        // let dependent waiters consume every pool worker and deadlock the one
+        // predecessor whose proof can make progress. At this point there is
+        // exactly one dependency-ready light-chain proof, so the pool contains
+        // useful work only.
+        match chain_pool {
+            Some(pool) => pool.install(|| BlockTxChainCircuit::prove_prepared(pending, chain_data)),
+            None => BlockTxChainCircuit::prove_prepared(pending, chain_data),
+        }
     })();
     result.unwrap_or_else(|error| {
         panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")
@@ -389,6 +426,12 @@ fn prove_path(
     );
     jump = next_jump;
 
+    // One persistent pool for the full 49-step light spine. Building a pool per
+    // fold would put thread creation on the critical path and discard Rayon
+    // worker-local caches. Heavy has only three steps and remains on the global
+    // pool so it can finish without occupying the four latency-critical lanes.
+    let chain_pool = build_light_chain_pool(path);
+    let chain_pool = chain_pool.as_ref();
 
     let chain_proof = std::thread::scope(|scope| {
         let base = &base_proof;
@@ -408,6 +451,7 @@ fn prove_path(
                     .spawn_scoped(scope, move || {
                         chain_step_proof(
                             path,
+                            chain_pool,
                             chain_target,
                             chain_data,
                             chain_step,
@@ -488,6 +532,7 @@ fn prove_path(
                 .spawn_scoped(scope, move || {
                     chain_step_proof(
                         path,
+                        chain_pool,
                         chain_target,
                         chain_data,
                         chain_step,
@@ -532,6 +577,7 @@ fn prove_path(
             let previous = chain.take();
             chain = Some(ChainState::Ready(chain_step_proof(
                 path,
+                chain_pool,
                 chain_target,
                 chain_data,
                 chain_step,
@@ -981,6 +1027,18 @@ mod tests {
         assert_eq!(final_chain_inputs(&light, &heavy), (&light, &heavy));
     }
 
+    #[test]
+    fn dedicated_pool_is_light_only_and_bounded() {
+        assert!(build_light_chain_pool(TxPath::Heavy).is_none());
+        let pool = build_light_chain_pool(TxPath::Light)
+            .expect("light-chain dedicated pool must be constructible");
+        assert_eq!(pool.current_num_threads(), LIGHT_CHAIN_RAYON_THREADS);
+        assert_eq!(
+            pool.install(rayon::current_num_threads),
+            LIGHT_CHAIN_RAYON_THREADS
+        );
+    }
+
     /// Manual timing harness for the two-phase chain-step witness split. Run with:
     /// `RAYON_NUM_THREADS=8 cargo test --release -p bench --bin prove -- --ignored chain_step`
     #[test]
@@ -1157,6 +1215,7 @@ mod tests {
             let direct_start = Instant::now();
             let direct_proof = chain_step_proof(
                 TxPath::Light,
+                None,
                 &circuits.chain_target,
                 &circuits.chain_data,
                 chain_step,
