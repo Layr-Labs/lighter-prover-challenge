@@ -219,6 +219,16 @@ fn u160_add_product(lo: &mut u128, hi: &mut u32, a: u64, b: u64) {
     *hi += carry as u32;
 }
 
+/// Merge two exact 160-bit partial sums. Callers prove that the combined sum
+/// is below `2^160`, so computing the high word through `u64` cannot truncate.
+#[inline(always)]
+fn u160_add_accumulators(a: (u128, u32), b: (u128, u32)) -> (u128, u32) {
+    let (lo, carry) = a.0.overflowing_add(b.0);
+    let hi = a.1 as u64 + b.1 as u64 + carry as u64;
+    debug_assert!(hi <= u32::MAX as u64);
+    (lo, hi as u32)
+}
+
 /// Compute `sum_i extension_values[i].scalar_mul(base_scalars[i])` in
 /// GF(p^2), delaying reduction across the complete dot product.
 ///
@@ -255,12 +265,30 @@ fn ext2_base_scalar_dot_product(
                         scalars: &[GoldilocksField]| {
         debug_assert_eq!(values.len(), scalars.len());
         debug_assert!(values.len() <= MAX_TERMS_PER_REDUCTION);
-        let (mut lo0, mut hi0) = (0u128, 0u32);
-        let (mut lo1, mut hi1) = (0u128, 0u32);
-        for (&QuadraticExtension([a0, a1]), &scalar) in values.iter().zip(scalars) {
-            u160_add_product(&mut lo0, &mut hi0, a0.0, scalar.0);
-            u160_add_product(&mut lo1, &mut hi1, a1.0, scalar.0);
+        // Two accumulator banks break the loop-carried dependency between
+        // adjacent products. Each bank receives alternating terms; merging
+        // their exact 160-bit sums before the sole reduction preserves the
+        // historical delayed-reduction field value (same reduce160 bound).
+        let (mut lo00, mut hi00) = (0u128, 0u32);
+        let (mut lo01, mut hi01) = (0u128, 0u32);
+        let (mut lo10, mut hi10) = (0u128, 0u32);
+        let (mut lo11, mut hi11) = (0u128, 0u32);
+        for (value_pair, scalar_pair) in values.chunks_exact(2).zip(scalars.chunks_exact(2)) {
+            let QuadraticExtension([a00, a10]) = value_pair[0];
+            let QuadraticExtension([a01, a11]) = value_pair[1];
+            u160_add_product(&mut lo00, &mut hi00, a00.0, scalar_pair[0].0);
+            u160_add_product(&mut lo10, &mut hi10, a10.0, scalar_pair[0].0);
+            u160_add_product(&mut lo01, &mut hi01, a01.0, scalar_pair[1].0);
+            u160_add_product(&mut lo11, &mut hi11, a11.0, scalar_pair[1].0);
         }
+        if values.len() % 2 != 0 {
+            let QuadraticExtension([a0, a1]) = values[values.len() - 1];
+            let scalar = scalars[scalars.len() - 1];
+            u160_add_product(&mut lo00, &mut hi00, a0.0, scalar.0);
+            u160_add_product(&mut lo10, &mut hi10, a1.0, scalar.0);
+        }
+        let (lo0, hi0) = u160_add_accumulators((lo00, hi00), (lo01, hi01));
+        let (lo1, hi1) = u160_add_accumulators((lo10, hi10), (lo11, hi11));
         // SAFETY: the exact worst-case bound above covers arbitrary u64
         // representatives for every term in this chunk.
         QuadraticExtension([unsafe { reduce160(lo0, hi0) }, unsafe {
