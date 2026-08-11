@@ -497,6 +497,97 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         }
     }
 
+    /// Gathers `n` consecutive logical LDE indices beginning at
+    /// `index_start`, wrapping once at `logical_domain`.
+    ///
+    /// This is the allocation-free form of materializing
+    /// `(index_start + k) & (logical_domain - 1)` into an index vector and
+    /// passing it to [`Self::fill_lde_batch`]. The quotient path uses it for
+    /// the next-Z sequence, whose power-of-two-domain batch wraps at most once.
+    pub(crate) fn fill_lde_batch_wrapping_range(
+        &self,
+        index_start: usize,
+        n: usize,
+        logical_domain: usize,
+        step: usize,
+        col_range: core::ops::Range<usize>,
+        layout: BatchLayout,
+        out: &mut Vec<F>,
+    ) {
+        debug_assert!(logical_domain.is_power_of_two());
+        debug_assert!(index_start < logical_domain);
+        debug_assert!(n <= logical_domain);
+        let first_len = n.min(logical_domain - index_start);
+        let start = col_range.start;
+        let w = col_range.len();
+        out.resize(n * w, F::ZERO);
+
+        match &self.merkle_tree.leaves {
+            MerkleLeaves::Columns { columns, .. } => {
+                for (ci, c) in col_range.enumerate() {
+                    let column = columns.col(c);
+                    match layout {
+                        BatchLayout::PolyMajor if step == 1 => {
+                            let destination = &mut out[ci * n..(ci + 1) * n];
+                            destination[..first_len].copy_from_slice(
+                                &column[index_start..index_start + first_len],
+                            );
+                            destination[first_len..]
+                                .copy_from_slice(&column[..n - first_len]);
+                        }
+                        BatchLayout::PolyMajor => {
+                            let destination = &mut out[ci * n..(ci + 1) * n];
+                            for k in 0..first_len {
+                                destination[k] = column[(index_start + k) * step];
+                            }
+                            for k in 0..n - first_len {
+                                destination[first_len + k] = column[k * step];
+                            }
+                        }
+                        BatchLayout::PointMajor => {
+                            for k in 0..first_len {
+                                out[k * w + ci] = column[(index_start + k) * step];
+                            }
+                            for k in 0..n - first_len {
+                                out[(first_len + k) * w + ci] = column[k * step];
+                            }
+                        }
+                    }
+                }
+            }
+            MerkleLeaves::Rows { .. } => {
+                for k in 0..first_len {
+                    let row =
+                        &self.get_lde_values(index_start + k, step)[start..start + w];
+                    match layout {
+                        BatchLayout::PointMajor => {
+                            out[k * w..(k + 1) * w].copy_from_slice(row);
+                        }
+                        BatchLayout::PolyMajor => {
+                            for (ci, &value) in row.iter().enumerate() {
+                                out[ci * n + k] = value;
+                            }
+                        }
+                    }
+                }
+                for wrapped_k in 0..n - first_len {
+                    let k = first_len + wrapped_k;
+                    let row = &self.get_lde_values(wrapped_k, step)[start..start + w];
+                    match layout {
+                        BatchLayout::PointMajor => {
+                            out[k * w..(k + 1) * w].copy_from_slice(row);
+                        }
+                        BatchLayout::PolyMajor => {
+                            for (ci, &value) in row.iter().enumerate() {
+                                out[ci * n + k] = value;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Extracts the stride-`step` LDE values for a whole quotient domain of
     /// `q_domain` indices, column-major (`PolyMajor`): `out[c * q_domain + i]`
     /// = `columns[c][i * step]`. The constants/sigma columns are

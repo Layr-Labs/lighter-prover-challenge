@@ -1,8 +1,12 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
+use core::any::TypeId;
 use core::cmp::min;
+use core::slice;
 
+use plonky2_field::goldilocks_field::{reduce160, GoldilocksField};
 use plonky2_field::polynomial::PolynomialCoeffs;
+use plonky2_field::types::PrimeField64;
 
 use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
@@ -184,6 +188,9 @@ pub(crate) struct VanishingScratch<F> {
     pub constraint_terms_batch: Vec<F>,
     /// Reused selector-filter buffer across batches (survivor-list package).
     pub gate_filters: Vec<F>,
+    /// Canonical powers `[alpha_0^r, alpha_1^r]` reused by the Goldilocks
+    /// two-challenge gate reduction specialization.
+    pub gate_alpha_powers: Vec<F>,
 }
 
 /// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
@@ -447,6 +454,214 @@ fn eval_interleave_pair_dense_fused<F: Field>(
     }
 }
 
+// The ranked circuits have at most 136 surviving CPU constraint rows. A full
+// power-sum therefore adds at most 135 products to one constant. Even for
+// arbitrary raw `u64` representatives its unreduced value is strictly below
+// `136 * 2^128 < 2^136`; the carry limb is at most 134, so it fits in `u32`,
+// and `reduce160`'s `x < 2^160 - 2^128 + 2^96` precondition holds.
+const MAX_UNREDUCED_GATE_ROWS: usize = 136;
+const _: () = assert!(MAX_UNREDUCED_GATE_ROWS - 1 < u32::MAX as usize);
+
+/// Goldilocks/two-challenge specialization of a zero-seeded gate Horner fold.
+///
+/// The ordinary reversed Horner chain is
+/// `c0 + alpha*c1 + ... + alpha^(rows-1)*c[rows-1]`. This evaluates the same
+/// polynomial as one 160-bit sum of products and performs a single modular
+/// reduction per point/challenge. Reassociation can change the noncanonical
+/// raw representative, but not the field value.
+///
+/// # Safety
+///
+/// `batch_size` must be nonzero, `rows` must be in the module-level bounded
+/// range, `rows * batch_size` must equal the term length, the power slice must
+/// hold two interleaved powers for each nonconstant row, and the output must
+/// hold two elements per point.
+unsafe fn reduce_gate_constraints_goldilocks_power_sum(
+    constraint_terms_batch: &[GoldilocksField],
+    batch_size: usize,
+    rows: usize,
+    alpha_powers: &[GoldilocksField],
+    res_out: &mut [GoldilocksField],
+) {
+    debug_assert!(batch_size > 0);
+    debug_assert!((2..=MAX_UNREDUCED_GATE_ROWS).contains(&rows));
+    debug_assert_eq!(constraint_terms_batch.len(), rows * batch_size);
+    let products = rows - 1;
+    debug_assert_eq!(alpha_powers.len(), 2 * products);
+    debug_assert_eq!(res_out.len(), 2 * batch_size);
+
+    let terms = constraint_terms_batch.as_ptr();
+    let powers = alpha_powers.as_ptr();
+    // SAFETY: the function's length preconditions put every pointer access
+    // below in bounds. Pairing adjacent points shares each pair of alpha-power
+    // loads and exposes four independent carry chains to the CPU.
+    unsafe {
+        let output = res_out.as_mut_ptr();
+        let paired_points = batch_size & !1;
+        for point in (0..paired_points).step_by(2) {
+            let constant_0 = (*terms.add(point)).0 as u128;
+            let constant_1 = (*terms.add(point + 1)).0 as u128;
+            let mut sum_00 = constant_0;
+            let mut sum_01 = constant_0;
+            let mut sum_10 = constant_1;
+            let mut sum_11 = constant_1;
+            let mut carry_00 = 0u32;
+            let mut carry_01 = 0u32;
+            let mut carry_10 = 0u32;
+            let mut carry_11 = 0u32;
+            let mut term_index = batch_size + point;
+            let mut power_index = 0;
+
+            for _ in 0..products {
+                let term_0 = (*terms.add(term_index)).0 as u128;
+                let term_1 = (*terms.add(term_index + 1)).0 as u128;
+                let power_0 = (*powers.add(power_index)).0 as u128;
+                let power_1 = (*powers.add(power_index + 1)).0 as u128;
+                let product_00 = term_0 * power_0;
+                let product_01 = term_0 * power_1;
+                let product_10 = term_1 * power_0;
+                let product_11 = term_1 * power_1;
+
+                let (next_00, overflow_00) = sum_00.overflowing_add(product_00);
+                let (next_01, overflow_01) = sum_01.overflowing_add(product_01);
+                let (next_10, overflow_10) = sum_10.overflowing_add(product_10);
+                let (next_11, overflow_11) = sum_11.overflowing_add(product_11);
+                sum_00 = next_00;
+                sum_01 = next_01;
+                sum_10 = next_10;
+                sum_11 = next_11;
+                carry_00 += u32::from(overflow_00);
+                carry_01 += u32::from(overflow_01);
+                carry_10 += u32::from(overflow_10);
+                carry_11 += u32::from(overflow_11);
+                term_index += batch_size;
+                power_index += 2;
+            }
+
+            // The module-level bound puts each represented integer below
+            // 2^136, well inside `reduce160`'s accepted range.
+            *output.add(2 * point) = reduce160(sum_00, carry_00);
+            *output.add(2 * point + 1) = reduce160(sum_01, carry_01);
+            *output.add(2 * point + 2) = reduce160(sum_10, carry_10);
+            *output.add(2 * point + 3) = reduce160(sum_11, carry_11);
+        }
+
+        if paired_points != batch_size {
+            let point = paired_points;
+            let constant = (*terms.add(point)).0 as u128;
+            let mut sum_0 = constant;
+            let mut sum_1 = constant;
+            let mut carry_0 = 0u32;
+            let mut carry_1 = 0u32;
+            let mut term_index = batch_size + point;
+            let mut power_index = 0;
+
+            for _ in 0..products {
+                let term = (*terms.add(term_index)).0 as u128;
+                let product_0 = term * (*powers.add(power_index)).0 as u128;
+                let product_1 = term * (*powers.add(power_index + 1)).0 as u128;
+                let (next_0, overflow_0) = sum_0.overflowing_add(product_0);
+                let (next_1, overflow_1) = sum_1.overflowing_add(product_1);
+                sum_0 = next_0;
+                sum_1 = next_1;
+                carry_0 += u32::from(overflow_0);
+                carry_1 += u32::from(overflow_1);
+                term_index += batch_size;
+                power_index += 2;
+            }
+
+            *output.add(2 * point) = reduce160(sum_0, carry_0);
+            *output.add(2 * point + 1) = reduce160(sum_1, carry_1);
+        }
+    }
+}
+
+#[inline(always)]
+fn reduce_gate_constraints_power_sum_or_scalar<F: Field>(
+    constraint_terms_batch: &[F],
+    batch_size: usize,
+    alphas: &[F],
+    res_out: &mut [F],
+    res_out_is_zero_seed: bool,
+    alpha_powers_scratch: &mut Vec<F>,
+) {
+    debug_assert!(batch_size > 0);
+    debug_assert_eq!(constraint_terms_batch.len() % batch_size, 0);
+    debug_assert_eq!(res_out.len(), batch_size * alphas.len());
+
+    let num_rows = constraint_terms_batch.len() / batch_size;
+    if res_out_is_zero_seed
+        && TypeId::of::<F>() == TypeId::of::<GoldilocksField>()
+        && alphas.len() == 2
+        && (2..=MAX_UNREDUCED_GATE_ROWS).contains(&num_rows)
+    {
+        let products = num_rows - 1;
+        if alpha_powers_scratch.len() != 2 * products
+            || alpha_powers_scratch[0] != alphas[0]
+            || alpha_powers_scratch[1] != alphas[1]
+        {
+            alpha_powers_scratch.clear();
+            alpha_powers_scratch.reserve(2 * products);
+            let mut power_0 = alphas[0];
+            let mut power_1 = alphas[1];
+            for _ in 0..products {
+                alpha_powers_scratch.push(power_0);
+                alpha_powers_scratch.push(power_1);
+                power_0 *= alphas[0];
+                power_1 *= alphas[1];
+            }
+
+            // Goldilocks multiplication may return the alternate representative
+            // in `[ORDER, 2^64)`. Canonicalize this tiny per-worker cache once so
+            // every factor in the unreduced sum has an explicit `< ORDER` bound;
+            // the hot point loop still performs no canonicalization.
+            // SAFETY: the enclosing exact `TypeId` check proves the element type.
+            let gold_powers = unsafe {
+                slice::from_raw_parts_mut(
+                    alpha_powers_scratch.as_mut_ptr().cast::<GoldilocksField>(),
+                    alpha_powers_scratch.len(),
+                )
+            };
+            for power in gold_powers {
+                power.0 = power.to_canonical_u64();
+            }
+        }
+
+        // SAFETY: `TypeId` equality proves all three `F` slices contain the
+        // concrete transparent `GoldilocksField` type. Length and alignment
+        // are consequently identical, and the mutable output remains uniquely
+        // borrowed for the duration of the specialized call. The enclosing
+        // shape guards and cache construction establish the kernel's remaining
+        // batch, row, and interleaved-power preconditions.
+        unsafe {
+            let terms = slice::from_raw_parts(
+                constraint_terms_batch.as_ptr().cast::<GoldilocksField>(),
+                constraint_terms_batch.len(),
+            );
+            let powers = slice::from_raw_parts(
+                alpha_powers_scratch.as_ptr().cast::<GoldilocksField>(),
+                alpha_powers_scratch.len(),
+            );
+            let output = slice::from_raw_parts_mut(
+                res_out.as_mut_ptr().cast::<GoldilocksField>(),
+                res_out.len(),
+            );
+            reduce_gate_constraints_goldilocks_power_sum(
+                terms, batch_size, num_rows, powers, output,
+            );
+        }
+        return;
+    }
+
+    reduce_gate_constraints_base_batch(
+        constraint_terms_batch,
+        batch_size,
+        alphas,
+        res_out,
+        res_out_is_zero_seed,
+    );
+}
+
 fn reduce_gate_constraints_base_batch<F: Field>(
     constraint_terms_batch: &[F],
     batch_size: usize,
@@ -593,7 +808,14 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(betas.len(), num_challenges);
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
-    reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out, true);
+    reduce_gate_constraints_power_sum_or_scalar(
+        constraint_terms_batch,
+        n,
+        alphas,
+        res_out,
+        true,
+        &mut scratch.gate_alpha_powers,
+    );
 
     if permutation_products_offloaded {
         assert!(!has_lookup, "lookup permutation products stay on the CPU");
@@ -1727,9 +1949,135 @@ pub(crate) fn eval_vanishing_poly_circuit<F: RichField + Extendable<D>, const D:
 #[cfg(test)]
 mod tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
-    use plonky2_field::types::PrimeField64;
+    use plonky2_field::types::{Field64, PrimeField64};
 
     use super::*;
+
+    fn reduce_gate_constraints_scalar_reference<F: Field>(
+        constraint_terms_batch: &[F],
+        batch_size: usize,
+        alphas: &[F],
+        res_out: &mut [F],
+        res_out_is_zero_seed: bool,
+    ) {
+        let mut rows = constraint_terms_batch.chunks_exact(batch_size).rev();
+        if res_out_is_zero_seed {
+            match rows.next() {
+                Some(first_row) => {
+                    for (point, &term) in first_row.iter().enumerate() {
+                        res_out[point * alphas.len()..(point + 1) * alphas.len()].fill(term);
+                    }
+                }
+                None => res_out.fill(F::ZERO),
+            }
+        }
+        for constraint_row in rows {
+            for (point, &term) in constraint_row.iter().enumerate() {
+                let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
+                for (value, &alpha) in result.iter_mut().zip(alphas) {
+                    *value = term.multiply_accumulate(*value, alpha);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn goldilocks_power_sum_matches_scalar_horner_for_boundary_raw_words() {
+        type F = GoldilocksField;
+
+        let boundary = [
+            0,
+            1,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let alpha_sets = [
+            [GoldilocksField(F::ORDER), GoldilocksField(u64::MAX)],
+            [GoldilocksField(1), GoldilocksField(F::ORDER + 1)],
+            [
+                GoldilocksField(u64::MAX - 1),
+                GoldilocksField(F::ORDER - 1),
+            ],
+        ];
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+
+        for rows in [2usize, 3, 7, 64, MAX_UNREDUCED_GATE_ROWS] {
+            for batch_size in [1usize, 3, 32] {
+                let terms = (0..rows * batch_size)
+                    .map(|i| {
+                        if i % 3 != 2 {
+                            GoldilocksField(boundary[i % boundary.len()])
+                        } else {
+                            state ^= state << 13;
+                            state ^= state >> 7;
+                            state ^= state << 17;
+                            GoldilocksField(state)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let mut power_scratch = Vec::new();
+
+                // Reuse one cache at the same length while changing alphas;
+                // the base-word check must invalidate and rebuild it.
+                for alphas in alpha_sets {
+                    let mut expected = vec![F::ZERO; 2 * batch_size];
+                    reduce_gate_constraints_scalar_reference(
+                        &terms,
+                        batch_size,
+                        &alphas,
+                        &mut expected,
+                        true,
+                    );
+                    let mut actual = vec![F::ZERO; 2 * batch_size];
+                    reduce_gate_constraints_power_sum_or_scalar(
+                        &terms,
+                        batch_size,
+                        &alphas,
+                        &mut actual,
+                        true,
+                        &mut power_scratch,
+                    );
+                    assert!(
+                        power_scratch.iter().all(|power| power.0 < F::ORDER),
+                        "every cached alpha power must be canonical"
+                    );
+
+                    for (slot, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+                        assert_eq!(
+                            got.to_canonical_u64(),
+                            want.to_canonical_u64(),
+                            "rows={rows}, batch={batch_size}, slot={slot}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unreduced_136_row_carry_bound_hits_only_eight_bits() {
+        let max = u64::MAX;
+        let product = (max as u128) * (max as u128);
+        let mut sum = max as u128;
+        let mut high = 0u32;
+        let mut expected = GoldilocksField(max);
+        for _ in 1..MAX_UNREDUCED_GATE_ROWS {
+            let (next, carry) = sum.overflowing_add(product);
+            sum = next;
+            high += u32::from(carry);
+            expected = expected.multiply_accumulate(GoldilocksField(max), GoldilocksField(max));
+        }
+        assert_eq!(high, 134);
+        assert!(high < 1 << 8);
+
+        // SAFETY: 136 raw-word summands are bounded by the same module-level
+        // proof used by the production specialization.
+        let actual = unsafe { reduce160(sum, high) };
+        assert_eq!(actual.to_canonical_u64(), expected.to_canonical_u64());
+    }
 
     #[test]
     fn constraint_major_reduction_preserves_pointwise_horner_order() {

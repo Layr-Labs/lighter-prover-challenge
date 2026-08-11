@@ -101,13 +101,27 @@ fn profile_command_buffer(
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 
-/// `poseidon2.metal` precompiled to AIR, so a worker that cannot use the Metal
-/// shader cache does not pay the MSL front end. Regenerate whenever
-/// `poseidon2.metal` changes (see `MetalShared::new`); the
-/// `metallib_matches_shader_source` test enforces it.
+/// Precompiled AIR for the generic shader entries, with uniform in-place
+/// wrappers in the two specialized entries. This avoids both a second library
+/// and a second PSO while retaining the generic bodies for every other shape.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
-/// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
+/// Exact 59c generic AIR retained solely as a PSO-level fail-safe for runtimes
+/// that load the linked container but reject one of its wrapper payloads.
+const SHADER_GENERIC_METALLIB: &[u8] = include_bytes!("poseidon2_generic.metallib");
+
+/// The committed library keeps the source-generic entry points, but its two
+/// hottest entries contain uniform in-place dispatches to AIR-specialized
+/// bodies. Pinning the container catches an accidental stale replacement.
+#[cfg(test)]
+const SHADER_METALLIB_SHA256: &str =
+    "3649313474d74a365e595ce41dd32bce788fabf2aec3e666e4a3c46816e2132b";
+#[cfg(test)]
+const SHADER_GENERIC_METALLIB_SHA256: &str =
+    "b21f90022d75c1145eae432e02b0f04e15d99975ec4280d81362a03e14ab2164";
+
+/// SHA-256 of the `poseidon2.metal` bytes used by the generic AIR bodies and by
+/// the source-compilation fallback.
 const SHADER_SOURCE_SHA256: &str =
     "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
 
@@ -176,9 +190,9 @@ struct MetalShared {
     leaf_pipeline: ComputePipelineState,
     leaf_colmajor_pipeline: ComputePipelineState,
     parent_pipeline: ComputePipelineState,
-    ntt_prepare_pipeline: ComputePipelineState,
-    ntt_stage_pipeline: ComputePipelineState,
-    ifft_finalize_pipeline: ComputePipelineState,
+    ntt_prepare_pipeline: Option<ComputePipelineState>,
+    ntt_stage_pipeline: Option<ComputePipelineState>,
+    ifft_finalize_pipeline: Option<ComputePipelineState>,
     parameters: Buffer,
     pool: Mutex<BufferPool>,
     /// Small, nonblocking cache for completed gate-quotient output buffers.
@@ -981,8 +995,15 @@ impl<F: RichField> TreeReadback<'_, F> {
 /// before, so a caller that arrives early simply takes the CPU path it would
 /// have taken had the kernel been unbuildable.
 struct LazyPipeline {
-    built: std::sync::OnceLock<Option<ComputePipelineState>>,
+    built: std::sync::OnceLock<Option<BuiltPipeline>>,
     builder: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+struct BuiltPipeline {
+    pipeline: ComputePipelineState,
+    /// The linked in-place AIR, rather than the generic fail-safe, produced
+    /// this PSO. Only the Range accessor consumes this capability bit.
+    inplace_air_specialization: bool,
 }
 
 impl LazyPipeline {
@@ -1001,7 +1022,7 @@ impl LazyPipeline {
     /// lands, which is every caller in a real proof, pays nothing. Reporting it
     /// absent instead would quietly move those gates onto the CPU, which can
     /// cost more than the startup this saves.
-    fn get(&self) -> Option<&ComputePipelineState> {
+    fn get(&self) -> Option<&BuiltPipeline> {
         if self.built.get().is_none() {
             let handle = self.builder.lock().ok().and_then(|mut slot| slot.take());
             if let Some(handle) = handle {
@@ -1019,20 +1040,70 @@ static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
 
-fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
-    POSEIDON_GATE_QUOTIENT_PIPELINE.get()
+/// Exact ranked light-transaction Range/U32 metadata on the 59c frontier.
+/// The host validates this whole vector before setting the private high-bit
+/// selector consumed by the in-place AIR wrapper.
+const LIGHT_TX_RANGE_METADATA: [u32; 180] = [
+    2, 14, 12, 17, 1, 15, 8, 4, 0, 0,
+    2, 15, 12, 17, 1, 5, 24, 4, 0, 0,
+    2, 16, 12, 17, 1, 8, 16, 4, 0, 0,
+    0, 2, 0, 7, 1, 10, 26, 6, 0, 0,
+    0, 3, 0, 7, 1, 11, 63, 2, 0, 0,
+    0, 4, 0, 7, 1, 8, 22, 6, 0, 0,
+    0, 5, 0, 7, 1, 4, 5, 0, 0, 0,
+    0, 6, 0, 7, 1, 5, 6, 0, 0, 0,
+    1, 7, 7, 12, 1, 12, 20, 0, 0, 0,
+    1, 10, 7, 12, 1, 11, 16, 4, 0, 0,
+    1, 11, 7, 12, 1, 3, 3, 8, 0, 0,
+    2, 13, 12, 17, 1, 6, 8, 3, 0, 6,
+    3, 17, 17, 22, 1, 1, 10, 0, 8, 0,
+    3, 18, 17, 22, 1, 2, 5, 6, 16, 2,
+    3, 19, 17, 22, 1, 0, 3, 0, 16, 0,
+    3, 20, 17, 22, 1, 1, 6, 0, 16, 0,
+    3, 21, 17, 22, 1, 1, 4, 0, 24, 0,
+    4, 22, 22, 24, 1, 6, 4, 4, 2, 6,
+];
+
+#[allow(clippy::too_many_arguments)]
+fn is_light_tx_range_request(
+    wire_rows: usize,
+    wire_cols: usize,
+    constant_rows: usize,
+    constant_cols: usize,
+    quotient_rows: usize,
+    step: usize,
+    metadata: &[u32],
+    range_count: usize,
+    u32_count: usize,
+    alpha_stride: usize,
+) -> bool {
+    wire_rows == 1 << 19
+        && wire_cols == 136
+        && constant_rows == wire_rows
+        && constant_cols == 8
+        && quotient_rows == 1 << 19
+        && step == 1
+        && range_count == 3
+        && u32_count == 15
+        && alpha_stride == 136
+        && metadata == LIGHT_TX_RANGE_METADATA
 }
 
-fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
-    RANGE_CHECK_GATE_QUOTIENT_PIPELINE.get()
+fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
+    Some(&POSEIDON_GATE_QUOTIENT_PIPELINE.get()?.pipeline)
+}
+
+fn range_check_gate_quotient_pipeline() -> Option<(&'static ComputePipelineState, bool)> {
+    let built = RANGE_CHECK_GATE_QUOTIENT_PIPELINE.get()?;
+    Some((&built.pipeline, built.inplace_air_specialization))
 }
 
 fn permutation_quotient_pipeline() -> Option<&'static ComputePipelineState> {
-    PERMUTATION_QUOTIENT_PIPELINE.get()
+    Some(&PERMUTATION_QUOTIENT_PIPELINE.get()?.pipeline)
 }
 
 fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
-    ABSORB_PASS_PIPELINE.get()
+    Some(&ABSORB_PASS_PIPELINE.get()?.pipeline)
 }
 
 /// Starts the two gate-quotient pipeline builds on detached threads.
@@ -1044,7 +1115,11 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
 /// Scheduling only. The pipelines are the same objects the blocking build
 /// produced, lowered from the same library, so nothing they later compute can
 /// differ; only the instant at which they become available does.
-fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
+fn spawn_optional_pipelines(
+    device: &Device,
+    library: &metal::Library,
+    library_has_inplace_air: bool,
+) {
     for (name, slot) in [
         ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
         (
@@ -1059,13 +1134,36 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
         let spawned = std::thread::Builder::new()
             .name(format!("poseidon2-metal-{name}"))
             .spawn(move || {
-                let pipeline = autoreleasepool(|| {
+                let preferred = autoreleasepool(|| {
                     library.get_function(name, None).ok().and_then(|function| {
                         device
                             .new_compute_pipeline_state_with_function(&function)
                             .ok()
                     })
                 });
+                let pipeline = preferred
+                    .map(|pipeline| BuiltPipeline {
+                        pipeline,
+                        inplace_air_specialization: library_has_inplace_air,
+                    })
+                    .or_else(|| {
+                        if !library_has_inplace_air {
+                            return None;
+                        }
+                        autoreleasepool(|| {
+                            let generic = device
+                                .new_library_with_data(SHADER_GENERIC_METALLIB)
+                                .ok()?;
+                            let function = generic.get_function(name, None).ok()?;
+                            let pipeline = device
+                                .new_compute_pipeline_state_with_function(&function)
+                                .ok()?;
+                            Some(BuiltPipeline {
+                                pipeline,
+                                inplace_air_specialization: false,
+                            })
+                        })
+                    });
                 if pipeline.is_none() {
                     log::debug!("{name} pipeline unavailable; evaluating those gates on the CPU");
                 }
@@ -1084,6 +1182,72 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             }
         }
     }
+}
+
+type RequiredPipelines = (
+    ComputePipelineState,
+    ComputePipelineState,
+    ComputePipelineState,
+    Option<ComputePipelineState>,
+    Option<ComputePipelineState>,
+    Option<ComputePipelineState>,
+);
+
+fn build_required_pipelines(
+    device: &Device,
+    library: &metal::Library,
+) -> Result<RequiredPipelines, String> {
+    let required = |name: &'static str, kind: &'static str| {
+        move || -> Result<ComputePipelineState, String> {
+            autoreleasepool(|| {
+                let function = library
+                    .get_function(name, None)
+                    .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
+                device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
+            })
+        }
+    };
+    let (leaf, colmajor, parent, ntt_prepare, ntt_stage, ifft_finalize) =
+        std::thread::scope(|scope| {
+            let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
+            let colmajor =
+                scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
+            let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
+            // Production keeps GPU_NTT_COMMITMENTS disabled. Tests retain
+            // these pipelines for the direct Metal NTT differentials.
+            let ntt_prepare =
+                cfg!(test).then(|| scope.spawn(required("ntt_prepare", "ntt prepare")));
+            let ntt_stage = cfg!(test).then(|| scope.spawn(required("ntt_stage", "ntt stage")));
+            let ifft_finalize =
+                cfg!(test).then(|| scope.spawn(required("ifft_finalize", "ifft finalize")));
+            (
+                leaf.join().expect("leaf pipeline thread panicked"),
+                colmajor
+                    .join()
+                    .expect("col-major leaf pipeline thread panicked"),
+                parent.join().expect("parent pipeline thread panicked"),
+                ntt_prepare
+                    .map(|handle| handle.join().expect("ntt prepare pipeline thread panicked")),
+                ntt_stage.map(|handle| {
+                    handle.join().expect("ntt stage pipeline thread panicked")
+                }),
+                ifft_finalize.map(|handle| {
+                    handle
+                        .join()
+                        .expect("ifft finalize pipeline thread panicked")
+                }),
+            )
+        });
+    Ok((
+        leaf?,
+        colmajor?,
+        parent?,
+        ntt_prepare.transpose()?,
+        ntt_stage.transpose()?,
+        ifft_finalize.transpose()?,
+    ))
 }
 
 static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShared::new);
@@ -2259,30 +2423,36 @@ impl MetalShared {
             // committed — which is what makes it viable where a build-time
             // `MTLBinaryArchive` is not.
             //
-            // Any failure falls back to compiling the source, so a runtime that
-            // rejects this AIR version behaves exactly as before. The function
-            // probe is what makes the fallback safe against a STALE artifact:
-            // regenerate with
-            //   xcrun -sdk macosx metal -c poseidon2.metal -o poseidon2.air
-            //   xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib
-            // and `metallib_matches_shader_source` fails the test run if you
-            // forget.
-            let library = device
+            // A container/function-probe failure falls back to compiling the
+            // source, so a runtime that cannot load this AIR version behaves
+            // exactly as before. The source and final container have separate
+            // SHA pins because two entries deliberately contain linked public
+            // specialized AIR in addition to their source-generic bodies.
+            let has_every_kernel = |library: &metal::Library| {
+                METALLIB_REQUIRED_KERNELS
+                    .iter()
+                    .all(|name| library.get_function(name, None).is_ok())
+            };
+            let prebuilt_library = device
                 .new_library_with_data(SHADER_METALLIB)
                 .ok()
-                .filter(|library| {
-                    METALLIB_REQUIRED_KERNELS
-                        .iter()
-                        .all(|name| library.get_function(name, None).is_ok())
-                })
-                .map_or_else(
-                    || {
-                        device
-                            .new_library_with_source(SHADER_SOURCE, &options)
-                            .map_err(|error| format!("shader compilation failed: {error}"))
-                    },
-                    Ok,
-                )?;
+                .filter(&has_every_kernel);
+            let load_generic = || -> Result<metal::Library, String> {
+                if let Some(library) = device
+                    .new_library_with_data(SHADER_GENERIC_METALLIB)
+                    .ok()
+                    .filter(&has_every_kernel)
+                {
+                    return Ok(library);
+                }
+                device
+                    .new_library_with_source(SHADER_SOURCE, &options)
+                    .map_err(|error| format!("shader compilation failed: {error}"))
+            };
+            let (mut library, mut inplace_air_specializations) = match prebuilt_library {
+                Some(library) => (library, true),
+                None => (load_generic()?, false),
+            };
             // Build the compute pipelines concurrently, one thread each.
             //
             // Every `newComputePipelineStateWithFunction:` lowers that kernel's
@@ -2292,9 +2462,9 @@ impl MetalShared {
             // result is not already in the OS shader cache. The benchmark
             // sandbox denies writes to that cache, which disables it outright —
             // reads miss too — so *every* scored worker process pays the full
-            // cold lowering, serialized at ~2.36 s. The compiler service handles
-            // the requests in parallel, so issuing all eight at once collapses
-            // that to the cost of the single slowest kernel (~0.67 s).
+            // cold lowering, serialized at ~2.36 s. Production lowers the three
+            // tree kernels here; quotient pipelines remain asynchronous and the
+            // disabled NTT commitment pipelines are not lowered at all.
             //
             // This is a scheduling change only: the pipelines, and therefore
             // every value the GPU later computes, are identical. `Device`,
@@ -2302,20 +2472,6 @@ impl MetalShared {
             // each worker thread gets its own autorelease pool so the temporary
             // `NSError`s the Metal API autoreleases are drained on the thread
             // that created them rather than leaking.
-            let device_ref = &device;
-            let library_ref = &library;
-            let required = |name: &'static str, kind: &'static str| {
-                move || -> Result<ComputePipelineState, String> {
-                    autoreleasepool(|| {
-                        let function = library_ref
-                            .get_function(name, None)
-                            .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
-                        device_ref
-                            .new_compute_pipeline_state_with_function(&function)
-                            .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
-                    })
-                }
-            };
             // The two gate-quotient kernels are the two most expensive to lower
             // and the only two the context can do without: every caller already
             // treats an absent pipeline as "run this on the CPU". Lowering them
@@ -2325,18 +2481,35 @@ impl MetalShared {
             //
             //     range_check_gate_quotient   679 ms
             //     poseidon2_gate_quotient     601 ms
-            //     the six required kernels    491 ms and below
+            //     the required tree kernels  491 ms and below
             //
             // Lowering all eight in parallel takes 886 ms against 474 ms for the
-            // six required ones, because the two extra kernels both raise the
+            // old six required ones, because the two extra kernels both raise the
             // maximum and add contention on MTLCompilerService. Building them
             // off the blocking path instead leaves the context ready in 838 ms
             // rather than 1270 ms, and they land shortly after, long before the
             // first quotient evaluation of a proof asks for them.
             //
-            // Started below, once the required six have finished, so they do not
+            // Started below, once the required tree pipelines have finished, so they do not
             // simply move their MTLCompilerService contention onto the path they
             // are being taken off.
+            let required_pipelines = match build_required_pipelines(&device, &library) {
+                Ok(pipelines) => pipelines,
+                Err(linked_error) if inplace_air_specializations => {
+                    log::warn!(
+                        "linked AIR pipeline unavailable ({linked_error}); using generic AIR"
+                    );
+                    library = load_generic()?;
+                    inplace_air_specializations = false;
+                    build_required_pipelines(&device, &library).map_err(|generic_error| {
+                        format!(
+                            "linked AIR failed ({linked_error}); generic AIR also failed: \
+                             {generic_error}"
+                        )
+                    })?
+                }
+                Err(error) => return Err(error),
+            };
             let (
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
@@ -2344,47 +2517,9 @@ impl MetalShared {
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
-            ) = std::thread::scope(|scope| {
-                let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
-                let leaf_colmajor =
-                    scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
-                let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
-                let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
-                let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
-                let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
-                // A panic inside a pipeline build is a bug, not a runtime
-                // condition; propagate it rather than papering over it.
-                (
-                    leaf.join().expect("leaf pipeline thread panicked"),
-                    leaf_colmajor
-                        .join()
-                        .expect("col-major leaf pipeline thread panicked"),
-                    parent.join().expect("parent pipeline thread panicked"),
-                    ntt_prepare
-                        .join()
-                        .expect("ntt prepare pipeline thread panicked"),
-                    ntt_stage
-                        .join()
-                        .expect("ntt stage pipeline thread panicked"),
-                    ifft_finalize
-                        .join()
-                        .expect("ifft finalize pipeline thread panicked"),
-                )
-            });
-            // Surfaced in kernel order, so a single missing or unbuildable
-            // kernel yields the same error string the sequential construction
-            // produced. Only the tie-break between two simultaneous failures
-            // can differ, and every one of these kernels is present in
-            // `SHADER_SOURCE`; a failure here means the whole library is bad,
-            // which `new_library_with_source` above has already rejected.
-            let leaf_pipeline = leaf_pipeline?;
-            let leaf_colmajor_pipeline = leaf_colmajor_pipeline?;
-            let parent_pipeline = parent_pipeline?;
-            let ntt_prepare_pipeline = ntt_prepare_pipeline?;
-            let ntt_stage_pipeline = ntt_stage_pipeline?;
-            let ifft_finalize_pipeline = ifft_finalize_pipeline?;
+            ) = required_pipelines;
 
-            spawn_optional_pipelines(&device, &library);
+            spawn_optional_pipelines(&device, &library, inplace_air_specializations);
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -2532,13 +2667,28 @@ impl MetalShared {
         alpha_powers: &[u64],
         alpha_stride: usize,
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
-        let pipeline = range_check_gate_quotient_pipeline()
+        let (pipeline, inplace_air_specialization) = range_check_gate_quotient_pipeline()
             .ok_or("RangeCheck gate quotient pipeline unavailable")?;
         if metadata.len() != (range_count + u32_count) * 10
             || alpha_powers.len() != alpha_stride * 2
         {
             return Err("invalid RangeCheck quotient metadata".to_string());
         }
+        let use_light_specialization = inplace_air_specialization
+            && is_light_tx_range_request(
+                wires.rows,
+                wires.cols,
+                constants.rows,
+                constants.cols,
+                quotient_rows,
+                step,
+                metadata,
+                range_count,
+                u32_count,
+                alpha_stride,
+            );
+        let range_count_word = (range_count as u32)
+            | if use_light_specialization { 1 << 31 } else { 0 };
         let len = quotient_rows
             .checked_mul(2)
             .ok_or("RangeCheck gate quotient output length overflow")?;
@@ -2568,7 +2718,7 @@ impl MetalShared {
             set_u32(encoder, 6, quotient_rows as u32);
             set_u32(encoder, 7, step as u32);
             set_u32(encoder, 8, alpha_stride as u32);
-            set_u32(encoder, 9, range_count as u32);
+            set_u32(encoder, 9, range_count_word);
             set_u32(encoder, 10, u32_count as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
@@ -2931,6 +3081,18 @@ impl MetalShared {
         let log_lde = lde_size.ilog2();
         let cap_count = 1usize << cap_height;
         let total_node_count = 2 * lde_size - cap_count;
+        let ntt_prepare_pipeline = self
+            .ntt_prepare_pipeline
+            .as_ref()
+            .ok_or("GPU NTT commitments are disabled")?;
+        let ntt_stage_pipeline = self
+            .ntt_stage_pipeline
+            .as_ref()
+            .ok_or("GPU NTT commitments are disabled")?;
+        let ifft_finalize_pipeline = self
+            .ifft_finalize_pipeline
+            .as_ref()
+            .ok_or("GPU NTT commitments are disabled")?;
 
         let job = GpuJobGuard::begin();
         let value_len = degree
@@ -3023,7 +3185,7 @@ impl MetalShared {
                 // column buffer serves as scratch; it is dead once the IFFT
                 // finalize gather has produced the coefficients.
                 let gather = command_buffer.new_compute_command_encoder();
-                gather.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+                gather.set_compute_pipeline_state(ntt_prepare_pipeline);
                 gather.set_buffer(0, Some(input_buffer), 0);
                 gather.set_buffer(1, Some(&ones_buffer), 0);
                 gather.set_buffer(2, Some(&column_buffer), 0);
@@ -3031,12 +3193,12 @@ impl MetalShared {
                 set_u32(gather, 4, degree_u32);
                 set_u32(gather, 5, log_degree_u32);
                 set_u32(gather, 6, 0);
-                dispatch2d(gather, &self.ntt_prepare_pipeline, degree, cols);
+                dispatch2d(gather, ntt_prepare_pipeline, degree, cols);
                 gather.end_encoding();
 
                 for stage in 0..log_degree_u32 {
                     let stage_encoder = command_buffer.new_compute_command_encoder();
-                    stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
+                    stage_encoder.set_compute_pipeline_state(ntt_stage_pipeline);
                     stage_encoder.set_buffer(0, Some(&column_buffer), 0);
                     stage_encoder.set_buffer(
                         1,
@@ -3046,12 +3208,12 @@ impl MetalShared {
                     set_u32(stage_encoder, 2, degree_u32);
                     set_u32(stage_encoder, 3, stage);
                     set_u32(stage_encoder, 4, 0);
-                    dispatch2d(stage_encoder, &self.ntt_stage_pipeline, degree / 2, cols);
+                    dispatch2d(stage_encoder, ntt_stage_pipeline, degree / 2, cols);
                     stage_encoder.end_encoding();
                 }
 
                 let finalize = command_buffer.new_compute_command_encoder();
-                finalize.set_compute_pipeline_state(&self.ifft_finalize_pipeline);
+                finalize.set_compute_pipeline_state(ifft_finalize_pipeline);
                 finalize.set_buffer(0, Some(&column_buffer), 0);
                 finalize.set_buffer(1, Some(&coeffs_buffer), 0);
                 set_u32(finalize, 2, degree_u32);
@@ -3060,12 +3222,12 @@ impl MetalShared {
                     size_of::<u64>() as NSUInteger,
                     (&n_inv as *const u64).cast::<c_void>(),
                 );
-                dispatch2d(finalize, &self.ifft_finalize_pipeline, degree, cols);
+                dispatch2d(finalize, ifft_finalize_pipeline, degree, cols);
                 finalize.end_encoding();
 
                 // Coset LDE of the coefficients, exactly as build_from_coeffs.
                 let prepare = command_buffer.new_compute_command_encoder();
-                prepare.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+                prepare.set_compute_pipeline_state(ntt_prepare_pipeline);
                 prepare.set_buffer(0, Some(&coeffs_buffer), 0);
                 prepare.set_buffer(1, Some(&shift_buffer), 0);
                 prepare.set_buffer(2, Some(&column_buffer), 0);
@@ -3073,12 +3235,12 @@ impl MetalShared {
                 set_u32(prepare, 4, lde_size_u32);
                 set_u32(prepare, 5, log_degree_u32);
                 set_u32(prepare, 6, rate_bits_u32);
-                dispatch2d(prepare, &self.ntt_prepare_pipeline, lde_size, cols);
+                dispatch2d(prepare, ntt_prepare_pipeline, lde_size, cols);
                 prepare.end_encoding();
 
                 for stage in rate_bits as u32..log_lde {
                     let stage_encoder = command_buffer.new_compute_command_encoder();
-                    stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
+                    stage_encoder.set_compute_pipeline_state(ntt_stage_pipeline);
                     stage_encoder.set_buffer(0, Some(&column_buffer), 0);
                     stage_encoder.set_buffer(
                         1,
@@ -3088,7 +3250,7 @@ impl MetalShared {
                     set_u32(stage_encoder, 2, lde_size_u32);
                     set_u32(stage_encoder, 3, stage);
                     set_u32(stage_encoder, 4, u32::from(stage == log_lde - 1));
-                    dispatch2d(stage_encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
+                    dispatch2d(stage_encoder, ntt_stage_pipeline, lde_size / 2, cols);
                     stage_encoder.end_encoding();
                 }
 
@@ -3276,6 +3438,14 @@ impl MetalShared {
         let lde_size = degree << rate_bits;
         let log_lde = lde_size.ilog2();
         let cap_count = 1usize << cap_height;
+        let ntt_prepare_pipeline = self
+            .ntt_prepare_pipeline
+            .as_ref()
+            .ok_or("GPU NTT commitments are disabled")?;
+        let ntt_stage_pipeline = self
+            .ntt_stage_pipeline
+            .as_ref()
+            .ok_or("GPU NTT commitments are disabled")?;
 
         if set
             .input
@@ -3325,7 +3495,7 @@ impl MetalShared {
             let command_buffer = self.queue.new_command_buffer();
 
             let prepare = command_buffer.new_compute_command_encoder();
-            prepare.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+            prepare.set_compute_pipeline_state(ntt_prepare_pipeline);
             prepare.set_buffer(0, Some(input_buffer), 0);
             prepare.set_buffer(1, Some(shift_buffer), 0);
             prepare.set_buffer(2, Some(column_buffer), 0);
@@ -3333,12 +3503,12 @@ impl MetalShared {
             set_u32(prepare, 4, lde_size_u32);
             set_u32(prepare, 5, log_degree_u32);
             set_u32(prepare, 6, rate_bits_u32);
-            dispatch2d(prepare, &self.ntt_prepare_pipeline, lde_size, cols);
+            dispatch2d(prepare, ntt_prepare_pipeline, lde_size, cols);
             prepare.end_encoding();
 
             for stage in rate_bits as u32..log_lde {
                 let stage_encoder = command_buffer.new_compute_command_encoder();
-                stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
+                stage_encoder.set_compute_pipeline_state(ntt_stage_pipeline);
                 stage_encoder.set_buffer(0, Some(column_buffer), 0);
                 stage_encoder.set_buffer(
                     1,
@@ -3352,7 +3522,7 @@ impl MetalShared {
                     4,
                     u32::from(stage == log_lde - 1),
                 );
-                dispatch2d(stage_encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
+                dispatch2d(stage_encoder, ntt_stage_pipeline, lde_size / 2, cols);
                 stage_encoder.end_encoding();
             }
 
@@ -3798,11 +3968,8 @@ mod tests {
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
 
-    /// The prebuilt AIR library is only sound while it is the compiled form of
-    /// the MSL we ship. Nothing in the type system ties the two together, so
-    /// this pins the source bytes: edit `poseidon2.metal` without regenerating
-    /// `poseidon2.metallib` and this fails loudly instead of silently proving
-    /// with stale kernels.
+    /// The generic bodies and source fallback are only sound while they match
+    /// the MSL we ship. The specialized container has its own independent pin.
     #[test]
     fn metallib_matches_shader_source() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
@@ -3815,10 +3982,8 @@ mod tests {
         let digest = digest.split_whitespace().next().expect("empty shasum output");
         assert_eq!(
             digest, SHADER_SOURCE_SHA256,
-            "poseidon2.metal changed but poseidon2.metallib was not regenerated. Run:\n  \
-             xcrun -sdk macosx metal -c poseidon2.metal -o poseidon2.air\n  \
-             xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib\n\
-             then update SHADER_SOURCE_SHA256 to {digest}."
+            "poseidon2.metal changed without updating the generic AIR/source-fallback pin; \
+             rebuild the generic AIR bodies and update SHADER_SOURCE_SHA256 to {digest}."
         );
     }
 
@@ -3830,14 +3995,19 @@ mod tests {
         let Some(device) = Device::system_default() else {
             return; // no Metal device in this environment
         };
-        let library = device
-            .new_library_with_data(SHADER_METALLIB)
-            .expect("prebuilt metallib must load");
-        for name in METALLIB_REQUIRED_KERNELS {
-            assert!(
-                library.get_function(name, None).is_ok(),
-                "prebuilt metallib is missing kernel {name}"
-            );
+        for (kind, bytes) in [
+            ("linked", SHADER_METALLIB),
+            ("generic", SHADER_GENERIC_METALLIB),
+        ] {
+            let library = device
+                .new_library_with_data(bytes)
+                .unwrap_or_else(|error| panic!("{kind} metallib must load: {error}"));
+            for name in METALLIB_REQUIRED_KERNELS {
+                assert!(
+                    library.get_function(name, None).is_ok(),
+                    "{kind} metallib is missing kernel {name}"
+                );
+            }
         }
     }
 
@@ -4179,6 +4349,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn inplace_air_metallib_is_pinned() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
+        for (name, expected) in [
+            ("poseidon2.metallib", SHADER_METALLIB_SHA256),
+            ("poseidon2_generic.metallib", SHADER_GENERIC_METALLIB_SHA256),
+        ] {
+            let output = std::process::Command::new("/usr/bin/shasum")
+                .args(["-a", "256", &format!("{dir}/{name}")])
+                .output()
+                .expect("shasum must be available");
+            assert!(output.status.success(), "shasum failed for {name}");
+            let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
+            assert_eq!(digest.split_whitespace().next(), Some(expected), "{name}");
+        }
+    }
+
+    #[test]
+    fn light_tx_range_specialization_is_exact_shape_only() {
+        let exact = |metadata: &[u32], wire_cols, quotient_rows| {
+            is_light_tx_range_request(
+                1 << 19,
+                wire_cols,
+                1 << 19,
+                8,
+                quotient_rows,
+                1,
+                metadata,
+                3,
+                15,
+                136,
+            )
+        };
+        assert!(exact(&LIGHT_TX_RANGE_METADATA, 136, 1 << 19));
+        assert!(!exact(&LIGHT_TX_RANGE_METADATA, 135, 1 << 19));
+        assert!(!exact(&LIGHT_TX_RANGE_METADATA, 136, 1 << 18));
+        let mut changed = LIGHT_TX_RANGE_METADATA;
+        changed[31] ^= 1;
+        assert!(!exact(&changed, 136, 1 << 19));
     }
 
     #[test]
