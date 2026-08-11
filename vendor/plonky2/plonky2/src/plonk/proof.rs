@@ -312,6 +312,149 @@ pub struct OpeningSet<F: RichField + Extendable<D>, const D: usize> {
     pub lookup_zs_next: Vec<F::Extension>,
 }
 
+/// A fixed piece of an opening work plan. A pair always shares one powers
+/// table; point boundaries are flushed before tasks for the next point are
+/// added.
+enum OpeningTask<'a, F: RichField + Extendable<D>, const D: usize> {
+    Pair {
+        powers: &'a [F::Extension],
+        polynomials: [&'a PolynomialCoeffs<F>; 2],
+    },
+    Single {
+        powers: &'a [F::Extension],
+        polynomial: &'a PolynomialCoeffs<F>,
+    },
+}
+
+/// The stack-only result of one task. `valid` is two for a pair and one for a
+/// tail; the unused single-task lane is never exposed to the output.
+struct OpeningTaskResult<E: Field> {
+    values: [E; 2],
+    valid: usize,
+}
+
+impl<'a, F: RichField + Extendable<D>, const D: usize> OpeningTask<'a, F, D> {
+    #[inline]
+    fn evaluate(&self) -> OpeningTaskResult<F::Extension> {
+        match self {
+            Self::Pair {
+                powers,
+                polynomials,
+            } => OpeningTaskResult {
+                values: F::extension_base_dot_products_2(
+                    powers,
+                    [
+                        polynomials[0].coeffs.as_slice(),
+                        polynomials[1].coeffs.as_slice(),
+                    ],
+                ),
+                valid: 2,
+            },
+            Self::Single { powers, polynomial } => OpeningTaskResult {
+                values: [
+                    F::extension_base_dot_product(powers, &polynomial.coeffs),
+                    F::Extension::ZERO,
+                ],
+                valid: 1,
+            },
+        }
+    }
+}
+
+impl<E: Field> OpeningTaskResult<E> {
+    #[inline]
+    fn into_valid_values(self) -> impl Iterator<Item = E> {
+        self.values.into_iter().take(self.valid)
+    }
+}
+
+/// Builds ordered pair/single tasks while retaining exact ranges in the
+/// flattened element stream. A pending tail is carried across logical group
+/// boundaries at the same point, so (for example) the last constants/sigmas
+/// polynomial may pair with the first Z polynomial.
+struct OpeningWorkPlan<'a, F: RichField + Extendable<D>, const D: usize> {
+    tasks: Vec<OpeningTask<'a, F, D>>,
+    pending: Option<(&'a [F::Extension], &'a PolynomialCoeffs<F>)>,
+    output_len: usize,
+}
+
+impl<'a, F: RichField + Extendable<D>, const D: usize> OpeningWorkPlan<'a, F, D> {
+    fn with_task_capacity(task_capacity: usize) -> Self {
+        Self {
+            tasks: Vec::with_capacity(task_capacity),
+            pending: None,
+            output_len: 0,
+        }
+    }
+
+    /// Add one ordered output group and return its exact element range. Calls
+    /// may share a pending pair lane, but only until `finish_point` is called.
+    fn add_polynomials(
+        &mut self,
+        powers: &'a [F::Extension],
+        polynomials: &'a [PolynomialCoeffs<F>],
+    ) -> core::ops::Range<usize> {
+        let start = self.output_len;
+        self.output_len += polynomials.len();
+        let mut polynomials = polynomials.iter();
+
+        if let Some((pending_powers, pending_polynomial)) = self.pending.take() {
+            // Every caller explicitly flushes between points. Keep the
+            // invariant local as well, so a future caller cannot accidentally
+            // pair zeta with g*zeta.
+            assert!(core::ptr::eq(pending_powers, powers));
+            if let Some(polynomial) = polynomials.next() {
+                self.tasks.push(OpeningTask::Pair {
+                    powers,
+                    polynomials: [pending_polynomial, polynomial],
+                });
+            } else {
+                self.pending = Some((pending_powers, pending_polynomial));
+            }
+        }
+
+        while let Some(first) = polynomials.next() {
+            if let Some(second) = polynomials.next() {
+                self.tasks.push(OpeningTask::Pair {
+                    powers,
+                    polynomials: [first, second],
+                });
+            } else {
+                self.pending = Some((powers, first));
+            }
+        }
+
+        start..self.output_len
+    }
+
+    /// Seal the current opening point. This is the only way a pending odd tail
+    /// becomes a single task and prevents cross-point pairing by construction.
+    fn finish_point(&mut self) {
+        if let Some((powers, polynomial)) = self.pending.take() {
+            self.tasks.push(OpeningTask::Single { powers, polynomial });
+        }
+    }
+
+    fn evaluate(mut self) -> Vec<F::Extension> {
+        self.finish_point();
+        let output_len = self.output_len;
+        // Preserve the indexed iterator through Rayon collection. Flattening
+        // first would make the iterator unindexed and allocate temporary leaf
+        // buffers; the serial flatten below only copies two values per task.
+        let task_results: Vec<_> = self
+            .tasks
+            .par_iter()
+            .map(OpeningTask::evaluate)
+            .collect();
+        let mut output = Vec::with_capacity(output_len);
+        for result in task_results {
+            output.extend(result.into_valid_values());
+        }
+        debug_assert_eq!(output.len(), output_len);
+        output
+    }
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
     pub fn new<C: GenericConfig<D, F = F>>(
         zeta: F::Extension,
@@ -372,43 +515,63 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
                 assert_eq!(a_raw, b_raw, "g-zeta table representative mismatch at {i}");
             }
         }
-        let eval_polynomials = |pows: &[F::Extension], polynomials: &[PolynomialCoeffs<F>]| {
-            polynomials
-                .par_iter()
-                .map(|p| F::extension_base_dot_product(pows, &p.coeffs))
-                .collect::<Vec<_>>()
-        };
-        let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
-            eval_polynomials(pows, &c.polynomials)
-        };
-        let constants_sigmas_eval = eval_commitment(&zeta_pows, constants_sigmas_commitment);
+        // Build one ordered element stream. Logical output groups receive
+        // exact ranges up front, while an odd tail may pair with the first
+        // polynomial of the next group at the same point. The explicit point
+        // flush below is the hard boundary between zeta and g*zeta.
+        let constants_polynomials =
+            &constants_sigmas_commitment.polynomials[common_data.constants_range()];
+        let sigmas_polynomials =
+            &constants_sigmas_commitment.polynomials[common_data.sigmas_range()];
+        let zs_partial_products_lookup_polynomials =
+            &zs_partial_products_lookup_commitment.polynomials;
+        let zs_polynomials = &zs_partial_products_lookup_polynomials[common_data.zs_range()];
+        let partial_products_polynomials =
+            &zs_partial_products_lookup_polynomials[common_data.partial_products_range()];
+        let lookup_polynomials =
+            &zs_partial_products_lookup_polynomials[common_data.lookup_range()];
+        let quotient_polynomials = &quotient_polys_commitment.polynomials;
+        let wires_polynomials = &wires_commitment.polynomials;
 
-        // `zs_partial_products_lookup_eval` contains the permutation argument polynomials as well as lookup polynomials.
-        let zs_partial_products_lookup_eval =
-            eval_commitment(&zeta_pows, zs_partial_products_lookup_commitment);
-        let shifted_polynomials = &zs_partial_products_lookup_commitment.polynomials;
-        let quotient_polys = eval_commitment(&zeta_pows, quotient_polys_commitment);
+        let zeta_output_count = constants_polynomials.len()
+            + sigmas_polynomials.len()
+            + zs_polynomials.len()
+            + partial_products_polynomials.len()
+            + lookup_polynomials.len()
+            + quotient_polynomials.len()
+            + wires_polynomials.len();
+        let shifted_output_count = zs_polynomials.len() + lookup_polynomials.len();
+        let task_capacity = zeta_output_count.div_ceil(2) + shifted_output_count.div_ceil(2);
+        let mut plan = OpeningWorkPlan::with_task_capacity(task_capacity);
+
+        // Preserve the established zeta output order in the global stream.
+        let constants = plan.add_polynomials(&zeta_pows, constants_polynomials);
+        let plonk_sigmas = plan.add_polynomials(&zeta_pows, sigmas_polynomials);
+        let plonk_zs = plan.add_polynomials(&zeta_pows, zs_polynomials);
+        let partial_products = plan.add_polynomials(&zeta_pows, partial_products_polynomials);
+        let lookup_zs = plan.add_polynomials(&zeta_pows, lookup_polynomials);
+        let quotient_polys = plan.add_polynomials(&zeta_pows, quotient_polynomials);
+        let wires = plan.add_polynomials(&zeta_pows, wires_polynomials);
+        plan.finish_point();
+
+        // Partial products are not opened at the shifted point. Shifted Z and
+        // lookup groups may pair across their boundary, but never with zeta.
+        let plonk_zs_next = plan.add_polynomials(&g_zeta_pows, zs_polynomials);
+        let lookup_zs_next = plan.add_polynomials(&g_zeta_pows, lookup_polynomials);
+        let evaluations = plan.evaluate();
+        debug_assert_eq!(evaluations.len(), zeta_output_count + shifted_output_count);
+        let values = |range: core::ops::Range<usize>| evaluations[range].to_vec();
 
         Self {
-            constants: constants_sigmas_eval[common_data.constants_range()].to_vec(),
-            plonk_sigmas: constants_sigmas_eval[common_data.sigmas_range()].to_vec(),
-            wires: eval_commitment(&zeta_pows, wires_commitment),
-            plonk_zs: zs_partial_products_lookup_eval[common_data.zs_range()].to_vec(),
-            // Partial-product polynomials are opened only at `zeta`, never at
-            // `g * zeta`; evaluate only the shifted Z polynomials consumed by
-            // the FRI next batch.
-            plonk_zs_next: eval_polynomials(
-                &g_zeta_pows,
-                &shifted_polynomials[common_data.zs_range()],
-            ),
-            partial_products: zs_partial_products_lookup_eval[common_data.partial_products_range()]
-                .to_vec(),
-            quotient_polys,
-            lookup_zs: zs_partial_products_lookup_eval[common_data.lookup_range()].to_vec(),
-            lookup_zs_next: eval_polynomials(
-                &g_zeta_pows,
-                &shifted_polynomials[common_data.lookup_range()],
-            ),
+            constants: values(constants),
+            plonk_sigmas: values(plonk_sigmas),
+            wires: values(wires),
+            plonk_zs: values(plonk_zs),
+            plonk_zs_next: values(plonk_zs_next),
+            partial_products: values(partial_products),
+            quotient_polys: values(quotient_polys),
+            lookup_zs: values(lookup_zs),
+            lookup_zs_next: values(lookup_zs_next),
         }
     }
     pub(crate) fn to_fri_openings(&self) -> FriOpenings<F, D> {
@@ -521,9 +684,11 @@ mod tests {
 
     use anyhow::Result;
     use itertools::Itertools;
-    use plonky2_field::types::Sample;
+    use plonky2_field::types::{Field64, Sample};
 
     use super::*;
+    use crate::field::extension::quadratic::QuadraticExtension;
+    use crate::field::goldilocks_field::GoldilocksField;
     use crate::fri::reduction_strategies::FriReductionStrategy;
     use crate::gates::lookup_table::LookupTable;
     use crate::gates::noop::NoopGate;
@@ -532,6 +697,535 @@ mod tests {
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::PoseidonGoldilocksConfig;
     use crate::plonk::verifier::verify;
+
+    const OPENING_TEST_D: usize = 2;
+    type OpeningTestConfig = PoseidonGoldilocksConfig;
+    type OpeningTestField = GoldilocksField;
+    type OpeningTestExtension = QuadraticExtension<GoldilocksField>;
+    type OpeningTestBatch = PolynomialBatch<OpeningTestField, OpeningTestConfig, OPENING_TEST_D>;
+
+    fn synthetic_opening_batch(count: usize, degree: usize, seed: u64) -> OpeningTestBatch {
+        let boundary = [
+            0,
+            1,
+            GoldilocksField::ORDER - 1,
+            GoldilocksField::ORDER,
+            GoldilocksField::ORDER + 1,
+            u64::MAX,
+        ];
+        let polynomials = (0..count)
+            .map(|poly| {
+                // Vary coefficient lengths to exercise the generic zipped-dot
+                // behavior as well as the full committed degree used in
+                // production.
+                let len = match poly % 5 {
+                    0 => degree,
+                    1 => degree.saturating_sub(1),
+                    2 => degree / 2 + 1,
+                    3 => 1,
+                    _ => degree,
+                };
+                let coeffs = (0..len)
+                    .map(|i| {
+                        let raw = if i < boundary.len() {
+                            boundary[(i + poly) % boundary.len()]
+                        } else {
+                            seed.wrapping_add((poly as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                                .wrapping_add((i as u64).wrapping_mul(0xD1B5_4A32_D192_ED03))
+                        };
+                        // The tuple constructor deliberately retains
+                        // noncanonical representatives for the differential.
+                        GoldilocksField(raw)
+                    })
+                    .collect();
+                PolynomialCoeffs::new(coeffs)
+            })
+            .collect();
+        OpeningTestBatch {
+            polynomials,
+            ..OpeningTestBatch::default()
+        }
+    }
+
+    fn opening_test_common(
+        with_lookup: bool,
+    ) -> CommonCircuitData<OpeningTestField, OPENING_TEST_D> {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<OpeningTestField, OPENING_TEST_D>::new(config);
+        if with_lookup {
+            let table: LookupTable = Arc::new(vec![(0, 3), (1, 2), (2, 1), (3, 0)]);
+            let table_index = builder.add_lookup_table_from_pairs(table);
+            let input = builder.constant(OpeningTestField::ONE);
+            let expected = builder.constant(OpeningTestField::TWO);
+            let actual = builder.add_lookup_from_index(input, table_index);
+            builder.connect(actual, expected);
+        }
+        for _ in 0..16 {
+            builder.add_gate(NoopGate, vec![]);
+        }
+        builder.build::<OpeningTestConfig>().common
+    }
+
+    /// The pre-work-plan shape: one complete collection per polynomial group.
+    /// This intentionally calls the same accepted reducer as production so a
+    /// raw-representative comparison isolates scheduling and result routing.
+    fn sequential_opening_reference(
+        zeta: OpeningTestExtension,
+        constants_sigmas: &OpeningTestBatch,
+        wires: &OpeningTestBatch,
+        zs_partial_products_lookup: &OpeningTestBatch,
+        quotient: &OpeningTestBatch,
+        common_data: &CommonCircuitData<OpeningTestField, OPENING_TEST_D>,
+    ) -> OpeningSet<OpeningTestField, OPENING_TEST_D> {
+        let degree = common_data.degree();
+        let zeta_pows: Vec<_> = zeta.powers().take(degree).collect();
+        let subgroup = crate::plonk::prover::precomputed::two_adic_subgroup::<OpeningTestField>(
+            common_data.degree_bits(),
+        );
+        let g_zeta_pows: Vec<_> = zeta_pows
+            .iter()
+            .zip(subgroup.iter())
+            .map(|(&zeta_pow, &g_pow)| {
+                <OpeningTestExtension as FieldExtension<OPENING_TEST_D>>::scalar_mul(
+                    &zeta_pow, g_pow,
+                )
+            })
+            .collect();
+        let eval = |pows: &[OpeningTestExtension], polynomials: &[PolynomialCoeffs<_>]| {
+            polynomials
+                .iter()
+                .map(|polynomial| {
+                    <OpeningTestField as Extendable<OPENING_TEST_D>>::extension_base_dot_product(
+                        pows,
+                        &polynomial.coeffs,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let constants_sigmas_eval = eval(&zeta_pows, &constants_sigmas.polynomials);
+        let zs_partial_products_lookup_eval =
+            eval(&zeta_pows, &zs_partial_products_lookup.polynomials);
+        let shifted = &zs_partial_products_lookup.polynomials;
+        OpeningSet {
+            constants: constants_sigmas_eval[common_data.constants_range()].to_vec(),
+            plonk_sigmas: constants_sigmas_eval[common_data.sigmas_range()].to_vec(),
+            wires: eval(&zeta_pows, &wires.polynomials),
+            plonk_zs: zs_partial_products_lookup_eval[common_data.zs_range()].to_vec(),
+            plonk_zs_next: eval(&g_zeta_pows, &shifted[common_data.zs_range()]),
+            partial_products: zs_partial_products_lookup_eval[common_data.partial_products_range()]
+                .to_vec(),
+            quotient_polys: eval(&zeta_pows, &quotient.polynomials),
+            lookup_zs: zs_partial_products_lookup_eval[common_data.lookup_range()].to_vec(),
+            lookup_zs_next: eval(&g_zeta_pows, &shifted[common_data.lookup_range()]),
+        }
+    }
+
+    fn assert_openings_raw_eq(
+        actual: &OpeningSet<OpeningTestField, OPENING_TEST_D>,
+        expected: &OpeningSet<OpeningTestField, OPENING_TEST_D>,
+    ) {
+        let groups = [
+            (
+                "constants",
+                actual.constants.as_slice(),
+                expected.constants.as_slice(),
+            ),
+            (
+                "sigmas",
+                actual.plonk_sigmas.as_slice(),
+                expected.plonk_sigmas.as_slice(),
+            ),
+            ("wires", actual.wires.as_slice(), expected.wires.as_slice()),
+            (
+                "zs",
+                actual.plonk_zs.as_slice(),
+                expected.plonk_zs.as_slice(),
+            ),
+            (
+                "zs_next",
+                actual.plonk_zs_next.as_slice(),
+                expected.plonk_zs_next.as_slice(),
+            ),
+            (
+                "partials",
+                actual.partial_products.as_slice(),
+                expected.partial_products.as_slice(),
+            ),
+            (
+                "quotient",
+                actual.quotient_polys.as_slice(),
+                expected.quotient_polys.as_slice(),
+            ),
+            (
+                "lookups",
+                actual.lookup_zs.as_slice(),
+                expected.lookup_zs.as_slice(),
+            ),
+            (
+                "lookups_next",
+                actual.lookup_zs_next.as_slice(),
+                expected.lookup_zs_next.as_slice(),
+            ),
+        ];
+        for (name, actual, expected) in groups {
+            assert_eq!(actual.len(), expected.len(), "{name} length");
+            for (i, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                let actual_raw = actual.0.map(|limb| limb.0);
+                let expected_raw = expected.0.map(|limb| limb.0);
+                assert_eq!(actual_raw, expected_raw, "raw {name}[{i}]");
+            }
+        }
+    }
+
+    fn check_opening_work_plan_differential(with_lookup: bool) {
+        let common = opening_test_common(with_lookup);
+        let degree = common.degree();
+        let constants_sigmas = synthetic_opening_batch(common.sigmas_range().end, degree, 0x1000);
+        let wires = synthetic_opening_batch(common.config.num_wires, degree, 0x2000);
+        let zs_partial_products_lookup = synthetic_opening_batch(
+            common.num_zs_partial_products_polys() + common.num_all_lookup_polys(),
+            degree,
+            0x3000,
+        );
+        let quotient = synthetic_opening_batch(common.num_quotient_polys(), degree, 0x4000);
+        let zeta = QuadraticExtension([
+            GoldilocksField(u64::MAX),
+            GoldilocksField(GoldilocksField::ORDER),
+        ]);
+        let g = OpeningTestExtension::primitive_root_of_unity(common.degree_bits());
+
+        let expected = sequential_opening_reference(
+            zeta,
+            &constants_sigmas,
+            &wires,
+            &zs_partial_products_lookup,
+            &quotient,
+            &common,
+        );
+        let actual = OpeningSet::new(
+            zeta,
+            g,
+            &constants_sigmas,
+            &wires,
+            &zs_partial_products_lookup,
+            &quotient,
+            &common,
+        );
+        assert_eq!(!actual.lookup_zs.is_empty(), with_lookup);
+        assert_openings_raw_eq(&actual, &expected);
+        let actual_fri = actual.to_fri_openings();
+        let expected_fri = expected.to_fri_openings();
+        assert_eq!(actual_fri.batches.len(), expected_fri.batches.len());
+        for (actual, expected) in actual_fri.batches.iter().zip(expected_fri.batches) {
+            assert_eq!(actual.values, expected.values);
+        }
+    }
+
+    #[test]
+    fn opening_work_plan_matches_sequential_without_lookups_raw() {
+        check_opening_work_plan_differential(false);
+    }
+
+    #[test]
+    fn opening_work_plan_matches_sequential_with_lookups_raw() {
+        check_opening_work_plan_differential(true);
+    }
+
+    /// Exercise range accounting, odd tails, same-point cross-group pairing,
+    /// and the hard boundary between zeta and g*zeta directly.
+    #[test]
+    fn opening_work_plan_preserves_output_order_and_point_boundaries() {
+        let polynomial = |raw| PolynomialCoeffs::new(vec![GoldilocksField(raw)]);
+        let zeta_first = [polynomial(0), polynomial(1), polynomial(u64::MAX)];
+        let zeta_second = [
+            polynomial(GoldilocksField::ORDER),
+            polynomial(GoldilocksField::ORDER + 1),
+        ];
+        let shifted_z = [polynomial(0x1111_2222_3333_4444)];
+        let shifted_lookup = [
+            polynomial(0x5555_6666_7777_8888),
+            polynomial(0x9999_AAAA_BBBB_CCCC),
+        ];
+        let zeta_pows = [QuadraticExtension([
+            GoldilocksField(u64::MAX),
+            GoldilocksField(GoldilocksField::ORDER),
+        ])];
+        let g_zeta_pows = [QuadraticExtension([
+            GoldilocksField(GoldilocksField::ORDER + 1),
+            GoldilocksField(0xDEAD_BEEF_CAFE_BABE),
+        ])];
+
+        let mut plan = OpeningWorkPlan::<OpeningTestField, OPENING_TEST_D>::with_task_capacity(5);
+        let first_range = plan.add_polynomials(&zeta_pows, &zeta_first);
+        let second_range = plan.add_polynomials(&zeta_pows, &zeta_second);
+        plan.finish_point();
+        let shifted_z_range = plan.add_polynomials(&g_zeta_pows, &shifted_z);
+        let shifted_lookup_range = plan.add_polynomials(&g_zeta_pows, &shifted_lookup);
+        plan.finish_point();
+
+        assert_eq!(first_range, 0..3);
+        assert_eq!(second_range, 3..5);
+        assert_eq!(shifted_z_range, 5..6);
+        assert_eq!(shifted_lookup_range, 6..8);
+        assert_eq!(plan.tasks.len(), 5);
+        assert!(matches!(
+            plan.tasks.as_slice(),
+            [
+                OpeningTask::Pair { .. },
+                OpeningTask::Pair { .. },
+                OpeningTask::Single { .. },
+                OpeningTask::Pair { .. },
+                OpeningTask::Single { .. },
+            ]
+        ));
+        match &plan.tasks[1] {
+            OpeningTask::Pair {
+                powers,
+                polynomials,
+            } => {
+                assert!(core::ptr::eq(*powers, zeta_pows.as_slice()));
+                assert!(core::ptr::eq(polynomials[0], &zeta_first[2]));
+                assert!(core::ptr::eq(polynomials[1], &zeta_second[0]));
+            }
+            OpeningTask::Single { .. } => unreachable!(),
+        }
+        match &plan.tasks[3] {
+            OpeningTask::Pair {
+                powers,
+                polynomials,
+            } => {
+                assert!(core::ptr::eq(*powers, g_zeta_pows.as_slice()));
+                assert!(core::ptr::eq(polynomials[0], &shifted_z[0]));
+                assert!(core::ptr::eq(polynomials[1], &shifted_lookup[0]));
+            }
+            OpeningTask::Single { .. } => unreachable!(),
+        }
+
+        let expected: Vec<_> = [
+            (zeta_pows.as_slice(), zeta_first.as_slice()),
+            (zeta_pows.as_slice(), zeta_second.as_slice()),
+            (g_zeta_pows.as_slice(), shifted_z.as_slice()),
+            (g_zeta_pows.as_slice(), shifted_lookup.as_slice()),
+        ]
+        .into_iter()
+        .flat_map(|(powers, polynomials)| {
+            polynomials.iter().map(move |polynomial| {
+                <OpeningTestField as Extendable<OPENING_TEST_D>>::extension_base_dot_product(
+                    powers,
+                    &polynomial.coeffs,
+                )
+            })
+        })
+        .collect();
+        let actual = plan.evaluate();
+        assert_eq!(actual.len(), expected.len());
+        for (i, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(
+                actual.0.map(|limb| limb.0),
+                expected.0.map(|limb| limb.0),
+                "raw flattened output {i}",
+            );
+        }
+    }
+
+    /// Focused comparison for the dominant production opening shape: degree
+    /// 2^16 and 256 output dots split 82/20/16/136 at zeta and 2/0 at the
+    /// shifted point. Run explicitly in release mode; normal test runs skip it.
+    #[cfg(feature = "std")]
+    #[test]
+    #[ignore]
+    fn opening_width2_single_wave_production_shape_microbenchmark() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        const DEGREE: usize = 1 << 16;
+        const ZETA_POLYS: usize = 82 + 20 + 16 + 136;
+        const OUTPUTS: usize = ZETA_POLYS + 2;
+        const SAMPLES: usize = 101;
+
+        let polynomials: Vec<_> = (0..ZETA_POLYS)
+            .map(|poly| {
+                PolynomialCoeffs::new(
+                    (0..DEGREE)
+                        .map(|i| {
+                            GoldilocksField(
+                                0xA076_1D64_78BD_642F_u64
+                                    .wrapping_add((poly as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                                    .wrapping_add((i as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let zeta = QuadraticExtension([
+            GoldilocksField(0x0123_4567_89AB_CDEF),
+            GoldilocksField(0xFEDC_BA98_7654_3210),
+        ]);
+        let zeta_pows: Vec<_> = zeta.powers().take(DEGREE).collect();
+        let subgroup = crate::plonk::prover::precomputed::two_adic_subgroup::<OpeningTestField>(16);
+        let g_zeta_pows: Vec<_> = zeta_pows
+            .iter()
+            .zip(subgroup.iter())
+            .map(|(&zeta_pow, &g_pow)| {
+                <OpeningTestExtension as FieldExtension<OPENING_TEST_D>>::scalar_mul(
+                    &zeta_pow, g_pow,
+                )
+            })
+            .collect();
+
+        let single_wave = |powers: &[OpeningTestExtension], polynomials: &[PolynomialCoeffs<_>]| {
+            polynomials
+                .par_iter()
+                .map(|polynomial| {
+                    <OpeningTestField as Extendable<OPENING_TEST_D>>::extension_base_dot_product(
+                        powers,
+                        &polynomial.coeffs,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let width2_wave = |powers: &[OpeningTestExtension], polynomials: &[PolynomialCoeffs<_>]| {
+            let full_len = polynomials.len() / 2 * 2;
+            let mut output = vec![OpeningTestExtension::ZERO; polynomials.len()];
+            output[..full_len]
+                    .par_chunks_exact_mut(2)
+                    .zip(polynomials[..full_len].par_chunks_exact(2))
+                    .for_each(|(output, pair)| {
+                        output.copy_from_slice(
+                            &<OpeningTestField as Extendable<OPENING_TEST_D>>::extension_base_dot_products_2(
+                                powers,
+                                [pair[0].coeffs.as_slice(), pair[1].coeffs.as_slice()],
+                            ),
+                        );
+                    });
+            for (output, polynomial) in output[full_len..].iter_mut().zip(&polynomials[full_len..])
+            {
+                *output =
+                    <OpeningTestField as Extendable<OPENING_TEST_D>>::extension_base_dot_product(
+                        powers,
+                        &polynomial.coeffs,
+                    );
+            }
+            output
+        };
+
+        let original_waves_singles = || {
+            let start = Instant::now();
+            let results = [
+                single_wave(&zeta_pows, &polynomials[0..82]),
+                single_wave(&zeta_pows, &polynomials[82..102]),
+                single_wave(&zeta_pows, &polynomials[102..118]),
+                single_wave(&zeta_pows, &polynomials[118..254]),
+                single_wave(&g_zeta_pows, &polynomials[82..84]),
+                single_wave(&g_zeta_pows, &polynomials[0..0]),
+            ];
+            black_box(&results);
+            start.elapsed()
+        };
+        let workplan_singles = || {
+            let start = Instant::now();
+            let groups = [
+                (zeta_pows.as_slice(), &polynomials[0..82]),
+                (zeta_pows.as_slice(), &polynomials[82..102]),
+                (zeta_pows.as_slice(), &polynomials[102..118]),
+                (zeta_pows.as_slice(), &polynomials[118..254]),
+                (g_zeta_pows.as_slice(), &polynomials[82..84]),
+                (g_zeta_pows.as_slice(), &polynomials[0..0]),
+            ];
+            let plan: Vec<_> = groups
+                .into_iter()
+                .flat_map(|(powers, polynomials)| {
+                    polynomials
+                        .iter()
+                        .map(move |polynomial| (powers, polynomial))
+                })
+                .collect();
+            let results: Vec<_> = plan
+                .par_iter()
+                .map(|(powers, polynomial)| {
+                    <OpeningTestField as Extendable<OPENING_TEST_D>>::extension_base_dot_product(
+                        powers,
+                        &polynomial.coeffs,
+                    )
+                })
+                .collect();
+            black_box(&results);
+            start.elapsed()
+        };
+        let per_commit_width2_waves = || {
+            let start = Instant::now();
+            let results = [
+                width2_wave(&zeta_pows, &polynomials[0..82]),
+                width2_wave(&zeta_pows, &polynomials[82..102]),
+                width2_wave(&zeta_pows, &polynomials[102..118]),
+                width2_wave(&zeta_pows, &polynomials[118..254]),
+                width2_wave(&g_zeta_pows, &polynomials[82..84]),
+                width2_wave(&g_zeta_pows, &polynomials[0..0]),
+            ];
+            black_box(&results);
+            start.elapsed()
+        };
+        let combined_single_wave_width2 = || {
+            let start = Instant::now();
+            let mut plan =
+                OpeningWorkPlan::<OpeningTestField, OPENING_TEST_D>::with_task_capacity(128);
+            plan.add_polynomials(&zeta_pows, &polynomials[0..82]);
+            plan.add_polynomials(&zeta_pows, &polynomials[82..102]);
+            plan.add_polynomials(&zeta_pows, &polynomials[102..118]);
+            plan.add_polynomials(&zeta_pows, &polynomials[118..254]);
+            plan.finish_point();
+            plan.add_polynomials(&g_zeta_pows, &polynomials[82..84]);
+            plan.add_polynomials(&g_zeta_pows, &polynomials[0..0]);
+            let results = plan.evaluate();
+            debug_assert_eq!(results.len(), OUTPUTS);
+            black_box(&results);
+            start.elapsed()
+        };
+
+        for _ in 0..3 {
+            black_box(original_waves_singles());
+            black_box(workplan_singles());
+            black_box(per_commit_width2_waves());
+            black_box(combined_single_wave_width2());
+        }
+        let mut original_samples = Vec::with_capacity(SAMPLES);
+        let mut singles_samples = Vec::with_capacity(SAMPLES);
+        let mut per_commit_samples = Vec::with_capacity(SAMPLES);
+        let mut combined_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            if sample % 2 == 0 {
+                original_samples.push(original_waves_singles());
+                singles_samples.push(workplan_singles());
+                per_commit_samples.push(per_commit_width2_waves());
+                combined_samples.push(combined_single_wave_width2());
+            } else {
+                combined_samples.push(combined_single_wave_width2());
+                per_commit_samples.push(per_commit_width2_waves());
+                singles_samples.push(workplan_singles());
+                original_samples.push(original_waves_singles());
+            }
+        }
+        original_samples.sort_unstable();
+        singles_samples.sort_unstable();
+        per_commit_samples.sort_unstable();
+        combined_samples.sort_unstable();
+        let original: Duration = original_samples[SAMPLES / 2];
+        let singles: Duration = singles_samples[SAMPLES / 2];
+        let per_commit: Duration = per_commit_samples[SAMPLES / 2];
+        let combined: Duration = combined_samples[SAMPLES / 2];
+        println!(
+            "opening width2 microbench: degree={DEGREE} outputs={OUTPUTS} samples={SAMPLES} original_waves_singles_ms={:.3} workplan_singles_ms={:.3} per_commit_width2_waves_ms={:.3} combined_single_wave_width2_ms={:.3} speedup_vs_original={:.3}x speedup_vs_workplan_singles={:.3}x speedup_vs_per_commit_width2={:.3}x",
+            original.as_secs_f64() * 1e3,
+            singles.as_secs_f64() * 1e3,
+            per_commit.as_secs_f64() * 1e3,
+            combined.as_secs_f64() * 1e3,
+            original.as_secs_f64() / combined.as_secs_f64(),
+            singles.as_secs_f64() / combined.as_secs_f64(),
+            per_commit.as_secs_f64() / combined.as_secs_f64(),
+        );
+    }
 
     #[test]
     fn test_proof_compression() -> Result<()> {
