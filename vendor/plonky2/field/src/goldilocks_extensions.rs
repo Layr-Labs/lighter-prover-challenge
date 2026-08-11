@@ -443,6 +443,42 @@ pub(crate) fn ext2_mul(a: [u64; 2], b: [u64; 2]) -> [GoldilocksField; 2] {
     [c0, c1]
 }
 
+/// `a * b + c` in GF(p^2) with one `reduce160` per limb (fold the addend
+/// into the 160-bit product accumulators before reduction).
+#[inline(always)]
+pub fn ext2_mul_add(a: [u64; 2], b: [u64; 2], c: [u64; 2]) -> [GoldilocksField; 2] {
+    const_assert!(<GoldilocksField as Extendable<2>>::W.0 == 7u64);
+    let [a0, a1] = a;
+    let [b0, b1] = b;
+    let [c0, c1] = c;
+    let mut cy;
+    // limb0 = a0*b0 + 7*a1*b1 + c0
+    let (mut lo0, mut hi0) = u160_times_7((a1 as u128) * (b1 as u128), 0u32);
+    (lo0, cy) = lo0.overflowing_add((a0 as u128) * (b0 as u128));
+    hi0 += cy as u32;
+    (lo0, cy) = lo0.overflowing_add(c0 as u128);
+    hi0 += cy as u32;
+    // limb1 = a0*b1 + a1*b0 + c1
+    let mut lo1 = (a0 as u128) * (b1 as u128);
+    (lo1, cy) = lo1.overflowing_add((a1 as u128) * (b0 as u128));
+    let mut hi1 = cy as u32;
+    (lo1, cy) = lo1.overflowing_add(c1 as u128);
+    hi1 += cy as u32;
+    [unsafe { reduce160(lo0, hi0) }, unsafe { reduce160(lo1, hi1) }]
+}
+
+#[inline(always)]
+pub fn ext2_mul_add_qe(
+    a: QuadraticExtension<GoldilocksField>,
+    b: QuadraticExtension<GoldilocksField>,
+    c: QuadraticExtension<GoldilocksField>,
+) -> QuadraticExtension<GoldilocksField> {
+    let QuadraticExtension([a0, a1]) = a;
+    let QuadraticExtension([b0, b1]) = b;
+    let QuadraticExtension([c0, c1]) = c;
+    QuadraticExtension(ext2_mul_add([a0.0, a1.0], [b0.0, b1.0], [c0.0, c1.0]))
+}
+
 /*
  * Quartic multiplication and squaring
  */
