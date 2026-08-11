@@ -1427,6 +1427,26 @@ kernel void range_check_gate_quotient(
                     alpha_powers, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
+        } else if (kind == 13u) {
+            // ArithmeticGate: four routed words per operation
+            // (multiplicand_0, multiplicand_1, addend, output).
+            uint constant_base = num_addends;
+            ulong const_0 = constants[(ulong)constant_base * lde_rows + source_row];
+            ulong const_1 = constants[((ulong)constant_base + 1u) * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong wire_base = (ulong)op * 4u;
+                ulong multiplicand_0 = wires[(wire_base + 0u) * lde_rows + source_row];
+                ulong multiplicand_1 = wires[(wire_base + 1u) * lde_rows + source_row];
+                ulong addend = wires[(wire_base + 2u) * lde_rows + source_row];
+                ulong output_value = wires[(wire_base + 3u) * lde_rows + source_row];
+                ulong computed = gl_add(
+                    gl_mul(gl_mul(multiplicand_0, multiplicand_1), const_0),
+                    gl_mul(addend, const_1));
+                range_check_gate_emit(
+                    gl_sub(output_value, computed),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
         } else if (kind == 11u) {
             // BaseSumGate: wire 0 is the sum and the next `num_ops` wires are
             // little-endian limbs. The addend-count slot carries base 2 or 4.
