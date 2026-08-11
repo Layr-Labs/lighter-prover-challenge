@@ -1374,6 +1374,23 @@ fn start_gpu_range_check_gate_quotient<
             gate_indices.push(gate_index);
         }
         if let Some(u32_gate) = u32_gate {
+            // The 63-limb binary BaseSum is a long serial recurrence followed
+            // by 63 boolean constraints for every quotient row. Keeping it in
+            // the combined Range/U32 kernel extends the tail of the single
+            // shared Metal command, while the generic CPU quotient evaluator
+            // can run the same gate alongside that command. Leave only this
+            // long shape on CPU; the much shorter base-4 variants remain in
+            // the GPU batch. As with the exclusions below, not adding its gate
+            // index means the ordinary CPU selector/alpha path stays intact.
+            if matches!(
+                u32_gate,
+                U32QuotientGate::BaseSum {
+                    base: 2,
+                    num_limbs: 63
+                }
+            ) {
+                continue;
+            }
             // A six-bit random access evaluates a 64-entry selection fold for
             // only ten quotient rows. On the five-worker ranked workload that
             // data-dependent branch extends the process-shared Range/U32 Metal
