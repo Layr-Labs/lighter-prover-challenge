@@ -1,4 +1,4 @@
-// Redraw marker 701-claude-fable-r2
+// Candidate marker 748-gpt56-sol-quotient-fusion-redraw-20260812
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 

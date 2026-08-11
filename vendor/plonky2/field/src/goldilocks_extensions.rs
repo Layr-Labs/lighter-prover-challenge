@@ -443,6 +443,43 @@ pub(crate) fn ext2_mul(a: [u64; 2], b: [u64; 2]) -> [GoldilocksField; 2] {
     [c0, c1]
 }
 
+/// Multiply two quadratic Goldilocks elements and add a third one before
+/// reducing either output limb.
+///
+/// This is the value-equivalent fast path for Horner sweeps of the form
+/// `a * b + c`. The unreduced accumulators stay well below `reduce160`'s
+/// precondition for arbitrary raw u64 representatives.
+#[inline(always)]
+pub fn ext2_mul_add(
+    a: [u64; 2],
+    b: [u64; 2],
+    addend: [u64; 2],
+) -> [GoldilocksField; 2] {
+    const_assert!(<GoldilocksField as Extendable<2>>::W.0 == 7u64);
+
+    let [a0, a1] = a;
+    let [b0, b1] = b;
+    let [add0, add1] = addend;
+
+    let (mut c0_lo, mut c0_hi) = u160_times_7((a1 as u128) * (b1 as u128), 0);
+    let (sum, carry) = c0_lo.overflowing_add((a0 as u128) * (b0 as u128));
+    c0_lo = sum;
+    c0_hi += carry as u32;
+    let (sum, carry) = c0_lo.overflowing_add(add0 as u128);
+    c0_lo = sum;
+    c0_hi += carry as u32;
+
+    let mut c1_lo = (a0 as u128) * (b1 as u128);
+    let (sum, carry) = c1_lo.overflowing_add((a1 as u128) * (b0 as u128));
+    c1_lo = sum;
+    let c1_hi = carry as u32;
+    let (sum, carry) = c1_lo.overflowing_add(add1 as u128);
+    c1_lo = sum;
+    let c1_hi = c1_hi + carry as u32;
+
+    [unsafe { reduce160(c0_lo, c0_hi) }, unsafe { reduce160(c1_lo, c1_hi) }]
+}
+
 /*
  * Quartic multiplication and squaring
  */

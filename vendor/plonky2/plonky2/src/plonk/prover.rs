@@ -2516,15 +2516,18 @@ fn compute_quotient_polys<
                 }
             }
         });
-    let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
+    let normalized_inverse_coset_shift_powers =
+        precomputed::normalized_inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
         .map(|column| {
-            // Fuse the coset post-scaling into the IFFT instead of walking the
-            // whole coefficient vector again afterwards, reusing a
-            // process-global inverse-shift power chain.
+            // Fuse coset post-scaling and 1/n normalization into the IFFT,
+            // so each coefficient pays one field multiplication rather than
+            // two. The normalized table is reused for this domain size.
             PolynomialValues::new(column)
-                .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
+                .coset_ifft_with_normalized_powers(
+                    normalized_inverse_coset_shift_powers.as_slice(),
+                )
         })
         .collect()
 }
@@ -2545,13 +2548,14 @@ pub(crate) mod precomputed {
         use std::sync::{Arc, OnceLock, RwLock};
 
         use crate::field::types::Field;
+        use crate::util::log2_strict;
 
         type Map = RwLock<HashMap<(TypeId, usize), Arc<dyn Any + Send + Sync>>>;
 
         static SUBGROUPS: OnceLock<Map> = OnceLock::new();
         static COSET_POWERS: OnceLock<Map> = OnceLock::new();
         static SHIFTED_SUBGROUPS: OnceLock<Map> = OnceLock::new();
-        static INVERSE_COSET_POWERS: OnceLock<Map> = OnceLock::new();
+        static NORMALIZED_INVERSE_COSET_POWERS: OnceLock<Map> = OnceLock::new();
 
         fn get_or_compute<F: Field>(
             cache: &'static OnceLock<Map>,
@@ -2603,12 +2607,22 @@ pub(crate) mod precomputed {
             })
         }
 
-        /// Cached `F::coset_shift().inverse().powers().take(degree)`. The
-        /// quotient columns' coset IFFT post-scaling uses the same power chain
-        /// on every proof of a given size, so build it once per process.
-        pub(crate) fn inverse_coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
-            get_or_compute(&INVERSE_COSET_POWERS, degree, || {
-                F::coset_shift().inverse().powers().take(degree).collect()
+        /// Cached inverse coset powers with the IFFT's 1/n normalization
+        /// folded in. The quotient IFFT consumes this table once per output
+        /// coefficient, so doing the extra multiplication during cache
+        /// construction removes one field multiplication from every later
+        /// coefficient without changing its field value.
+        pub(crate) fn normalized_inverse_coset_shift_powers<F: Field>(
+            degree: usize,
+        ) -> Arc<Vec<F>> {
+            get_or_compute(&NORMALIZED_INVERSE_COSET_POWERS, degree, || {
+                let n_inv = F::inverse_2exp(log2_strict(degree));
+                F::coset_shift()
+                    .inverse()
+                    .powers()
+                    .take(degree)
+                    .map(|power| n_inv * power)
+                    .collect()
             })
         }
     }
@@ -2621,6 +2635,7 @@ pub(crate) mod precomputed {
         use alloc::vec::Vec;
 
         use crate::field::types::Field;
+        use crate::util::log2_strict;
 
         pub(crate) fn two_adic_subgroup<F: Field>(n_log: usize) -> Arc<Vec<F>> {
             Arc::new(F::two_adic_subgroup(n_log))
@@ -2635,19 +2650,23 @@ pub(crate) mod precomputed {
             Arc::new(F::two_adic_subgroup(n_log).into_iter().map(|x| shift * x).collect::<Vec<F>>())
         }
 
-        pub(crate) fn inverse_coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
+        pub(crate) fn normalized_inverse_coset_shift_powers<F: Field>(
+            degree: usize,
+        ) -> Arc<Vec<F>> {
+            let n_inv = F::inverse_2exp(log2_strict(degree));
             Arc::new(
                 F::coset_shift()
                     .inverse()
                     .powers()
                     .take(degree)
+                    .map(|power| n_inv * power)
                     .collect::<Vec<F>>(),
             )
         }
     }
 
     pub(crate) use imp::{
-        coset_shift_powers, inverse_coset_shift_powers, shifted_two_adic_subgroup,
+        coset_shift_powers, normalized_inverse_coset_shift_powers, shifted_two_adic_subgroup,
         two_adic_subgroup,
     };
 }
