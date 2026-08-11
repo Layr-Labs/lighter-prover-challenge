@@ -126,6 +126,19 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
 
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash;
 
+    /// Attempts the native FRI proof-of-work search with a specialized
+    /// backend. `duplex_intermediate_state` is the challenger sponge after
+    /// buffered inputs have been overwritten but before the witness is set
+    /// and the permutation is applied. Returning `None` selects the scalar
+    /// search without changing transcript semantics.
+    fn try_fri_proof_of_work(
+        _duplex_intermediate_state: &Self::Permutation,
+        _witness_input_pos: usize,
+        _min_leading_zeros: u32,
+    ) -> Option<F> {
+        None
+    }
+
     /// Build the native Merkle digests and cap with a specialized backend, when available.
     ///
     /// `leaves` is one flat row-major buffer holding `num_leaves` leaves of `leaf_width`
