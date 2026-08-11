@@ -109,7 +109,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
+    "9e6fd6cb61b27dd7907d43924bce6c1e591cf444cabf6ee21a9c0fc6c2125207";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -487,6 +487,19 @@ pub(crate) enum U32QuotientKind {
     BaseAddition {
         constant_base: usize,
     },
+    /// Base-field quadratic arithmetic: four routed words per operation
+    /// (multiplicand_0, multiplicand_1, addend, output), two gate-local constants.
+    BaseArithmetic {
+        constant_base: usize,
+    },
+    /// Extension-field quadratic arithmetic (D=2), eight routed words per op.
+    BaseArithmeticExtension {
+        constant_base: usize,
+    },
+    /// Extension-field multiplication (D=2), six routed words per op.
+    BaseMulExtension {
+        constant_base: usize,
+    },
     /// Base-2/base-4 decomposition; `num_ops` carries the limb count.
     BaseSum {
         base: usize,
@@ -502,89 +515,6 @@ pub(crate) struct U32QuotientSpec {
     pub include_unused_selector: bool,
     pub num_ops: usize,
     pub kind: U32QuotientKind,
-}
-
-/// Bounded exact-size cache of shared column-store buffers.
-///
-/// The commitment column stores recur at identical byte sizes every proof
-/// (three per transaction/chain step, plus the quotient gather stores), and
-/// each was previously a fresh `new_buffer` whose pages the kernel
-/// zero-faults again during the fill — kernel time repaid 50+ times per
-/// worker. Reuse is sound because no consumer relies on zero initialization:
-/// the LDE column fill writes the live prefix without reading it and the
-/// zero-padded FFT writes every tail element before reading it (the
-/// `fill_lde_column_store` / `lde_values` invariant), and every other
-/// allocation site fully writes its store before any read. Buffers above the
-/// per-buffer cap (the one-off final-block stores) are never retained.
-struct ColumnStorePool {
-    free: Vec<Buffer>,
-    total_bytes: u64,
-}
-
-const MAX_CACHED_COLUMN_STORE_BYTES: u64 = 640 << 20;
-const MAX_COLUMN_STORE_POOL_BYTES: u64 = 2560 << 20;
-
-static COLUMN_STORE_POOL: Mutex<ColumnStorePool> = Mutex::new(ColumnStorePool {
-    free: Vec::new(),
-    total_bytes: 0,
-});
-
-impl ColumnStorePool {
-    /// Smallest free buffer that fits `bytes`. The recurring shapes match
-    /// their own previous allocation exactly; best-fit additionally tolerates
-    /// any allocator size rounding in `Buffer::length` without silent misses.
-    fn take_best_fit(&mut self, bytes: u64) -> Option<Buffer> {
-        let (index, length) = self
-            .free
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.length() >= bytes)
-            .min_by_key(|(_, b)| b.length())
-            .map(|(index, b)| (index, b.length()))?;
-        self.total_bytes -= length;
-        Some(self.free.swap_remove(index))
-    }
-
-    fn recycle(&mut self, buffer: Buffer) {
-        let bytes = buffer.length();
-        if bytes <= MAX_CACHED_COLUMN_STORE_BYTES
-            && self.total_bytes + bytes <= MAX_COLUMN_STORE_POOL_BYTES
-        {
-            self.total_bytes += bytes;
-            self.free.push(buffer);
-        }
-    }
-}
-
-/// Returns a pooled buffer of exactly `bytes` when one is free, else a fresh
-/// device allocation. Misses (including lock contention) fall through to the
-/// allocator; the pool is a best-effort page-warm cache, never a correctness
-/// dependency.
-fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
-    if bytes <= MAX_CACHED_COLUMN_STORE_BYTES {
-        if let Ok(mut pool) = COLUMN_STORE_POOL.try_lock() {
-            if let Some(buffer) = pool.take_best_fit(bytes) {
-                return buffer;
-            }
-        }
-    }
-    autoreleasepool(|| device.new_buffer(bytes, MTLResourceOptions::StorageModeShared))
-}
-
-/// Owns one column-store buffer for the lifetime of all `MetalColumns`
-/// handles over it; the last handle's drop returns the buffer to the pool
-/// (same pattern as `MetalDigestInner`). `try_lock`: on contention the
-/// buffer simply drops.
-struct ColumnStoreLease {
-    buffer: Buffer,
-}
-
-impl Drop for ColumnStoreLease {
-    fn drop(&mut self) {
-        if let Ok(mut pool) = COLUMN_STORE_POOL.try_lock() {
-            pool.recycle(self.buffer.clone());
-        }
-    }
 }
 
 /// LDE columns computed and retained in a CPU-visible Metal shared buffer.
@@ -606,26 +536,20 @@ pub struct MetalColumns<F> {
     base: usize,
     rows: usize,
     cols: usize,
-    /// Handle counter (exclusive access iff the count is 1) whose final drop
-    /// returns the buffer to `COLUMN_STORE_POOL`.
-    uniqueness: Arc<ColumnStoreLease>,
+    uniqueness: Arc<()>,
     _phantom: PhantomData<F>,
 }
 
 impl<F> MetalColumns<F> {
-    /// Wraps a freshly allocated (or pool-reused) shared buffer, capturing
-    /// its contents pointer.
+    /// Wraps a freshly allocated shared buffer, capturing its contents pointer.
     fn with_buffer(buffer: Buffer, rows: usize, cols: usize) -> Self {
         let base = buffer.contents() as usize;
-        let lease = ColumnStoreLease {
-            buffer: buffer.clone(),
-        };
         Self {
             buffer,
             base,
             rows,
             cols,
-            uniqueness: Arc::new(lease),
+            uniqueness: Arc::new(()),
             _phantom: PhantomData,
         }
     }
@@ -1780,6 +1704,45 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
                         spec.num_ops,
                     )
                 }
+                U32QuotientKind::BaseArithmetic { constant_base } => {
+                    if constant_base.checked_add(2)? > constants.cols {
+                        return None;
+                    }
+                    (
+                        13usize,
+                        constant_base,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_mul(4)?,
+                        spec.num_ops,
+                    )
+                }
+                U32QuotientKind::BaseArithmeticExtension { constant_base } => {
+                    if constant_base.checked_add(2)? > constants.cols {
+                        return None;
+                    }
+                    (
+                        14usize,
+                        constant_base,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_mul(8)?,
+                        spec.num_ops.checked_mul(2)?,
+                    )
+                }
+                U32QuotientKind::BaseMulExtension { constant_base } => {
+                    if constant_base.checked_add(1)? > constants.cols {
+                        return None;
+                    }
+                    (
+                        15usize,
+                        constant_base,
+                        0usize,
+                        0usize,
+                        spec.num_ops.checked_mul(6)?,
+                        spec.num_ops.checked_mul(2)?,
+                    )
+                }
                 U32QuotientKind::BaseSum { base } => {
                     if !matches!((base, spec.num_ops), (2, 63) | (4, 4 | 16 | 32)) {
                         return None;
@@ -2436,7 +2399,10 @@ impl MetalShared {
         let bytes = len
             .checked_mul(size_of::<u64>())
             .ok_or("Metal column size overflow")?;
-        let buffer = take_or_new_column_buffer(&self.device, bytes as u64);
+        let buffer = autoreleasepool(|| {
+            self.device
+                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+        });
         Ok(MetalColumns::with_buffer(buffer, rows, cols))
     }
 
@@ -2960,7 +2926,10 @@ impl MetalShared {
         )
         .to_canonical_u64();
 
-        let column_buffer = take_or_new_column_buffer(&self.device, column_bytes as u64);
+        let column_buffer = autoreleasepool(|| {
+            self.device
+                .new_buffer(column_bytes as u64, MTLResourceOptions::StorageModeShared)
+        });
         // Coefficients need their own buffer: the LDE prepare reads them while
         // writing the full column buffer.
         let coeffs_buffer = autoreleasepool(|| {
@@ -3224,10 +3193,12 @@ impl MetalShared {
         let (roots_buffer, roots_offsets) = self.roots_for(log_lde)?;
         let shift_buffer = self.shift_powers_for(degree)?;
 
-        // The LDE columns outlive this call as the oracle's leaf storage —
-        // distinct from the transient `BufferSet` staging pool; they use the
-        // column-store pool keyed by exact size.
-        let column_buffer = take_or_new_column_buffer(&self.device, column_bytes as u64);
+        // The LDE columns outlive this call as the oracle's leaf storage, so
+        // they get their own buffer rather than a pooled one.
+        let column_buffer = autoreleasepool(|| {
+            self.device
+                .new_buffer(column_bytes as u64, MTLResourceOptions::StorageModeShared)
+        });
 
         let mut set = self.acquire_set()?;
         let result = self.build_from_coeffs_with_set(
@@ -3667,7 +3638,7 @@ fn dispatch2d(
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(64)
+        .min(128)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
@@ -3691,7 +3662,7 @@ fn dispatch(
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(128)
+        .min( 256)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
@@ -4742,6 +4713,62 @@ mod tests {
                             }
                             assert_eq!(constraints.len(), spec.num_ops);
                         }
+                        U32QuotientKind::BaseArithmetic { constant_base } => {
+                            let const_0 = constants.col(constant_base)[source_row];
+                            let const_1 = constants.col(constant_base + 1)[source_row];
+                            for op in 0..spec.num_ops {
+                                let wire_base = 4 * op;
+                                constraints.push(
+                                    wires.col(wire_base + 3)[source_row]
+                                        - wires.col(wire_base)[source_row]
+                                            * wires.col(wire_base + 1)[source_row]
+                                            * const_0
+                                        - wires.col(wire_base + 2)[source_row] * const_1,
+                                );
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops);
+                        }
+                        U32QuotientKind::BaseArithmeticExtension { constant_base } => {
+                            let c0 = constants.col(constant_base)[source_row];
+                            let c1 = constants.col(constant_base + 1)[source_row];
+                            let seven = F::from_canonical_u64(7);
+                            for op in 0..spec.num_ops {
+                                let b = 8 * op;
+                                let m0_0 = wires.col(b)[source_row];
+                                let m0_1 = wires.col(b + 1)[source_row];
+                                let m1_0 = wires.col(b + 2)[source_row];
+                                let m1_1 = wires.col(b + 3)[source_row];
+                                let a_0 = wires.col(b + 4)[source_row];
+                                let a_1 = wires.col(b + 5)[source_row];
+                                let o_0 = wires.col(b + 6)[source_row];
+                                let o_1 = wires.col(b + 7)[source_row];
+                                let p0 = m0_0 * m1_0 + seven * m0_1 * m1_1;
+                                let p1 = m0_0 * m1_1 + m0_1 * m1_0;
+                                let comp_0 = p0 * c0 + a_0 * c1;
+                                let comp_1 = p1 * c0 + a_1 * c1;
+                                constraints.push(o_0 - comp_0);
+                                constraints.push(o_1 - comp_1);
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * 2);
+                        }
+                        U32QuotientKind::BaseMulExtension { constant_base } => {
+                            let c0 = constants.col(constant_base)[source_row];
+                            let seven = F::from_canonical_u64(7);
+                            for op in 0..spec.num_ops {
+                                let b = 6 * op;
+                                let m0_0 = wires.col(b)[source_row];
+                                let m0_1 = wires.col(b + 1)[source_row];
+                                let m1_0 = wires.col(b + 2)[source_row];
+                                let m1_1 = wires.col(b + 3)[source_row];
+                                let o_0 = wires.col(b + 4)[source_row];
+                                let o_1 = wires.col(b + 5)[source_row];
+                                let p0 = m0_0 * m1_0 + seven * m0_1 * m1_1;
+                                let p1 = m0_0 * m1_1 + m0_1 * m1_0;
+                                constraints.push(o_0 - p0 * c0);
+                                constraints.push(o_1 - p1 * c0);
+                            }
+                            assert_eq!(constraints.len(), spec.num_ops * 2);
+                        }
                         U32QuotientKind::BaseSum { base } => {
                             let base = F::from_canonical_usize(base);
                             let mut computed = F::ZERO;
@@ -5383,6 +5410,15 @@ mod tests {
                             );
                         }
                         U32QuotientKind::BaseAddition { .. } => {
+                            unreachable!("covered by metal_u32_gate_quotient_matches_cpu")
+                        }
+                        U32QuotientKind::BaseArithmetic { .. } => {
+                            unreachable!("covered by metal_u32_gate_quotient_matches_cpu")
+                        }
+                        U32QuotientKind::BaseArithmeticExtension { .. } => {
+                            unreachable!("covered by metal_u32_gate_quotient_matches_cpu")
+                        }
+                        U32QuotientKind::BaseMulExtension { .. } => {
                             unreachable!("covered by metal_u32_gate_quotient_matches_cpu")
                         }
                         U32QuotientKind::BaseSum { .. } => {

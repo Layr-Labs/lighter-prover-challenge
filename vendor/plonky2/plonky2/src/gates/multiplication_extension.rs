@@ -11,7 +11,7 @@ use anyhow::Result;
 
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
-use crate::gates::gate::Gate;
+use crate::gates::gate::{Gate, U32QuotientGate};
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
 use crate::iop::ext_target::ExtensionTarget;
@@ -235,6 +235,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for MulExtensionGa
 
     fn num_constraints(&self) -> usize {
         self.num_ops * D
+    }
+
+    fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+        if D == 2 {
+            Some(U32QuotientGate::BaseMulExtension { num_ops: self.num_ops })
+        } else {
+            None
+        }
     }
 }
 

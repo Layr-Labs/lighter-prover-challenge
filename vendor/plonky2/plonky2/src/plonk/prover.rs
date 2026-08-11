@@ -1374,16 +1374,6 @@ fn start_gpu_range_check_gate_quotient<
             gate_indices.push(gate_index);
         }
         if let Some(u32_gate) = u32_gate {
-            // A six-bit random access evaluates a 64-entry selection fold for
-            // only ten quotient rows. On the five-worker ranked workload that
-            // data-dependent branch extends the process-shared Range/U32 Metal
-            // command disproportionately. Keep exactly this shape on the
-            // existing CPU direct-accumulation evaluator instead: skipping it
-            // here means it is never added to `gate_indices`, so the generic
-            // CPU quotient pass retains its unchanged selector and alpha work.
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. }) {
-                continue;
-            }
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
                 U32QuotientGate::Arithmetic { num_ops } => (
                     U32QuotientKind::Arithmetic,
@@ -1544,6 +1534,53 @@ fn start_gpu_range_check_gate_quotient<
                         num_ops,
                     )
                 }
+                U32QuotientGate::BaseArithmetic { num_ops } => {
+                    if gate.0.num_constants() != 2
+                        || raw_constant_base.checked_add(2)? > common_data.num_constants
+                    {
+                        return None;
+                    }
+                    (
+                        U32QuotientKind::BaseArithmetic {
+                            constant_base: raw_constant_base,
+                        },
+                        num_ops,
+                        num_ops.checked_mul(4)?,
+                        num_ops,
+                    )
+                }
+                U32QuotientGate::BaseArithmeticExtension { num_ops } => {
+                    if D != 2
+                        || gate.0.num_constants() != 2
+                        || raw_constant_base.checked_add(2)? > common_data.num_constants
+                    {
+                        return None;
+                    }
+                    (
+                        U32QuotientKind::BaseArithmeticExtension {
+                            constant_base: raw_constant_base,
+                        },
+                        num_ops,
+                        num_ops.checked_mul(8)?,
+                        num_ops.checked_mul(2)?,
+                    )
+                }
+                U32QuotientGate::BaseMulExtension { num_ops } => {
+                    if D != 2
+                        || gate.0.num_constants() != 1
+                        || raw_constant_base.checked_add(1)? > common_data.num_constants
+                    {
+                        return None;
+                    }
+                    (
+                        U32QuotientKind::BaseMulExtension {
+                            constant_base: raw_constant_base,
+                        },
+                        num_ops,
+                        num_ops.checked_mul(6)?,
+                        num_ops.checked_mul(2)?,
+                    )
+                }
                 U32QuotientGate::BaseSum { base, num_limbs } => (
                     U32QuotientKind::BaseSum { base },
                     num_limbs,
@@ -1591,15 +1628,16 @@ fn start_gpu_range_check_gate_quotient<
         // the production circuits and are pure arithmetic, so they are matched
         // by type here instead of through the downstream-crate trait hooks
         // (those hooks exist only to avoid a `plonky2` -> circuit-crate dep).
-        let native = if gate.0.as_any().is::<ExponentiationGate<F, D>>() {
-            // The transaction circuits' 67-bit exponentiation loop is the
-            // most divergent native branch in the shared Range/U32 command.
-            // Leave this one family on the existing CPU quotient evaluator:
-            // it stays out of `gate_indices`, so it is not CPU-excluded and
-            // its selector/alpha contribution remains byte-for-byte the
-            // ordinary generic path. This trades a small parallel CPU span
-            // for a shorter process-shared Metal queue tail.
-            None
+        let native = if let Some(exponentiation) =
+            gate.0.as_any().downcast_ref::<ExponentiationGate<F, D>>()
+        {
+            let num_power_bits = exponentiation.num_power_bits;
+            Some((
+                U32QuotientKind::Exponentiation,
+                num_power_bits,
+                num_power_bits.checked_mul(2)?.checked_add(2)?,
+                num_power_bits.checked_add(1)?,
+            ))
         } else if let Some(equality) = gate.0.as_any().downcast_ref::<EqualityGate>() {
             // The gate reads its single constant (the "one" value) as local
             // constant 0, i.e. the column immediately after the selector

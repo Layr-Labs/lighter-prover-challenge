@@ -78,6 +78,12 @@ pub enum U32QuotientGate {
     },
     /// Weighted base-field addition with two gate-local constants.
     BaseAddition { num_ops: usize },
+    /// Base-field quadratic arithmetic with two gate-local constants.
+    BaseArithmetic { num_ops: usize },
+    /// Extension-field quadratic arithmetic (D=2): eight routed words per op.
+    BaseArithmeticExtension { num_ops: usize },
+    /// Extension-field multiplication (D=2): six routed words per op.
+    BaseMulExtension { num_ops: usize },
     /// Little-endian base decomposition: one sum wire followed by `num_limbs`
     /// limbs, with the recomposition constraint followed by limb checks.
     BaseSum { base: usize, num_limbs: usize },
