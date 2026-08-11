@@ -22,7 +22,8 @@
 //! * the representative map is stored as zigzag-varint deltas against the
 //!   identity permutation (mostly zeros) instead of 8-byte usizes;
 //! * the generator watch index is stored in its CSR form (varint-delta
-//!   offsets + `u32` watcher ids);
+//!   offsets + `u32` watcher ids), with precomputed per-generator watch
+//!   counts as uvarints;
 //! * constant polynomials are stored as *values* (step-function selectors,
 //!   long constant runs) rather than incompressible coefficients;
 //! * every bulky section is independently zstd-compressed, keeping parallel
@@ -66,7 +67,7 @@ fn embed_generator_serializer() -> EmbedGeneratorSerializer {
 }
 
 const EMBED_MAGIC: u32 = 0x4C45_4331; // "LEC1"
-const EMBED_VERSION: u32 = 1;
+const EMBED_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Primitive encoding helpers
@@ -161,6 +162,55 @@ fn read_compressed_section(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
         raw.len()
     );
     Ok(raw)
+}
+
+fn encode_generator_watch_counts(counts: &[usize]) -> Result<Vec<u8>> {
+    let mut encoded = Vec::with_capacity(counts.len() + 8);
+    write_uvarint(
+        &mut encoded,
+        u64::try_from(counts.len()).context("generator watch count length exceeds u64")?,
+    );
+    for &count in counts {
+        write_uvarint(
+            &mut encoded,
+            u64::try_from(count).context("generator watch count exceeds u64")?,
+        );
+    }
+    Ok(encoded)
+}
+
+fn decode_generator_watch_counts(
+    encoded: &[u8],
+    generator_count: usize,
+    watcher_edge_count: usize,
+) -> Result<Vec<usize>> {
+    let mut pos = 0usize;
+    let count_len = usize::try_from(read_uvarint(encoded, &mut pos)?)
+        .context("generator watch count length exceeds usize")?;
+    ensure!(
+        count_len == generator_count,
+        "generator watch count length {count_len} does not match generator count {generator_count}"
+    );
+
+    let mut counts = Vec::with_capacity(count_len);
+    let mut total = 0usize;
+    for _ in 0..count_len {
+        let count = usize::try_from(read_uvarint(encoded, &mut pos)?)
+            .context("generator watch count exceeds usize")?;
+        total = total
+            .checked_add(count)
+            .context("generator watch count sum exceeds usize")?;
+        counts.push(count);
+    }
+    ensure!(
+        pos == encoded.len(),
+        "trailing bytes in generator watch count section"
+    );
+    ensure!(
+        total == watcher_edge_count,
+        "generator watch count sum {total} does not match watcher edge count {watcher_edge_count}"
+    );
+    Ok(counts)
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +315,25 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     }
     write_compressed_section(&mut out, &buf);
 
+    // The builder has already computed these counts while it deduplicates each
+    // generator's watched targets. Persist them rather than making every
+    // worker recover them by scanning the full watcher edge list at startup.
+    ensure!(
+        prover.generator_watch_counts.len() == prover.generators.len(),
+        "generator watch count length does not match generator count"
+    );
+    let watch_count_sum = prover
+        .generator_watch_counts
+        .iter()
+        .try_fold(0usize, |sum, &count| sum.checked_add(count))
+        .context("generator watch count sum exceeds usize")?;
+    ensure!(
+        watch_count_sum == watchers.len(),
+        "generator watch count sum does not match watcher edge count"
+    );
+    let buf = encode_generator_watch_counts(&prover.generator_watch_counts)?;
+    write_compressed_section(&mut out, &buf);
+
     // constant polynomial *values* (fft of the committed coefficients; the
     // loader inverts this with the same exact-arithmetic ifft the builder's
     // from_values uses, so the round trip is bit-exact)
@@ -299,7 +368,7 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
 ///
 /// The returned `CircuitData` is value-identical to the freshly built one:
 /// deserialized components are byte round trips, and every recomputed
-/// component (subgroup, FFT root table, sigma values/transpose, watch counts,
+/// component (subgroup, FFT root table, sigma values/transpose, and
 /// constants/sigmas commitment) is derived by the same code paths the builder
 /// itself runs, from the same inputs. The recomputed commitment cap is checked
 /// against the embedded verifier data before returning.
@@ -423,12 +492,12 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         ensure!(watcher < generator_count, "watcher index out of range");
         watchers.push(watcher);
     }
-    // Watch counts are a pure function of the (deduplicated) watcher lists;
-    // this mirrors `read_prover_only_circuit_data`'s reconstruction.
-    let mut generator_watch_counts = vec![0usize; generator_count];
-    for &watcher in &watchers {
-        generator_watch_counts[watcher] += 1;
-    }
+    // The builder computed these counts while producing its deduplicated watch
+    // lists. Loading them is O(generators), rather than scanning every watcher
+    // edge again in each worker process.
+    let section = read_compressed_section(bytes, &mut pos)?;
+    let generator_watch_counts =
+        decode_generator_watch_counts(&section, generator_count, watchers_len)?;
     let generator_indices_by_watches = GeneratorWatchIndex::from_parts(offsets, watchers);
 
     // constant polynomial values
@@ -655,5 +724,70 @@ mod tests {
         let decoded = read_compressed_section(&framed, &mut pos).unwrap();
         assert_eq!(decoded, input);
         assert_eq!(pos, framed.len());
+    }
+
+    #[test]
+    fn generator_watch_count_section_round_trips() {
+        let counts = vec![0, 1, 127, 128, 16_384, 3];
+        let raw = encode_generator_watch_counts(&counts).unwrap();
+        let mut framed = Vec::new();
+        write_compressed_section(&mut framed, &raw);
+
+        let mut section_pos = 0;
+        let decoded_raw = read_compressed_section(&framed, &mut section_pos).unwrap();
+        let decoded =
+            decode_generator_watch_counts(&decoded_raw, counts.len(), counts.iter().sum()).unwrap();
+        assert_eq!(decoded, counts);
+        assert_eq!(section_pos, framed.len());
+    }
+
+    #[test]
+    fn generator_watch_count_section_rejects_corruption() {
+        let raw = encode_generator_watch_counts(&[1, 2, 3]).unwrap();
+
+        let mut corrupt_len = raw.clone();
+        corrupt_len[0] = 4;
+        let wrong_len = decode_generator_watch_counts(&corrupt_len, 3, 6)
+            .err()
+            .expect("corrupt length must fail");
+        assert!(
+            wrong_len
+                .to_string()
+                .contains("does not match generator count")
+        );
+
+        let mut corrupt_sum = raw.clone();
+        *corrupt_sum.last_mut().unwrap() = 4;
+        let wrong_sum = decode_generator_watch_counts(&corrupt_sum, 3, 6)
+            .err()
+            .expect("corrupt sum must fail");
+        assert!(
+            wrong_sum
+                .to_string()
+                .contains("does not match watcher edge count")
+        );
+
+        let mut trailing = raw;
+        trailing.push(0);
+        let trailing_error = decode_generator_watch_counts(&trailing, 3, 6)
+            .err()
+            .expect("trailing corruption must fail");
+        assert!(trailing_error.to_string().contains("trailing bytes"));
+    }
+
+    #[test]
+    fn previous_embed_version_is_rejected() {
+        let mut previous_header = Vec::new();
+        previous_header.extend_from_slice(&EMBED_MAGIC.to_le_bytes());
+        previous_header.extend_from_slice(&1u32.to_le_bytes());
+
+        let error = deserialize_embedded::<()>(&previous_header)
+            .err()
+            .expect("version 1 blobs must be rejected after the section layout change");
+        assert!(
+            error
+                .to_string()
+                .contains("embedded circuit blob version 1 unsupported")
+        );
     }
 }
