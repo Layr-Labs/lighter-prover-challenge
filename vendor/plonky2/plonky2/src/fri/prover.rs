@@ -15,7 +15,7 @@ use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
@@ -287,18 +287,63 @@ pub(crate) fn fri_proof_of_work<
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
+    const POW_BATCH_SIZE: u64 = 2;
+    let max_candidate = F::NEG_ONE.to_canonical_u64();
+    let num_candidate_batches = max_candidate / POW_BATCH_SIZE + 1;
+    let permute_candidate_batch = |batch_index: u64| {
+        let first_candidate = batch_index * POW_BATCH_SIZE;
+        let mut duplex_states = [duplex_intermediate_state; POW_BATCH_SIZE as usize];
+        for (lane, duplex_state) in duplex_states.iter_mut().enumerate() {
+            let candidate = first_candidate + lane as u64;
+            if candidate <= max_candidate {
+                duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+            }
+        }
+        <<C as GenericConfig<D>>::Hasher as Hasher<F>>::Permutation::permute_x2(
+            &mut duplex_states,
+        );
+        duplex_states
+    };
+
+    let witness_batch = (0..num_candidate_batches)
         .into_par_iter()
-        .find_any(|&candidate| {
-            let mut duplex_state = duplex_intermediate_state;
-            duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-            duplex_state.permute();
-            let pow_response = duplex_state.squeeze().iter().last().unwrap();
-            let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-            leading_zeros >= min_leading_zeros
+        .find_any(|&batch_index| {
+            let first_candidate = batch_index * POW_BATCH_SIZE;
+            permute_candidate_batch(batch_index)
+                .iter()
+                .enumerate()
+                .any(|(lane, duplex_state)| {
+                    let candidate = first_candidate + lane as u64;
+                    candidate <= max_candidate
+                        && duplex_state
+                            .squeeze()
+                            .last()
+                            .unwrap()
+                            .to_canonical_u64()
+                            .leading_zeros()
+                            >= min_leading_zeros
+                })
         })
-        .map(F::from_canonical_u64)
         .expect("Proof of work failed. This is highly unlikely!");
+
+    let first_candidate = witness_batch * POW_BATCH_SIZE;
+    let witness_states = permute_candidate_batch(witness_batch);
+    let pow_witness = witness_states
+        .iter()
+        .enumerate()
+        .find_map(|(lane, duplex_state)| {
+            let candidate = first_candidate + lane as u64;
+            (candidate <= max_candidate
+                && duplex_state
+                    .squeeze()
+                    .last()
+                    .unwrap()
+                    .to_canonical_u64()
+                    .leading_zeros()
+                    >= min_leading_zeros)
+                .then(|| F::from_canonical_u64(candidate))
+        })
+        .expect("Selected proof-of-work batch contains no valid witness");
 
     // Recompute pow_response using our normal Challenger code, and make sure it matches.
     challenger.observe_element(pow_witness);
