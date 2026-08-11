@@ -34,6 +34,15 @@ impl Extendable<2> for GoldilocksField {
     ) -> QuadraticExtension<Self> {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
+    #[inline]
+    fn extension_base_dot_product_pair(
+        powers_a: &[QuadraticExtension<Self>],
+        powers_b: &[QuadraticExtension<Self>],
+        base_scalars: &[Self],
+    ) -> (QuadraticExtension<Self>, QuadraticExtension<Self>) {
+        ext2_base_scalar_dot_product_pair(powers_a, powers_b, base_scalars)
+    }
+
 
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
@@ -279,6 +288,94 @@ fn ext2_base_scalar_dot_product(
     result
 }
 
+/// Dual-point form of [`ext2_base_scalar_dot_product`]: evaluate one base
+/// coefficient polynomial against two extension power tables in a single
+/// coefficient traversal.
+///
+/// Each coefficient is loaded once and folded into four independent 160-bit
+/// limb accumulators (two points times two quadratic limbs). The per-chunk
+/// `reduce160` bound is identical to the single-point kernel: at most
+/// `u32::MAX` terms of `(2^64-1)^2` products. Longer inputs reduce
+/// chunk-wise and add the field-reduced partials.
+#[inline]
+fn ext2_base_scalar_dot_product_pair(
+    powers_a: &[QuadraticExtension<GoldilocksField>],
+    powers_b: &[QuadraticExtension<GoldilocksField>],
+    base_scalars: &[GoldilocksField],
+) -> (
+    QuadraticExtension<GoldilocksField>,
+    QuadraticExtension<GoldilocksField>,
+) {
+    const MAX_TERMS_PER_REDUCTION: usize = u32::MAX as usize;
+
+    let len_a = base_scalars.len().min(powers_a.len());
+    let len_b = base_scalars.len().min(powers_b.len());
+    // The trait fallback applies the iterator/zip rule independently at each
+    // point. Production power tables have equal length; preserve fallback
+    // semantics for arbitrary callers without complicating the hot loop.
+    if len_a != len_b {
+        return (
+            ext2_base_scalar_dot_product(powers_a, base_scalars),
+            ext2_base_scalar_dot_product(powers_b, base_scalars),
+        );
+    }
+    let len = len_a;
+    if len == 0 {
+        return (QuadraticExtension::ZERO, QuadraticExtension::ZERO);
+    }
+
+    let reduce_chunk = |pa: &[QuadraticExtension<GoldilocksField>],
+                        pb: &[QuadraticExtension<GoldilocksField>],
+                        scalars: &[GoldilocksField]| {
+        debug_assert_eq!(pa.len(), scalars.len());
+        debug_assert_eq!(pb.len(), scalars.len());
+        debug_assert!(scalars.len() <= MAX_TERMS_PER_REDUCTION);
+        let (mut a_lo0, mut a_hi0) = (0u128, 0u32);
+        let (mut a_lo1, mut a_hi1) = (0u128, 0u32);
+        let (mut b_lo0, mut b_hi0) = (0u128, 0u32);
+        let (mut b_lo1, mut b_hi1) = (0u128, 0u32);
+        for i in 0..scalars.len() {
+            // SAFETY: all three slices share length `scalars.len()`.
+            let c = unsafe { scalars.get_unchecked(i).0 };
+            let QuadraticExtension([a0, a1]) = unsafe { *pa.get_unchecked(i) };
+            let QuadraticExtension([b0, b1]) = unsafe { *pb.get_unchecked(i) };
+            u160_add_product(&mut a_lo0, &mut a_hi0, a0.0, c);
+            u160_add_product(&mut a_lo1, &mut a_hi1, a1.0, c);
+            u160_add_product(&mut b_lo0, &mut b_hi0, b0.0, c);
+            u160_add_product(&mut b_lo1, &mut b_hi1, b1.0, c);
+        }
+        // SAFETY: same exact worst-case bound as the single-point kernel.
+        (
+            QuadraticExtension([unsafe { reduce160(a_lo0, a_hi0) }, unsafe {
+                reduce160(a_lo1, a_hi1)
+            }]),
+            QuadraticExtension([unsafe { reduce160(b_lo0, b_hi0) }, unsafe {
+                reduce160(b_lo1, b_hi1)
+            }]),
+        )
+    };
+
+    let first_end = len.min(MAX_TERMS_PER_REDUCTION);
+    let (mut out_a, mut out_b) = reduce_chunk(
+        &powers_a[..first_end],
+        &powers_b[..first_end],
+        &base_scalars[..first_end],
+    );
+    let mut start = first_end;
+    while start < len {
+        let end = len.min(start + MAX_TERMS_PER_REDUCTION);
+        let (part_a, part_b) = reduce_chunk(
+            &powers_a[start..end],
+            &powers_b[start..end],
+            &base_scalars[start..end],
+        );
+        out_a += part_a;
+        out_b += part_b;
+        start = end;
+    }
+    (out_a, out_b)
+}
+
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction
 /// across the complete production FRI arity. For raw limbs below 2^64,
 ///
@@ -306,6 +403,56 @@ fn ext2_dot_product_arity16(
         u160_add_product(&mut c1_lo, &mut c1_hi, a0.0, b1.0);
         u160_add_product(&mut c1_lo, &mut c1_hi, a1.0, b0.0);
     }
+
+    let (c0_w_lo, c0_w_hi) = u160_times_7(c0_w_lo, c0_w_hi);
+    let (c0_lo, carry) = c0_plain_lo.overflowing_add(c0_w_lo);
+    let c0_hi = c0_plain_hi + c0_w_hi + carry as u32;
+
+    // SAFETY: the bounds documented above are far below reduce160's
+    // `2^160 - 2^128 + 2^96` precondition.
+    let c0 = unsafe { reduce160(c0_lo, c0_hi) };
+    let c1 = unsafe { reduce160(c1_lo, c1_hi) };
+    QuadraticExtension([c0, c1])
+}
+
+/// Fused `a * b + c` for the Goldilocks quadratic extension, delaying both
+/// modular reductions until after the addend limbs are folded into the
+/// 160-bit accumulators. This is the multiply-add used by the FRI final-poly
+/// Horner sweep, where the separate spelling performs a delayed `ext2_mul`
+/// (two `reduce160`) followed by a canonicalizing extension add (two more
+/// reductions); this form performs exactly two `reduce160` for the whole
+/// operation.
+///
+/// Bounds: each of the three 64x64 products is below `2^128`, the addend
+/// limbs are below `2^64`, and the `7 * (a1 * b1)` term is below
+/// `7 * 2^128`; the combined `c0` accumulator is below `10 * 2^128` and
+/// `c1` below `3 * 2^128`, both far under `reduce160`'s
+/// `2^160 - 2^128 + 2^96` precondition.
+#[inline(always)]
+pub fn ext2_mul_add(
+    a: QuadraticExtension<GoldilocksField>,
+    b: QuadraticExtension<GoldilocksField>,
+    c: QuadraticExtension<GoldilocksField>,
+) -> QuadraticExtension<GoldilocksField> {
+    let QuadraticExtension([a0, a1]) = a;
+    let QuadraticExtension([b0, b1]) = b;
+    let QuadraticExtension([c0, c1]) = c;
+
+    let (mut c0_plain_lo, mut c0_plain_hi) = (0u128, 0u32);
+    let (mut c0_w_lo, mut c0_w_hi) = (0u128, 0u32);
+    let (mut c1_lo, mut c1_hi) = (0u128, 0u32);
+
+    u160_add_product(&mut c0_plain_lo, &mut c0_plain_hi, a0.0, b0.0);
+    u160_add_product(&mut c0_w_lo, &mut c0_w_hi, a1.0, b1.0);
+    u160_add_product(&mut c1_lo, &mut c1_hi, a0.0, b1.0);
+    u160_add_product(&mut c1_lo, &mut c1_hi, a1.0, b0.0);
+
+    let (sum, carry) = c0_plain_lo.overflowing_add(c0.0 as u128);
+    c0_plain_lo = sum;
+    c0_plain_hi += carry as u32;
+    let (sum, carry) = c1_lo.overflowing_add(c1.0 as u128);
+    c1_lo = sum;
+    c1_hi += carry as u32;
 
     let (c0_w_lo, c0_w_hi) = u160_times_7(c0_w_lo, c0_w_hi);
     let (c0_lo, carry) = c0_plain_lo.overflowing_add(c0_w_lo);
@@ -764,6 +911,7 @@ mod tests {
     use crate::extension::quartic::QuarticExtension;
     use crate::extension::quintic::{QuinticExtension, QuinticFirstCoeff};
     use crate::extension::{Extendable, FieldExtension, Frobenius, OEF};
+    use crate::goldilocks_extensions::ext2_mul_add;
     use crate::goldilocks_field::GoldilocksField;
     use crate::types::{Field, Field64, PrimeField64};
 
@@ -887,6 +1035,131 @@ mod tests {
     }
 
     #[test]
+    fn extension_base_dot_product_pair_default_matches_two_singles() {
+        let values_a: Vec<Q4> = (0..17)
+            .map(|i| {
+                QuarticExtension(core::array::from_fn(|limb| {
+                    GoldilocksField(
+                        (i as u64 + 1)
+                            .wrapping_mul(0xA076_1D64_78BD_642Fu64.rotate_left(limb as u32)),
+                    )
+                }))
+            })
+            .collect();
+        let values_b: Vec<Q4> = (0..15)
+            .map(|i| {
+                QuarticExtension(core::array::from_fn(|limb| {
+                    GoldilocksField(
+                        (i as u64 + 3)
+                            .wrapping_mul(0xE703_7ED1_A0B4_28DBu64.rotate_right(limb as u32)),
+                    )
+                }))
+            })
+            .collect();
+        let scalars: Vec<GF> = (0..16)
+            .map(|i| GoldilocksField((i as u64 + 5).wrapping_mul(u64::MAX - 1)))
+            .collect();
+
+        let expected_a = <GF as Extendable<4>>::extension_base_dot_product(&values_a, &scalars);
+        let expected_b = <GF as Extendable<4>>::extension_base_dot_product(&values_b, &scalars);
+        let actual = <GF as Extendable<4>>::extension_base_dot_product_pair(
+            &values_a, &values_b, &scalars,
+        );
+        assert_eq!(actual, (expected_a, expected_b));
+    }
+
+    #[test]
+    fn ext2_extension_base_dot_product_pair_matches_two_singles_raw() {
+        let p = GF::ORDER;
+        let raw_specials = [0, 1, 2, p - 1, p, p + 1, u64::MAX];
+        // Equal production lengths exercise the fused path. Unequal and empty
+        // lengths pin the generic fallback's independent zip semantics.
+        let lengths = [
+            (0usize, 0usize, 0usize),
+            (0, 1, 1),
+            (1, 0, 1),
+            (1, 1, 0),
+            (1, 2, 2),
+            (2, 1, 2),
+            (2, 2, 1),
+            (15, 15, 15),
+            (16, 16, 16),
+            (17, 17, 17),
+            (63, 63, 63),
+            (64, 64, 64),
+            (65, 65, 65),
+            (255, 255, 255),
+            (256, 256, 256),
+            (257, 257, 257),
+            (2048, 2048, 2048),
+            (2049, 2049, 2049),
+        ];
+        let mut state = 0xC0FF_EE00_D15C_AFEEu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for &(len_a, len_b, scalars_len) in &lengths {
+            let powers_a: Vec<Q2> = (0..len_a)
+                .map(|i| {
+                    QuadraticExtension([
+                        GoldilocksField(if i < raw_specials.len() {
+                            raw_specials[i]
+                        } else {
+                            next()
+                        }),
+                        GoldilocksField(if i < raw_specials.len() {
+                            raw_specials[raw_specials.len() - 1 - i]
+                        } else {
+                            next()
+                        }),
+                    ])
+                })
+                .collect();
+            let powers_b: Vec<Q2> = (0..len_b)
+                .map(|_| QuadraticExtension([GoldilocksField(next()), GoldilocksField(next())]))
+                .collect();
+            let scalars: Vec<GF> = (0..scalars_len)
+                .map(|i| {
+                    GoldilocksField(if i < raw_specials.len() {
+                        raw_specials[(i * 5) % raw_specials.len()]
+                    } else {
+                        next()
+                    })
+                })
+                .collect();
+
+            let expected_a = <GF as Extendable<2>>::extension_base_dot_product(&powers_a, &scalars);
+            let expected_b = <GF as Extendable<2>>::extension_base_dot_product(&powers_b, &scalars);
+            let (actual_a, actual_b) = <GF as Extendable<2>>::extension_base_dot_product_pair(
+                &powers_a, &powers_b, &scalars,
+            );
+            for limb in 0..2 {
+                // Pairing must preserve the single kernel's raw representative,
+                // not merely its canonical field value.
+                assert_eq!(
+                    actual_a.0[limb].0, expected_a.0[limb].0,
+                    "raw pair limb {limb} point A mismatch at ({len_a}, {len_b}, {scalars_len})"
+                );
+                assert_eq!(
+                    actual_b.0[limb].0, expected_b.0[limb].0,
+                    "raw pair limb {limb} point B mismatch at ({len_a}, {len_b}, {scalars_len})"
+                );
+                assert_eq!(
+                    actual_a.0[limb].to_canonical_u64(),
+                    expected_a.0[limb].to_canonical_u64()
+                );
+                assert_eq!(
+                    actual_b.0[limb].to_canonical_u64(),
+                    expected_b.0[limb].to_canonical_u64()
+                );
+            }
+        }
+    }
+
+#[test]
     fn ext2_extension_base_dot_product_reduce160_bound() {
         use num::BigUint;
 
@@ -943,6 +1216,68 @@ mod tests {
                 GF::from_noncanonical_u64(next())
             }));
             check(terms, beta);
+        }
+    }
+
+    #[test]
+    fn ext2_mul_add_matches_mul_then_add_raw() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..2000 {
+            let a = QuadraticExtension(core::array::from_fn(|_| {
+                GF::from_canonical_u64(next() % GF::ORDER)
+            }));
+            let b = QuadraticExtension(core::array::from_fn(|_| {
+                GF::from_canonical_u64(next() % GF::ORDER)
+            }));
+            let c = QuadraticExtension(core::array::from_fn(|_| {
+                GF::from_canonical_u64(next() % GF::ORDER)
+            }));
+            let expected = a * b + c;
+            let actual = ext2_mul_add(a, b, c);
+            for limb in 0..2 {
+                assert_eq!(
+                    actual.0[limb].0, expected.0[limb].0,
+                    "raw limb {limb} mismatch for a={a:?} b={b:?} c={c:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ext2_mul_add_matches_mul_then_add_for_noncanonical_limbs() {
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut next_noncanonical = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Direct tuple construction is intentional. `from_noncanonical_u64`
+            // accepts the entire u64 range, so random calls almost never sample
+            // the narrow noncanonical interval [ORDER, u64::MAX].
+            GoldilocksField(u64::MAX - state % (u64::MAX - GF::ORDER + 1))
+        };
+        for _ in 0..2000 {
+            let a = QuadraticExtension(core::array::from_fn(|_| next_noncanonical()));
+            let b = QuadraticExtension(core::array::from_fn(|_| next_noncanonical()));
+            let c = QuadraticExtension(core::array::from_fn(|_| next_noncanonical()));
+            for value in a.0.into_iter().chain(b.0).chain(c.0) {
+                assert!(value.0 >= GF::ORDER, "test limb must be noncanonical");
+            }
+
+            let expected = a * b + c;
+            let actual = ext2_mul_add(a, b, c);
+            for limb in 0..2 {
+                assert_eq!(
+                    actual.0[limb].to_canonical_u64(),
+                    expected.0[limb].to_canonical_u64(),
+                    "canonical limb {limb} mismatch for a={a:?} b={b:?} c={c:?}"
+                );
+            }
         }
     }
 
