@@ -532,6 +532,16 @@ fn fft_classic_simd_single_layer_neon(
     let half = 1usize << lg_half_m;
     let m = half << 1;
     debug_assert!(omega_row.len() >= half);
+    // Large passes may run on an SME feeder thread instead (bit-identical
+    // kernel; see ssve_fft). The length gate keeps the 2^13 cache-blocked
+    // slices on the tuned NEON path where they are already L1-resident.
+    if values.len() >= (1 << 14) && lg_half_m >= 4 {
+        if let Some(token) = crate::arch::aarch64::ssve_fft::try_feeder() {
+            crate::arch::aarch64::ssve_fft::single_layer(values, lg_half_m, omega_row);
+            drop(token);
+            return;
+        }
+    }
     let base = values.as_mut_ptr().cast::<u64>();
     unsafe {
         let eps = vdupq_n_u64(EPSILON);
@@ -994,6 +1004,15 @@ fn fft_classic_simd_layers<P, M>(
                     packed_values.len() * P::WIDTH,
                 )
             };
+            // A couple of feeder threads run these passes on the cluster's
+            // SME block (bit-identical kernel; see ssve_fft) so their
+            // butterflies stop competing with the other workers' pipes. The
+            // token is held across the whole fused schedule: once a thread
+            // becomes a feeder it streams every remaining deep pass of this
+            // transform, instead of thrashing the permit between columns.
+            // The streaming kernel needs q >= two 512-bit vectors, so the
+            // rare lg_half_m < 4 head passes (r = 0 schedules) stay on NEON.
+            let mut ssve_token = None;
             while lg_half_m + 2 <= end {
                 let w1_row = unsafe {
                     let row = &root_table[lg_half_m];
@@ -1009,9 +1028,20 @@ fn fft_classic_simd_layers<P, M>(
                         row.len(),
                     )
                 };
+                if lg_half_m >= 4 {
+                    if ssve_token.is_none() {
+                        ssve_token = crate::arch::aarch64::ssve_fft::try_feeder();
+                    }
+                    if ssve_token.is_some() {
+                        crate::arch::aarch64::ssve_fft::fused2(scalars, lg_half_m, w1_row, w2_row);
+                        lg_half_m += 2;
+                        continue;
+                    }
+                }
                 fft_classic_simd_two_layers_neon(scalars, lg_half_m, w1_row, w2_row);
                 lg_half_m += 2;
             }
+            drop(ssve_token);
         }
         if lg_half_m < end {
             fft_classic_simd_single_layer_with::<P, M>(
@@ -3004,6 +3034,73 @@ mod tests {
                 "raw limb mismatch at 2^{lg_n}, r={r}"
             );
         }
+    }
+
+    /// The SSVE feeder kernels must reproduce the NEON kernels' raw words on
+    /// the full non-canonical `u64` domain — representatives are hashed as-is.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn ssve_kernels_match_neon_raw_words() {
+        use super::{fft_classic_simd_single_layer_neon, fft_classic_simd_two_layers_neon};
+        use crate::arch::aarch64::ssve_fft;
+
+        // Skip silently where SME is absent or disabled; the token also keeps
+        // the in-kernel dispatch from re-routing the NEON arm below.
+        let Some(hold_all) = ssve_fft::try_feeder() else {
+            return;
+        };
+        let hold_rest: Vec<_> = core::iter::from_fn(ssve_fft::try_feeder).collect();
+
+        let mut state = 0x243F_6A88_85A3_08D3u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Bias toward adversarial representatives: top-heavy words hit the
+            // double-correction paths of add/sub and the mul carry folds.
+            match state & 7 {
+                0 => state | 0xFFFF_FFFF_0000_0000,
+                1 => u64::MAX - (state >> 56),
+                _ => state,
+            }
+        };
+
+        for lg_half_m in [4usize, 5, 7, 9] {
+            let q = 1usize << lg_half_m;
+            for blocks in [1usize, 3] {
+                let len = 4 * q * blocks;
+                let values: Vec<GoldilocksField> =
+                    (0..len).map(|_| GoldilocksField(next())).collect();
+                let w1: Vec<GoldilocksField> = (0..q).map(|_| GoldilocksField(next())).collect();
+                let w2: Vec<GoldilocksField> =
+                    (0..2 * q).map(|_| GoldilocksField(next())).collect();
+
+                let mut neon = values.clone();
+                fft_classic_simd_two_layers_neon(&mut neon, lg_half_m, &w1, &w2);
+                let mut ssve = values.clone();
+                ssve_fft::fused2(&mut ssve, lg_half_m, &w1, &w2);
+                assert_eq!(
+                    neon.iter().map(|x| x.0).collect::<Vec<_>>(),
+                    ssve.iter().map(|x| x.0).collect::<Vec<_>>(),
+                    "fused raw-word mismatch at lg_half_m={lg_half_m}, blocks={blocks}"
+                );
+
+                let single_len = 2 * q * blocks;
+                let values: Vec<GoldilocksField> =
+                    (0..single_len).map(|_| GoldilocksField(next())).collect();
+                let mut neon = values.clone();
+                fft_classic_simd_single_layer_neon(&mut neon, lg_half_m, &w1);
+                let mut ssve = values.clone();
+                ssve_fft::single_layer(&mut ssve, lg_half_m, &w1);
+                assert_eq!(
+                    neon.iter().map(|x| x.0).collect::<Vec<_>>(),
+                    ssve.iter().map(|x| x.0).collect::<Vec<_>>(),
+                    "single raw-word mismatch at lg_half_m={lg_half_m}, blocks={blocks}"
+                );
+            }
+        }
+        drop(hold_rest);
+        drop(hold_all);
     }
 
     #[test]
