@@ -1,15 +1,20 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec::Vec};
 
+use core::any::TypeId;
+
 use itertools::Itertools;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
+use crate::field::extension::quadratic::QuadraticExtension;
 use crate::field::extension::Extendable;
 use crate::field::fft::{
     FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
 };
+use crate::field::goldilocks_extensions::ext2_mul_add;
+use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
@@ -794,6 +799,51 @@ fn accumulate_linear_quotient<F: Field>(
     }
     // Highest slot: the quotient coefficient there is the explicit zero pad.
     buf[d - 1] *= shift;
+    // Production Goldilocks-quadratic fast path: the two Horner steps per
+    // slot are each a multiply and an add, and `ext2_mul_add` folds the
+    // addend into the multiply's 160-bit accumulators before one reduction
+    // pair. The generic loop performs a delayed ext2 multiply (two
+    // `reduce160`) followed by a canonicalizing extension add (two more
+    // reductions) per step; the fused form keeps exactly two `reduce160`
+    // per step. Field-equal by construction; the raw representative may
+    // differ, under the same license as the other delayed reducers in this
+    // file.
+    if TypeId::of::<F>() == TypeId::of::<QuadraticExtension<GoldilocksField>>() {
+        // SAFETY: the TypeId comparison proves `F` is exactly
+        // `QuadraticExtension<GoldilocksField>`, not merely a type with a
+        // similar representation. Therefore size and alignment are equal and
+        // the pointer casts below preserve layout, provenance and length.
+        debug_assert_eq!(
+            core::mem::size_of::<F>(),
+            core::mem::size_of::<QuadraticExtension<GoldilocksField>>()
+        );
+        debug_assert_eq!(
+            core::mem::align_of::<F>(),
+            core::mem::align_of::<QuadraticExtension<GoldilocksField>>()
+        );
+        let buf_q = unsafe {
+            core::slice::from_raw_parts_mut(
+                buf.as_mut_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
+                buf.len(),
+            )
+        };
+        let coeffs_q = unsafe {
+            core::slice::from_raw_parts(
+                coeffs.as_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
+                coeffs.len(),
+            )
+        };
+        let z_q =
+            unsafe { *(&z as *const F as *const QuadraticExtension<GoldilocksField>) };
+        let shift_q =
+            unsafe { *(&shift as *const F as *const QuadraticExtension<GoldilocksField>) };
+        let mut acc = QuadraticExtension::<GoldilocksField>::ZERO;
+        for i in (0..d - 1).rev() {
+            acc = ext2_mul_add(acc, z_q, coeffs_q[i + 1]);
+            buf_q[i] = ext2_mul_add(buf_q[i], shift_q, acc);
+        }
+        return;
+    }
     // Synthetic division, highest coefficient first: the quotient's
     // coefficient at `x^i` is the accumulator after absorbing `coeffs[i + 1]`.
     let mut acc = F::ZERO;
@@ -1083,6 +1133,128 @@ mod tests {
 
             assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
             assert_eq!(raw(&actual.coeffs), raw(&expected_in_place.coeffs));
+        }
+    }
+
+    /// Exercise the TypeId-guarded Goldilocks D2 cast and fused Horner path
+    /// with raw limbs that are guaranteed to be noncanonical. The fused
+    /// reducer is allowed to choose a different representative, so this
+    /// differential compares canonical values against the generic recurrence.
+    #[test]
+    fn goldilocks_d2_accumulation_fast_path_matches_generic_noncanonical() {
+        use crate::field::types::{Field64, PrimeField64};
+
+        type F = QuadraticExtension<GoldilocksField>;
+
+        fn next_noncanonical(state: &mut u64) -> GoldilocksField {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            // This direct tuple limb is always in [ORDER, u64::MAX]. Random
+            // `from_noncanonical_u64` calls hit that interval only about once
+            // per 2^32 samples and would not meaningfully exercise it.
+            GoldilocksField(
+                u64::MAX
+                    - *state % (u64::MAX - <GoldilocksField as Field64>::ORDER + 1),
+            )
+        }
+
+        fn next_extension(state: &mut u64) -> F {
+            QuadraticExtension([next_noncanonical(state), next_noncanonical(state)])
+        }
+
+        fn generic_accumulate(
+            final_poly: &mut PolynomialCoeffs<F>,
+            composition_poly: &PolynomialCoeffs<F>,
+            z: F,
+            shift: F,
+        ) {
+            let d = composition_poly.len();
+            let coeffs = &composition_poly.coeffs;
+            let buf = &mut final_poly.coeffs;
+            for value in buf.iter_mut().skip(d) {
+                *value *= shift;
+            }
+            if buf.len() < d {
+                buf.resize(d, F::ZERO);
+            }
+            if d == 0 {
+                return;
+            }
+            buf[d - 1] *= shift;
+            let mut acc = F::ZERO;
+            for i in (0..d - 1).rev() {
+                acc = acc * z + coeffs[i + 1];
+                buf[i] = buf[i] * shift + acc;
+            }
+        }
+
+        fn canonical(values: &[F]) -> Vec<u64> {
+            values
+                .iter()
+                .flat_map(|value| value.0)
+                .map(|limb| limb.to_canonical_u64())
+                .collect()
+        }
+
+        fn guarded_scalar_cast<T: Field>(value: T) -> F {
+            assert_eq!(core::any::TypeId::of::<T>(), core::any::TypeId::of::<F>());
+            assert_eq!(core::mem::size_of::<T>(), core::mem::size_of::<F>());
+            assert_eq!(core::mem::align_of::<T>(), core::mem::align_of::<F>());
+            // SAFETY: the exact TypeId equality above proves T is F, which
+            // proves identical validity, size and alignment requirements.
+            unsafe { *(&value as *const T).cast::<F>() }
+        }
+
+        let mut state = 0xA076_1D64_78BD_642Fu64;
+        let cast_source = next_extension(&mut state);
+        let cast_result = guarded_scalar_cast(cast_source);
+        assert_eq!(
+            cast_result.0.map(|limb| limb.0),
+            cast_source.0.map(|limb| limb.0)
+        );
+
+        for (old_len, d) in [
+            (0usize, 0usize),
+            (3, 0),
+            (0, 1),
+            (0, 8),
+            (1, 1),
+            (8, 8),
+            (4, 8),
+            (8, 4),
+            (256, 256),
+        ] {
+            let initial = PolynomialCoeffs::new(
+                (0..old_len)
+                    .map(|_| next_extension(&mut state))
+                    .collect(),
+            );
+            let composition_poly = PolynomialCoeffs::new(
+                (0..d).map(|_| next_extension(&mut state)).collect(),
+            );
+            let z = next_extension(&mut state);
+            let shift = next_extension(&mut state);
+
+            for limb in initial
+                .coeffs
+                .iter()
+                .chain(&composition_poly.coeffs)
+                .chain([&z, &shift])
+                .flat_map(|value| value.0)
+            {
+                assert!(
+                    limb.0 >= <GoldilocksField as Field64>::ORDER,
+                    "test limb must be genuinely noncanonical"
+                );
+            }
+
+            let mut expected = initial.clone();
+            generic_accumulate(&mut expected, &composition_poly, z, shift);
+            let mut actual = initial;
+            accumulate_linear_quotient(&mut actual, &composition_poly, z, shift);
+
+            assert_eq!(canonical(&actual.coeffs), canonical(&expected.coeffs));
         }
     }
 

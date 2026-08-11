@@ -2516,15 +2516,20 @@ fn compute_quotient_polys<
                 }
             }
         });
-    let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
+    let inverse_coset_shift_powers =
+        precomputed::inverse_coset_shift_powers_scaled::<F>(points.len());
     challenge_columns
         .into_par_iter()
         .map(|column| {
             // Fuse the coset post-scaling into the IFFT instead of walking the
             // whole coefficient vector again afterwards, reusing a
-            // process-global inverse-shift power chain.
+            // process-global inverse-shift power chain. The cached chain
+            // already carries the IFFT's `1/n` normalization, so each
+            // coefficient receives exactly one multiply in the post-pass
+            // instead of a `1/n` multiply followed by the shift-power
+            // multiply.
             PolynomialValues::new(column)
-                .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
+                .coset_ifft_with_prescaled_powers(inverse_coset_shift_powers.as_slice())
         })
         .collect()
 }
@@ -2544,6 +2549,8 @@ pub(crate) mod precomputed {
         use std::collections::HashMap;
         use std::sync::{Arc, OnceLock, RwLock};
 
+        use plonky2_util::log2_strict;
+
         use crate::field::types::Field;
 
         type Map = RwLock<HashMap<(TypeId, usize), Arc<dyn Any + Send + Sync>>>;
@@ -2552,6 +2559,7 @@ pub(crate) mod precomputed {
         static COSET_POWERS: OnceLock<Map> = OnceLock::new();
         static SHIFTED_SUBGROUPS: OnceLock<Map> = OnceLock::new();
         static INVERSE_COSET_POWERS: OnceLock<Map> = OnceLock::new();
+        static INVERSE_COSET_POWERS_SCALED: OnceLock<Map> = OnceLock::new();
 
         fn get_or_compute<F: Field>(
             cache: &'static OnceLock<Map>,
@@ -2611,6 +2619,27 @@ pub(crate) mod precomputed {
                 F::coset_shift().inverse().powers().take(degree).collect()
             })
         }
+
+        /// Cached `n_inv * F::coset_shift().inverse().powers().take(degree)`.
+        /// The quotient columns' coset IFFT post-scaling multiplies every
+        /// coefficient by both `1/n` and the inverse shift power, so the two
+        /// canonical factors are folded into one per-slot multiply. The
+        /// value for each slot is the product of the same two factors the
+        /// two-multiply form uses; field multiplication is commutative, so
+        /// every coefficient is field-identical.
+        pub(crate) fn inverse_coset_shift_powers_scaled<F: Field>(
+            degree: usize,
+        ) -> Arc<Vec<F>> {
+            get_or_compute(&INVERSE_COSET_POWERS_SCALED, degree, || {
+                let n_inv = F::inverse_2exp(log2_strict(degree));
+                F::coset_shift()
+                    .inverse()
+                    .powers()
+                    .take(degree)
+                    .map(|power| n_inv * power)
+                    .collect()
+            })
+        }
     }
 
     /// Without `std` there is no process-global synchronization; fall back to
@@ -2644,11 +2673,25 @@ pub(crate) mod precomputed {
                     .collect::<Vec<F>>(),
             )
         }
+
+        pub(crate) fn inverse_coset_shift_powers_scaled<F: Field>(
+            degree: usize,
+        ) -> Arc<Vec<F>> {
+            let n_inv = F::inverse_2exp(plonky2_util::log2_strict(degree));
+            Arc::new(
+                F::coset_shift()
+                    .inverse()
+                    .powers()
+                    .take(degree)
+                    .map(|power| n_inv * power)
+                    .collect::<Vec<F>>(),
+            )
+        }
     }
 
     pub(crate) use imp::{
-        coset_shift_powers, inverse_coset_shift_powers, shifted_two_adic_subgroup,
-        two_adic_subgroup,
+        coset_shift_powers, inverse_coset_shift_powers, inverse_coset_shift_powers_scaled,
+        shifted_two_adic_subgroup, two_adic_subgroup,
     };
 }
 
