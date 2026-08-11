@@ -35,6 +35,14 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    #[inline]
+    fn extension_base_dot_products_2(
+        extension_values: &[QuadraticExtension<Self>],
+        base_polynomials: [&[Self]; 2],
+    ) -> [QuadraticExtension<Self>; 2] {
+        ext2_base_scalar_dot_products_2(extension_values, base_polynomials)
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -278,6 +286,150 @@ fn ext2_base_scalar_dot_product(
     }
     result
 }
+
+/// Generate a fixed-stack same-point polynomial evaluator. The literal width
+/// makes `unroll_for_loops` expand every coefficient-column loop; only the
+/// powers-table loop remains dynamic.
+macro_rules! ext2_base_scalar_dot_products {
+    ($function:ident, $chunk_function:ident, $width:literal) => {
+        #[inline(always)]
+        #[unroll_for_loops]
+        fn $chunk_function(
+            extension_values: &[QuadraticExtension<GoldilocksField>],
+            base_polynomials: [&[GoldilocksField]; $width],
+            lengths: [usize; $width],
+            start: usize,
+            end: usize,
+            common_len: usize,
+        ) -> [QuadraticExtension<GoldilocksField>; $width] {
+            debug_assert!(start <= end);
+            debug_assert!(end - start <= u32::MAX as usize);
+
+            let dense_end = end.min(common_len).max(start);
+            let mut lo0 = [0u128; $width];
+            let mut hi0 = [0u32; $width];
+            let mut lo1 = [0u128; $width];
+            let mut hi1 = [0u32; $width];
+
+            // Production polynomials have equal lengths. Load each extension
+            // power once, then update independent u160 accumulators for every
+            // coefficient column without a length branch or dynamic inner loop.
+            for i in start..dense_end {
+                let QuadraticExtension([power0, power1]) = extension_values[i];
+                for j in 0..$width {
+                    let coefficient = base_polynomials[j][i].0;
+                    u160_add_product(&mut lo0[j], &mut hi0[j], power0.0, coefficient);
+                    u160_add_product(&mut lo1[j], &mut hi1[j], power1.0, coefficient);
+                }
+            }
+
+            // Retain independent zip/min semantics for ragged coefficient
+            // slices without slowing the equal-length production prefix.
+            for i in dense_end..end {
+                let QuadraticExtension([power0, power1]) = extension_values[i];
+                for j in 0..$width {
+                    if i < lengths[j] {
+                        let coefficient = base_polynomials[j][i].0;
+                        u160_add_product(&mut lo0[j], &mut hi0[j], power0.0, coefficient);
+                        u160_add_product(&mut lo1[j], &mut hi1[j], power1.0, coefficient);
+                    }
+                }
+            }
+
+            let mut chunk = [QuadraticExtension::ZERO; $width];
+            for j in 0..$width {
+                if start < lengths[j] {
+                    // SAFETY: each accumulator contains at most u32::MAX
+                    // arbitrary-u64 products, the exact bound established for
+                    // the single-dot evaluator above.
+                    chunk[j] = QuadraticExtension([
+                        unsafe { reduce160(lo0[j], hi0[j]) },
+                        unsafe { reduce160(lo1[j], hi1[j]) },
+                    ]);
+                }
+            }
+            chunk
+        }
+
+        /// Evaluate fixed-width base-coefficient polynomials against one shared
+        /// quadratic-extension powers table without heap allocation.
+        #[doc(hidden)]
+        #[inline]
+        #[unroll_for_loops]
+        fn $function(
+            extension_values: &[QuadraticExtension<GoldilocksField>],
+            base_polynomials: [&[GoldilocksField]; $width],
+        ) -> [QuadraticExtension<GoldilocksField>; $width] {
+            const MAX_TERMS_PER_REDUCTION: usize = u32::MAX as usize;
+
+            let mut lengths = [0usize; $width];
+            let mut max_len = 0usize;
+            let mut common_len = extension_values.len();
+            for j in 0..$width {
+                lengths[j] = extension_values.len().min(base_polynomials[j].len());
+                max_len = max_len.max(lengths[j]);
+                common_len = common_len.min(lengths[j]);
+            }
+
+            if max_len <= MAX_TERMS_PER_REDUCTION {
+                return $chunk_function(
+                    extension_values,
+                    base_polynomials,
+                    lengths,
+                    0,
+                    max_len,
+                    common_len,
+                );
+            }
+
+            // This path is unreachable for production degrees, but retains the
+            // reduce160 bound for arbitrarily long slices without changing the
+            // fixed-stack interface.
+            let mut output = [QuadraticExtension::ZERO; $width];
+            let mut start = 0usize;
+            while start < max_len {
+                let end = max_len.min(start.saturating_add(MAX_TERMS_PER_REDUCTION));
+                let chunk = $chunk_function(
+                    extension_values,
+                    base_polynomials,
+                    lengths,
+                    start,
+                    end,
+                    common_len,
+                );
+                for j in 0..$width {
+                    if start < lengths[j] {
+                        if start == 0 {
+                            output[j] = chunk[j];
+                        } else {
+                            output[j] += chunk[j];
+                        }
+                    }
+                }
+                start = end;
+            }
+            output
+        }
+    };
+}
+
+ext2_base_scalar_dot_products!(
+    ext2_base_scalar_dot_products_2,
+    ext2_base_scalar_dot_products_2_chunk,
+    2
+);
+#[cfg(test)]
+ext2_base_scalar_dot_products!(
+    ext2_base_scalar_dot_products_4,
+    ext2_base_scalar_dot_products_4_chunk,
+    4
+);
+#[cfg(test)]
+ext2_base_scalar_dot_products!(
+    ext2_base_scalar_dot_products_8,
+    ext2_base_scalar_dot_products_8_chunk,
+    8
+);
 
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction
 /// across the complete production FRI arity. For raw limbs below 2^64,
@@ -884,6 +1036,158 @@ mod tests {
         // Raw representatives are deliberately not part of the assertion:
         // delayed and per-term reduction are required to agree as field
         // values, including when every input can occupy the full u64 range.
+    }
+
+    fn assert_ext2_batch_matches_generic<const WIDTH: usize>(
+        powers: &[Q2],
+        polynomials: [&[GF]; WIDTH],
+        actual: [Q2; WIDTH],
+        context: &str,
+    ) {
+        for column in 0..WIDTH {
+            let expected = generic_extension_base_dot_product(powers, polynomials[column]);
+            for limb in 0..2 {
+                assert_eq!(
+                    actual[column].0[limb].to_canonical_u64(),
+                    expected.0[limb].to_canonical_u64(),
+                    "column {column} limb {limb}: {context}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extension_base_dot_products_2_default_preserves_order_and_raw_outputs() {
+        let powers: Vec<Q4> = (0..13)
+            .map(|i| {
+                QuarticExtension(core::array::from_fn(|limb| {
+                    GoldilocksField(
+                        (i as u64 + 1)
+                            .wrapping_mul(0xD6E8_FEB8_6659_FD93u64.rotate_left(limb as u32)),
+                    )
+                }))
+            })
+            .collect();
+        let polynomials = [
+            (0..12).map(|i| GoldilocksField(i * 17)).collect(),
+            (0..14)
+                .map(|i| GoldilocksField((i as u64).wrapping_mul(u64::MAX - 2)))
+                .collect(),
+        ];
+        let polynomial_refs = polynomials.each_ref().map(Vec::as_slice);
+        let expected = polynomial_refs
+            .map(|coeffs| <GF as Extendable<4>>::extension_base_dot_product(&powers, coeffs));
+        let actual =
+            <GF as Extendable<4>>::extension_base_dot_products_2(&powers, polynomial_refs);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn ext2_extension_base_dot_products_match_generic_at_boundaries() {
+        let p = GF::ORDER;
+        let specials = [0, 1, 2, p - 1, p, p + 1, u64::MAX - 1, u64::MAX];
+        for &powers_len in &[0usize, 1, 2, 3, 7, 8, 9, 63, 64, 65, 257, 4096, 16384] {
+            let powers = (0..powers_len)
+                .map(|i| {
+                    QuadraticExtension([
+                        GoldilocksField(specials[i % specials.len()]),
+                        GoldilocksField(specials[(i * 5 + 3) % specials.len()]),
+                    ])
+                })
+                .collect::<Vec<_>>();
+            let lengths = [
+                0,
+                1,
+                powers_len.saturating_sub(1),
+                powers_len,
+                powers_len.saturating_add(1),
+                powers_len / 2,
+                powers_len.saturating_add(7),
+                powers_len,
+            ];
+            let polynomials: [Vec<GF>; 8] = core::array::from_fn(|column| {
+                (0..lengths[column])
+                    .map(|i| GoldilocksField(specials[(i * 3 + column) % specials.len()]))
+                    .collect()
+            });
+            let refs = polynomials.each_ref().map(Vec::as_slice);
+
+            assert_ext2_batch_matches_generic(
+                &powers,
+                [refs[0], refs[1]],
+                super::ext2_base_scalar_dot_products_2(&powers, [refs[0], refs[1]]),
+                &format!("width 2, powers={powers_len}"),
+            );
+            assert_ext2_batch_matches_generic(
+                &powers,
+                [refs[0], refs[1], refs[2], refs[3]],
+                super::ext2_base_scalar_dot_products_4(
+                    &powers,
+                    [refs[0], refs[1], refs[2], refs[3]],
+                ),
+                &format!("width 4, powers={powers_len}"),
+            );
+            assert_ext2_batch_matches_generic(
+                &powers,
+                refs,
+                super::ext2_base_scalar_dot_products_8(&powers, refs),
+                &format!("width 8, powers={powers_len}"),
+            );
+            let trait_actual = <GF as Extendable<2>>::extension_base_dot_products_2(
+                &powers,
+                [refs[6], refs[7]],
+            );
+            assert_ext2_batch_matches_generic(
+                &powers,
+                [refs[6], refs[7]],
+                trait_actual,
+                &format!("trait width 2, powers={powers_len}"),
+            );
+        }
+    }
+
+    #[test]
+    fn ext2_extension_base_dot_products_random_noncanonical_differential() {
+        let mut state = 0x243F_6A88_85A3_08D3u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for case in 0..200 {
+            let powers_len = (next() as usize) % 300;
+            let powers = (0..powers_len)
+                .map(|_| QuadraticExtension([GoldilocksField(next()), GoldilocksField(next())]))
+                .collect::<Vec<_>>();
+            let polynomials: [Vec<GF>; 8] = core::array::from_fn(|_| {
+                let len = (next() as usize) % 320;
+                (0..len).map(|_| GoldilocksField(next())).collect()
+            });
+            let refs = polynomials.each_ref().map(Vec::as_slice);
+
+            assert_ext2_batch_matches_generic(
+                &powers,
+                [refs[0], refs[1]],
+                super::ext2_base_scalar_dot_products_2(&powers, [refs[0], refs[1]]),
+                &format!("random width 2 case {case}"),
+            );
+            assert_ext2_batch_matches_generic(
+                &powers,
+                [refs[0], refs[1], refs[2], refs[3]],
+                super::ext2_base_scalar_dot_products_4(
+                    &powers,
+                    [refs[0], refs[1], refs[2], refs[3]],
+                ),
+                &format!("random width 4 case {case}"),
+            );
+            assert_ext2_batch_matches_generic(
+                &powers,
+                refs,
+                super::ext2_base_scalar_dot_products_8(&powers, refs),
+                &format!("random width 8 case {case}"),
+            );
+        }
     }
 
     #[test]
