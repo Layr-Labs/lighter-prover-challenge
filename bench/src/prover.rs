@@ -50,7 +50,28 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
     }
 }
 
-const LIGHT_TX_PROOF_WINDOW: usize = 4;
+// Light-proof throughput is the run's terminal constraint (the chain drains
+// concurrently and finishes within a step of the last tx proof; the block
+// waits for both), so the window depth divides the longest phase directly.
+// The depth-4 ceiling dated from tighter-memory hosts: measured peak RSS is
+// ~6.8 GB at depth 4 against 24 GB local / 48 GB ranked, and mid-run CPU
+// occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
+// machine has headroom for deeper overlap. LIGHTER_LIGHT_WINDOW overrides
+// for experiments.
+const LIGHT_TX_PROOF_WINDOW: usize = 6;
+
+/// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
+/// experiments; read once.
+fn light_tx_proof_window() -> usize {
+    static WINDOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        std::env::var("LIGHTER_LIGHT_WINDOW")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|w| (1..=12).contains(w))
+            .unwrap_or(LIGHT_TX_PROOF_WINDOW)
+    })
+}
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
@@ -193,6 +214,9 @@ fn chain_step_proof(
         })?;
         BlockTxChainCircuit::prove_prepared(pending, chain_data)
     })();
+    // This step is no longer part of the runnable backlog (see the matching
+    // spine_backlog_add(1) at both spawn sites).
+    plonky2::hash::poseidon2::spine_backlog_add(-1);
     result.unwrap_or_else(|error| {
         panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")
     })
@@ -402,6 +426,11 @@ fn prove_path(
                 // The predecessor handle moves into the chain thread, which waits for it only
                 // after its tx-proof-side witness generation: the path thread never blocks here.
                 let previous = chain.take();
+                // This step is now runnable (its tx proof exists); while the
+                // count of runnable-but-unproven steps is high, the chain is
+                // the laggard and its GPU trees take priority (see
+                // spine_backlog_add). Decremented inside chain_step_proof.
+                plonky2::hash::poseidon2::spine_backlog_add(1);
                 let handle = std::thread::Builder::new()
                     .name(format!("{path:?}-chain-step-{chain_step}"))
                     .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -454,7 +483,7 @@ fn prove_path(
             );
             let max_in_flight =
                 if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
-                    LIGHT_TX_PROOF_WINDOW
+                    light_tx_proof_window()
                 } else {
                     1
                 };
@@ -506,7 +535,7 @@ fn prove_path(
         // pre-execution and final block phases — but only once this path is the
         // last one proving, since the switch is process-global (see
         // [`claims_exclusive_gpu_phase`]).
-        let exclusive_drain = claims_exclusive_gpu_phase(active_paths);
+        let mut exclusive_drain = claims_exclusive_gpu_phase(active_paths);
         #[cfg(feature = "diagnostic_profile")]
         {
             plonky2::util::profile::counter(
@@ -524,22 +553,45 @@ fn prove_path(
             plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
         }
         while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
-            #[cfg(feature = "diagnostic_profile")]
-            let _join_wait = plonky2::util::profile::span("wait", "tx_proof_drain_join");
-            let tx_proof = proof_handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            // The sibling path may retire mid-drain; re-sampling flips the
+            // remaining steps onto the exclusive-GPU routing the moment this
+            // path is the last one proving (the read is a relaxed atomic).
+            if !exclusive_drain && claims_exclusive_gpu_phase(active_paths) {
+                exclusive_drain = true;
+                plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
+            }
+            let tx_proof = {
+                #[cfg(feature = "diagnostic_profile")]
+                let _join_wait = plonky2::util::profile::span("wait", "tx_proof_drain_join");
+                proof_handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            };
+            // Spawn the drained step exactly like the pipelined phase so its
+            // phase-1 witness (which needs only the tx proof) overlaps the
+            // predecessor's prove instead of serializing behind it. Only one
+            // proof's GPU work is in flight at a time either way — phase 1 is
+            // pure CPU generator execution — so the exclusive-drain contract
+            // above is unchanged.
             let previous = chain.take();
-            chain = Some(ChainState::Ready(chain_step_proof(
-                path,
-                chain_target,
-                chain_data,
-                chain_step,
-                previous,
-                base,
-                dummy_proof,
-                &tx_proof,
-            )));
+            plonky2::hash::poseidon2::spine_backlog_add(1);
+            let handle = std::thread::Builder::new()
+                .name(format!("{path:?}-chain-drain-{chain_step}"))
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    chain_step_proof(
+                        path,
+                        chain_target,
+                        chain_data,
+                        chain_step,
+                        previous,
+                        base,
+                        dummy_proof,
+                        &tx_proof,
+                    )
+                })
+                .expect("chain drain thread must start");
+            chain = Some(ChainState::InFlight(handle));
         }
         let chain_proof = chain
             .map(ChainState::wait)
