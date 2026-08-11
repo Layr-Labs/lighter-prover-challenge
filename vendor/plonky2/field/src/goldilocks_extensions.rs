@@ -318,6 +318,56 @@ fn ext2_dot_product_arity16(
     QuadraticExtension([c0, c1])
 }
 
+/// Fused `a * b + c` for the Goldilocks quadratic extension, delaying both
+/// modular reductions until after the addend limbs are folded into the
+/// 160-bit accumulators. This is the multiply-add used by the FRI final-poly
+/// Horner sweep, where the separate spelling performs a delayed `ext2_mul`
+/// (two `reduce160`) followed by a canonicalizing extension add (two more
+/// reductions); this form performs exactly two `reduce160` for the whole
+/// operation.
+///
+/// Bounds: each of the three 64x64 products is below `2^128`, the addend
+/// limbs are below `2^64`, and the `7 * (a1 * b1)` term is below
+/// `7 * 2^128`; the combined `c0` accumulator is below `10 * 2^128` and
+/// `c1` below `3 * 2^128`, both far under `reduce160`'s
+/// `2^160 - 2^128 + 2^96` precondition.
+#[inline(always)]
+pub fn ext2_mul_add(
+    a: QuadraticExtension<GoldilocksField>,
+    b: QuadraticExtension<GoldilocksField>,
+    c: QuadraticExtension<GoldilocksField>,
+) -> QuadraticExtension<GoldilocksField> {
+    let QuadraticExtension([a0, a1]) = a;
+    let QuadraticExtension([b0, b1]) = b;
+    let QuadraticExtension([c0, c1]) = c;
+
+    let (mut c0_plain_lo, mut c0_plain_hi) = (0u128, 0u32);
+    let (mut c0_w_lo, mut c0_w_hi) = (0u128, 0u32);
+    let (mut c1_lo, mut c1_hi) = (0u128, 0u32);
+
+    u160_add_product(&mut c0_plain_lo, &mut c0_plain_hi, a0.0, b0.0);
+    u160_add_product(&mut c0_w_lo, &mut c0_w_hi, a1.0, b1.0);
+    u160_add_product(&mut c1_lo, &mut c1_hi, a0.0, b1.0);
+    u160_add_product(&mut c1_lo, &mut c1_hi, a1.0, b0.0);
+
+    let (sum, carry) = c0_plain_lo.overflowing_add(c0.0 as u128);
+    c0_plain_lo = sum;
+    c0_plain_hi += carry as u32;
+    let (sum, carry) = c1_lo.overflowing_add(c1.0 as u128);
+    c1_lo = sum;
+    c1_hi += carry as u32;
+
+    let (c0_w_lo, c0_w_hi) = u160_times_7(c0_w_lo, c0_w_hi);
+    let (c0_lo, carry) = c0_plain_lo.overflowing_add(c0_w_lo);
+    let c0_hi = c0_plain_hi + c0_w_hi + carry as u32;
+
+    // SAFETY: the bounds documented above are far below reduce160's
+    // `2^160 - 2^128 + 2^96` precondition.
+    let c0 = unsafe { reduce160(c0_lo, c0_hi) };
+    let c1 = unsafe { reduce160(c1_lo, c1_hi) };
+    QuadraticExtension([c0, c1])
+}
+
 /// For each output slot `i`, compute
 /// `out[i] = sum_j powers[j].scalar_mul(polys[j][start + i])`
 /// over every polynomial long enough to reach that slot, delaying modular
@@ -764,6 +814,7 @@ mod tests {
     use crate::extension::quartic::QuarticExtension;
     use crate::extension::quintic::{QuinticExtension, QuinticFirstCoeff};
     use crate::extension::{Extendable, FieldExtension, Frobenius, OEF};
+    use crate::goldilocks_extensions::ext2_mul_add;
     use crate::goldilocks_field::GoldilocksField;
     use crate::types::{Field, Field64, PrimeField64};
 
@@ -943,6 +994,36 @@ mod tests {
                 GF::from_noncanonical_u64(next())
             }));
             check(terms, beta);
+        }
+    }
+
+    #[test]
+    fn ext2_mul_add_matches_mul_then_add_raw() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..2000 {
+            let a = QuadraticExtension(core::array::from_fn(|_| {
+                GF::from_noncanonical_u64(next())
+            }));
+            let b = QuadraticExtension(core::array::from_fn(|_| {
+                GF::from_noncanonical_u64(next())
+            }));
+            let c = QuadraticExtension(core::array::from_fn(|_| {
+                GF::from_noncanonical_u64(next())
+            }));
+            let expected = a * b + c;
+            let actual = ext2_mul_add(a, b, c);
+            for limb in 0..2 {
+                assert_eq!(
+                    actual.0[limb].0, expected.0[limb].0,
+                    "raw limb {limb} mismatch for a={a:?} b={b:?} c={c:?}"
+                );
+            }
         }
     }
 
