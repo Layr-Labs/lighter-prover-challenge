@@ -309,6 +309,14 @@ impl Drop for ForceRangeQuotientFinishFailureGuard {
     }
 }
 impl<F: RichField> PoseidonGateQuotientJob<F> {
+    /// Whether `finish` can return immediately without waiting for Metal.
+    pub(crate) fn is_finished(&self) -> bool {
+        matches!(
+            self.command_buffer.status(),
+            MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+        )
+    }
+
     pub(crate) fn finish(&self) -> Result<&[F], String> {
         self.command_buffer.wait_until_completed();
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
@@ -325,6 +333,14 @@ impl<F: RichField> PoseidonGateQuotientJob<F> {
 }
 
 impl<F: RichField> RangeCheckGateQuotientJob<F> {
+    /// Whether `finish` can return immediately without waiting for Metal.
+    pub(crate) fn is_finished(&self) -> bool {
+        matches!(
+            self.command_buffer.status(),
+            MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+        )
+    }
+
     pub(crate) fn finish(&self) -> Result<&[F], String> {
         self.command_buffer.wait_until_completed();
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
@@ -357,6 +373,14 @@ impl<F: RichField> RangeCheckGateQuotientJob<F> {
 }
 
 impl<F: RichField> PermutationQuotientJob<F> {
+    /// Whether `finish` can return immediately without waiting for Metal.
+    pub(crate) fn is_finished(&self) -> bool {
+        matches!(
+            self.command_buffer.status(),
+            MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+        )
+    }
+
     pub(crate) fn finish(&self) -> Result<&[F], String> {
         self.command_buffer.wait_until_completed();
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
