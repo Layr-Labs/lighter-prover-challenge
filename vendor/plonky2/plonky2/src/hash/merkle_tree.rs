@@ -843,16 +843,24 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         let flat = match &columns {
             ColumnStore::Owned(owned) => crate::util::transpose_to_bitrev_flat(owned),
             #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-            ColumnStore::Shared(_) => {
-                let mut flat = vec![F::ZERO; num_leaves * num_columns];
-                flat.par_chunks_mut(num_columns)
+            ColumnStore::Shared(shared) => {
+                let len = num_leaves * num_columns;
+                let column_slices: Vec<&[F]> =
+                    (0..num_columns).map(|column| shared.col(column)).collect();
+                let mut flat = Vec::with_capacity(len);
+                flat.spare_capacity_mut()[..len]
+                    .par_chunks_mut(num_columns)
                     .enumerate()
                     .for_each(|(leaf, row)| {
                         let natural = crate::util::reverse_bits(leaf, log_rows);
-                        for (column, value) in row.iter_mut().enumerate() {
-                            *value = columns.col(column)[natural];
+                        for (slot, column) in row.iter_mut().zip(&column_slices) {
+                            slot.write(column[natural]);
                         }
                     });
+                // SAFETY: the parallel chunks partition exactly `len` spare
+                // slots, and each row loop initializes every slot once. Rayon
+                // joins before this point; on panic the Vec length stays zero.
+                unsafe { flat.set_len(len) };
                 flat
             }
         };
