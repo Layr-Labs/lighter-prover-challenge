@@ -1956,7 +1956,10 @@ pub trait Write {
         self.write_usize(generator_indices_by_watches.len())?;
         for (k, v) in generator_indices_by_watches.iter() {
             self.write_usize(k)?;
-            self.write_usize_vec(v)?;
+            self.write_usize(v.len())?;
+            for &watcher in v {
+                self.write_usize(watcher as usize)?;
+            }
         }
 
         self.write_polynomial_batch(constants_sigmas_commitment)?;
