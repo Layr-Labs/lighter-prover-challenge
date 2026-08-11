@@ -53,8 +53,7 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // Light-proof throughput is the run's terminal constraint (the chain drains
 // concurrently and finishes within a step of the last tx proof; the block
 // waits for both), so the window depth divides the longest phase directly.
-// Series draw marker: v8 surface, sample 5 (identical trees deduplicate to
-// the prior submission, so redraws carry this counter).
+// Series draw marker: v8 surface, sample 5.
 // The depth-4 ceiling dated from tighter-memory hosts: measured peak RSS is
 // ~6.8 GB at depth 4 against 24 GB local / 48 GB ranked, and mid-run CPU
 // occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
@@ -153,25 +152,6 @@ fn mark_spine_thread_latency_critical() {
 #[cfg(not(target_os = "macos"))]
 fn mark_spine_thread_latency_critical() {}
 
-/// Marks the calling thread `QOS_CLASS_USER_INITIATED` (0x19). Used for the
-/// transaction-proof threads: they hold the single GPU buffer set across
-/// submit/wait/readback, so a default-QoS holder woken by the condvar can be
-/// preempted while every other tree build queues behind it — a classic
-/// priority inversion at the pipeline's one serialized station. Best-effort.
-#[cfg(target_os = "macos")]
-fn mark_thread_user_initiated() {
-    #[allow(non_camel_case_types)]
-    type qos_class_t = u32;
-    unsafe extern "C" {
-        fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
-    }
-    unsafe {
-        let _ = pthread_set_qos_class_self_np(0x19, 0);
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn mark_thread_user_initiated() {}
 
 /// Marks the calling thread `QOS_CLASS_UTILITY` (0x11) so background page
 /// walks prefer E-cores instead of competing with the light pipeline's
@@ -260,9 +240,6 @@ fn chain_step_proof(
         })?;
         BlockTxChainCircuit::prove_prepared(pending, chain_data)
     })();
-    // This step is no longer part of the runnable backlog (see the matching
-    // spine_backlog_add(1) at both spawn sites).
-    plonky2::hash::poseidon2::spine_backlog_add(-1);
     result.unwrap_or_else(|error| {
         panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")
     })
@@ -472,11 +449,6 @@ fn prove_path(
                 // The predecessor handle moves into the chain thread, which waits for it only
                 // after its tx-proof-side witness generation: the path thread never blocks here.
                 let previous = chain.take();
-                // This step is now runnable (its tx proof exists); while the
-                // count of runnable-but-unproven steps is high, the chain is
-                // the laggard and its GPU trees take priority (see
-                // spine_backlog_add). Decremented inside chain_step_proof.
-                plonky2::hash::poseidon2::spine_backlog_add(1);
                 let handle = std::thread::Builder::new()
                     .name(format!("{path:?}-chain-step-{chain_step}"))
                     .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -501,9 +473,6 @@ fn prove_path(
                 .name(format!("{path:?}-tx-proof-{current_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
-                    // These threads hold the single GPU buffer set across
-                    // submit/wait/readback; see mark_thread_user_initiated.
-                    mark_thread_user_initiated();
                     prove_tx_witness(path, current_chunk_index, tx_data, witness)
                 })
                 .expect("transaction proof pipeline thread must start");
@@ -592,12 +561,19 @@ fn prove_path(
             in_flight.len() as u64,
         );
         while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
+            let tx_proof = {
+                #[cfg(feature = "diagnostic_profile")]
+                let _join_wait = plonky2::util::profile::span("wait", "tx_proof_drain_join");
+                proof_handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            };
             // Claim the exclusive phase only once the window has actually
-            // flushed: at drain entry, `in_flight` still holds up to a full
-            // window of chunk proofs whose trees the exclusive routing (lower
-            // GPU cutoff, occupancy bypass) would otherwise queue against —
-            // the flag's contract is "no other proof runs concurrently", and
-            // that becomes true at the last window entry, not at drain entry.
+            // flushed AND the last chunk proof has retired (the join above):
+            // the flag's contract is "no other proof runs concurrently", which
+            // becomes true here, not at drain entry — before this point the
+            // exclusive routing's lower GPU cutoff and occupancy bypass would
+            // queue still-running chunk proofs' trees against the drain's.
             // Also covers the sibling path retiring mid-drain (relaxed read).
             if !exclusive_drain
                 && in_flight.is_empty()
@@ -606,13 +582,6 @@ fn prove_path(
                 exclusive_drain = true;
                 plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
             }
-            let tx_proof = {
-                #[cfg(feature = "diagnostic_profile")]
-                let _join_wait = plonky2::util::profile::span("wait", "tx_proof_drain_join");
-                proof_handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-            };
             // Spawn the drained step exactly like the pipelined phase so its
             // phase-1 witness (which needs only the tx proof) overlaps the
             // predecessor's prove instead of serializing behind it. Only one
@@ -620,7 +589,6 @@ fn prove_path(
             // pure CPU generator execution — so the exclusive-drain contract
             // above is unchanged.
             let previous = chain.take();
-            plonky2::hash::poseidon2::spine_backlog_add(1);
             let handle = std::thread::Builder::new()
                 .name(format!("{path:?}-chain-drain-{chain_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
