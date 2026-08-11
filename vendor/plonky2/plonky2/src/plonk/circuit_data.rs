@@ -422,17 +422,20 @@ impl GeneratorWatchIndex {
     /// flat avoids a tree node and a separately allocated `Vec` for every watched representative.
     pub(crate) fn from_sorted_generator_representatives(
         representatives: &[u32],
-        generator_watch_counts: &[usize],
+        generator_watch_counts: &[u32],
     ) -> Self {
         debug_assert_eq!(
-            generator_watch_counts.iter().sum::<usize>(),
+            generator_watch_counts
+                .iter()
+                .map(|&count| count as usize)
+                .sum::<usize>(),
             representatives.len()
         );
         debug_assert!({
             let mut end = 0usize;
             generator_watch_counts.iter().all(|&count| {
                 let start = end;
-                end += count;
+                end += count as usize;
                 representatives[start..end]
                     .windows(2)
                     .all(|pair| pair[0] < pair[1])
@@ -478,7 +481,7 @@ impl GeneratorWatchIndex {
         let mut watchers = vec![0usize; representatives.len()];
         let mut group_end = representatives.len();
         for (generator, &count) in generator_watch_counts.iter().enumerate().rev() {
-            let group_start = group_end - count;
+            let group_start = group_end - count as usize;
             for &representative in &representatives[group_start..group_end] {
                 let cursor = &mut offsets[representative as usize + 1];
                 *cursor -= 1;
@@ -581,7 +584,7 @@ pub struct ProverOnlyCircuitData<
     /// decrementing on first population, instead of traversing the entire watcher map at the
     /// start of every proof. Runtime-only: it is a pure function of `generator_indices_by_watches`
     /// and is reconstructed on deserialization, so the serialized format is unchanged.
-    pub generator_watch_counts: Vec<usize>,
+    pub generator_watch_counts: Vec<u32>,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.
