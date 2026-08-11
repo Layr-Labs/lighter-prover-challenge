@@ -312,6 +312,57 @@ pub struct OpeningSet<F: RichField + Extendable<D>, const D: usize> {
     pub lookup_zs_next: Vec<F::Extension>,
 }
 
+/// Build the two extension-power tables consumed by opening evaluation.
+///
+/// A single `powers()` iterator is a degree-long multiply dependency chain.
+/// Instead, compute one start value per block and let each block advance its
+/// own short chain. The shifted table is written in the same pass from the
+/// cached base-field subgroup, so there is no second traversal of `zeta_pows`.
+fn opening_power_tables<F: RichField + Extendable<D>, const D: usize>(
+    zeta: F::Extension,
+    g_subgroup: &[F],
+) -> (Vec<F::Extension>, Vec<F::Extension>) {
+    const BLOCK: usize = 1 << 11;
+
+    let degree = g_subgroup.len();
+    if degree == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let block_count = degree.div_ceil(BLOCK);
+    let block_factor = zeta.exp_u64(BLOCK as u64);
+    let block_starts = block_factor.powers().take(block_count).collect::<Vec<_>>();
+
+    let mut zeta_pows = Vec::with_capacity(degree);
+    let mut g_zeta_pows = Vec::with_capacity(degree);
+    {
+        let zeta_slots = &mut zeta_pows.spare_capacity_mut()[..degree];
+        let g_zeta_slots = &mut g_zeta_pows.spare_capacity_mut()[..degree];
+        zeta_slots
+            .par_chunks_mut(BLOCK)
+            .zip(g_zeta_slots.par_chunks_mut(BLOCK))
+            .enumerate()
+            .for_each(|(block, (zeta_out, g_zeta_out))| {
+                let base = block * BLOCK;
+                let mut power = block_starts[block];
+                for (offset, (zeta_slot, g_zeta_slot)) in
+                    zeta_out.iter_mut().zip(g_zeta_out).enumerate()
+                {
+                    zeta_slot.write(power);
+                    g_zeta_slot.write(power.scalar_mul(g_subgroup[base + offset]));
+                    power *= zeta;
+                }
+            });
+    }
+    // SAFETY: the paired chunk traversal partitions exactly `degree` slots in
+    // each spare-capacity slice and writes every slot once before this point.
+    unsafe {
+        zeta_pows.set_len(degree);
+        g_zeta_pows.set_len(degree);
+    }
+    (zeta_pows, g_zeta_pows)
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
     pub fn new<C: GenericConfig<D, F = F>>(
         zeta: F::Extension,
@@ -338,7 +389,6 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         // identical field element and the transcript is unchanged.
         let degree = common_data.degree();
         let table = |z: F::Extension| -> Vec<F::Extension> { z.powers().take(degree).collect() };
-        let zeta_pows = table(zeta);
         // `g` is the order-`degree` subgroup generator, so `g^i` is exactly
         // the process-cached natural-order two-adic subgroup, and
         // `(g·ζ)^i = g^i · ζ^i` in the exact field. Deriving the shifted
@@ -350,11 +400,7 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         // and compares every entry by raw noncanonical limbs.
         let g_subgroup =
             crate::plonk::prover::precomputed::two_adic_subgroup::<F>(common_data.degree_bits());
-        let g_zeta_pows: Vec<F::Extension> = zeta_pows
-            .iter()
-            .zip(g_subgroup.iter())
-            .map(|(&zeta_pow, &g_pow)| zeta_pow.scalar_mul(g_pow))
-            .collect();
+        let (zeta_pows, g_zeta_pows) = opening_power_tables::<F, D>(zeta, &g_subgroup);
         if std::env::var_os("LIGHTER_GZETA_TABLE_ASSERT").is_some() {
             let reference = table(g * zeta);
             assert_eq!(reference.len(), g_zeta_pows.len());
@@ -532,6 +578,49 @@ mod tests {
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::PoseidonGoldilocksConfig;
     use crate::plonk::verifier::verify;
+
+    #[test]
+    fn parallel_opening_power_tables_match_serial_reference() {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type E = <F as Extendable<D>>::Extension;
+
+        let zeta = E::from_basefield_array([
+            F::from_canonical_u64(0x1234_5678_9abc_def0),
+            F::from_canonical_u64(0x0fed_cba9_8765_4321),
+        ]);
+        let g = F::from_canonical_u64(0x1357_9bdf);
+
+        for degree in [0usize, 1, 17, 2047, 2048, 2049, 4097] {
+            let g_subgroup = g.powers().take(degree).collect::<Vec<_>>();
+            let (actual_zeta, actual_shifted) = opening_power_tables::<F, D>(zeta, &g_subgroup);
+            let expected_zeta = zeta.powers().take(degree).collect::<Vec<_>>();
+
+            assert_eq!(actual_zeta.len(), degree);
+            assert_eq!(actual_shifted.len(), degree);
+            for i in 0..degree {
+                assert!(
+                    (actual_zeta[i] - expected_zeta[i]).is_zero(),
+                    "zeta power differs at degree {degree}, index {i}",
+                );
+                assert_eq!(
+                    actual_zeta[i], expected_zeta[i],
+                    "zeta representative differs at degree {degree}, index {i}",
+                );
+                let expected_shifted =
+                    <E as FieldExtension<D>>::scalar_mul(&expected_zeta[i], g_subgroup[i]);
+                assert!(
+                    (actual_shifted[i] - expected_shifted).is_zero(),
+                    "shifted power differs at degree {degree}, index {i}",
+                );
+                assert_eq!(
+                    actual_shifted[i], expected_shifted,
+                    "shifted representative differs at degree {degree}, index {i}",
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_proof_compression() -> Result<()> {
