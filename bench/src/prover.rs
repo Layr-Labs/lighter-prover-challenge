@@ -50,7 +50,7 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
     }
 }
 
-const LIGHT_TX_PROOF_WINDOW: usize = 4;
+const LIGHT_TX_PROOF_WINDOW: usize = 6;
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
