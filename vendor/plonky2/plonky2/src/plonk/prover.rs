@@ -1801,6 +1801,233 @@ fn start_gpu_permutation_quotient<
     Some(job)
 }
 
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+enum GpuQuotientJob<'a, F: RichField> {
+    Poseidon(&'a crate::hash::poseidon2::metal::PoseidonGateQuotientJob<F>),
+    Range(&'a crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>),
+    Permutation(&'a crate::hash::poseidon2::metal::PermutationQuotientJob<F>),
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+impl<'a, F: RichField> GpuQuotientJob<'a, F> {
+    fn is_finished(&self) -> bool {
+        match self {
+            Self::Poseidon(job) => job.is_finished(),
+            Self::Range(job) => job.is_finished(),
+            Self::Permutation(job) => job.is_finished(),
+        }
+    }
+
+    fn finish(&self) -> Result<&[F], String> {
+        match self {
+            Self::Poseidon(job) => job.finish(),
+            Self::Range(job) => job.finish(),
+            Self::Permutation(job) => job.finish(),
+        }
+    }
+
+    fn record_completed(&self) {
+        match self {
+            Self::Poseidon(_) => {
+                GPU_POSEIDON_QUOTIENT_COMPLETED
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            Self::Range(_) => {
+                GPU_RANGE_QUOTIENT_COMPLETED
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            Self::Permutation(_) => {}
+        }
+    }
+
+    fn record_failure(&self, error: &str) {
+        match self {
+            Self::Poseidon(_) => {
+                GPU_POSEIDON_QUOTIENT_FALLBACKS
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                log::warn!(
+                    "Metal Poseidon2 gate quotient failed; recomputing quotient on CPU: {error}"
+                );
+                if gpu_poseidon_quotient_diagnostics_enabled() {
+                    eprintln!(
+                        "[gpu-poseidon-quotient] runtime failure; falling back to CPU: {error}"
+                    );
+                }
+            }
+            Self::Range(_) => {
+                GPU_RANGE_QUOTIENT_FALLBACKS
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                log::warn!(
+                    "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
+                );
+                if gpu_poseidon_quotient_diagnostics_enabled() {
+                    eprintln!(
+                        "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
+                    );
+                }
+            }
+            Self::Permutation(_) => {
+                log::warn!(
+                    "Metal permutation quotient failed; recomputing quotient on CPU: {error}"
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn mark_cpu_recompute_completed_for_tests(&self) {
+        if let Self::Range(job) = self {
+            job.mark_cpu_recompute_completed_for_tests();
+        }
+    }
+}
+
+#[cfg(any(
+    test,
+    all(feature = "std", target_arch = "aarch64", target_os = "macos")
+))]
+fn merge_gpu_quotient_group<F: Field>(
+    quotient_values: &mut [F],
+    first_values: &[F],
+    additional_values: [Option<&[F]>; 2],
+    num_challenges: usize,
+    denominator_inverse: impl Fn(usize) -> F + Sync,
+) {
+    debug_assert!(num_challenges > 0);
+    debug_assert_eq!(first_values.len(), quotient_values.len());
+    for values in additional_values.iter().flatten() {
+        debug_assert_eq!(values.len(), quotient_values.len());
+    }
+
+    match additional_values {
+        [None, None] => quotient_values
+            .par_chunks_exact_mut(num_challenges)
+            .zip(first_values.par_chunks_exact(num_challenges))
+            .enumerate()
+            .for_each(|(i, (cpu_values, first_values))| {
+                let denominator_inv = denominator_inverse(i);
+                for (cpu, &first) in cpu_values.iter_mut().zip(first_values) {
+                    *cpu += first * denominator_inv;
+                }
+            }),
+        [Some(second_values), None] => quotient_values
+            .par_chunks_exact_mut(num_challenges)
+            .zip(first_values.par_chunks_exact(num_challenges))
+            .zip(second_values.par_chunks_exact(num_challenges))
+            .enumerate()
+            .for_each(|(i, ((cpu_values, first_values), second_values))| {
+                let denominator_inv = denominator_inverse(i);
+                for ((cpu, &first), &second) in cpu_values
+                    .iter_mut()
+                    .zip(first_values)
+                    .zip(second_values)
+                {
+                    *cpu += (first + second) * denominator_inv;
+                }
+            }),
+        [Some(second_values), Some(third_values)] => quotient_values
+            .par_chunks_exact_mut(num_challenges)
+            .zip(first_values.par_chunks_exact(num_challenges))
+            .zip(second_values.par_chunks_exact(num_challenges))
+            .zip(third_values.par_chunks_exact(num_challenges))
+            .enumerate()
+            .for_each(
+                |(i, (((cpu_values, first_values), second_values), third_values))| {
+                    let denominator_inv = denominator_inverse(i);
+                    for (((cpu, &first), &second), &third) in cpu_values
+                        .iter_mut()
+                        .zip(first_values)
+                        .zip(second_values)
+                        .zip(third_values)
+                    {
+                        *cpu += (first + second + third) * denominator_inv;
+                    }
+                },
+            ),
+        [None, Some(_)] => unreachable!("GPU quotient merge groups are densely packed"),
+    }
+}
+
+#[cfg(test)]
+mod gpu_quotient_ready_merge_tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::merge_gpu_quotient_group;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::{Field, Field64};
+
+    #[test]
+    fn grouped_merge_matches_separate_sweeps_for_every_presence_mask() {
+        type F = GoldilocksField;
+
+        let num_challenges = 2;
+        let rows = 5;
+        let cpu = (0..rows * num_challenges)
+            .map(|i| F::from_canonical_u64(F::ORDER - 1 - i as u64))
+            .collect::<Vec<_>>();
+        let families = core::array::from_fn::<_, 3, _>(|family| {
+            (0..rows * num_challenges)
+                .map(|i| {
+                    F::from_canonical_u64(
+                        F::ORDER - 17 - (family * rows * num_challenges + i) as u64,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        let denominators = (0..rows)
+            .map(|i| F::from_canonical_u64(F::ORDER - 101 - i as u64))
+            .collect::<Vec<_>>();
+
+        for mask in 1..8usize {
+            let mut expected = cpu.clone();
+            for (family, values) in families.iter().enumerate() {
+                if mask & (1 << family) == 0 {
+                    continue;
+                }
+                for (i, cpu_values) in expected.chunks_exact_mut(num_challenges).enumerate() {
+                    for (cpu, &gpu) in cpu_values
+                        .iter_mut()
+                        .zip(values[i * num_challenges..][..num_challenges].iter())
+                    {
+                        *cpu += gpu * denominators[i];
+                    }
+                }
+            }
+
+            let mut active = families
+                .iter()
+                .enumerate()
+                .filter(|(family, _)| mask & (1 << family) != 0)
+                .map(|(_, values)| values.as_slice());
+            let first = active.next().unwrap();
+            let additional = [active.next(), active.next()];
+            let denominator_evaluations = AtomicUsize::new(0);
+            let mut actual = cpu.clone();
+            merge_gpu_quotient_group(
+                &mut actual,
+                first,
+                additional,
+                num_challenges,
+                |i| {
+                    denominator_evaluations.fetch_add(1, Ordering::Relaxed);
+                    denominators[i]
+                },
+            );
+
+            assert_eq!(
+                actual.iter().map(|value| value.0).collect::<Vec<_>>(),
+                expected.iter().map(|value| value.0).collect::<Vec<_>>(),
+                "raw field words differ for active family mask {mask:#05b}"
+            );
+            assert_eq!(
+                denominator_evaluations.load(Ordering::Relaxed),
+                rows,
+                "active family mask {mask:#05b}"
+            );
+        }
+    }
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2347,135 +2574,101 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
-            Ok(values) => {
-                GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
+    {
+        // Preserve the original early-family overlap: block only on the first
+        // active job, then coalesce any later jobs which are already terminal.
+        // A pending later job is never waited on for fusion; merge the current
+        // ready group immediately while that command continues on Metal.
+        let gpu_jobs = [
+            gpu_poseidon
+                .as_ref()
+                .map(|(_, job)| GpuQuotientJob::Poseidon(job)),
+            gpu_range
+                .as_ref()
+                .map(|(_, job)| GpuQuotientJob::Range(job)),
+            gpu_permutation
+                .as_ref()
+                .map(GpuQuotientJob::Permutation),
+        ];
+        let mut next_job = 0usize;
+        while next_job < gpu_jobs.len() {
+            while next_job < gpu_jobs.len() && gpu_jobs[next_job].is_none() {
+                next_job += 1;
             }
-            Err(error) => {
-                GPU_POSEIDON_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                log::warn!(
-                    "Metal Poseidon2 gate quotient failed; recomputing quotient on CPU: {error}"
-                );
-                if gpu_poseidon_quotient_diagnostics_enabled() {
-                    eprintln!(
-                        "[gpu-poseidon-quotient] runtime failure; falling back to CPU: {error}"
-                    );
-                }
-                return compute_quotient_polys(
-                    common_data,
-                    prover_data,
-                    public_inputs_hash,
-                    wires_commitment,
-                    zs_partial_products_and_lookup_commitment,
-                    betas,
-                    gammas,
-                    beta_k_is,
-                    deltas,
-                    alphas,
-                    col_major_perm,
-                    false,
-                );
+            if next_job == gpu_jobs.len() {
+                break;
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
 
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
-            Ok(values) => {
-                GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
-            }
-            Err(error) => {
-                GPU_RANGE_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                log::warn!(
-                    "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
-                );
-                if gpu_poseidon_quotient_diagnostics_enabled() {
-                    eprintln!(
-                        "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
-                    );
+            let mut group_values: [Option<&[F]>; 3] = [None, None, None];
+            let mut group_len = 0usize;
+            loop {
+                let job = gpu_jobs[next_job].as_ref().unwrap();
+                if group_len != 0 && !job.is_finished() {
+                    break;
                 }
-                let result = compute_quotient_polys(
-                    common_data,
-                    prover_data,
-                    public_inputs_hash,
-                    wires_commitment,
-                    zs_partial_products_and_lookup_commitment,
-                    betas,
-                    gammas,
-                    beta_k_is,
-                    deltas,
-                    alphas,
-                    col_major_perm,
-                    false,
-                );
-                #[cfg(test)]
-                job.mark_cpu_recompute_completed_for_tests();
-                return result;
-            }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                let values = match job.finish() {
+                    Ok(values) => {
+                        job.record_completed();
+                        values
+                    }
+                    Err(error) => {
+                        job.record_failure(&error);
+                        let result = compute_quotient_polys(
+                            common_data,
+                            prover_data,
+                            public_inputs_hash,
+                            wires_commitment,
+                            zs_partial_products_and_lookup_commitment,
+                            betas,
+                            gammas,
+                            beta_k_is,
+                            deltas,
+                            alphas,
+                            col_major_perm,
+                            false,
+                        );
+                        #[cfg(test)]
+                        job.mark_cpu_recompute_completed_for_tests();
+                        return result;
+                    }
+                };
+                debug_assert_eq!(values.len(), quotient_values.len());
+                group_values[group_len] = Some(values);
+                group_len += 1;
+                next_job += 1;
+                while next_job < gpu_jobs.len() && gpu_jobs[next_job].is_none() {
+                    next_job += 1;
                 }
-            });
-    }
+                if next_job == gpu_jobs.len() {
+                    break;
+                }
+            }
 
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some(job) = &gpu_permutation {
-        let gpu_values = match job.finish() {
-            Ok(values) => values,
-            Err(error) => {
-                log::warn!(
-                    "Metal permutation quotient failed; recomputing quotient on CPU: {error}"
-                );
-                return compute_quotient_polys(
-                    common_data,
-                    prover_data,
-                    public_inputs_hash,
-                    wires_commitment,
-                    zs_partial_products_and_lookup_commitment,
-                    betas,
-                    gammas,
-                    beta_k_is,
-                    deltas,
-                    alphas,
-                    col_major_perm,
-                    false,
+            let first_values = group_values[0].unwrap();
+            if group_len == 1 {
+                // Keep the no-fusion case byte-for-byte shaped like the
+                // original early merge; readiness polling must not replace it
+                // with a different indexed traversal.
+                quotient_values
+                    .par_chunks_exact_mut(num_challenges)
+                    .zip(first_values.par_chunks_exact(num_challenges))
+                    .enumerate()
+                    .for_each(|(i, (cpu_values, gpu_values))| {
+                        let denominator_inv = z_h_on_coset.eval_inverse(i);
+                        for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                            *cpu += gpu * denominator_inv;
+                        }
+                    });
+            } else {
+                merge_gpu_quotient_group(
+                    &mut quotient_values,
+                    first_values,
+                    [group_values[1], group_values[2]],
+                    num_challenges,
+                    |i| z_h_on_coset.eval_inverse(i),
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        }
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
