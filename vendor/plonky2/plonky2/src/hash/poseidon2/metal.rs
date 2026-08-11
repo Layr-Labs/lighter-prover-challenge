@@ -2026,6 +2026,125 @@ pub(crate) fn allocate_columns<F: RichField>(
 /// serializes any unexpected second caller onto the classic path.
 static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
 
+/// Fully prefaulted state/output pair reserved for a future larger streamed
+/// tree. It cannot live in `STREAMED_BUFFERS` yet: a smaller light-path build
+/// would use the oversized output and move it into that proof's retained tree,
+/// leaving the final block cold again.
+static PREWARMED_STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
+
+/// Fully prefaulted replacement for the final streamed tree's retained digest
+/// output. Kept separate from `DigestOutputPool`: a smaller light-path tree
+/// must not borrow this one before the final 2^21-leaf commitment reaches the
+/// serial tail.
+static PREWARMED_STREAMED_OUTPUT: Mutex<Option<Buffer>> = Mutex::new(None);
+
+fn prefault_shared_buffer(buffer: &Buffer) {
+    const PAGE: isize = 16 * 1024;
+    let base = buffer.contents().cast::<u64>();
+    let bytes = buffer.length();
+    let mut offset = 0isize;
+    while (offset as u64) < bytes {
+        // SAFETY: `offset` stays within the shared buffer. These buffers have
+        // not been published yet, so no GPU or CPU consumer can race the walk.
+        unsafe { base.byte_offset(offset).write_volatile(0) };
+        offset += PAGE;
+    }
+}
+
+/// Allocates and prefaults the exact state/output buffers needed by a future
+/// streamed Merkle build, then publishes them to reserved slots.
+///
+/// Allocation and page walking deliberately happen outside the live and
+/// reserved locks, so the light pipeline continues using its old pair while
+/// this background work runs. Publishing only fully warmed buffers also avoids
+/// a page walker racing the first absorb kernel. The extra output is the
+/// replacement moved into the retained final-block tree after completion.
+pub fn prewarm_streamed_merkle_buffers(leaf_count: usize, cap_height: usize) {
+    if leaf_count == 0
+        || !leaf_count.is_power_of_two()
+        || cap_height > leaf_count.ilog2() as usize
+    {
+        return;
+    }
+    let Some(context) = shared_context() else {
+        return;
+    };
+    let cap_count = 1usize << cap_height;
+    let Some(total_node_count) = leaf_count.checked_mul(2).and_then(|n| n.checked_sub(cap_count))
+    else {
+        return;
+    };
+    let Some(state_bytes) = leaf_count
+        .checked_mul(12)
+        .and_then(|n| n.checked_mul(size_of::<u64>()))
+    else {
+        return;
+    };
+    let Some(output_bytes) = total_node_count
+        .checked_mul(4)
+        .and_then(|n| n.checked_mul(size_of::<u64>()))
+    else {
+        return;
+    };
+
+    let (state, output, replacement) = autoreleasepool(|| {
+        let buffer = |bytes: usize| {
+            context
+                .device
+                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+        };
+        (
+            buffer(state_bytes),
+            buffer(output_bytes),
+            buffer(output_bytes),
+        )
+    });
+    prefault_shared_buffer(&state);
+    prefault_shared_buffer(&output);
+    prefault_shared_buffer(&replacement);
+
+    // Publish the spare first. If the final build arrives between the two
+    // locks, it may still grow its state pair itself but its retained-output
+    // handoff is already warm; the reverse order could expose a warm pair with
+    // no warm replacement.
+    if let Ok(mut slot) = PREWARMED_STREAMED_OUTPUT.lock() {
+        if slot
+            .as_ref()
+            .map_or(true, |buffer| buffer.length() < replacement.length())
+        {
+            *slot = Some(replacement);
+        }
+    }
+    if let Ok(mut buffers) = PREWARMED_STREAMED_BUFFERS.lock() {
+        let needs_grow = buffers.as_ref().map_or(true, |(old_state, old_output)| {
+            old_state.length() < state.length() || old_output.length() < output.length()
+        });
+        if needs_grow {
+            *buffers = Some((state, output));
+        }
+    }
+}
+
+fn take_prewarmed_streamed_output(bytes: u64) -> Option<Buffer> {
+    let mut slot = PREWARMED_STREAMED_OUTPUT.try_lock().ok()?;
+    if slot
+        .as_ref()
+        .is_some_and(|buffer| buffer.length() == bytes)
+    {
+        slot.take()
+    } else {
+        None
+    }
+}
+
+fn take_prewarmed_streamed_buffers(state_bytes: u64, output_bytes: u64) -> Option<(Buffer, Buffer)> {
+    let mut slot = PREWARMED_STREAMED_BUFFERS.try_lock().ok()?;
+    let fits = slot.as_ref().is_some_and(|(state, output)| {
+        state.length() >= state_bytes && output.length() >= output_bytes
+    });
+    fits.then(|| slot.take().expect("checked above"))
+}
+
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
 /// the GPU absorbs each group while the CPU fills the next. Only used inside
@@ -2089,18 +2208,23 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         state.length() < state_bytes as u64 || output.length() < output_bytes as u64
     });
     if needs_new {
-        *buffers = Some(autoreleasepool(|| {
-            (
-                context.device.new_buffer(
-                    state_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
-                context.device.new_buffer(
-                    output_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
-            )
-        }));
+        *buffers = Some(
+            take_prewarmed_streamed_buffers(state_bytes as u64, output_bytes as u64)
+                .unwrap_or_else(|| {
+                    autoreleasepool(|| {
+                        (
+                            context.device.new_buffer(
+                                state_bytes as u64,
+                                MTLResourceOptions::StorageModeShared,
+                            ),
+                            context.device.new_buffer(
+                                output_bytes as u64,
+                                MTLResourceOptions::StorageModeShared,
+                            ),
+                        )
+                    })
+                }),
+        );
     }
     let (state_buffer, output_buffer) = buffers.as_mut()?;
 
@@ -2205,11 +2329,14 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         return None;
     }
 
-    let replacement = context
-        .digest_output_pool
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take_best_fit(output_bytes as u64)
+    let replacement = take_prewarmed_streamed_output(output_bytes as u64)
+        .or_else(|| {
+            context
+                .digest_output_pool
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take_best_fit(output_bytes as u64)
+        })
         .unwrap_or_else(|| {
             autoreleasepool(|| {
                 context

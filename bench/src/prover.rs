@@ -674,6 +674,14 @@ fn prove_path(
                 const BLOCK_WIRES_STORE_BYTES: u64 =
                     (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
                 plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
+                // The streamed wire commitment also grows its per-leaf sponge
+                // state (192 MiB) and two level-order digest outputs (128 MiB
+                // each) from the earlier 2^19 shapes. Prefault the exact final
+                // shape in the same slack window; the Metal helper allocates
+                // and walks outside its live-buffer lock, then publishes only
+                // complete buffers so the light pipeline never waits on or
+                // races this background work.
+                plonky2::hash::poseidon2::prewarm_streamed_merkle_buffers(1 << 21, 4);
             })
             .ok();
     }
