@@ -1374,14 +1374,19 @@ fn start_gpu_range_check_gate_quotient<
             gate_indices.push(gate_index);
         }
         if let Some(u32_gate) = u32_gate {
-            // A six-bit random access evaluates a 64-entry selection fold for
-            // only ten quotient rows. On the five-worker ranked workload that
-            // data-dependent branch extends the process-shared Range/U32 Metal
-            // command disproportionately. Keep exactly this shape on the
-            // existing CPU direct-accumulation evaluator instead: skipping it
-            // here means it is never added to `gate_indices`, so the generic
-            // CPU quotient pass retains its unchanged selector and alpha work.
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. }) {
+            // Every random-access shape evaluates a data-dependent selection
+            // fold (a 64-entry fold for six bits, 16 entries for four, 8 for
+            // three) for a small number of quotient rows. On the five-worker
+            // ranked workload those divergent branches extend the
+            // process-shared Range/U32 Metal command disproportionately, the
+            // same property that already moved the six-bit shape (and the
+            // 67-bit exponentiation loop) onto the existing CPU
+            // direct-accumulation evaluator. Skip all of them here: a skipped
+            // gate is never added to `gate_indices`, so the generic CPU
+            // quotient pass retains its unchanged selector and alpha work and
+            // the proof bytes are produced by the same code path the control
+            // uses for every unadmitted gate.
+            if matches!(u32_gate, U32QuotientGate::RandomAccess { .. }) {
                 continue;
             }
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
@@ -1917,6 +1922,30 @@ fn compute_quotient_polys<
             )
         })
         .flatten();
+    // When at least one Metal quotient job is active, every producer's values
+    // are numerators on the same quotient domain. Leave the CPU batch
+    // unscaled, merge the GPU numerators additively, and apply the common
+    // `Z_H(i)^-1` scale once per point afterwards. Without any Metal job the
+    // established CPU-only schedule is kept unchanged (the denominator
+    // multiplication stays inside the hot 32-point batch, exactly as before).
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let any_gpu_quotient =
+        gpu_poseidon.is_some() || gpu_range.is_some() || gpu_permutation.is_some();
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let any_gpu_quotient = false;
+    // The common `Z_H(i)^-1` scale is applied inside the *last* active GPU
+    // merge, so the merged buffer is traversed exactly as many times as the
+    // promoted per-job merges did, with no extra final pass.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let scale_in_poseidon_merge =
+        gpu_poseidon.is_some() && gpu_range.is_none() && gpu_permutation.is_none();
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let scale_in_range_merge = gpu_range.is_some() && gpu_permutation.is_none();
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let scale_in_permutation_merge = gpu_permutation.is_some();
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let (_scale_in_poseidon_merge, _scale_in_range_merge, _scale_in_permutation_merge) =
+        (false, false, false);
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let permutation_products_offloaded = gpu_permutation.is_some();
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
@@ -2334,14 +2363,16 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
+                if !any_gpu_quotient {
+                    for (&i, quotient_values) in indices_batch
+                        .iter()
+                        .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
+                    {
+                        let denominator_inv = z_h_on_coset.eval_inverse(i);
+                        quotient_values
+                            .iter_mut()
+                            .for_each(|v| *v *= denominator_inv);
+                    }
                 }
             },
         );
@@ -2385,9 +2416,12 @@ fn compute_quotient_polys<
             .zip(gpu_values.par_chunks_exact(num_challenges))
             .enumerate()
             .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    *cpu += gpu;
+                }
+                if scale_in_poseidon_merge {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    cpu_values.iter_mut().for_each(|v| *v *= denominator_inv);
                 }
             });
     }
@@ -2434,9 +2468,12 @@ fn compute_quotient_polys<
             .zip(gpu_values.par_chunks_exact(num_challenges))
             .enumerate()
             .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    *cpu += gpu;
+                }
+                if scale_in_range_merge {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    cpu_values.iter_mut().for_each(|v| *v *= denominator_inv);
                 }
             });
     }
@@ -2471,9 +2508,12 @@ fn compute_quotient_polys<
             .zip(gpu_values.par_chunks_exact(num_challenges))
             .enumerate()
             .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    *cpu += gpu;
+                }
+                if scale_in_permutation_merge {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    cpu_values.iter_mut().for_each(|v| *v *= denominator_inv);
                 }
             });
     }
@@ -2516,15 +2556,20 @@ fn compute_quotient_polys<
                 }
             }
         });
-    let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
+    let inverse_coset_shift_powers =
+        precomputed::inverse_coset_shift_powers_scaled::<F>(points.len());
     challenge_columns
         .into_par_iter()
         .map(|column| {
             // Fuse the coset post-scaling into the IFFT instead of walking the
             // whole coefficient vector again afterwards, reusing a
-            // process-global inverse-shift power chain.
+            // process-global inverse-shift power chain. The cached chain
+            // already carries the IFFT's `1/n` normalization, so each
+            // coefficient receives exactly one multiply in the post-pass
+            // instead of a `1/n` multiply followed by the shift-power
+            // multiply.
             PolynomialValues::new(column)
-                .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
+                .coset_ifft_with_prescaled_powers(inverse_coset_shift_powers.as_slice())
         })
         .collect()
 }
@@ -2544,6 +2589,8 @@ pub(crate) mod precomputed {
         use std::collections::HashMap;
         use std::sync::{Arc, OnceLock, RwLock};
 
+        use plonky2_util::log2_strict;
+
         use crate::field::types::Field;
 
         type Map = RwLock<HashMap<(TypeId, usize), Arc<dyn Any + Send + Sync>>>;
@@ -2552,6 +2599,7 @@ pub(crate) mod precomputed {
         static COSET_POWERS: OnceLock<Map> = OnceLock::new();
         static SHIFTED_SUBGROUPS: OnceLock<Map> = OnceLock::new();
         static INVERSE_COSET_POWERS: OnceLock<Map> = OnceLock::new();
+        static INVERSE_COSET_POWERS_SCALED: OnceLock<Map> = OnceLock::new();
 
         fn get_or_compute<F: Field>(
             cache: &'static OnceLock<Map>,
@@ -2611,6 +2659,27 @@ pub(crate) mod precomputed {
                 F::coset_shift().inverse().powers().take(degree).collect()
             })
         }
+
+        /// Cached `n_inv * F::coset_shift().inverse().powers().take(degree)`.
+        /// The quotient columns' coset IFFT post-scaling multiplies every
+        /// coefficient by both `1/n` and the inverse shift power, so the two
+        /// canonical factors are folded into one per-slot multiply. The
+        /// value for each slot is the product of the same two factors the
+        /// two-multiply form uses; field multiplication is commutative, so
+        /// every coefficient is field-identical.
+        pub(crate) fn inverse_coset_shift_powers_scaled<F: Field>(
+            degree: usize,
+        ) -> Arc<Vec<F>> {
+            get_or_compute(&INVERSE_COSET_POWERS_SCALED, degree, || {
+                let n_inv = F::inverse_2exp(log2_strict(degree));
+                F::coset_shift()
+                    .inverse()
+                    .powers()
+                    .take(degree)
+                    .map(|power| n_inv * power)
+                    .collect()
+            })
+        }
     }
 
     /// Without `std` there is no process-global synchronization; fall back to
@@ -2644,11 +2713,25 @@ pub(crate) mod precomputed {
                     .collect::<Vec<F>>(),
             )
         }
+
+        pub(crate) fn inverse_coset_shift_powers_scaled<F: Field>(
+            degree: usize,
+        ) -> Arc<Vec<F>> {
+            let n_inv = F::inverse_2exp(plonky2_util::log2_strict(degree));
+            Arc::new(
+                F::coset_shift()
+                    .inverse()
+                    .powers()
+                    .take(degree)
+                    .map(|power| n_inv * power)
+                    .collect::<Vec<F>>(),
+            )
+        }
     }
 
     pub(crate) use imp::{
-        coset_shift_powers, inverse_coset_shift_powers, shifted_two_adic_subgroup,
-        two_adic_subgroup,
+        coset_shift_powers, inverse_coset_shift_powers, inverse_coset_shift_powers_scaled,
+        shifted_two_adic_subgroup, two_adic_subgroup,
     };
 }
 
