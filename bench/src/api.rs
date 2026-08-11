@@ -1,4 +1,4 @@
-// Redraw marker 701-claude-fable-r2
+// IFFT scaled + ext2_mul_add on tip — marker 625-ifft-muladd-1786460949
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
