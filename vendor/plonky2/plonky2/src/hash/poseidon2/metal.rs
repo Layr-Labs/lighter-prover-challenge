@@ -1912,6 +1912,13 @@ pub(crate) fn allocate_columns<F: RichField>(
 /// serializes any unexpected second caller onto the classic path.
 static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
 
+/// Bound the CPU producer to two committed absorb passes. On unified-memory
+/// Apple GPUs, filling many later 128 MiB column groups can otherwise leave
+/// the first command unscheduled while the CPU runs far ahead. A two-command
+/// window retains one full group of CPU/GPU overlap while forcing progress
+/// before the lead recreates that bandwidth and residency pressure.
+const STREAMED_PRODUCER_WINDOW: usize = 2;
+
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
 /// the GPU absorbs each group while the CPU fills the next. Only used inside
@@ -2023,6 +2030,10 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             command_buffer.to_owned()
         });
         absorb_commands.push(command_buffer);
+        if group + 1 < groups && absorb_commands.len() >= STREAMED_PRODUCER_WINDOW {
+            let oldest = &absorb_commands[absorb_commands.len() - STREAMED_PRODUCER_WINDOW];
+            oldest.wait_until_completed();
+        }
     }
 
     // Parent levels over the completed leaf digests, exactly as in the
@@ -6324,7 +6335,7 @@ kernel void goldilocks_mul_bench_native(
 
         let context = shared_context().expect("Metal context");
         let rows = 1usize << 20;
-        let cols = 16;
+        let cols = 17;
         let cap_height = 4;
         let columns = context
             .allocate_columns::<F>(rows, cols)
