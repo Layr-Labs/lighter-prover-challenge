@@ -61,6 +61,71 @@ pub fn reverse_index_bits<T: Copy>(arr: &[T]) -> Vec<T> {
     }
 }
 
+/// Writes a transformed bit-reversal of `source` into `destination`.
+///
+/// The callback receives contiguous source and destination chunks plus the
+/// source chunk's global offset, and must initialize the whole destination
+/// chunk. For large arrays the first row permutation of the cache-blocked
+/// bit-reversal is performed out of place: transformed source row `i` is
+/// written directly to bit-reversed destination row `rev(i)`. This lets a
+/// caller fuse useful copy work into that permutation instead of first
+/// materializing a natural-order destination and then shuffling it.
+pub fn reverse_index_bits_out_of_place_with<T, Transform>(
+    source: &[T],
+    destination: &mut [T],
+    mut transform: Transform,
+) where
+    Transform: FnMut(&[T], &mut [T], usize),
+{
+    assert_eq!(source.len(), destination.len());
+    let n = source.len();
+    let lb_n = log2_strict(n);
+
+    if size_of::<T>() << lb_n <= SMALL_ARR_SIZE || size_of::<T>() >= BIG_T_SIZE {
+        transform(source, destination, 0);
+        reverse_index_bits_in_place(destination);
+        return;
+    }
+
+    let lb_num_chunks = lb_n >> 1;
+    let lb_chunk_size = lb_n - lb_num_chunks;
+    let chunk_size = 1usize << lb_chunk_size;
+    let num_chunks = 1usize << lb_num_chunks;
+
+    // This is the first row permutation of the in-place algorithm, combined
+    // with the caller's source-to-destination transform. Each destination row
+    // is written exactly once.
+    for source_chunk in 0..num_chunks {
+        let destination_chunk = source_chunk
+            .reverse_bits()
+            .wrapping_shr(usize::BITS - lb_num_chunks as u32);
+        let source_start = source_chunk * chunk_size;
+        let destination_start = destination_chunk * chunk_size;
+        transform(
+            &source[source_start..source_start + chunk_size],
+            &mut destination[destination_start..destination_start + chunk_size],
+            source_start,
+        );
+    }
+
+    // Finish the same transpose + row-reversal network as
+    // `reverse_index_bits_in_place`; only its first row permutation was
+    // replaced by the transformed out-of-place write above.
+    unsafe {
+        transpose_in_place_square(destination, lb_chunk_size, lb_num_chunks, 0);
+        if lb_num_chunks != lb_chunk_size {
+            let destination_with_offset = &mut destination[1 << lb_num_chunks..];
+            transpose_in_place_square(
+                destination_with_offset,
+                lb_chunk_size,
+                lb_num_chunks,
+                0,
+            );
+        }
+        reverse_index_bits_in_place_chunks(destination, lb_num_chunks, lb_chunk_size);
+    }
+}
+
 /* Both functions below are semantically equivalent to:
         for i in 0..n {
             result.push(arr[reverse_bits(i, n_power)]);
@@ -329,6 +394,41 @@ mod tests {
                     assert_eq!(got, expect);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_transformed_out_of_place_bit_reversal() {
+        for length in [1, 32, 128, 1 << 15, 1 << 16] {
+            let source: Vec<u64> = (0..length)
+                .map(|i| (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+                .collect();
+            let scales: Vec<u64> = (0..length)
+                .map(|i| (i as u64).wrapping_mul(17).wrapping_add(3))
+                .collect();
+            let transformed: Vec<u64> = source
+                .iter()
+                .zip(&scales)
+                .map(|(&value, &scale)| value.wrapping_mul(scale))
+                .collect();
+            let expected = super::reverse_index_bits(&transformed);
+            let mut actual = vec![0; length];
+
+            super::reverse_index_bits_out_of_place_with(
+                &source,
+                &mut actual,
+                |source_chunk, destination_chunk, source_start| {
+                    for (index, (source, destination)) in source_chunk
+                        .iter()
+                        .zip(destination_chunk.iter_mut())
+                        .enumerate()
+                    {
+                        *destination = source.wrapping_mul(scales[source_start + index]);
+                    }
+                },
+            );
+
+            assert_eq!(actual, expected, "length {length}");
         }
     }
 

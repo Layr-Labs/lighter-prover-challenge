@@ -8,7 +8,8 @@ use plonky2_maybe_rayon::*;
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
 use crate::field::extension::Extendable;
 use crate::field::fft::{
-    FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
+    FftRootTable, fft_in_place_with_options, fft_in_place_with_options_from_bit_reversed,
+    fft_in_place_with_options_parallel,
 };
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
@@ -23,7 +24,7 @@ use crate::plonk::config::{GenericConfig, Hasher};
 use crate::timed;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_strict, reverse_bits};
+use crate::util::{log2_strict, reverse_bits, reverse_index_bits_out_of_place_with};
 
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
@@ -192,15 +193,22 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                         degree,
                                         "Polynomial degrees inconsistent"
                                     );
-                                    batch_multiply_into(
-                                        &mut destination[..degree],
+                                    reverse_index_bits_out_of_place_with(
                                         &polynomial.coeffs,
-                                        &coset_powers,
+                                        &mut destination[..degree],
+                                        |source, destination, source_start| {
+                                            batch_multiply_into(
+                                                destination,
+                                                source,
+                                                &coset_powers[source_start
+                                                    ..source_start + source.len()],
+                                            );
+                                        },
                                     );
                                     if rate_bits == 0 || degree < 2 {
                                         destination[degree..].fill(F::ZERO);
                                     }
-                                    fft_in_place_with_options(
+                                    fft_in_place_with_options_from_bit_reversed(
                                         destination,
                                         Some(rate_bits),
                                         fft_root_table,
@@ -341,19 +349,24 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .zip(polynomials.par_iter())
             .for_each(|(destination, polynomial)| {
                 assert_eq!(polynomial.len(), degree, "Polynomial degrees inconsistent");
-                // Fused copy-and-scale: the unscaled coefficient image that
-                // `copy_from_slice` used to materialize here is never observed —
-                // the FFT reads only the coset-scaled values — so writing the
-                // product directly deletes one full read+write pass over
-                // `degree` words per column, per commitment, per proof. Word
-                // values are unchanged: `batch_multiply_into` uses the same
-                // packed-prefix/scalar-tail schedule as the
-                // `batch_multiply_inplace` it replaces, and it never reads the
-                // (possibly uninitialized) destination.
-                batch_multiply_into(
-                    &mut destination[..degree],
+                // Fuse the coset-scaled source-to-destination copy with the
+                // first row permutation of the cache-blocked bit reversal.
+                // The old path wrote the packed products in natural order and
+                // then read/wrote the whole prefix again to reverse its first
+                // row dimension. Here transformed source row `i` lands
+                // directly in row `reverse(i)`, deleting that extra pass while
+                // retaining packed multiplication over contiguous source,
+                // powers and destination chunks.
+                reverse_index_bits_out_of_place_with(
                     &polynomial.coeffs,
-                    &coset_powers,
+                    &mut destination[..degree],
+                    |source, destination, source_start| {
+                        batch_multiply_into(
+                            destination,
+                            source,
+                            &coset_powers[source_start..source_start + source.len()],
+                        );
+                    },
                 );
                 if rate_bits == 0 || degree < 2 {
                     destination[degree..].fill(F::ZERO);
@@ -361,7 +374,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // For a nontrivial zero-padded FFT, the expansion path writes
                 // every tail element before reading it. This is the same
                 // invariant used by `lde_values` to avoid a dead tail memset.
-                fft_in_place_with_options(destination, Some(rate_bits), fft_root_table);
+                fft_in_place_with_options_from_bit_reversed(
+                    destination,
+                    Some(rate_bits),
+                    fft_root_table,
+                );
             });
         true
     }
@@ -910,6 +927,54 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Exercise the cache-blocked (larger than 64 KiB) out-of-place first
+    /// permutation used by production commitments. The small-shape test above
+    /// intentionally covers boundary values; this pins the distinct large
+    /// transpose network at the ranked rate-8 shape.
+    #[test]
+    fn retained_large_fused_bit_reversal_lde_matches_legacy() {
+        const D: usize = 2;
+        const DEGREE: usize = 1 << 14;
+        const RATE_BITS: usize = 3;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let polynomials = (0..2)
+            .map(|column| {
+                PolynomialCoeffs::new(
+                    (0..DEGREE)
+                        .map(|row| {
+                            F::from_canonical_usize(
+                                row.wrapping_mul(0x9e37).wrapping_add(column * 17),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = PolynomialBatch::<F, C, D>::lde_values(
+            &polynomials,
+            RATE_BITS,
+            false,
+            None,
+        );
+        let mut retained = ColumnStore::Owned(
+            (0..polynomials.len())
+                .map(|_| vec![F::ZERO; DEGREE << RATE_BITS])
+                .collect(),
+        );
+
+        assert!(PolynomialBatch::<F, C, D>::fill_lde_column_store(
+            &mut retained,
+            &polynomials,
+            RATE_BITS,
+            None,
+        ));
+        for (column, expected) in expected.iter().enumerate() {
+            assert_eq!(retained.col(column), expected);
         }
     }
 
