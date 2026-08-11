@@ -121,7 +121,7 @@ fn run_generator_worklist<
 >(
     witness: &mut PartitionWitness<F>,
     prover_data: &ProverOnlyCircuitData<F, C, D>,
-    unresolved_watches: &mut [usize],
+    unresolved_watches: &mut [u32],
     generator_is_expired: &mut [bool],
     remaining_generators: &mut usize,
     mut pending_generator_indices: Vec<usize>,
@@ -165,7 +165,7 @@ fn run_generator_worklist<
             // records its generators in ready-set order, so the merge below observes ascending
             // generator-index order regardless of thread count.
             let round_witness: &PartitionWitness<F> = witness;
-            let round_unresolved_watches: &[usize] = unresolved_watches;
+            let round_unresolved_watches: &[u32] = unresolved_watches;
             let round_generator_is_expired: &[bool] = generator_is_expired;
             #[allow(clippy::type_complexity)]
             let round_outputs: Vec<(
@@ -301,9 +301,9 @@ fn run_generator_worklist<
 fn seed_inputs_and_unresolved_watches<F: Field>(
     witness: &mut PartitionWitness<F>,
     inputs: PartialWitness<F>,
-    generator_watch_counts: &[usize],
+    generator_watch_counts: &[u32],
     generator_indices_by_watches: &GeneratorWatchIndex,
-) -> Result<Vec<usize>> {
+) -> Result<Vec<u32>> {
     let mut unresolved_watches = generator_watch_counts.to_vec();
 
     for (t, v) in inputs.target_values.into_iter() {
@@ -329,7 +329,7 @@ fn seed_inputs_and_unresolved_watches<F: Field>(
 /// inputs decrement at most once and no counter can underflow.
 pub struct PartitionSeeder<'a, 'b, F: Field> {
     witness: &'b mut PartitionWitness<'a, F>,
-    unresolved_watches: &'b mut [usize],
+    unresolved_watches: &'b mut [u32],
     generator_indices_by_watches: &'b GeneratorWatchIndex,
 }
 
@@ -366,7 +366,7 @@ impl<F: Field> Witness<F> for PartitionSeeder<'_, '_, F> {
 /// worklist; expired generators are skipped.
 pub struct PartitionFeeder<'a, 'b, F: Field> {
     witness: &'b mut PartitionWitness<'a, F>,
-    unresolved_watches: &'b mut [usize],
+    unresolved_watches: &'b mut [u32],
     generator_is_expired: &'b [bool],
     pending_generator_indices: &'b mut Vec<usize>,
     generator_indices_by_watches: &'b GeneratorWatchIndex,
@@ -415,7 +415,7 @@ pub struct PendingPartitionWitness<
     const D: usize,
 > {
     witness: PartitionWitness<'a, F>,
-    unresolved_watches: Vec<usize>,
+    unresolved_watches: Vec<u32>,
     generator_is_expired: Vec<bool>,
     remaining_generators: usize,
     prover_data: &'a ProverOnlyCircuitData<F, C, D>,
@@ -993,8 +993,8 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D> for Con
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
@@ -1083,6 +1083,69 @@ mod tests {
                     .unwrap();
                 false
             }
+        }
+
+        fn serialize(
+            &self,
+            _dst: &mut Vec<u8>,
+            _common_data: &CommonCircuitData<F, D>,
+        ) -> IoResult<()> {
+            unreachable!("test generator is never serialized")
+        }
+
+        fn deserialize(
+            _src: &mut Buffer,
+            _common_data: &CommonCircuitData<F, D>,
+        ) -> IoResult<Self> {
+            unreachable!("test generator is never deserialized")
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScheduleRecordingGenerator {
+        ordinal: usize,
+        dependencies: Vec<Target>,
+        output: Target,
+        schedule: Arc<Mutex<Vec<(usize, bool)>>>,
+    }
+
+    impl WitnessGenerator<F, D> for ScheduleRecordingGenerator {
+        fn id(&self) -> String {
+            format!("ScheduleRecordingGenerator({})", self.ordinal)
+        }
+
+        fn watch_list(&self) -> Vec<Target> {
+            self.dependencies.clone()
+        }
+
+        fn run(&self, witness: &PartitionWitness<F>, out_buffer: &mut GeneratedValues<F>) -> bool {
+            self.run_with_ready_hint(
+                witness,
+                out_buffer,
+                witness.contains_all(&self.dependencies),
+            )
+        }
+
+        fn run_with_ready_hint(
+            &self,
+            witness: &PartitionWitness<F>,
+            out_buffer: &mut GeneratedValues<F>,
+            all_watches_populated: bool,
+        ) -> bool {
+            self.schedule
+                .lock()
+                .unwrap()
+                .push((self.ordinal, all_watches_populated));
+            if !all_watches_populated {
+                return false;
+            }
+            let value = self
+                .dependencies
+                .iter()
+                .map(|&target| witness.get_target(target))
+                .sum();
+            out_buffer.set_target(self.output, value).unwrap();
+            true
         }
 
         fn serialize(
@@ -1223,6 +1286,73 @@ mod tests {
         Ok(unresolved_watches)
     }
 
+    /// Sequential scheduler before the counter narrowing, retained as a test oracle. It uses
+    /// `usize` counters and the old full-index initialization, but otherwise preserves the
+    /// production worklist's merge and enqueue order exactly.
+    fn legacy_usize_worklist<'a>(
+        inputs: PartialWitness<F>,
+        prover_data: &'a ProverOnlyCircuitData<F, C, D>,
+        common_data: &CommonCircuitData<F, D>,
+    ) -> Result<PartitionWitness<'a, F>> {
+        let mut witness = PartitionWitness::new(
+            common_data.config.num_wires,
+            common_data.degree(),
+            &prover_data.representative_map,
+        );
+        let mut unresolved_watches =
+            legacy_seed_inputs_and_unresolved_watches(&mut witness, inputs, prover_data)?;
+        let mut generator_is_expired = vec![false; prover_data.generators.len()];
+        let mut remaining_generators = prover_data.generators.len();
+        let mut pending_generator_indices = (0..prover_data.generators.len()).collect::<Vec<_>>();
+        let mut next_pending_generator_indices = Vec::new();
+        let mut buffer = GeneratedValues::empty();
+
+        while !pending_generator_indices.is_empty() {
+            next_pending_generator_indices.clear();
+            for &generator_idx in &pending_generator_indices {
+                if generator_is_expired[generator_idx] {
+                    continue;
+                }
+                let finished = prover_data.generators[generator_idx].0.run_with_ready_hint(
+                    &witness,
+                    &mut buffer,
+                    unresolved_watches[generator_idx] == 0,
+                );
+                if finished {
+                    generator_is_expired[generator_idx] = true;
+                    remaining_generators -= 1;
+                }
+
+                for (target, value) in buffer.target_values.drain(..) {
+                    if let Some(watch) = witness.set_target_returning_rep(target, value)? {
+                        if let Some(watchers) = prover_data.generator_indices_by_watches.get(&watch)
+                        {
+                            for &watching_generator_idx in watchers {
+                                if !generator_is_expired[watching_generator_idx] {
+                                    assert_ne!(
+                                        unresolved_watches[watching_generator_idx], 0,
+                                        "legacy oracle watch counter underflow"
+                                    );
+                                    unresolved_watches[watching_generator_idx] -= 1;
+                                    next_pending_generator_indices.push(watching_generator_idx);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            core::mem::swap(
+                &mut pending_generator_indices,
+                &mut next_pending_generator_indices,
+            );
+        }
+
+        if remaining_generators != 0 {
+            return Err(anyhow!("{remaining_generators} generators weren't run"));
+        }
+        Ok(witness)
+    }
+
     /// M2 differential: the precomputed-count initialization must produce exactly the vector the
     /// removed whole-map scan produced, for every seeding of the inputs. `unresolved_watches` is
     /// the only state M2 touches, so equality here implies an identical generator schedule.
@@ -1233,10 +1363,12 @@ mod tests {
 
         // The builder-derived counts must equal the number of watcher-list occurrences of each
         // generator across the whole map (the "no representative is populated yet" case).
-        let mut occurrences = vec![0usize; prover_data.generators.len()];
+        let mut occurrences = vec![0u32; prover_data.generators.len()];
         for (_, watchers) in prover_data.generator_indices_by_watches.iter() {
             for &generator_idx in watchers {
-                occurrences[generator_idx] += 1;
+                occurrences[generator_idx] = occurrences[generator_idx]
+                    .checked_add(1)
+                    .expect("test circuit watch count exceeds u32");
             }
         }
         assert_eq!(
@@ -1282,13 +1414,80 @@ mod tests {
             )?;
 
             assert_eq!(
-                new_counts, legacy_counts,
+                new_counts
+                    .iter()
+                    .map(|&count| count as usize)
+                    .collect::<Vec<_>>(),
+                legacy_counts,
                 "unresolved-watch counts diverge from the legacy map scan"
             );
             assert_eq!(new_witness.values, legacy_witness.values);
             assert_eq!(new_witness.set_bitmap, legacy_witness.set_bitmap);
         }
 
+        Ok(())
+    }
+
+    /// Narrowing the counters must not perturb either readiness decisions or watcher-list enqueue
+    /// order. The consumer is deliberately registered before its producers so it first runs
+    /// unready, is then enqueued once per producer output, and finally expires on the first queued
+    /// retry; this exercises duplicate worklist entries as well as both readiness states.
+    #[test]
+    fn u32_watch_counters_match_usize_schedule_and_worklist_order() -> Result<()> {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let a = builder.add_virtual_target();
+        let b = builder.add_virtual_target();
+        let x = builder.add_virtual_target();
+        let y = builder.add_virtual_target();
+        let output = builder.add_virtual_target();
+        let schedule = Arc::new(Mutex::new(Vec::new()));
+
+        // Registration order is worklist order: consumer first, then its two producers.
+        builder.add_generators(vec![
+            WitnessGeneratorRef::new(ScheduleRecordingGenerator {
+                ordinal: 2,
+                dependencies: vec![x, y],
+                output,
+                schedule: Arc::clone(&schedule),
+            }),
+            WitnessGeneratorRef::new(ScheduleRecordingGenerator {
+                ordinal: 0,
+                dependencies: vec![a],
+                output: x,
+                schedule: Arc::clone(&schedule),
+            }),
+            WitnessGeneratorRef::new(ScheduleRecordingGenerator {
+                ordinal: 1,
+                dependencies: vec![a, b],
+                output: y,
+                schedule: Arc::clone(&schedule),
+            }),
+        ]);
+        builder.register_public_input(output);
+        let circuit = builder.build::<C>();
+
+        let mut inputs = PartialWitness::new();
+        inputs.set_target(a, F::from_canonical_u64(2))?;
+        inputs.set_target(b, F::from_canonical_u64(3))?;
+
+        let legacy = legacy_usize_worklist(inputs.clone(), &circuit.prover_only, &circuit.common)?;
+        let legacy_schedule = core::mem::take(&mut *schedule.lock().unwrap());
+        let narrowed = PendingPartitionWitness::start_with_threshold(
+            inputs,
+            &circuit.prover_only,
+            &circuit.common,
+            usize::MAX,
+        )?
+        .finish()?;
+        let narrowed_schedule = core::mem::take(&mut *schedule.lock().unwrap());
+
+        assert_eq!(
+            legacy_schedule,
+            vec![(2, false), (0, true), (1, true), (2, true)],
+            "fixture did not exercise the intended ready/worklist ordering"
+        );
+        assert_eq!(narrowed_schedule, legacy_schedule);
+        assert_eq!(narrowed.get_target(output), legacy.get_target(output));
         Ok(())
     }
 

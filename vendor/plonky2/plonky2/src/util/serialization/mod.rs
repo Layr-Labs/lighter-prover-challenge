@@ -880,18 +880,13 @@ pub trait Read {
         // `generator_watch_counts` is runtime-only and carries no bytes: it is a pure function of
         // the watcher map just read. Each map entry's watcher list is deduplicated at build time,
         // so a generator appears once per distinct representative it watches and counting its
-        // occurrences reproduces the builder-derived counts exactly.
-        let mut generator_watch_counts = vec![0usize; generators.len()];
-        for watchers in generator_indices_by_watches.values() {
-            for &generator_idx in watchers {
-                if generator_idx >= generators.len() {
-                    return Err(IoError);
-                }
-                generator_watch_counts[generator_idx] += 1;
-            }
-        }
+        // occurrences reproduces the builder-derived counts exactly. Reconstruction also checks
+        // both watcher indices and the `u32` edge/count bound.
         let generator_indices_by_watches =
             GeneratorWatchIndex::from_map(generator_indices_by_watches);
+        let generator_watch_counts = generator_indices_by_watches
+            .generator_watch_counts(generators.len())
+            .ok_or(IoError)?;
 
         let constants_sigmas_commitment = self.read_polynomial_batch()?;
         let sigmas_len = self.read_usize()?;

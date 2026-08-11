@@ -412,7 +412,8 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     }
     let section = read_compressed_section(bytes, &mut pos)?;
     let mut vpos = 0usize;
-    let watchers_len = read_uvarint(&section, &mut vpos)? as usize;
+    let watchers_len = u32::try_from(read_uvarint(&section, &mut vpos)?)
+        .context("watch index watcher count exceeds u32")? as usize;
     ensure!(
         section.len() == vpos + 4 * watchers_len,
         "watch index watcher section length mismatch"
@@ -424,12 +425,11 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         watchers.push(watcher);
     }
     // Watch counts are a pure function of the (deduplicated) watcher lists;
-    // this mirrors `read_prover_only_circuit_data`'s reconstruction.
-    let mut generator_watch_counts = vec![0usize; generator_count];
-    for &watcher in &watchers {
-        generator_watch_counts[watcher] += 1;
-    }
+    // this mirrors `read_prover_only_circuit_data`'s reconstruction and checks the narrowed count.
     let generator_indices_by_watches = GeneratorWatchIndex::from_parts(offsets, watchers);
+    let generator_watch_counts = generator_indices_by_watches
+        .generator_watch_counts(generator_count)
+        .context("watch index contains an invalid generator or count")?;
 
     // constant polynomial values
     let section = read_compressed_section(bytes, &mut pos)?;
