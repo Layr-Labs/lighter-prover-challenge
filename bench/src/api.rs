@@ -1,4 +1,4 @@
-// Redraw marker 701-claude-fable-r2
+// Redraw marker exponent-affine2-r2
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
