@@ -856,6 +856,24 @@ pub(crate) fn prove_block_after_pre(
             .expect("final block proof failed")
     };
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+
+    // The caller serializes `final_proof`, closes its output descriptor, and
+    // terminates with `_exit(2)`. None of the finished circuit/proof inputs is
+    // observable after this point, yet dropping their multi-allocation graphs
+    // here delays the return to serialization. Let the kernel reclaim them
+    // wholesale at process exit. The environment switch retains the historical
+    // destructor path as a same-binary timing control.
+    if !std::env::var_os("LIGHTER_DROP_FINISHED_PROVER_STATE").is_some_and(|v| v == "1") {
+        std::mem::forget((
+            block,
+            circuits,
+            pre_proof,
+            pre_output,
+            light_chain_proof,
+            heavy_chain_proof,
+            block_target,
+        ));
+    }
     final_proof
 }
 
