@@ -28,13 +28,18 @@ use crate::util::{log2_strict, reverse_bits};
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
 
-/// Route the whole commitment (NTT + hashing) through the GPU backend.
-/// Official ranked A/B: submission 644c4257 (this on, over the 8.0011
-/// frontier) scored 6.2323 despite a +4.6% controlled local win — the NTT
-/// stages extend each tree's exclusive occupancy of the serialized GPU
-/// stream, which is the ranked critical path. Keep off; hashing-only GPU
-/// trees (`new_columns`) remain on.
-const GPU_NTT_COMMITMENTS: bool = false;
+/// Route the whole commitment (NTT + hashing) through the GPU only when the
+/// prover has declared an exclusive phase. The global form was rejected by
+/// ranked submission 644c4257 despite a +4.6% controlled local win: extending
+/// each tree's occupancy of the serialized Metal queue delayed concurrent
+/// transaction proofs. In the exclusive light-chain drain and final-block
+/// tail there is no competing proof, which removes that negative mechanism;
+/// the backend's ordinary shape and break-even checks still decide whether a
+/// particular commitment is worthwhile.
+#[inline]
+fn gpu_ntt_commitments_enabled() -> bool {
+    crate::hash::poseidon2::is_exclusive_gpu_phase()
+}
 
 /// Output layout for [`PolynomialBatch::fill_lde_batch`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,7 +87,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
-        if GPU_NTT_COMMITMENTS && !blinding {
+        if gpu_ntt_commitments_enabled() && !blinding {
             let value_columns: Vec<&[F]> =
                 values.iter().map(|v| v.values.as_slice()).collect();
             if let Some((columns, digests, cap, coeff_columns)) = timed!(
@@ -136,7 +141,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) -> Self {
         let degree = polynomials[0].len();
 
-        if GPU_NTT_COMMITMENTS && !blinding {
+        if gpu_ntt_commitments_enabled() && !blinding {
             let coeff_columns: Vec<&[F]> = polynomials
                 .iter()
                 .map(|p| p.coeffs.as_slice())
