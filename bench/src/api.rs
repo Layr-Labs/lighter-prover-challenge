@@ -1,4 +1,4 @@
-// Redraw marker 701-claude-fable-r2
+// Candidate marker 742-gpt56-sol-ready-prefix-merge-redraw-20260812
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
