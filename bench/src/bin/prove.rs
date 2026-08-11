@@ -44,6 +44,23 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
+fn get_performance_core_count() -> usize {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        if let Ok(output) = Command::new("sysctl").arg("-n").arg("hw.perflevel0.logicalcpu").output() {
+            if let Ok(s) = std::str::from_utf8(&output.stdout) {
+                if let Ok(count) = s.trim().parse::<usize>() {
+                    if count > 0 {
+                        return count;
+                    }
+                }
+            }
+        }
+    }
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
 fn main() {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context("worker", 0, &[]);
@@ -64,7 +81,9 @@ fn main() {
     // `log` is statically disabled in release builds: the ranked worker has no
     // log consumer, and diagnostics remain available in debug/test builds.
     // Do not link and initialize an unused logger in every scored process.
+    let num_p_cores = get_performance_core_count();
     rayon::ThreadPoolBuilder::new()
+        .num_threads(num_p_cores)
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
         .expect("cannot configure prover thread pool");
