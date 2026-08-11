@@ -17,8 +17,16 @@
 //! Set `LIGHTER_SKIP_EMBED=1` to write empty blobs instead (the runtime then
 //! falls back to building circuits from scratch); use this to A/B the
 //! mechanism or to cut compile time while iterating on unrelated code.
+//!
+//! The build never touches the build host's Metal device. If a separately
+//! generated, source-tracked, and integrity-pinned pipeline archive is
+//! present, it is copied into OUT_DIR for `prove` to embed. Otherwise an empty
+//! archive is embedded and the runtime safely takes its exact generic path.
 
 use std::path::{Path, PathBuf};
+
+#[path = "prebuilt_metal_archive.rs"]
+mod prebuilt_metal_archive;
 
 use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
 use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, Circuit as _};
@@ -72,15 +80,75 @@ fn build_path_blobs(tx_per_proof: usize, tx_mode: u8) -> (Vec<u8>, Vec<u8>) {
     (tx_blob, chain_blob)
 }
 
+fn write_empty_metal_archive(path: &Path) {
+    std::fs::write(path, []).unwrap_or_else(|error| {
+        panic!(
+            "cannot write Metal archive fallback {}: {error}",
+            path.display()
+        )
+    });
+}
+
+/// Installs only a byte-for-byte pinned, source-tracked archive. Generation is
+/// intentionally external: sandboxed benchmark build hosts have crashed while
+/// creating an `MTLDevice`, and build-time generation also makes the artifact
+/// depend on hidden host state. Every rejection writes an empty stub so the
+/// runtime cannot mistake an unverified file for an archive hit.
+fn install_prebuilt_metal_archive(out_dir: &Path, manifest_dir: &Path) {
+    let output_path = out_dir.join(prebuilt_metal_archive::FILE_NAME);
+    let source_path = manifest_dir.join(prebuilt_metal_archive::FILE_NAME);
+
+    println!("cargo:rerun-if-changed={}", source_path.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("prebuilt_metal_archive.rs").display()
+    );
+
+    if std::env::var_os("LIGHTER_SKIP_METAL_ARCHIVE").is_some_and(|value| value == "1") {
+        write_empty_metal_archive(&output_path);
+        println!(
+            "cargo:warning=LIGHTER_SKIP_METAL_ARCHIVE=1: embedded Metal archive is an empty fallback stub"
+        );
+        return;
+    }
+
+    match prebuilt_metal_archive::read_verified(&source_path) {
+        Ok(bytes) => {
+            std::fs::write(&output_path, &bytes).unwrap_or_else(|error| {
+                panic!(
+                    "cannot copy verified Metal archive to {}: {error}",
+                    output_path.display()
+                )
+            });
+            println!(
+                "cargo:warning=embedded pinned source Metal archive: {} bytes, SHA-256 {}",
+                bytes.len(),
+                prebuilt_metal_archive::sha256_hex(&bytes)
+            );
+        }
+        Err(error) => {
+            write_empty_metal_archive(&output_path);
+            println!(
+                "cargo:warning=committed Metal archive rejected ({error}); embedded empty fallback"
+            );
+        }
+    }
+}
+
 fn main() {
     // A dependency change (circuit/, vendor/plonky2/) rebuilds this script and
     // re-runs it regardless of these directives; bench's own sources do not
     // affect the blobs, so they are deliberately not tracked.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=LIGHTER_SKIP_EMBED");
+    println!("cargo:rerun-if-env-changed=LIGHTER_SKIP_METAL_ARCHIVE");
 
     let out_dir =
         PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR must be set for build scripts"));
+    let manifest_dir = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"),
+    );
+    install_prebuilt_metal_archive(&out_dir, &manifest_dir);
 
     if std::env::var_os("LIGHTER_SKIP_EMBED").is_some_and(|v| v == "1") {
         for name in BLOB_NAMES {
