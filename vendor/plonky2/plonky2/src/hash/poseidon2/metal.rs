@@ -1059,6 +1059,10 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
         let spawned = std::thread::Builder::new()
             .name(format!("poseidon2-metal-{name}"))
             .spawn(move || {
+                // These lazy pipeline builders are cold-start dependencies too. Request the
+                // same performance-core QoS explicitly rather than relying on whether a new
+                // pthread inherits the prewarm parent's scheduling class.
+                mark_prewarm_thread_latency_critical();
                 let pipeline = autoreleasepool(|| {
                     library.get_function(name, None).ok().and_then(|function| {
                         device
@@ -1170,10 +1174,30 @@ fn context_ready() -> bool {
 /// compiling blocks until it finishes and then observes the same context.
 /// Callers that never touch the GPU pay only the thread spawn. Nothing here
 /// is observable in a proof — the context holds compiled kernels, not values.
+#[cfg(target_os = "macos")]
+fn mark_prewarm_thread_latency_critical() {
+    #[allow(non_camel_case_types)]
+    type qos_class_t = u32;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
+    }
+    // Best-effort. Failure preserves the default scheduling used before this candidate.
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(0x21, 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mark_prewarm_thread_latency_critical() {}
+
 pub fn prewarm() {
     std::thread::Builder::new()
         .name("poseidon2-metal-prewarm".to_owned())
         .spawn(|| {
+            // Shader compilation and pipeline lowering are a cold-start serial dependency for
+            // every scored worker. Keep that short-lived compiler thread on a performance core
+            // while fixture parsing and circuit loading compete for CPU time.
+            mark_prewarm_thread_latency_critical();
             let _ = force_context();
         })
         .ok();
