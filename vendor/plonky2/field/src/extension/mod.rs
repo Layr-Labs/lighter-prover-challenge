@@ -99,6 +99,17 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    /// Four independent dot products over one shared extension-value table.
+    /// The default retains the existing per-output implementation.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_product_quad(
+        extension_values: &[Self::Extension],
+        base_scalars: [&[Self]; 4],
+    ) -> [Self::Extension; 4] {
+        base_scalars.map(|scalars| Self::extension_base_dot_product(extension_values, scalars))
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.

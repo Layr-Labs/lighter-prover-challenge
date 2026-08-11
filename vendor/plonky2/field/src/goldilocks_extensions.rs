@@ -35,6 +35,14 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    #[inline]
+    fn extension_base_dot_product_quad(
+        extension_values: &[QuadraticExtension<Self>],
+        base_scalars: [&[Self]; 4],
+    ) -> [QuadraticExtension<Self>; 4] {
+        ext2_base_scalar_dot_product_quad(extension_values, base_scalars)
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -389,6 +397,37 @@ pub fn ext2_base_scalar_dot_slots(
             unsafe { reduce160(lo1, hi1) },
         ]);
     }
+}
+
+/// Four same-length quadratic-extension/base-field dot products sharing one
+/// powers-table walk. Every lane is reduced once per extension limb.
+#[inline]
+pub fn ext2_base_scalar_dot_product_quad(
+    extension_values: &[QuadraticExtension<GoldilocksField>],
+    base_scalars: [&[GoldilocksField]; 4],
+) -> [QuadraticExtension<GoldilocksField>; 4] {
+    let len = extension_values.len();
+    assert!(base_scalars.iter().all(|values| values.len() == len));
+    assert!(len < 1 << 24);
+    let mut lo0 = [0u128; 4];
+    let mut hi0 = [0u32; 4];
+    let mut lo1 = [0u128; 4];
+    let mut hi1 = [0u32; 4];
+    for i in 0..len {
+        let QuadraticExtension([b0, b1]) = extension_values[i];
+        for lane in 0..4 {
+            let c = base_scalars[lane][i].0;
+            u160_add_product(&mut lo0[lane], &mut hi0[lane], b0.0, c);
+            u160_add_product(&mut lo1[lane], &mut hi1[lane], b1.0, c);
+        }
+    }
+    core::array::from_fn(|lane| {
+        // SAFETY: fewer than 2^24 products is far within reduce160's bound.
+        QuadraticExtension([
+            unsafe { reduce160(lo0[lane], hi0[lane]) },
+            unsafe { reduce160(lo1[lane], hi1[lane]) },
+        ])
+    })
 }
 
 /*
@@ -760,6 +799,7 @@ pub(crate) fn ext5_mul(a: [u64; 5], b: [u64; 5]) -> [GoldilocksField; 5] {
 
 #[cfg(test)]
 mod tests {
+    use super::{ext2_base_scalar_dot_product, ext2_base_scalar_dot_product_quad};
     use crate::extension::quadratic::QuadraticExtension;
     use crate::extension::quartic::QuarticExtension;
     use crate::extension::quintic::{QuinticExtension, QuinticFirstCoeff};
@@ -884,6 +924,40 @@ mod tests {
         // Raw representatives are deliberately not part of the assertion:
         // delayed and per-term reduction are required to agree as field
         // values, including when every input can occupy the full u64 range.
+    }
+
+    #[test]
+    fn ext2_extension_base_dot_product_quad_matches_individual() {
+        let p = GF::ORDER;
+        for len in [0usize, 1, 17, 257, 2048] {
+            let values: Vec<Q2> = (0..len)
+                .map(|i| {
+                    QuadraticExtension([
+                        GF::from_noncanonical_u64((i as u64).wrapping_mul(17).wrapping_add(p)),
+                        GF::from_noncanonical_u64((i as u64).wrapping_mul(23).wrapping_add(u64::MAX)),
+                    ])
+                })
+                .collect();
+            let lanes: [Vec<GF>; 4] = core::array::from_fn(|lane| {
+                (0..len)
+                    .map(|i| GF::from_noncanonical_u64((i as u64 + lane as u64).wrapping_mul(29)))
+                    .collect()
+            });
+            let actual = ext2_base_scalar_dot_product_quad(
+                &values,
+                [lanes[0].as_slice(), lanes[1].as_slice(), lanes[2].as_slice(), lanes[3].as_slice()],
+            );
+            for lane in 0..4 {
+                let expected = ext2_base_scalar_dot_product(&values, &lanes[lane]);
+                for limb in 0..2 {
+                    assert_eq!(
+                        actual[lane].0[limb].to_canonical_u64(),
+                        expected.0[limb].to_canonical_u64(),
+                        "length {len}, lane {lane}, limb {limb}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

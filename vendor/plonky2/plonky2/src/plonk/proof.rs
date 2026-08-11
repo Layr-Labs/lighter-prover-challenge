@@ -312,6 +312,43 @@ pub struct OpeningSet<F: RichField + Extendable<D>, const D: usize> {
     pub lookup_zs_next: Vec<F::Extension>,
 }
 
+const OPENING_EVAL_GROUP_WIDTH: usize = 4;
+
+fn eval_polynomial_groups<F: RichField + Extendable<D>, const D: usize>(
+    pows: &[F::Extension],
+    batches: &[&[PolynomialCoeffs<F>]],
+) -> Vec<F::Extension> {
+    let polynomials: Vec<&PolynomialCoeffs<F>> =
+        batches.iter().flat_map(|batch| batch.iter()).collect();
+    let mut evaluations = vec![F::Extension::ZERO; polynomials.len()];
+    let use_quad = std::env::var("LIGHTER_DISABLE_OPENING_EVAL_QUAD").ok().as_deref() != Some("1");
+    evaluations
+        .par_chunks_mut(OPENING_EVAL_GROUP_WIDTH)
+        .zip(polynomials.par_chunks(OPENING_EVAL_GROUP_WIDTH))
+        .for_each(|(out, group)| {
+            if use_quad
+                && group.len() == OPENING_EVAL_GROUP_WIDTH
+                && group.iter().all(|polynomial| polynomial.coeffs.len() == pows.len())
+            {
+                let values = F::extension_base_dot_product_quad(
+                    pows,
+                    [
+                        group[0].coeffs.as_slice(),
+                        group[1].coeffs.as_slice(),
+                        group[2].coeffs.as_slice(),
+                        group[3].coeffs.as_slice(),
+                    ],
+                );
+                out.copy_from_slice(&values);
+            } else {
+                for (output, polynomial) in out.iter_mut().zip(group) {
+                    *output = F::extension_base_dot_product(pows, &polynomial.coeffs);
+                }
+            }
+        });
+    evaluations
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
     pub fn new<C: GenericConfig<D, F = F>>(
         zeta: F::Extension,
@@ -378,21 +415,31 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
                 .map(|p| F::extension_base_dot_product(pows, &p.coeffs))
                 .collect::<Vec<_>>()
         };
-        let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
-            eval_polynomials(pows, &c.polynomials)
-        };
-        let constants_sigmas_eval = eval_commitment(&zeta_pows, constants_sigmas_commitment);
+        let constants_sigmas_len = constants_sigmas_commitment.polynomials.len();
+        let wires_len = wires_commitment.polynomials.len();
+        let zs_len = zs_partial_products_lookup_commitment.polynomials.len();
+        let quotient_offset = constants_sigmas_len + wires_len + zs_len;
+        let mut zeta_evals = eval_polynomial_groups(
+            &zeta_pows,
+            &[
+                &constants_sigmas_commitment.polynomials,
+                &wires_commitment.polynomials,
+                &zs_partial_products_lookup_commitment.polynomials,
+                &quotient_polys_commitment.polynomials,
+            ],
+        );
+        let quotient_polys = zeta_evals.split_off(quotient_offset);
+        let zs_partial_products_lookup_eval = zeta_evals.split_off(constants_sigmas_len + wires_len);
+        let wires = zeta_evals.split_off(constants_sigmas_len);
+        let constants_sigmas_eval = zeta_evals;
 
         // `zs_partial_products_lookup_eval` contains the permutation argument polynomials as well as lookup polynomials.
-        let zs_partial_products_lookup_eval =
-            eval_commitment(&zeta_pows, zs_partial_products_lookup_commitment);
         let shifted_polynomials = &zs_partial_products_lookup_commitment.polynomials;
-        let quotient_polys = eval_commitment(&zeta_pows, quotient_polys_commitment);
 
         Self {
             constants: constants_sigmas_eval[common_data.constants_range()].to_vec(),
             plonk_sigmas: constants_sigmas_eval[common_data.sigmas_range()].to_vec(),
-            wires: eval_commitment(&zeta_pows, wires_commitment),
+            wires,
             plonk_zs: zs_partial_products_lookup_eval[common_data.zs_range()].to_vec(),
             // Partial-product polynomials are opened only at `zeta`, never at
             // `g * zeta`; evaluate only the shifted Z polynomials consumed by
