@@ -209,29 +209,17 @@ where
     // place; routed columns are IFFT'd from the borrowed witness column
     // (`ifft_borrowed` fuses the former clone with the FFT's initial
     // bit-reversal gather), so no witness column is copied.
-    let num_routed_wires = common_data.config.num_routed_wires;
-    let wires_coeffs: Vec<PolynomialCoeffs<F>> = timed!(
-        timing,
-        "compute wire polynomials (IFFT)",
-        witness
-            .wire_values
-            .par_iter_mut()
-            .enumerate()
-            .map(|(j, column)| {
-                if j < num_routed_wires {
-                    ifft_borrowed(column)
-                } else {
-                    PolynomialValues::new(core::mem::take(column)).ifft()
-                }
-            })
-            .collect()
-    );
+    let wires_values: Vec<PolynomialValues<F>> = witness
+        .wire_values
+        .iter()
+        .map(|col| PolynomialValues::new(col.clone()))
+        .collect();
 
     let wires_commitment = timed!(
         timing,
         "compute wires commitment",
-        PolynomialBatch::<F, C, D>::from_coeffs(
-            wires_coeffs,
+        PolynomialBatch::<F, C, D>::from_values(
+            wires_values,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::WIRES.blinding,
             config.fri_config.cap_height,
