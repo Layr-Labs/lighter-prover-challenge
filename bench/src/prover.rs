@@ -53,8 +53,7 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // Light-proof throughput is the run's terminal constraint (the chain drains
 // concurrently and finishes within a step of the last tx proof; the block
 // waits for both), so the window depth divides the longest phase directly.
-// Series draw marker: v8 surface, sample 5 (identical trees deduplicate to
-// the prior submission, so redraws carry this counter).
+// Series draw marker: promoted surface restored, sample 6.
 // The depth-4 ceiling dated from tighter-memory hosts: measured peak RSS is
 // ~6.8 GB at depth 4 against 24 GB local / 48 GB ranked, and mid-run CPU
 // occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
@@ -592,20 +591,6 @@ fn prove_path(
             in_flight.len() as u64,
         );
         while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
-            // Claim the exclusive phase only once the window has actually
-            // flushed: at drain entry, `in_flight` still holds up to a full
-            // window of chunk proofs whose trees the exclusive routing (lower
-            // GPU cutoff, occupancy bypass) would otherwise queue against —
-            // the flag's contract is "no other proof runs concurrently", and
-            // that becomes true at the last window entry, not at drain entry.
-            // Also covers the sibling path retiring mid-drain (relaxed read).
-            if !exclusive_drain
-                && in_flight.is_empty()
-                && claims_exclusive_gpu_phase(active_paths)
-            {
-                exclusive_drain = true;
-                plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-            }
             let tx_proof = {
                 #[cfg(feature = "diagnostic_profile")]
                 let _join_wait = plonky2::util::profile::span("wait", "tx_proof_drain_join");
@@ -613,6 +598,18 @@ fn prove_path(
                     .join()
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
             };
+            // Claim the exclusive phase only once the window has flushed AND
+            // the last chunk proof has retired (the join above): before this
+            // point the exclusive routing's lower GPU cutoff and occupancy
+            // bypass would queue still-running chunk proofs' trees against
+            // the drain's. Covers the sibling retiring mid-drain (relaxed).
+            if !exclusive_drain
+                && in_flight.is_empty()
+                && claims_exclusive_gpu_phase(active_paths)
+            {
+                exclusive_drain = true;
+                plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
+            }
             // Spawn the drained step exactly like the pipelined phase so its
             // phase-1 witness (which needs only the tx proof) overlaps the
             // predecessor's prove instead of serializing behind it. Only one
