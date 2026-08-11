@@ -1,4 +1,4 @@
-// Redraw marker 701-claude-fable-r2
+// Redraw marker 620-codex-top-alap
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
@@ -33,12 +33,13 @@ pub struct Circuits {
     /// against the light path's forty-nine — so their preprocessed extensions
     /// are dead for the great majority of the process lifetime. They sit behind
     /// an `RwLock` purely so that death can be acted on: every reader (the heavy
-    /// path for its whole run, the final block circuit's construction for the
-    /// duration of `define`) holds a shared guard, and
-    /// [`Circuits::release_heavy_circuit_extensions`] takes the exclusive guard
-    /// once both are gone. Shared guards never block one another, so no reader
-    /// is serialized against another and no work is added; the lock is a proof
-    /// obligation discharged by the type system, not a scheduling change.
+    /// path for its whole run, the deferred final block circuit's construction
+    /// for the duration of `define`) holds a shared guard. The release runs in
+    /// the gap after the heavy reader exits and before the block reader begins;
+    /// that later reader needs only fields the release preserves. Shared guards
+    /// never block one another, so no reader is serialized against another and
+    /// no work is added; the lock is a proof obligation discharged by the type
+    /// system, not a scheduling change.
     pub heavy_tx_data: std::sync::RwLock<CircuitData<F, C, D>>,
     pub light_tx_target: BlockTxTarget,
     /// The light pair's extensions are dead the moment the light path's thread
@@ -147,12 +148,14 @@ impl Circuits {
     /// and the block itself.
     ///
     /// Those five extensions are `2 * 2^19 * 88 + 3 * 2^17 * 86` field elements
-    /// = 1.01 GB, and on this host they are resident in CPU-visible Metal
-    /// shared buffers whose release returns the pages to the OS immediately.
+    /// = 1.01 GB in CPU-visible Metal shared buffers. Dropping their owners
+    /// removes them from the live circuit set and makes their backing storage
+    /// eligible for Metal-pool reuse or allocator release; physical RSS timing
+    /// remains an allocator/driver decision.
     /// The final block proof is the process's peak-RSS moment — it stacks its
     /// own `2^21`-row wires, Z and quotient extensions (2.89 GB) on top of
-    /// every retained extension — so releasing these first takes 1.01 GB
-    /// straight off the high-water mark.
+    /// every retained extension — so retiring these first avoids keeping that
+    /// 1.01 GB logically live across the final proof's allocation peak.
     ///
     /// Nothing else is released here. Generators, representative maps and
     /// witness buffers are CPU-heap objects whose recursive drop is not free.
@@ -193,20 +196,19 @@ impl Circuits {
     /// The heavy path proves three chunks; the light path proves forty-nine.
     /// The heavy pair therefore stops being read after a small fraction of the
     /// process lifetime, but until now its two extensions — `2^19 * 88 + 2^17 *
-    /// 86` field elements = 438 MiB of CPU-visible Metal shared buffers whose
-    /// release returns the pages to the OS immediately — stayed resident until
-    /// the pipeline joined, i.e. across the whole light phase, which is exactly
-    /// the window in which five concurrent workers contend for the machine's
-    /// memory.
+    /// 86` field elements = 438 MiB in CPU-visible Metal shared buffers — stayed
+    /// logically live until the pipeline joined. Retiring their owners makes the
+    /// backing storage eligible for Metal-pool reuse or allocator release during
+    /// the whole remaining light phase.
     ///
     /// The `RwLock` is what makes the release provable rather than merely
-    /// plausible: acquiring the exclusive guard *is* the proof that no reader
-    /// remains, because every reader of these two circuits holds a shared guard
-    /// for the whole span in which it may touch them — the heavy path from
-    /// before its first witness until after its chain proof, and
-    /// [`Self::build_block_circuit`] for the duration of `BlockCircuit::define`.
-    /// The caller runs this after joining the heavy path's thread, so both
-    /// guards are already gone and the acquisition is uncontended.
+    /// plausible. The heavy path holds a shared guard from before its first
+    /// witness until after its chain proof, and the caller joins that path before
+    /// acquiring this exclusive guard. The deferred
+    /// [`Self::build_block_circuit`] starts only after this method returns; its
+    /// later `BlockCircuit::define` reads only the preserved `common` and
+    /// `verifier_only` fields, not either value cleared here. The acquisition is
+    /// therefore uncontended and no live reader can observe a cleared value.
     ///
     /// Value-exact and free: no quantity is computed differently and no work is
     /// added — storage that no subsequent read can reach is returned earlier.
@@ -227,13 +229,13 @@ impl Circuits {
     /// extensions as soon as the light path's thread has produced its chain
     /// proof. Same shape and proof obligation as
     /// [`Self::release_heavy_circuit_extensions`]: the light path holds the
-    /// shared guards for its whole run, [`Self::build_block_circuit`] holds a
-    /// light-chain guard for the duration of `define` (which finishes long
-    /// before the light path), and the caller joins the light thread before
-    /// acquiring the exclusive guard, so the acquisition is uncontended. The
-    /// extensions are `2^19 * 88 + 2^17 * 86` field elements = 438 MiB of
-    /// CPU-visible Metal shared buffers released seconds before
-    /// [`Self::release_finished_circuit_extensions`] would.
+    /// shared guards for its whole run, and [`Self::build_block_circuit`] holds a
+    /// light-chain guard for the duration of `define`. The caller joins both the
+    /// block-build lane and the light thread before acquiring the exclusive
+    /// guard, so no assumption about which finishes first is required. The
+    /// extensions are `2^19 * 88 + 2^17 * 86` field elements = 438 MiB in
+    /// CPU-visible Metal shared buffers, made eligible for pool reuse or
+    /// allocator release before [`Self::release_finished_circuit_extensions`].
     pub fn release_light_circuit_extensions(&self) {
         for lock in [&self.light_tx_data, &self.light_chain_data] {
             let mut data = lock

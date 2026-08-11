@@ -83,12 +83,15 @@ fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
 /// disables occupancy-conditional routing process-wide for the light pipeline and
 /// simultaneously force-routes this path's own fold trees behind the light
 /// pipeline's chunk trees — it hurts both sides. The claim is legitimate only for
-/// the path that is the last one still proving, which this counter identifies.
+/// the path that is the last active GPU user, which this counter identifies.
+/// The deferred final-block build is also a GPU user: it remains counted until
+/// `CircuitBuilder::build` returns, so a chain drain cannot force narrow trees
+/// onto Metal while that build is still submitting commitment work.
 ///
 /// Routing is a scheduling heuristic: either outcome hashes the identical tree,
 /// so a stale read here is benign and no proof byte depends on the answer.
-fn claims_exclusive_gpu_phase(active_paths: &AtomicUsize) -> bool {
-    active_paths.load(Ordering::Acquire) == 1
+fn claims_exclusive_gpu_phase(active_gpu_lanes: &AtomicUsize) -> bool {
+    active_gpu_lanes.load(Ordering::Acquire) == 1
 }
 
 /// Marks the calling thread as latency-critical to the macOS scheduler.
@@ -300,7 +303,7 @@ fn prove_path(
     old_account_delta_tree_root: HashOut<F>,
     pre_output: &BlockPreExecWitness<F>,
     state_metadata_hash: HashOut<F>,
-    active_paths: &AtomicUsize,
+    active_gpu_lanes: &AtomicUsize,
 ) -> Proof {
     assert!(
         !chunks.is_empty(),
@@ -322,8 +325,10 @@ fn prove_path(
     // exists — so the exclusive acquisition in
     // `Circuits::release_heavy_circuit_extensions` is a proof that the heavy
     // path is finished with them. Shared guards never block one another, so
-    // this neither serializes the two paths nor delays the concurrent block
-    // circuit construction, which takes its own shared guard.
+    // this neither serializes the two paths nor delays the deferred block
+    // circuit construction. That construction starts after the heavy path
+    // releases these guards and reads only the preserved `common` and
+    // `verifier_only` fields.
     let heavy_tx_guard;
     let heavy_chain_guard;
     let light_tx_guard;
@@ -506,7 +511,7 @@ fn prove_path(
         // pre-execution and final block phases — but only once this path is the
         // last one proving, since the switch is process-global (see
         // [`claims_exclusive_gpu_phase`]).
-        let exclusive_drain = claims_exclusive_gpu_phase(active_paths);
+        let exclusive_drain = claims_exclusive_gpu_phase(active_gpu_lanes);
         #[cfg(feature = "diagnostic_profile")]
         {
             plonky2::util::profile::counter(
@@ -550,9 +555,9 @@ fn prove_path(
         chain_proof
     });
     // This path has produced its last proof. Retiring it here — after the scope,
-    // so every thread it spawned has joined — is what lets the sibling path's
-    // drain observe that it is alone and claim the exclusive GPU phase.
-    active_paths.fetch_sub(1, Ordering::Release);
+    // so every thread it spawned has joined — is what lets a sibling path's
+    // drain observe when neither another path nor the block build is active.
+    active_gpu_lanes.fetch_sub(1, Ordering::Release);
     chain_proof
 }
 
@@ -652,25 +657,31 @@ pub(crate) fn prove_block_after_pre(
     block.tx_chunks = tx_chunks;
     block.tx_chunks.push(Vec::new());
 
-    // Both transaction paths prove concurrently and each ends in a strictly
-    // sequential chain tail, but the exclusive-GPU switch that tail wants is
-    // process-global. This counter lets a path tell "my own pipeline is done"
-    // apart from "no other proof is running": each path retires itself when its
-    // chain proof is finished, so only the last one standing claims the phase.
-    let active_paths = AtomicUsize::new(2);
+    // The two transaction paths and the deferred final-block build can all use
+    // the process-global Metal queue. A chain tail may claim the exclusive-GPU
+    // phase only after both sibling users have retired. Heavy and light retire
+    // after their final chain proofs; the block-build lane retires immediately
+    // after `CircuitBuilder::build` returns and all of its commitment work has
+    // completed. The expected transition is 3 -> 2 (heavy) -> 1 (block build),
+    // leaving the long light tail as the sole GPU user.
+    let active_gpu_lanes = AtomicUsize::new(3);
     let (light_chain_proof, heavy_chain_proof, block_target, block_data, block_pending) = {
         // The pipeline only ever reads the circuits; the borrow ends with this
         // block so the finished extensions can be released below.
         let circuits = &circuits;
-        let active_paths = &active_paths;
+        let active_gpu_lanes = &active_gpu_lanes;
         std::thread::scope(|scope| {
-            // The final block circuit depends only on already-built circuit data
-            // and is not needed until the final proof, so it builds concurrently
-            // with the entire transaction/chain proving pipeline.
+            // The final block circuit is not needed until both transaction paths
+            // finish. Delay its Rayon- and Metal-heavy build until the three-chunk
+            // heavy path retires, then hide it under the roughly thirty-second
+            // light-only suffix. This removes the build from the fully saturated
+            // heavy+light interval and logically retires the heavy pair's
+            // 438 MiB of extensions before allocating the final circuit, making
+            // their backing storage eligible for pool reuse or allocator drop.
             // Two-phase final-block witness (H13): this lane also runs the
             // EARLY witness phase (block data + pre-proof generators) after the
-            // build, then joins the heavy path — which finishes ~30 s before
-            // the light path — and feeds its verify subtree here, mid-pipeline.
+            // deferred build and feeds the already-joined heavy proof here,
+            // mid-pipeline.
             // Measured feed split: light 0.018 s vs heavy 0.575 s; the heavy
             // verify subtree (ECDSA/keccak) owns the late witness cost, and
             // moving it here deletes it from the serial tail. Both phases run
@@ -695,7 +706,7 @@ pub(crate) fn prove_block_after_pre(
                         block.old_account_delta_tree_root,
                         &pre_output,
                         state_metadata_hash,
-                        active_paths,
+                        active_gpu_lanes,
                     )
                 })
                 .expect("heavy transaction chain thread must start");
@@ -714,12 +725,31 @@ pub(crate) fn prove_block_after_pre(
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_span =
                         plonky2::util::profile::span("orchestration", "final_block_build_lane");
+                    #[cfg(feature = "diagnostic_profile")]
+                    let _heavy_wait =
+                        plonky2::util::profile::span("wait", "heavy_path_join_for_final");
+                    let heavy_chain_proof = heavy_handle_outer
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    #[cfg(feature = "diagnostic_profile")]
+                    drop(_heavy_wait);
+                    // Heavy proving is finished and no block-build reader exists
+                    // yet. Retire its 438 MiB of preprocessed extensions before
+                    // allocating the final circuit, making their storage eligible
+                    // for pool reuse or allocator release. `build_block_circuit`
+                    // later reads only preserved `common` and `verifier_only` data.
+                    circuits.release_heavy_circuit_extensions();
                     let (block_target, block_data) = {
                         #[cfg(feature = "diagnostic_profile")]
                         let _span =
                             plonky2::util::profile::span("orchestration", "build_block_circuit");
                         circuits.build_block_circuit()
                     };
+                    // `build::<C>()` waits for every commitment it submits before
+                    // returning. From here on the block lane performs CPU witness
+                    // work only, so it no longer prevents the light chain tail
+                    // from claiming the process-global exclusive GPU phase.
+                    active_gpu_lanes.fetch_sub(1, Ordering::Release);
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
                     let early = BlockCircuit::witness_inputs_early(
@@ -734,23 +764,6 @@ pub(crate) fn prove_block_after_pre(
                         &block_data.common,
                     )
                     .expect("final block early witness phase failed");
-                    #[cfg(feature = "diagnostic_profile")]
-                    let _heavy_wait =
-                        plonky2::util::profile::span("wait", "heavy_path_join_for_final");
-                    let heavy_chain_proof = heavy_handle_outer
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                    // The heavy path's thread has exited, so its shared guards
-                    // on the heavy transaction and chain circuits are gone, and
-                    // this lane dropped its own guard when `build_block_circuit`
-                    // returned above. Nothing reads those two circuits again:
-                    // the light pipeline uses the light pair, and the final
-                    // block proof uses only `block_data`, the three finished
-                    // proofs and the block. Retire their preprocessed
-                    // extensions here — 438 MiB of Metal shared buffers whose
-                    // release returns the pages to the OS immediately — instead
-                    // of holding them across the whole light phase.
-                    circuits.release_heavy_circuit_extensions();
                     pending
                         .feed(
                             BlockCircuit::witness_inputs_heavy_chain(
@@ -778,7 +791,7 @@ pub(crate) fn prove_block_after_pre(
                         block.old_account_delta_tree_root,
                         &pre_output,
                         state_metadata_hash,
-                        active_paths,
+                        active_gpu_lanes,
                     )
                 })
                 .expect("light transaction chain thread must start");
@@ -797,14 +810,14 @@ pub(crate) fn prove_block_after_pre(
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             // The light path's thread has exited, so its shared guards on the
-            // light transaction and chain circuits are gone, and the block lane
-            // dropped its own light-chain guard when `build_block_circuit`
-            // returned long ago. Nothing reads the light pair again: the final
+            // light transaction and chain circuits are gone, and the joined block
+            // lane dropped its own light-chain guard when `build_block_circuit`
+            // returned. Nothing reads the light pair again: the final
             // block proof uses only `block_data`, the three finished proofs and
-            // the block. Retire their preprocessed extensions here — 438 MiB of
-            // Metal shared buffers whose release returns the pages to the OS
-            // immediately — instead of holding them through the final witness
-            // setup until the backstop below.
+            // the block. Retire their 438 MiB of preprocessed Metal shared
+            // buffers here, making the storage eligible for pool reuse or
+            // allocator release instead of keeping it logically live through
+            // final witness setup until the backstop below.
             circuits.release_light_circuit_extensions();
             (
                 light_chain_proof,
@@ -957,20 +970,42 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_gpu_phase_is_claimed_only_by_the_last_running_path() {
-        // Two paths proving: the one that reaches its drain first (the three-chunk
-        // heavy path) must not claim the process-global exclusive phase while the
-        // forty-nine-chunk light pipeline is still running.
-        let active_paths = AtomicUsize::new(2);
-        assert!(!claims_exclusive_gpu_phase(&active_paths));
+    fn exclusive_gpu_phase_waits_for_heavy_and_block_build_lanes() {
+        // Heavy, light and the deferred block build can all submit Metal work.
+        let active_gpu_lanes = AtomicUsize::new(3);
+        assert!(!claims_exclusive_gpu_phase(&active_gpu_lanes));
 
-        // The heavy path retires; the light path's drain is now genuinely alone.
-        active_paths.fetch_sub(1, Ordering::Release);
-        assert!(claims_exclusive_gpu_phase(&active_paths));
+        // Heavy retires first. The block build still overlaps the light path,
+        // so the light drain must continue to use occupancy-aware routing.
+        active_gpu_lanes.fetch_sub(1, Ordering::Release);
+        assert_eq!(active_gpu_lanes.load(Ordering::Acquire), 2);
+        assert!(!claims_exclusive_gpu_phase(&active_gpu_lanes));
 
-        // Both retired: nothing is proving, so nothing claims the phase either.
-        active_paths.fetch_sub(1, Ordering::Release);
-        assert!(!claims_exclusive_gpu_phase(&active_paths));
+        // Once the deferred build returns, the light path is genuinely alone.
+        active_gpu_lanes.fetch_sub(1, Ordering::Release);
+        assert_eq!(active_gpu_lanes.load(Ordering::Acquire), 1);
+        assert!(claims_exclusive_gpu_phase(&active_gpu_lanes));
+
+        // The light path retires last; no caller remains to claim the phase.
+        active_gpu_lanes.fetch_sub(1, Ordering::Release);
+        assert_eq!(active_gpu_lanes.load(Ordering::Acquire), 0);
+        assert!(!claims_exclusive_gpu_phase(&active_gpu_lanes));
+    }
+
+    #[test]
+    fn light_drain_stays_nonexclusive_when_block_build_outlives_it() {
+        let active_gpu_lanes = AtomicUsize::new(3);
+
+        // Heavy has finished, but a slow block build is still a concurrent GPU
+        // user when light reaches its drain.
+        active_gpu_lanes.fetch_sub(1, Ordering::Release);
+        assert_eq!(active_gpu_lanes.load(Ordering::Acquire), 2);
+        assert!(!claims_exclusive_gpu_phase(&active_gpu_lanes));
+
+        // Retiring light before the block lane is safe: the decision above was
+        // fail-closed, and the block builder never calls the chain-tail predicate.
+        active_gpu_lanes.fetch_sub(1, Ordering::Release);
+        assert_eq!(active_gpu_lanes.load(Ordering::Acquire), 1);
     }
 
     #[test]
