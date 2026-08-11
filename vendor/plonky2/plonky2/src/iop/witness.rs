@@ -473,8 +473,12 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
 
         MatrixWitness { wire_values }
     }
-    #[allow(dead_code)]
-    fn full_witness_serial_reference(self) -> MatrixWitness<F> {
+    /// Materialize the identical witness without submitting work to the global Rayon pool.
+    ///
+    /// Small latency-critical proofs can use this to avoid queueing a tiny copy behind bulk
+    /// proof work. The traversal and bitmap semantics are deliberately identical to
+    /// [`Self::full_witness`].
+    pub fn full_witness_serial(self) -> MatrixWitness<F> {
         let mut wire_values: Vec<Vec<F>> = (0..self.num_wires)
             .map(|_| Vec::with_capacity(self.degree))
             .collect();
@@ -512,5 +516,31 @@ impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    #[test]
+    fn serial_full_witness_matches_parallel_with_set_and_unset_slots() {
+        type F = GoldilocksField;
+        let representatives: Vec<u32> = (0..8).collect();
+        let make_witness = || {
+            let mut witness = PartitionWitness::<F>::new(2, 4, &representatives);
+            witness
+                .set_target(Target::wire(0, 0), F::from_canonical_u64(11))
+                .unwrap();
+            witness
+                .set_target(Target::wire(2, 1), F::from_canonical_u64(29))
+                .unwrap();
+            witness
+        };
+
+        let parallel = make_witness().full_witness();
+        let serial = make_witness().full_witness_serial();
+        assert_eq!(parallel.wire_values, serial.wire_values);
     }
 }

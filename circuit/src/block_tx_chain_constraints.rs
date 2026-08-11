@@ -18,7 +18,7 @@ use plonky2::plonk::circuit_data::{
 };
 use plonky2::plonk::config::GenericConfig;
 use plonky2::plonk::proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget};
-use plonky2::plonk::prover::prove_with_partition_witness;
+use plonky2::plonk::prover::prove_with_partition_witness_serial_full_witness;
 use plonky2::timed;
 use plonky2::util::timing::TimingTree;
 
@@ -322,7 +322,7 @@ impl BlockTxChainCircuit {
         let partition_witness = pending.finish()?;
         let proof = {
             let mut prove_timing = TimingTree::new("BlockTxChainProve", Level::Debug);
-            let proof = prove_with_partition_witness(
+            let proof = prove_with_partition_witness_serial_full_witness(
                 &circuit_data.prover_only,
                 &circuit_data.common,
                 partition_witness,

@@ -140,7 +140,47 @@ pub fn prove_with_partition_witness<
 >(
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
+    partition_witness: PartitionWitness<F>,
+    timing: &mut TimingTree,
+) -> Result<ProofWithPublicInputs<F, C, D>>
+where
+    C::Hasher: Hasher<F>,
+    C::InnerHasher: Hasher<F>,
+{
+    prove_with_partition_witness_inner(prover_data, common_data, partition_witness, false, timing)
+}
+
+/// Prove from a pre-generated witness, materializing its wire matrix on the calling thread.
+///
+/// This is intended only for small latency-critical circuits whose caller would otherwise submit
+/// a short copy to a globally busy Rayon pool. It is proof-semantic equivalent to
+/// [`prove_with_partition_witness`].
+pub fn prove_with_partition_witness_serial_full_witness<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+    partition_witness: PartitionWitness<F>,
+    timing: &mut TimingTree,
+) -> Result<ProofWithPublicInputs<F, C, D>>
+where
+    C::Hasher: Hasher<F>,
+    C::InnerHasher: Hasher<F>,
+{
+    prove_with_partition_witness_inner(prover_data, common_data, partition_witness, true, timing)
+}
+
+fn prove_with_partition_witness_inner<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
     mut partition_witness: PartitionWitness<F>,
+    serial_full_witness: bool,
     timing: &mut TimingTree,
 ) -> Result<ProofWithPublicInputs<F, C, D>>
 where
@@ -200,7 +240,11 @@ where
     let mut witness = timed!(
         timing,
         "compute full witness",
-        partition_witness.full_witness()
+        if serial_full_witness {
+            partition_witness.full_witness_serial()
+        } else {
+            partition_witness.full_witness()
+        }
     );
 
     // Only the routed columns are read again after this point (the
