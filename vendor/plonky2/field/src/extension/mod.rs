@@ -99,6 +99,23 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    /// Evaluate two base-coefficient polynomials at the same extension powers
+    /// table. Each polynomial independently keeps the zip/min behavior of
+    /// [`Self::extension_base_dot_product`], and outputs retain input order.
+    ///
+    /// The fixed array interface lets callers batch without per-group heap
+    /// allocation. The generic fallback is exactly two historical single-dot
+    /// calls; fields may specialize it to reuse each shared power load.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_products_2(
+        extension_values: &[Self::Extension],
+        base_polynomials: [&[Self]; 2],
+    ) -> [Self::Extension; 2] {
+        base_polynomials
+            .map(|coeffs| Self::extension_base_dot_product(extension_values, coeffs))
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.
