@@ -1,4 +1,4 @@
-// Redraw marker 701-claude-fable-r2
+// Candidate marker 718-gpt56-sol-frontier-redraw6-20260811
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
