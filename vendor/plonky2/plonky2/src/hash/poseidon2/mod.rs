@@ -7,6 +7,7 @@ pub(crate) mod metal;
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 pub use metal::{
     is_exclusive_gpu_phase, prewarm as prewarm_gpu, set_exclusive_gpu_phase,
+    set_pipeline_archive_dir,
 };
 
 /// No-op fallback so callers can toggle the exclusive-phase GPU routing hint
@@ -24,6 +25,11 @@ pub fn is_exclusive_gpu_phase() -> bool {
 /// unconditionally on platforms without the Metal backend.
 #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
 pub fn prewarm_gpu() {}
+
+/// No-op fallback so a process entry point can register the staged pipeline
+/// archive directory unconditionally on platforms without the Metal backend.
+#[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+pub fn set_pipeline_archive_dir(_dir: &std::path::Path) {}
 
 #[cfg(test)]
 pub mod p3;
