@@ -3,7 +3,8 @@ use core::marker::PhantomData;
 use core::mem::{size_of, size_of_val};
 use core::slice;
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 
 #[cfg(feature = "diagnostic_profile")]
 use block::ConcreteBlock;
@@ -14,8 +15,9 @@ use objc::runtime::Sel;
 #[cfg(feature = "diagnostic_profile")]
 use objc::Message;
 use metal::{
-    Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSUInteger,
+    BinaryArchive, BinaryArchiveDescriptor, Buffer, CommandBuffer, CommandQueue, CompileOptions,
+    ComputePipelineDescriptor, ComputePipelineState, Device, MTLCommandBufferStatus,
+    MTLResourceOptions, MTLSize, NSUInteger, URL,
 };
 use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
@@ -106,6 +108,22 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// `poseidon2.metal` changes (see `MetalShared::new`); the
 /// `metallib_matches_shader_source` test enforces it.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
+
+/// GPU-family-specific pipelines produced by this crate's build script on the
+/// ranked M4 builder. An empty slice is the portable fallback used by other
+/// build hosts and when build-time Metal access is unavailable.
+const SHADER_BINARY_ARCHIVE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/poseidon2.binary.metallib"));
+
+/// The benchmark sandbox grants writes only beside the requested proof output.
+/// The worker publishes that directory before starting the background Metal
+/// prewarm so the embedded archive can be materialized just long enough for
+/// `newBinaryArchiveWithDescriptor:` to consume it.
+static BINARY_ARCHIVE_DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn set_binary_archive_directory<P: AsRef<Path>>(directory: P) {
+    let _ = BINARY_ARCHIVE_DIRECTORY.set(directory.as_ref().to_owned());
+}
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
@@ -1035,16 +1053,22 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.get()
 }
 
-/// Starts the two gate-quotient pipeline builds on detached threads.
+/// Starts the optional gate-quotient and absorb pipeline builds on detached
+/// threads.
 ///
-/// One thread each rather than one for both: they are the two slowest kernels
-/// in the shader, so serializing them would keep the GPU quotient path on the
-/// CPU for the sum of their lowerings instead of the larger of the two.
+/// One thread each: the gate kernels are the slowest kernels in the shader, so
+/// serializing a fallback lowering would keep the GPU quotient path on the CPU
+/// for the sum of their costs instead of the largest one. Archive hits make
+/// these calls cheap but preserve the same scheduling and fallback behavior.
 ///
 /// Scheduling only. The pipelines are the same objects the blocking build
 /// produced, lowered from the same library, so nothing they later compute can
 /// differ; only the instant at which they become available does.
-fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
+fn spawn_optional_pipelines(
+    device: &Device,
+    library: &metal::Library,
+    archive: Option<&BinaryArchive>,
+) {
     for (name, slot) in [
         ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
         (
@@ -1056,15 +1080,12 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
     ] {
         let device = device.clone();
         let library = library.clone();
+        let archive = archive.cloned();
         let spawned = std::thread::Builder::new()
             .name(format!("poseidon2-metal-{name}"))
             .spawn(move || {
                 let pipeline = autoreleasepool(|| {
-                    library.get_function(name, None).ok().and_then(|function| {
-                        device
-                            .new_compute_pipeline_state_with_function(&function)
-                            .ok()
-                    })
+                    build_compute_pipeline(&device, &library, archive.as_ref(), name).ok()
                 });
                 if pipeline.is_none() {
                     log::debug!("{name} pipeline unavailable; evaluating those gates on the CPU");
@@ -2239,6 +2260,51 @@ enum LeafSource<'a, F> {
     Shared(&'a MetalColumns<F>),
 }
 
+/// Loads the build-host pipeline archive without depending on Metal's normal
+/// per-user cache, which is deliberately read-only in the ranked sandbox.
+/// Any I/O, compatibility or format failure returns `None`; callers then use
+/// the committed portable metallib and the exact previous runtime lowering.
+fn load_binary_archive(device: &Device) -> Option<BinaryArchive> {
+    if SHADER_BINARY_ARCHIVE.is_empty() {
+        return None;
+    }
+    let directory = BINARY_ARCHIVE_DIRECTORY.get()?;
+    let path = directory.join(format!(
+        ".lighter-poseidon2-{}.binary.metallib",
+        std::process::id()
+    ));
+    std::fs::write(&path, SHADER_BINARY_ARCHIVE).ok()?;
+    let descriptor = BinaryArchiveDescriptor::new();
+    let url = URL::new_with_string(&format!("file://{}", path.display()));
+    descriptor.set_url(&url);
+    let archive = device.new_binary_archive_with_descriptor(&descriptor).ok();
+    // Metal has synchronously constructed a retained archive object. Unlinking
+    // the scratch copy now avoids leaving an extra output while keeping any
+    // already-open mapping valid for the lifetime of `archive`.
+    let _ = std::fs::remove_file(path);
+    archive
+}
+
+/// Builds a pipeline from a precompiled archive when possible, then retries
+/// the old function-based path on any archive miss or incompatibility.
+fn build_compute_pipeline(
+    device: &Device,
+    library: &metal::Library,
+    archive: Option<&BinaryArchive>,
+    name: &str,
+) -> Result<ComputePipelineState, String> {
+    let function = library.get_function(name, None)?;
+    if let Some(archive) = archive {
+        let descriptor = ComputePipelineDescriptor::new();
+        descriptor.set_compute_function(Some(&function));
+        descriptor.set_binary_archives(&[archive]);
+        if let Ok(pipeline) = device.new_compute_pipeline_state(&descriptor) {
+            return Ok(pipeline);
+        }
+    }
+    device.new_compute_pipeline_state_with_function(&function)
+}
+
 impl MetalShared {
     fn new() -> Result<Self, String> {
         autoreleasepool(|| {
@@ -2255,9 +2321,11 @@ impl MetalShared {
             // `newLibraryWithData:` skips the front end; only the AIR->ISA
             // pipeline lowering below remains.
             //
-            // This needs no Metal toolchain at build time — the artifact is
-            // committed — which is what makes it viable where a build-time
-            // `MTLBinaryArchive` is not.
+            // The committed artifact still needs no Metal toolchain and remains
+            // the universal fallback. On the ranked M4 builder, build.rs also
+            // lowers its ten production kernels into `SHADER_BINARY_ARCHIVE`;
+            // a compatible benchmark host can therefore skip the remaining
+            // AIR->ISA work as well.
             //
             // Any failure falls back to compiling the source, so a runtime that
             // rejects this AIR version behaves exactly as before. The function
@@ -2283,18 +2351,21 @@ impl MetalShared {
                     },
                     Ok,
                 )?;
+            let binary_archive = load_binary_archive(&device);
             // Build the compute pipelines concurrently, one thread each.
             //
-            // Every `newComputePipelineStateWithFunction:` lowers that kernel's
-            // AIR to a GPU binary through MTLCompilerService, and the three
+            // On an archive miss, every
+            // `newComputePipelineStateWithFunction:` lowers that kernel's AIR
+            // to a GPU binary through MTLCompilerService, and the three
             // Poseidon2 permutation kernels plus the two gate-quotient kernels
             // are large enough that each takes hundreds of milliseconds when the
             // result is not already in the OS shader cache. The benchmark
             // sandbox denies writes to that cache, which disables it outright —
-            // reads miss too — so *every* scored worker process pays the full
-            // cold lowering, serialized at ~2.36 s. The compiler service handles
-            // the requests in parallel, so issuing all eight at once collapses
-            // that to the cost of the single slowest kernel (~0.67 s).
+            // reads miss too — so the old path made *every* scored worker pay
+            // the full cold lowering, serialized at ~2.36 s. The compiler
+            // service handles fallback requests in parallel, so retaining that
+            // schedule collapses a rejected/missing archive to the cost of the
+            // single slowest kernel (~0.67 s).
             //
             // This is a scheduling change only: the pipelines, and therefore
             // every value the GPU later computes, are identical. `Device`,
@@ -2304,14 +2375,11 @@ impl MetalShared {
             // that created them rather than leaking.
             let device_ref = &device;
             let library_ref = &library;
+            let archive_ref = binary_archive.as_ref();
             let required = |name: &'static str, kind: &'static str| {
                 move || -> Result<ComputePipelineState, String> {
                     autoreleasepool(|| {
-                        let function = library_ref
-                            .get_function(name, None)
-                            .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
-                        device_ref
-                            .new_compute_pipeline_state_with_function(&function)
+                        build_compute_pipeline(device_ref, library_ref, archive_ref, name)
                             .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
                     })
                 }
@@ -2384,7 +2452,7 @@ impl MetalShared {
             let ntt_stage_pipeline = ntt_stage_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
-            spawn_optional_pipelines(&device, &library);
+            spawn_optional_pipelines(&device, &library, binary_archive.as_ref());
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
