@@ -1801,6 +1801,146 @@ fn start_gpu_permutation_quotient<
     Some(job)
 }
 
+#[inline]
+fn deinterleave_two_challenge_batch<F: Copy>(
+    point_major: &[F],
+    challenge_0: &mut [F],
+    challenge_1: &mut [F],
+) {
+    debug_assert_eq!(point_major.len(), challenge_0.len() * 2);
+    debug_assert_eq!(challenge_0.len(), challenge_1.len());
+    for ((out_0, out_1), values) in challenge_0
+        .iter_mut()
+        .zip(challenge_1)
+        .zip(point_major.chunks_exact(2))
+    {
+        *out_0 = values[0];
+        *out_1 = values[1];
+    }
+}
+
+#[inline(always)]
+fn add_scaled_gpu_pair<F: Field>(
+    cpu_0: &mut F,
+    cpu_1: &mut F,
+    gpu_values: &[F],
+    denominator_inv: F,
+) {
+    debug_assert_eq!(gpu_values.len(), 2);
+    *cpu_0 += gpu_values[0] * denominator_inv;
+    *cpu_1 += gpu_values[1] * denominator_inv;
+}
+
+enum QuotientStorage<F> {
+    PointMajor(Vec<F>),
+    TwoColumns([Vec<F>; 2]),
+}
+
+impl<F: Field> QuotientStorage<F> {
+    fn uninitialized(num_points: usize, num_challenges: usize) -> Self {
+        if num_challenges == 2 {
+            let mut columns = core::array::from_fn(|_| Vec::with_capacity(num_points));
+            for column in &mut columns {
+                // SAFETY: the production pass partitions each column into
+                // disjoint batches and assigns every slot before any read.
+                unsafe { column.set_len(num_points) };
+            }
+            Self::TwoColumns(columns)
+        } else {
+            let quotient_len = num_points * num_challenges;
+            let mut values = Vec::with_capacity(quotient_len);
+            // SAFETY: the general pass assigns every point-major slot before
+            // any read, including every element of a short final batch.
+            unsafe { values.set_len(quotient_len) };
+            Self::PointMajor(values)
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::PointMajor(values) => values.len(),
+            Self::TwoColumns([challenge_0, challenge_1]) => {
+                debug_assert_eq!(challenge_0.len(), challenge_1.len());
+                challenge_0.len() * 2
+            }
+        }
+    }
+
+    fn add_gpu_values(
+        &mut self,
+        gpu_values: &[F],
+        num_challenges: usize,
+        z_h_on_coset: &ZeroPolyOnCoset<F>,
+    ) {
+        debug_assert_eq!(gpu_values.len(), self.len());
+        match self {
+            Self::PointMajor(values) => values
+                .par_chunks_exact_mut(num_challenges)
+                .zip(gpu_values.par_chunks_exact(num_challenges))
+                .enumerate()
+                .for_each(|(i, (cpu_values, gpu_values))| {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                        *cpu += gpu * denominator_inv;
+                    }
+                }),
+            Self::TwoColumns([challenge_0, challenge_1]) => challenge_0
+                .par_iter_mut()
+                .zip(challenge_1.par_iter_mut())
+                .zip(gpu_values.par_chunks_exact(2))
+                .enumerate()
+                .for_each(|(i, ((cpu_0, cpu_1), gpu_values))| {
+                    add_scaled_gpu_pair(
+                        cpu_0,
+                        cpu_1,
+                        gpu_values,
+                        z_h_on_coset.eval_inverse(i),
+                    );
+                }),
+        }
+    }
+
+    fn into_challenge_columns(self, num_challenges: usize) -> Vec<Vec<F>> {
+        match self {
+            Self::TwoColumns(columns) => columns.into_iter().collect(),
+            Self::PointMajor(values) => {
+                struct ColPtr<T>(*mut T);
+                unsafe impl<T> Send for ColPtr<T> {}
+                unsafe impl<T> Sync for ColPtr<T> {}
+
+                let num_points = values.len() / num_challenges;
+                let mut columns: Vec<Vec<F>> = (0..num_challenges)
+                    .map(|_| {
+                        let mut column = Vec::with_capacity(num_points);
+                        // SAFETY: the disjoint parallel scatter below writes
+                        // every element exactly once before any read.
+                        unsafe { column.set_len(num_points) };
+                        column
+                    })
+                    .collect();
+                let column_ptrs: Vec<ColPtr<F>> = columns
+                    .iter_mut()
+                    .map(|column| ColPtr(column.as_mut_ptr()))
+                    .collect();
+                values
+                    .par_chunks(BATCH_SIZE * num_challenges)
+                    .enumerate()
+                    .for_each(|(chunk_i, chunk)| {
+                        let base = BATCH_SIZE * chunk_i;
+                        for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                            for (column, &value) in column_ptrs.iter().zip(point_values) {
+                                // SAFETY: this worker owns `base + k` in every
+                                // output column, and that position is in range.
+                                unsafe { *column.0.add(base + k) = value };
+                            }
+                        }
+                    });
+                columns
+            }
+        }
+    }
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2001,7 +2141,6 @@ fn compute_quotient_polys<
     let lut_re_poly_evals_refs: Vec<&[F]> =
         lut_re_poly_evals.iter().map(|v| v.as_slice()).collect();
 
-    let points_batches = points.par_chunks(BATCH_SIZE);
     let num_batches = points.len().div_ceil(BATCH_SIZE);
 
     struct QuotientScratch<F: RichField> {
@@ -2065,41 +2204,17 @@ fn compute_quotient_polys<
         gate_census_once(common_data, &excluded_gate_indices, cpu_num_wires);
     }
 
-    // The zero-fill this used to do existed only to seed the Horner chain in
-    // `reduce_gate_constraints_base_batch`, which is the first thing every
-    // batch does. That chain now *assigns* its first reversed row instead of
-    // accumulating into zeros (a raw-limb-identical change: the old first pass
-    // computed `reduce128(term as u128)`, which returns `term` unchanged), so
-    // every slot of this buffer is stored before it is read and the memset is
-    // dead. `par_chunks_mut` partitions the whole buffer and each batch writes
-    // all of its own slice, including a short final batch.
-    //
-    // `F` has no `IsZero` specialization, so the old `vec![F::ZERO; n]` was a
-    // real serial store loop, not `alloc_zeroed`: 8 MiB per d16 tx proof,
-    // 2 MiB per chain-step proof, on the per-proof spine between the Zs
-    // commitment and the quotient commitment.
-    let quotient_len = points.len() * num_challenges;
-    let mut quotient_values: Vec<F> = Vec::with_capacity(quotient_len);
-    // SAFETY: capacity is exactly `quotient_len`, and the parallel pass below
-    // writes every element before any is read (see above). Same idiom as the
-    // promoted zero-tail fast path in `fri/oracle.rs`.
-    unsafe { quotient_values.set_len(quotient_len) };
-    quotient_values
-        .par_chunks_mut(BATCH_SIZE * num_challenges)
-        .zip(points_batches)
-        .enumerate()
-        .for_each_init(
-            || QuotientScratch::<F> {
-                indices: Vec::with_capacity(BATCH_SIZE),
-                indices_next: Vec::with_capacity(BATCH_SIZE),
-                local_constants: Vec::new(),
-                local_wires: Vec::new(),
-                s_sigmas_flat: Vec::new(),
-                zs_local_flat: Vec::new(),
-                zs_next_flat: Vec::new(),
-                vanishing: VanishingScratch::default(),
-            },
-            |scratch, (batch_i, (quotient_values_batch, xs_batch))| {
+    // Production uses two challenges. Write those final columns from each
+    // producer batch, rather than retaining a whole-domain point-major matrix
+    // and reading it again in a later deinterleave pass. Other challenge counts
+    // keep the original point-major representation as a verifier-neutral
+    // general fallback.
+    let mut quotient_storage = QuotientStorage::uninitialized(points.len(), num_challenges);
+    let process_batch =
+        |scratch: &mut QuotientScratch<F>,
+         batch_i: usize,
+         quotient_values_batch: &mut [F],
+         xs_batch: &[F]| {
                 // Each batch must be the same size, except the last one, which may be smaller.
                 debug_assert!(
                     xs_batch.len() == BATCH_SIZE
@@ -2334,17 +2449,71 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
-                }
-            },
-        );
+            for (&i, quotient_values) in indices_batch
+                .iter()
+                .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
+            {
+                let denominator_inv = z_h_on_coset.eval_inverse(i);
+                quotient_values
+                    .iter_mut()
+                    .for_each(|v| *v *= denominator_inv);
+            }
+        };
+
+    match &mut quotient_storage {
+        QuotientStorage::PointMajor(quotient_values) => quotient_values
+            .par_chunks_mut(BATCH_SIZE * num_challenges)
+            .zip(points.par_chunks(BATCH_SIZE))
+            .enumerate()
+            .for_each_init(
+                || QuotientScratch::<F> {
+                    indices: Vec::with_capacity(BATCH_SIZE),
+                    indices_next: Vec::with_capacity(BATCH_SIZE),
+                    local_constants: Vec::new(),
+                    local_wires: Vec::new(),
+                    s_sigmas_flat: Vec::new(),
+                    zs_local_flat: Vec::new(),
+                    zs_next_flat: Vec::new(),
+                    vanishing: VanishingScratch::default(),
+                },
+                |scratch, (batch_i, (quotient_values_batch, xs_batch))| {
+                    process_batch(scratch, batch_i, quotient_values_batch, xs_batch);
+                },
+            ),
+        QuotientStorage::TwoColumns([challenge_0, challenge_1]) => challenge_0
+            .par_chunks_mut(BATCH_SIZE)
+            .zip(challenge_1.par_chunks_mut(BATCH_SIZE))
+            .zip(points.par_chunks(BATCH_SIZE))
+            .enumerate()
+            .for_each_init(
+                || {
+                    (
+                        QuotientScratch::<F> {
+                            indices: Vec::with_capacity(BATCH_SIZE),
+                            indices_next: Vec::with_capacity(BATCH_SIZE),
+                            local_constants: Vec::new(),
+                            local_wires: Vec::new(),
+                            s_sigmas_flat: Vec::new(),
+                            zs_local_flat: Vec::new(),
+                            zs_next_flat: Vec::new(),
+                            vanishing: VanishingScratch::default(),
+                        },
+                        Vec::with_capacity(BATCH_SIZE * 2),
+                    )
+                },
+                |(scratch, quotient_batch),
+                 (batch_i, ((challenge_0_batch, challenge_1_batch), xs_batch))| {
+                    let batch_len = xs_batch.len() * 2;
+                    quotient_batch.resize(batch_len, F::ZERO);
+                    process_batch(scratch, batch_i, quotient_batch, xs_batch);
+                    deinterleave_two_challenge_batch(
+                        quotient_batch,
+                        challenge_0_batch,
+                        challenge_1_batch,
+                    );
+                },
+            ),
+    }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if let Some((_, job)) = &gpu_poseidon {
@@ -2379,17 +2548,7 @@ fn compute_quotient_polys<
                 );
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        quotient_storage.add_gpu_values(&gpu_values, num_challenges, &z_h_on_coset);
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2428,17 +2587,7 @@ fn compute_quotient_polys<
                 return result;
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        quotient_storage.add_gpu_values(&gpu_values, num_challenges, &z_h_on_coset);
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2465,57 +2614,14 @@ fn compute_quotient_polys<
                 );
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        quotient_storage.add_gpu_values(&gpu_values, num_challenges, &z_h_on_coset);
     }
 
-    debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
-    // Parallel scatter of the interleaved point-major buffer into the
-    // per-challenge columns. The former single streaming pass was serial:
-    // 16 MiB of traffic per d16 proof (32 MiB for the final block proof)
-    // walked by one thread between the parallel quotient evaluation and the
-    // parallel IFFT while every other core sat idle. Each parallel chunk
-    // below owns a disjoint point range, and column position `i` is written
-    // exactly once with the identical value the serial pass stored there.
-    struct ColPtr<T>(*mut T);
-    unsafe impl<T> Send for ColPtr<T> {}
-    unsafe impl<T> Sync for ColPtr<T> {}
-    let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
-        .map(|_| {
-            let mut column = Vec::with_capacity(points.len());
-            // SAFETY: the disjoint parallel scatter below writes every element
-            // exactly once before any read; `F` is plain data. Same idiom as
-            // the zero-tail fast path in `fri/oracle.rs`.
-            unsafe { column.set_len(points.len()) };
-            column
-        })
-        .collect();
-    let column_ptrs: Vec<ColPtr<F>> = challenge_columns
-        .iter_mut()
-        .map(|column| ColPtr(column.as_mut_ptr()))
-        .collect();
-    let column_ptrs = &column_ptrs;
-    quotient_values
-        .par_chunks(BATCH_SIZE * num_challenges)
-        .enumerate()
-        .for_each(|(chunk_i, chunk)| {
-            let base = BATCH_SIZE * chunk_i;
-            for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                for (column, &value) in column_ptrs.iter().zip(point_values) {
-                    // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
-                }
-            }
-        });
+    debug_assert_eq!(
+        quotient_storage.len(),
+        points.len() * num_challenges
+    );
+    let challenge_columns = quotient_storage.into_challenge_columns(num_challenges);
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
@@ -3735,5 +3841,155 @@ mod permutation_pairing_tests {
                 assert_eq!(paired[challenge][column].values, reference[column]);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod quotient_storage_tests {
+    use super::{
+        add_scaled_gpu_pair, deinterleave_two_challenge_batch, QuotientStorage, BATCH_SIZE,
+    };
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::{Field, Field64, PrimeField64};
+    use crate::iop::witness::{PartialWitness, WitnessWrite};
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::circuit_data::CircuitConfig;
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+
+    type F = GoldilocksField;
+    const D: usize = 2;
+
+    fn sample(index: usize, salt: u64) -> F {
+        let offset = (index as u64).wrapping_mul(97).wrapping_add(salt) & 0xffff;
+        if index % 3 == 0 {
+            // Exercise copy identity with valid noncanonical Goldilocks limbs.
+            F::from_noncanonical_u64(F::ORDER + 1 + offset)
+        } else {
+            F::from_canonical_u64(offset)
+        }
+    }
+
+    fn raw_limbs(values: &[F]) -> Vec<u64> {
+        values.iter().map(F::to_noncanonical_u64).collect()
+    }
+
+    #[test]
+    fn producer_fused_deinterleave_is_limb_identical_including_short_batches() {
+        for num_points in [1, BATCH_SIZE - 1, BATCH_SIZE, BATCH_SIZE + 1, 2 * BATCH_SIZE + 5] {
+            let point_major = (0..num_points * 2)
+                .map(|index| sample(index, 11))
+                .collect::<Vec<_>>();
+            let expected_0 = point_major.iter().step_by(2).copied().collect::<Vec<_>>();
+            let expected_1 = point_major
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .copied()
+                .collect::<Vec<_>>();
+
+            let mut challenge_0 = vec![F::ZERO; num_points];
+            let mut challenge_1 = vec![F::ZERO; num_points];
+            for ((point_batch, challenge_0_batch), challenge_1_batch) in point_major
+                .chunks(BATCH_SIZE * 2)
+                .zip(challenge_0.chunks_mut(BATCH_SIZE))
+                .zip(challenge_1.chunks_mut(BATCH_SIZE))
+            {
+                deinterleave_two_challenge_batch(
+                    point_batch,
+                    challenge_0_batch,
+                    challenge_1_batch,
+                );
+            }
+
+            assert_eq!(raw_limbs(&challenge_0), raw_limbs(&expected_0));
+            assert_eq!(raw_limbs(&challenge_1), raw_limbs(&expected_1));
+        }
+    }
+
+    #[test]
+    fn two_column_gpu_merge_is_limb_identical_to_point_major_merge() {
+        let num_points = 2 * BATCH_SIZE + 3;
+        let cpu = (0..num_points * 2)
+            .map(|index| sample(index, 23))
+            .collect::<Vec<_>>();
+        let gpu = (0..num_points * 2)
+            .map(|index| sample(index, 41))
+            .collect::<Vec<_>>();
+        let denominator_inverses = (0..num_points)
+            .map(|index| sample(index + 1, 59))
+            .collect::<Vec<_>>();
+
+        let mut expected = cpu.clone();
+        for ((cpu_values, gpu_values), &denominator_inv) in expected
+            .chunks_exact_mut(2)
+            .zip(gpu.chunks_exact(2))
+            .zip(&denominator_inverses)
+        {
+            for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                *cpu += gpu * denominator_inv;
+            }
+        }
+
+        let mut challenge_0 = cpu.iter().step_by(2).copied().collect::<Vec<_>>();
+        let mut challenge_1 = cpu.iter().skip(1).step_by(2).copied().collect::<Vec<_>>();
+        for (i, ((cpu_0, cpu_1), gpu_values)) in challenge_0
+            .iter_mut()
+            .zip(&mut challenge_1)
+            .zip(gpu.chunks_exact(2))
+            .enumerate()
+        {
+            add_scaled_gpu_pair(
+                cpu_0,
+                cpu_1,
+                gpu_values,
+                denominator_inverses[i],
+            );
+        }
+
+        let actual = challenge_0
+            .into_iter()
+            .zip(challenge_1)
+            .flat_map(|pair| [pair.0, pair.1])
+            .collect::<Vec<_>>();
+        assert_eq!(raw_limbs(&actual), raw_limbs(&expected));
+    }
+
+    #[test]
+    fn general_point_major_fallback_keeps_existing_column_order() {
+        let num_challenges = 3;
+        let num_points = BATCH_SIZE + 7;
+        let point_major = (0..num_points * num_challenges)
+            .map(|index| sample(index, 73))
+            .collect::<Vec<_>>();
+        let expected = (0..num_challenges)
+            .map(|challenge| {
+                point_major
+                    .chunks_exact(num_challenges)
+                    .map(|point| point[challenge])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let actual = QuotientStorage::PointMajor(point_major)
+            .into_challenge_columns(num_challenges);
+        for challenge in 0..num_challenges {
+            assert_eq!(raw_limbs(&actual[challenge]), raw_limbs(&expected[challenge]));
+        }
+    }
+
+    #[test]
+    fn general_three_challenge_fallback_proves_and_verifies() {
+        let mut config = CircuitConfig::standard_recursion_config();
+        config.num_challenges = 3;
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let x = builder.add_virtual_target();
+        let square = builder.mul(x, x);
+        builder.register_public_input(square);
+        let data = builder.build::<PoseidonGoldilocksConfig>();
+
+        let mut witness = PartialWitness::new();
+        witness.set_target(x, F::from_canonical_u64(7)).unwrap();
+        let proof = data.prove(witness).unwrap();
+        data.verify(proof).unwrap();
     }
 }

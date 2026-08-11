@@ -99,6 +99,26 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    /// Evaluate one base-field coefficient polynomial at two extension
+    /// points whose power tables are already materialised.
+    ///
+    /// The default issues two independent [`Self::extension_base_dot_product`]
+    /// calls. A base field may specialise this into a single coefficient
+    /// traversal that updates both accumulators together, deleting one full
+    /// re-read of the coefficient vector.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_product_pair(
+        powers_a: &[Self::Extension],
+        powers_b: &[Self::Extension],
+        base_scalars: &[Self],
+    ) -> (Self::Extension, Self::Extension) {
+        (
+            Self::extension_base_dot_product(powers_a, base_scalars),
+            Self::extension_base_dot_product(powers_b, base_scalars),
+        )
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.
@@ -126,6 +146,7 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .rev()
             .fold(Self::Extension::ZERO, |acc, &term| acc * beta + term)
     }
+
 }
 
 impl<F: Field + Frobenius<1> + FieldExtension<1, BaseField = F>> Extendable<1> for F {
