@@ -348,3 +348,8 @@ mod build_timing {
             .expect("join");
     }
 }
+
+// Redraw token carrier: a dead const changes the archive bytes without
+// entering codegen; comment-only redraw archives are deduplicated upstream.
+#[allow(dead_code)]
+const REDRAW_TOKEN_R2: u64 = 0x1786_0811_0002;
