@@ -1651,58 +1651,6 @@ kernel void poseidon2_hash_leaves_colmajor(
     }
 }
 
-// Production-specialized col-major leaf hashes for the recurring 20- and
-// 136-column commitments. Compile-time chunk bounds remove runtime
-// min/tail checks while preserving the generic kernel's exact load,
-// canonicalization, permutation, and bit-reversed write order.
-template <uint fixed_leaf_width>
-inline void poseidon2_hash_leaves_colmajor_fixed(
-    const device ulong* leaves,
-    device ulong* hashes,
-    constant ulong* parameters,
-    uint leaf_count,
-    uint log_leaf_count,
-    uint gid) {
-    uint out_row = log_leaf_count == 0
-        ? gid
-        : (reverse_bits(gid) >> (32 - log_leaf_count));
-    device ulong* output = hashes + (ulong)out_row * 4;
-    ulong state[12] = { 0 };
-#pragma unroll
-    for (uint offset = 0; offset < fixed_leaf_width; offset += 8u) {
-        uint chunk_size = min(8u, fixed_leaf_width - offset);
-#pragma unroll
-        for (uint i = 0; i < chunk_size; ++i) {
-            state[i] = gl_canonicalize(leaves[(ulong)(offset + i) * leaf_count + gid]);
-        }
-        poseidon2(state, parameters);
-    }
-#pragma unroll
-    for (uint i = 0; i < 4u; ++i) {
-        output[i] = gl_canonicalize(state[i]);
-    }
-}
-
-kernel void poseidon2_hash_leaves_colmajor_hot(
-    const device ulong* leaves [[buffer(0)]],
-    device ulong* hashes [[buffer(1)]],
-    constant ulong* parameters [[buffer(2)]],
-    constant uint& leaf_width [[buffer(3)]],
-    constant uint& leaf_count [[buffer(4)]],
-    constant uint& log_leaf_count [[buffer(5)]],
-    uint gid [[thread_position_in_grid]]) {
-    if (gid >= leaf_count) {
-        return;
-    }
-    if (leaf_width == 136u) {
-        poseidon2_hash_leaves_colmajor_fixed<136u>(
-            leaves, hashes, parameters, leaf_count, log_leaf_count, gid);
-    } else {
-        poseidon2_hash_leaves_colmajor_fixed<20u>(
-            leaves, hashes, parameters, leaf_count, log_leaf_count, gid);
-    }
-}
-
 kernel void poseidon2_hash_parents(
     const device ulong* children [[buffer(0)]],
     device ulong* parents [[buffer(1)]],
