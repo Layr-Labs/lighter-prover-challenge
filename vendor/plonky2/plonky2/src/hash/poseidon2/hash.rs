@@ -7,8 +7,8 @@ use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::goldilocks_field::GoldilocksField as F;
 use crate::field::types::{Field, PrimeField64};
 use crate::gates::poseidon2::Poseidon2Gate;
-use crate::hash::hash_types::{HashOut, NUM_HASH_OUT_ELTS, RichField};
-use crate::hash::hashing::{PlonkyPermutation, compress, hash_n_to_hash_no_pad};
+use crate::hash::hash_types::{HashOut, RichField, NUM_HASH_OUT_ELTS};
+use crate::hash::hashing::{compress, hash_n_to_hash_no_pad, PlonkyPermutation};
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::{BoolTarget, Target};
 use crate::plonk::circuit_builder::CircuitBuilder;
@@ -807,8 +807,7 @@ pub(crate) fn hash_quad_no_pad<F: RichField + Poseidon2>(
         state_b[..chunk_b.len()].copy_from_slice(chunk_b);
         state_c[..chunk_c.len()].copy_from_slice(chunk_c);
         state_d[..chunk_d.len()].copy_from_slice(chunk_d);
-        (state_a, state_b, state_c, state_d) =
-            F::poseidon2_x4(state_a, state_b, state_c, state_d);
+        (state_a, state_b, state_c, state_d) = F::poseidon2_x4(state_a, state_b, state_c, state_d);
     }
 
     let out = |state: &[F; WIDTH]| HashOut {
@@ -940,6 +939,17 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
         Vec<Self::Hash>,
     )> {
         super::metal::build_merkle_tree(leaves, leaf_width, num_leaves, cap_height)
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn try_build_merkle_tree_from_leaf_digests(
+        leaf_digests: &[Self::Hash],
+        cap_height: usize,
+    ) -> Option<(
+        crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
+        Vec<Self::Hash>,
+    )> {
+        super::metal::build_merkle_tree_from_leaf_digests(leaf_digests, cap_height)
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -1104,7 +1114,7 @@ mod test {
     use num::{BigUint, One};
     use p3_field::{AbstractField, PrimeField64 as _};
     use p3_goldilocks::Goldilocks;
-    use rand::{RngCore, thread_rng};
+    use rand::{thread_rng, RngCore};
 
     use super::*;
     use crate::field::types::PrimeField64;
@@ -1236,8 +1246,16 @@ mod pair_hash_tests {
             let a: Vec<F> = (0..width).map(|_| F::rand()).collect();
             let b: Vec<F> = (0..width).map(|_| F::rand()).collect();
             let (ha, hb) = Poseidon2Hash::hash_or_noop_pair(&a, &b);
-            assert_eq!(ha, <Poseidon2Hash as Hasher<F>>::hash_or_noop(&a), "width {width} a");
-            assert_eq!(hb, <Poseidon2Hash as Hasher<F>>::hash_or_noop(&b), "width {width} b");
+            assert_eq!(
+                ha,
+                <Poseidon2Hash as Hasher<F>>::hash_or_noop(&a),
+                "width {width} a"
+            );
+            assert_eq!(
+                hb,
+                <Poseidon2Hash as Hasher<F>>::hash_or_noop(&b),
+                "width {width} b"
+            );
         }
     }
 

@@ -8,17 +8,18 @@
 //! untimed), and [`deserialize_embedded`] reconstitutes the exact same
 //! `CircuitData` at runtime far faster than re-running circuit construction.
 //!
-//! The blob deliberately omits everything that is cheap to recompute and
-//! expensive to store, keeping the binary small enough that macOS's per-exec
-//! code-signature validation (~7.5 ms/MB on every fresh inode) does not eat
-//! the startup win:
+//! The blob omits bulky values that are cheaper to reconstruct, while storing
+//! the small fixed artifacts whose recomputation dominates startup. This keeps
+//! macOS's per-exec code-signature validation (~7.5 ms/MB on every fresh inode)
+//! well below the saved work:
 //!
 //! * the 80 sigma coefficient polynomials (~40 MiB/tx circuit) are **not**
 //!   stored — sigma *values* are re-derived from the representative map with
 //!   the same [`Forest::wire_partition`] + [`WirePartition::get_sigma_polys`]
-//!   code the builder itself uses, and the constants/sigmas commitment is
-//!   recomputed through [`PolynomialBatch::from_values`], the builder's own
-//!   commitment path, guaranteeing a bit-identical Merkle cap;
+//!   code the builder itself uses. The LDE columns and coefficient polynomials
+//!   are reconstructed through the builder's FFT path, but the four-field
+//!   Merkle leaf digests are embedded. This removes eleven Poseidon2 sponge
+//!   permutations per width-82 LDE row; only the cheap parent tree is rebuilt;
 //! * the representative map is stored as zigzag-varint deltas against the
 //!   identity permutation (mostly zeros) instead of 8-byte usizes;
 //! * the generator watch index is stored in its CSR form (varint-delta
@@ -28,25 +29,25 @@
 //! * every bulky section is independently zstd-compressed, keeping parallel
 //!   load memory bounded without a second whole-blob decompression pass.
 //!
-//! Everything recomputed is validated at load: the recomputed commitment cap
-//! must equal the embedded verifier data's cap, which transitively pins the
+//! Everything reconstructed is validated at load: the resulting commitment
+//! cap must equal the embedded verifier data's cap, which transitively pins the
 //! circuit digest. On any mismatch the loader errors and callers fall back to
 //! building circuits from scratch.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{bail, ensure, Context, Result};
 use plonky2::field::fft::{cached_fft_root_table, cached_two_adic_subgroup};
 use plonky2::field::polynomial::PolynomialValues;
-use plonky2::field::types::Field;
 use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::plonk::circuit_data::{
     CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
 };
+use plonky2::plonk::config::GenericConfig;
 use plonky2::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
 use plonky2::util::{log2_ceil, transpose_poly_values_ref};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 use crate::circuit_serializer::{BlockGateSerializer, BlockGeneratorSerializer};
 use crate::ecdsa::curve::secp256k1::Secp256K1;
@@ -66,7 +67,7 @@ fn embed_generator_serializer() -> EmbedGeneratorSerializer {
 }
 
 const EMBED_MAGIC: u32 = 0x4C45_4331; // "LEC1"
-const EMBED_VERSION: u32 = 1;
+const EMBED_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Primitive encoding helpers
@@ -136,8 +137,8 @@ fn write_compressed_section(out: &mut Vec<u8>, raw: &[u8]) {
     // section directly with zstd avoids the former runtime double decode
     // (whole-blob zstd followed by per-section LZ4) while retaining bounded
     // per-section peak memory during parallel circuit loading.
-    let compressed = zstd::bulk::compress(raw, 19)
-        .expect("zstd-compressing embedded circuit section");
+    let compressed =
+        zstd::bulk::compress(raw, 19).expect("zstd-compressing embedded circuit section");
     out.extend_from_slice(&(raw.len() as u64).to_le_bytes());
     write_section(out, &compressed);
 }
@@ -169,7 +170,10 @@ fn read_compressed_section(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
 
 /// Serializes a built circuit (target struct + [`CircuitData`]) into an
 /// embeddable blob. Companion of [`deserialize_embedded`].
-pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>) -> Result<Vec<u8>> {
+pub fn serialize_embedded<T: Serialize>(
+    target: &T,
+    data: &CircuitData<F, C, D>,
+) -> Result<Vec<u8>> {
     let gate_serializer = BlockGateSerializer;
     let generator_serializer = embed_generator_serializer();
     let common = &data.common;
@@ -287,6 +291,21 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     }
     write_compressed_section(&mut out, &buf);
 
+    // Constants/sigmas Merkle leaf digests. The LDE columns themselves are
+    // intentionally still omitted: they are roughly 82 times larger and are
+    // needed as live column storage anyway, so the loader reconstructs them
+    // with the ordinary FFT path. These four-word hashes remove the eleven
+    // Poseidon2 sponge permutations per fixed width-82 leaf while adding only
+    // one digest per LDE row. Hash serialization canonicalizes every limb.
+    let leaf_digests = prover
+        .constants_sigmas_commitment
+        .merkle_tree
+        .leaf_digests();
+    let mut buf = Vec::with_capacity(8 + leaf_digests.len() * 32);
+    buf.write_hash_vec::<F, <C as GenericConfig<D>>::Hasher>(&leaf_digests)
+        .map_err(|e| anyhow::anyhow!("serializing constants/sigmas leaf digests: {e:?}"))?;
+    write_section(&mut out, &buf);
+
     Ok(out)
 }
 
@@ -297,13 +316,16 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
 /// Reconstructs the target struct and the full [`CircuitData`] from a blob
 /// produced by [`serialize_embedded`].
 ///
-/// The returned `CircuitData` is value-identical to the freshly built one:
-/// deserialized components are byte round trips, and every recomputed
-/// component (subgroup, FFT root table, sigma values/transpose, watch counts,
-/// constants/sigmas commitment) is derived by the same code paths the builder
-/// itself runs, from the same inputs. The recomputed commitment cap is checked
-/// against the embedded verifier data before returning.
-pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, CircuitData<F, C, D>)> {
+/// The returned `CircuitData` is semantically identical to the freshly built
+/// one: deserialized components are byte round trips, derived field data uses
+/// the builder's own code paths, and the constants/sigmas commitment combines
+/// freshly reconstructed polynomials/LDE columns with canonical precomputed
+/// leaf digests. Its cap is checked against the embedded verifier data before
+/// returning. The Merkle nodes may use a different internal storage layout;
+/// serialization, caps, and every authentication path remain identical.
+pub fn deserialize_embedded<T: DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<(T, CircuitData<F, C, D>)> {
     let gate_serializer = BlockGateSerializer;
     let generator_serializer = embed_generator_serializer();
 
@@ -312,8 +334,8 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // the wrap disabled degrades to the previous format instead of failing.
     let unwrapped;
     let bytes = if bytes.len() >= 4 && bytes[0..4] == [0x28, 0xB5, 0x2F, 0xFD] {
-        unwrapped = zstd::stream::decode_all(bytes)
-            .context("embedded circuit blob failed zstd unwrap")?;
+        unwrapped =
+            zstd::stream::decode_all(bytes).context("embedded circuit blob failed zstd unwrap")?;
         &unwrapped[..]
     } else {
         bytes
@@ -468,7 +490,20 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         representative_map
             .push(u32::try_from(parent).context("representative map entry out of range")?);
     }
-    ensure!(pos == bytes.len(), "trailing bytes in embedded circuit blob");
+
+    // Precomputed constants/sigmas Merkle leaf digests, in tree-leaf order.
+    let section = read_section(bytes, &mut pos)?;
+    let mut reader = Buffer::new(section);
+    let leaf_digest_count = reader
+        .read_usize()
+        .map_err(|e| anyhow::anyhow!("deserializing constants/sigmas leaf digest count: {e:?}"))?;
+    let constants_sigmas_leaf_digests = reader
+        .read_hash_vec::<F, <C as GenericConfig<D>>::Hasher>(leaf_digest_count)
+        .map_err(|e| anyhow::anyhow!("deserializing constants/sigmas leaf digests: {e:?}"))?;
+    ensure!(
+        pos == bytes.len(),
+        "trailing bytes in embedded circuit blob"
+    );
 
     // ---- recompute the derived prover-only components ----
     let degree_bits = common.degree_bits();
@@ -508,15 +543,21 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // of two independent reads changes — no quantity is computed differently.
     let sigmas = transpose_poly_values_ref(&sigma_vecs);
 
-    // The builder's commitment path: values in, IFFT inside, LDE + Merkle.
-    // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).
+    // The builder's polynomial path: values in, IFFT and LDE inside. The fixed
+    // leaf hashes come from the blob, so only the Merkle parent levels are
+    // rebuilt. `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` here.
     let mut constants_sigmas_vecs = constant_values;
     constants_sigmas_vecs.extend(sigma_vecs);
-    let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
+    ensure!(
+        constants_sigmas_leaf_digests.len() == degree << rate_bits,
+        "embedded constants/sigmas leaf digest count diverges from the LDE domain"
+    );
+    let constants_sigmas_commitment =
+        PolynomialBatch::<F, C, D>::from_values_with_precomputed_leaf_digests(
         constants_sigmas_vecs,
         rate_bits,
-        false,
         cap_height,
+            constants_sigmas_leaf_digests,
         &mut TimingTree::default(),
         Some(&root_table),
     );
@@ -547,7 +588,11 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // costs one extra full-LDE allocation plus copy per circuit and holds that
     // duplicate resident for the rest of the process.
     let quotient_degree_bits = plonky2::util::log2_ceil(common.quotient_degree_factor);
-    let (constants_sigmas_quotient_cache, constants_sigmas_quotient_step, constants_sigmas_quotient_domain) = {
+    let (
+        constants_sigmas_quotient_cache,
+        constants_sigmas_quotient_step,
+        constants_sigmas_quotient_domain,
+    ) = {
         let step = 1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
         let domain = 1 << (common.degree_bits() + quotient_degree_bits);
         let cols = common.constants_range().len() + common.sigmas_range().len();

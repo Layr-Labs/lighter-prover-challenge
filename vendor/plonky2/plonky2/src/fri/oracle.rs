@@ -8,14 +8,14 @@ use plonky2_maybe_rayon::*;
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
 use crate::field::extension::Extendable;
 use crate::field::fft::{
-    FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
+    fft_in_place_with_options, fft_in_place_with_options_parallel, FftRootTable,
 };
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
-use crate::fri::FriParams;
 use crate::fri::proof::FriProof;
 use crate::fri::prover::fri_proof;
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
+use crate::fri::FriParams;
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::{ColumnStore, MerkleLeaves, MerkleTree};
 use crate::iop::challenger::Challenger;
@@ -83,16 +83,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
         if GPU_NTT_COMMITMENTS && !blinding {
-            let value_columns: Vec<&[F]> =
-                values.iter().map(|v| v.values.as_slice()).collect();
+            let value_columns: Vec<&[F]> = values.iter().map(|v| v.values.as_slice()).collect();
             if let Some((columns, digests, cap, coeff_columns)) = timed!(
                 timing,
                 "build Merkle tree",
-                C::Hasher::try_build_commitment_from_values(
-                    &value_columns,
-                    rate_bits,
-                    cap_height,
-                )
+                C::Hasher::try_build_commitment_from_values(&value_columns, rate_bits, cap_height,)
             ) {
                 let degree = values[0].len();
                 let merkle_tree = MerkleTree::from_prebuilt_columns(columns, digests, cap);
@@ -125,6 +120,62 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         )
     }
 
+    /// Reconstructs a fixed non-blinded commitment while reusing leaf digests
+    /// computed by an untimed build. Coefficients and natural-order LDE columns
+    /// are still derived normally because the prover needs them for quotient
+    /// evaluation and openings; only the wide Merkle leaf sponge is skipped.
+    pub fn from_values_with_precomputed_leaf_digests(
+        values: Vec<PolynomialValues<F>>,
+        rate_bits: usize,
+        cap_height: usize,
+        leaf_digests: Vec<<C::Hasher as Hasher<F>>::Hash>,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Self {
+        let coeffs = timed!(
+            timing,
+            "IFFT",
+            values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
+        );
+        let degree = coeffs[0].len();
+        let lde_len = degree << rate_bits;
+        assert_eq!(leaf_digests.len(), lde_len);
+
+        let mut shared_columns =
+            C::Hasher::try_allocate_merkle_tree_columns(coeffs.len(), lde_len, cap_height);
+        let columns = if let Some(columns) = shared_columns.as_mut() {
+            let initialized = timed!(
+                timing,
+                "FFT + blinding",
+                Self::fill_lde_column_store(columns, &coeffs, rate_bits, fft_root_table)
+            );
+            if initialized {
+                shared_columns.take().unwrap()
+            } else {
+                ColumnStore::Owned(Self::lde_values(&coeffs, rate_bits, false, fft_root_table))
+            }
+        } else {
+            ColumnStore::Owned(timed!(
+                timing,
+                "FFT + blinding",
+                Self::lde_values(&coeffs, rate_bits, false, fft_root_table)
+            ))
+        };
+
+        let merkle_tree = timed!(
+            timing,
+            "build Merkle tree from prehashed leaves",
+            MerkleTree::from_prehashed_columns(columns, leaf_digests, cap_height)
+        );
+        Self {
+            polynomials: coeffs,
+            merkle_tree,
+            degree_log: log2_strict(degree),
+            rate_bits,
+            blinding: false,
+        }
+    }
+
     /// Creates a list polynomial commitment for the polynomials `polynomials`.
     pub fn from_coeffs(
         polynomials: Vec<PolynomialCoeffs<F>>,
@@ -137,18 +188,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let degree = polynomials[0].len();
 
         if GPU_NTT_COMMITMENTS && !blinding {
-            let coeff_columns: Vec<&[F]> = polynomials
-                .iter()
-                .map(|p| p.coeffs.as_slice())
-                .collect();
+            let coeff_columns: Vec<&[F]> =
+                polynomials.iter().map(|p| p.coeffs.as_slice()).collect();
             if let Some((columns, digests, cap)) = timed!(
                 timing,
                 "build Merkle tree",
-                C::Hasher::try_build_commitment_from_coeffs(
-                    &coeff_columns,
-                    rate_bits,
-                    cap_height,
-                )
+                C::Hasher::try_build_commitment_from_coeffs(&coeff_columns, rate_bits, cap_height,)
             ) {
                 let merkle_tree = MerkleTree::from_prebuilt_columns(columns, digests, cap);
                 return Self {
@@ -184,8 +229,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         &columns,
                         cap_height,
                         &|group, destinations: &mut [&mut [F]]| {
-                            destinations.par_iter_mut().enumerate().for_each(
-                                |(k, destination)| {
+                            destinations
+                                .par_iter_mut()
+                                .enumerate()
+                                .for_each(|(k, destination)| {
                                     let polynomial = &polys[group * 8 + k];
                                     assert_eq!(
                                         polynomial.len(),
@@ -205,8 +252,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                         Some(rate_bits),
                                         fft_root_table,
                                     );
-                                },
-                            );
+                                });
                         },
                     )
                 };
@@ -1005,10 +1051,8 @@ mod tests {
                         coeffs.resize(n, F::ZERO);
                         let poly = PolynomialCoeffs::new(coeffs);
                         let shift = F::rand();
-                        let expected =
-                            poly.coset_fft_with_options(shift, Some(rate_bits), None);
-                        let actual =
-                            coset_fft_zero_tail(&poly, shift, live, Some(rate_bits), None);
+                        let expected = poly.coset_fft_with_options(shift, Some(rate_bits), None);
+                        let actual = coset_fft_zero_tail(&poly, shift, live, Some(rate_bits), None);
                         assert_eq!(actual.values, expected.values);
                     }
                 }
@@ -1072,9 +1116,7 @@ mod tests {
             // This tree's exact pre-fusion sequence: the consuming in-place
             // division (top slot already the pad) + shift_poly + add.
             let mut expected_in_place = initial.clone();
-            let quotient_in_place = composition_poly
-                .clone()
-                .divide_by_linear_padded_in_place(z);
+            let quotient_in_place = composition_poly.clone().divide_by_linear_padded_in_place(z);
             expected_in_place *= shift; // shift_poly
             expected_in_place += quotient_in_place;
 
@@ -1230,7 +1272,11 @@ mod tests {
                     })
                     .collect::<Vec<_>>()
             };
-            assert_eq!(raw(&by_ref), raw(&consumed), "width={width} degree={degree}");
+            assert_eq!(
+                raw(&by_ref),
+                raw(&consumed),
+                "width={width} degree={degree}"
+            );
         }
     }
 }

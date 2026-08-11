@@ -157,6 +157,8 @@ impl Circuits {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use circuit::circuit_serializer::BlockGateSerializer;
     use circuit::embed::EmbedGeneratorSerializer;
     use plonky2::util::serialization::Write as _;
@@ -192,6 +194,41 @@ mod tests {
                 .expect("generator must serialize");
         }
         bytes
+    }
+
+    fn prover_stream_bytes(data: &CircuitData<F, C, D>) -> Vec<u8> {
+        let serializer = EmbedGeneratorSerializer {
+            _phantom: Default::default(),
+            _phantom2: Default::default(),
+        };
+        data.prover_only
+            .to_bytes(&serializer, &data.common)
+            .expect("prover-only data must serialize")
+    }
+
+    fn circuits_from_blob_dir(dir: &Path) -> anyhow::Result<Circuits> {
+        fn read<T: serde::de::DeserializeOwned>(
+            dir: &Path,
+            stem: &'static str,
+        ) -> anyhow::Result<(T, CircuitData<F, C, D>)> {
+            let bytes = std::fs::read(dir.join(format!("{stem}.embed")))?;
+            load_blob(stem, &bytes)
+        }
+
+        let pre = read::<BlockPreExecutionTarget>(dir, "pre")?;
+        let remaining = RemainingEmbeddedCircuits {
+            heavy_tx: read::<BlockTxTarget>(dir, "heavy_tx")?,
+            heavy_chain: read::<BlockTxChainTarget>(dir, "heavy_chain")?,
+            light_tx: read::<BlockTxTarget>(dir, "light_tx")?,
+            light_chain: read::<BlockTxChainTarget>(dir, "light_chain")?,
+            dummy_heavy_proof: bincode::deserialize(include_bytes!(
+                "../dummy-heavy-chain-proof.bin"
+            ))?,
+            dummy_light_proof: bincode::deserialize(include_bytes!(
+                "../dummy-light-chain-proof.bin"
+            ))?,
+        };
+        Ok(remaining.into_circuits(pre))
     }
 
     fn assert_circuit_pair_identical<T: serde::Serialize>(
@@ -236,8 +273,7 @@ mod tests {
             "{name}: sigmas[777] diverges"
         );
         assert!(
-            rebuilt_data.prover_only.generators.len()
-                == embedded_data.prover_only.generators.len(),
+            rebuilt_data.prover_only.generators.len() == embedded_data.prover_only.generators.len(),
             "{name}: generator count diverges"
         );
         for index in [0, 1000, rebuilt_data.prover_only.generators.len() - 1] {
@@ -262,12 +298,41 @@ mod tests {
             "{name}: common circuit data diverges"
         );
 
-        // Prover-only: full structural equality (commitment polynomials and
-        // Merkle tree, sigmas, subgroup, public inputs, representative map,
-        // watch index + counts, fft root table, lookups; generators by id).
+        // Prover-only: byte-identical canonical serialization covers the
+        // commitment polynomials, Merkle leaves/nodes/cap, sigmas, subgroup,
+        // public inputs, representative map, watch index, roots, and lookups.
+        // Comparing the Rust struct directly would reject the equivalent
+        // level-order Merkle node layout used by the prehashed GPU builder.
         assert!(
-            rebuilt_data.prover_only == embedded_data.prover_only,
-            "{name}: prover-only circuit data diverges"
+            prover_stream_bytes(rebuilt_data) == prover_stream_bytes(embedded_data),
+            "{name}: serialized prover-only circuit data diverges"
+        );
+
+        // Runtime-only fields are deliberately absent from serialization.
+        assert_eq!(
+            rebuilt_data.prover_only.generator_watch_counts,
+            embedded_data.prover_only.generator_watch_counts,
+            "{name}: generator watch counts diverge"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.fixed_routed_wires,
+            embedded_data.prover_only.fixed_routed_wires,
+            "{name}: fixed routed-wire mask diverges"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.constants_sigmas_quotient_cache,
+            embedded_data.prover_only.constants_sigmas_quotient_cache,
+            "{name}: constants/sigmas quotient cache diverges"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.constants_sigmas_quotient_step,
+            embedded_data.prover_only.constants_sigmas_quotient_step,
+            "{name}: constants/sigmas quotient step diverges"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.constants_sigmas_quotient_domain,
+            embedded_data.prover_only.constants_sigmas_quotient_domain,
+            "{name}: constants/sigmas quotient domain diverges"
         );
     }
 
@@ -281,8 +346,12 @@ mod tests {
     fn embedded_matches_rebuilt() {
         on_big_stack(|| {
             let rebuilt = Circuits::new();
-            let embedded = Circuits::from_embedded()
-                .expect("embedded circuits must load when blobs are compiled in");
+            let embedded = match std::env::var_os("LIGHTER_EMBED_TEST_DIR") {
+                Some(dir) => circuits_from_blob_dir(Path::new(&dir))
+                    .expect("external embedded circuits must load"),
+                None => Circuits::from_embedded()
+                    .expect("embedded circuits must load when blobs are compiled in"),
+            };
 
             assert_circuit_pair_identical(
                 "pre",

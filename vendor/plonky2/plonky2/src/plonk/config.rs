@@ -143,6 +143,21 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
         None
     }
 
+    /// Builds the parent levels and cap from already-computed leaf digests.
+    /// The digests are in tree-leaf order (the same order as level zero of
+    /// [`crate::hash::merkle_tree::LevelOrderDigests`]). A specialized backend
+    /// may upload them directly and skip the substantially more expensive
+    /// wide-leaf sponge phase.
+    fn try_build_merkle_tree_from_leaf_digests(
+        _leaf_digests: &[Self::Hash],
+        _cap_height: usize,
+    ) -> Option<(
+        crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
+        Vec<Self::Hash>,
+    )> {
+        None
+    }
+
     /// Like [`Hasher::try_build_merkle_tree`], but the leaves arrive as
     /// natural-order poly-major columns: tree leaf `i` is
     /// `columns[j][reverse_bits(i, log2(num_leaves))]`.
