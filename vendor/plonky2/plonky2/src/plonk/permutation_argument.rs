@@ -279,6 +279,29 @@ pub struct WirePartition {
 }
 
 impl WirePartition {
+    /// Return the sigma permutation itself in flat row-major order.
+    ///
+    /// A sigma value at `(row, column)` is always
+    /// `k[target_column] * subgroup[target_row]`; retaining that 64-bit field
+    /// element therefore duplicates information already present in the
+    /// permutation. The packed target index needs only 32 bits and lets the
+    /// prover recover the same denominator with its existing `beta * k`
+    /// table, without adding a field multiplication.
+    pub fn get_sigma_indices_row_major(&self, degree: usize) -> Vec<u32> {
+        debug_assert_eq!(self.sigma.len() % degree, 0);
+        let width = self.sigma.len() / degree;
+        let mut row_major = vec![0u32; self.sigma.len()];
+        row_major
+            .par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(row, output)| {
+                for (column, target) in output.iter_mut().enumerate() {
+                    *target = self.sigma[column * degree + row];
+                }
+            });
+        row_major
+    }
+
     pub fn get_sigma_polys<F: Field>(
         &self,
         degree_log: usize,

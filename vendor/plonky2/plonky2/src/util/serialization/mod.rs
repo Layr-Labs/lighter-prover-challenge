@@ -895,10 +895,17 @@ pub trait Read {
 
         let constants_sigmas_commitment = self.read_polynomial_batch()?;
         let sigmas_len = self.read_usize()?;
-        let mut sigmas = Vec::with_capacity(sigmas_len);
+        // Sigma values retain their legacy row-of-fields wire encoding. The
+        // runtime representation is reconstructed from the representative map
+        // below, so consume without retaining this redundant 64-bit matrix.
         for _ in 0..sigmas_len {
             let sigma_len = self.read_usize()?;
-            sigmas.push(self.read_field_vec(sigma_len)?);
+            if sigma_len != common_data.config.num_routed_wires {
+                return Err(IoError);
+            }
+            for _ in 0..sigma_len {
+                let _ = self.read_field::<F>()?;
+            }
         }
 
         let subgroup_len = self.read_usize()?;
@@ -907,6 +914,19 @@ pub trait Read {
         let public_inputs = self.read_target_vec()?;
 
         let representative_map = self.read_usize_encoded_u32_vec()?;
+        let degree = subgroup.len();
+        if sigmas_len != degree {
+            return Err(IoError);
+        }
+        let mut sigma_forest = crate::plonk::permutation_argument::Forest::from_parents(
+            representative_map.clone(),
+            common_data.config.num_wires,
+            common_data.config.num_routed_wires,
+            degree,
+        );
+        let sigmas = sigma_forest
+            .wire_partition()
+            .get_sigma_indices_row_major(degree);
         let fixed_routed_wires = crate::plonk::permutation_argument::fixed_routed_wire_mask(
             &representative_map,
             common_data.config.num_wires,
@@ -1960,10 +1980,22 @@ pub trait Write {
         }
 
         self.write_polynomial_batch(constants_sigmas_commitment)?;
-        self.write_usize(sigmas.len())?;
-        for i in 0..sigmas.len() {
-            self.write_usize(sigmas[i].len())?;
-            self.write_field_vec(&sigmas[i])?;
+        let degree = subgroup.len();
+        let width = common_data.config.num_routed_wires;
+        if sigmas.len() != degree * width {
+            return Err(IoError);
+        }
+        let degree_bits = common_data.degree_bits();
+        let degree_mask = degree - 1;
+        self.write_usize(degree)?;
+        for row in 0..degree {
+            self.write_usize(width)?;
+            for column in 0..width {
+                let target = sigmas[row * width + column] as usize;
+                let sigma = common_data.k_is[target >> degree_bits]
+                    * subgroup[target & degree_mask];
+                self.write_field(sigma)?;
+            }
         }
         self.write_usize(subgroup.len())?;
         self.write_field_vec(subgroup)?;

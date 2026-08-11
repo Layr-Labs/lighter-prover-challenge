@@ -584,8 +584,11 @@ pub struct ProverOnlyCircuitData<
     pub generator_watch_counts: Vec<usize>,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
-    /// The transpose of the list of sigma polynomials.
-    pub sigmas: Vec<Vec<F>>,
+    /// The sigma permutation in flat row-major order. Each `u32` packs
+    /// `target_column * degree + target_row`; the corresponding field value is
+    /// `k_is[target_column] * subgroup[target_row]`. Keeping the index rather
+    /// than that derived 64-bit value halves this proof-hot matrix.
+    pub sigmas: Vec<u32>,
     /// Subgroup of order `degree`.
     pub subgroup: Vec<F>,
     /// Targets to be made public.

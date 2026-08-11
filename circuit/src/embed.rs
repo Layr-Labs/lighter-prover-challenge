@@ -44,7 +44,7 @@ use plonky2::plonk::circuit_data::{
 use plonky2::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
-use plonky2::util::{log2_ceil, transpose_poly_values_ref};
+use plonky2::util::log2_ceil;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -500,13 +500,11 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         fixed_routed_wire_mask(&representative_map, num_wires, num_routed, degree)
             .context("embedded circuit has an invalid compressed representative map")?;
 
-    // `prover_only.sigmas` is the transpose of the sigma *values*, and the
-    // commitment below consumes those same values. Transposing first reads the
-    // columns in place, so they can then be moved into the commitment instead
-    // of cloned; the clone was one extra full copy of the sigma columns
-    // (`num_routed_wires * degree` field elements) per circuit. Only the order
-    // of two independent reads changes — no quantity is computed differently.
-    let sigmas = transpose_poly_values_ref(&sigma_vecs);
+    // Keep only the packed sigma permutation for the proof-hot row-major view.
+    // The field-valued columns below are still consumed by the commitment, but
+    // retaining a second 64-bit copy would duplicate values that the prover can
+    // recover from this 32-bit target index and its existing `beta * k` table.
+    let sigmas = wire_partition.get_sigma_indices_row_major(degree);
 
     // The builder's commitment path: values in, IFFT inside, LDE + Merkle.
     // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).

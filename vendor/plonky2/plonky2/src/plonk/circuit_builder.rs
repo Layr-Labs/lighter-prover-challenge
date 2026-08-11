@@ -55,7 +55,7 @@ use crate::timed;
 use crate::util::context_tree::ContextTree;
 use crate::util::partial_products::num_partial_products;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil, log2_strict, transpose_poly_values_ref};
+use crate::util::{log2_ceil, log2_strict};
 
 /// Number of random coins needed for lookups (for each challenge).
 /// A coin is a randomly sampled extension field element from the verifier,
@@ -1039,7 +1039,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .collect()
     }
 
-    fn sigma_vecs(&self, k_is: &[F], subgroup: &[F]) -> (Vec<PolynomialValues<F>>, Forest) {
+    fn sigma_vecs(
+        &self,
+        k_is: &[F],
+        subgroup: &[F],
+    ) -> (Vec<PolynomialValues<F>>, Vec<u32>, Forest) {
         let degree = self.gate_instances.len();
         let degree_log = log2_strict(degree);
         let config = &self.config;
@@ -1070,8 +1074,10 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         forest.compress_paths();
 
         let wire_partition = forest.wire_partition();
+        let sigmas = wire_partition.get_sigma_indices_row_major(degree);
         (
             wire_partition.get_sigma_polys(degree_log, k_is, subgroup),
+            sigmas,
             forest,
         )
     }
@@ -1266,7 +1272,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let subgroup = F::two_adic_subgroup(degree_bits);
 
         let k_is = get_unique_coset_shifts(degree, self.config.num_routed_wires);
-        let (sigma_vecs, forest) = timed!(
+        let (sigma_vecs, sigmas, forest) = timed!(
             timing,
             "generate sigma polynomials",
             self.sigma_vecs(&k_is, &subgroup)
@@ -1275,14 +1281,6 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // Precompute FFT roots.
         let max_fft_points = 1 << (degree_bits + max(rate_bits, log2_ceil(quotient_degree_factor)));
         let fft_root_table = fft_root_table(max_fft_points);
-
-        // `prover_only.sigmas` is the transpose of the sigma *values*, and the
-        // commitment below consumes those same values. Transposing first reads the
-        // columns in place, so they can then be moved into the commitment instead
-        // of cloned; the clone was one extra full copy of the sigma columns
-        // (`num_routed_wires * degree` field elements) per circuit. Only the order
-        // of two independent reads changes — no quantity is computed differently.
-        let sigmas = transpose_poly_values_ref(&sigma_vecs);
 
         let constants_sigmas_commitment = if commit_to_sigma {
             let mut constants_sigmas_vecs = constant_vecs;
