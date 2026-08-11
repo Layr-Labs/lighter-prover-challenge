@@ -1498,12 +1498,18 @@ mod tests {
         let direct_seeded = direct_seeded.finish()?;
 
         let mut nondeterministic_positions = 0usize;
-        for ((map, map_repeat), direct) in map_seeded
-            .values
-            .iter()
-            .zip(&map_seeded_repeat.values)
-            .zip(&direct_seeded.values)
-        {
+        // Unset slots are uninitialized storage; compare bitmap-set slots only
+        // (same masking as the other witness-equality tests in this module).
+        for rep in 0..map_seeded.values.len() {
+            if !(map_seeded.is_set_by_rep_index(rep)
+                && map_seeded_repeat.is_set_by_rep_index(rep)
+                && direct_seeded.is_set_by_rep_index(rep))
+            {
+                continue;
+            }
+            let map = &map_seeded.values[rep];
+            let map_repeat = &map_seeded_repeat.values[rep];
+            let direct = &direct_seeded.values[rep];
             if map == map_repeat {
                 assert_eq!(map, direct);
             } else {
