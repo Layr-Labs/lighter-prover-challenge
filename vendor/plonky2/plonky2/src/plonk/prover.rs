@@ -2516,7 +2516,7 @@ fn compute_quotient_polys<
                 }
             }
         });
-    let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
+    let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers_scaled::<F>(points.len());
     challenge_columns
         .into_par_iter()
         .map(|column| {
@@ -2524,7 +2524,7 @@ fn compute_quotient_polys<
             // whole coefficient vector again afterwards, reusing a
             // process-global inverse-shift power chain.
             PolynomialValues::new(column)
-                .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
+                .coset_ifft_with_scaled_powers(inverse_coset_shift_powers.as_slice())
         })
         .collect()
 }
@@ -2552,6 +2552,7 @@ pub(crate) mod precomputed {
         static COSET_POWERS: OnceLock<Map> = OnceLock::new();
         static SHIFTED_SUBGROUPS: OnceLock<Map> = OnceLock::new();
         static INVERSE_COSET_POWERS: OnceLock<Map> = OnceLock::new();
+        static INVERSE_COSET_POWERS_SCALED: OnceLock<Map> = OnceLock::new();
 
         fn get_or_compute<F: Field>(
             cache: &'static OnceLock<Map>,
@@ -2611,6 +2612,20 @@ pub(crate) mod precomputed {
                 F::coset_shift().inverse().powers().take(degree).collect()
             })
         }
+
+        /// Cached `n^-1 * coset_shift^-i` for quotient coset IFFTs of length `degree`.
+        pub(crate) fn inverse_coset_shift_powers_scaled<F: Field>(degree: usize) -> Arc<Vec<F>> {
+            get_or_compute(&INVERSE_COSET_POWERS_SCALED, degree, || {
+                let lg_n = crate::util::log2_strict(degree);
+                let n_inv = F::inverse_2exp(lg_n);
+                F::coset_shift()
+                    .inverse()
+                    .powers()
+                    .take(degree)
+                    .map(|p| p * n_inv)
+                    .collect()
+            })
+        }
     }
 
     /// Without `std` there is no process-global synchronization; fall back to
@@ -2644,11 +2659,24 @@ pub(crate) mod precomputed {
                     .collect::<Vec<F>>(),
             )
         }
+
+        pub(crate) fn inverse_coset_shift_powers_scaled<F: Field>(degree: usize) -> Arc<Vec<F>> {
+            let lg_n = crate::util::log2_strict(degree);
+            let n_inv = F::inverse_2exp(lg_n);
+            Arc::new(
+                F::coset_shift()
+                    .inverse()
+                    .powers()
+                    .take(degree)
+                    .map(|p| p * n_inv)
+                    .collect::<Vec<F>>(),
+            )
+        }
     }
 
     pub(crate) use imp::{
-        coset_shift_powers, inverse_coset_shift_powers, shifted_two_adic_subgroup,
-        two_adic_subgroup,
+        coset_shift_powers, inverse_coset_shift_powers, inverse_coset_shift_powers_scaled,
+        shifted_two_adic_subgroup, two_adic_subgroup,
     };
 }
 
