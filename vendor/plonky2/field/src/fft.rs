@@ -673,7 +673,9 @@ fn fft_classic_simd_two_layers_neon(
 /// four-product form runs. The butterfly `u + t` / `u - t` reductions always
 /// run as two-lane vector adds/subs reproducing `impl Add/Sub for
 /// GoldilocksField` word for word. Same blocks, same pairing, same twiddles,
-/// same order as the generic body.
+/// same order as the generic body. Two independent extension elements are
+/// issued per iteration, matching the proven base-field unroll while keeping
+/// the one-element layer as the original tail.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn fft_classic_simd_single_layer_neon_ext(
@@ -703,16 +705,76 @@ fn fft_classic_simd_single_layer_neon_ext(
         let mut k = 0;
         while k + m <= values.len() {
             let mut j = 0;
-            while j + 1 <= half {
+            while j + 2 <= half {
+                let v0 = *values.get_unchecked(k + half + j);
+                let v1 = *values.get_unchecked(k + half + j + 1);
+                let w0 = *omega_row.get_unchecked(j);
+                let w1 = *omega_row.get_unchecked(j + 1);
+                let ((c00, c01), (c10, c11)) = if base_subfield {
+                    // Each [w0, 0] product remains component-paired exactly as
+                    // in the one-element loop; the independent pair only adds
+                    // instruction-level parallelism.
+                    let p0 = NeonGoldilocksField([w0.0[0], w0.0[0]])
+                        * NeonGoldilocksField([v0.0[0], v0.0[1]]);
+                    let p1 = NeonGoldilocksField([w1.0[0], w1.0[0]])
+                        * NeonGoldilocksField([v1.0[0], v1.0[1]]);
+                    ((p0.0[0].0, p0.0[1].0), (p1.0[0].0, p1.0[1].0))
+                } else {
+                    // General products retain the same two paired multiplies
+                    // and the same component reductions for each element.
+                    let p0 = NeonGoldilocksField([w0.0[0], w0.0[1]])
+                        * NeonGoldilocksField([v0.0[0], v0.0[1]]);
+                    let p1 = NeonGoldilocksField([w1.0[0], w1.0[1]])
+                        * NeonGoldilocksField([v1.0[0], v1.0[1]]);
+                    let q0 = NeonGoldilocksField([w0.0[0], w0.0[1]])
+                        * NeonGoldilocksField([v0.0[1], v0.0[0]]);
+                    let q1 = NeonGoldilocksField([w1.0[0], w1.0[1]])
+                        * NeonGoldilocksField([v1.0[1], v1.0[0]]);
+                    let c00 = (p0.0[0] + GoldilocksField(W) * p0.0[1]).0;
+                    let c01 = (q0.0[0] + q0.0[1]).0;
+                    let c10 = (p1.0[0] + GoldilocksField(W) * p1.0[1]).0;
+                    let c11 = (q1.0[0] + q1.0[1]).0;
+                    ((c00, c01), (c10, c11))
+                };
+                let tv0 = vcombine_u64(vcreate_u64(c00), vcreate_u64(c01));
+                let tv1 = vcombine_u64(vcreate_u64(c10), vcreate_u64(c11));
+
+                let u0 = *values.get_unchecked(k + j);
+                let u1 = *values.get_unchecked(k + j + 1);
+                let uv0 = vcombine_u64(vcreate_u64(u0.0[0].0), vcreate_u64(u0.0[1].0));
+                let uv1 = vcombine_u64(vcreate_u64(u1.0[0].0), vcreate_u64(u1.0[1].0));
+                let sum0 = gl_add_neon(uv0, tv0, eps);
+                let diff0 = gl_sub_neon(uv0, tv0, eps);
+                let sum1 = gl_add_neon(uv1, tv1, eps);
+                let diff1 = gl_sub_neon(uv1, tv1, eps);
+                *values.get_unchecked_mut(k + j) = QuadraticExtension([
+                    GoldilocksField(vgetq_lane_u64(sum0, 0)),
+                    GoldilocksField(vgetq_lane_u64(sum0, 1)),
+                ]);
+                *values.get_unchecked_mut(k + half + j) = QuadraticExtension([
+                    GoldilocksField(vgetq_lane_u64(diff0, 0)),
+                    GoldilocksField(vgetq_lane_u64(diff0, 1)),
+                ]);
+                *values.get_unchecked_mut(k + j + 1) = QuadraticExtension([
+                    GoldilocksField(vgetq_lane_u64(sum1, 0)),
+                    GoldilocksField(vgetq_lane_u64(sum1, 1)),
+                ]);
+                *values.get_unchecked_mut(k + half + j + 1) = QuadraticExtension([
+                    GoldilocksField(vgetq_lane_u64(diff1, 0)),
+                    GoldilocksField(vgetq_lane_u64(diff1, 1)),
+                ]);
+                j += 2;
+            }
+            // The only production tail is the two-element layer (`half == 1`);
+            // keep the original element-at-a-time operation and store order.
+            while j < half {
                 let v = *values.get_unchecked(k + half + j);
                 let w = *omega_row.get_unchecked(j);
                 let (c0, c1) = if base_subfield {
-                    // [w0, 0] * [v0, v1] = [w0*v0, w0*v1]: one paired mul.
                     let p = NeonGoldilocksField([w.0[0], w.0[0]])
                         * NeonGoldilocksField([v.0[0], v.0[1]]);
                     (p.0[0].0, p.0[1].0)
                 } else {
-                    // General extension product with the W = 7 conjugation.
                     let p = NeonGoldilocksField([w.0[0], w.0[1]])
                         * NeonGoldilocksField([v.0[0], v.0[1]]);
                     let q = NeonGoldilocksField([w.0[0], w.0[1]])
@@ -722,7 +784,6 @@ fn fft_classic_simd_single_layer_neon_ext(
                     (c0, c1)
                 };
                 let tv = vcombine_u64(vcreate_u64(c0), vcreate_u64(c1));
-
                 let u = *values.get_unchecked(k + j);
                 let uv = vcombine_u64(vcreate_u64(u.0[0].0), vcreate_u64(u.0[1].0));
                 let sum = gl_add_neon(uv, tv, eps);
@@ -2617,18 +2678,20 @@ mod tests {
     /// rare double-overflow and double-underflow corrections actually fire --
     /// a differential that never exercises its corrections cannot catch them.
     ///
-    /// The quadratic extension is included deliberately: it is `WIDTH == 1` and
-    /// must take the generic fallback, so the fallback being exercised is as
-    /// much a correctness requirement as the fast path.
+    /// The quadratic extension is covered at every layer of sizes spanning the
+    /// scalar tail, the two-element unrolled body, cache-block-sized work, and
+    /// full-array work. Both base-subfield production rows and adversarial
+    /// extension-valued rows are checked, so both multiplication arms must
+    /// reproduce the generic raw limbs exactly.
     ///
     /// The oracle keeps the plain `twiddle * value` product, while the arm under
     /// test runs `BaseSubfieldTwiddle`, the marker production selects for these
-    /// sizes. The extension half is therefore simultaneously the fallback
-    /// differential it always was and a twiddle-specialization differential.
+    /// sizes. On aarch64 the exact-type dispatch reaches the extension NEON
+    /// kernel; other targets exercise the unchanged generic fallback.
     #[test]
     fn neon_single_layer_matches_generic_raw_words() {
         use crate::fft::fft_classic_simd_single_layer_with;
-        use crate::types::{Field64, PrimeField64};
+        use crate::types::Field64;
 
         /// Verbatim copy of the generic body, as the oracle.
         fn generic<P: PackedField>(
@@ -2692,21 +2755,68 @@ mod tests {
             }
         }
 
-        // Fallback instantiations: both are WIDTH == 1 and must be unaffected.
         type FE = QuadraticExtension<GoldilocksField>;
-        for lg_n in [6usize, 9] {
+        let specials = [
+            0,
+            1,
+            2,
+            0xffff_fffe_ffff_ffff,
+            0xffff_ffff_0000_0000,
+            0xffff_ffff_0000_0001,
+            0xffff_ffff_0000_0002,
+            u64::MAX,
+        ];
+        for lg_n in [1usize, 2, 3, 4, 5, 6, 8, 11, 13, 16, 17] {
             let n = 1usize << lg_n;
             let roots_ext = fft_root_table::<FE>(n);
             for lg_half_m in 0..lg_n {
-                let mut expected: Vec<FE> = (0..n)
-                    .map(|i| QuadraticExtension([deterministic_value(i), deterministic_value(i + n)]))
-                    .collect();
-                let mut actual = expected.clone();
-                generic::<FE>(&mut expected, lg_half_m, 0, &roots_ext);
-                fft_classic_simd_single_layer_with::<FE, BaseSubfieldTwiddle>(&mut actual, lg_half_m, 0, &roots_ext);
-                for (a, e) in actual.iter().zip(expected.iter()) {
-                    assert_eq!(a.0[0].to_canonical_u64(), e.0[0].to_canonical_u64());
-                    assert_eq!(a.0[1].to_canonical_u64(), e.0[1].to_canonical_u64());
+                let input = (0..n)
+                    .map(|i| {
+                        let x = (i as u64)
+                            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                            .rotate_left((i % 61) as u32);
+                        QuadraticExtension([
+                            GoldilocksField(specials[i % specials.len()] ^ x),
+                            GoldilocksField(
+                                specials[(i * 5 + 3) % specials.len()]
+                                    ^ x.rotate_left(17),
+                            ),
+                        ])
+                    })
+                    .collect::<Vec<_>>();
+
+                // Production roots live in the base subfield. A second row
+                // with nonzero high limbs forces the general extension arm.
+                for general in [false, true] {
+                    let mut table = roots_ext.clone();
+                    if general {
+                        for (j, w) in table[lg_half_m].iter_mut().enumerate() {
+                            w.0[1] = GoldilocksField(
+                                specials[(j + 1) % specials.len()]
+                                    | ((j as u64).wrapping_mul(0xd1b5_4a32_d192_ed03) | 1),
+                            );
+                        }
+                    }
+                    let mut expected = input.clone();
+                    let mut actual = input.clone();
+                    generic::<FE>(&mut expected, lg_half_m, 0, &table);
+                    fft_classic_simd_single_layer_with::<FE, BaseSubfieldTwiddle>(
+                        &mut actual,
+                        lg_half_m,
+                        0,
+                        &table,
+                    );
+                    for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                        assert_eq!(
+                            [a.0[0].0, a.0[1].0],
+                            [e.0[0].0, e.0[1].0],
+                            "extension raw mismatch: size=2^{} layer={} general={} index={}",
+                            lg_n,
+                            lg_half_m,
+                            general,
+                            i,
+                        );
+                    }
                 }
             }
         }
