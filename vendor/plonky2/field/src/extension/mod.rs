@@ -99,6 +99,21 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    /// Compute two dot products that share the same extension-field values.
+    /// The default preserves the two independent calls; concrete fields may
+    /// traverse the shared values once and keep both accumulators live.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_product_pair(
+        extension_values: &[Self::Extension],
+        base_scalars: [&[Self]; 2],
+    ) -> [Self::Extension; 2] {
+        [
+            Self::extension_base_dot_product(extension_values, base_scalars[0]),
+            Self::extension_base_dot_product(extension_values, base_scalars[1]),
+        ]
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.

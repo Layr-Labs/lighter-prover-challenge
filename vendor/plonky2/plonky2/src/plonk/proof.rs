@@ -312,6 +312,28 @@ pub struct OpeningSet<F: RichField + Extendable<D>, const D: usize> {
     pub lookup_zs_next: Vec<F::Extension>,
 }
 
+/// Evaluate base-field coefficient polynomials against one extension-power
+/// table. Pairing adjacent polynomials lets a concrete field load the shared
+/// power stream once while retaining independent delayed-reduction sums.
+fn evaluate_base_polynomials<F: RichField + Extendable<D>, const D: usize>(
+    powers: &[F::Extension],
+    polynomials: &[PolynomialCoeffs<F>],
+) -> Vec<F::Extension> {
+    let mut evaluations = vec![F::Extension::ZERO; polynomials.len()];
+    evaluations
+        .par_chunks_mut(2)
+        .zip(polynomials.par_chunks(2))
+        .for_each(|(output, polynomials)| match polynomials {
+            [first, second] => output.copy_from_slice(&F::extension_base_dot_product_pair(
+                powers,
+                [&first.coeffs, &second.coeffs],
+            )),
+            [last] => output[0] = F::extension_base_dot_product(powers, &last.coeffs),
+            _ => unreachable!("chunks of two contain one or two polynomials"),
+        });
+    evaluations
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
     pub fn new<C: GenericConfig<D, F = F>>(
         zeta: F::Extension,
@@ -373,10 +395,7 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
             }
         }
         let eval_polynomials = |pows: &[F::Extension], polynomials: &[PolynomialCoeffs<F>]| {
-            polynomials
-                .par_iter()
-                .map(|p| F::extension_base_dot_product(pows, &p.coeffs))
-                .collect::<Vec<_>>()
+            evaluate_base_polynomials::<F, D>(pows, polynomials)
         };
         let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
             eval_polynomials(pows, &c.polynomials)
@@ -532,6 +551,41 @@ mod tests {
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::PoseidonGoldilocksConfig;
     use crate::plonk::verifier::verify;
+
+    #[test]
+    fn paired_opening_evaluation_preserves_order_and_values() {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type E = <F as Extendable<D>>::Extension;
+
+        let powers = E::rand_vec(257);
+        let polynomials = [257usize, 257, 128, 0, 1]
+            .into_iter()
+            .map(|len| PolynomialCoeffs::new(F::rand_vec(len)))
+            .collect::<Vec<_>>();
+        let expected = polynomials
+            .iter()
+            .map(|polynomial| {
+                powers
+                    .iter()
+                    .zip(&polynomial.coeffs)
+                    .map(|(&power, &coefficient)| {
+                        <E as FieldExtension<D>>::scalar_mul(&power, coefficient)
+                    })
+                    .sum::<E>()
+            })
+            .collect::<Vec<_>>();
+        let actual = evaluate_base_polynomials::<F, D>(&powers, &polynomials);
+
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).is_zero(),
+                "opening evaluation {index} differs as a field element",
+            );
+        }
+    }
 
     #[test]
     fn test_proof_compression() -> Result<()> {

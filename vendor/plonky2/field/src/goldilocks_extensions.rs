@@ -35,6 +35,14 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    #[inline]
+    fn extension_base_dot_product_pair(
+        extension_values: &[QuadraticExtension<Self>],
+        base_scalars: [&[Self]; 2],
+    ) -> [QuadraticExtension<Self>; 2] {
+        ext2_base_scalar_dot_product_pair(extension_values, base_scalars)
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -275,6 +283,94 @@ fn ext2_base_scalar_dot_product(
         let end = len.min(start + MAX_TERMS_PER_REDUCTION);
         result += reduce_chunk(&extension_values[start..end], &base_scalars[start..end]);
         start = end;
+    }
+    result
+}
+
+/// Evaluate two base-coefficient polynomials against one extension-power
+/// stream. Production opening batches contain equal-degree polynomials, so
+/// the common prefix is the whole input: each power is loaded once while four
+/// independent 160-bit limb accumulators expose enough instruction-level
+/// parallelism for Apple Silicon's out-of-order core.
+///
+/// Each accumulator obeys the same exact worst-case bound as
+/// [`ext2_base_scalar_dot_product`]. Unequal inputs retain zip semantics: the
+/// shared prefix is fused, then either remaining suffix uses the established
+/// single-dot path.
+#[inline]
+fn ext2_base_scalar_dot_product_pair(
+    extension_values: &[QuadraticExtension<GoldilocksField>],
+    base_scalars: [&[GoldilocksField]; 2],
+) -> [QuadraticExtension<GoldilocksField>; 2] {
+    const MAX_TERMS_PER_REDUCTION: usize = u32::MAX as usize;
+
+    let len0 = extension_values.len().min(base_scalars[0].len());
+    let len1 = extension_values.len().min(base_scalars[1].len());
+    let common_len = len0.min(len1);
+
+    let reduce_pair_chunk = |values: &[QuadraticExtension<GoldilocksField>],
+                             scalars0: &[GoldilocksField],
+                             scalars1: &[GoldilocksField]| {
+        debug_assert_eq!(values.len(), scalars0.len());
+        debug_assert_eq!(values.len(), scalars1.len());
+        debug_assert!(values.len() <= MAX_TERMS_PER_REDUCTION);
+        let (mut lo00, mut hi00) = (0u128, 0u32);
+        let (mut lo01, mut hi01) = (0u128, 0u32);
+        let (mut lo10, mut hi10) = (0u128, 0u32);
+        let (mut lo11, mut hi11) = (0u128, 0u32);
+        for ((&QuadraticExtension([power0, power1]), &scalar0), &scalar1) in
+            values.iter().zip(scalars0).zip(scalars1)
+        {
+            u160_add_product(&mut lo00, &mut hi00, power0.0, scalar0.0);
+            u160_add_product(&mut lo01, &mut hi01, power1.0, scalar0.0);
+            u160_add_product(&mut lo10, &mut hi10, power0.0, scalar1.0);
+            u160_add_product(&mut lo11, &mut hi11, power1.0, scalar1.0);
+        }
+        // SAFETY: every accumulator contains at most u32::MAX raw 64x64
+        // products, exactly the bound proved for the single-dot path above.
+        [
+            QuadraticExtension([unsafe { reduce160(lo00, hi00) }, unsafe {
+                reduce160(lo01, hi01)
+            }]),
+            QuadraticExtension([unsafe { reduce160(lo10, hi10) }, unsafe {
+                reduce160(lo11, hi11)
+            }]),
+        ]
+    };
+
+    let first_end = common_len.min(MAX_TERMS_PER_REDUCTION);
+    let mut result = if first_end == 0 {
+        [QuadraticExtension::ZERO; 2]
+    } else {
+        reduce_pair_chunk(
+            &extension_values[..first_end],
+            &base_scalars[0][..first_end],
+            &base_scalars[1][..first_end],
+        )
+    };
+    let mut start = first_end;
+    while start < common_len {
+        let end = common_len.min(start + MAX_TERMS_PER_REDUCTION);
+        let reduced = reduce_pair_chunk(
+            &extension_values[start..end],
+            &base_scalars[0][start..end],
+            &base_scalars[1][start..end],
+        );
+        result[0] += reduced[0];
+        result[1] += reduced[1];
+        start = end;
+    }
+    if common_len < len0 {
+        result[0] += ext2_base_scalar_dot_product(
+            &extension_values[common_len..len0],
+            &base_scalars[0][common_len..len0],
+        );
+    }
+    if common_len < len1 {
+        result[1] += ext2_base_scalar_dot_product(
+            &extension_values[common_len..len1],
+            &base_scalars[1][common_len..len1],
+        );
     }
     result
 }
@@ -806,6 +902,22 @@ mod tests {
             <GF as Extendable<4>>::extension_base_dot_product(&[], &scalars),
             Q4::ZERO
         );
+        let second_scalars = scalars.iter().copied().rev().collect::<Vec<_>>();
+        let expected_pair = [
+            expected,
+            values
+                .iter()
+                .zip(&second_scalars)
+                .map(|(&value, &scalar)| <Q4 as FieldExtension<4>>::scalar_mul(&value, scalar))
+                .sum(),
+        ];
+        assert_eq!(
+            <GF as Extendable<4>>::extension_base_dot_product_pair(
+                &values,
+                [&scalars, &second_scalars],
+            ),
+            expected_pair,
+        );
     }
 
     #[test]
@@ -897,6 +1009,58 @@ mod tests {
         let first_unsafe_worst_case = BigUint::from(u64::from(u32::MAX) + 1) * max_product;
         assert!(max_safe_sum < reduce160_limit);
         assert!(first_unsafe_worst_case >= reduce160_limit);
+    }
+
+    #[test]
+    fn ext2_extension_base_dot_product_pair_matches_independent_sums() {
+        let shapes = [
+            (0, 0, 0),
+            (1, 1, 0),
+            (1, 0, 1),
+            (2, 1, 2),
+            (17, 17, 16),
+            (64, 63, 64),
+            (257, 257, 257),
+            (2049, 2048, 2049),
+            (4097, 4097, 4096),
+        ];
+        let mut state = 0xE703_7ED1_A0B4_28DBu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for (values_len, scalars0_len, scalars1_len) in shapes {
+            let values = (0..values_len)
+                .map(|_| QuadraticExtension([GoldilocksField(next()), GoldilocksField(next())]))
+                .collect::<Vec<_>>();
+            let scalars0 = (0..scalars0_len)
+                .map(|_| GoldilocksField(next()))
+                .collect::<Vec<_>>();
+            let scalars1 = (0..scalars1_len)
+                .map(|_| GoldilocksField(next()))
+                .collect::<Vec<_>>();
+            let expected = [
+                generic_extension_base_dot_product(&values, &scalars0),
+                generic_extension_base_dot_product(&values, &scalars1),
+            ];
+            let actual = <GF as Extendable<2>>::extension_base_dot_product_pair(
+                &values,
+                [&scalars0, &scalars1],
+            );
+            for polynomial in 0..2 {
+                for limb in 0..2 {
+                    assert_eq!(
+                        actual[polynomial].0[limb].to_canonical_u64(),
+                        expected[polynomial].0[limb].to_canonical_u64(),
+                        "polynomial {polynomial} limb {limb} mismatch at shape \
+                         ({values_len}, {scalars0_len}, {scalars1_len})",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
