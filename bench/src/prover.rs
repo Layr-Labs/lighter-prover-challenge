@@ -822,6 +822,12 @@ pub(crate) fn prove_block_after_pre(
     // own extensions on top of them.
     circuits.release_finished_circuit_extensions();
 
+    // The transaction paths have joined, so the main thread now owns the only remaining proof's
+    // serial spine. Give its transcript, FRI-control, and GPU-dispatch sections the same
+    // performance-core scheduling request as each latency-critical chain step. Rayon workers
+    // retain their existing QoS and all arithmetic/order is unchanged.
+    mark_spine_thread_latency_critical();
+
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context =
         plonky2::util::profile::enter_context("final_block", block.block_number, &[]);
