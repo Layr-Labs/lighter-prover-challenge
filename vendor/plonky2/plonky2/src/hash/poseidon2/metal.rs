@@ -107,6 +107,13 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// `metallib_matches_shader_source` test enforces it.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
+/// Build-host-compiled portable AIR containing the optional two-stage NTT
+/// kernel. Empty on non-Mac builders or when the optional toolchain is absent.
+/// Unlike an `MTLBinaryArchive`, this is not tied to a build-host GPU binary;
+/// the benchmark host performs its ordinary compatible AIR-to-ISA lowering.
+const SHADER_FUSED_METALLIB: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/poseidon2_fused.metallib"));
+
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
     "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
@@ -178,6 +185,7 @@ struct MetalShared {
     parent_pipeline: ComputePipelineState,
     ntt_prepare_pipeline: ComputePipelineState,
     ntt_stage_pipeline: ComputePipelineState,
+    ntt_stage2_pipeline: Option<ComputePipelineState>,
     ifft_finalize_pipeline: ComputePipelineState,
     parameters: Buffer,
     pool: Mutex<BufferPool>,
@@ -2267,13 +2275,25 @@ impl MetalShared {
             //   xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib
             // and `metallib_matches_shader_source` fails the test run if you
             // forget.
-            let library = device
-                .new_library_with_data(SHADER_METALLIB)
-                .ok()
+            let fused_library = (!SHADER_FUSED_METALLIB.is_empty())
+                .then(|| device.new_library_with_data(SHADER_FUSED_METALLIB).ok())
+                .flatten()
                 .filter(|library| {
                     METALLIB_REQUIRED_KERNELS
                         .iter()
                         .all(|name| library.get_function(name, None).is_ok())
+                        && library.get_function("ntt_stage2", None).is_ok()
+                });
+            let library = fused_library
+                .or_else(|| {
+                    device
+                        .new_library_with_data(SHADER_METALLIB)
+                        .ok()
+                        .filter(|library| {
+                            METALLIB_REQUIRED_KERNELS
+                                .iter()
+                                .all(|name| library.get_function(name, None).is_ok())
+                        })
                 })
                 .map_or_else(
                     || {
@@ -2343,6 +2363,7 @@ impl MetalShared {
                 parent_pipeline,
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
+                ntt_stage2_pipeline,
                 ifft_finalize_pipeline,
             ) = std::thread::scope(|scope| {
                 let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
@@ -2351,6 +2372,14 @@ impl MetalShared {
                 let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
                 let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
                 let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
+                let ntt_stage2 = scope.spawn(|| {
+                    autoreleasepool(|| {
+                        let function = library_ref.get_function("ntt_stage2", None).ok()?;
+                        device_ref
+                            .new_compute_pipeline_state_with_function(&function)
+                            .ok()
+                    })
+                });
                 let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
                 // A panic inside a pipeline build is a bug, not a runtime
                 // condition; propagate it rather than papering over it.
@@ -2366,6 +2395,9 @@ impl MetalShared {
                     ntt_stage
                         .join()
                         .expect("ntt stage pipeline thread panicked"),
+                    ntt_stage2
+                        .join()
+                        .expect("fused NTT pipeline thread panicked"),
                     ifft_finalize
                         .join()
                         .expect("ifft finalize pipeline thread panicked"),
@@ -2405,6 +2437,7 @@ impl MetalShared {
                 parent_pipeline,
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
+                ntt_stage2_pipeline,
                 ifft_finalize_pipeline,
                 parameters,
                 pool: Mutex::new(BufferPool {
@@ -2423,6 +2456,72 @@ impl MetalShared {
                 permutation_points: Mutex::new(HashMap::new()),
             })
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_ntt_stages(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        values: &metal::BufferRef,
+        roots: &metal::BufferRef,
+        roots_offsets: &[usize],
+        n: usize,
+        cols: usize,
+        first_stage: u32,
+        last_stage: u32,
+        canonicalize_final: bool,
+    ) {
+        let n_u32 = n as u32;
+        let mut stage = first_stage;
+
+        if let Some(pipeline) = self.ntt_stage2_pipeline.as_ref() {
+            while stage + 1 < last_stage {
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(pipeline);
+                encoder.set_buffer(0, Some(values), 0);
+                encoder.set_buffer(
+                    1,
+                    Some(roots),
+                    (roots_offsets[stage as usize] * size_of::<u64>()) as NSUInteger,
+                );
+                encoder.set_buffer(
+                    2,
+                    Some(roots),
+                    (roots_offsets[stage as usize + 1] * size_of::<u64>()) as NSUInteger,
+                );
+                set_u32(encoder, 3, n_u32);
+                set_u32(encoder, 4, stage);
+                set_u32(
+                    encoder,
+                    5,
+                    u32::from(canonicalize_final && stage + 2 == last_stage),
+                );
+                dispatch2d(encoder, pipeline, n / 4, cols);
+                encoder.end_encoding();
+                stage += 2;
+            }
+        }
+
+        while stage < last_stage {
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
+            encoder.set_buffer(0, Some(values), 0);
+            encoder.set_buffer(
+                1,
+                Some(roots),
+                (roots_offsets[stage as usize] * size_of::<u64>()) as NSUInteger,
+            );
+            set_u32(encoder, 2, n_u32);
+            set_u32(encoder, 3, stage);
+            set_u32(
+                encoder,
+                4,
+                u32::from(canonicalize_final && stage + 1 == last_stage),
+            );
+            dispatch2d(encoder, &self.ntt_stage_pipeline, n / 2, cols);
+            encoder.end_encoding();
+            stage += 1;
+        }
     }
 
     fn allocate_columns<F: RichField>(
@@ -3034,21 +3133,17 @@ impl MetalShared {
                 dispatch2d(gather, &self.ntt_prepare_pipeline, degree, cols);
                 gather.end_encoding();
 
-                for stage in 0..log_degree_u32 {
-                    let stage_encoder = command_buffer.new_compute_command_encoder();
-                    stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
-                    stage_encoder.set_buffer(0, Some(&column_buffer), 0);
-                    stage_encoder.set_buffer(
-                        1,
-                        Some(&roots_buffer),
-                        (roots_offsets[stage as usize] * size_of::<u64>()) as NSUInteger,
-                    );
-                    set_u32(stage_encoder, 2, degree_u32);
-                    set_u32(stage_encoder, 3, stage);
-                    set_u32(stage_encoder, 4, 0);
-                    dispatch2d(stage_encoder, &self.ntt_stage_pipeline, degree / 2, cols);
-                    stage_encoder.end_encoding();
-                }
+                self.encode_ntt_stages(
+                    command_buffer,
+                    &column_buffer,
+                    &roots_buffer,
+                    &roots_offsets,
+                    degree,
+                    cols,
+                    0,
+                    log_degree_u32,
+                    false,
+                );
 
                 let finalize = command_buffer.new_compute_command_encoder();
                 finalize.set_compute_pipeline_state(&self.ifft_finalize_pipeline);
@@ -3076,21 +3171,17 @@ impl MetalShared {
                 dispatch2d(prepare, &self.ntt_prepare_pipeline, lde_size, cols);
                 prepare.end_encoding();
 
-                for stage in rate_bits as u32..log_lde {
-                    let stage_encoder = command_buffer.new_compute_command_encoder();
-                    stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
-                    stage_encoder.set_buffer(0, Some(&column_buffer), 0);
-                    stage_encoder.set_buffer(
-                        1,
-                        Some(&roots_buffer),
-                        (roots_offsets[stage as usize] * size_of::<u64>()) as NSUInteger,
-                    );
-                    set_u32(stage_encoder, 2, lde_size_u32);
-                    set_u32(stage_encoder, 3, stage);
-                    set_u32(stage_encoder, 4, u32::from(stage == log_lde - 1));
-                    dispatch2d(stage_encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
-                    stage_encoder.end_encoding();
-                }
+                self.encode_ntt_stages(
+                    command_buffer,
+                    &column_buffer,
+                    &roots_buffer,
+                    &roots_offsets,
+                    lde_size,
+                    cols,
+                    rate_bits_u32,
+                    log_lde,
+                    true,
+                );
 
                 let leaf_encoder = command_buffer.new_compute_command_encoder();
                 leaf_encoder.set_compute_pipeline_state(&self.leaf_colmajor_pipeline);
@@ -3336,25 +3427,17 @@ impl MetalShared {
             dispatch2d(prepare, &self.ntt_prepare_pipeline, lde_size, cols);
             prepare.end_encoding();
 
-            for stage in rate_bits as u32..log_lde {
-                let stage_encoder = command_buffer.new_compute_command_encoder();
-                stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
-                stage_encoder.set_buffer(0, Some(column_buffer), 0);
-                stage_encoder.set_buffer(
-                    1,
-                    Some(roots_buffer),
-                    (roots_offsets[stage as usize] * size_of::<u64>()) as NSUInteger,
-                );
-                set_u32(stage_encoder, 2, lde_size_u32);
-                set_u32(stage_encoder, 3, stage);
-                set_u32(
-                    stage_encoder,
-                    4,
-                    u32::from(stage == log_lde - 1),
-                );
-                dispatch2d(stage_encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
-                stage_encoder.end_encoding();
-            }
+            self.encode_ntt_stages(
+                command_buffer,
+                column_buffer,
+                roots_buffer,
+                roots_offsets,
+                lde_size,
+                cols,
+                rate_bits_u32,
+                log_lde,
+                true,
+            );
 
             let leaf_encoder = command_buffer.new_compute_command_encoder();
             leaf_encoder.set_compute_pipeline_state(&self.leaf_colmajor_pipeline);
