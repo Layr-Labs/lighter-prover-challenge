@@ -27,20 +27,34 @@ use plonky2::fri::oracle::PolynomialBatch;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// jemalloc runs with its default decay periods (dirty 10 s): freed pages stay
-// mapped long enough for the next identically-shaped allocation to reuse them.
+// Return freed pages to the OS as soon as they are unused instead of retaining
+// them for the process lifetime.
 //
-// A previous revision exported `_rjem_malloc_conf = "dirty_decay_ms:0,
-// muzzy_decay_ms:0"` on the stated premise that five scored workers run
-// concurrently and contend for residency. The harness runs them strictly
-// sequentially (`run_private_sequence` awaits each worker's exit before
-// spawning the next), so exactly one worker owns the machine at a time and
-// residency pressure from a sibling worker does not exist. What decay:0 does
-// cost is kernel work on the proving path: the transaction/chain pipeline
-// allocates and frees the same multi-hundred-megabyte witness/coefficient
-// shapes 50+ times per worker, and with decay disabled every one of those
-// cycles madvises the pages away and then re-faults them zeroed on the next
-// step. Allocator page retention changes no computed value.
+// The benchmark runs five of these workers concurrently and the score is the
+// sum of their lifetimes, so every resident page one worker holds is a page the
+// other four contend for. With decay disabled the allocator never madvises a
+// freed extent away, so this process's resident set is the *high-water mark* of
+// its heap rather than its live set: the transaction/chain pipeline allocates
+// and frees the same shapes of multi-hundred-megabyte witness, coefficient and
+// digest buffers 50+ times, and the retained slack accumulates monotonically.
+// Setting both decay periods to zero makes residency track the live set.
+//
+// This changes no computed value: `malloc_conf` only tunes when the allocator
+// hands unused pages back to the kernel. Every allocation still returns
+// correctly sized, correctly aligned storage, and no arithmetic, ordering or
+// buffer content depends on the option.
+//
+// ABI note: jemalloc reads `const char *malloc_conf` (prefixed `_rjem_` in
+// tikv-jemalloc-sys), i.e. a pointer-sized slot holding the address of a
+// NUL-terminated string. `&[u8; 34]` is a thin pointer to the NUL-terminated
+// bytes, which matches that ABI exactly. Exporting the bare byte array itself
+// (no indirection) or omitting the trailing NUL would make jemalloc read the
+// string bytes as a pointer and crash. This is a default: the environment and
+// /etc/malloc.conf can still override it.
+#[cfg(not(target_env = "msvc"))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF: &[u8; 34] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
+
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
@@ -252,4 +266,4 @@ fn main() {
     unsafe { _exit(0) }
 }
 
-// p90-fire-b7-1786376354
+// p90-fire-1604-1786407045
