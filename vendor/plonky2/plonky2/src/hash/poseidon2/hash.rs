@@ -489,20 +489,22 @@ impl Poseidon2 for F {
         // AArch64 NEON has no native widening 64x64 multiply. The packed
         // Goldilocks path therefore expands each four-lane product, while the
         // scalar backend lowers each fixed product directly to `mul`/`umulh`.
-        // Keep the exact historical multiply-then-add order in every lane.
+        // Fold the shared sum into that product before reduction: Goldilocks'
+        // AArch64 `multiply_accumulate` removes the intermediate product
+        // reduction and the following standalone modular addition.
         let sum = sum_12(state);
-        state[0] = sum + state[0] * F(0xc3b6c08e23ba9300);
-        state[1] = sum + state[1] * F(0xd84b5de94a324fb6);
-        state[2] = sum + state[2] * F(0x0d0c371c5b35b84f);
-        state[3] = sum + state[3] * F(0x7964f570e7188037);
-        state[4] = sum + state[4] * F(0x5daf18bbd996604b);
-        state[5] = sum + state[5] * F(0x6743bc47b9595257);
-        state[6] = sum + state[6] * F(0x5528b9362c59bb70);
-        state[7] = sum + state[7] * F(0xac45e25b7127b68b);
-        state[8] = sum + state[8] * F(0xa2077d7dfbb606b5);
-        state[9] = sum + state[9] * F(0xf3faac6faee378ae);
-        state[10] = sum + state[10] * F(0x0c6388b51545e883);
-        state[11] = sum + state[11] * F(0xd27dbb6944917b60);
+        state[0] = sum.multiply_accumulate(state[0], F(0xc3b6c08e23ba9300));
+        state[1] = sum.multiply_accumulate(state[1], F(0xd84b5de94a324fb6));
+        state[2] = sum.multiply_accumulate(state[2], F(0x0d0c371c5b35b84f));
+        state[3] = sum.multiply_accumulate(state[3], F(0x7964f570e7188037));
+        state[4] = sum.multiply_accumulate(state[4], F(0x5daf18bbd996604b));
+        state[5] = sum.multiply_accumulate(state[5], F(0x6743bc47b9595257));
+        state[6] = sum.multiply_accumulate(state[6], F(0x5528b9362c59bb70));
+        state[7] = sum.multiply_accumulate(state[7], F(0xac45e25b7127b68b));
+        state[8] = sum.multiply_accumulate(state[8], F(0xa2077d7dfbb606b5));
+        state[9] = sum.multiply_accumulate(state[9], F(0xf3faac6faee378ae));
+        state[10] = sum.multiply_accumulate(state[10], F(0x0c6388b51545e883));
+        state[11] = sum.multiply_accumulate(state[11], F(0xd27dbb6944917b60));
     }
 
     /// Grouped x2 internal layer: sum both states first, then interleave the
@@ -513,30 +515,30 @@ impl Poseidon2 for F {
     fn internal_linear_layer_x2(a: &mut [Self; WIDTH], b: &mut [Self; WIDTH]) {
         let sum_a = sum_12(a);
         let sum_b = sum_12(b);
-        a[0] = sum_a + a[0] * F(0xc3b6c08e23ba9300);
-        b[0] = sum_b + b[0] * F(0xc3b6c08e23ba9300);
-        a[1] = sum_a + a[1] * F(0xd84b5de94a324fb6);
-        b[1] = sum_b + b[1] * F(0xd84b5de94a324fb6);
-        a[2] = sum_a + a[2] * F(0x0d0c371c5b35b84f);
-        b[2] = sum_b + b[2] * F(0x0d0c371c5b35b84f);
-        a[3] = sum_a + a[3] * F(0x7964f570e7188037);
-        b[3] = sum_b + b[3] * F(0x7964f570e7188037);
-        a[4] = sum_a + a[4] * F(0x5daf18bbd996604b);
-        b[4] = sum_b + b[4] * F(0x5daf18bbd996604b);
-        a[5] = sum_a + a[5] * F(0x6743bc47b9595257);
-        b[5] = sum_b + b[5] * F(0x6743bc47b9595257);
-        a[6] = sum_a + a[6] * F(0x5528b9362c59bb70);
-        b[6] = sum_b + b[6] * F(0x5528b9362c59bb70);
-        a[7] = sum_a + a[7] * F(0xac45e25b7127b68b);
-        b[7] = sum_b + b[7] * F(0xac45e25b7127b68b);
-        a[8] = sum_a + a[8] * F(0xa2077d7dfbb606b5);
-        b[8] = sum_b + b[8] * F(0xa2077d7dfbb606b5);
-        a[9] = sum_a + a[9] * F(0xf3faac6faee378ae);
-        b[9] = sum_b + b[9] * F(0xf3faac6faee378ae);
-        a[10] = sum_a + a[10] * F(0x0c6388b51545e883);
-        b[10] = sum_b + b[10] * F(0x0c6388b51545e883);
-        a[11] = sum_a + a[11] * F(0xd27dbb6944917b60);
-        b[11] = sum_b + b[11] * F(0xd27dbb6944917b60);
+        a[0] = sum_a.multiply_accumulate(a[0], F(0xc3b6c08e23ba9300));
+        b[0] = sum_b.multiply_accumulate(b[0], F(0xc3b6c08e23ba9300));
+        a[1] = sum_a.multiply_accumulate(a[1], F(0xd84b5de94a324fb6));
+        b[1] = sum_b.multiply_accumulate(b[1], F(0xd84b5de94a324fb6));
+        a[2] = sum_a.multiply_accumulate(a[2], F(0x0d0c371c5b35b84f));
+        b[2] = sum_b.multiply_accumulate(b[2], F(0x0d0c371c5b35b84f));
+        a[3] = sum_a.multiply_accumulate(a[3], F(0x7964f570e7188037));
+        b[3] = sum_b.multiply_accumulate(b[3], F(0x7964f570e7188037));
+        a[4] = sum_a.multiply_accumulate(a[4], F(0x5daf18bbd996604b));
+        b[4] = sum_b.multiply_accumulate(b[4], F(0x5daf18bbd996604b));
+        a[5] = sum_a.multiply_accumulate(a[5], F(0x6743bc47b9595257));
+        b[5] = sum_b.multiply_accumulate(b[5], F(0x6743bc47b9595257));
+        a[6] = sum_a.multiply_accumulate(a[6], F(0x5528b9362c59bb70));
+        b[6] = sum_b.multiply_accumulate(b[6], F(0x5528b9362c59bb70));
+        a[7] = sum_a.multiply_accumulate(a[7], F(0xac45e25b7127b68b));
+        b[7] = sum_b.multiply_accumulate(b[7], F(0xac45e25b7127b68b));
+        a[8] = sum_a.multiply_accumulate(a[8], F(0xa2077d7dfbb606b5));
+        b[8] = sum_b.multiply_accumulate(b[8], F(0xa2077d7dfbb606b5));
+        a[9] = sum_a.multiply_accumulate(a[9], F(0xf3faac6faee378ae));
+        b[9] = sum_b.multiply_accumulate(b[9], F(0xf3faac6faee378ae));
+        a[10] = sum_a.multiply_accumulate(a[10], F(0x0c6388b51545e883));
+        b[10] = sum_b.multiply_accumulate(b[10], F(0x0c6388b51545e883));
+        a[11] = sum_a.multiply_accumulate(a[11], F(0xd27dbb6944917b60));
+        b[11] = sum_b.multiply_accumulate(b[11], F(0xd27dbb6944917b60));
     }
 
     /// Grouped x4 internal layer: four independent sums first, then interleaved
@@ -553,54 +555,54 @@ impl Poseidon2 for F {
         let sum_b = sum_12(b);
         let sum_c = sum_12(c);
         let sum_d = sum_12(d);
-        a[0] = sum_a + a[0] * F(0xc3b6c08e23ba9300);
-        b[0] = sum_b + b[0] * F(0xc3b6c08e23ba9300);
-        c[0] = sum_c + c[0] * F(0xc3b6c08e23ba9300);
-        d[0] = sum_d + d[0] * F(0xc3b6c08e23ba9300);
-        a[1] = sum_a + a[1] * F(0xd84b5de94a324fb6);
-        b[1] = sum_b + b[1] * F(0xd84b5de94a324fb6);
-        c[1] = sum_c + c[1] * F(0xd84b5de94a324fb6);
-        d[1] = sum_d + d[1] * F(0xd84b5de94a324fb6);
-        a[2] = sum_a + a[2] * F(0x0d0c371c5b35b84f);
-        b[2] = sum_b + b[2] * F(0x0d0c371c5b35b84f);
-        c[2] = sum_c + c[2] * F(0x0d0c371c5b35b84f);
-        d[2] = sum_d + d[2] * F(0x0d0c371c5b35b84f);
-        a[3] = sum_a + a[3] * F(0x7964f570e7188037);
-        b[3] = sum_b + b[3] * F(0x7964f570e7188037);
-        c[3] = sum_c + c[3] * F(0x7964f570e7188037);
-        d[3] = sum_d + d[3] * F(0x7964f570e7188037);
-        a[4] = sum_a + a[4] * F(0x5daf18bbd996604b);
-        b[4] = sum_b + b[4] * F(0x5daf18bbd996604b);
-        c[4] = sum_c + c[4] * F(0x5daf18bbd996604b);
-        d[4] = sum_d + d[4] * F(0x5daf18bbd996604b);
-        a[5] = sum_a + a[5] * F(0x6743bc47b9595257);
-        b[5] = sum_b + b[5] * F(0x6743bc47b9595257);
-        c[5] = sum_c + c[5] * F(0x6743bc47b9595257);
-        d[5] = sum_d + d[5] * F(0x6743bc47b9595257);
-        a[6] = sum_a + a[6] * F(0x5528b9362c59bb70);
-        b[6] = sum_b + b[6] * F(0x5528b9362c59bb70);
-        c[6] = sum_c + c[6] * F(0x5528b9362c59bb70);
-        d[6] = sum_d + d[6] * F(0x5528b9362c59bb70);
-        a[7] = sum_a + a[7] * F(0xac45e25b7127b68b);
-        b[7] = sum_b + b[7] * F(0xac45e25b7127b68b);
-        c[7] = sum_c + c[7] * F(0xac45e25b7127b68b);
-        d[7] = sum_d + d[7] * F(0xac45e25b7127b68b);
-        a[8] = sum_a + a[8] * F(0xa2077d7dfbb606b5);
-        b[8] = sum_b + b[8] * F(0xa2077d7dfbb606b5);
-        c[8] = sum_c + c[8] * F(0xa2077d7dfbb606b5);
-        d[8] = sum_d + d[8] * F(0xa2077d7dfbb606b5);
-        a[9] = sum_a + a[9] * F(0xf3faac6faee378ae);
-        b[9] = sum_b + b[9] * F(0xf3faac6faee378ae);
-        c[9] = sum_c + c[9] * F(0xf3faac6faee378ae);
-        d[9] = sum_d + d[9] * F(0xf3faac6faee378ae);
-        a[10] = sum_a + a[10] * F(0x0c6388b51545e883);
-        b[10] = sum_b + b[10] * F(0x0c6388b51545e883);
-        c[10] = sum_c + c[10] * F(0x0c6388b51545e883);
-        d[10] = sum_d + d[10] * F(0x0c6388b51545e883);
-        a[11] = sum_a + a[11] * F(0xd27dbb6944917b60);
-        b[11] = sum_b + b[11] * F(0xd27dbb6944917b60);
-        c[11] = sum_c + c[11] * F(0xd27dbb6944917b60);
-        d[11] = sum_d + d[11] * F(0xd27dbb6944917b60);
+        a[0] = sum_a.multiply_accumulate(a[0], F(0xc3b6c08e23ba9300));
+        b[0] = sum_b.multiply_accumulate(b[0], F(0xc3b6c08e23ba9300));
+        c[0] = sum_c.multiply_accumulate(c[0], F(0xc3b6c08e23ba9300));
+        d[0] = sum_d.multiply_accumulate(d[0], F(0xc3b6c08e23ba9300));
+        a[1] = sum_a.multiply_accumulate(a[1], F(0xd84b5de94a324fb6));
+        b[1] = sum_b.multiply_accumulate(b[1], F(0xd84b5de94a324fb6));
+        c[1] = sum_c.multiply_accumulate(c[1], F(0xd84b5de94a324fb6));
+        d[1] = sum_d.multiply_accumulate(d[1], F(0xd84b5de94a324fb6));
+        a[2] = sum_a.multiply_accumulate(a[2], F(0x0d0c371c5b35b84f));
+        b[2] = sum_b.multiply_accumulate(b[2], F(0x0d0c371c5b35b84f));
+        c[2] = sum_c.multiply_accumulate(c[2], F(0x0d0c371c5b35b84f));
+        d[2] = sum_d.multiply_accumulate(d[2], F(0x0d0c371c5b35b84f));
+        a[3] = sum_a.multiply_accumulate(a[3], F(0x7964f570e7188037));
+        b[3] = sum_b.multiply_accumulate(b[3], F(0x7964f570e7188037));
+        c[3] = sum_c.multiply_accumulate(c[3], F(0x7964f570e7188037));
+        d[3] = sum_d.multiply_accumulate(d[3], F(0x7964f570e7188037));
+        a[4] = sum_a.multiply_accumulate(a[4], F(0x5daf18bbd996604b));
+        b[4] = sum_b.multiply_accumulate(b[4], F(0x5daf18bbd996604b));
+        c[4] = sum_c.multiply_accumulate(c[4], F(0x5daf18bbd996604b));
+        d[4] = sum_d.multiply_accumulate(d[4], F(0x5daf18bbd996604b));
+        a[5] = sum_a.multiply_accumulate(a[5], F(0x6743bc47b9595257));
+        b[5] = sum_b.multiply_accumulate(b[5], F(0x6743bc47b9595257));
+        c[5] = sum_c.multiply_accumulate(c[5], F(0x6743bc47b9595257));
+        d[5] = sum_d.multiply_accumulate(d[5], F(0x6743bc47b9595257));
+        a[6] = sum_a.multiply_accumulate(a[6], F(0x5528b9362c59bb70));
+        b[6] = sum_b.multiply_accumulate(b[6], F(0x5528b9362c59bb70));
+        c[6] = sum_c.multiply_accumulate(c[6], F(0x5528b9362c59bb70));
+        d[6] = sum_d.multiply_accumulate(d[6], F(0x5528b9362c59bb70));
+        a[7] = sum_a.multiply_accumulate(a[7], F(0xac45e25b7127b68b));
+        b[7] = sum_b.multiply_accumulate(b[7], F(0xac45e25b7127b68b));
+        c[7] = sum_c.multiply_accumulate(c[7], F(0xac45e25b7127b68b));
+        d[7] = sum_d.multiply_accumulate(d[7], F(0xac45e25b7127b68b));
+        a[8] = sum_a.multiply_accumulate(a[8], F(0xa2077d7dfbb606b5));
+        b[8] = sum_b.multiply_accumulate(b[8], F(0xa2077d7dfbb606b5));
+        c[8] = sum_c.multiply_accumulate(c[8], F(0xa2077d7dfbb606b5));
+        d[8] = sum_d.multiply_accumulate(d[8], F(0xa2077d7dfbb606b5));
+        a[9] = sum_a.multiply_accumulate(a[9], F(0xf3faac6faee378ae));
+        b[9] = sum_b.multiply_accumulate(b[9], F(0xf3faac6faee378ae));
+        c[9] = sum_c.multiply_accumulate(c[9], F(0xf3faac6faee378ae));
+        d[9] = sum_d.multiply_accumulate(d[9], F(0xf3faac6faee378ae));
+        a[10] = sum_a.multiply_accumulate(a[10], F(0x0c6388b51545e883));
+        b[10] = sum_b.multiply_accumulate(b[10], F(0x0c6388b51545e883));
+        c[10] = sum_c.multiply_accumulate(c[10], F(0x0c6388b51545e883));
+        d[10] = sum_d.multiply_accumulate(d[10], F(0x0c6388b51545e883));
+        a[11] = sum_a.multiply_accumulate(a[11], F(0xd27dbb6944917b60));
+        b[11] = sum_b.multiply_accumulate(b[11], F(0xd27dbb6944917b60));
+        c[11] = sum_c.multiply_accumulate(c[11], F(0xd27dbb6944917b60));
+        d[11] = sum_d.multiply_accumulate(d[11], F(0xd27dbb6944917b60));
     }
 
     #[inline]
