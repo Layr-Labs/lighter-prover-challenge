@@ -50,7 +50,34 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
     }
 }
 
-const LIGHT_TX_PROOF_WINDOW: usize = 4;
+// Light-proof throughput is the run's terminal constraint (the chain drains
+// concurrently and finishes within a step of the last tx proof; the block
+// waits for both), so the window depth divides the longest phase directly.
+// The depth-4 ceiling dated from tighter-memory hosts: measured peak RSS is
+// ~6.8 GB at depth 4 against 24 GB local / 48 GB ranked, and mid-run CPU
+// occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
+// machine has headroom for deeper overlap. LIGHTER_LIGHT_WINDOW overrides
+// for experiments.
+const LIGHT_TX_PROOF_WINDOW: usize = 6;
+
+/// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
+/// experiments; read once. Depth is deliberately NOT scaled up on
+/// bigger-memory hosts: the depth-8 regression reproduces at ~9.5 GiB peak
+/// RSS on a 24 GiB machine — the collapse is allocator/fault churn from more
+/// concurrent proof allocations, not memory capacity, and a 48 GiB host runs
+/// the same allocator. Measured: depth 6 beats 4 by ~4.6% on a quiet
+/// machine; under heavy external load the ordering inverts, so depth tuning
+/// beyond 6 needs quiet-host evidence first.
+fn light_tx_proof_window() -> usize {
+    static WINDOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        std::env::var("LIGHTER_LIGHT_WINDOW")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|w| (1..=12).contains(w))
+            .unwrap_or(LIGHT_TX_PROOF_WINDOW)
+    })
+}
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
@@ -124,6 +151,44 @@ fn mark_spine_thread_latency_critical() {
 #[cfg(not(target_os = "macos"))]
 fn mark_spine_thread_latency_critical() {}
 
+/// Marks the calling thread `QOS_CLASS_USER_INITIATED` (0x19). Used for the
+/// transaction-proof threads: they hold the single GPU buffer set across
+/// submit/wait/readback, so a default-QoS holder woken by the condvar can be
+/// preempted while every other tree build queues behind it — a classic
+/// priority inversion at the pipeline's one serialized station. Best-effort.
+#[cfg(target_os = "macos")]
+fn mark_thread_user_initiated() {
+    #[allow(non_camel_case_types)]
+    type qos_class_t = u32;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
+    }
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(0x19, 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mark_thread_user_initiated() {}
+
+/// Marks the calling thread `QOS_CLASS_UTILITY` (0x11) so background page
+/// walks prefer E-cores instead of competing with the light pipeline's
+/// P-core work. Best-effort.
+#[cfg(target_os = "macos")]
+fn mark_thread_utility() {
+    #[allow(non_camel_case_types)]
+    type qos_class_t = u32;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
+    }
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(0x11, 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mark_thread_utility() {}
+
 enum ChainState<'scope> {
     Ready(Proof),
     InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
@@ -193,6 +258,9 @@ fn chain_step_proof(
         })?;
         BlockTxChainCircuit::prove_prepared(pending, chain_data)
     })();
+    // This step is no longer part of the runnable backlog (see the matching
+    // spine_backlog_add(1) at both spawn sites).
+    plonky2::hash::poseidon2::spine_backlog_add(-1);
     result.unwrap_or_else(|error| {
         panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")
     })
@@ -402,6 +470,11 @@ fn prove_path(
                 // The predecessor handle moves into the chain thread, which waits for it only
                 // after its tx-proof-side witness generation: the path thread never blocks here.
                 let previous = chain.take();
+                // This step is now runnable (its tx proof exists); while the
+                // count of runnable-but-unproven steps is high, the chain is
+                // the laggard and its GPU trees take priority (see
+                // spine_backlog_add). Decremented inside chain_step_proof.
+                plonky2::hash::poseidon2::spine_backlog_add(1);
                 let handle = std::thread::Builder::new()
                     .name(format!("{path:?}-chain-step-{chain_step}"))
                     .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -426,6 +499,9 @@ fn prove_path(
                 .name(format!("{path:?}-tx-proof-{current_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
+                    // These threads hold the single GPU buffer set across
+                    // submit/wait/readback; see mark_thread_user_initiated.
+                    mark_thread_user_initiated();
                     prove_tx_witness(path, current_chunk_index, tx_data, witness)
                 })
                 .expect("transaction proof pipeline thread must start");
@@ -454,7 +530,7 @@ fn prove_path(
             );
             let max_in_flight =
                 if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
-                    LIGHT_TX_PROOF_WINDOW
+                    light_tx_proof_window()
                 } else {
                     1
                 };
@@ -506,40 +582,60 @@ fn prove_path(
         // pre-execution and final block phases — but only once this path is the
         // last one proving, since the switch is process-global (see
         // [`claims_exclusive_gpu_phase`]).
-        let exclusive_drain = claims_exclusive_gpu_phase(active_paths);
+        let mut exclusive_drain = false;
         #[cfg(feature = "diagnostic_profile")]
-        {
-            plonky2::util::profile::counter(
-                "scheduler",
-                "drain_tx_in_flight",
-                in_flight.len() as u64,
-            );
-            plonky2::util::profile::counter(
-                "scheduler",
-                "exclusive_drain_claimed",
-                exclusive_drain as u64,
-            );
-        }
-        if exclusive_drain {
-            plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-        }
+        plonky2::util::profile::counter(
+            "scheduler",
+            "drain_tx_in_flight",
+            in_flight.len() as u64,
+        );
         while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
-            #[cfg(feature = "diagnostic_profile")]
-            let _join_wait = plonky2::util::profile::span("wait", "tx_proof_drain_join");
-            let tx_proof = proof_handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            // Claim the exclusive phase only once the window has actually
+            // flushed: at drain entry, `in_flight` still holds up to a full
+            // window of chunk proofs whose trees the exclusive routing (lower
+            // GPU cutoff, occupancy bypass) would otherwise queue against —
+            // the flag's contract is "no other proof runs concurrently", and
+            // that becomes true at the last window entry, not at drain entry.
+            // Also covers the sibling path retiring mid-drain (relaxed read).
+            if !exclusive_drain
+                && in_flight.is_empty()
+                && claims_exclusive_gpu_phase(active_paths)
+            {
+                exclusive_drain = true;
+                plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
+            }
+            let tx_proof = {
+                #[cfg(feature = "diagnostic_profile")]
+                let _join_wait = plonky2::util::profile::span("wait", "tx_proof_drain_join");
+                proof_handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            };
+            // Spawn the drained step exactly like the pipelined phase so its
+            // phase-1 witness (which needs only the tx proof) overlaps the
+            // predecessor's prove instead of serializing behind it. Only one
+            // proof's GPU work is in flight at a time either way — phase 1 is
+            // pure CPU generator execution — so the exclusive-drain contract
+            // above is unchanged.
             let previous = chain.take();
-            chain = Some(ChainState::Ready(chain_step_proof(
-                path,
-                chain_target,
-                chain_data,
-                chain_step,
-                previous,
-                base,
-                dummy_proof,
-                &tx_proof,
-            )));
+            plonky2::hash::poseidon2::spine_backlog_add(1);
+            let handle = std::thread::Builder::new()
+                .name(format!("{path:?}-chain-drain-{chain_step}"))
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    chain_step_proof(
+                        path,
+                        chain_target,
+                        chain_data,
+                        chain_step,
+                        previous,
+                        base,
+                        dummy_proof,
+                        &tx_proof,
+                    )
+                })
+                .expect("chain drain thread must start");
+            chain = Some(ChainState::InFlight(handle));
         }
         let chain_proof = chain
             .map(ChainState::wait)
@@ -553,6 +649,28 @@ fn prove_path(
     // so every thread it spawned has joined — is what lets the sibling path's
     // drain observe that it is alone and claim the exclusive GPU phase.
     active_paths.fetch_sub(1, Ordering::Release);
+    if path == TxPath::Heavy {
+        // The heavy path retires far ahead of the light path; use the slack
+        // to pre-fault the final block's wires column store (larger than the
+        // Metal pool cap, so otherwise freshly zero-faulted ~2 GiB inside the
+        // run's most serial window). Detached: only populates a stash the
+        // block's allocation consults; a size miss falls through unchanged.
+        std::thread::Builder::new()
+            .name("block-store-prewarm".to_owned())
+            .spawn(|| {
+                // Page-walking ~2 GiB at default QoS competes with the light
+                // pipeline for P-cores; utility class prefers the E-cores,
+                // whose memory-bound fault service is nearly as fast.
+                mark_thread_utility();
+                // Final block: 2^18 rows << 3 rate bits = 2^21 LDE rows, one
+                // u64 per wire column. Kept in sync with CIRCUIT_CONFIG's
+                // num_wires; a drift just misses the stash harmlessly.
+                const BLOCK_WIRES_STORE_BYTES: u64 =
+                    (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
+                plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
+            })
+            .ok();
+    }
     chain_proof
 }
 
