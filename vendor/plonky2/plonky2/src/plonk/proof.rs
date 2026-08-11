@@ -340,38 +340,9 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         let table = |z: F::Extension| -> Vec<F::Extension> { z.powers().take(degree).collect() };
         let zeta_pows = table(zeta);
         // `g` is the order-`degree` subgroup generator, so `g^i` is exactly
-        // the process-cached natural-order two-adic subgroup, and
-        // `(g·ζ)^i = g^i · ζ^i` in the exact field. Deriving the shifted
-        // table from the `ζ` table by one elementwise base-field scalar
-        // product deletes the second serial `powers()` chain (a
-        // `degree`-long dependent extension-multiply chain in this serial
-        // opening phase) per proof. Representative-exactness is checkable at
-        // runtime: `LIGHTER_GZETA_TABLE_ASSERT=1` recomputes the old chain
-        // and compares every entry by raw noncanonical limbs.
+        // the process-cached natural-order two-adic subgroup.
         let g_subgroup =
             crate::plonk::prover::precomputed::two_adic_subgroup::<F>(common_data.degree_bits());
-        let g_zeta_pows: Vec<F::Extension> = zeta_pows
-            .iter()
-            .zip(g_subgroup.iter())
-            .map(|(&zeta_pow, &g_pow)| zeta_pow.scalar_mul(g_pow))
-            .collect();
-        if std::env::var_os("LIGHTER_GZETA_TABLE_ASSERT").is_some() {
-            let reference = table(g * zeta);
-            assert_eq!(reference.len(), g_zeta_pows.len());
-            for (i, (a, b)) in reference.iter().zip(&g_zeta_pows).enumerate() {
-                let a_raw: Vec<u64> = a
-                    .to_basefield_array()
-                    .iter()
-                    .map(|c| c.to_noncanonical_u64())
-                    .collect();
-                let b_raw: Vec<u64> = b
-                    .to_basefield_array()
-                    .iter()
-                    .map(|c| c.to_noncanonical_u64())
-                    .collect();
-                assert_eq!(a_raw, b_raw, "g-zeta table representative mismatch at {i}");
-            }
-        }
         let eval_polynomials = |pows: &[F::Extension], polynomials: &[PolynomialCoeffs<F>]| {
             polynomials
                 .par_iter()
@@ -389,6 +360,56 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         let shifted_polynomials = &zs_partial_products_lookup_commitment.polynomials;
         let quotient_polys = eval_commitment(&zeta_pows, quotient_polys_commitment);
 
+        // A shifted extension table costs `D` base multiplications and one
+        // degree-sized extension write per index. With no lookup polynomials,
+        // production has only the two challenge-Z openings. Distribute `g^i`
+        // into each base coefficient inside those existing two outer tasks:
+        // the multiplication count does not increase when their count is at
+        // most `D`, while the shifted allocation, fill, and later reads vanish.
+        // Lookup circuits retain the shared table because many shifted
+        // polynomials amortize its construction.
+        let zs_range = common_data.zs_range();
+        let lookup_range = common_data.lookup_range();
+        let has_lookups = lookup_range.start < shifted_polynomials.len();
+        let (plonk_zs_next, lookup_zs_next) = if !has_lookups && zs_range.len() <= D {
+            let plonk_zs_next = shifted_polynomials[zs_range.clone()]
+                .par_iter()
+                .map(|p| F::extension_base_dot_product_scaled(&zeta_pows, &p.coeffs, &g_subgroup))
+                .collect();
+            (plonk_zs_next, Vec::new())
+        } else {
+            // `(g·ζ)^i = g^i · ζ^i` in the exact field. Deriving this
+            // table from `zeta_pows` retains the frontier's deletion of a
+            // second serial extension `powers()` chain. The opt-in check
+            // compares its raw representatives with that old chain.
+            let g_zeta_pows: Vec<F::Extension> = zeta_pows
+                .iter()
+                .zip(g_subgroup.iter())
+                .map(|(&zeta_pow, &g_pow)| zeta_pow.scalar_mul(g_pow))
+                .collect();
+            if std::env::var_os("LIGHTER_GZETA_TABLE_ASSERT").is_some() {
+                let reference = table(g * zeta);
+                assert_eq!(reference.len(), g_zeta_pows.len());
+                for (i, (a, b)) in reference.iter().zip(&g_zeta_pows).enumerate() {
+                    let a_raw: Vec<u64> = a
+                        .to_basefield_array()
+                        .iter()
+                        .map(|c| c.to_noncanonical_u64())
+                        .collect();
+                    let b_raw: Vec<u64> = b
+                        .to_basefield_array()
+                        .iter()
+                        .map(|c| c.to_noncanonical_u64())
+                        .collect();
+                    assert_eq!(a_raw, b_raw, "g-zeta table representative mismatch at {i}");
+                }
+            }
+            (
+                eval_polynomials(&g_zeta_pows, &shifted_polynomials[zs_range.clone()]),
+                eval_polynomials(&g_zeta_pows, &shifted_polynomials[lookup_range.clone()]),
+            )
+        };
+
         Self {
             constants: constants_sigmas_eval[common_data.constants_range()].to_vec(),
             plonk_sigmas: constants_sigmas_eval[common_data.sigmas_range()].to_vec(),
@@ -397,18 +418,12 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
             // Partial-product polynomials are opened only at `zeta`, never at
             // `g * zeta`; evaluate only the shifted Z polynomials consumed by
             // the FRI next batch.
-            plonk_zs_next: eval_polynomials(
-                &g_zeta_pows,
-                &shifted_polynomials[common_data.zs_range()],
-            ),
+            plonk_zs_next,
             partial_products: zs_partial_products_lookup_eval[common_data.partial_products_range()]
                 .to_vec(),
             quotient_polys,
             lookup_zs: zs_partial_products_lookup_eval[common_data.lookup_range()].to_vec(),
-            lookup_zs_next: eval_polynomials(
-                &g_zeta_pows,
-                &shifted_polynomials[common_data.lookup_range()],
-            ),
+            lookup_zs_next,
         }
     }
     pub(crate) fn to_fri_openings(&self) -> FriOpenings<F, D> {

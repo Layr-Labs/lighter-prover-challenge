@@ -99,6 +99,28 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    /// Compute an extension/base dot product with one additional base-field
+    /// scale per term: `sum_i extension_values[i] * base_scalars[i] * scales[i]`.
+    /// The default preserves ordinary field arithmetic and zipped-slice
+    /// semantics; concrete fields may fuse the two base factors into a
+    /// delayed-reduction accumulator.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_product_scaled(
+        extension_values: &[Self::Extension],
+        base_scalars: &[Self],
+        scales: &[Self],
+    ) -> Self::Extension {
+        extension_values
+            .iter()
+            .zip(base_scalars)
+            .zip(scales)
+            .map(|((&value, &scalar), &scale)| {
+                <Self::Extension as FieldExtension<D>>::scalar_mul(&value, scalar * scale)
+            })
+            .sum()
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.
