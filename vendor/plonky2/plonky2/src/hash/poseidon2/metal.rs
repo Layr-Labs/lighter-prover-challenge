@@ -1087,6 +1087,7 @@ impl LazyPipeline {
 
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
+static TILED_RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
 
@@ -1096,6 +1097,15 @@ fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
 
 fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     RANGE_CHECK_GATE_QUOTIENT_PIPELINE.get()
+}
+
+/// Nonblocking accessor for the separately compiled tiled kernel. The classic
+/// prebuilt pipeline remains the fallback until this background build lands.
+fn tiled_range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
+    TILED_RANGE_CHECK_GATE_QUOTIENT_PIPELINE
+        .built
+        .get()?
+        .as_ref()
 }
 
 fn permutation_quotient_pipeline() -> Option<&'static ComputePipelineState> {
@@ -1153,6 +1163,172 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             Err(_) => {
                 let _ = slot.built.set(None);
             }
+        }
+    }
+
+    spawn_tiled_range_check_pipeline(device);
+}
+
+const RANGE_TILE_ROWS: usize = 16;
+const RANGE_TILE_WIRES: usize = 136;
+
+/// Builds a second source string containing the unchanged Range/U32 kernel
+/// body with only its wire-LDE accessor redirected through a 16-row x
+/// 136-column threadgroup tile. Keeping the checked-in shader untouched means
+/// the promoted precompiled metallib remains valid for every existing kernel.
+fn tiled_range_check_shader_source() -> Option<String> {
+    let start = SHADER_SOURCE.find("kernel void range_check_gate_quotient(")?;
+    let end = SHADER_SOURCE[start..]
+        .find("kernel void poseidon2_hash_leaves(")?
+        + start;
+    let helper_start = SHADER_SOURCE[..start].rfind("inline ulong random_access_select_8(")?;
+    let mut helper = SHADER_SOURCE[helper_start..start].to_owned();
+    let mut kernel = SHADER_SOURCE[start..end].to_owned();
+
+    helper = helper.replacen(
+        "inline ulong random_access_select_8(",
+        "inline ulong random_access_select_8_tiled(",
+        1,
+    );
+    helper = helper.replacen(
+        "const device ulong* wires,",
+        "const threadgroup ulong* wires,",
+        1,
+    );
+
+    kernel = kernel.replacen(
+        "kernel void range_check_gate_quotient(",
+        "kernel void range_check_gate_quotient_tiled(",
+        1,
+    );
+    kernel = kernel.replacen(
+        "const device ulong* wires [[buffer(0)]],",
+        "const device ulong* wire_lde [[buffer(0)]],",
+        1,
+    );
+    kernel = kernel.replacen(
+        "constant uint& lde_rows [[buffer(5)]],",
+        "constant uint& global_lde_rows [[buffer(5)]],",
+        1,
+    );
+    kernel = kernel.replacen(
+        "uint gid [[thread_position_in_grid]]) {",
+        "uint gid [[thread_position_in_grid]],\n    uint lane [[thread_index_in_threadgroup]]) {",
+        1,
+    );
+    kernel = kernel.replace("random_access_select_8(", "random_access_select_8_tiled(");
+
+    let old_prelude = "    if (gid >= quotient_rows) {\n        return;\n    }\n\n    uint source_row = gid * step;";
+    let new_prelude = format!(
+        "    threadgroup ulong tiled_wires[{}u * {}u];\n\
+         \x20   bool active = gid < quotient_rows;\n\
+         \x20   uint global_source_row = active ? gid * step : 0u;\n\
+         \x20   for (uint column = 0; column < {}u; ++column) {{\n\
+         \x20       tiled_wires[(ulong)column * {}u + lane] = active\n\
+         \x20           ? wire_lde[(ulong)column * global_lde_rows + global_source_row]\n\
+         \x20           : 0u;\n\
+         \x20   }}\n\
+         \x20   threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \x20   if (!active) {{\n\
+         \x20       return;\n\
+         \x20   }}\n\n\
+         \x20   threadgroup ulong* wires = tiled_wires;\n\
+         \x20   uint lde_rows = {}u;\n\
+         \x20   uint source_row = lane;",
+        RANGE_TILE_WIRES,
+        RANGE_TILE_ROWS,
+        RANGE_TILE_WIRES,
+        RANGE_TILE_ROWS,
+        RANGE_TILE_ROWS,
+    );
+    if !kernel.contains(old_prelude) {
+        return None;
+    }
+    kernel = kernel.replacen(old_prelude, &new_prelude, 1);
+
+    // Redirect the repeated wire reads to the compact tile. Six constants
+    // reads must remain on the original global LDE; repair those exact
+    // expressions after the uniform stride substitution.
+    kernel = kernel.replace(
+        "* lde_rows + source_row",
+        &format!("* {}u + lane", RANGE_TILE_ROWS),
+    );
+    kernel = kernel.replace(
+        "constants[(ulong)selector_column * 16u + lane]",
+        "constants[(ulong)selector_column * global_lde_rows + global_source_row]",
+    );
+    kernel = kernel.replace(
+        "((ulong)constant_base + i) * 16u + lane",
+        "((ulong)constant_base + i) * global_lde_rows + global_source_row",
+    );
+    kernel = kernel.replace(
+        "constants[(ulong)constant_column * 16u + lane]",
+        "constants[(ulong)constant_column * global_lde_rows + global_source_row]",
+    );
+    kernel = kernel.replace(
+        "constants[(ulong)constant_base * 16u + lane]",
+        "constants[(ulong)constant_base * global_lde_rows + global_source_row]",
+    );
+    kernel = kernel.replace(
+        "constants[((ulong)constant_base + 1u) * 16u + lane]",
+        "constants[((ulong)constant_base + 1u) * global_lde_rows + global_source_row]",
+    );
+
+    // Fail closed if the promoted kernel's textual ABI or addressing shape
+    // changes: the classic pipeline will be used instead of compiling a
+    // partially transformed specialization.
+    if kernel.contains("wire_lde[") && !kernel.contains("wires[(") {
+        return None;
+    }
+    if kernel.contains("constants[")
+        && kernel.contains("constants[(ulong)selector_column * 16u + lane]")
+    {
+        return None;
+    }
+
+    let mut source =
+        String::with_capacity(SHADER_SOURCE.len() + helper.len() + kernel.len() + 3);
+    source.push_str(SHADER_SOURCE);
+    source.push('\n');
+    source.push_str(&helper);
+    source.push('\n');
+    source.push_str(&kernel);
+    Some(source)
+}
+
+/// Compile the tiled specialization off the context's blocking path. Source
+/// or pipeline failure settles the optional slot to `None`; callers continue
+/// with the promoted prebuilt Range/U32 kernel.
+fn spawn_tiled_range_check_pipeline(device: &Device) {
+    let device = device.clone();
+    let slot = &TILED_RANGE_CHECK_GATE_QUOTIENT_PIPELINE;
+    let spawned = std::thread::Builder::new()
+        .name("poseidon2-metal-range-tiled".to_owned())
+        .spawn(move || {
+            let pipeline = autoreleasepool(|| {
+                let source = tiled_range_check_shader_source()?;
+                let options = CompileOptions::new();
+                let library = device.new_library_with_source(&source, &options).ok()?;
+                let function = library
+                    .get_function("range_check_gate_quotient_tiled", None)
+                    .ok()?;
+                device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .ok()
+            });
+            if pipeline.is_none() {
+                log::debug!("tiled Range/U32 pipeline unavailable; using promoted kernel");
+            }
+            let _ = slot.built.set(pipeline);
+        });
+    match spawned {
+        Ok(handle) => {
+            if let Ok(mut builder) = slot.builder.lock() {
+                *builder = Some(handle);
+            }
+        }
+        Err(_) => {
+            let _ = slot.built.set(None);
         }
     }
 }
@@ -2659,8 +2835,21 @@ impl MetalShared {
         alpha_powers: &[u64],
         alpha_stride: usize,
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
-        let pipeline = range_check_gate_quotient_pipeline()
-            .ok_or("RangeCheck gate quotient pipeline unavailable")?;
+        // The tiled specialization is valid for the production 136-wire
+        // layout. Until its background source build completes (or for any
+        // other layout), retain the promoted prebuilt pipeline exactly.
+        let tiled_pipeline = (wires.cols == RANGE_TILE_WIRES)
+            .then(tiled_range_check_gate_quotient_pipeline)
+            .flatten();
+        let (pipeline, tiled) = if let Some(pipeline) = tiled_pipeline {
+            (pipeline, true)
+        } else {
+            (
+                range_check_gate_quotient_pipeline()
+                    .ok_or("RangeCheck gate quotient pipeline unavailable")?,
+                false,
+            )
+        };
         if metadata.len() != (range_count + u32_count) * 10
             || alpha_powers.len() != alpha_stride * 2
         {
@@ -2697,7 +2886,11 @@ impl MetalShared {
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            if tiled {
+                dispatch_with_width(encoder, quotient_rows, RANGE_TILE_ROWS);
+            } else {
+                dispatch(encoder, pipeline, quotient_rows);
+            }
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
@@ -3855,6 +4048,26 @@ fn dispatch(
         },
         MTLSize {
             width: group_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Dispatch with the exact threadgroup width required by a cooperative tile.
+fn dispatch_with_width(
+    encoder: &metal::ComputeCommandEncoderRef,
+    thread_count: usize,
+    group_width: usize,
+) {
+    encoder.dispatch_threads(
+        MTLSize {
+            width: thread_count as NSUInteger,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: group_width as NSUInteger,
             height: 1,
             depth: 1,
         },
