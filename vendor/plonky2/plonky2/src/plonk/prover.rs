@@ -1,8 +1,10 @@
 //! plonky2 prover implementation.
 
 #[cfg(not(feature = "std"))]
-use alloc::{format, vec, vec::Vec};
+use alloc::{format, sync::Arc, vec, vec::Vec};
 use core::cmp::min;
+#[cfg(feature = "std")]
+use std::sync::Arc;
 
 use anyhow::{ensure, Result};
 use hashbrown::HashMap;
@@ -26,6 +28,8 @@ use crate::iop::target::Target;
 use crate::iop::witness::{MatrixWitness, PartialWitness, PartitionWitness, Witness, WitnessWrite};
 use crate::plonk::circuit_builder::NUM_COINS_LOOKUP;
 use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
+#[cfg(feature = "std")]
+use crate::plonk::circuit_data::WireCommitmentSnapshot;
 use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::permutation_argument::fixed_routed_wire;
@@ -38,6 +42,101 @@ use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_ceil};
+
+#[cfg(feature = "std")]
+fn wire_matrices_raw_equal<F: RichField>(left: &[Vec<F>], right: &[Vec<F>]) -> bool {
+    left.len() == right.len()
+        && left.par_iter().zip(right.par_iter()).all(|(left, right)| {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(left, right)| {
+                    left.to_noncanonical_u64() == right.to_noncanonical_u64()
+                })
+        })
+}
+
+/// Build the wire commitment normally, or reuse the complete previous d16
+/// commitment when every raw witness limb is identical. A hit deletes the
+/// wire IFFTs, LDE FFTs, and Merkle build together; any mismatch follows the
+/// original path and publishes a matching immutable snapshot for later proofs.
+fn compute_wires_commitment<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+    witness: &mut MatrixWitness<F>,
+    timing: &mut TimingTree,
+) -> Arc<PolynomialBatch<F, C, D>>
+where
+    C::Hasher: Hasher<F>,
+{
+    let num_routed_wires = common_data.config.num_routed_wires;
+
+    #[cfg(feature = "std")]
+    let eligible = common_data.degree_bits() == 16
+        && !common_data.config.zero_knowledge
+        && witness.wire_values.len() == common_data.config.num_wires;
+
+    #[cfg(feature = "std")]
+    if eligible {
+        if let Some(prior) = prover_data.wire_commitment_cache.load() {
+            if wire_matrices_raw_equal(&witness.wire_values, &prior.values) {
+                witness.wire_values[num_routed_wires..]
+                    .iter_mut()
+                    .for_each(|column| drop(core::mem::take(column)));
+                #[cfg(feature = "diagnostic_profile")]
+                crate::util::profile::counter("cache", "wire_commitment_reused", 1);
+                return Arc::clone(&prior.commitment);
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    let cached_values = eligible.then(|| witness.wire_values.par_iter().cloned().collect());
+
+    let wires_coeffs: Vec<PolynomialCoeffs<F>> = timed!(
+        timing,
+        "compute wire polynomials (IFFT)",
+        witness
+            .wire_values
+            .par_iter_mut()
+            .enumerate()
+            .map(|(column_index, column)| {
+                if column_index < num_routed_wires {
+                    ifft_borrowed(column)
+                } else {
+                    PolynomialValues::new(core::mem::take(column)).ifft()
+                }
+            })
+            .collect()
+    );
+
+    let commitment = Arc::new(timed!(
+        timing,
+        "compute wires commitment",
+        PolynomialBatch::<F, C, D>::from_coeffs(
+            wires_coeffs,
+            common_data.config.fri_config.rate_bits,
+            common_data.config.zero_knowledge && PlonkOracle::WIRES.blinding,
+            common_data.config.fri_config.cap_height,
+            timing,
+            prover_data.fft_root_table.as_ref(),
+        )
+    ));
+
+    #[cfg(feature = "std")]
+    if let Some(values) = cached_values {
+        prover_data
+            .wire_commitment_cache
+            .store(WireCommitmentSnapshot {
+                values,
+                commitment: Arc::clone(&commitment),
+            });
+    }
+
+    commitment
+}
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -209,36 +308,8 @@ where
     // place; routed columns are IFFT'd from the borrowed witness column
     // (`ifft_borrowed` fuses the former clone with the FFT's initial
     // bit-reversal gather), so no witness column is copied.
-    let num_routed_wires = common_data.config.num_routed_wires;
-    let wires_coeffs: Vec<PolynomialCoeffs<F>> = timed!(
-        timing,
-        "compute wire polynomials (IFFT)",
-        witness
-            .wire_values
-            .par_iter_mut()
-            .enumerate()
-            .map(|(j, column)| {
-                if j < num_routed_wires {
-                    ifft_borrowed(column)
-                } else {
-                    PolynomialValues::new(core::mem::take(column)).ifft()
-                }
-            })
-            .collect()
-    );
-
-    let wires_commitment = timed!(
-        timing,
-        "compute wires commitment",
-        PolynomialBatch::<F, C, D>::from_coeffs(
-            wires_coeffs,
-            config.fri_config.rate_bits,
-            config.zero_knowledge && PlonkOracle::WIRES.blinding,
-            config.fri_config.cap_height,
-            timing,
-            prover_data.fft_root_table.as_ref(),
-        )
-    );
+    let wires_commitment =
+        compute_wires_commitment(prover_data, common_data, &mut witness, timing);
 
     let mut challenger = Challenger::<F, C::Hasher>::new();
 
@@ -504,7 +575,7 @@ where
     );
 
     let proof = Proof::<F, C, D> {
-        wires_cap: wires_commitment.merkle_tree.cap,
+        wires_cap: wires_commitment.merkle_tree.cap.clone(),
         plonk_zs_partial_products_cap: partial_products_zs_and_lookup_commitment.merkle_tree.cap,
         quotient_polys_cap: quotient_polys_commitment.merkle_tree.cap,
         openings,

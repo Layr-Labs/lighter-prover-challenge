@@ -593,6 +593,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         circuit_digest,
         lookup_rows,
         lut_to_lookups,
+        wire_commitment_cache: Default::default(),
     };
 
     Ok((

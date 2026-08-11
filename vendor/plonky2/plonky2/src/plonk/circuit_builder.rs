@@ -1479,6 +1479,8 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             constants_sigmas_quotient_cache,
             constants_sigmas_quotient_step,
             constants_sigmas_quotient_domain,
+            #[cfg(feature = "std")]
+            wire_commitment_cache: Default::default(),
         };
 
         let verifier_only = VerifierOnlyCircuitData::<C, D> {

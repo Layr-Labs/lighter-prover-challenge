@@ -17,6 +17,8 @@ use alloc::{collections::BTreeMap, vec, vec::Vec};
 use core::ops::{Range, RangeFrom};
 #[cfg(feature = "std")]
 use std::collections::BTreeMap;
+#[cfg(feature = "std")]
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use serde::Serialize;
@@ -561,6 +563,98 @@ impl GeneratorWatchIndex {
     }
 }
 
+/// Exact previous d16 wire matrix and its complete commitment. The snapshot is
+/// immutable, so proofs may read it concurrently after a short cache lookup.
+#[cfg(feature = "std")]
+pub(crate) struct WireCommitmentSnapshot<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> {
+    pub(crate) values: Vec<Vec<F>>,
+    pub(crate) commitment: Arc<PolynomialBatch<F, C, D>>,
+}
+
+/// Runtime-only exact wire-commitment cache. It contributes no serialized
+/// bytes and compares equal regardless of warmed state.
+#[cfg(feature = "std")]
+pub struct WireCommitmentCache<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> {
+    latest: Mutex<Option<Arc<WireCommitmentSnapshot<F, C, D>>>>,
+}
+
+#[cfg(feature = "std")]
+impl<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> Default for WireCommitmentCache<F, C, D>
+{
+    fn default() -> Self {
+        Self {
+            latest: Mutex::new(None),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> WireCommitmentCache<F, C, D>
+{
+    pub(crate) fn load(&self) -> Option<Arc<WireCommitmentSnapshot<F, C, D>>> {
+        self.latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn store(&self, snapshot: WireCommitmentSnapshot<F, C, D>) {
+        *self
+            .latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(snapshot));
+    }
+}
+
+#[cfg(feature = "std")]
+impl<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> core::fmt::Debug for WireCommitmentCache<F, C, D>
+{
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("WireCommitmentCache(..)")
+    }
+}
+
+#[cfg(feature = "std")]
+impl<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> PartialEq for WireCommitmentCache<F, C, D>
+{
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "std")]
+impl<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> Eq for WireCommitmentCache<F, C, D>
+{
+}
+
 /// Circuit data required by the prover, but not the verifier.
 #[derive(Eq, PartialEq, Debug)]
 pub struct ProverOnlyCircuitData<
@@ -629,6 +723,11 @@ pub struct ProverOnlyCircuitData<
     pub constants_sigmas_quotient_step: usize,
     /// Quotient domain size used to extract [`Self::constants_sigmas_quotient_cache`].
     pub constants_sigmas_quotient_domain: usize,
+    /// Previous exact wire matrix and complete commitment for non-ZK d16
+    /// proofs. Runtime-only and intentionally absent from serialization.
+    #[cfg(feature = "std")]
+    #[doc(hidden)]
+    pub wire_commitment_cache: WireCommitmentCache<F, C, D>,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>

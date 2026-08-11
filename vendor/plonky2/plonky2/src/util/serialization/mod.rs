@@ -966,6 +966,8 @@ pub trait Read {
             constants_sigmas_quotient_cache: None,
             constants_sigmas_quotient_step: 0,
             constants_sigmas_quotient_domain: 0,
+            #[cfg(feature = "std")]
+            wire_commitment_cache: Default::default(),
         })
     }
 
@@ -1934,6 +1936,8 @@ pub trait Write {
             constants_sigmas_quotient_cache: _,
             constants_sigmas_quotient_step: _,
             constants_sigmas_quotient_domain: _,
+            #[cfg(feature = "std")]
+            wire_commitment_cache: _,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
