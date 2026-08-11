@@ -1174,10 +1174,36 @@ pub fn prewarm() {
     std::thread::Builder::new()
         .name("poseidon2-metal-prewarm".to_owned())
         .spawn(|| {
+            mark_prewarm_thread_latency_critical();
             let _ = force_context();
         })
         .ok();
 }
+
+/// Best-effort macOS scheduling hint for the GPU prewarm thread.
+///
+/// The prewarm thread's shader compile and pipeline lowering is on the
+/// startup path of every scored worker, and the ranked host runs exactly one
+/// worker at a time, so there is no sibling-worker residency pressure to
+/// argue against a latency class. `QOS_CLASS_USER_INTERACTIVE` (0x21) asks
+/// the scheduler to keep this short-lived thread on a performance core ahead
+/// of default-QoS pool work. A nonzero return leaves the thread at its
+/// previous QoS, which is exactly the pre-change behavior. Non-macOS targets
+/// compile this to a no-op.
+#[cfg(target_os = "macos")]
+fn mark_prewarm_thread_latency_critical() {
+    #[allow(non_camel_case_types)]
+    type qos_class_t = u32;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
+    }
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(0x21, 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mark_prewarm_thread_latency_critical() {}
 
 /// True while the prover is inside an exclusive serial phase (pre-execution
 /// or final block proof) where no concurrent proof can contend for the
