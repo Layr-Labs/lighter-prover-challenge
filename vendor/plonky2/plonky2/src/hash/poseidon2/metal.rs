@@ -1984,6 +1984,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let groups = leaf_width.div_ceil(8);
     let base = columns.buffer.contents().cast::<F>();
     let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
+    let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
     for group in 0..groups {
         let col_start = group * 8;
         let chunk = (leaf_width - col_start).min(8);
@@ -2016,63 +2017,74 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
             dispatch(encoder, pipeline, leaf_count);
+
+            // Preserve the fine-grained fill/absorb overlap for every earlier
+            // group, but let the final absorb continue directly into all parent
+            // levels. The classic builder uses the same one-encoder schedule:
+            // explicit resource barriers preserve the leaf-to-parent and
+            // parent-to-parent hazards without paying a new command buffer and
+            // compute encoder for every level.
+            if group == groups - 1 {
+                let output_resource: &metal::ResourceRef = output_buffer;
+                let mut level_offset = 0usize;
+                let mut child_count = leaf_count;
+                level_offsets.push(level_offset);
+                if child_count > cap_count {
+                    encoder.set_compute_pipeline_state(&context.parent_pipeline);
+                }
+                while child_count > cap_count {
+                    encoder.memory_barrier_with_resources(&[output_resource]);
+
+                    let parent_count = child_count / 2;
+                    let child_offset = level_offset;
+                    level_offset += child_count * 4;
+                    level_offsets.push(level_offset);
+
+                    encoder.set_buffer(
+                        0,
+                        Some(output_buffer),
+                        (child_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    encoder.set_buffer(
+                        1,
+                        Some(output_buffer),
+                        (level_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    encoder.set_buffer(2, Some(&context.parameters), 0);
+                    set_u32(encoder, 3, parent_count as u32);
+                    dispatch(encoder, &context.parent_pipeline, parent_count);
+
+                    child_count = parent_count;
+                }
+            }
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
+            profile_command_buffer(
+                command_buffer,
+                if group == groups - 1 {
+                    "merkle_absorb_and_parents"
+                } else {
+                    "merkle_absorb"
+                },
+                (leaf_count * chunk) as u64,
+            );
             command_buffer.commit();
             command_buffer.to_owned()
         });
         absorb_commands.push(command_buffer);
     }
 
-    // Parent levels over the completed leaf digests, exactly as in the
-    // classic single-command build.
-    let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
-    let parents_command = autoreleasepool(|| -> CommandBuffer {
-        let command_buffer = context.queue.new_command_buffer();
-        let mut level_offset = 0usize;
-        let mut child_count = leaf_count;
-        level_offsets.push(level_offset);
-        while child_count > cap_count {
-            let parent_count = child_count / 2;
-            let child_offset = level_offset;
-            level_offset += child_count * 4;
-            level_offsets.push(level_offset);
-
-            let parent_count_u32 = parent_count as u32;
-            let parent_encoder = command_buffer.new_compute_command_encoder();
-            parent_encoder.set_compute_pipeline_state(&context.parent_pipeline);
-            parent_encoder.set_buffer(
-                0,
-                Some(output_buffer),
-                (child_offset * size_of::<u64>()) as NSUInteger,
-            );
-            parent_encoder.set_buffer(
-                1,
-                Some(output_buffer),
-                (level_offset * size_of::<u64>()) as NSUInteger,
-            );
-            parent_encoder.set_buffer(2, Some(&context.parameters), 0);
-            set_u32(parent_encoder, 3, parent_count_u32);
-            dispatch(parent_encoder, &context.parent_pipeline, parent_count);
-            parent_encoder.end_encoding();
-
-            child_count = parent_count;
-        }
-        #[cfg(feature = "diagnostic_profile")]
-        profile_command_buffer(command_buffer, "merkle_parents", leaf_count as u64);
-        command_buffer.commit();
-        command_buffer.to_owned()
+    // Waiting for the final combined command also waits for every earlier
+    // absorb on this FIFO queue. Retain the per-command status audit so a
+    // failed early pass still takes the value-identical classic fallback.
+    absorb_commands
+        .last()
+        .expect("streamed build has at least one absorb group")
+        .wait_until_completed();
+    let all_ok = absorb_commands.iter().all(|command_buffer| {
+        command_buffer.wait_until_completed();
+        command_buffer.status() == MTLCommandBufferStatus::Completed
     });
-
-    parents_command.wait_until_completed();
-    let all_ok = absorb_commands
-        .iter()
-        .chain(core::iter::once(&parents_command))
-        .all(|command_buffer| {
-            command_buffer.wait_until_completed();
-            command_buffer.status() == MTLCommandBufferStatus::Completed
-        });
     drop(job);
     if !all_ok {
         log::warn!("streamed Metal sponge build failed; falling back to the classic path");
@@ -6324,7 +6336,10 @@ kernel void goldilocks_mul_bench_native(
 
         let context = shared_context().expect("Metal context");
         let rows = 1usize << 20;
-        let cols = 16;
+        // Seventeen columns exercise two full absorb groups followed by a
+        // one-column final group, which is the group whose command buffer also
+        // carries every parent level.
+        let cols = 17;
         let cap_height = 4;
         let columns = context
             .allocate_columns::<F>(rows, cols)
@@ -6333,10 +6348,15 @@ kernel void goldilocks_mul_bench_native(
         let _reset = ExclusiveReset;
         assert!(is_exclusive_gpu_phase());
         assert!(absorb_pass_pipeline().is_some(), "absorb pipeline");
+        let fill_schedule = Mutex::new(Vec::new());
         let streamed = build_merkle_tree_shared_streamed(
             &columns,
             cap_height,
             &|group, destinations| {
+                fill_schedule
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((group, destinations.len()));
                 for (index, destination) in destinations.iter_mut().enumerate() {
                     destination.fill(F::from_canonical_usize(group * 8 + index + 1));
                 }
@@ -6344,6 +6364,12 @@ kernel void goldilocks_mul_bench_native(
         )
         .expect("streamed tree");
         assert!(streamed.0.nodes.is_shared());
+        assert_eq!(
+            *fill_schedule
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            [(0, 8), (1, 8), (2, 1)],
+        );
 
         let classic = context
             .build(LeafSource::Shared(&columns), cols, rows, cap_height)
