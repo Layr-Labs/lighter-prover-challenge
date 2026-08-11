@@ -1801,6 +1801,51 @@ fn start_gpu_permutation_quotient<
     Some(job)
 }
 
+fn merge_completed_quotient_contributions<F, I>(
+    quotient_values: &mut [F],
+    num_challenges: usize,
+    contributions: [Option<&[F]>; 3],
+    inverse_at: I,
+    fused: bool,
+) where
+    F: RichField,
+    I: Fn(usize) -> F + Sync,
+{
+    if contributions.iter().all(Option::is_none) {
+        return;
+    }
+    for values in contributions.iter().flatten() {
+        debug_assert_eq!(values.len(), quotient_values.len());
+    }
+    if fused {
+        quotient_values
+            .par_chunks_exact_mut(num_challenges)
+            .enumerate()
+            .for_each(|(i, cpu_values)| {
+                let denominator_inv = inverse_at(i);
+                let offset = i * num_challenges;
+                for values in contributions.iter().flatten() {
+                    for challenge in 0..num_challenges {
+                        cpu_values[challenge] += values[offset + challenge] * denominator_inv;
+                    }
+                }
+            });
+    } else {
+        for values in contributions.iter().flatten() {
+            quotient_values
+                .par_chunks_exact_mut(num_challenges)
+                .zip(values.par_chunks_exact(num_challenges))
+                .enumerate()
+                .for_each(|(i, (cpu_values, gpu_values))| {
+                    let denominator_inv = inverse_at(i);
+                    for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                        *cpu += gpu * denominator_inv;
+                    }
+                });
+        }
+    }
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2347,8 +2392,8 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
+    let gpu_poseidon_values = if let Some((_, job)) = &gpu_poseidon {
+        Some(match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2378,23 +2423,14 @@ fn compute_quotient_polys<
                     false,
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        })
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
+    let gpu_range_values = if let Some((_, job)) = &gpu_range {
+        Some(match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2427,23 +2463,14 @@ fn compute_quotient_polys<
                 job.mark_cpu_recompute_completed_for_tests();
                 return result;
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        })
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some(job) = &gpu_permutation {
-        let gpu_values = match job.finish() {
+    let gpu_permutation_values = if let Some(job) = &gpu_permutation {
+        Some(match job.finish() {
             Ok(values) => values,
             Err(error) => {
                 log::warn!(
@@ -2464,18 +2491,39 @@ fn compute_quotient_polys<
                     false,
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        })
+    } else {
+        None
+    };
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    {
+        let contributions = [
+            gpu_poseidon_values,
+            gpu_range_values,
+            gpu_permutation_values,
+        ];
+
+        // Same-binary A/B seam for the focused production-shape benchmark.
+        // The default is the fused traversal used by ranked workers; setting
+        // the control variable to any value other than "0" restores the three
+        // historical Rayon traversals, matching the existing diagnostic flags.
+        static FUSED_GPU_MERGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let fused = *FUSED_GPU_MERGE.get_or_init(|| {
+            !std::env::var_os("PLONKY2_GPU_QUOTIENT_MERGE_CONTROL")
+                .map(|value| value != "0")
+                .unwrap_or(false)
+        });
+        // Apply contributions in the historical Poseidon, Range/U32,
+        // permutation order. Fusing changes no per-cell field-operation order;
+        // it only deletes two quotient/inverse-table traversals.
+        merge_completed_quotient_contributions(
+            &mut quotient_values,
+            num_challenges,
+            contributions,
+            |i| z_h_on_coset.eval_inverse(i),
+            fused,
+        );
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
@@ -2658,7 +2706,10 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{
+        merge_completed_quotient_contributions, precomputed, BatchLayout,
+        COMPARE_QUOTIENT_LAYOUTS,
+    };
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
@@ -2695,6 +2746,117 @@ mod quotient_layout_tests {
         let mut pw = PartialWitness::new();
         pw.set_target(x, F::from_canonical_u64(3)).unwrap();
         (data, pw)
+    }
+
+    #[test]
+    fn fused_gpu_quotient_merge_matches_three_pass_raw() {
+        const GOLDILOCKS_ORDER: u64 = 0xffff_ffff_0000_0001;
+        let n = 1 << 12;
+        let num_challenges = 2;
+        // Build raw tuple values in [p, 2^64), bypassing the canonicalizing
+        // constructors. This pins representation identity, not only equality
+        // modulo p.
+        let noncanonical = |i: usize, salt: u64| {
+            GoldilocksField(
+                GOLDILOCKS_ORDER
+                    + ((i as u64).wrapping_mul(salt) & 0xffff_fffe),
+            )
+        };
+        let initial = (0..n * num_challenges)
+            .map(|i| noncanonical(i, 0x9e37_79b9))
+            .collect::<Vec<_>>();
+        let contribution = |salt: u64| {
+            (0..n * num_challenges)
+                .map(|i| noncanonical(i, salt))
+                .collect::<Vec<_>>()
+        };
+        let c0 = contribution(0xd6e8_feb8);
+        let c1 = contribution(0xa076_1d64);
+        let c2 = contribution(0xe703_7ed1);
+        assert!(initial
+            .iter()
+            .chain(&c0)
+            .chain(&c1)
+            .chain(&c2)
+            .all(|value| value.0 >= GOLDILOCKS_ORDER));
+        let inverses = core::array::from_fn::<_, 8, _>(|i| {
+            F::from_canonical_usize(i + 2).inverse()
+        });
+
+        // Exercise every subset of the three optional Metal jobs, including
+        // mask 000 (recursive/non-Metal CPU fallback). The inverse closure
+        // deliberately panics for 000, proving the empty fast return does no
+        // quotient or inverse-table traversal.
+        for mask in 0u8..8 {
+            let contributions = [
+                (mask & 1 != 0).then_some(c0.as_slice()),
+                (mask & 2 != 0).then_some(c1.as_slice()),
+                (mask & 4 != 0).then_some(c2.as_slice()),
+            ];
+            let inverse_at = |i: usize| {
+                assert_ne!(mask, 0, "empty contribution mask must return immediately");
+                inverses[i & 7]
+            };
+
+            let mut control = initial.clone();
+            merge_completed_quotient_contributions(
+                &mut control,
+                num_challenges,
+                contributions,
+                inverse_at,
+                false,
+            );
+            let mut fused = initial.clone();
+            merge_completed_quotient_contributions(
+                &mut fused,
+                num_challenges,
+                contributions,
+                inverse_at,
+                true,
+            );
+            for (i, (actual, expected)) in fused.iter().zip(control.iter()).enumerate() {
+                assert_eq!(actual.0, expected.0, "mask {mask:03b}, raw quotient limb {i}");
+            }
+        }
+    }
+
+    /// Same release test binary, selected by the production A/B environment
+    /// seam, for exactly 52 d16, 53 d14 and one d18 scored quotient merge.
+    #[test]
+    #[ignore]
+    fn benchmark_scored_gpu_quotient_merges() {
+        let fused = !std::env::var_os("PLONKY2_GPU_QUOTIENT_MERGE_CONTROL")
+            .map(|value| value != "0")
+            .unwrap_or(false);
+        let inverses = core::array::from_fn::<_, 8, _>(|i| {
+            F::from_canonical_usize(i + 2).inverse()
+        });
+        let start = std::time::Instant::now();
+        let mut checksum = 0u64;
+        for (domain_bits, calls) in [(19usize, 52usize), (17, 53), (21, 1)] {
+            let len = (1usize << domain_bits) * 2;
+            let mut quotient = vec![F::from_canonical_u64(11); len];
+            let c0 = vec![F::from_canonical_u64(13); len];
+            let c1 = vec![F::from_canonical_u64(17); len];
+            let c2 = vec![F::from_canonical_u64(19); len];
+            let contributions = [Some(c0.as_slice()), Some(c1.as_slice()), Some(c2.as_slice())];
+            for _ in 0..calls {
+                merge_completed_quotient_contributions(
+                    &mut quotient,
+                    2,
+                    contributions,
+                    |i| inverses[i & 7],
+                    fused,
+                );
+            }
+            checksum ^= quotient[0].0 ^ quotient[quotient.len() - 1].0;
+            std::hint::black_box((&quotient, &c0, &c1, &c2));
+        }
+        println!(
+            "arm={} calls=106 contributions=318 elapsed_ms={:.3} checksum={checksum}",
+            if fused { "fused" } else { "control" },
+            start.elapsed().as_secs_f64() * 1000.0,
+        );
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
