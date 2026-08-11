@@ -112,13 +112,9 @@ impl<F: RichField, H: Hasher<F>> Challenger<F, H> {
     where
         F: RichField + Extendable<D>,
     {
-        // `get_n_challenges(D)` heap-allocates a `D`-element `Vec` that is
-        // copied into `arr` and dropped immediately. Drawing the coefficients
-        // directly keeps the identical draw order — `from_fn` evaluates its
-        // closure for indices 0..D in order, which is exactly the order
-        // `get_n_challenges` pushes in — so the transcript is unchanged, and
-        // `get_hash` already uses this idiom in this file.
-        F::Extension::from_basefield_array(core::array::from_fn(|_| self.get_challenge()))
+        let mut arr = [F::ZERO; D];
+        arr.copy_from_slice(&self.get_n_challenges(D));
+        F::Extension::from_basefield_array(arr)
     }
 
     pub fn get_n_extension_challenges<const D: usize>(&mut self, n: usize) -> Vec<F::Extension>

@@ -90,7 +90,7 @@ pub struct BlockTxChainCircuit {
     pub block_tx_witness_size: usize,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug)]
 pub struct BlockTxChainTarget {
     pub cyclic_proof: ProofWithPublicInputsTarget<D>, // proof of previous iteration
     pub self_verifier_data: VerifierCircuitTarget,    // Verifier Circuit Data for this circuit
@@ -259,51 +259,6 @@ impl BlockTxChainCircuit {
     }
 
     /// The cyclic-proof witness inputs, fed once the previous chain step's proof is available.
-    /// Writes the full early (pre-cyclic) witness inputs — verifier data,
-    /// dummy-slot proof, tx proof, recursion step — directly into any
-    /// writable witness, bypassing the `PartialWitness` template/clone/replay
-    /// path. The set of (target, value) pairs written is identical to
-    /// [`Self::witness_inputs_early`]'s.
-    pub fn witness_inputs_early_into<W>(
-        target: &BlockTxChainTarget,
-        circuit_data: &CircuitData<F, C, D>,
-        recursion_step: u64,
-        dummy_proof_cyclic: &ProofWithPublicInputs<F, C, D>,
-        current_block_tx_proof: &ProofWithPublicInputs<F, C, D>,
-        pw: &mut W,
-    ) -> Result<()>
-    where
-        W: plonky2::iop::witness::Witness<F>,
-    {
-        pw.set_verifier_data_target(&target.self_verifier_data, &circuit_data.verifier_only)?;
-
-        pw.set_proof_with_pis_target(&target.tx_proof, current_block_tx_proof)?;
-
-        pw.set_target(target.recursion_step, F::from_canonical_u64(recursion_step))?;
-
-        // This will take place of `DummyProofGenerator`
-        pw.set_proof_with_pis_target(
-            &target.dummy_proof_with_pis_target_cyclic,
-            dummy_proof_cyclic,
-        )?;
-
-        Ok(())
-    }
-
-    /// Writes the cyclic-proof witness inputs directly into any writable
-    /// witness; identical pairs to [`Self::witness_inputs_cyclic`].
-    pub fn witness_inputs_cyclic_into<W>(
-        target: &BlockTxChainTarget,
-        cyclic_proof: &ProofWithPublicInputs<F, C, D>,
-        pw: &mut W,
-    ) -> Result<()>
-    where
-        W: plonky2::iop::witness::Witness<F>,
-    {
-        pw.set_proof_with_pis_target(&target.cyclic_proof, cyclic_proof)?;
-        Ok(())
-    }
-
     pub fn witness_inputs_cyclic(
         target: &BlockTxChainTarget,
         cyclic_proof: &ProofWithPublicInputs<F, C, D>,

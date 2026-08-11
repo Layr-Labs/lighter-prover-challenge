@@ -64,6 +64,25 @@ pub trait Frobenius<const D: usize>: OEF<D> {
 pub trait Extendable<const D: usize>: Field + Sized {
     type Extension: Field + OEF<D, BaseField = Self> + Frobenius<D> + From<Self>;
 
+    /// Evaluate a base-field coefficient vector at extension-field powers.
+    ///
+    /// Implementations may specialize this hot path when the base field has a
+    /// wider accumulator that can safely delay modular reduction. The default
+    /// keeps the historical generic semantics, including truncation to the
+    /// shorter input slice.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_product(
+        coefficients: &[Self],
+        powers: &[Self::Extension],
+    ) -> Self::Extension {
+        coefficients
+            .iter()
+            .zip(powers)
+            .map(|(&coefficient, power)| power.scalar_mul(coefficient))
+            .sum()
+    }
+
     const W: Self;
 
     const DTH_ROOT: Self;
@@ -76,56 +95,6 @@ pub trait Extendable<const D: usize>: Field + Sized {
     /// we get `Self::BaseField::POWER_OF_TWO_GENERATOR`. This makes `primitive_root_of_unity` coherent
     /// with the base field which implies that the FFT commutes with field inclusion.
     const EXT_POWER_OF_TWO_GENERATOR: [Self; D];
-
-    /// Compute the dot product of extension-field values and base-field
-    /// scalars. The slices are zipped, matching the usual iterator behavior
-    /// when their lengths differ.
-    ///
-    /// The default preserves the reduce-per-product implementation. A base
-    /// field may specialize this when it can safely delay modular reduction
-    /// across several products.
-    #[doc(hidden)]
-    #[inline]
-    fn extension_base_dot_product(
-        extension_values: &[Self::Extension],
-        base_scalars: &[Self],
-    ) -> Self::Extension {
-        extension_values
-            .iter()
-            .zip(base_scalars)
-            .map(|(&value, &scalar)| {
-                <Self::Extension as FieldExtension<D>>::scalar_mul(&value, scalar)
-            })
-            .sum()
-    }
-
-    /// Internal FFT hook. The default preserves general extension
-    /// multiplication; a base field may explicitly specialize multiplication
-    /// by its own embedded twiddles without overlapping trait impls.
-    #[doc(hidden)]
-    #[inline(always)]
-    fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
-        let [a0, a1] = twiddle;
-        let [b0, b1] = value;
-        [a0 * b0 + Self::W * a1 * b1, a0 * b1 + a1 * b0]
-    }
-
-    /// Internal fixed-shape FRI hook. The default keeps the historical
-    /// reversed Horner recurrence, including its raw field representation.
-    /// A base field may specialize the production arity without changing the
-    /// generic FRI implementation or any other reduction call site.
-    #[doc(hidden)]
-    #[inline(always)]
-    fn fri_fold_arity16(
-        terms: &[Self::Extension; 16],
-        beta: Self::Extension,
-        _beta_powers: &[Self::Extension; 16],
-    ) -> Self::Extension {
-        terms
-            .iter()
-            .rev()
-            .fold(Self::Extension::ZERO, |acc, &term| acc * beta + term)
-    }
 }
 
 impl<F: Field + Frobenius<1> + FieldExtension<1, BaseField = F>> Extendable<1> for F {

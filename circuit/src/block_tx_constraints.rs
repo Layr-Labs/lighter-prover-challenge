@@ -8,7 +8,7 @@ use plonky2::field::extension::Extendable;
 use plonky2::field::types::{Field, Field64};
 use plonky2::hash::hash_types::{HashOutTarget, NUM_HASH_OUT_ELTS, RichField};
 use plonky2::iop::target::Target;
-use plonky2::iop::witness::PartialWitness;
+use plonky2::iop::witness::{PartialWitness, WitnessWrite};
 use plonky2::plonk::circuit_data::{CircuitConfig, CircuitData};
 use plonky2::plonk::config::GenericConfig;
 use plonky2::plonk::proof::ProofWithPublicInputs;
@@ -58,8 +58,7 @@ pub struct BlockTxCircuit {
     pub target: BlockTxTarget,
 }
 
-#[serde_with::serde_as]
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug)]
 pub struct BlockTxTarget {
     pub created_at: Target, // 48 bits
 
@@ -89,7 +88,6 @@ pub struct BlockTxTarget {
     // /*************************/
     pub new_account_delta_tree_root: HashOutTarget,
     pub priority_operations_count: Target,
-    #[serde_as(as = "[_; MAX_PRIORITY_OPERATIONS_PUB_DATA_BYTES_PER_TX]")]
     pub priority_operations_pub_data: [U8Target; MAX_PRIORITY_OPERATIONS_PUB_DATA_BYTES_PER_TX],
     pub on_chain_operations_count: Target,
     pub on_chain_operations_pub_data: [U8Target; ON_CHAIN_OPERATIONS_PUB_DATA_BYTES_SIZE],
@@ -196,26 +194,7 @@ impl Circuit<C, F, D> for BlockTxCircuit {
 
     fn generate_witness(block: &BlockTx<F>, target: &BlockTxTarget) -> Result<PartialWitness<F>> {
         let mut pw = PartialWitness::new();
-        BlockTxCircuit::generate_witness_into(block, target, &mut pw)?;
-        Ok(pw)
-    }
-}
 
-impl BlockTxCircuit {
-    /// Writes the block-transaction witness into any writable witness — in
-    /// particular directly into a `PartitionWitness`-backed seeder, whose
-    /// representative slots are array-indexed, bypassing the `PartialWitness`
-    /// hash map (and its per-target hashing) entirely. The set of
-    /// (target, value) pairs written is identical to
-    /// [`Circuit::generate_witness`]'s.
-    pub fn generate_witness_into<W>(
-        block: &BlockTx<F>,
-        target: &BlockTxTarget,
-        pw: &mut W,
-    ) -> Result<()>
-    where
-        W: plonky2::iop::witness::Witness<F>,
-    {
         pw.set_target(target.created_at, F::from_canonical_i64(block.created_at))?;
         pw.set_hash_target(target.state_metadata_hash, block.state_metadata_hash)?;
 
@@ -253,7 +232,7 @@ impl BlockTxCircuit {
             .zip_eq(block.txs.iter())
             .try_for_each(|(t, tx)| pw.set_tx_target(t, tx))?;
 
-        Ok(())
+        Ok(pw)
     }
 }
 

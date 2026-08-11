@@ -42,8 +42,8 @@ use crate::iop::target::{BoolTarget, Target};
 use crate::iop::wire::Wire;
 use crate::plonk::circuit_builder::LookupWire;
 use crate::plonk::circuit_data::{
-    CircuitConfig, CircuitData, CommonCircuitData, GeneratorWatchIndex, ProverCircuitData,
-    ProverOnlyCircuitData, VerifierCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
+    CircuitConfig, CircuitData, CommonCircuitData, ProverCircuitData, ProverOnlyCircuitData,
+    VerifierCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
 };
 use crate::plonk::config::{GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::plonk_common::salt_size;
@@ -364,7 +364,6 @@ pub trait Read {
             },
             num_leaves,
             digests,
-            level_digests: None,
             cap,
         })
     }
@@ -890,8 +889,6 @@ pub trait Read {
                 generator_watch_counts[generator_idx] += 1;
             }
         }
-        let generator_indices_by_watches =
-            GeneratorWatchIndex::from_map(generator_indices_by_watches);
 
         let constants_sigmas_commitment = self.read_polynomial_batch()?;
         let sigmas_len = self.read_usize()?;
@@ -907,13 +904,6 @@ pub trait Read {
         let public_inputs = self.read_target_vec()?;
 
         let representative_map = self.read_usize_encoded_u32_vec()?;
-        let fixed_routed_wires = crate::plonk::permutation_argument::fixed_routed_wire_mask(
-            &representative_map,
-            common_data.config.num_wires,
-            common_data.config.num_routed_wires,
-            subgroup.len(),
-        )
-        .ok_or(IoError)?;
 
         let is_some = self.read_bool()?;
         let fft_root_table = match is_some {
@@ -956,16 +946,10 @@ pub trait Read {
             subgroup,
             public_inputs,
             representative_map,
-            fixed_routed_wires,
             fft_root_table,
             circuit_digest,
             lookup_rows,
             lut_to_lookups,
-            // Runtime-only: the cache is not serialized; the quotient path
-            // falls back to the strided gather.
-            constants_sigmas_quotient_cache: None,
-            constants_sigmas_quotient_step: 0,
-            constants_sigmas_quotient_domain: 0,
         })
     }
 
@@ -1500,12 +1484,7 @@ pub trait Write {
             self.write_usize(leaf.len())?;
             self.write_field_vec(&leaf)?;
         }
-        match &tree.level_digests {
-            // GPU-built trees keep their digests in level order; materialize
-            // the interleaved layout the wire format expects (cold path).
-            Some(levels) => self.write_hash_vec::<F, H>(&levels.to_interleaved())?,
-            None => self.write_hash_vec::<F, H>(&tree.digests)?,
-        }
+        self.write_hash_vec::<F, H>(&tree.digests)?;
         self.write_usize(tree.cap.height())?;
         self.write_merkle_cap(&tree.cap)?;
 
@@ -1930,18 +1909,11 @@ pub trait Write {
             // Runtime-only: reconstructed from `generator_indices_by_watches` on read, so it
             // contributes no bytes and the serialized format is unchanged.
             generator_watch_counts: _,
-            // Runtime-only: contributes no bytes; the serialized format is unchanged.
-            constants_sigmas_quotient_cache: _,
-            constants_sigmas_quotient_step: _,
-            constants_sigmas_quotient_domain: _,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
             public_inputs,
             representative_map,
-            // Runtime-only: reconstructed from `representative_map` on read, so it contributes
-            // no bytes and the serialized format is unchanged.
-            fixed_routed_wires: _,
             fft_root_table,
             circuit_digest,
             lookup_rows,
@@ -1954,8 +1926,8 @@ pub trait Write {
         }
 
         self.write_usize(generator_indices_by_watches.len())?;
-        for (k, v) in generator_indices_by_watches.iter() {
-            self.write_usize(k)?;
+        for (k, v) in generator_indices_by_watches {
+            self.write_usize(*k)?;
             self.write_usize_vec(v)?;
         }
 
@@ -2436,10 +2408,6 @@ mod tests {
         assert_eq!(
             decoded.representative_map,
             circuit.prover_only.representative_map
-        );
-        assert_eq!(
-            decoded.fixed_routed_wires, circuit.prover_only.fixed_routed_wires,
-            "runtime fixed-factor mask was not reconstructed from the representative map"
         );
         assert_eq!(
             decoded.generator_watch_counts,

@@ -263,7 +263,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
             (evaluation_point - shifted_evaluation_point.scalar_mul(shift)).to_basefield_array(),
         );
 
-        let domain = crate::field::fft::cached_two_adic_subgroup::<F>(self.subgroup_bits);
+        let domain = F::two_adic_subgroup(self.subgroup_bits);
         let values = (0..self.num_points())
             .map(|i| vars.get_local_ext(self.wires_value(i)))
             .collect::<Vec<_>>();
@@ -317,10 +317,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
         let num_constraints = <Self as Gate<F, D>>::num_constraints(self);
         assert!(combined_gate_constraints.len() >= num_constraints * n);
 
-        // Cached process-wide: value-identical to `F::two_adic_subgroup`, but
-        // skips the primitive-root exponentiation and power chain that would
-        // otherwise run once per 32-point batch call.
-        let domain = crate::field::fft::cached_two_adic_subgroup::<F>(self.subgroup_bits);
+        let domain = F::two_adic_subgroup(self.subgroup_bits);
         let weights = &self.barycentric_weights;
         let mut values = vec![F::Extension::ZERO; self.num_points()];
         let mut scratch = vec![F::ZERO; num_constraints * n];
@@ -501,8 +498,7 @@ pub struct InterpolationGenerator<F: RichField + Extendable<D>, const D: usize> 
 
 impl<F: RichField + Extendable<D>, const D: usize> InterpolationGenerator<F, D> {
     fn new(row: usize, gate: CosetInterpolationGate<F, D>) -> Self {
-        let interpolation_domain =
-            crate::field::fft::cached_two_adic_subgroup::<F>(gate.subgroup_bits).to_vec();
+        let interpolation_domain = F::two_adic_subgroup(gate.subgroup_bits);
         InterpolationGenerator {
             row,
             gate,

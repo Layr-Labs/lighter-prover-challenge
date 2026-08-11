@@ -28,14 +28,14 @@ use crate::utils::CircuitBuilderUtils;
 /// `sign`: `-1` &rarr; For negative values
 ///
 /// `sign`: `0` &rarr; For zero value
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default)]
 pub struct BigIntTarget {
     pub abs: BigUintTarget,
     pub sign: SignTarget,
 }
 
 /// Target that represents the Sign of the BigIntTarget, possible values are -1, 0 and 1
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 #[allow(clippy::manual_non_exhaustive)]
 pub struct SignTarget {
     pub target: Target,

@@ -1,6 +1,5 @@
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
-use core::mem::MaybeUninit;
 
 use crate::field::extension::Extendable;
 use crate::field::packable::Packable;
@@ -64,29 +63,11 @@ pub trait PackedEvaluableBase<F: RichField + Extendable<D>, const D: usize>: Gat
 
         // Scratch for one lane group's constraint block. Batches are 32 points, so for
         // typical gates this is at most a few KiB; keep it on the stack when it fits.
-        //
-        // Only `[..scratch_len]` is ever addressed, so the reservation is sized for
-        // the worst case but declared uninitialized and zeroed over exactly that
-        // prefix. `[F::ZERO; 1024]` instead zeroed all 8 KiB on every call, of which
-        // `1024 - scratch_len` elements are then never read, written or aliased by
-        // anything — the slice handed to `StridedConstraintConsumer` stops at
-        // `scratch_len`. This is the hottest CPU loop in the prover: the accumulate
-        // impl runs once per CPU-resident gate per 32-point quotient batch, i.e.
-        // `num_gates * quotient_domain / 32` times per proof, so the deleted stores
-        // are hundreds of megabytes of L1 store traffic per proof. The zeroing that
-        // remains is bit-for-bit the zeroing the used prefix received before, so
-        // every constraint value read below is unchanged, including for a gate that
-        // emits fewer values than it advertises.
         let scratch_len = num_constraints * width;
-        let mut scratch_stack = [MaybeUninit::<F>::uninit(); 1024];
+        let mut scratch_stack = [F::ZERO; 1024];
         let mut scratch_heap;
-        let scratch: &mut [F] = if scratch_len <= scratch_stack.len() {
-            let prefix = &mut scratch_stack[..scratch_len];
-            prefix.fill(MaybeUninit::new(F::ZERO));
-            // SAFETY: every element of `prefix` was just written with `F::ZERO`, and
-            // `MaybeUninit<F>` has the same layout and alignment as `F`. Same idiom
-            // as `RandomAccessGate`'s stack-or-heap scratch.
-            unsafe { core::slice::from_raw_parts_mut(prefix.as_mut_ptr().cast::<F>(), scratch_len) }
+        let scratch: &mut [F] = if scratch_len <= 1024 {
+            &mut scratch_stack[..scratch_len]
         } else {
             scratch_heap = vec![F::ZERO; scratch_len];
             &mut scratch_heap

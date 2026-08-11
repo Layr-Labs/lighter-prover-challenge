@@ -16,17 +16,11 @@ pub struct TimingTree {
     exit_time: Option<Instant>,
     /// Any child scopes.
     children: Vec<TimingTree>,
-    #[cfg(feature = "diagnostic_profile")]
-    profile_span: Option<crate::util::profile::Span>,
 }
 
 #[cfg(not(feature = "timing"))]
 #[derive(Debug)]
-pub struct TimingTree {
-    level: Level,
-    #[cfg(feature = "diagnostic_profile")]
-    profile_spans: Vec<crate::util::profile::Span>,
-}
+pub struct TimingTree(Level);
 
 #[cfg(feature = "timing")]
 impl Default for TimingTree {
@@ -51,18 +45,12 @@ impl TimingTree {
             enter_time: Instant::now(),
             exit_time: None,
             children: vec![],
-            #[cfg(feature = "diagnostic_profile")]
-            profile_span: Some(crate::util::profile::span("plonky2", root_name)),
         }
     }
 
     #[cfg(not(feature = "timing"))]
-    pub fn new(root_name: &str, level: Level) -> Self {
-        Self {
-            level,
-            #[cfg(feature = "diagnostic_profile")]
-            profile_spans: vec![crate::util::profile::span("plonky2", root_name)],
-        }
+    pub fn new(_root_name: &str, level: Level) -> Self {
+        Self(level)
     }
 
     /// Whether this scope is still in scope.
@@ -109,17 +97,11 @@ impl TimingTree {
             enter_time: Instant::now(),
             exit_time: None,
             children: vec![],
-            #[cfg(feature = "diagnostic_profile")]
-            profile_span: Some(crate::util::profile::span("plonky2", ctx)),
         })
     }
 
     #[cfg(not(feature = "timing"))]
-    pub fn push(&mut self, ctx: &str, _level: log::Level) {
-        #[cfg(feature = "diagnostic_profile")]
-        self.profile_spans
-            .push(crate::util::profile::span("plonky2", ctx));
-    }
+    pub fn push(&mut self, _ctx: &str, _level: log::Level) {}
 
     /// Close the deepest open scope from this tree.
     #[cfg(feature = "timing")]
@@ -134,20 +116,10 @@ impl TimingTree {
         }
 
         self.exit_time = Some(Instant::now());
-        #[cfg(feature = "diagnostic_profile")]
-        drop(self.profile_span.take());
     }
 
     #[cfg(not(feature = "timing"))]
-    pub fn pop(&mut self) {
-        #[cfg(feature = "diagnostic_profile")]
-        {
-            // Keep the root span alive until the tree itself is dropped.
-            if self.profile_spans.len() > 1 {
-                self.profile_spans.pop();
-            }
-        }
-    }
+    pub fn pop(&mut self) {}
 
     #[cfg(feature = "timing")]
     fn duration(&self) -> Duration {
@@ -170,8 +142,6 @@ impl TimingTree {
                 .filter(|c| c.duration() >= min_delta)
                 .map(|c| c.filter(min_delta))
                 .collect(),
-            #[cfg(feature = "diagnostic_profile")]
-            profile_span: None,
         }
     }
 
@@ -183,7 +153,7 @@ impl TimingTree {
     #[cfg(not(feature = "timing"))]
     pub fn print(&self) {
         log!(
-            self.level,
+            self.0,
             "TimingTree is not supported without the 'timing' feature enabled"
         );
     }

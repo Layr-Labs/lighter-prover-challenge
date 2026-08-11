@@ -45,7 +45,7 @@ pub struct L2UpdateMarginTx {
     pub direction: u8,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug)]
 pub struct L2UpdateMarginTxTarget {
     pub account_index: Target,
     pub api_key_index: Target,

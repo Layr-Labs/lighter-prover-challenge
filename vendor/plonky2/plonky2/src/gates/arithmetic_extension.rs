@@ -4,7 +4,6 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::mem::MaybeUninit;
 use core::ops::Range;
 
 use anyhow::Result;
@@ -139,36 +138,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticExte
             F::Extension::from_basefield_array(arr)
         };
 
-        // One `D x n` constraint block, reused across the `num_ops` operations.
-        // Every slot is assigned by the point loop below before the
-        // `batch_multiply_add_inplace` read: `to_basefield_array()` yields exactly
-        // `D` values and `p` covers `0..n`, so `(d, p)` sweeps the whole block —
-        // and the loop over operations already depends on that, since it never
-        // re-zeroes between iterations. The buffer therefore needed neither its
-        // zero-fill nor a heap allocation of its own. This accumulate impl runs
-        // once per 32-point quotient batch for a gate that stays on the CPU
-        // quotient path of every proof, i.e. `quotient_domain / 32` times per
-        // proof, and each call was paying a malloc, a free, and a `D * n` memset
-        // for a block it immediately overwrote.
-        const STACK_SCRATCH: usize = 128;
-        let scratch_len = D * n;
-        let mut scratch_stack = [MaybeUninit::<F>::uninit(); STACK_SCRATCH];
-        let mut scratch_heap;
-        let scratch: &mut [F] = if scratch_len <= STACK_SCRATCH {
-            // SAFETY: `MaybeUninit<F>` has the same layout and alignment as `F`,
-            // and every element of `[..scratch_len]` is written by the point loop
-            // below before any is read. Same idiom as `RandomAccessGate`'s
-            // stack-or-heap scratch.
-            unsafe {
-                core::slice::from_raw_parts_mut(
-                    scratch_stack[..scratch_len].as_mut_ptr().cast::<F>(),
-                    scratch_len,
-                )
-            }
-        } else {
-            scratch_heap = vec![F::ZERO; scratch_len];
-            &mut scratch_heap
-        };
+        let mut scratch = vec![F::ZERO; D * n];
         for i in 0..self.num_ops {
             let m0_start = Self::wires_ith_multiplicand_0(i).start;
             let m1_start = Self::wires_ith_multiplicand_1(i).start;

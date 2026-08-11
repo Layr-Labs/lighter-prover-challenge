@@ -6,16 +6,15 @@ use alloc::{
     vec::Vec,
 };
 use core::marker::PhantomData;
-use core::mem::MaybeUninit;
 
 use anyhow::Result;
 use itertools::Itertools;
 
+use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::Extendable;
-use crate::field::packable::Packable;
 use crate::field::packed::PackedField;
 use crate::field::types::Field;
-use crate::gates::gate::{Gate, U32QuotientGate};
+use crate::gates::gate::Gate;
 use crate::gates::packed_util::PackedEvaluableBase;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -45,46 +44,6 @@ pub struct RandomAccessGate<F: RichField + Extendable<D>, const D: usize> {
     pub num_extra_constants: usize,
 
     _phantom: PhantomData<F>,
-}
-
-/// Evaluate one constraint row point-by-point and immediately fold it into
-/// the shared filtered accumulator. This mirrors `batch_multiply_add_inplace`
-/// exactly: the maximal prefix is reinterpreted as the field's preferred
-/// packing and uses `Packing::multiply_accumulate`, while the ragged suffix
-/// keeps the scalar `out += term * filter` operation.
-///
-/// Constraint terms are deliberately computed with scalar `F` operations and
-/// only then placed in a single packed register. Computing the expressions in
-/// `Packing` directly could produce a different noncanonical representative,
-/// even when the field value is equal.
-#[inline]
-fn accumulate_constraint_direct<F: Field>(
-    out: &mut [F],
-    filters: &[F],
-    mut term_at: impl FnMut(usize) -> F,
-) {
-    assert_eq!(out.len(), filters.len());
-
-    type Packing<F> = <F as Packable>::Packing;
-    let width = Packing::<F>::WIDTH;
-    let packed_len = out.len() - out.len() % width;
-    let (out_prefix, out_leftovers) = out.split_at_mut(packed_len);
-    let (filter_prefix, filter_leftovers) = filters.split_at(packed_len);
-    let out_packed = Packing::<F>::pack_slice_mut(out_prefix);
-    let filter_packed = Packing::<F>::pack_slice(filter_prefix);
-
-    for (group, (x_out, &x_filter)) in out_packed.iter_mut().zip(filter_packed).enumerate() {
-        let mut terms = Packing::<F>::ZEROS;
-        let base = group * width;
-        for (lane, slot) in terms.as_slice_mut().iter_mut().enumerate() {
-            *slot = term_at(base + lane);
-        }
-        *x_out = x_out.multiply_accumulate(terms, x_filter);
-    }
-
-    for (offset, (x_out, &x_filter)) in out_leftovers.iter_mut().zip(filter_leftovers).enumerate() {
-        *x_out += term_at(packed_len + offset) * x_filter;
-    }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> RandomAccessGate<F, D> {
@@ -329,74 +288,52 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
         let col = |w: usize| &wires[w * n..][..n];
         let vec_size = self.vec_size();
         let mut row = 0;
-        // The first selector fold reads the immutable wire columns directly,
-        // so only its `vec_size / 2` output columns need scratch storage. The
-        // former path zero-filled and copied all `vec_size` input columns here,
-        // then immediately consumed and discarded that mirror.
-        let item_count = (vec_size / 2) * n;
-        // The ranked shape is bits=4 over a 32-point batch: eight folded
-        // columns fit exactly here. Larger generic shapes retain heap storage.
-        let mut items_stack = [MaybeUninit::<F>::uninit(); 8 * 32];
-        let mut items_heap;
-        let items_uninit: &mut [MaybeUninit<F>] = if item_count <= items_stack.len() {
-            &mut items_stack[..item_count]
-        } else {
-            items_heap = vec![MaybeUninit::uninit(); item_count];
-            &mut items_heap
+        let mut scratch = vec![F::ZERO; n];
+        // `items` holds vec_size columns of n points, folded in place; the
+        // write index k always trails the read indices 2k, 2k+1, which were
+        // consumed at an earlier k of the same level.
+        let mut items = vec![F::ZERO; vec_size * n];
+
+        let mut emit = |row: &mut usize, scratch: &[F]| {
+            batch_multiply_add_inplace(
+                &mut combined_gate_constraints[*row * n..][..n],
+                scratch,
+                filters,
+            );
+            *row += 1;
         };
 
         for copy in 0..self.num_copies {
             // Assert that each bit wire value is indeed boolean.
             for i in 0..self.bits {
                 let b = col(self.wire_bit(i, copy));
-                accumulate_constraint_direct(
-                    &mut combined_gate_constraints[row * n..][..n],
-                    filters,
-                    |p| b[p] * (b[p] - F::ONE),
-                );
-                row += 1;
+                for p in 0..n {
+                    scratch[p] = b[p] * (b[p] - F::ONE);
+                }
+                emit(&mut row, &scratch);
             }
 
             // Assert that the binary decomposition was correct.
-            let access_index = col(self.wire_access_index(copy));
-            accumulate_constraint_direct(
-                &mut combined_gate_constraints[row * n..][..n],
-                filters,
-                |p| {
-                    let mut reconstructed_index = F::ZERO;
-                    for i in (0..self.bits).rev() {
-                        reconstructed_index =
-                            reconstructed_index.double() + col(self.wire_bit(i, copy))[p];
-                    }
-                    reconstructed_index - access_index[p]
-                },
-            );
-            row += 1;
-
-            // Repeatedly fold the list, selecting the left or right item from
-            // each pair based on the corresponding bit. Build the first level
-            // straight from the wire columns; this performs the same field
-            // expression in the same order as the mirror-backed reference.
-            if self.bits != 0 {
-                let b = col(self.wire_bit(0, copy));
-                for k in 0..vec_size / 2 {
-                    let xs = col(self.wire_list_item(2 * k, copy));
-                    let ys = col(self.wire_list_item(2 * k + 1, copy));
-                    for p in 0..n {
-                        let x = xs[p];
-                        let y = ys[p];
-                        items_uninit[k * n + p].write(x + b[p] * (y - x));
-                    }
+            scratch.fill(F::ZERO);
+            for i in (0..self.bits).rev() {
+                let b = col(self.wire_bit(i, copy));
+                for p in 0..n {
+                    scratch[p] = scratch[p].double() + b[p];
                 }
             }
-            // SAFETY: With zero index bits the slice is empty. Otherwise the
-            // first selector level initialized every element exactly once;
-            // `MaybeUninit<F>` has the same layout and alignment as `F`.
-            let items = unsafe {
-                core::slice::from_raw_parts_mut(items_uninit.as_mut_ptr().cast::<F>(), item_count)
-            };
-            let mut level_size = vec_size / 2;
-            for i in 1..self.bits {
+            let access_index = col(self.wire_access_index(copy));
+            for p in 0..n {
+                scratch[p] -= access_index[p];
+            }
+            emit(&mut row, &scratch);
+
+            // Repeatedly fold the list, selecting the left or right item from
+            // each pair based on the corresponding bit.
+            for i in 0..vec_size {
+                items[i * n..][..n].copy_from_slice(col(self.wire_list_item(i, copy)));
+            }
+            let mut level_size = vec_size;
+            for i in 0..self.bits {
                 let b = col(self.wire_bit(i, copy));
                 for k in 0..level_size / 2 {
                     for p in 0..n {
@@ -408,30 +345,19 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
                 level_size /= 2;
             }
             let claimed_element = col(self.wire_claimed_element(copy));
-            accumulate_constraint_direct(
-                &mut combined_gate_constraints[row * n..][..n],
-                filters,
-                |p| {
-                    let selected = if self.bits == 0 {
-                        col(self.wire_list_item(0, copy))[p]
-                    } else {
-                        items[p]
-                    };
-                    selected - claimed_element[p]
-                },
-            );
-            row += 1;
+            for p in 0..n {
+                scratch[p] = items[p] - claimed_element[p];
+            }
+            emit(&mut row, &scratch);
         }
 
         for i in 0..self.num_extra_constants {
             let constant = &constants[i * n..][..n];
             let wire = col(self.wire_extra_constant(i));
-            accumulate_constraint_direct(
-                &mut combined_gate_constraints[row * n..][..n],
-                filters,
-                |p| constant[p] - wire[p],
-            );
-            row += 1;
+            for p in 0..n {
+                scratch[p] = constant[p] - wire[p];
+            }
+            emit(&mut row, &scratch);
         }
         debug_assert_eq!(row, self.num_constraints());
     }
@@ -509,7 +435,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
     }
 
     fn num_wires(&self) -> usize {
-        self.num_routed_wires() + self.num_copies * self.bits
+        self.wire_bit(self.bits - 1, self.num_copies - 1) + 1
     }
 
     fn num_constants(&self) -> usize {
@@ -523,14 +449,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
     fn num_constraints(&self) -> usize {
         let constraints_per_copy = self.bits + 2;
         self.num_copies * constraints_per_copy + self.num_extra_constants
-    }
-
-    fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
-        Some(U32QuotientGate::RandomAccess {
-            bits: self.bits,
-            num_ops: self.num_copies,
-            num_extra_constants: self.num_extra_constants,
-        })
     }
 
     fn extra_constant_wires(&self) -> Vec<(usize, usize)> {
@@ -670,9 +588,8 @@ mod tests {
     use rand::Rng;
 
     use super::*;
-    use crate::field::batch_util::batch_multiply_add_inplace;
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::{Field64, PrimeField64, Sample};
+    use crate::field::types::Sample;
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
     use crate::hash::hash_types::HashOut;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
@@ -688,103 +605,6 @@ mod tests {
         type C = PoseidonGoldilocksConfig;
         type F = <C as GenericConfig<D>>::F;
         test_eval_fns::<F, C, _, D>(RandomAccessGate::new(4, 4, 1))
-    }
-
-    #[test]
-    fn direct_accumulation_matches_materialized_mirror_raw_words() {
-        const D: usize = 2;
-        type F = GoldilocksField;
-
-        // Include valid noncanonical Goldilocks representatives so this test
-        // detects changes hidden by field equality. Small canonical values
-        // and ORDER + small represent the same field elements with different
-        // raw words.
-        fn value(i: usize) -> F {
-            let small = ((i as u64).wrapping_mul(0x9e37_79b9) ^ 0x5a5a_a5a5) & 0xffff;
-            if i % 3 == 0 {
-                GoldilocksField(F::ORDER + small)
-            } else {
-                F::from_canonical_u64(small)
-            }
-        }
-
-        // Exercise both sides of every preferred-packing boundary so the
-        // direct path must match the reference's packed prefix and scalar
-        // leftovers on any target, not just WIDTH=4 AArch64.
-        let packing_width = <<F as Packable>::Packing as PackedField>::WIDTH;
-        let mut batch_sizes = vec![
-            1,
-            3,
-            5,
-            7,
-            11,
-            31,
-            32,
-            33,
-            packing_width.saturating_sub(1).max(1),
-            packing_width,
-            packing_width + 1,
-            packing_width + 2,
-            2 * packing_width - 1,
-            2 * packing_width,
-            2 * packing_width + 1,
-        ];
-        // Hit every possible scalar-tail length after one and two complete
-        // packed groups (notably remainder 2 when WIDTH=4).
-        batch_sizes.extend((0..packing_width).map(|remainder| packing_width + remainder));
-        batch_sizes.extend((0..packing_width).map(|remainder| 2 * packing_width + remainder));
-        batch_sizes.sort_unstable();
-        batch_sizes.dedup();
-        for bits in [0, 1, 2, 3, 4, 6] {
-            for &n in &batch_sizes {
-                let gate = RandomAccessGate::<F, D>::new(3, bits, 2);
-                let wires = (0..gate.num_wires() * n)
-                    .map(|i| value(i + 1))
-                    .collect::<Vec<_>>();
-                let constants = (0..gate.num_constants() * n)
-                    .map(|i| value(i + 10_001))
-                    .collect::<Vec<_>>();
-                let filters = (0..n)
-                    .map(|i| match i % 7 {
-                        0 => F::ZERO,
-                        1 => GoldilocksField(F::ORDER), // noncanonical zero
-                        _ => value(i + 20_001),
-                    })
-                    .collect::<Vec<_>>();
-                let hash = HashOut::ZERO;
-                let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
-
-                // `eval_unfiltered_base_batch` intentionally retains the old
-                // zero-fill + full list mirror + in-place fold and is the
-                // independent reference for the production accumulate path.
-                let materialized = gate.eval_unfiltered_base_batch(vars);
-                let initial = (0..gate.num_constraints() * n)
-                    .map(|i| match i % 11 {
-                        0 => F::ZERO,
-                        1 => GoldilocksField(F::ORDER), // noncanonical zero
-                        _ => value(i + 30_001),
-                    })
-                    .collect::<Vec<_>>();
-                let mut expected = initial.clone();
-                for (acc, constraints) in expected
-                    .chunks_exact_mut(n)
-                    .zip(materialized.chunks_exact(n))
-                {
-                    batch_multiply_add_inplace(acc, constraints, &filters);
-                }
-
-                let mut actual = initial;
-                gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
-
-                for (i, (&expected, &actual)) in expected.iter().zip(&actual).enumerate() {
-                    assert_eq!(
-                        actual.to_noncanonical_u64(),
-                        expected.to_noncanonical_u64(),
-                        "bits={bits}, n={n}, output={i}"
-                    );
-                }
-            }
-        }
     }
 
     #[test]

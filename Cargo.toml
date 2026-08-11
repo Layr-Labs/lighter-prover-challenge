@@ -17,12 +17,7 @@ hashbrown = { version = "0.14.3", default-features = false, features = [
   "serde",
 ] } # NOTE: When upgrading, see `ahash` dependency.
 itertools = { version = "0.13.0", default-features = false }
-# Ranked workers do not consume application logs. Keep logging available in
-# debug/test builds, but compile every log call out of release binaries so the
-# proving hot path does not repeatedly load and compare the global max level.
-log = { version = "0.4.14", default-features = false, features = [
-  "release_max_level_off",
-] }
+log = { version = "0.4.14", default-features = false }
 num = { version = "0.4", default-features = false, features = [
   "rand",
   "serde",
@@ -58,19 +53,3 @@ incremental = false
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-# The score is the sum of worker process lifetimes, and each spawn validates the
-# binary's code signature over its whole mapped size. Debug symbols and the
-# local symbol table are never read by anything on the scored path — nothing
-# unwinds (`panic = "abort"`) and no backtrace is printed — so they are pure
-# per-spawn weight. Stripping them cannot change what any instruction does.
-strip = "symbols"
-
-# bench/build.rs constructs and serializes the five startup circuits at
-# compile time. Build scripts default to opt-level 0, which would turn that
-# few-second construction into minutes of untimed-but-annoying work; compile
-# the build-dependency graph optimized instead.
-[profile.release.build-override]
-opt-level = 3
-
-[profile.dev.build-override]
-opt-level = 3

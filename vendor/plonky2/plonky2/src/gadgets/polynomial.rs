@@ -8,7 +8,7 @@ use crate::iop::target::Target;
 use crate::plonk::circuit_builder::CircuitBuilder;
 use crate::util::reducing::ReducingFactorTarget;
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolynomialCoeffsExtTarget<const D: usize>(pub Vec<ExtensionTarget<D>>);
 
 impl<const D: usize> PolynomialCoeffsExtTarget<D> {

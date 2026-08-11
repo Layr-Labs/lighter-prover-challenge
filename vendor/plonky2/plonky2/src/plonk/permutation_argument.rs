@@ -15,82 +15,7 @@ use crate::iop::wire::Wire;
 /// placement moves. Flip to `false` to restore the previous sequential-outer schedule exactly.
 const OUTER_PARALLEL_SIGMA_COLUMNS: bool = false;
 
-/// Derive one bit per routed `(row, column)` position, in row-major order, that is set exactly
-/// when the position is the only routed member of its copy-constraint component.
-///
-/// `wire_partition` cycles only routed members of each component. Consequently a component with
-/// one routed member maps that member to itself in sigma, even when the component also contains
-/// virtual or advice-wire aliases; a component with two or more routed members has no fixed point.
-/// The compressed representative map therefore contains all the information needed to identify
-/// factors that cancel from the permutation numerator and denominator for every proof.
-///
-/// Cardinalities are saturated at two and packed into two temporary bits per representative. The
-/// retained mask costs one bit per routed position (640 KiB at 80 x 2^16), while peak derivation
-/// scratch is bounded by `representative_map.len() / 4` rather than a `usize` count per target.
-pub fn fixed_routed_wire_mask(
-    representative_map: &[u32],
-    num_wires: usize,
-    num_routed_wires: usize,
-    degree: usize,
-) -> Option<Vec<u8>> {
-    if num_routed_wires > num_wires {
-        return None;
-    }
-    let wire_targets = degree.checked_mul(num_wires)?;
-    if wire_targets > representative_map.len() {
-        return None;
-    }
-    let routed_positions = degree.checked_mul(num_routed_wires)?;
-
-    // Two-bit states: 0 = unseen, 1 = exactly one routed member, 2 = at least two.
-    let mut cardinalities = vec![0u8; representative_map.len().div_ceil(4)];
-    for row in 0..degree {
-        let target_base = row * num_wires;
-        for column in 0..num_routed_wires {
-            let representative = representative_map[target_base + column] as usize;
-            // Stored maps have had every path compressed. Besides rejecting a malformed index,
-            // requiring the representative to be a root prevents an uncompressed map from
-            // splitting one component into several apparent singleton components.
-            if representative >= representative_map.len()
-                || representative_map[representative] as usize != representative
-            {
-                return None;
-            }
-            let byte = representative >> 2;
-            let shift = (representative & 3) << 1;
-            let state = (cardinalities[byte] >> shift) & 3;
-            if state < 2 {
-                cardinalities[byte] =
-                    (cardinalities[byte] & !(3 << shift)) | ((state + 1) << shift);
-            }
-        }
-    }
-
-    let mut fixed = vec![0u8; routed_positions.div_ceil(8)];
-    for row in 0..degree {
-        let target_base = row * num_wires;
-        let routed_base = row * num_routed_wires;
-        for column in 0..num_routed_wires {
-            let representative = representative_map[target_base + column] as usize;
-            let state = (cardinalities[representative >> 2] >> ((representative & 3) << 1)) & 3;
-            if state == 1 {
-                let routed_index = routed_base + column;
-                fixed[routed_index >> 3] |= 1 << (routed_index & 7);
-            }
-        }
-    }
-    Some(fixed)
-}
-
-/// Test a row-major routed-position bit. Out-of-range indices conservatively return `false`.
-#[inline(always)]
-pub(crate) fn fixed_routed_wire(mask: &[u8], routed_index: usize) -> bool {
-    mask.get(routed_index >> 3)
-        .is_some_and(|byte| byte & (1 << (routed_index & 7)) != 0)
-}
-
 /// Disjoint Set Forest data-structure following <https://en.wikipedia.org/wiki/Disjoint-set_data_structure>.
-#[derive(Debug)]
 pub struct Forest {
     /// A map of parent pointers, stored as indices.
     ///
@@ -125,33 +50,6 @@ impl Forest {
             num_routed_wires,
             degree,
         }
-    }
-
-    /// Reconstructs a forest from a stored representative map (the `parents`
-    /// vector of a forest whose paths have already been compressed, i.e.
-    /// `ProverOnlyCircuitData::representative_map`). Intended for loaders that
-    /// re-derive the sigma polynomials without re-running circuit
-    /// construction; the returned forest is exactly the state `sigma_vecs`
-    /// leaves behind after `compress_paths`, so `wire_partition` and
-    /// `get_sigma_polys` produce identical output to the original build.
-    pub fn from_parents(
-        parents: Vec<u32>,
-        num_wires: usize,
-        num_routed_wires: usize,
-        degree: usize,
-    ) -> Self {
-        Self {
-            parents,
-            num_wires,
-            num_routed_wires,
-            degree,
-        }
-    }
-
-    /// Consumes the forest and returns its parent map, undoing
-    /// [`Self::from_parents`] without copying.
-    pub fn into_parents(self) -> Vec<u32> {
-        self.parents
     }
 
     pub(crate) fn target_index(&self, target: Target) -> usize {
@@ -210,17 +108,11 @@ impl Forest {
     /// Compress all paths. After calling this, every `parent` value will point to the node's
     /// representative.
     ///
-    /// The final `parents` vector is identical to calling `find(i)` for every `i`: a node is only
-    /// ever written when it is a non-root (the `continue` guard), and the value written is always
-    /// a root, so roots are stable for the whole pass and every index ends at `root(i)`.
-    ///
-    /// The writeback loop is load-bearing for performance, not just for `i`. A copy-constraint
-    /// class built by repeated `connect` is a *chain*, and the outer loop visits it in the
-    /// direction that walks it from the far end: writing the root into `parents[i]` alone leaves
-    /// every intermediate node still pointing along the chain, so the next index re-walks almost
-    /// the whole thing — quadratic in the class length, over a `parents` array of tens of
-    /// millions of entries. Writing the root into every node on the path as we go makes each
-    /// later node terminate in one hop.
+    /// This dedicated full pass visits every index once and gives it its own direct-root write,
+    /// so the general `find`'s second chain walk (which rewrites intermediate nodes) is
+    /// unnecessary: each intermediate node receives its direct-root assignment when the outer
+    /// loop reaches it. Roots are stable during this pass, so the final `parents` vector is
+    /// identical to calling `find(i)` for every `i`.
     pub(crate) fn compress_paths(&mut self) {
         for i in 0..self.parents.len() {
             let parent = self.parents[i];
@@ -231,13 +123,7 @@ impl Forest {
             while self.parents[root as usize] != root {
                 root = self.parents[root as usize];
             }
-            // Point every node on `i`'s path directly at the root, not just `i`.
-            let mut x = i;
-            while self.parents[x] != root {
-                let next = self.parents[x] as usize;
-                self.parents[x] = root;
-                x = next;
-            }
+            self.parents[i] = root;
         }
     }
 
@@ -273,13 +159,12 @@ impl Forest {
     }
 }
 
-#[derive(Debug)]
 pub struct WirePartition {
     sigma: Vec<u32>,
 }
 
 impl WirePartition {
-    pub fn get_sigma_polys<F: Field>(
+    pub(crate) fn get_sigma_polys<F: Field>(
         &self,
         degree_log: usize,
         k_is: &[F],
@@ -872,74 +757,5 @@ mod tests {
 
         let actual = partition.get_sigma_polys(degree_log, &k_is, &subgroup);
         assert_eq!(actual, expected);
-    }
-
-    /// The runtime cancellation mask is derived from copy-component cardinality, not from a
-    /// target being its own representative. A component may contain virtual/advice aliases and
-    /// still have exactly one routed member; conversely, every routed member of a multi-routed
-    /// component participates in a nontrivial sigma cycle.
-    #[test]
-    fn fixed_routed_mask_is_exactly_sigma_identity_with_aliases() {
-        let (num_wires, num_routed_wires, degree, num_virtual_targets) = (5, 3, 4, 2);
-        let merges = [
-            // Singleton routed component with a virtual alias.
-            (
-                Target::Wire(Wire { row: 0, column: 0 }),
-                Target::VirtualTarget { index: 0 },
-            ),
-            // Singleton routed component with an advice-wire alias.
-            (
-                Target::Wire(Wire { row: 0, column: 1 }),
-                Target::Wire(Wire { row: 2, column: 4 }),
-            ),
-            // Two separate multi-routed components.
-            (
-                Target::Wire(Wire { row: 0, column: 2 }),
-                Target::Wire(Wire { row: 1, column: 0 }),
-            ),
-            (
-                Target::Wire(Wire { row: 1, column: 1 }),
-                Target::Wire(Wire { row: 1, column: 2 }),
-            ),
-            (
-                Target::Wire(Wire { row: 1, column: 2 }),
-                Target::VirtualTarget { index: 1 },
-            ),
-        ];
-        let mut forest = build_forest(
-            num_wires,
-            num_routed_wires,
-            degree,
-            num_virtual_targets,
-            &merges,
-        );
-        forest.compress_paths();
-        let representative_map = forest.parents.clone();
-        let sigma = forest.wire_partition().sigma;
-
-        let mask = fixed_routed_wire_mask(
-            &representative_map,
-            num_wires,
-            num_routed_wires,
-            degree,
-        )
-        .expect("valid compressed representative map");
-        assert_eq!(mask.len(), (degree * num_routed_wires).div_ceil(8));
-
-        for row in 0..degree {
-            for column in 0..num_routed_wires {
-                let row_major = row * num_routed_wires + column;
-                let column_major = column * degree + row;
-                assert_eq!(
-                    fixed_routed_wire(&mask, row_major),
-                    sigma[column_major] as usize == column_major,
-                    "mask/sigma identity mismatch at ({row}, {column})"
-                );
-            }
-        }
-        assert!(fixed_routed_wire(&mask, 0));
-        assert!(fixed_routed_wire(&mask, 1));
-        assert!(!fixed_routed_wire(&mask, 2));
-        assert!(!fixed_routed_wire(&mask, num_routed_wires));
     }
 }

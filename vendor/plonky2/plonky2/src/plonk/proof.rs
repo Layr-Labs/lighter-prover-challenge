@@ -11,8 +11,7 @@ use anyhow::ensure;
 use plonky2_maybe_rayon::*;
 use serde::{Deserialize, Serialize};
 
-use crate::field::extension::{Extendable, FieldExtension};
-use crate::field::polynomial::PolynomialCoeffs;
+use crate::field::extension::Extendable;
 use crate::field::types::Field;
 use crate::fri::oracle::PolynomialBatch;
 use crate::fri::proof::{
@@ -46,7 +45,7 @@ pub struct Proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
     pub opening_proof: FriProof<F, C::Hasher, D>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProofTarget<const D: usize> {
     pub wires_cap: MerkleCapTarget,
     pub plonk_zs_partial_products_cap: MerkleCapTarget,
@@ -292,7 +291,7 @@ pub(crate) struct FriInferredElements<F: RichField + Extendable<D>, const D: usi
     pub Vec<F::Extension>,
 );
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProofWithPublicInputsTarget<const D: usize> {
     pub proof: ProofTarget<D>,
     pub public_inputs: Vec<Target>,
@@ -329,9 +328,7 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         // into a degree-sized extension vector (one allocation plus a full
         // conversion pass per polynomial) before running extension-by-
         // extension Horner. The dot product reads the base coefficients in
-        // place; `Extendable::extension_base_dot_product` defaults to the old
-        // scalar-multiply-and-sum loop and lets concrete fields delay
-        // reductions where their representation makes that safe.
+        // place, and multiplies each by a table entry via `scalar_mul`.
         // Value-exactness: the field is exact, `powers()` produces exactly
         // `z^i`, and `sum c_i z^i` under any association equals Horner's
         // `(..(c_{n-1} z + c_{n-2}) z + ..)`, so every opening is the
@@ -339,54 +336,22 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         let degree = common_data.degree();
         let table = |z: F::Extension| -> Vec<F::Extension> { z.powers().take(degree).collect() };
         let zeta_pows = table(zeta);
-        // `g` is the order-`degree` subgroup generator, so `g^i` is exactly
-        // the process-cached natural-order two-adic subgroup, and
-        // `(g·ζ)^i = g^i · ζ^i` in the exact field. Deriving the shifted
-        // table from the `ζ` table by one elementwise base-field scalar
-        // product deletes the second serial `powers()` chain (a
-        // `degree`-long dependent extension-multiply chain in this serial
-        // opening phase) per proof. Representative-exactness is checkable at
-        // runtime: `LIGHTER_GZETA_TABLE_ASSERT=1` recomputes the old chain
-        // and compares every entry by raw noncanonical limbs.
-        let g_subgroup =
-            crate::plonk::prover::precomputed::two_adic_subgroup::<F>(common_data.degree_bits());
-        let g_zeta_pows: Vec<F::Extension> = zeta_pows
-            .iter()
-            .zip(g_subgroup.iter())
-            .map(|(&zeta_pow, &g_pow)| zeta_pow.scalar_mul(g_pow))
-            .collect();
-        if std::env::var_os("LIGHTER_GZETA_TABLE_ASSERT").is_some() {
-            let reference = table(g * zeta);
-            assert_eq!(reference.len(), g_zeta_pows.len());
-            for (i, (a, b)) in reference.iter().zip(&g_zeta_pows).enumerate() {
-                let a_raw: Vec<u64> = a
-                    .to_basefield_array()
-                    .iter()
-                    .map(|c| c.to_noncanonical_u64())
-                    .collect();
-                let b_raw: Vec<u64> = b
-                    .to_basefield_array()
-                    .iter()
-                    .map(|c| c.to_noncanonical_u64())
-                    .collect();
-                assert_eq!(a_raw, b_raw, "g-zeta table representative mismatch at {i}");
-            }
-        }
-        let eval_polynomials = |pows: &[F::Extension], polynomials: &[PolynomialCoeffs<F>]| {
-            polynomials
-                .par_iter()
-                .map(|p| F::extension_base_dot_product(pows, &p.coeffs))
-                .collect::<Vec<_>>()
-        };
+        let g_zeta_pows = table(g * zeta);
         let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
-            eval_polynomials(pows, &c.polynomials)
+            c.polynomials
+                .par_iter()
+                .map(|p| {
+                    F::extension_base_dot_product(&p.coeffs, pows)
+                })
+                .collect::<Vec<_>>()
         };
         let constants_sigmas_eval = eval_commitment(&zeta_pows, constants_sigmas_commitment);
 
         // `zs_partial_products_lookup_eval` contains the permutation argument polynomials as well as lookup polynomials.
         let zs_partial_products_lookup_eval =
             eval_commitment(&zeta_pows, zs_partial_products_lookup_commitment);
-        let shifted_polynomials = &zs_partial_products_lookup_commitment.polynomials;
+        let zs_partial_products_lookup_next_eval =
+            eval_commitment(&g_zeta_pows, zs_partial_products_lookup_commitment);
         let quotient_polys = eval_commitment(&zeta_pows, quotient_polys_commitment);
 
         Self {
@@ -394,21 +359,13 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
             plonk_sigmas: constants_sigmas_eval[common_data.sigmas_range()].to_vec(),
             wires: eval_commitment(&zeta_pows, wires_commitment),
             plonk_zs: zs_partial_products_lookup_eval[common_data.zs_range()].to_vec(),
-            // Partial-product polynomials are opened only at `zeta`, never at
-            // `g * zeta`; evaluate only the shifted Z polynomials consumed by
-            // the FRI next batch.
-            plonk_zs_next: eval_polynomials(
-                &g_zeta_pows,
-                &shifted_polynomials[common_data.zs_range()],
-            ),
+            plonk_zs_next: zs_partial_products_lookup_next_eval[common_data.zs_range()].to_vec(),
             partial_products: zs_partial_products_lookup_eval[common_data.partial_products_range()]
                 .to_vec(),
             quotient_polys,
             lookup_zs: zs_partial_products_lookup_eval[common_data.lookup_range()].to_vec(),
-            lookup_zs_next: eval_polynomials(
-                &g_zeta_pows,
-                &shifted_polynomials[common_data.lookup_range()],
-            ),
+            lookup_zs_next: zs_partial_products_lookup_next_eval[common_data.lookup_range()]
+                .to_vec(),
         }
     }
     pub(crate) fn to_fri_openings(&self) -> FriOpenings<F, D> {
@@ -455,7 +412,7 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
 }
 
 /// The purported values of each polynomial at a single point.
-#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OpeningSetTarget<const D: usize> {
     pub constants: Vec<ExtensionTarget<D>>,
     pub plonk_sigmas: Vec<ExtensionTarget<D>>,

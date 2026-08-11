@@ -360,207 +360,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     }
 }
 
-/// Generator indices grouped by the representative target they watch.
-///
-/// Representatives are dense target indices, so a CSR offset table turns the prover's frequent
-/// watcher lookup into two adjacent loads and one contiguous slice. The previous `BTreeMap`
-/// required a pointer-chasing tree walk for every newly populated representative.
-#[derive(Eq, PartialEq, Debug)]
-pub struct GeneratorWatchIndex {
-    offsets: Vec<u32>,
-    watchers: Vec<usize>,
-    entries: usize,
-}
-
-impl GeneratorWatchIndex {
-    pub fn from_map(map: BTreeMap<usize, Vec<usize>>) -> Self {
-        let entries = map.values().filter(|watchers| !watchers.is_empty()).count();
-        let Some((&max_representative, _)) = map.last_key_value() else {
-            return Self {
-                offsets: vec![0],
-                watchers: Vec::new(),
-                entries: 0,
-            };
-        };
-
-        let offsets_len = max_representative
-            .checked_add(2)
-            .expect("generator watch representative index overflow");
-        let total_watchers = map.values().map(Vec::len).sum::<usize>();
-        assert!(
-            u32::try_from(total_watchers).is_ok(),
-            "generator watch index exceeds u32 offsets"
-        );
-
-        let mut offsets = vec![0u32; offsets_len];
-        let mut watchers = Vec::with_capacity(total_watchers);
-        let mut entries_iter = map.into_iter().peekable();
-        for representative in 0..=max_representative {
-            offsets[representative] = watchers.len() as u32;
-            if entries_iter
-                .peek()
-                .is_some_and(|(key, _)| *key == representative)
-            {
-                let (_, representative_watchers) = entries_iter.next().unwrap();
-                watchers.extend(representative_watchers);
-            }
-        }
-        offsets[max_representative + 1] = watchers.len() as u32;
-        debug_assert!(entries_iter.next().is_none());
-
-        Self {
-            offsets,
-            watchers,
-            entries,
-        }
-    }
-
-    /// Builds the CSR directly from consecutive, per-generator groups of sorted, distinct
-    /// representative indices. The groups themselves are ordered by generator index.
-    ///
-    /// This is the circuit builder's trusted construction seam. Keeping the transient edge list
-    /// flat avoids a tree node and a separately allocated `Vec` for every watched representative.
-    pub(crate) fn from_sorted_generator_representatives(
-        representatives: &[u32],
-        generator_watch_counts: &[usize],
-    ) -> Self {
-        debug_assert_eq!(
-            generator_watch_counts.iter().sum::<usize>(),
-            representatives.len()
-        );
-        debug_assert!({
-            let mut end = 0usize;
-            generator_watch_counts.iter().all(|&count| {
-                let start = end;
-                end += count;
-                representatives[start..end]
-                    .windows(2)
-                    .all(|pair| pair[0] < pair[1])
-            })
-        });
-
-        let Some(&max_representative) = representatives.iter().max() else {
-            return Self {
-                offsets: vec![0],
-                watchers: Vec::new(),
-                entries: 0,
-            };
-        };
-        let max_representative = max_representative as usize;
-        let offsets_len = max_representative
-            .checked_add(2)
-            .expect("generator watch representative index overflow");
-        assert!(
-            u32::try_from(representatives.len()).is_ok(),
-            "generator watch index exceeds u32 offsets"
-        );
-
-        // First form cumulative end offsets. Counts live in slot `representative + 1`, so the
-        // prefix sum is already the normal CSR layout before it is reused as a fill cursor below.
-        let mut offsets = vec![0u32; offsets_len];
-        let mut entries = 0usize;
-        for &representative in representatives {
-            let count = &mut offsets[representative as usize + 1];
-            entries += usize::from(*count == 0);
-            *count += 1;
-        }
-        let mut total = 0u32;
-        for offset in &mut offsets[1..] {
-            total += *offset;
-            *offset = total;
-        }
-        debug_assert_eq!(total as usize, representatives.len());
-
-        // Fill each representative's slice backwards while visiting generators backwards. This
-        // preserves the old ascending generator order without a second cursor array. Afterwards,
-        // each end cursor has become the next representative's start, so one overlapping shift
-        // restores the original CSR offsets.
-        let mut watchers = vec![0usize; representatives.len()];
-        let mut group_end = representatives.len();
-        for (generator, &count) in generator_watch_counts.iter().enumerate().rev() {
-            let group_start = group_end - count;
-            for &representative in &representatives[group_start..group_end] {
-                let cursor = &mut offsets[representative as usize + 1];
-                *cursor -= 1;
-                watchers[*cursor as usize] = generator;
-            }
-            group_end = group_start;
-        }
-        debug_assert_eq!(group_end, 0);
-        offsets.copy_within(2.., 1);
-        *offsets.last_mut().unwrap() = total;
-
-        Self {
-            offsets,
-            watchers,
-            entries,
-        }
-    }
-
-    /// The raw CSR offset table (`representative -> [start, end)` into
-    /// [`Self::watchers`]). Exposed for compact serialization of the index.
-    pub fn offsets(&self) -> &[u32] {
-        &self.offsets
-    }
-
-    /// The flat, concatenated watcher lists indexed by [`Self::offsets`].
-    pub fn watchers(&self) -> &[usize] {
-        &self.watchers
-    }
-
-    /// Rebuilds the index from its raw CSR parts (as exposed by
-    /// [`Self::offsets`] and [`Self::watchers`]); the `entries` count is a pure
-    /// function of the offsets and is re-derived. The offsets must be
-    /// monotonically nondecreasing, start at 0 and end at `watchers.len()`,
-    /// exactly as [`Self::from_map`] produces them.
-    pub fn from_parts(offsets: Vec<u32>, watchers: Vec<usize>) -> Self {
-        assert!(!offsets.is_empty(), "watch index offsets must be non-empty");
-        assert_eq!(offsets[0], 0, "watch index offsets must start at zero");
-        assert_eq!(
-            *offsets.last().unwrap() as usize,
-            watchers.len(),
-            "watch index offsets must cover the watcher list"
-        );
-        let mut entries = 0usize;
-        for bounds in offsets.windows(2) {
-            assert!(bounds[0] <= bounds[1], "watch index offsets must be sorted");
-            if bounds[0] != bounds[1] {
-                entries += 1;
-            }
-        }
-        Self {
-            offsets,
-            watchers,
-            entries,
-        }
-    }
-
-    #[inline]
-    pub fn get(&self, representative: &usize) -> Option<&[usize]> {
-        let end_index = representative.checked_add(1)?;
-        let (&start, &end) = (
-            self.offsets.get(*representative)?,
-            self.offsets.get(end_index)?,
-        );
-        (start != end).then(|| &self.watchers[start as usize..end as usize])
-    }
-
-    pub const fn len(&self) -> usize {
-        self.entries
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (usize, &[usize])> {
-        self.offsets
-            .windows(2)
-            .enumerate()
-            .filter_map(|(representative, bounds)| {
-                let start = bounds[0] as usize;
-                let end = bounds[1] as usize;
-                (start != end).then(|| (representative, &self.watchers[start..end]))
-            })
-    }
-}
-
 /// Circuit data required by the prover, but not the verifier.
 #[derive(Eq, PartialEq, Debug)]
 pub struct ProverOnlyCircuitData<
@@ -571,7 +370,7 @@ pub struct ProverOnlyCircuitData<
     pub generators: Vec<WitnessGeneratorRef<F, D>>,
     /// Generator indices (within the `Vec` above), indexed by the representative of each target
     /// they watch.
-    pub generator_indices_by_watches: GeneratorWatchIndex,
+    pub generator_indices_by_watches: BTreeMap<usize, Vec<usize>>,
     /// For each generator (indexed as in `generators`), the number of *distinct* representatives
     /// it watches — equivalently, the number of entries of `generator_indices_by_watches` whose
     /// watcher list contains that generator.
@@ -597,14 +396,6 @@ pub struct ProverOnlyCircuitData<
     /// zero-extended at every indexing site. The serialized encoding keeps the legacy 8-byte
     /// per-entry format.
     pub representative_map: Vec<u32>,
-    /// One bit per routed `(row, column)` position, in row-major order. A set bit means that the
-    /// position is the sole routed member of its copy-constraint component, hence its sigma
-    /// permutation target is itself and its permutation factor cancels for every proof.
-    ///
-    /// Runtime-only: this is derived from [`Self::representative_map`] during circuit construction
-    /// and reconstructed during deserialization, so it changes neither the serialized format nor
-    /// the circuit digest.
-    pub fixed_routed_wires: Vec<u8>,
     /// Pre-computed roots for faster FFT.
     pub fft_root_table: Option<FftRootTable<F>>,
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to
@@ -614,21 +405,6 @@ pub struct ProverOnlyCircuitData<
     pub lookup_rows: Vec<LookupWire>,
     /// A vector of (looking_in, looking_out) pairs for each lookup table index.
     pub lut_to_lookups: Vec<Lookup>,
-    /// Quotient-domain values of the constants and sigma columns (PolyMajor:
-    /// all `constants_range().len() + sigmas_range().len()` columns, each a
-    /// `constants_sigmas_quotient_domain`-length slice, constants first), plus
-    /// the gather parameters they were extracted with. The constants and sigma
-    /// polynomials are circuit-fixed, so these strided LDE values are
-    /// identical for every proof of this circuit; the quotient batch loop
-    /// copies from here instead of re-walking the LDE. `None` when the
-    /// commitment is not column-backed or the cache would be too large.
-    /// Runtime-only: not serialized (the quotient path falls back to the
-    /// strided gather on a deserialized circuit).
-    pub constants_sigmas_quotient_cache: Option<Vec<F>>,
-    /// Stride used to extract [`Self::constants_sigmas_quotient_cache`].
-    pub constants_sigmas_quotient_step: usize,
-    /// Quotient domain size used to extract [`Self::constants_sigmas_quotient_cache`].
-    pub constants_sigmas_quotient_domain: usize,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
@@ -932,37 +708,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
 /// is intentionally missing certain fields, such as `CircuitConfig`, because we support only a
 /// limited form of dynamic inner circuits. We can't practically make things like the wire count
 /// dynamic, at least not without setting a maximum wire count and paying for the worst case.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifierCircuitTarget {
     /// A commitment to each constant polynomial and each permutation polynomial.
     pub constants_sigmas_cap: MerkleCapTarget,
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to
     /// seed Fiat-Shamir.
     pub circuit_digest: HashOutTarget,
-}
-
-#[cfg(test)]
-mod generator_watch_index_tests {
-    use super::GeneratorWatchIndex;
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn sparse_watch_index_preserves_lists_and_empty_representatives() {
-        let map = BTreeMap::from([(1usize, vec![2usize, 5]), (4, vec![3])]);
-        let index = GeneratorWatchIndex::from_map(map);
-
-        assert_eq!(index.len(), 2);
-        assert_eq!(index.get(&0), None);
-        assert_eq!(index.get(&1), Some([2usize, 5].as_slice()));
-        assert_eq!(index.get(&2), None);
-        assert_eq!(index.get(&3), None);
-        assert_eq!(index.get(&4), Some([3usize].as_slice()));
-        assert_eq!(index.get(&5), None);
-
-        let entries = index
-            .iter()
-            .map(|(representative, watchers)| (representative, watchers.to_vec()))
-            .collect::<Vec<_>>();
-        assert_eq!(entries, vec![(1, vec![2, 5]), (4, vec![3])]);
-    }
 }

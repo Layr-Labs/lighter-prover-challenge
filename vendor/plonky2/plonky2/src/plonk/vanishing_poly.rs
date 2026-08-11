@@ -6,14 +6,12 @@ use plonky2_field::polynomial::PolynomialCoeffs;
 
 use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
-use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
-use crate::gates::gate::InterleavePairGate;
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
-use crate::gates::selectors::{LookupSelectors, UNUSED_SELECTOR};
+use crate::gates::selectors::LookupSelectors;
 use crate::hash::hash_types::RichField;
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::Target;
@@ -172,18 +170,11 @@ pub(crate) fn eval_vanishing_poly<F: RichField + Extendable<D>, const D: usize>(
 pub(crate) struct VanishingScratch<F> {
     pub numerator_values: Vec<F>,
     pub denominator_values: Vec<F>,
-    /// Second challenge's product rows in the specialized two-challenge
-    /// column evaluator. Kept separate so each challenge preserves its exact
-    /// left-to-right multiplication order while sharing column loads.
-    pub numerator_values_second: Vec<F>,
-    pub denominator_values_second: Vec<F>,
     pub vanishing_z_1_terms: Vec<F>,
     pub vanishing_partial_products_terms: Vec<F>,
     pub vanishing_all_lookup_terms: Vec<F>,
     pub lookup_selectors: Vec<F>,
     pub constraint_terms_batch: Vec<F>,
-    /// Reused selector-filter buffer across batches (survivor-list package).
-    pub gate_filters: Vec<F>,
 }
 
 /// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
@@ -217,300 +208,17 @@ pub(crate) enum PermutationBatch<'a, F> {
     },
 }
 
-const INTERLEAVE_PAIR_WIRES: usize = 136;
-const INTERLEAVE_PAIR_CONSTRAINTS: usize = 136;
-const INTERLEAVE_OPS: usize = 4;
-const UNINTERLEAVE_OPS: usize = 2;
-const INTERLEAVE_PAIR_STACK_BATCH: usize = 32;
-
-/// Proof-local recognition of the exact CPU-owned pair used by the ranked
-/// final-block circuit. The plan is evaluator-only and changes no circuit data.
-pub(crate) struct InterleavePairPlan {
-    pub(crate) interleave_index: usize,
-    pub(crate) uninterleave_index: usize,
-}
-
-/// Returns a plan only when both exact shapes remain in the CPU survivor set.
-/// If either gate moves to another backend, is duplicated, or changes shape,
-/// both gates retain their ordinary independent evaluators.
-pub(crate) fn interleave_pair_plan<F: RichField + Extendable<D>, const D: usize>(
-    common_data: &CommonCircuitData<F, D>,
-    cpu_gate_indices: &[usize],
-) -> Option<InterleavePairPlan> {
-    let mut tagged = cpu_gate_indices.iter().filter_map(|&index| {
-        common_data.gates[index]
-            .0
-            .interleave_pair_gate()
-            .map(|kind| (index, kind))
-    });
-    let first = tagged.next()?;
-    let second = tagged.next()?;
-    if tagged.next().is_some() {
-        return None;
-    }
-
-    let (interleave_index, uninterleave_index) = match (first, second) {
-        (
-            (
-                interleave_index,
-                InterleavePairGate::Interleave {
-                    num_ops: INTERLEAVE_OPS,
-                },
-            ),
-            (
-                uninterleave_index,
-                InterleavePairGate::UninterleaveToU32 {
-                    num_ops: UNINTERLEAVE_OPS,
-                },
-            ),
-        ) if interleave_index < uninterleave_index => (interleave_index, uninterleave_index),
-        _ => return None,
-    };
-
-    [interleave_index, uninterleave_index]
-        .into_iter()
-        .all(|index| {
-            let gate = &common_data.gates[index].0;
-            gate.num_wires() == INTERLEAVE_PAIR_WIRES
-                && gate.num_constraints() == INTERLEAVE_PAIR_CONSTRAINTS
-        })
-        .then_some(InterleavePairPlan {
-            interleave_index,
-            uninterleave_index,
-        })
-}
-
-/// Computes one selector filter column in the same factor order as
-/// `Gate::eval_filtered_base_batch` without consuming the constants prefix.
-fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
-    common_data: &CommonCircuitData<F, D>,
-    vars_batch: EvaluationVarsBaseBatch<F>,
-    gate_index: usize,
-    output: &mut [F],
-) {
-    let batch_size = vars_batch.len();
-    debug_assert_eq!(output.len(), batch_size);
-    let selector_index = common_data.selectors_info.selector_indices[gate_index];
-    let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
-    let mut factors = common_data.selectors_info.groups[selector_index]
-        .clone()
-        .filter(|&index| index != gate_index)
-        .chain((common_data.selectors_info.num_selectors() > 1).then_some(UNUSED_SELECTOR));
-
-    if let Some(index) = factors.next() {
-        let constant = F::from_canonical_usize(index);
-        for (filter, &selector) in output.iter_mut().zip(selector_col) {
-            *filter = constant - selector;
-        }
-    } else {
-        output.fill(F::ONE);
-    }
-    for index in factors {
-        let constant = F::from_canonical_usize(index);
-        for (filter, &selector) in output.iter_mut().zip(selector_col) {
-            *filter *= constant - selector;
-        }
-    }
-}
-
-/// Evaluates the exact Interleave(4) + Uninterleave(2) pair with one traversal
-/// of their shared 128 bit columns while retaining the ordinary 136-row dense
-/// matrix and its existing alpha reducer.
-///
-/// The first 32-bit half of each uninterleave operation lands two rows after
-/// the corresponding interleave range row, so those values use two packed
-/// MACs. The second half lands on the same row and uses one packed MAC with the
-/// pre-summed filters. No range column survives past the current bit.
-fn eval_interleave_pair_dense_fused<F: Field>(
-    wires: &[F],
-    batch_size: usize,
-    interleave_filter: &[F],
-    uninterleave_filter: &[F],
-    summed_filter: &[F],
-    combined: &mut [F],
-) {
-    debug_assert_eq!(interleave_filter.len(), batch_size);
-    debug_assert_eq!(uninterleave_filter.len(), batch_size);
-    debug_assert_eq!(summed_filter.len(), batch_size);
-    debug_assert!(wires.len() >= INTERLEAVE_PAIR_WIRES * batch_size);
-    debug_assert!(combined.len() >= INTERLEAVE_PAIR_CONSTRAINTS * batch_size);
-
-    const STACK_COLS: usize = 10;
-    let required = STACK_COLS * batch_size;
-    let mut stack = [F::ZERO; STACK_COLS * INTERLEAVE_PAIR_STACK_BATCH];
-    let mut heap;
-    let scratch: &mut [F] = if batch_size <= INTERLEAVE_PAIR_STACK_BATCH {
-        &mut stack[..required]
-    } else {
-        heap = vec![F::ZERO; required];
-        &mut heap
-    };
-    let (x_accumulators, rest) = scratch.split_at_mut(INTERLEAVE_OPS * batch_size);
-    let (parity_accumulators, rest) = rest.split_at_mut(4 * batch_size);
-    let (base4_accumulator, range) = rest.split_at_mut(batch_size);
-    parity_accumulators.fill(F::ZERO);
-
-    let base2 = F::from_canonical_usize(2);
-    let base4 = F::from_canonical_usize(4);
-
-    for operation in 0..INTERLEAVE_OPS {
-        let interleave_row = operation * 34;
-        let bit_offset = operation * 32;
-        let x = &mut x_accumulators[operation * batch_size..(operation + 1) * batch_size];
-        x.fill(F::ZERO);
-        base4_accumulator.fill(F::ZERO);
-
-        for bit_index in 0..32 {
-            let bit_number = bit_offset + bit_index;
-            let bit_col = &wires[(8 + bit_number) * batch_size..][..batch_size];
-            let parity_index = 2 * (operation / 2) + bit_index % 2;
-            let parity = &mut parity_accumulators
-                [parity_index * batch_size..(parity_index + 1) * batch_size];
-            for point in 0..batch_size {
-                let bit = bit_col[point];
-                x[point] = x[point] * base2 + bit;
-                base4_accumulator[point] = base4_accumulator[point] * base4 + bit;
-                parity[point] = parity[point] * base2 + bit;
-                range[point] = bit * (bit - F::ONE);
-            }
-
-            let row = interleave_row + 2 + bit_index;
-            let interleave_output = &mut combined[row * batch_size..(row + 1) * batch_size];
-            if operation % 2 == 0 {
-                batch_multiply_add_inplace(interleave_output, range, interleave_filter);
-                let uninterleave_row = row + 2;
-                let uninterleave_output = &mut combined
-                    [uninterleave_row * batch_size..(uninterleave_row + 1) * batch_size];
-                batch_multiply_add_inplace(uninterleave_output, range, uninterleave_filter);
-            } else {
-                batch_multiply_add_inplace(interleave_output, range, summed_filter);
-            }
-        }
-
-        let x_col = &wires[(2 * operation) * batch_size..][..batch_size];
-        for point in 0..batch_size {
-            range[point] = x[point] - x_col[point];
-        }
-        let output = &mut combined
-            [interleave_row * batch_size..(interleave_row + 1) * batch_size];
-        batch_multiply_add_inplace(output, range, interleave_filter);
-
-        let spread_col = &wires[(2 * operation + 1) * batch_size..][..batch_size];
-        for point in 0..batch_size {
-            range[point] = base4_accumulator[point] - spread_col[point];
-        }
-        let output = &mut combined
-            [(interleave_row + 1) * batch_size..(interleave_row + 2) * batch_size];
-        batch_multiply_add_inplace(output, range, interleave_filter);
-    }
-
-    let split = F::from_canonical_u64(1 << 32u64);
-    let u32_max = F::from_canonical_u32(u32::MAX);
-    for operation in 0..UNINTERLEAVE_OPS {
-        let row = operation * 68;
-        let high = &x_accumulators[(2 * operation) * batch_size..(2 * operation + 1) * batch_size];
-        let low =
-            &x_accumulators[(2 * operation + 1) * batch_size..(2 * operation + 2) * batch_size];
-        let evens =
-            &parity_accumulators[(2 * operation) * batch_size..(2 * operation + 1) * batch_size];
-        let odds = &parity_accumulators
-            [(2 * operation + 1) * batch_size..(2 * operation + 2) * batch_size];
-        let interleaved = &wires[(4 * operation) * batch_size..][..batch_size];
-        let x_evens = &wires[(4 * operation + 1) * batch_size..][..batch_size];
-        let x_odds = &wires[(4 * operation + 2) * batch_size..][..batch_size];
-        let inverse = &wires[(4 * operation + 3) * batch_size..][..batch_size];
-
-        for point in 0..batch_size {
-            range[point] =
-                (inverse[point] * (u32_max - high[point]) - F::ONE) * low[point];
-        }
-        let output = &mut combined[row * batch_size..(row + 1) * batch_size];
-        batch_multiply_add_inplace(output, range, uninterleave_filter);
-
-        for point in 0..batch_size {
-            range[point] = high[point] * split + low[point] - interleaved[point];
-        }
-        let output = &mut combined[(row + 1) * batch_size..(row + 2) * batch_size];
-        batch_multiply_add_inplace(output, range, uninterleave_filter);
-
-        for point in 0..batch_size {
-            range[point] = evens[point] - x_evens[point];
-        }
-        let output = &mut combined[(row + 2) * batch_size..(row + 3) * batch_size];
-        batch_multiply_add_inplace(output, range, uninterleave_filter);
-
-        for point in 0..batch_size {
-            range[point] = odds[point] - x_odds[point];
-        }
-        let output = &mut combined[(row + 3) * batch_size..(row + 4) * batch_size];
-        batch_multiply_add_inplace(output, range, uninterleave_filter);
-    }
-}
-
 fn reduce_gate_constraints_base_batch<F: Field>(
     constraint_terms_batch: &[F],
     batch_size: usize,
     alphas: &[F],
     res_out: &mut [F],
-    res_out_is_zero_seed: bool,
 ) {
     debug_assert!(batch_size > 0);
     debug_assert_eq!(constraint_terms_batch.len() % batch_size, 0);
     debug_assert_eq!(res_out.len(), batch_size * alphas.len());
 
-    // When `res_out` is known to be an all-zero (or uninitialized) seed, the
-    // first reversed row can be *assigned* rather than accumulated: with
-    // `*value == F::ZERO`, `term.multiply_accumulate(ZERO, alpha)` is
-    // `reduce128(term as u128)`, whose high half is zero, so `reduce128`
-    // returns `term` unchanged — a raw-limb-identical copy, not merely a
-    // field-value-identical one. Assigning it makes every slot of `res_out`
-    // stored before it is read, which lets the quotient caller skip
-    // zero-filling the accumulator entirely, and drops one multiply per
-    // (point, challenge) on that row.
-    //
-    // This is NOT valid for a caller that passes a nonzero running
-    // accumulator, which the general contract permits, so it is opt-in.
-    let mut rows = constraint_terms_batch.chunks_exact(batch_size).rev();
-    if alphas.len() == 2 {
-        // Production always uses two challenges: load alphas once and walk
-        // point-major output in exact pairs instead of rediscovering the
-        // runtime slice length for every row and point.
-        let alpha_0 = alphas[0];
-        let alpha_1 = alphas[1];
-        if res_out_is_zero_seed {
-            match rows.next() {
-                Some(first_row) => {
-                    for (&term, result) in first_row.iter().zip(res_out.chunks_exact_mut(2)) {
-                        result[0] = term;
-                        result[1] = term;
-                    }
-                }
-                None => res_out.fill(F::ZERO),
-            }
-        }
-        for constraint_row in rows {
-            for (&term, result) in constraint_row.iter().zip(res_out.chunks_exact_mut(2)) {
-                result[0] = term.multiply_accumulate(result[0], alpha_0);
-                result[1] = term.multiply_accumulate(result[1], alpha_1);
-            }
-        }
-        return;
-    }
-
-    if res_out_is_zero_seed {
-        match rows.next() {
-            Some(first_row) => {
-                for (point, &term) in first_row.iter().enumerate() {
-                    let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
-                    result.fill(term);
-                }
-            }
-            // No constraint rows: preserve the "every slot written" contract.
-            None => res_out.fill(F::ZERO),
-        }
-    }
-
-    for constraint_row in rows {
+    for constraint_row in constraint_terms_batch.chunks_exact(batch_size).rev() {
         for (point, &term) in constraint_row.iter().enumerate() {
             let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
             for (value, &alpha) in result.iter_mut().zip(alphas) {
@@ -518,11 +226,6 @@ fn reduce_gate_constraints_base_batch<F: Field>(
             }
         }
     }
-}
-
-#[inline(always)]
-fn permutation_factor_fma<F: Field>(wire: F, beta: F, point: F, gamma: F) -> F {
-    wire.multiply_accumulate(beta, point) + gamma
 }
 
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
@@ -544,11 +247,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     beta_k_is: &[F],
     deltas: &[F],
     alphas: &[F],
-    cpu_gate_indices: &[usize],
-    cpu_num_gate_constraints: usize,
-    interleave_pair: Option<&InterleavePairPlan>,
-    permutation_products_offloaded: bool,
-    permutation_gate_scales: &[F],
     z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
     scratch: &mut VanishingScratch<F>,
@@ -572,63 +270,20 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     let num_gate_constraints = common_data.num_gate_constraints;
 
-    evaluate_gate_constraints_base_batch_into_cpu_gates::<F, D>(
+    evaluate_gate_constraints_base_batch_into::<F, D>(
         common_data,
         vars_batch,
         &mut scratch.constraint_terms_batch,
-        cpu_gate_indices,
-        &mut scratch.gate_filters,
-        cpu_num_gate_constraints,
-        interleave_pair,
     );
     let constraint_terms_batch = &scratch.constraint_terms_batch;
-    // `<=`, not `==`: the buffer is sized by the widest gate still on the CPU,
-    // which is at most `num_gate_constraints` and strictly less whenever a
-    // widest gate has been offloaded.
-    debug_assert!(constraint_terms_batch.len() <= n * num_gate_constraints);
-    debug_assert_eq!(constraint_terms_batch.len() % n, 0);
+    debug_assert!(constraint_terms_batch.len() == n * num_gate_constraints);
 
     let num_challenges = common_data.config.num_challenges;
     let num_routed_wires = common_data.config.num_routed_wires;
     debug_assert_eq!(betas.len(), num_challenges);
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
-    reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out, true);
-
-    if permutation_products_offloaded {
-        assert!(!has_lookup, "lookup permutation products stay on the CPU");
-        let PermutationBatch::Cols {
-            zs_partial_products_cols,
-            ..
-        } = perm
-        else {
-            unreachable!("Metal permutation offload requires column-major inputs")
-        };
-        assert!(zs_partial_products_cols.len() >= num_challenges * n);
-        // Global constraint order is
-        //   [z1_0, z1_1, partial(0,0..chunks), partial(1,0..chunks), gates...].
-        // The Metal job emits only the partial rows at their powers 2..P-1.
-        // Shift the CPU gate-only Horner polynomial by P, then add the two
-        // inexpensive L_0 rows here. This deletes every routed-wire/sigma/
-        // partial-product traversal from the CPU without moving a transcript
-        // barrier or changing an alpha exponent.
-        assert_eq!(permutation_gate_scales.len(), num_challenges);
-        for k in 0..n {
-            let l_0_x = z_h_on_coset.eval_l_0(indices_batch[k], xs_batch[k]);
-            let z1_0 = l_0_x * zs_partial_products_cols[k].sub_one();
-            let z1_1 = l_0_x * zs_partial_products_cols[n + k].sub_one();
-            let point = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
-            for ((&alpha, &gate_scale), value) in alphas
-                .iter()
-                .zip(permutation_gate_scales)
-                .zip(point.iter_mut())
-            {
-                let gate_terms = *value * gate_scale;
-                *value = z1_0 + z1_1 * alpha + gate_terms;
-            }
-        }
-        return;
-    }
+    reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out);
 
     let numerator_values = &mut scratch.numerator_values;
     let denominator_values = &mut scratch.denominator_values;
@@ -697,8 +352,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
         let num_prod = &mut scratch.numerator_values;
         let den_prod = &mut scratch.denominator_values;
-        let num_prod_second = &mut scratch.numerator_values_second;
-        let den_prod_second = &mut scratch.denominator_values_second;
 
         // The accumulator chain for challenge `i` is the column sequence
         // [Z_i(x) | partials i*num_prods..(i+1)*num_prods | Z_i(gx)], read
@@ -723,111 +376,47 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             for k in 0..n {
                 z1_row[k] = l_0_xs[k] * z_col[k].sub_one();
             }
-        }
 
-        if num_challenges == 2 {
-            // Both production challenges traverse the same routed-wire,
-            // sigma and point columns. Keep their arithmetic chains separate,
-            // but update them side by side so every shared input is loaded
-            // once. Operations within either challenge retain the old exact
-            // j-ascending order and expression association.
-            let beta_0 = betas[0];
-            let beta_1 = betas[1];
-            let gamma_0 = gammas[0];
-            let gamma_1 = gammas[1];
             for c in 0..num_chunks {
                 let j_start = c * chunk_size;
                 let j_end = ((c + 1) * chunk_size).min(num_routed_wires);
+                let beta = betas[i];
+                let gamma = gammas[i];
 
+                // The first factor of each chunk lands by direct assignment:
+                // the reference path multiplies it into `ONE`, and
+                // `ONE * a == a` bitwise for Goldilocks (`reduce128` is the
+                // identity on inputs `< 2^64`), so skipping that multiply —
+                // and the resize-to-ONE memset — changes no value.
                 num_prod.clear();
                 den_prod.clear();
-                num_prod_second.clear();
-                den_prod_second.clear();
                 {
                     let wire_col = &wires[j_start * n..][..n];
                     let sigma_col = &s_sigmas_cols[j_start * n..][..n];
-                    let beta_k_0 = beta_k_is[j_start];
-                    let beta_k_1 = beta_k_is[num_routed_wires + j_start];
+                    let beta_k_i = beta_k_is[i * num_routed_wires + j_start];
                     for k in 0..n {
-                        let wire = wire_col[k];
-                        let sigma = sigma_col[k];
-                        let x = xs_batch[k];
-                        num_prod.push(permutation_factor_fma(wire, beta_k_0, x, gamma_0));
-                        den_prod.push(permutation_factor_fma(wire, beta_0, sigma, gamma_0));
-                        num_prod_second.push(permutation_factor_fma(wire, beta_k_1, x, gamma_1));
-                        den_prod_second.push(permutation_factor_fma(wire, beta_1, sigma, gamma_1));
+                        num_prod.push(wire_col[k] + beta_k_i * xs_batch[k] + gamma);
+                        den_prod.push(wire_col[k] + beta * sigma_col[k] + gamma);
                     }
                 }
                 for j in j_start + 1..j_end {
                     let wire_col = &wires[j * n..][..n];
                     let sigma_col = &s_sigmas_cols[j * n..][..n];
-                    let beta_k_0 = beta_k_is[j];
-                    let beta_k_1 = beta_k_is[num_routed_wires + j];
+                    let beta_k_i = beta_k_is[i * num_routed_wires + j];
                     for k in 0..n {
-                        let wire = wire_col[k];
-                        let sigma = sigma_col[k];
-                        let x = xs_batch[k];
-                        num_prod[k] *= permutation_factor_fma(wire, beta_k_0, x, gamma_0);
-                        den_prod[k] *= permutation_factor_fma(wire, beta_0, sigma, gamma_0);
-                        num_prod_second[k] *= permutation_factor_fma(wire, beta_k_1, x, gamma_1);
-                        den_prod_second[k] *= permutation_factor_fma(wire, beta_1, sigma, gamma_1);
+                        num_prod[k] *= wire_col[k] + beta_k_i * xs_batch[k] + gamma;
+                        den_prod[k] *= wire_col[k] + beta * sigma_col[k] + gamma;
                     }
                 }
 
-                let row_0 = (num_challenges + c) * n;
-                let row_1 = (num_challenges + num_chunks + c) * n;
-                let (rows_before_1, rows_from_1) = term_rows.split_at_mut(row_1);
-                let row_0 = &mut rows_before_1[row_0..row_0 + n];
-                let row_1 = &mut rows_from_1[..n];
-                let prev_0 = acc_col(0, c);
-                let next_0 = acc_col(0, c + 1);
-                let prev_1 = acc_col(1, c);
-                let next_1 = acc_col(1, c + 1);
+                let row =
+                    &mut term_rows[(num_challenges + i * num_chunks + c) * n..][..n];
+                // Chunk c reads accumulator column c as prev and column c+1
+                // as next.
+                let prev_col = acc_col(i, c);
+                let next_col = acc_col(i, c + 1);
                 for k in 0..n {
-                    row_0[k] = prev_0[k] * num_prod[k] - next_0[k] * den_prod[k];
-                    row_1[k] = prev_1[k] * num_prod_second[k]
-                        - next_1[k] * den_prod_second[k];
-                }
-            }
-        } else {
-            for i in 0..num_challenges {
-                for c in 0..num_chunks {
-                    let j_start = c * chunk_size;
-                    let j_end = ((c + 1) * chunk_size).min(num_routed_wires);
-                    let beta = betas[i];
-                    let gamma = gammas[i];
-
-                    // The first factor of each chunk lands by direct
-                    // assignment; multiplying it into `ONE` is a raw-limb
-                    // identity for Goldilocks.
-                    num_prod.clear();
-                    den_prod.clear();
-                    {
-                        let wire_col = &wires[j_start * n..][..n];
-                        let sigma_col = &s_sigmas_cols[j_start * n..][..n];
-                        let beta_k_i = beta_k_is[i * num_routed_wires + j_start];
-                        for k in 0..n {
-                            num_prod.push(wire_col[k] + beta_k_i * xs_batch[k] + gamma);
-                            den_prod.push(wire_col[k] + beta * sigma_col[k] + gamma);
-                        }
-                    }
-                    for j in j_start + 1..j_end {
-                        let wire_col = &wires[j * n..][..n];
-                        let sigma_col = &s_sigmas_cols[j * n..][..n];
-                        let beta_k_i = beta_k_is[i * num_routed_wires + j];
-                        for k in 0..n {
-                            num_prod[k] *= wire_col[k] + beta_k_i * xs_batch[k] + gamma;
-                            den_prod[k] *= wire_col[k] + beta * sigma_col[k] + gamma;
-                        }
-                    }
-
-                    let row =
-                        &mut term_rows[(num_challenges + i * num_chunks + c) * n..][..n];
-                    let prev_col = acc_col(i, c);
-                    let next_col = acc_col(i, c + 1);
-                    for k in 0..n {
-                        row[k] = prev_col[k] * num_prod[k] - next_col[k] * den_prod[k];
-                    }
+                    row[k] = prev_col[k] * num_prod[k] - next_col[k] * den_prod[k];
                 }
             }
         }
@@ -846,8 +435,6 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         l_0_xs.clear();
         num_prod.clear();
         den_prod.clear();
-        num_prod_second.clear();
-        den_prod_second.clear();
         return;
     }
 
@@ -1355,155 +942,10 @@ pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, c
     vars_batch: EvaluationVarsBaseBatch<F>,
     constraints_batch: &mut Vec<F>,
 ) {
-    evaluate_gate_constraints_base_batch_into_excluding(
-        common_data,
-        vars_batch,
-        constraints_batch,
-        None,
-    );
-}
-
-/// Number of shared constraint rows the CPU can still write. Every gate
-/// writes rows `[0, num_constraints())` from row zero, so excluding a gate
-/// leaves a suffix of the shared row space identically zero. This is the
-/// constraint-row analogue of `cpu_num_wires` in `plonk/prover.rs`, and like
-/// it, it must be computed once per proof rather than per batch.
-pub(crate) fn cpu_gate_constraint_rows<F: RichField + Extendable<D>, const D: usize>(
-    common_data: &CommonCircuitData<F, D>,
-    excluded_gate_indices: &[usize],
-) -> usize {
-    common_data
-        .gates
-        .iter()
-        .enumerate()
-        .filter(|(gate_index, _)| !excluded_gate_indices.contains(gate_index))
-        .map(|(_, gate)| gate.0.num_constraints())
-        .max()
-        .unwrap_or(0)
-}
-
-/// Internal quotient variant that leaves one gate type's filtered
-/// contribution at zero so a specialized backend can add it separately.
-pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding<
-    F: RichField + Extendable<D>,
-    const D: usize,
->(
-    common_data: &CommonCircuitData<F, D>,
-    vars_batch: EvaluationVarsBaseBatch<F>,
-    constraints_batch: &mut Vec<F>,
-    excluded_gate_index: Option<usize>,
-) {
-    // Cold path: not the per-batch quotient loop, so computing the row count
-    // here rather than hoisting it costs nothing.
-    match excluded_gate_index {
-        Some(index) => {
-            let excluded = core::slice::from_ref(&index);
-            evaluate_gate_constraints_base_batch_into_excluding_many(
-                common_data,
-                vars_batch,
-                constraints_batch,
-                excluded,
-                cpu_gate_constraint_rows(common_data, excluded),
-            )
-        }
-        None => evaluate_gate_constraints_base_batch_into_excluding_many(
-            common_data,
-            vars_batch,
-            constraints_batch,
-            &[],
-            cpu_gate_constraint_rows(common_data, &[]),
-        ),
-    }
-}
-
-/// Multi-gate version used when one GPU quotient pass replaces several gate
-/// types while the CPU evaluates the remaining shared constraint rows.
-pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
-    F: RichField + Extendable<D>,
-    const D: usize,
->(
-    common_data: &CommonCircuitData<F, D>,
-    vars_batch: EvaluationVarsBaseBatch<F>,
-    constraints_batch: &mut Vec<F>,
-    excluded_gate_indices: &[usize],
-    num_constraint_rows: usize,
-) {
-    // Rows at or above `num_constraint_rows` are identically zero once the
-    // excluded gates are gone, and `reduce_gate_constraints_base_batch` walks
-    // rows backwards off a raw-zero seed, so omitting them is raw-limb
-    // identical while deleting both this memset and their Horner passes.
-    debug_assert!(num_constraint_rows <= common_data.num_gate_constraints);
-    debug_assert_eq!(
-        num_constraint_rows,
-        cpu_gate_constraint_rows(common_data, excluded_gate_indices)
-    );
-    let cpu_gate_indices = (0..common_data.gates.len())
-        .filter(|i| !excluded_gate_indices.contains(i))
-        .collect::<Vec<_>>();
-    let mut filters = Vec::with_capacity(vars_batch.len());
-    evaluate_gate_constraints_base_batch_into_cpu_gates(
-        common_data,
-        vars_batch,
-        constraints_batch,
-        &cpu_gate_indices,
-        &mut filters,
-        num_constraint_rows,
-        None,
-    );
-}
-
-pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
-    F: RichField + Extendable<D>,
-    const D: usize,
->(
-    common_data: &CommonCircuitData<F, D>,
-    vars_batch: EvaluationVarsBaseBatch<F>,
-    constraints_batch: &mut Vec<F>,
-    cpu_gate_indices: &[usize],
-    filters: &mut Vec<F>,
-    num_constraint_rows: usize,
-    interleave_pair: Option<&InterleavePairPlan>,
-) {
-    debug_assert!(num_constraint_rows <= common_data.num_gate_constraints);
     constraints_batch.clear();
-    constraints_batch.resize(num_constraint_rows * vars_batch.len(), F::ZERO);
-    for &i in cpu_gate_indices {
-        if let Some(plan) = interleave_pair {
-            if i == plan.interleave_index {
-                filters.clear();
-                filters.resize(3 * vars_batch.len(), F::ZERO);
-                let (interleave_filter, rest) = filters.split_at_mut(vars_batch.len());
-                let (uninterleave_filter, summed_filter) = rest.split_at_mut(vars_batch.len());
-                fill_interleave_gate_filter(
-                    common_data,
-                    vars_batch,
-                    plan.interleave_index,
-                    interleave_filter,
-                );
-                fill_interleave_gate_filter(
-                    common_data,
-                    vars_batch,
-                    plan.uninterleave_index,
-                    uninterleave_filter,
-                );
-                for point in 0..vars_batch.len() {
-                    summed_filter[point] = interleave_filter[point] + uninterleave_filter[point];
-                }
-                eval_interleave_pair_dense_fused(
-                    vars_batch.local_wires,
-                    vars_batch.len(),
-                    interleave_filter,
-                    uninterleave_filter,
-                    summed_filter,
-                    constraints_batch,
-                );
-                continue;
-            }
-            if i == plan.uninterleave_index {
-                continue;
-            }
-        }
-        let gate = &common_data.gates[i];
+    constraints_batch.resize(common_data.num_gate_constraints * vars_batch.len(), F::ZERO);
+    let mut filters = Vec::with_capacity(vars_batch.len());
+    for (i, gate) in common_data.gates.iter().enumerate() {
         let selector_index = common_data.selectors_info.selector_indices[i];
         gate.0.eval_filtered_base_batch(
             vars_batch,
@@ -1512,7 +954,7 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
             common_data.selectors_info.groups[selector_index].clone(),
             common_data.selectors_info.num_selectors(),
             common_data.num_lookup_selectors,
-            filters,
+            &mut filters,
             constraints_batch,
         );
     }
@@ -1727,7 +1169,6 @@ pub(crate) fn eval_vanishing_poly_circuit<F: RichField + Extendable<D>, const D:
 #[cfg(test)]
 mod tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
-    use plonky2_field::types::PrimeField64;
 
     use super::*;
 
@@ -1751,7 +1192,7 @@ mod tests {
             F::from_canonical_u64(6),
             F::from_canonical_u64(6),
         ];
-        reduce_gate_constraints_base_batch(&terms, 2, &alphas, &mut actual, false);
+        reduce_gate_constraints_base_batch(&terms, 2, &alphas, &mut actual);
         assert_eq!(actual[0], F::from_canonical_u64(91));
         assert_eq!(actual[2], F::from_canonical_u64(116));
 
@@ -1775,220 +1216,8 @@ mod tests {
             }
 
             let mut actual = initial;
-            reduce_gate_constraints_base_batch(&terms, batch_size, &alphas, &mut actual, false);
+            reduce_gate_constraints_base_batch(&terms, batch_size, &alphas, &mut actual);
             assert_eq!(actual, expected, "batch size {batch_size}");
-        }
-    }
-
-    #[test]
-    fn packed_dense_interleave_pair_matches_independent_alpha_reduction_canonically() {
-        type F = GoldilocksField;
-
-        let mut state = 0x6a09_e667_f3bc_c909u64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            // Deliberately retain arbitrary raw representatives. The fused
-            // same-row filter changes legal field association, so equality is
-            // required canonically rather than at the raw-limb level.
-            GoldilocksField(state)
-        };
-
-        for batch_size in [1usize, 7, 32] {
-            let wires = (0..INTERLEAVE_PAIR_WIRES * batch_size)
-                .map(|_| next())
-                .collect::<Vec<_>>();
-            let interleave_filter = (0..batch_size).map(|_| next()).collect::<Vec<_>>();
-            let uninterleave_filter = (0..batch_size).map(|_| next()).collect::<Vec<_>>();
-            let summed_filter = interleave_filter
-                .iter()
-                .zip(&uninterleave_filter)
-                .map(|(&interleave, &uninterleave)| interleave + uninterleave)
-                .collect::<Vec<_>>();
-
-            // A nonzero shared seed ensures the specialization really adds to
-            // prior gate rows rather than accidentally assigning them.
-            let initial_rows = (0..INTERLEAVE_PAIR_CONSTRAINTS * batch_size)
-                .map(|_| next())
-                .collect::<Vec<_>>();
-            let mut expected_rows = initial_rows.clone();
-            let base2 = F::from_canonical_usize(2);
-            let base4 = F::from_canonical_usize(4);
-            let split = F::from_canonical_u64(1 << 32u64);
-            let u32_max = F::from_canonical_u32(u32::MAX);
-
-            // Independent dense oracle: evaluate the two gates separately in
-            // their original row layouts and apply their distinct filters.
-            for point in 0..batch_size {
-                let mut halves = [F::ZERO; INTERLEAVE_OPS];
-                let mut parities = [F::ZERO; 4];
-                for operation in 0..INTERLEAVE_OPS {
-                    let row = operation * 34;
-                    let mut x = F::ZERO;
-                    let mut spread = F::ZERO;
-                    for bit_index in 0..32 {
-                        let bit_number = operation * 32 + bit_index;
-                        let bit = wires[(8 + bit_number) * batch_size + point];
-                        x = x * base2 + bit;
-                        spread = spread * base4 + bit;
-                        let parity_index = 2 * (operation / 2) + bit_index % 2;
-                        parities[parity_index] = parities[parity_index] * base2 + bit;
-                        let range = bit * (bit - F::ONE);
-                        expected_rows[(row + 2 + bit_index) * batch_size + point] +=
-                            interleave_filter[point] * range;
-                        let uninterleave_row =
-                            (operation / 2) * 68 + 4 + (operation % 2) * 32 + bit_index;
-                        expected_rows[uninterleave_row * batch_size + point] +=
-                            uninterleave_filter[point] * range;
-                    }
-                    halves[operation] = x;
-                    expected_rows[row * batch_size + point] += interleave_filter[point]
-                        * (x - wires[(2 * operation) * batch_size + point]);
-                    expected_rows[(row + 1) * batch_size + point] += interleave_filter[point]
-                        * (spread - wires[(2 * operation + 1) * batch_size + point]);
-                }
-
-                for operation in 0..UNINTERLEAVE_OPS {
-                    let row = operation * 68;
-                    let high = halves[2 * operation];
-                    let low = halves[2 * operation + 1];
-                    let constraints = [
-                        (wires[(4 * operation + 3) * batch_size + point] * (u32_max - high)
-                            - F::ONE)
-                            * low,
-                        high * split + low - wires[(4 * operation) * batch_size + point],
-                        parities[2 * operation] - wires[(4 * operation + 1) * batch_size + point],
-                        parities[2 * operation + 1]
-                            - wires[(4 * operation + 2) * batch_size + point],
-                    ];
-                    for (offset, constraint) in constraints.into_iter().enumerate() {
-                        expected_rows[(row + offset) * batch_size + point] +=
-                            uninterleave_filter[point] * constraint;
-                    }
-                }
-            }
-
-            let mut actual_rows = initial_rows;
-            eval_interleave_pair_dense_fused(
-                &wires,
-                batch_size,
-                &interleave_filter,
-                &uninterleave_filter,
-                &summed_filter,
-                &mut actual_rows,
-            );
-
-            for (index, (&actual, &expected)) in
-                actual_rows.iter().zip(&expected_rows).enumerate()
-            {
-                assert_eq!(
-                    actual.to_canonical_u64(),
-                    expected.to_canonical_u64(),
-                    "dense canonical mismatch at {index}, batch={batch_size}"
-                );
-            }
-
-            let alphas = [next(), next()];
-            let initial_reduction = (0..batch_size * alphas.len())
-                .map(|_| next())
-                .collect::<Vec<_>>();
-            let mut expected_reduction = initial_reduction.clone();
-            let mut actual_reduction = initial_reduction;
-            reduce_gate_constraints_base_batch(
-                &expected_rows,
-                batch_size,
-                &alphas,
-                &mut expected_reduction,
-                false,
-            );
-            reduce_gate_constraints_base_batch(
-                &actual_rows,
-                batch_size,
-                &alphas,
-                &mut actual_reduction,
-                false,
-            );
-            for (index, (&actual, &expected)) in actual_reduction
-                .iter()
-                .zip(&expected_reduction)
-                .enumerate()
-            {
-                assert_eq!(
-                    actual.to_canonical_u64(),
-                    expected.to_canonical_u64(),
-                    "alpha reduction mismatch at {index}, batch={batch_size}"
-                );
-            }
-        }
-    }
-
-    /// The narrowing sizes the shared row buffer by the widest gate still on
-    /// the CPU, so rows above it are never materialized. This asserts that
-    /// dropping that dead suffix is RAW-LIMB identical to reducing the
-    /// full-width buffer with those rows present and zero, which is the
-    /// property the whole mechanism rests on. Raw limbs, not `PartialEq`:
-    /// Goldilocks does not canonicalize, so field equality would hide a
-    /// representation change that alters proof bytes.
-    #[test]
-    fn narrowed_row_space_matches_full_width_reduction_in_raw_limbs() {
-        type F = GoldilocksField;
-
-        let alphas = [F::from_canonical_u64(7), F::from_canonical_u64(11)];
-
-        // Deliberately arbitrary, large witness values: a pass must not be an
-        // artifact of terms that happen to be zero or small.
-        let mut state = 0x243f_6a88_85a3_08d3u64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            // `>> 1` keeps every value below the Goldilocks order without
-            // needing `Field::ORDER` in scope here.
-            F::from_canonical_u64(state >> 1)
-        };
-
-        for batch_size in [1usize, 7, 32] {
-            for k in [1usize, 88, 136] {
-                for m in [0usize, 1, k / 2, k] {
-                    if m > k {
-                        continue;
-                    }
-                    // Live prefix `[0, m)`; the suffix `[m, k)` stays zero,
-                    // exactly as an offloaded gate leaves it.
-                    let mut full = vec![F::ZERO; k * batch_size];
-                    for row in 0..m {
-                        for point in 0..batch_size {
-                            full[row * batch_size + point] = next();
-                        }
-                    }
-                    let narrowed = &full[..m * batch_size];
-
-                    let mut expected = vec![F::ZERO; batch_size * alphas.len()];
-                    reduce_gate_constraints_base_batch(
-                        &full,
-                        batch_size,
-                        &alphas,
-                        &mut expected,
-                        true,
-                    );
-                    let mut actual = vec![F::ZERO; batch_size * alphas.len()];
-                    reduce_gate_constraints_base_batch(
-                        narrowed,
-                        batch_size,
-                        &alphas,
-                        &mut actual,
-                        true,
-                    );
-
-                    for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
-                        assert_eq!(
-                            a.0, e.0,
-                            "raw limb mismatch at {i} (k={k}, m={m}, batch={batch_size})"
-                        );
-                    }
-                }
-            }
         }
     }
 }

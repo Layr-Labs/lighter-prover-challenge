@@ -1,12 +1,15 @@
 #[cfg(not(feature = "std"))]
 use alloc::{
     boxed::Box,
+    collections::BTreeMap,
     string::{String, ToString},
     vec,
     vec::Vec,
 };
 use core::fmt::Debug;
 use core::marker::PhantomData;
+#[cfg(feature = "std")]
+use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow};
 use plonky2_maybe_rayon::*;
@@ -18,7 +21,7 @@ use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::Target;
 use crate::iop::wire::Wire;
 use crate::iop::witness::{PartialWitness, PartitionWitness, Witness, WitnessWrite};
-use crate::plonk::circuit_data::{CommonCircuitData, GeneratorWatchIndex, ProverOnlyCircuitData};
+use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
 use crate::plonk::config::GenericConfig;
 use crate::util::serialization::{Buffer, IoResult, Read, Write};
 
@@ -133,22 +136,9 @@ fn run_generator_worklist<
     let parallel_rounds = parallel_rounds_enabled();
     let mut buffer = GeneratedValues::empty();
 
-    // The two round queues are swapped rather than reallocated. Every round used
-    // to start from a fresh `Vec::new()` and end by *moving* it over the old
-    // queue, which freed the old buffer and forced the new one to grow from zero
-    // capacity again — a fresh allocation plus a geometric doubling chain (each
-    // step memcpying everything pushed so far) on every round of every witness
-    // generation, and there is one witness generation per transaction chunk and
-    // per chain step. Swapping keeps both buffers at their high-water capacity,
-    // so after the first few rounds a round costs no allocation and no growth
-    // copies at all. `clear()` only resets the length (`usize` has no `Drop`),
-    // so each round still observes an empty queue and pushes exactly the same
-    // indices in exactly the same order.
-    let mut next_pending_generator_indices = Vec::new();
-
     // Keep running generators until we fail to make progress.
     while !pending_generator_indices.is_empty() {
-        next_pending_generator_indices.clear();
+        let mut next_pending_generator_indices = Vec::new();
 
         if parallel_rounds && pending_generator_indices.len() >= parallel_threshold {
             // A generator can be enqueued once per newly populated watch, and may have expired
@@ -170,7 +160,7 @@ fn run_generator_worklist<
             #[allow(clippy::type_complexity)]
             let round_outputs: Vec<(
                 Vec<(usize, bool, usize)>,
-                Vec<(Target, F, Option<&[usize]>)>,
+                Vec<(Target, F, Option<&Vec<usize>>)>,
             )> = pending_generator_indices
                 .par_chunks(PARALLEL_WORKLIST_CHUNK)
                 .map(|chunk| {
@@ -232,10 +222,7 @@ fn run_generator_worklist<
                 }
             }
 
-            core::mem::swap(
-                &mut pending_generator_indices,
-                &mut next_pending_generator_indices,
-            );
+            pending_generator_indices = next_pending_generator_indices;
             continue;
         }
 
@@ -276,10 +263,7 @@ fn run_generator_worklist<
             }
         }
 
-        core::mem::swap(
-            &mut pending_generator_indices,
-            &mut next_pending_generator_indices,
-        );
+        pending_generator_indices = next_pending_generator_indices;
     }
 
     Ok(())
@@ -302,7 +286,7 @@ fn seed_inputs_and_unresolved_watches<F: Field>(
     witness: &mut PartitionWitness<F>,
     inputs: PartialWitness<F>,
     generator_watch_counts: &[usize],
-    generator_indices_by_watches: &GeneratorWatchIndex,
+    generator_indices_by_watches: &BTreeMap<usize, Vec<usize>>,
 ) -> Result<Vec<usize>> {
     let mut unresolved_watches = generator_watch_counts.to_vec();
 
@@ -318,87 +302,6 @@ fn seed_inputs_and_unresolved_watches<F: Field>(
     }
 
     Ok(unresolved_watches)
-}
-
-/// Direct-seeding adapter: writes values straight into the partition's
-/// representative slots while maintaining the same per-generator
-/// unresolved-watch counters as [`seed_inputs_and_unresolved_watches`],
-/// without routing the values through a `PartialWitness` map first. The
-/// decrement rule is identical: `set_target_returning_rep` returns the
-/// representative only on first population, so aliased or duplicated
-/// inputs decrement at most once and no counter can underflow.
-pub struct PartitionSeeder<'a, 'b, F: Field> {
-    witness: &'b mut PartitionWitness<'a, F>,
-    unresolved_watches: &'b mut [usize],
-    generator_indices_by_watches: &'b GeneratorWatchIndex,
-}
-
-impl<F: Field> Debug for PartitionSeeder<'_, '_, F> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("PartitionSeeder").finish_non_exhaustive()
-    }
-}
-
-impl<F: Field> WitnessWrite<F> for PartitionSeeder<'_, '_, F> {
-    fn set_target(&mut self, target: Target, value: F) -> Result<()> {
-        if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
-            if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
-                for &generator_idx in watchers {
-                    debug_assert_ne!(self.unresolved_watches[generator_idx], 0);
-                    self.unresolved_watches[generator_idx] -= 1;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl<F: Field> Witness<F> for PartitionSeeder<'_, '_, F> {
-    fn try_get_target(&self, target: Target) -> Option<F> {
-        self.witness.try_get_target(target)
-    }
-}
-
-/// Direct-feeding adapter: the [`PendingPartitionWitness::feed`] analog of
-/// [`PartitionSeeder`]. Writes values straight into the partition while
-/// applying `feed`'s exact bookkeeping: each first-populated representative
-/// decrements its unfinished watchers and queues them for the resume
-/// worklist; expired generators are skipped.
-pub struct PartitionFeeder<'a, 'b, F: Field> {
-    witness: &'b mut PartitionWitness<'a, F>,
-    unresolved_watches: &'b mut [usize],
-    generator_is_expired: &'b [bool],
-    pending_generator_indices: &'b mut Vec<usize>,
-    generator_indices_by_watches: &'b GeneratorWatchIndex,
-}
-
-impl<F: Field> Debug for PartitionFeeder<'_, '_, F> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("PartitionFeeder").finish_non_exhaustive()
-    }
-}
-
-impl<F: Field> WitnessWrite<F> for PartitionFeeder<'_, '_, F> {
-    fn set_target(&mut self, target: Target, value: F) -> Result<()> {
-        if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
-            if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
-                for &watching_generator_idx in watchers {
-                    if !self.generator_is_expired[watching_generator_idx] {
-                        debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
-                        self.unresolved_watches[watching_generator_idx] -= 1;
-                        self.pending_generator_indices.push(watching_generator_idx);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl<F: Field> Witness<F> for PartitionFeeder<'_, '_, F> {
-    fn try_get_target(&self, target: Target) -> Option<F> {
-        self.witness.try_get_target(target)
-    }
 }
 
 /// Resumable witness generation: [`Self::start`] seeds an initial set of inputs and runs every
@@ -496,55 +399,6 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         })
     }
 
-    /// Like [`Self::start`], but the initial inputs are written by `seed`
-    /// directly into the partition through a [`PartitionSeeder`] — no
-    /// intermediate `PartialWitness` map is built or replayed. Worklist
-    /// initialization is unchanged: all generators are queued, gated by the
-    /// same unresolved-watch counters the map-seeded path would produce.
-    pub fn start_seeded(
-        prover_data: &'a ProverOnlyCircuitData<F, C, D>,
-        common_data: &CommonCircuitData<F, D>,
-        seed: impl FnOnce(&mut PartitionSeeder<'a, '_, F>) -> Result<()>,
-    ) -> Result<Self> {
-        let generators = &prover_data.generators;
-
-        let mut witness = PartitionWitness::new(
-            common_data.config.num_wires,
-            common_data.degree(),
-            &prover_data.representative_map,
-        );
-
-        let mut unresolved_watches = prover_data.generator_watch_counts.to_vec();
-        seed(&mut PartitionSeeder {
-            witness: &mut witness,
-            unresolved_watches: &mut unresolved_watches,
-            generator_indices_by_watches: &prover_data.generator_indices_by_watches,
-        })?;
-
-        let mut generator_is_expired = vec![false; generators.len()];
-        let mut remaining_generators = generators.len();
-
-        // Initially, all generators are queued.
-        run_generator_worklist(
-            &mut witness,
-            prover_data,
-            &mut unresolved_watches,
-            &mut generator_is_expired,
-            &mut remaining_generators,
-            (0..generators.len()).collect(),
-            PARALLEL_WORKLIST_THRESHOLD,
-        )?;
-
-        Ok(Self {
-            witness,
-            unresolved_watches,
-            generator_is_expired,
-            remaining_generators,
-            prover_data,
-            parallel_threshold: PARALLEL_WORKLIST_THRESHOLD,
-        })
-    }
-
     /// Sets newly available inputs and resumes witness generation. Only the unfinished watchers of
     /// newly populated representatives are queued; every other unfinished generator was already
     /// run to quiescence and cannot make progress without new values.
@@ -565,35 +419,6 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
                 }
             }
         }
-
-        run_generator_worklist(
-            &mut self.witness,
-            self.prover_data,
-            &mut self.unresolved_watches,
-            &mut self.generator_is_expired,
-            &mut self.remaining_generators,
-            pending_generator_indices,
-            self.parallel_threshold,
-        )
-    }
-
-    /// The [`Self::feed`] analog of [`Self::start_seeded`]: newly available
-    /// inputs are written by `seed` directly into the partition through a
-    /// [`PartitionFeeder`] — no intermediate `PartialWitness` map is built or
-    /// replayed. Resume semantics are identical to [`Self::feed`]: only the
-    /// unfinished watchers of newly populated representatives are queued.
-    pub fn feed_seeded(
-        &mut self,
-        seed: impl FnOnce(&mut PartitionFeeder<'a, '_, F>) -> Result<()>,
-    ) -> Result<()> {
-        let mut pending_generator_indices = Vec::new();
-        seed(&mut PartitionFeeder {
-            witness: &mut self.witness,
-            unresolved_watches: &mut self.unresolved_watches,
-            generator_is_expired: &self.generator_is_expired,
-            pending_generator_indices: &mut pending_generator_indices,
-            generator_indices_by_watches: &self.prover_data.generator_indices_by_watches,
-        })?;
 
         run_generator_worklist(
             &mut self.witness,
@@ -871,17 +696,8 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D> for Ran
         _witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        // Deterministic instead of `F::rand()`. These targets are the unused
-        // public-input-gate wires (`randomize_unused_pi_wires`) and, under
-        // `zero_knowledge`, blinding rows — this config never enables ZK. The
-        // randomness existed to give a *retry* an independent chance against
-        // the astronomically rare permutation-argument division by zero
-        // (plonky2 #456); nothing in this prover retries, so a fixed value has
-        // the identical single-shot failure probability while making witness
-        // generation — and therefore entire proofs — bit-reproducible. That
-        // reproducibility is what lets the orchestration differential oracles
-        // compare full proof bytes.
-        out_buffer.set_target(self.target, F::ZERO)
+        let random_value = F::rand();
+        out_buffer.set_target(self.target, random_value)
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
@@ -1213,7 +1029,7 @@ mod tests {
         }
 
         let mut unresolved_watches = vec![0usize; prover_data.generators.len()];
-        for (watch, watchers) in prover_data.generator_indices_by_watches.iter() {
+        for (&watch, watchers) in &prover_data.generator_indices_by_watches {
             if !witness.is_set_by_rep_index(watch) {
                 for &generator_idx in watchers {
                     unresolved_watches[generator_idx] += 1;
@@ -1234,7 +1050,7 @@ mod tests {
         // The builder-derived counts must equal the number of watcher-list occurrences of each
         // generator across the whole map (the "no representative is populated yet" case).
         let mut occurrences = vec![0usize; prover_data.generators.len()];
-        for (_, watchers) in prover_data.generator_indices_by_watches.iter() {
+        for watchers in prover_data.generator_indices_by_watches.values() {
             for &generator_idx in watchers {
                 occurrences[generator_idx] += 1;
             }
@@ -1245,11 +1061,11 @@ mod tests {
         );
 
         // Watcher lists are deduplicated, so a count is the number of *distinct* representatives.
-        for (_, watchers) in prover_data.generator_indices_by_watches.iter() {
-            let mut sorted = watchers.to_vec();
+        for watchers in prover_data.generator_indices_by_watches.values() {
+            let mut sorted = watchers.clone();
             sorted.sort_unstable();
             sorted.dedup();
-            assert_eq!(sorted, watchers, "watcher list is not deduplicated/sorted");
+            assert_eq!(&sorted, watchers, "watcher list is not deduplicated/sorted");
         }
 
         for inputs in [
@@ -1444,76 +1260,6 @@ mod tests {
         )?;
         outer.verify(single_shot_proof)?;
         outer.verify(two_phase_proof)
-    }
-
-    #[test]
-    fn direct_seeded_pending_witness_matches_map_seeded_recursive_circuit() -> Result<()> {
-        let (outer, early_inputs, late_inputs) = two_inner_proof_fixture()?;
-
-        let mut map_seeded =
-            PendingPartitionWitness::start(early_inputs.clone(), &outer.prover_only, &outer.common)?;
-        map_seeded.feed(late_inputs.clone())?;
-        let map_seeded = map_seeded.finish()?;
-
-        // RandomValueGenerator outputs are expected to differ between the two
-        // executions, but all remaining witness slots must match.
-        let mut map_seeded_repeat =
-            PendingPartitionWitness::start(early_inputs.clone(), &outer.prover_only, &outer.common)?;
-        map_seeded_repeat.feed(late_inputs.clone())?;
-        let map_seeded_repeat = map_seeded_repeat.finish()?;
-        let num_random_generators = count_random_generators(&outer.prover_only);
-
-        let mut direct_seeded = PendingPartitionWitness::start_seeded(
-            &outer.prover_only,
-            &outer.common,
-            |seeder| {
-                for (&target, &value) in &early_inputs.target_values {
-                    seeder.set_target(target, value)?;
-                }
-                Ok(())
-            },
-        )?;
-        direct_seeded.feed_seeded(|feeder| {
-            for (&target, &value) in &late_inputs.target_values {
-                feeder.set_target(target, value)?;
-            }
-            Ok(())
-        })?;
-        let direct_seeded = direct_seeded.finish()?;
-
-        let mut nondeterministic_positions = 0usize;
-        for ((map, map_repeat), direct) in map_seeded
-            .values
-            .iter()
-            .zip(&map_seeded_repeat.values)
-            .zip(&direct_seeded.values)
-        {
-            if map == map_repeat {
-                assert_eq!(map, direct);
-            } else {
-                nondeterministic_positions += 1;
-            }
-        }
-        assert!(
-            nondeterministic_positions <= num_random_generators,
-            "{nondeterministic_positions} nondeterministic positions exceed the {num_random_generators} random generators"
-        );
-
-        let map_seeded_proof = crate::plonk::prover::prove_with_partition_witness(
-            &outer.prover_only,
-            &outer.common,
-            map_seeded,
-            &mut crate::util::timing::TimingTree::default(),
-        )?;
-        outer.verify(map_seeded_proof)?;
-
-        let proof = crate::plonk::prover::prove_with_partition_witness(
-            &outer.prover_only,
-            &outer.common,
-            direct_seeded,
-            &mut crate::util::timing::TimingTree::default(),
-        )?;
-        outer.verify(proof)
     }
 
     #[test]

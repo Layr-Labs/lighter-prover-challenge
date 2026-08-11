@@ -133,8 +133,7 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     let mut trees = Vec::with_capacity(fri_params.reduction_arity_bits.len());
 
     let mut shift = F::MULTIPLICATIVE_GROUP_GENERATOR;
-    let num_rounds = fri_params.reduction_arity_bits.len();
-    for (round, arity_bits) in fri_params.reduction_arity_bits.iter().enumerate() {
+    for arity_bits in &fri_params.reduction_arity_bits {
         let arity = 1 << arity_bits;
 
         // Fused bit-reversal + flatten: one gather pass writes the flat leaf
@@ -161,47 +160,11 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         let n_chunks = coeffs.coeffs.len() / arity;
         let support = coeffs.coeffs.len() >> fri_params.config.rate_bits;
         let live_chunks = support.div_ceil(arity).min(n_chunks);
-        let beta_powers_16 = if arity == 16 {
-            let mut powers = [F::Extension::ONE; 16];
-            for i in 1..16 {
-                powers[i] = powers[i - 1] * beta;
-            }
-            Some(powers)
-        } else {
-            None
-        };
         let mut folded = coeffs.coeffs[..live_chunks * arity]
             .par_chunks_exact(arity)
-            .map(|chunk| match &beta_powers_16 {
-                Some(beta_powers) => {
-                    let terms: &[F::Extension; 16] = chunk
-                        .try_into()
-                        .expect("arity-16 FRI chunk must contain 16 terms");
-                    F::fri_fold_arity16(terms, beta, beta_powers)
-                }
-                None => reduce_with_powers(chunk, beta),
-            })
+            .map(|chunk| reduce_with_powers(chunk, beta))
             .collect::<Vec<_>>();
-        // The historical `resize(n_chunks, ZERO)` zero-filled the whole dead
-        // tail. Zeros are actually *read as values* only where the next
-        // round's exact-`arity` chunking can reach past the live support —
-        // at most `arity_next - 1` slots past `live` — because every other
-        // tail consumer (the zero-tail coset FFT and the final truncation +
-        // transcript observation) reads only the live prefix. Extend the
-        // length without storing the rest.
-        let live = folded.len();
-        folded.reserve(n_chunks - live);
-        // SAFETY: length equals capacity; the slots beyond `pad_end` are
-        // never read (see above), and `F::Extension` is plain data.
-        unsafe { folded.set_len(n_chunks) };
-        let pad_end = if round + 1 < num_rounds {
-            n_chunks.min(live + (1 << fri_params.reduction_arity_bits[round + 1]))
-        } else {
-            live
-        };
-        for value in folded[live..pad_end].iter_mut() {
-            *value = F::Extension::ZERO;
-        }
+        folded.resize(n_chunks, F::Extension::ZERO);
         coeffs = PolynomialCoeffs::new(folded);
         shift = shift.exp_u64(arity as u64);
         // Chunk-wise folding preserves the zero tail: the coefficient vector
@@ -210,20 +173,13 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // The coefficients from `live_chunks` on are the zeros the `resize`
         // above just wrote, and `shift^i * 0 == 0`, so the coset scaling is
         // dead work over that tail: scale only the folded prefix.
-        //
-        // `values` is read by exactly one thing: the *next* round's leaf
-        // gather at the top of this loop. After the final round it is dropped
-        // unread — everything below this loop uses only `coeffs` — so the
-        // last round's transform is entirely dead work. Skip it.
-        if round + 1 < num_rounds {
-            values = coset_fft_zero_tail(
-                &coeffs,
-                shift.into(),
-                live_chunks,
-                Some(fri_params.config.rate_bits),
-                None,
-            );
-        }
+        values = coset_fft_zero_tail(
+            &coeffs,
+            shift.into(),
+            live_chunks,
+            Some(fri_params.config.rate_bits),
+            None,
+        )
     }
 
     // When verifying this proof in a circuit with a different number of query steps,

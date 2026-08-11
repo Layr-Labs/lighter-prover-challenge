@@ -23,7 +23,6 @@ pub const NUM_HASH_OUT_ELTS: usize = 4;
 /// Represents a ~256 bit hash output.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(bound = "")]
-#[repr(transparent)]
 pub struct HashOut<F: Field> {
     pub elements: [F; NUM_HASH_OUT_ELTS],
 }
@@ -121,7 +120,7 @@ impl<F: Field> Default for HashOut<F> {
 }
 
 /// Represents a ~256 bit hash output.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct HashOutTarget {
     pub elements: [Target; NUM_HASH_OUT_ELTS],
 }
@@ -159,7 +158,7 @@ impl TryFrom<&[Target]> for HashOutTarget {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MerkleCapTarget(pub Vec<HashOutTarget>);
 
 /// Hash consisting of a byte array.

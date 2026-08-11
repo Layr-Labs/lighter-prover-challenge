@@ -58,7 +58,7 @@ pub struct PublicPoolInfo {
     pub strategies: [BigInt; NB_STRATEGIES], // 96 bits
 }
 
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct PublicPoolShareTarget {
     pub public_pool_index: Target,
     pub share_amount: Target,
@@ -124,7 +124,7 @@ impl PublicPoolShareTarget {
     }
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct PublicPoolInfoTarget {
     pub status: Target,
     pub operator_fee: Target,
