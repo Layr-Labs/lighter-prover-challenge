@@ -164,7 +164,15 @@ const STAGING_CHUNK: usize = 1 << 19;
 /// block's one-off 32 MiB outputs remain uncached so the pool cannot amplify
 /// peak unified-memory pressure.
 const MAX_CACHED_QUOTIENT_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
+/// Sized to the quotient outputs that are live at the same time. A no-lookup
+/// proof starts three jobs — Poseidon2 gate, RangeCheck/U32 gate and
+/// permutation product — before its CPU batch loop, and all three outputs stay
+/// live until `compute_quotient_polys` returns, so a single proof holds three.
+/// Nothing serializes those phases across proofs and the pipeline keeps several
+/// transaction proofs in flight per path, so two proofs can hold six at once.
+/// At two entries every steady-state proof missed the cache and paid a fresh
+/// 8 MiB shared allocation plus its first-touch page faults.
+const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 6;
 /// Retain the recurring d14/d16 digest buffers, but not the one-off d18 final
 /// tree. These buffers replace equally large CPU digest vectors.
 const MAX_CACHED_DIGEST_OUTPUT_BYTES: u64 = 40 * 1024 * 1024;
@@ -734,9 +742,11 @@ impl QuotientOutputPool {
         Some(self.free.swap_remove(index))
     }
 
-    /// Retains at most the two largest recurring-size buffers. A larger buffer
-    /// can service every smaller quotient shape, while final-proof outputs are
-    /// rejected by the size cap before they reach the cache.
+    /// Retains at most [`MAX_CACHED_QUOTIENT_OUTPUTS`] recurring-size buffers —
+    /// the three concurrent jobs of two overlapping no-lookup quotient phases —
+    /// and evicts the smallest when full. A larger buffer can service every
+    /// smaller quotient shape, while final-proof outputs are rejected by the
+    /// size cap before they reach the cache.
     fn recycle(&mut self, buffer: Buffer) {
         let length = buffer.length();
         if length > MAX_CACHED_QUOTIENT_OUTPUT_BYTES {
@@ -3852,20 +3862,39 @@ mod tests {
             })
         };
         let mib = 1024 * 1024;
+        // One distinct megabyte size per slot plus one that oversubscribes the
+        // pool; every size stays under the caching cap.
+        let overflow = MAX_CACHED_QUOTIENT_OUTPUTS as u64 + 1;
+        assert!(overflow * mib <= MAX_CACHED_QUOTIENT_OUTPUT_BYTES);
         let mut pool = QuotientOutputPool::default();
 
-        pool.recycle(buffer(2 * mib));
-        pool.recycle(buffer(8 * mib));
-        pool.recycle(buffer(4 * mib));
+        for slot in 1..=MAX_CACHED_QUOTIENT_OUTPUTS as u64 {
+            pool.recycle(buffer(slot * mib));
+        }
+        assert_eq!(pool.free.len(), MAX_CACHED_QUOTIENT_OUTPUTS);
+
+        // Once full the pool keeps the largest buffers: the 1 MiB entry makes
+        // room for the larger one, and a repeat of the smallest is dropped.
+        pool.recycle(buffer(overflow * mib));
+        pool.recycle(buffer(mib));
         assert_eq!(pool.free.len(), MAX_CACHED_QUOTIENT_OUTPUTS);
         let mut lengths = pool.free.iter().map(|buffer| buffer.length()).collect::<Vec<_>>();
         lengths.sort_unstable();
-        assert_eq!(lengths, vec![4 * mib, 8 * mib]);
+        assert_eq!(
+            lengths,
+            (2..=overflow).map(|slot| slot * mib).collect::<Vec<_>>()
+        );
 
-        let four = pool.take_best_fit(3 * mib).expect("4 MiB best fit");
-        assert_eq!(four.length(), 4 * mib);
-        let eight = pool.take_best_fit(1).expect("remaining 8 MiB buffer");
-        assert_eq!(eight.length(), 8 * mib);
+        let smallest = pool.take_best_fit(mib + 1).expect("2 MiB best fit");
+        assert_eq!(smallest.length(), 2 * mib);
+        let mut drained = core::iter::from_fn(|| pool.take_best_fit(1))
+            .map(|buffer| buffer.length())
+            .collect::<Vec<_>>();
+        drained.sort_unstable();
+        assert_eq!(
+            drained,
+            (3..=overflow).map(|slot| slot * mib).collect::<Vec<_>>()
+        );
         assert!(pool.take_best_fit(1).is_none());
 
         pool.recycle(buffer(MAX_CACHED_QUOTIENT_OUTPUT_BYTES + 1));
