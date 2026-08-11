@@ -322,6 +322,12 @@ fn fri_prover_query_rounds<
     challenger
         .get_n_challenges(fri_params.config.num_query_rounds)
         .into_par_iter()
+        // A proof has only 28 independent query rounds, but it shares the
+        // global Rayon pool with several concurrently progressing proofs.
+        // Keep every round independently stealable so a chain proof is not
+        // held behind the other rounds in one descheduled iterator chunk.
+        // Indexed collection still restores the challenger-derived order.
+        .with_max_len(1)
         .map(|rand| {
             let x_index = rand.to_canonical_u64() as usize % n;
             fri_prover_query_round::<F, C, D>(initial_merkle_trees, trees, x_index, fri_params)
