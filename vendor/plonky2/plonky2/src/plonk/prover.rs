@@ -227,7 +227,7 @@ where
             .collect()
     );
 
-    let wires_commitment = timed!(
+    let mut wires_commitment = timed!(
         timing,
         "compute wires commitment",
         PolynomialBatch::<F, C, D>::from_coeffs(
@@ -319,7 +319,7 @@ where
         zs_partial_products.extend(lookup_polys);
     }
 
-    let partial_products_zs_and_lookup_commitment = timed!(
+    let mut partial_products_zs_and_lookup_commitment = timed!(
         timing,
         "commit to partial products, Z's and, if any, lookup polynomials",
         PolynomialBatch::from_values(
@@ -443,7 +443,7 @@ where
             .collect()
     );
 
-    let quotient_polys_commitment = timed!(
+    let mut quotient_polys_commitment = timed!(
         timing,
         "commit to quotient polys",
         PolynomialBatch::<F, C, D>::from_coeffs(
@@ -484,29 +484,66 @@ where
     challenger.observe_openings(&openings.to_fri_openings());
     let instance = common_data.get_fri_instance(zeta);
 
+    // The caps are tiny and must outlive the owned-tree handoff below. Clone
+    // them before moving the three per-proof trees into FRI; the retained
+    // constants/sigmas tree remains in reusable circuit prover data.
+    let wires_cap = wires_commitment.merkle_tree.cap.clone();
+    let plonk_zs_partial_products_cap =
+        partial_products_zs_and_lookup_commitment.merkle_tree.cap.clone();
+    let quotient_polys_cap = quotient_polys_commitment.merkle_tree.cap.clone();
     let opening_proof = timed!(
         timing,
         "compute opening proofs",
-        PolynomialBatch::<F, C, D>::prove_openings(
-            &instance,
-            &[
-                &prover_data.constants_sigmas_commitment,
-                &wires_commitment,
-                &partial_products_zs_and_lookup_commitment,
-                &quotient_polys_commitment,
-            ],
-            &mut challenger,
-            &common_data.fri_params,
-            None,
-            None,
-            timing,
-        )
+        {
+            let retain_initial_trees =
+                std::env::var_os("PLONKY2_RETAIN_INITIAL_FRI_TREES").is_some();
+            if retain_initial_trees {
+                // Same-binary control: preserve the frontier's borrowed tree
+                // lifetime and per-query initial/fold proof construction.
+                PolynomialBatch::<F, C, D>::prove_openings(
+                    &instance,
+                    &[
+                        &prover_data.constants_sigmas_commitment,
+                        &wires_commitment,
+                        &partial_products_zs_and_lookup_commitment,
+                        &quotient_polys_commitment,
+                    ],
+                    &mut challenger,
+                    &common_data.fri_params,
+                    None,
+                    None,
+                    timing,
+                )
+            } else {
+                let ephemeral_initial_trees = vec![
+                    core::mem::take(&mut wires_commitment.merkle_tree),
+                    core::mem::take(&mut partial_products_zs_and_lookup_commitment.merkle_tree),
+                    core::mem::take(&mut quotient_polys_commitment.merkle_tree),
+                ];
+                PolynomialBatch::<F, C, D>::prove_openings_retiring_initial_trees(
+                    &instance,
+                    &[
+                        &prover_data.constants_sigmas_commitment,
+                        &wires_commitment,
+                        &partial_products_zs_and_lookup_commitment,
+                        &quotient_polys_commitment,
+                    ],
+                    &prover_data.constants_sigmas_commitment.merkle_tree,
+                    ephemeral_initial_trees,
+                    &mut challenger,
+                    &common_data.fri_params,
+                    None,
+                    None,
+                    timing,
+                )
+            }
+        }
     );
 
     let proof = Proof::<F, C, D> {
-        wires_cap: wires_commitment.merkle_tree.cap,
-        plonk_zs_partial_products_cap: partial_products_zs_and_lookup_commitment.merkle_tree.cap,
-        quotient_polys_cap: quotient_polys_commitment.merkle_tree.cap,
+        wires_cap,
+        plonk_zs_partial_products_cap,
+        quotient_polys_cap,
         openings,
         opening_proof,
     };

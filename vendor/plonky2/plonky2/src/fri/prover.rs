@@ -70,6 +70,69 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
     }
 }
 
+/// Builds a FRI proof while owning all per-proof initial Merkle trees.
+///
+/// The transcript and proof order are identical to [`fri_proof`]. Ownership
+/// only shortens the lifetime of the large initial leaf stores: once every
+/// challenged initial leaf and path has been copied into the proof, the trees
+/// are dropped (and Metal-backed stores return to their exact-size pool)
+/// before the smaller FRI commit-tree query proofs are constructed.
+#[allow(clippy::too_many_arguments)]
+pub fn fri_proof_retiring_initial_trees<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    retained_initial_tree: &MerkleTree<F, C::Hasher>,
+    ephemeral_initial_trees: Vec<MerkleTree<F, C::Hasher>>,
+    lde_polynomial_coeffs: PolynomialCoeffs<F::Extension>,
+    lde_polynomial_values: PolynomialValues<F::Extension>,
+    challenger: &mut Challenger<F, C::Hasher>,
+    fri_params: &FriParams,
+    final_poly_coeff_len: Option<usize>,
+    max_num_query_steps: Option<usize>,
+    timing: &mut TimingTree,
+) -> FriProof<F, C::Hasher, D> {
+    let n = lde_polynomial_values.len();
+    assert_eq!(lde_polynomial_coeffs.len(), n);
+
+    let (trees, final_coeffs) = timed!(
+        timing,
+        "fold codewords in the commitment phase",
+        fri_committed_trees::<F, C, D>(
+            lde_polynomial_coeffs,
+            lde_polynomial_values,
+            challenger,
+            fri_params,
+            final_poly_coeff_len,
+            max_num_query_steps,
+        )
+    );
+
+    let pow_witness = timed!(
+        timing,
+        "find proof-of-work witness",
+        fri_proof_of_work::<F, C, D>(challenger, &fri_params.config)
+    );
+
+    let commit_phase_merkle_caps = trees.iter().map(|tree| tree.cap.clone()).collect();
+    let query_round_proofs = fri_prover_query_rounds_retiring_initial_trees::<F, C, D>(
+        retained_initial_tree,
+        ephemeral_initial_trees,
+        trees,
+        challenger,
+        n,
+        fri_params,
+    );
+
+    FriProof {
+        commit_phase_merkle_caps,
+        query_round_proofs,
+        final_poly: final_coeffs,
+        pow_witness,
+    }
+}
+
 pub(crate) type FriCommitedTrees<F, C, const D: usize> = (
     Vec<MerkleTree<F, <C as GenericConfig<D>>::Hasher>>,
     PolynomialCoeffs<<F as Extendable<D>>::Extension>,
@@ -325,6 +388,75 @@ fn fri_prover_query_rounds<
         .map(|rand| {
             let x_index = rand.to_canonical_u64() as usize % n;
             fri_prover_query_round::<F, C, D>(initial_merkle_trees, trees, x_index, fri_params)
+        })
+        .collect()
+}
+
+fn fri_prover_query_rounds_retiring_initial_trees<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    retained_initial_tree: &MerkleTree<F, C::Hasher>,
+    ephemeral_initial_trees: Vec<MerkleTree<F, C::Hasher>>,
+    trees: Vec<MerkleTree<F, C::Hasher>>,
+    challenger: &mut Challenger<F, C::Hasher>,
+    n: usize,
+    fri_params: &FriParams,
+) -> Vec<FriQueryRound<F, C::Hasher, D>> {
+    let query_indices = challenger
+        .get_n_challenges(fri_params.config.num_query_rounds)
+        .into_iter()
+        .map(|rand| rand.to_canonical_u64() as usize % n)
+        .collect::<Vec<_>>();
+
+    // Keep the original per-query parallel grain and oracle order. Splitting
+    // the old loop at this exact last-use boundary adds one Rayon fan-out, but
+    // avoids a tree-by-tree transpose and lets all three large Metal stores
+    // retire together before the remaining FRI-step work.
+    let initial_trees_proofs = query_indices
+        .par_iter()
+        .map(|&x_index| {
+            let evals_proofs = core::iter::once(retained_initial_tree)
+                .chain(ephemeral_initial_trees.iter())
+                .map(|tree| (tree.leaf_vec(x_index), tree.prove(x_index)))
+                .collect();
+            FriInitialTreeProof { evals_proofs }
+        })
+        .collect::<Vec<_>>();
+
+    // This is the ownership handoff: every initial leaf/path is now owned by
+    // `initial_trees_proofs`, so the full LDE stores can be reused by another
+    // in-flight proof while this proof constructs its fold-tree queries.
+    drop(ephemeral_initial_trees);
+
+    let steps = query_indices
+        .par_iter()
+        .map(|&initial_index| {
+            let mut x_index = initial_index;
+            trees
+                .iter()
+                .enumerate()
+                .map(|(i, tree)| {
+                    let arity_bits = fri_params.reduction_arity_bits[i];
+                    let evals = unflatten(tree.get(x_index >> arity_bits));
+                    let merkle_proof = tree.prove(x_index >> arity_bits);
+                    x_index >>= arity_bits;
+                    FriQueryStep {
+                        evals,
+                        merkle_proof,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    initial_trees_proofs
+        .into_iter()
+        .zip(steps)
+        .map(|(initial_trees_proof, steps)| FriQueryRound {
+            initial_trees_proof,
+            steps,
         })
         .collect()
 }

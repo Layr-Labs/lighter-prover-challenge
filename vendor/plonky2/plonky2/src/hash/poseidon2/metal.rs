@@ -527,6 +527,12 @@ struct ColumnStorePool {
 
 const MAX_CACHED_COLUMN_STORE_BYTES: u64 = 640 << 20;
 const MAX_COLUMN_STORE_POOL_BYTES: u64 = 2560 << 20;
+/// Below this size the transaction/chain pipeline has a small set of recurring
+/// commitment shapes. Lending one shape to a smaller request can force a fresh
+/// allocation when its native request arrives before the borrower retires.
+/// Large terminal requests retain best-fit flexibility because they do not
+/// recur after the final proof starts.
+const EXACT_COLUMN_STORE_REUSE_BELOW_BYTES: u64 = 256 << 20;
 
 static COLUMN_STORE_POOL: Mutex<ColumnStorePool> = Mutex::new(ColumnStorePool {
     free: Vec::new(),
@@ -537,12 +543,12 @@ impl ColumnStorePool {
     /// Smallest free buffer that fits `bytes`. The recurring shapes match
     /// their own previous allocation exactly; best-fit additionally tolerates
     /// any allocator size rounding in `Buffer::length` without silent misses.
-    fn take_best_fit(&mut self, bytes: u64) -> Option<Buffer> {
+    fn take_best_fit(&mut self, bytes: u64, allow_oversize: bool) -> Option<Buffer> {
         let (index, length) = self
             .free
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.length() >= bytes)
+            .filter(|(_, b)| b.length() == bytes || (allow_oversize && b.length() > bytes))
             .min_by_key(|(_, b)| b.length())
             .map(|(index, b)| (index, b.length()))?;
         self.total_bytes -= length;
@@ -606,7 +612,12 @@ pub fn prewarm_large_column_store(bytes: u64) {
 fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
     if bytes <= MAX_CACHED_COLUMN_STORE_BYTES {
         if let Ok(mut pool) = COLUMN_STORE_POOL.try_lock() {
-            if let Some(buffer) = pool.take_best_fit(bytes) {
+            // Preserve small recurring shapes. The environment switch keeps a
+            // same-binary control for local A/B and is intentionally read at
+            // allocation time only; it cannot affect proof values.
+            let historical_best_fit = std::env::var_os("PLONKY2_METAL_COLUMN_BEST_FIT").is_some();
+            let allow_oversize = historical_best_fit || bytes >= EXACT_COLUMN_STORE_REUSE_BELOW_BYTES;
+            if let Some(buffer) = pool.take_best_fit(bytes, allow_oversize) {
                 return buffer;
             }
         }
@@ -4021,6 +4032,43 @@ mod tests {
 
         pool.recycle(buffer(MAX_CACHED_QUOTIENT_OUTPUT_BYTES + 1));
         assert!(pool.free.is_empty(), "oversized output must not be cached");
+    }
+
+    #[test]
+    fn column_store_pool_preserves_exact_small_shapes() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let buffer = |bytes| {
+            autoreleasepool(|| {
+                device.new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+            })
+        };
+        let mib = 1024 * 1024;
+        let mut pool = ColumnStorePool {
+            free: Vec::new(),
+            total_bytes: 0,
+        };
+        pool.recycle(buffer(64 * mib));
+        pool.recycle(buffer(80 * mib));
+
+        assert!(
+            pool.take_best_fit(20 * mib, false).is_none(),
+            "an exact-bin request must not cannibalize a recurring larger shape"
+        );
+        assert_eq!(
+            pool.take_best_fit(20 * mib, true)
+                .expect("historical best-fit control")
+                .length(),
+            64 * mib
+        );
+        assert_eq!(
+            pool.take_best_fit(80 * mib, false)
+                .expect("exact match")
+                .length(),
+            80 * mib
+        );
+        assert_eq!(pool.total_bytes, 0);
     }
 
     #[test]

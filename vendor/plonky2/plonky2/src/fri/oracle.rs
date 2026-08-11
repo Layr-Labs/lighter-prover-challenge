@@ -14,7 +14,7 @@ use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
 use crate::fri::proof::FriProof;
-use crate::fri::prover::fri_proof;
+use crate::fri::prover::{fri_proof, fri_proof_retiring_initial_trees};
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::{ColumnStore, MerkleLeaves, MerkleTree};
@@ -608,6 +608,68 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         max_num_query_steps: Option<usize>,
         timing: &mut TimingTree,
     ) -> FriProof<F, C::Hasher, D> {
+        Self::prove_openings_inner(
+            instance,
+            oracles,
+            None,
+            challenger,
+            fri_params,
+            final_poly_coeff_len,
+            max_num_query_steps,
+            timing,
+        )
+    }
+
+    /// Produces the same opening proof while taking ownership of ephemeral
+    /// initial Merkle trees. Their full leaf stores are needed through the FRI
+    /// challenge/PoW boundary, but only until the initial query leaves and
+    /// paths have been materialized. The owned path lets FRI return those
+    /// stores to the Metal pool before constructing the remaining fold-tree
+    /// query proofs, so another concurrently proving stage can reuse the exact
+    /// allocation shape. Polynomial coefficients remain borrowed and keep the
+    /// same lifetime and reduction order as [`Self::prove_openings`].
+    pub fn prove_openings_retiring_initial_trees(
+        instance: &FriInstanceInfo<F, D>,
+        oracles: &[&Self],
+        retained_initial_tree: &MerkleTree<F, C::Hasher>,
+        ephemeral_initial_trees: Vec<MerkleTree<F, C::Hasher>>,
+        challenger: &mut Challenger<F, C::Hasher>,
+        fri_params: &FriParams,
+        final_poly_coeff_len: Option<usize>,
+        max_num_query_steps: Option<usize>,
+        timing: &mut TimingTree,
+    ) -> FriProof<F, C::Hasher, D> {
+        assert_eq!(
+            oracles.len(),
+            ephemeral_initial_trees.len() + 1,
+            "retained tree plus ephemeral trees must cover every oracle"
+        );
+        Self::prove_openings_inner(
+            instance,
+            oracles,
+            Some((retained_initial_tree, ephemeral_initial_trees)),
+            challenger,
+            fri_params,
+            final_poly_coeff_len,
+            max_num_query_steps,
+            timing,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prove_openings_inner(
+        instance: &FriInstanceInfo<F, D>,
+        oracles: &[&Self],
+        retiring_initial_trees: Option<(
+            &MerkleTree<F, C::Hasher>,
+            Vec<MerkleTree<F, C::Hasher>>,
+        )>,
+        challenger: &mut Challenger<F, C::Hasher>,
+        fri_params: &FriParams,
+        final_poly_coeff_len: Option<usize>,
+        max_num_query_steps: Option<usize>,
+        timing: &mut TimingTree,
+    ) -> FriProof<F, C::Hasher, D> {
         assert!(D > 1, "Not implemented for D=1.");
         let alpha = challenger.get_extension_challenge::<D>();
         let mut alpha = ReducingFactor::new(alpha);
@@ -693,19 +755,34 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             )
         );
 
-        let fri_proof = fri_proof::<F, C, D>(
-            &oracles
-                .par_iter()
-                .map(|c| &c.merkle_tree)
-                .collect::<Vec<_>>(),
-            lde_final_poly,
-            lde_final_values,
-            challenger,
-            fri_params,
-            final_poly_coeff_len,
-            max_num_query_steps,
-            timing,
-        );
+        let fri_proof = match retiring_initial_trees {
+            Some((retained_initial_tree, ephemeral_initial_trees)) => {
+                fri_proof_retiring_initial_trees::<F, C, D>(
+                    retained_initial_tree,
+                    ephemeral_initial_trees,
+                    lde_final_poly,
+                    lde_final_values,
+                    challenger,
+                    fri_params,
+                    final_poly_coeff_len,
+                    max_num_query_steps,
+                    timing,
+                )
+            }
+            None => fri_proof::<F, C, D>(
+                &oracles
+                    .par_iter()
+                    .map(|c| &c.merkle_tree)
+                    .collect::<Vec<_>>(),
+                lde_final_poly,
+                lde_final_values,
+                challenger,
+                fri_params,
+                final_poly_coeff_len,
+                max_num_query_steps,
+                timing,
+            ),
+        };
 
         fri_proof
     }
