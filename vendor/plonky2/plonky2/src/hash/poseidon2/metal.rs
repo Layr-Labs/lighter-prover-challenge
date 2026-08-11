@@ -1174,6 +1174,24 @@ pub fn prewarm() {
     std::thread::Builder::new()
         .name("poseidon2-metal-prewarm".to_owned())
         .spawn(|| {
+            // The eight concurrent pipeline lowerings are the context's whole
+            // startup cost; keep the thread that drives them on a performance
+            // core while the rest of the startup work competes for them.
+            // `QOS_CLASS_USER_INTERACTIVE` is 0x21 in <sys/qos.h>; best-effort
+            // on failure, exactly like the chain spine threads. Scheduling
+            // only — the compiled kernels are identical either way.
+            #[cfg(target_os = "macos")]
+            {
+                #[allow(non_camel_case_types)]
+                type qos_class_t = u32;
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32)
+                        -> i32;
+                }
+                unsafe {
+                    let _ = pthread_set_qos_class_self_np(0x21, 0);
+                }
+            }
             let _ = force_context();
         })
         .ok();

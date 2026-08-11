@@ -25,6 +25,7 @@ pub const ON_CHAIN_OPERATIONS_LIMIT: usize = 1;
 pub const PUBLIC_HEAVY_TX_COUNT: usize = 10;
 pub const PUBLIC_LIGHT_TX_COUNT: usize = 490;
 pub const PROVER_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
+// Ranked redraw marker: marker-free cc5 semantics plus Poseidon2 one-reduction, revision 2.
 
 pub struct Circuits {
     pub heavy_tx_target: BlockTxTarget,
