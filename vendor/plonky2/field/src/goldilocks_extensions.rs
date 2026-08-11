@@ -368,8 +368,30 @@ pub fn ext2_base_scalar_dot_slots(
     for (i, o) in out.iter_mut().enumerate() {
         let (mut lo0, mut hi0) = (0u128, 0u32);
         let (mut lo1, mut hi1) = (0u128, 0u32);
-        for &(p, QuadraticExtension([b0, b1])) in &full {
+        // Two independent 160-bit lanes break the loop-carried `adds`/`adcs`
+        // dependency without increasing the number of final reductions. A
+        // two-lane unroll keeps all four (two extension limbs x two lanes)
+        // accumulators resident on AArch64 while retaining register headroom
+        // for the slice pointers, coefficients, and widening products.
+        let (mut lo0_b, mut hi0_b) = (0u128, 0u32);
+        let (mut lo1_b, mut hi1_b) = (0u128, 0u32);
+        let mut full_pairs = full.chunks_exact(2);
+        for pair in &mut full_pairs {
+            let &(p, QuadraticExtension([b0, b1])) = &pair[0];
             // SAFETY: every slice in `full` has length exactly `out.len()`.
+            let c = unsafe { p.get_unchecked(i).0 };
+            u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+            u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+
+            let &(p, QuadraticExtension([b0, b1])) = &pair[1];
+            // SAFETY: every slice in `full` has length exactly `out.len()`.
+            let c = unsafe { p.get_unchecked(i).0 };
+            u160_add_product(&mut lo0_b, &mut hi0_b, b0.0, c);
+            u160_add_product(&mut lo1_b, &mut hi1_b, b1.0, c);
+        }
+        for &(p, QuadraticExtension([b0, b1])) in full_pairs.remainder() {
+            // SAFETY: the odd tail still comes from `full`, whose slices all
+            // have length exactly `out.len()`.
             let c = unsafe { p.get_unchecked(i).0 };
             u160_add_product(&mut lo0, &mut hi0, b0.0, c);
             u160_add_product(&mut lo1, &mut hi1, b1.0, c);
@@ -381,6 +403,15 @@ pub fn ext2_base_scalar_dot_slots(
                 u160_add_product(&mut lo1, &mut hi1, b1.0, c);
             }
         }
+        // The merged high limbs stay below `polys.len() < 2^24`; therefore
+        // neither u32 addition can overflow and the original whole-batch
+        // reduce160 bound still applies exactly.
+        let (merged_lo0, carry0) = lo0.overflowing_add(lo0_b);
+        lo0 = merged_lo0;
+        hi0 += hi0_b + carry0 as u32;
+        let (merged_lo1, carry1) = lo1.overflowing_add(lo1_b);
+        lo1 = merged_lo1;
+        hi1 += hi1_b + carry1 as u32;
         // SAFETY: the accumulator bound documented above — below
         // `polys.len() * 2^128 < 2^152` — is far under reduce160's
         // precondition.
@@ -884,6 +915,66 @@ mod tests {
         // Raw representatives are deliberately not part of the assertion:
         // delayed and per-term reduction are required to agree as field
         // values, including when every input can occupy the full u64 range.
+    }
+
+    #[test]
+    fn ext2_base_scalar_dot_slots_two_lanes_matches_generic_boundaries() {
+        let p = GF::ORDER;
+        let raw = [0, 1, 2, p - 1, p, p + 1, u64::MAX];
+        let start = 3;
+        let out_len = 7;
+        let end = start + out_len;
+
+        // Odd/even full-batch widths exercise both unrolled lanes and the
+        // one-element remainder. Five boundary-length polynomials exercise
+        // the unchanged partial-coverage path in the same calls.
+        for full_count in [0, 1, 2, 17, 18] {
+            let mut polys: Vec<Vec<GF>> = (0..full_count)
+                .map(|j| {
+                    (0..end)
+                        .map(|i| GoldilocksField(raw[(i + 3 * j) % raw.len()]))
+                        .collect()
+                })
+                .collect();
+            for len in [0, start - 1, start, start + 1, end - 1] {
+                let j = polys.len();
+                polys.push(
+                    (0..len)
+                        .map(|i| GoldilocksField(raw[(2 * i + j) % raw.len()]))
+                        .collect(),
+                );
+            }
+            let powers: Vec<Q2> = (0..polys.len())
+                .map(|j| {
+                    QuadraticExtension([
+                        GoldilocksField(raw[j % raw.len()]),
+                        GoldilocksField(raw[(j + 3) % raw.len()]),
+                    ])
+                })
+                .collect();
+            let poly_refs: Vec<&[GF]> = polys.iter().map(Vec::as_slice).collect();
+            let mut actual = vec![Q2::ZERO; out_len];
+            super::ext2_base_scalar_dot_slots(&mut actual, start, &poly_refs, &powers);
+
+            for (i, value) in actual.iter().enumerate() {
+                let expected: Q2 = powers
+                    .iter()
+                    .zip(&polys)
+                    .filter_map(|(&power, poly)| {
+                        poly.get(start + i).map(|&coefficient| {
+                            <Q2 as FieldExtension<2>>::scalar_mul(&power, coefficient)
+                        })
+                    })
+                    .sum();
+                for limb in 0..2 {
+                    assert_eq!(
+                        value.0[limb].to_canonical_u64(),
+                        expected.0[limb].to_canonical_u64(),
+                        "full_count={full_count} slot={i} limb={limb}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
