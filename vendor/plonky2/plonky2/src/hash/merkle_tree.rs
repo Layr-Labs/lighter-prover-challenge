@@ -844,15 +844,24 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             ColumnStore::Owned(owned) => crate::util::transpose_to_bitrev_flat(owned),
             #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
             ColumnStore::Shared(_) => {
-                let mut flat = vec![F::ZERO; num_leaves * num_columns];
-                flat.par_chunks_mut(num_columns)
-                    .enumerate()
-                    .for_each(|(leaf, row)| {
-                        let natural = crate::util::reverse_bits(leaf, log_rows);
-                        for (column, value) in row.iter_mut().enumerate() {
-                            *value = columns.col(column)[natural];
-                        }
-                    });
+                let flat_len = num_leaves * num_columns;
+                let mut flat: Vec<F> = Vec::with_capacity(flat_len);
+                {
+                    let flat_slots = capacity_up_to_mut(&mut flat, flat_len);
+                    flat_slots
+                        .par_chunks_mut(num_columns)
+                        .enumerate()
+                        .for_each(|(leaf, row)| {
+                            let natural = crate::util::reverse_bits(leaf, log_rows);
+                            for (column, slot) in row.iter_mut().enumerate() {
+                                slot.write(columns.col(column)[natural]);
+                            }
+                        });
+                }
+                // SAFETY: `flat_len` is exactly divisible by the nonzero
+                // `num_columns`, and the parallel loop writes every slot in
+                // every chunk exactly once before the vector length is set.
+                unsafe { flat.set_len(flat_len) };
                 flat
             }
         };
