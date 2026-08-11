@@ -1801,6 +1801,20 @@ fn start_gpu_permutation_quotient<
     Some(job)
 }
 
+/// Adds two unscaled Metal quotient contributions to an already-scaled CPU
+/// quotient value. Keeping the CPU scale in its original 32-point batch is
+/// important for locality; only the two final GPU numerators share their
+/// common `Z_H` inverse at the challenge-column materialization boundary.
+#[inline(always)]
+fn add_two_scaled_quotient_parts<F: RichField>(
+    cpu_scaled: F,
+    first_numerator: F,
+    second_numerator: F,
+    denominator_inverse: F,
+) -> F {
+    cpu_scaled + (first_numerator + second_numerator) * denominator_inverse
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2393,7 +2407,10 @@ fn compute_quotient_polys<
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
+    let fuse_tail_gpu_pair = gpu_range.is_some() && gpu_permutation.is_some();
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_range_values = if let Some((_, job)) = &gpu_range {
         let gpu_values = match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2429,20 +2446,27 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        if fuse_tail_gpu_pair {
+            Some(gpu_values)
+        } else {
+            quotient_values
+                .par_chunks_exact_mut(num_challenges)
+                .zip(gpu_values.par_chunks_exact(num_challenges))
+                .enumerate()
+                .for_each(|(i, (cpu_values, gpu_values))| {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                        *cpu += gpu * denominator_inv;
+                    }
+                });
+            None
+        }
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some(job) = &gpu_permutation {
+    let gpu_permutation_values = if let Some(job) = &gpu_permutation {
         let gpu_values = match job.finish() {
             Ok(values) => values,
             Err(error) => {
@@ -2466,17 +2490,24 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        if fuse_tail_gpu_pair {
+            Some(gpu_values)
+        } else {
+            quotient_values
+                .par_chunks_exact_mut(num_challenges)
+                .zip(gpu_values.par_chunks_exact(num_challenges))
+                .enumerate()
+                .for_each(|(i, (cpu_values, gpu_values))| {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                        *cpu += gpu * denominator_inv;
+                    }
+                });
+            None
+        }
+    } else {
+        None
+    };
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
     // Parallel scatter of the interleaved point-major buffer into the
@@ -2504,18 +2535,62 @@ fn compute_quotient_polys<
         .map(|column| ColPtr(column.as_mut_ptr()))
         .collect();
     let column_ptrs = &column_ptrs;
-    quotient_values
-        .par_chunks(BATCH_SIZE * num_challenges)
-        .enumerate()
-        .for_each(|(chunk_i, chunk)| {
-            let base = BATCH_SIZE * chunk_i;
-            for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                for (column, &value) in column_ptrs.iter().zip(point_values) {
-                    // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let tail_gpu_pair = gpu_range_values.zip(gpu_permutation_values);
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let tail_gpu_pair: Option<(&[F], &[F])> = None;
+
+    if let Some((range_values, permutation_values)) = tail_gpu_pair {
+        // Range/U32 and permutation are the final two command buffers on the
+        // proof's Metal queue. Their old completion path made two separate
+        // whole-domain read/modify/write passes over `quotient_values`, then
+        // this scatter read the finished buffer a third time. Materialize the
+        // same field value directly here instead: the CPU and Poseidon terms
+        // are already scaled in `quotient_values`, while the two final Metal
+        // numerators share one denominator multiplication. This preserves the
+        // early Poseidon merge (which can overlap the later GPU commands) and
+        // adds no new post-GPU pass.
+        quotient_values
+            .par_chunks(BATCH_SIZE * num_challenges)
+            .zip(range_values.par_chunks(BATCH_SIZE * num_challenges))
+            .zip(permutation_values.par_chunks(BATCH_SIZE * num_challenges))
+            .enumerate()
+            .for_each(|(chunk_i, ((cpu_chunk, range_chunk), permutation_chunk))| {
+                let base = BATCH_SIZE * chunk_i;
+                for (k, ((cpu_values, range_values), permutation_values)) in cpu_chunk
+                    .chunks_exact(num_challenges)
+                    .zip(range_chunk.chunks_exact(num_challenges))
+                    .zip(permutation_chunk.chunks_exact(num_challenges))
+                    .enumerate()
+                {
+                    let denominator_inverse = z_h_on_coset.eval_inverse(base + k);
+                    for challenge in 0..num_challenges {
+                        let value = add_two_scaled_quotient_parts(
+                            cpu_values[challenge],
+                            range_values[challenge],
+                            permutation_values[challenge],
+                            denominator_inverse,
+                        );
+                        // SAFETY: `base + k` lies in this chunk's disjoint
+                        // range and each challenge owns a distinct column.
+                        unsafe { *column_ptrs[challenge].0.add(base + k) = value };
+                    }
                 }
-            }
-        });
+            });
+    } else {
+        quotient_values
+            .par_chunks(BATCH_SIZE * num_challenges)
+            .enumerate()
+            .for_each(|(chunk_i, chunk)| {
+                let base = BATCH_SIZE * chunk_i;
+                for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                    for (column, &value) in column_ptrs.iter().zip(point_values) {
+                        // SAFETY: `base + k` lies in this chunk's disjoint range.
+                        unsafe { *column.0.add(base + k) = value };
+                    }
+                }
+            });
+    }
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
@@ -2658,11 +2733,13 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{
+        add_two_scaled_quotient_parts, precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS,
+    };
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::{Field, Field64};
+    use crate::field::types::{Field, Field64, PrimeField64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::gate::U32QuotientGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2728,6 +2805,35 @@ mod quotient_layout_tests {
 
         data.verify(proof?)?;
         Ok(())
+    }
+
+    #[test]
+    fn fused_tail_gpu_pair_matches_separate_scales() {
+        let values = [
+            F::ZERO,
+            F::ONE,
+            F::from_canonical_u64(7),
+            F::from_canonical_u64(0xffff_ffff),
+            F::from_noncanonical_u64(u64::MAX),
+        ];
+        for &cpu_scaled in &values {
+            for &range_numerator in &values {
+                for &permutation_numerator in &values {
+                    for &denominator_inverse in &values {
+                        let expected = cpu_scaled
+                            + range_numerator * denominator_inverse
+                            + permutation_numerator * denominator_inverse;
+                        let actual = add_two_scaled_quotient_parts(
+                            cpu_scaled,
+                            range_numerator,
+                            permutation_numerator,
+                            denominator_inverse,
+                        );
+                        assert_eq!(actual.to_canonical_u64(), expected.to_canonical_u64());
+                    }
+                }
+            }
+        }
     }
 
     /// End-to-end retained-column differential for every audited combined-gate
