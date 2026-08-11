@@ -3,21 +3,25 @@ use core::marker::PhantomData;
 use core::mem::{size_of, size_of_val};
 use core::slice;
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::ffi::CString;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 
 #[cfg(feature = "diagnostic_profile")]
 use block::ConcreteBlock;
 #[cfg(feature = "diagnostic_profile")]
 use metal::CommandBufferRef;
-#[cfg(feature = "diagnostic_profile")]
-use objc::runtime::Sel;
-#[cfg(feature = "diagnostic_profile")]
-use objc::Message;
+use metal::foreign_types::ForeignType;
 use metal::{
-    Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSUInteger,
+    BinaryArchive, BinaryArchiveDescriptor, Buffer, CommandBuffer, CommandQueue, CompileOptions,
+    ComputePipelineDescriptor, ComputePipelineState, Device, Library, MTLCommandBufferStatus,
+    MTLComputePipelineState, MTLPipelineOption, MTLResourceOptions, MTLSize, NSUInteger, URL,
 };
 use objc::rc::autoreleasepool;
+use objc::runtime::{Class, Object, Sel, BOOL, NO};
+use objc::Message;
 use plonky2_maybe_rayon::*;
 
 use crate::field::types::{Field, PrimeField64};
@@ -99,23 +103,56 @@ fn profile_command_buffer(
     command_buffer.add_completed_handler(&completed_handler);
 }
 
+#[cfg(test)]
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 
 /// `poseidon2.metal` precompiled to AIR, so a worker that cannot use the Metal
 /// shader cache does not pay the MSL front end. Regenerate whenever
-/// `poseidon2.metal` changes (see `MetalShared::new`); the
-/// `metallib_matches_shader_source` test enforces it.
+/// `poseidon2.metal` changes (see `MetalShared::new`); the source and deployed
+/// library SHA tests enforce both halves of that provenance.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
+#[cfg(test)]
+const SHADER_METALLIB_SHA256: &str =
+    "06336b88e0722b9dd6d727980d4ebba8041f70c7fcfbdc7b22d53c123cf1fd08";
 
-/// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
-const SHADER_SOURCE_SHA256: &str =
+/// Exact 59c generic library used whenever the all-or-nothing archive probe
+/// cannot activate the hot library. Keeping this artifact separate prevents a
+/// foreign or partial archive from imposing the new hot pipeline's cold
+/// lowering cost on the established ten-pipeline fallback.
+const GENERIC_SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.generic.metallib");
+const GENERIC_SHADER_SOURCE: &str = include_str!("poseidon2.generic.metal");
+#[cfg(test)]
+const GENERIC_SHADER_METALLIB_SHA256: &str =
+    "b21f90022d75c1145eae432e02b0f04e15d99975ec4280d81362a03e14ab2164";
+#[cfg(test)]
+const GENERIC_SHADER_SOURCE_SHA256: &str =
     "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
 
-/// Every kernel the shader defines. The prebuilt library is trusted only if all
-/// of them resolve, so a stale or truncated artifact falls back to compiling the
-/// source. This deliberately includes the lazily-built gate-quotient kernels:
-/// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
+/// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
+#[cfg(test)]
+const SHADER_SOURCE_SHA256: &str =
+    "dd7a9e501728c718997b15117dbc78009501daac2a12ce0f37c7ab4b875e31ee";
+
+/// Every kernel the shader defines. The artifact integrity test resolves this
+/// full roster; runtime archive probes resolve the six required functions in
+/// a fixed sequential order, while the remaining five lower normally on
+/// detached builders.
+#[cfg(test)]
+const METALLIB_REQUIRED_KERNELS: [&str; 11] = [
+    "poseidon2_hash_leaves",
+    "poseidon2_hash_leaves_colmajor",
+    "poseidon2_hash_leaves_colmajor_hot",
+    "poseidon2_hash_parents",
+    "poseidon2_absorb_pass",
+    "ntt_prepare",
+    "ntt_stage",
+    "ifft_finalize",
+    "poseidon2_gate_quotient",
+    "range_check_gate_quotient",
+    "permutation_quotient",
+];
+
+const GENERIC_METALLIB_REQUIRED_KERNELS: [&str; 10] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
     "poseidon2_hash_parents",
@@ -127,6 +164,337 @@ const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
     "range_check_gate_quotient",
     "permutation_quotient",
 ];
+
+/// The build script embeds either the verified device-built archive artifact
+/// or an empty sentinel. The archive is installed before [`CONTEXT`] starts.
+static EMBEDDED_PIPELINE_ARCHIVE: OnceLock<&'static [u8]> = OnceLock::new();
+
+/// Exact bridge-approved proof-output path used by the required archive mode.
+/// The bridge may leave this path absent or install a writable placeholder.
+/// Archive setup creates or truncates and fully verifies the file there; the
+/// final proof writer later truncates the same path after every strict archive
+/// lookup has completed.
+static PIPELINE_ARCHIVE_OUTPUT_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Set only by the scored benchmark's strict entry point. In this mode any
+/// inability to prove an archive hit terminates the worker instead of silently
+/// measuring the generic fallback. The ordinary public entry point remains a
+/// soft-fallback API for non-benchmark consumers.
+static REQUIRE_EMBEDDED_PIPELINE_ARCHIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static METAL_CONTEXT_INITIALIZATION_STARTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+fn archive_is_required() -> bool {
+    REQUIRE_EMBEDDED_PIPELINE_ARCHIVE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+#[cold]
+fn abort_required_archive(error: &str) -> ! {
+    eprintln!("required Metal pipeline archive failed: {error}");
+    std::process::abort();
+}
+
+/// The pinned target26 artifact contains the two ranked M4-family slices. This
+/// bound is intentionally generous while still rejecting an accidental
+/// unrelated build artifact.
+const MAX_PIPELINE_ARCHIVE_BYTES: usize = 256 << 20;
+
+/// Owns every Objective-C input that keys the loaded archive. Required pipeline
+/// states are published only after all six sequential strict probes succeed.
+/// Retaining these owners with [`MetalShared`] avoids driver-side ambiguity
+/// after the proof writer truncates the archive's backing output file.
+struct LoadedPipelineArchive {
+    archive: BinaryArchive,
+    _descriptor: BinaryArchiveDescriptor,
+    _url: URL,
+}
+
+fn load_generic_shader_library(device: &Device) -> Result<Library, String> {
+    let options = CompileOptions::new();
+    device
+        .new_library_with_data(GENERIC_SHADER_METALLIB)
+        .ok()
+        .and_then(|library| {
+            GENERIC_METALLIB_REQUIRED_KERNELS
+                .iter()
+                .all(|name| library.get_function(name, None).is_ok())
+                .then_some(library)
+        })
+        .map_or_else(
+            || {
+                device
+                    .new_library_with_source(GENERIC_SHADER_SOURCE, &options)
+                    .map_err(|error| format!("exact generic 59c shader compilation failed: {error}"))
+            },
+            Ok,
+        )
+}
+
+/// Writes the embedded archive at the exact installed proof-output path. The
+/// bridge may leave that path absent or install a writable placeholder;
+/// create-and-truncate handles both. The descriptor is closed before the
+/// read-back and the read-back handle is closed before returning, so the proof
+/// writer can later truncate this path.
+fn materialize_pipeline_archive_file() -> Result<Option<PathBuf>, String> {
+    let Some(&bytes) = EMBEDDED_PIPELINE_ARCHIVE.get() else {
+        return Ok(None);
+    };
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() > MAX_PIPELINE_ARCHIVE_BYTES {
+        return Err(format!(
+            "embedded Metal binary archive is too large: {} bytes",
+            bytes.len()
+        ));
+    }
+
+    let path = PIPELINE_ARCHIVE_OUTPUT_PATH
+        .get()
+        .ok_or_else(|| "Metal archive proof-output path was not installed".to_owned())?;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| {
+            format!(
+                "creating staged Metal archive {} failed: {error}",
+                path.display()
+            )
+        })?;
+    file.write_all(bytes).map_err(|error| {
+        format!(
+            "writing staged Metal archive {} failed: {error}",
+            path.display()
+        )
+    })?;
+    file.flush().map_err(|error| {
+        format!(
+            "flushing staged Metal archive {} failed: {error}",
+            path.display()
+        )
+    })?;
+    let written_size = file
+        .metadata()
+        .map_err(|error| {
+            format!(
+                "statting staged Metal archive {} failed: {error}",
+                path.display()
+            )
+        })?
+        .len();
+    drop(file);
+    if written_size != bytes.len() as u64 {
+        return Err(format!(
+            "staged Metal archive size mismatch: wrote {written_size}, expected {}",
+            bytes.len()
+        ));
+    }
+    let read_back = std::fs::read(path).map_err(|error| {
+        format!(
+            "reading back staged Metal archive {} failed: {error}",
+            path.display()
+        )
+    })?;
+    if read_back.len() != bytes.len() || read_back.as_slice() != bytes {
+        return Err(format!(
+            "staged Metal archive read-back mismatch: got {} bytes, expected {}",
+            read_back.len(),
+            bytes.len()
+        ));
+    }
+    drop(read_back);
+    Ok(Some(path.to_owned()))
+}
+
+/// Builds a file URL with Foundation's raw path API instead of parsing a URI
+/// string. The returned wrapper owns the explicit retain performed here.
+fn file_url_for_archive(path: &Path) -> Result<URL, String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| "staged Metal archive path is not UTF-8".to_owned())?;
+    let c_path = CString::new(path)
+        .map_err(|_| "staged Metal archive path contains an interior NUL".to_owned())?;
+
+    // SAFETY: NSString and NSURL are Foundation classes on supported macOS.
+    // Every returned pointer is checked, and `retain` supplies the +1 ownership
+    // expected by metal-rs's `URL::from_ptr` wrapper.
+    unsafe {
+        let ns_string_class =
+            Class::get("NSString").ok_or_else(|| "NSString class is unavailable".to_owned())?;
+        let ns_path: *mut Object = ns_string_class
+            .send_message(
+                Sel::register("stringWithUTF8String:"),
+                (c_path.as_ptr(),),
+            )
+            .map_err(|error| format!("creating NSString path failed: {error}"))?;
+        if ns_path.is_null() {
+            return Err("NSString rejected the staged Metal archive path".to_owned());
+        }
+        let ns_url_class =
+            Class::get("NSURL").ok_or_else(|| "NSURL class is unavailable".to_owned())?;
+        let raw_url: *mut Object = ns_url_class
+            .send_message(
+                Sel::register("fileURLWithPath:isDirectory:"),
+                (ns_path, NO),
+            )
+            .map_err(|error| format!("fileURLWithPath message failed: {error}"))?;
+        if raw_url.is_null() {
+            return Err("fileURLWithPath returned nil for the staged Metal archive".to_owned());
+        }
+        let retained_url: *mut Object = (&*raw_url)
+            .send_message(Sel::register("retain"), ())
+            .map_err(|error| format!("retaining staged Metal archive URL failed: {error}"))?;
+        if retained_url.is_null() {
+            return Err("retaining staged Metal archive URL returned nil".to_owned());
+        }
+        let url = URL::from_ptr(retained_url.cast());
+        let is_file_url: BOOL = url
+            .send_message(Sel::register("isFileURL"), ())
+            .map_err(|error| format!("querying isFileURL failed: {error}"))?;
+        if is_file_url == NO {
+            return Err("Foundation did not create a file URL for the archive".to_owned());
+        }
+        if url.path() != path {
+            return Err(format!(
+                "Foundation file URL path mismatch: got {:?}, expected {path:?}",
+                url.path()
+            ));
+        }
+        Ok(url)
+    }
+}
+
+fn load_pipeline_archive_url(
+    device: &Device,
+    url: URL,
+) -> Result<LoadedPipelineArchive, String> {
+    autoreleasepool(|| {
+        let descriptor = BinaryArchiveDescriptor::new();
+        descriptor.set_url(&url);
+        let archive = device
+            .new_binary_archive_with_descriptor(&descriptor)
+            .map_err(|error| format!("loading staged Metal archive failed: {error}"))?;
+        Ok(LoadedPipelineArchive {
+            archive,
+            _descriptor: descriptor,
+            _url: url,
+        })
+    })
+}
+
+/// Loads the exact staged bytes while retaining the URL and descriptor beside
+/// the archive. Ordinary callers treat every error as the established soft
+/// miss; required mode makes the same error abort during context construction.
+fn materialize_pipeline_archive(device: &Device) -> Result<Option<LoadedPipelineArchive>, String> {
+    let Some(path) = materialize_pipeline_archive_file()? else {
+        return Ok(None);
+    };
+    let url = autoreleasepool(|| file_url_for_archive(&path))?;
+    load_pipeline_archive_url(device, url).map(Some)
+}
+
+/// Retrieves one exact archived pipeline. `FailOnBinaryArchiveMiss` is the
+/// key safety property: a stale/foreign archive returns immediately instead
+/// of silently lowering the function and making a miss look like a hit.
+fn pipeline_from_archive(
+    device: &Device,
+    library: &Library,
+    archive: &BinaryArchive,
+    name: &str,
+) -> Result<ComputePipelineState, String> {
+    let function = library
+        .get_function(name, None)
+        .map_err(|error| format!("archive kernel {name} unavailable: {error}"))?;
+    let descriptor = ComputePipelineDescriptor::new();
+    descriptor.set_compute_function(Some(&function));
+    descriptor.set_binary_archives(&[archive]);
+
+    // metal-rs's reflection helper assumes a non-null reflection object even
+    // though no reflection is requested, so call the selector directly.
+    unsafe {
+        let device_ref: &metal::DeviceRef = device;
+        let mut error: *mut Object = core::ptr::null_mut();
+        let mut reflection: *mut Object = core::ptr::null_mut();
+        let pipeline: *mut MTLComputePipelineState = device_ref
+            .send_message(
+                Sel::register(
+                    "newComputePipelineStateWithDescriptor:options:reflection:error:",
+                ),
+                (
+                    &*descriptor,
+                    MTLPipelineOption::FailOnBinaryArchiveMiss.bits(),
+                    &mut reflection,
+                    &mut error,
+                ),
+            )
+            .map_err(|error| format!("Metal archive call failed for {name}: {error}"))?;
+        if !error.is_null() || pipeline.is_null() {
+            return Err(format!("Metal binary archive missed pipeline {name}"));
+        }
+        Ok(ComputePipelineState::from_ptr(pipeline))
+    }
+}
+
+struct ArchivedPipelineSet {
+    required: RequiredPipelines,
+    library: Library,
+    loaded_archive: LoadedPipelineArchive,
+}
+
+fn build_required_archived_pipelines(
+    device: &Device,
+    library: &Library,
+    archive: &BinaryArchive,
+) -> Result<RequiredPipelines, String> {
+    let device_ref = device;
+    let library_ref = library;
+    let archive_ref = archive;
+    let required = |name: &'static str| {
+        autoreleasepool(|| pipeline_from_archive(device_ref, library_ref, archive_ref, name))
+    };
+
+    // Metal accepted this exact archive and roster sequentially in the timed
+    // diagnostic. Keep the production probes on the same thread and in that
+    // fixed order; the tuple is returned for publication only after every
+    // strict `FailOnBinaryArchiveMiss` lookup succeeds.
+    let leaf = required("poseidon2_hash_leaves")?;
+    let leaf_colmajor = required("poseidon2_hash_leaves_colmajor")?;
+    let parent = required("poseidon2_hash_parents")?;
+    let ntt_prepare = required("ntt_prepare")?;
+    let ntt_stage = required("ntt_stage")?;
+    let ifft_finalize = required("ifft_finalize")?;
+
+    Ok((
+        leaf,
+        leaf_colmajor,
+        parent,
+        ntt_prepare,
+        ntt_stage,
+        ifft_finalize,
+    ))
+}
+
+fn try_archived_pipelines(device: &Device) -> Result<Option<ArchivedPipelineSet>, String> {
+    let Some(loaded_archive) = materialize_pipeline_archive(device)? else {
+        return Ok(None);
+    };
+
+    let library = device
+        .new_library_with_data(SHADER_METALLIB)
+        .map_err(|error| format!("loading archive-matched hot metallib failed: {error}"))?;
+    let required =
+        build_required_archived_pipelines(device, &library, &loaded_archive.archive)?;
+    Ok(Some(ArchivedPipelineSet {
+        required,
+        library,
+        loaded_archive,
+    }))
+}
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
 /// (6654d43) ranked-validated this raised value inside its composition; my
 /// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
@@ -158,10 +526,6 @@ const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
 /// official ranked host (submission 41467098), so concurrent GPU submission is
 /// intentionally disabled.
 const MAX_BUFFER_SETS: usize = 1;
-/// Concurrent detached digest readbacks (see `BufferPool::detached_readbacks`).
-/// Detachment only moves the post-completion digest copy off the buffer set;
-/// GPU builds themselves stay serialized by `MAX_BUFFER_SETS`.
-const MAX_DETACHED_READBACKS: usize = 2;
 /// Parallel staging copy granularity in u64 elements (4 MiB chunks).
 const STAGING_CHUNK: usize = 1 << 19;
 /// Reuse only the recurring transaction/chain quotient outputs. The final
@@ -176,6 +540,12 @@ const MAX_CACHED_DIGEST_OUTPUTS: usize = 4;
 
 struct MetalShared {
     device: Device,
+    /// Keep every archive-key owner and its matched library alive for the
+    /// process lifetime. All six sequential strict archive probes complete
+    /// before this object is published; later optional lowering never calls
+    /// archive APIs.
+    _loaded_pipeline_archive: Option<LoadedPipelineArchive>,
+    _pipeline_archive_library: Option<Library>,
     queue: CommandQueue,
     leaf_pipeline: ComputePipelineState,
     leaf_colmajor_pipeline: ComputePipelineState,
@@ -560,45 +930,6 @@ impl ColumnStorePool {
     }
 }
 
-/// One-slot stash for a pre-faulted large column store. The final block's
-/// wires store (larger than the pool's per-buffer cap, so never recycled)
-/// otherwise zero-faults its ~2 GiB inside the run's most serial window; the
-/// orchestrator fills this slot from a background thread while the pipeline
-/// still runs, so the block's fill starts on already-resident pages. A size
-/// mismatch simply misses and falls through to a fresh allocation.
-static PREWARMED_LARGE_STORE: Mutex<Option<Buffer>> = Mutex::new(None);
-
-/// Allocates a `bytes`-sized shared buffer, touches one word per page so the
-/// kernel's zero-fill happens here (off the critical path) rather than under
-/// the final block's LDE fill, and stashes it for the next oversized
-/// [`take_or_new_column_buffer`] request. Scheduling-only: buffer contents
-/// are fully written by the fill before any read, exactly as a fresh
-/// allocation's would be.
-pub fn prewarm_large_column_store(bytes: u64) {
-    let Some(context) = shared_context() else {
-        return;
-    };
-    let buffer = autoreleasepool(|| {
-        context
-            .device
-            .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
-    });
-    const PAGE: isize = 16 * 1024;
-    let base = buffer.contents().cast::<u8>();
-    if base.is_null() {
-        return;
-    }
-    let mut offset: isize = 0;
-    while (offset as u64) < bytes {
-        // SAFETY: offset stays within the buffer's allocated length.
-        unsafe { base.offset(offset).write_volatile(0) };
-        offset += PAGE;
-    }
-    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
-        *slot = Some(buffer);
-    }
-}
-
 /// Returns a pooled buffer of exactly `bytes` when one is free, else a fresh
 /// device allocation. Misses (including lock contention) fall through to the
 /// allocator; the pool is a best-effort page-warm cache, never a correctness
@@ -609,10 +940,6 @@ fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
             if let Some(buffer) = pool.take_best_fit(bytes) {
                 return buffer;
             }
-        }
-    } else if let Ok(mut slot) = PREWARMED_LARGE_STORE.try_lock() {
-        if slot.as_ref().is_some_and(|b| b.length() >= bytes) {
-            return slot.take().expect("checked above");
         }
     }
     autoreleasepool(|| device.new_buffer(bytes, MTLResourceOptions::StorageModeShared))
@@ -759,29 +1086,8 @@ struct BufferPool {
     free: Vec<BufferSet>,
     created: usize,
     waiters: usize,
-    /// Waiters for serial-critical-path (2^17 spine) tree builds. While one is
-    /// queued, non-spine acquisitions defer, so a freed set always goes to the
-    /// spine first: command buffers execute FIFO per queue, so this is the only
-    /// place the chain-step wires tree can jump the pipelined chunk trees it
-    /// otherwise parks behind (fold commit phases measured 200-320 ms under
-    /// pipeline load vs 10-50 ms alone — that gap is queue wait, and it sits
-    /// on the strictly serial chain spine). Still exactly one build in flight:
-    /// this reorders the wait queue and never adds GPU concurrency (the
-    /// 3-set experiment scored -21.6% ranked; MAX_BUFFER_SETS stays 1).
-    /// Starvation is bounded by construction: spine proofs are serialized, so
-    /// at most one spine build exists at a time and a chunk waiter defers by
-    /// at most one ~8-50 ms spine build per wake.
-    spine_waiters: usize,
-    /// Retained replacement buffers for detached readbacks (bounded by
-    /// [`MAX_DETACHED_READBACKS`]).
-    spare_outputs: Vec<Buffer>,
-    /// Number of readbacks currently running detached from the set. Each
-    /// detachment lets the completing build release the set before its
-    /// ~tens-of-MB digest copy; while all slots are taken, a completing
-    /// build copies inline holding the set, delaying the next build. Two
-    /// slots cover the common case of two builds completing back-to-back
-    /// under the deeper proof window.
-    detached_readbacks: usize,
+    spare_output: Option<Buffer>,
+    detached_readback: bool,
 }
 
 #[derive(Default)]
@@ -958,8 +1264,8 @@ impl DetachedOutput<'_> {
             .pool
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        debug_assert!(pool.detached_readbacks > 0);
-        pool.detached_readbacks -= 1;
+        debug_assert!(pool.detached_readback);
+        pool.detached_readback = false;
         drop(pool);
         MetalDigests::with_buffer(buffer, digest_pool, len)
     }
@@ -975,10 +1281,10 @@ impl Drop for DetachedOutput<'_> {
             .pool
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        debug_assert!(pool.detached_readbacks > 0);
-        debug_assert!(pool.spare_outputs.len() < MAX_DETACHED_READBACKS);
-        pool.spare_outputs.push(buffer);
-        pool.detached_readbacks -= 1;
+        debug_assert!(pool.detached_readback);
+        debug_assert!(pool.spare_output.is_none());
+        pool.spare_output = Some(buffer);
+        pool.detached_readback = false;
     }
 }
 
@@ -1080,15 +1386,32 @@ impl LazyPipeline {
         }
         self.built.get()?.as_ref()
     }
+
+    /// Returns immediately; an in-flight optional build uses the generic path.
+    fn ready(&self) -> Option<&ComputePipelineState> {
+        self.built.get()?.as_ref()
+    }
 }
 
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
+static LEAF_COLMAJOR_HOT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     POSEIDON_GATE_QUOTIENT_PIPELINE.get()
+}
+
+fn leaf_colmajor_hot_pipeline() -> Option<&'static ComputePipelineState> {
+    #[cfg(test)]
+    {
+        return LEAF_COLMAJOR_HOT_PIPELINE.get();
+    }
+    #[cfg(not(test))]
+    {
+        LEAF_COLMAJOR_HOT_PIPELINE.ready()
+    }
 }
 
 fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
@@ -1103,17 +1426,16 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.get()
 }
 
-/// Starts the two gate-quotient pipeline builds on detached threads.
+/// Starts the generic library's optional pipeline builds on detached threads.
 ///
-/// One thread each rather than one for both: they are the two slowest kernels
-/// in the shader, so serializing them would keep the GPU quotient path on the
-/// CPU for the sum of their lowerings instead of the larger of the two.
+/// The hot-width leaf pipeline is deliberately absent here. A total archive
+/// miss retains the exact ten-pipeline 59c cold-start cost.
 ///
 /// Scheduling only. The pipelines are the same objects the blocking build
 /// produced, lowered from the same library, so nothing they later compute can
 /// differ; only the instant at which they become available does.
 fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
-    for (name, slot) in [
+    let optional = [
         ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
         (
             "range_check_gate_quotient",
@@ -1121,7 +1443,8 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
         ),
         ("permutation_quotient", &PERMUTATION_QUOTIENT_PIPELINE),
         ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
-    ] {
+    ];
+    for (name, slot) in optional {
         let device = device.clone();
         let library = library.clone();
         let spawned = std::thread::Builder::new()
@@ -1152,6 +1475,190 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             }
         }
     }
+}
+
+/// Loads the hot AIR library and lowers only its wide col-major leaf pipeline
+/// on a detached thread. This is used when the build host could verify only
+/// the exact generic ten-entry archive. Readers use [`LazyPipeline::ready`]
+/// and therefore fall back to the archived generic col-major state without
+/// ever waiting for this work.
+#[cfg(test)]
+fn spawn_hot_leaf_pipeline(device: &Device) {
+    let device = device.clone();
+    let slot = &LEAF_COLMAJOR_HOT_PIPELINE;
+    let spawned = std::thread::Builder::new()
+        .name("poseidon2-metal-poseidon2_hash_leaves_colmajor_hot".to_owned())
+        .spawn(move || {
+            let pipeline = autoreleasepool(|| {
+                device
+                    .new_library_with_data(SHADER_METALLIB)
+                    .ok()
+                    .and_then(|library| {
+                        library
+                            .get_function("poseidon2_hash_leaves_colmajor_hot", None)
+                            .ok()
+                            .and_then(|function| {
+                                device
+                                    .new_compute_pipeline_state_with_function(&function)
+                                    .ok()
+                            })
+                    })
+            });
+            if pipeline.is_none() {
+                log::debug!(
+                    "hot col-major leaf pipeline unavailable; using archived generic col-major"
+                );
+            }
+            let _ = slot.built.set(pipeline);
+        });
+    match spawned {
+        Ok(handle) => {
+            if let Ok(mut builder) = slot.builder.lock() {
+                *builder = Some(handle);
+            }
+        }
+        Err(_) => {
+            let _ = slot.built.set(None);
+        }
+    }
+}
+
+/// The four established optional pipelines and hot col-major specialization.
+fn matched_optional_pipelines() -> [(&'static str, &'static LazyPipeline); 5] {
+    [
+        (
+            "poseidon2_hash_leaves_colmajor_hot",
+            &LEAF_COLMAJOR_HOT_PIPELINE,
+        ),
+        ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
+        (
+            "range_check_gate_quotient",
+            &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
+        ),
+        ("permutation_quotient", &PERMUTATION_QUOTIENT_PIPELINE),
+        ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
+    ]
+}
+
+/// Lowers every non-gating pipeline normally from the same pinned target26
+/// library used by the archived required set. These independent builds remain
+/// off context readiness; the four established readers retain their existing
+/// wait/fallback semantics, while the hot leaf reader never waits.
+fn spawn_matched_optional_pipelines(device: &Device, library: &Library) {
+    for (name, slot) in matched_optional_pipelines() {
+        let device = device.clone();
+        let library = library.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("poseidon2-metal-{name}"))
+            .spawn(move || {
+                let pipeline = autoreleasepool(|| {
+                    library.get_function(name, None).ok().and_then(|function| {
+                        device
+                            .new_compute_pipeline_state_with_function(&function)
+                            .ok()
+                    })
+                });
+                if pipeline.is_none() {
+                    log::debug!(
+                        "{name} pipeline unavailable after asynchronous lowering; using its sound fallback"
+                    );
+                }
+                let _ = slot.built.set(pipeline);
+            });
+        match spawned {
+            Ok(handle) => {
+                if let Ok(mut builder) = slot.builder.lock() {
+                    *builder = Some(handle);
+                }
+            }
+            Err(_) => {
+                let _ = slot.built.set(None);
+            }
+        }
+    }
+}
+
+type RequiredPipelines = (
+    ComputePipelineState,
+    ComputePipelineState,
+    ComputePipelineState,
+    ComputePipelineState,
+    ComputePipelineState,
+    ComputePipelineState,
+);
+
+fn activate_archived_pipelines(
+    device: &Device,
+    set: ArchivedPipelineSet,
+) -> (RequiredPipelines, LoadedPipelineArchive, Library) {
+    // Deliberately ordinary lowering: these five builders receive only Device
+    // and Library clones. No BinaryArchive escapes into them, so the required
+    // sixth sequential strict hit above is the final archive API use here.
+    spawn_matched_optional_pipelines(device, &set.library);
+    log::debug!(
+        "Metal archive active: required 6/6 hard hits; five matched optional lowers started"
+    );
+    (set.required, set.loaded_archive, set.library)
+}
+
+fn build_generic_pipelines(device: &Device) -> Result<RequiredPipelines, String> {
+    let library = load_generic_shader_library(device)?;
+    let device_ref = device;
+    let library_ref = &library;
+    let required = |name: &'static str, kind: &'static str| {
+        move || -> Result<ComputePipelineState, String> {
+            autoreleasepool(|| {
+                let function = library_ref
+                    .get_function(name, None)
+                    .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
+                device_ref
+                    .new_compute_pipeline_state_with_function(&function)
+                    .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
+            })
+        }
+    };
+
+    let pipelines = std::thread::scope(|scope| {
+        let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
+        let leaf_colmajor =
+            scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
+        let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
+        let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
+        let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
+        let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
+        (
+            leaf.join().expect("leaf pipeline thread panicked"),
+            leaf_colmajor
+                .join()
+                .expect("col-major leaf pipeline thread panicked"),
+            parent.join().expect("parent pipeline thread panicked"),
+            ntt_prepare
+                .join()
+                .expect("ntt prepare pipeline thread panicked"),
+            ntt_stage.join().expect("ntt stage pipeline thread panicked"),
+            ifft_finalize
+                .join()
+                .expect("ifft finalize pipeline thread panicked"),
+        )
+    });
+
+    // Preserve the established error order and start only the original four
+    // optional pipelines after all six required states are ready.
+    let pipelines = (
+        pipelines.0?,
+        pipelines.1?,
+        pipelines.2?,
+        pipelines.3?,
+        pipelines.4?,
+        pipelines.5?,
+    );
+    spawn_optional_pipelines(device, &library);
+    // The production miss path must not request the hot-only pipeline. Metal
+    // differential tests still execute it without depending on a build.rs
+    // archive, while retaining the exact production miss behavior.
+    #[cfg(test)]
+    spawn_hot_leaf_pipeline(device);
+    Ok(pipelines)
 }
 
 static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShared::new);
@@ -1242,30 +1749,60 @@ pub fn prewarm() {
     std::thread::Builder::new()
         .name("poseidon2-metal-prewarm".to_owned())
         .spawn(|| {
-            // The shader compile and AIR->ISA lowering run in
-            // MTLCompilerService, an XPC service that inherits the requesting
-            // thread's QoS through XPC boost propagation. Under the benchmark
-            // sandbox the OS shader cache is disabled, so every scored worker
-            // pays this cold path at startup — at default QoS it competes at
-            // parity with ordinary work for compiler-service scheduling.
-            // QOS_CLASS_USER_INITIATED (0x19) shortens the context-ready
-            // latency the first GPU-wanting proving step otherwise absorbs.
-            #[allow(non_camel_case_types)]
-            {
-                type qos_class_t = u32;
-                unsafe extern "C" {
-                    fn pthread_set_qos_class_self_np(
-                        qos_class: qos_class_t,
-                        relative_priority: i32,
-                    ) -> i32;
-                }
-                unsafe {
-                    let _ = pthread_set_qos_class_self_np(0x19, 0);
-                }
-            }
             let _ = force_context();
         })
         .ok();
+}
+
+/// Installs the build-time distribution archive before starting [`CONTEXT`].
+/// Empty bytes select the exact generic fallback without touching Metal's
+/// archive APIs. Six required states are strict-probed sequentially in fixed
+/// order; four gate states and the hot leaf specialization lower normally and
+/// asynchronously from the same archive-matched library.
+pub fn prewarm_with_archive(bytes: &'static [u8]) {
+    if !bytes.is_empty() && EMBEDDED_PIPELINE_ARCHIVE.set(bytes).is_err() {
+        log::warn!("Metal pipeline archive was installed more than once");
+    }
+    prewarm();
+}
+
+/// Strict variant used by the scored benchmark candidate. A missing,
+/// incompatible, partial, or unprobeable required archive aborts the worker.
+/// A completed run proves all six gating `FailOnBinaryArchiveMiss` lookups
+/// succeeded; optional states are ordinary asynchronous lowers and are not
+/// part of this requirement. The bridge may leave the exact proof-output path
+/// absent or install a writable placeholder; archive file I/O validates it.
+pub fn prewarm_with_required_archive(bytes: &'static [u8], archive_output_path: &Path) {
+    if bytes.is_empty() {
+        abort_required_archive("the embedded archive is empty");
+    }
+    REQUIRE_EMBEDDED_PIPELINE_ARCHIVE.store(true, core::sync::atomic::Ordering::Release);
+    if METAL_CONTEXT_INITIALIZATION_STARTED.load(core::sync::atomic::Ordering::Acquire) {
+        abort_required_archive("Metal context initialization had already started");
+    }
+    if PIPELINE_ARCHIVE_OUTPUT_PATH
+        .set(archive_output_path.to_owned())
+        .is_err()
+    {
+        abort_required_archive("a proof-output path was already installed");
+    }
+    if EMBEDDED_PIPELINE_ARCHIVE.set(bytes).is_err() {
+        abort_required_archive("an archive was already installed");
+    }
+    prewarm();
+}
+
+/// Completion gate paired with [`prewarm_with_required_archive`]. Forcing the
+/// context makes all six blocking strict probes authoritative before the
+/// worker reports success; optional lowering remains deliberately outside the
+/// gate.
+pub fn verify_required_archive_hits() {
+    if !archive_is_required() {
+        return;
+    }
+    if let Err(error) = force_context().as_ref() {
+        abort_required_archive(error);
+    }
 }
 
 /// True while the prover is inside an exclusive serial phase (pre-execution
@@ -1288,28 +1825,6 @@ pub fn set_exclusive_gpu_phase(enabled: bool) {
 /// idle CPU workers without changing proof semantics.
 pub fn is_exclusive_gpu_phase() -> bool {
     EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
-}
-
-/// Runnable-but-unproven chain steps: incremented by the orchestrator when a
-/// chain step's transaction proof is ready (the step could prove right now),
-/// decremented when its proof completes. While this backlog is at or above
-/// [`SPINE_URGENT_BACKLOG`], the chain is the pipeline's laggard and its
-/// 2^17 spine trees take priority for the single GPU buffer set; below it,
-/// chunk trees keep plain FIFO so the transaction pipeline is not slowed on
-/// the spine's behalf while the spine has slack. A plain unconditional
-/// priority measured both directions: the chain's predecessor waits fell but
-/// the deferred chunk trees stretched the light path — this backlog gate is
-/// the balance point.
-static SPINE_BACKLOG: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
-const SPINE_URGENT_BACKLOG: isize = 3;
-
-/// See [`SPINE_BACKLOG`].
-pub fn spine_backlog_add(delta: isize) {
-    SPINE_BACKLOG.fetch_add(delta, core::sync::atomic::Ordering::Relaxed);
-}
-
-fn spine_urgent() -> bool {
-    SPINE_BACKLOG.load(core::sync::atomic::Ordering::Relaxed) >= SPINE_URGENT_BACKLOG
 }
 
 /// Number of Merkle builds currently occupying the serialized GPU stream
@@ -2046,27 +2561,15 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
-    // Exclusive phases stream the 2^20+ trees as before. Outside them, the
-    // pipelined 2^19 commitments (tx wires/Zs/quotient) also stream — but
-    // only when the GPU stream is unoccupied at entry, the same occupancy
-    // condition gpu_worthwhile uses for the serial-critical shapes: streaming
-    // converts the proof's serial CPU-fill-then-GPU-hash into max(fill, hash),
-    // while an already-busy stream would just queue the absorb groups behind
-    // another tree and stretch both.
-    let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
-        leaf_count >= 1 << 20
-    } else {
-        leaf_count >= 1 << 19
-            && GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0
-    };
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || leaf_width < 16
-        || !stream_admitted
+        || leaf_count < 1 << 20
         || !leaf_count.is_power_of_two()
         || leaf_count > u32::MAX as usize
         || leaf_width > u32::MAX as usize
         || cap_height > leaf_count.ilog2() as usize
+        || !EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
     {
         return None;
     }
@@ -2364,102 +2867,38 @@ enum LeafSource<'a, F> {
 
 impl MetalShared {
     fn new() -> Result<Self, String> {
+        METAL_CONTEXT_INITIALIZATION_STARTED.store(true, core::sync::atomic::Ordering::Release);
         autoreleasepool(|| {
             let device = Device::system_default().ok_or("no Metal device")?;
-            let options = CompileOptions::new();
-            // Prefer the prebuilt AIR library over compiling the MSL source.
-            //
-            // The ranked sandbox profile grants read but DENIES write on
-            // `com.apple.metal` (see `write-benchmark-sandbox-profile.sh`), so the
-            // shader cache is unusable and every worker process re-runs the full
-            // MSL->AIR compile of the shader. The harness spawns one worker per
-            // fixture and the score is the sum of worker process lifetimes, so
-            // that cost is paid once per fixture and every millisecond is scored.
-            // `newLibraryWithData:` skips the front end; only the AIR->ISA
-            // pipeline lowering below remains.
-            //
-            // This needs no Metal toolchain at build time — the artifact is
-            // committed — which is what makes it viable where a build-time
-            // `MTLBinaryArchive` is not.
-            //
-            // Any failure falls back to compiling the source, so a runtime that
-            // rejects this AIR version behaves exactly as before. The function
-            // probe is what makes the fallback safe against a STALE artifact:
-            // regenerate with
-            //   xcrun -sdk macosx metal -c poseidon2.metal -o poseidon2.air
-            //   xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib
-            // and `metallib_matches_shader_source` fails the test run if you
-            // forget.
-            let library = device
-                .new_library_with_data(SHADER_METALLIB)
-                .ok()
-                .filter(|library| {
-                    METALLIB_REQUIRED_KERNELS
-                        .iter()
-                        .all(|name| library.get_function(name, None).is_ok())
-                })
-                .map_or_else(
-                    || {
-                        device
-                            .new_library_with_source(SHADER_SOURCE, &options)
-                            .map_err(|error| format!("shader compilation failed: {error}"))
-                    },
-                    Ok,
-                )?;
-            // Build the compute pipelines concurrently, one thread each.
-            //
-            // Every `newComputePipelineStateWithFunction:` lowers that kernel's
-            // AIR to a GPU binary through MTLCompilerService, and the three
-            // Poseidon2 permutation kernels plus the two gate-quotient kernels
-            // are large enough that each takes hundreds of milliseconds when the
-            // result is not already in the OS shader cache. The benchmark
-            // sandbox denies writes to that cache, which disables it outright —
-            // reads miss too — so *every* scored worker process pays the full
-            // cold lowering, serialized at ~2.36 s. The compiler service handles
-            // the requests in parallel, so issuing all eight at once collapses
-            // that to the cost of the single slowest kernel (~0.67 s).
-            //
-            // This is a scheduling change only: the pipelines, and therefore
-            // every value the GPU later computes, are identical. `Device`,
-            // `Library` and `ComputePipelineState` are all `Send + Sync`, and
-            // each worker thread gets its own autorelease pool so the temporary
-            // `NSError`s the Metal API autoreleases are drained on the thread
-            // that created them rather than leaking.
-            let device_ref = &device;
-            let library_ref = &library;
-            let required = |name: &'static str, kind: &'static str| {
-                move || -> Result<ComputePipelineState, String> {
-                    autoreleasepool(|| {
-                        let function = library_ref
-                            .get_function(name, None)
-                            .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
-                        device_ref
-                            .new_compute_pipeline_state_with_function(&function)
-                            .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
-                    })
+            // Only the six states needed for context readiness are strict
+            // archive probes. The remaining five states lower normally in the
+            // background from the same matched target26 library. Required mode
+            // makes a core archive failure unmistakable, while ordinary
+            // callers retain the exact generic 59c fallback.
+            let archived = match try_archived_pipelines(&device) {
+                Ok(Some(archived)) => Some(archived),
+                Ok(None) => {
+                    if archive_is_required() {
+                        abort_required_archive("no embedded archive was installed");
+                    }
+                    None
+                }
+                Err(error) => {
+                    if archive_is_required() {
+                        abort_required_archive(&error);
+                    }
+                    log::debug!("Metal pipeline archive rejected ({error}); using generic 59c");
+                    None
                 }
             };
-            // The two gate-quotient kernels are the two most expensive to lower
-            // and the only two the context can do without: every caller already
-            // treats an absent pipeline as "run this on the CPU". Lowering them
-            // on the blocking path makes the whole context wait for the slowest
-            // kernel in the shader; measured cold under the benchmark's sandbox
-            // profile, where the OS shader cache is disabled:
-            //
-            //     range_check_gate_quotient   679 ms
-            //     poseidon2_gate_quotient     601 ms
-            //     the six required kernels    491 ms and below
-            //
-            // Lowering all eight in parallel takes 886 ms against 474 ms for the
-            // six required ones, because the two extra kernels both raise the
-            // maximum and add contention on MTLCompilerService. Building them
-            // off the blocking path instead leaves the context ready in 838 ms
-            // rather than 1270 ms, and they land shortly after, long before the
-            // first quotient evaluation of a proof asks for them.
-            //
-            // Started below, once the required six have finished, so they do not
-            // simply move their MTLCompilerService contention onto the path they
-            // are being taken off.
+            let (pipelines, loaded_pipeline_archive, pipeline_archive_library) = match archived {
+                Some(pipelines) => {
+                    let (required, loaded_archive, library) =
+                        activate_archived_pipelines(&device, pipelines);
+                    (required, Some(loaded_archive), Some(library))
+                }
+                None => (build_generic_pipelines(&device)?, None, None),
+            };
             let (
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
@@ -2467,48 +2906,7 @@ impl MetalShared {
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
-            ) = std::thread::scope(|scope| {
-                let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
-                let leaf_colmajor =
-                    scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
-                let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
-                let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
-                let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
-                let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
-                // A panic inside a pipeline build is a bug, not a runtime
-                // condition; propagate it rather than papering over it.
-                (
-                    leaf.join().expect("leaf pipeline thread panicked"),
-                    leaf_colmajor
-                        .join()
-                        .expect("col-major leaf pipeline thread panicked"),
-                    parent.join().expect("parent pipeline thread panicked"),
-                    ntt_prepare
-                        .join()
-                        .expect("ntt prepare pipeline thread panicked"),
-                    ntt_stage
-                        .join()
-                        .expect("ntt stage pipeline thread panicked"),
-                    ifft_finalize
-                        .join()
-                        .expect("ifft finalize pipeline thread panicked"),
-                )
-            });
-            // Surfaced in kernel order, so a single missing or unbuildable
-            // kernel yields the same error string the sequential construction
-            // produced. Only the tie-break between two simultaneous failures
-            // can differ, and every one of these kernels is present in
-            // `SHADER_SOURCE`; a failure here means the whole library is bad,
-            // which `new_library_with_source` above has already rejected.
-            let leaf_pipeline = leaf_pipeline?;
-            let leaf_colmajor_pipeline = leaf_colmajor_pipeline?;
-            let parent_pipeline = parent_pipeline?;
-            let ntt_prepare_pipeline = ntt_prepare_pipeline?;
-            let ntt_stage_pipeline = ntt_stage_pipeline?;
-            let ifft_finalize_pipeline = ifft_finalize_pipeline?;
-
-            spawn_optional_pipelines(&device, &library);
-
+            ) = pipelines;
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
             parameter_values.extend(INTERNAL_CONSTANTS);
@@ -2523,6 +2921,8 @@ impl MetalShared {
             Ok(Self {
                 queue: device.new_command_queue(),
                 device,
+                _loaded_pipeline_archive: loaded_pipeline_archive,
+                _pipeline_archive_library: pipeline_archive_library,
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
                 parent_pipeline,
@@ -2534,9 +2934,8 @@ impl MetalShared {
                     free: Vec::new(),
                     created: 0,
                     waiters: 0,
-                    spine_waiters: 0,
-                    spare_outputs: Vec::new(),
-                    detached_readbacks: 0,
+                    spare_output: None,
+                    detached_readback: false,
                 }),
                 quotient_output_pool: Arc::new(Mutex::new(QuotientOutputPool::default())),
                 digest_output_pool: Arc::new(Mutex::new(DigestOutputPool::default())),
@@ -2813,44 +3212,27 @@ impl MetalShared {
     }
 
     fn acquire_set(&self) -> Result<BufferSet, String> {
-        self.acquire_set_priority(false)
-    }
-
-    /// `spine` acquisitions (the 2^17 serial-critical trees) take a freed set
-    /// ahead of any queued non-spine waiter; see `BufferPool::spine_waiters`.
-    fn acquire_set_priority(&self, spine: bool) -> Result<BufferSet, String> {
         let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
         loop {
-            if spine || pool.spine_waiters == 0 {
-                if let Some(set) = pool.free.pop() {
-                    return Ok(set);
-                }
-                if pool.created < MAX_BUFFER_SETS {
-                    pool.created += 1;
-                    return Ok(BufferSet {
-                        input: None,
-                        output: None,
-                    });
-                }
+            if let Some(set) = pool.free.pop() {
+                return Ok(set);
+            }
+            if pool.created < MAX_BUFFER_SETS {
+                pool.created += 1;
+                return Ok(BufferSet {
+                    input: None,
+                    output: None,
+                });
             }
             pool.waiters += 1;
-            if spine {
-                pool.spine_waiters += 1;
-            }
             match self.available.wait(pool) {
                 Ok(mut next) => {
                     next.waiters -= 1;
-                    if spine {
-                        next.spine_waiters -= 1;
-                    }
                     pool = next;
                 }
                 Err(poisoned) => {
                     let mut next = poisoned.into_inner();
                     next.waiters -= 1;
-                    if spine {
-                        next.spine_waiters -= 1;
-                    }
                     return Err("buffer pool poisoned".to_string());
                 }
             }
@@ -2863,11 +3245,7 @@ impl MetalShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.free.push(set);
-        // Wake every waiter: with a spine waiter queued, whichever non-spine
-        // waiter the OS would hand a `notify_one` to would just re-block, so
-        // the wake must reach the spine thread. Waiter counts here are tiny
-        // (window depth + one spine), so the thundering herd is a few threads.
-        self.available.notify_all();
+        self.available.notify_one();
     }
 
     fn try_detach_completed_output(
@@ -2876,15 +3254,13 @@ impl MetalShared {
         output_bytes: usize,
     ) -> Result<Option<DetachedOutput<'_>>, String> {
         let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
-        if pool.detached_readbacks >= MAX_DETACHED_READBACKS {
+        if pool.detached_readback {
             return Ok(None);
         }
-        let spare_index = pool
-            .spare_outputs
-            .iter()
-            .position(|buffer| buffer.length() >= output_bytes as u64);
-        let replacement = spare_index
-            .map(|index| pool.spare_outputs.swap_remove(index))
+        let replacement = pool
+            .spare_output
+            .take()
+            .filter(|buffer| buffer.length() >= output_bytes as u64)
             .or_else(|| {
                 self.digest_output_pool
                     .lock()
@@ -2901,7 +3277,7 @@ impl MetalShared {
             .output
             .replace(replacement)
             .ok_or_else(|| "completed output buffer missing".to_string())?;
-        pool.detached_readbacks += 1;
+        pool.detached_readback = true;
         drop(pool);
         Ok(Some(DetachedOutput {
             owner: self,
@@ -3595,11 +3971,7 @@ impl MetalShared {
             .ok_or("Metal Merkle output size overflow")?;
 
         let job = GpuJobGuard::begin();
-        // Spine trees (the 2^17 serial-critical shapes, same predicate as
-        // gpu_worthwhile) jump queued chunk-tree waiters for the single set —
-        // but only while the chain is actually the laggard (see SPINE_BACKLOG).
-        let spine = leaf_count == 1 << 17 && leaf_width > 4 && spine_urgent();
-        let mut set = self.acquire_set_priority(spine)?;
+        let mut set = self.acquire_set()?;
         let result = self.build_with_set(
             &mut set,
             source,
@@ -3705,6 +4077,9 @@ impl MetalShared {
             let log_leaf_count_u32 = leaf_count.ilog2();
             let leaf_pipeline = match &source {
                 LeafSource::Rows(_) => &self.leaf_pipeline,
+                LeafSource::Columns(_) | LeafSource::Shared(_) if matches!(leaf_width, 20 | 136) => {
+                    leaf_colmajor_hot_pipeline().unwrap_or(&self.leaf_colmajor_pipeline)
+                }
                 LeafSource::Columns(_) | LeafSource::Shared(_) => &self.leaf_colmajor_pipeline,
             };
             let command_buffer = self.queue.new_command_buffer();
@@ -3951,11 +4326,11 @@ mod tests {
 
     /// The prebuilt AIR library is only sound while it is the compiled form of
     /// the MSL we ship. Nothing in the type system ties the two together, so
-    /// this pins the source bytes: edit `poseidon2.metal` without regenerating
-    /// `poseidon2.metallib` and this fails loudly instead of silently proving
-    /// with stale kernels.
+    /// this pins both the source and deployed library bytes: editing the source
+    /// without regeneration, or replacing the verified macOS 26 artifact,
+    /// fails loudly instead of silently proving with stale kernels.
     #[test]
-    fn metallib_matches_shader_source() {
+    fn metallib_matches_shader_source_and_pinned_artifact() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
         let output = std::process::Command::new("/usr/bin/shasum")
             .args(["-a", "256", &format!("{dir}/poseidon2.metal")])
@@ -3967,10 +4342,46 @@ mod tests {
         assert_eq!(
             digest, SHADER_SOURCE_SHA256,
             "poseidon2.metal changed but poseidon2.metallib was not regenerated. Run:\n  \
-             xcrun -sdk macosx metal -c poseidon2.metal -o poseidon2.air\n  \
+             xcrun -sdk macosx metal -mmacosx-version-min=26.0 \
+             -c poseidon2.metal -o poseidon2.air\n  \
              xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib\n\
              then update SHADER_SOURCE_SHA256 to {digest}."
         );
+
+        let output = std::process::Command::new("/usr/bin/shasum")
+            .args(["-a", "256", &format!("{dir}/poseidon2.metallib")])
+            .output()
+            .expect("shasum must be available to verify the hot metallib");
+        assert!(output.status.success(), "shasum failed");
+        let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
+        let digest = digest.split_whitespace().next().expect("empty shasum output");
+        assert_eq!(
+            digest, SHADER_METALLIB_SHA256,
+            "poseidon2.metallib is not the pinned macOS 26 deployment artifact; \
+             update SHADER_METALLIB_SHA256 only after archive generation and hard-hit verification"
+        );
+    }
+
+    #[test]
+    fn generic_metallib_matches_exact_59c_artifact() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
+        let output = std::process::Command::new("/usr/bin/shasum")
+            .args(["-a", "256", &format!("{dir}/poseidon2.generic.metallib")])
+            .output()
+            .expect("shasum must be available to verify the generic metallib");
+        assert!(output.status.success(), "shasum failed");
+        let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
+        let digest = digest.split_whitespace().next().expect("empty shasum output");
+        assert_eq!(digest, GENERIC_SHADER_METALLIB_SHA256);
+
+        let output = std::process::Command::new("/usr/bin/shasum")
+            .args(["-a", "256", &format!("{dir}/poseidon2.generic.metal")])
+            .output()
+            .expect("shasum must be available to verify the generic source");
+        assert!(output.status.success(), "shasum failed");
+        let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
+        let digest = digest.split_whitespace().next().expect("empty shasum output");
+        assert_eq!(digest, GENERIC_SHADER_SOURCE_SHA256);
     }
 
     /// The fallback in `MetalShared::new` hides a broken artifact behind a
@@ -4119,11 +4530,11 @@ mod tests {
             .expect("resident digest storage always detaches");
         assert_eq!(detached.buffer().contents(), original);
         assert_ne!(set.output.as_ref().unwrap().contents(), original);
-        assert_eq!(context.pool.lock().unwrap().detached_readbacks, 1);
+        assert!(context.pool.lock().unwrap().detached_readback);
         drop(detached);
         let pool = context.pool.lock().unwrap();
-        assert!(!pool.spare_outputs.is_empty());
-        assert_eq!(pool.detached_readbacks, 0);
+        assert!(pool.spare_output.is_some());
+        assert!(!pool.detached_readback);
     }
 
     #[test]
@@ -4170,8 +4581,8 @@ mod tests {
 
             drop(detached);
             let pool = context.pool.lock().unwrap();
-            assert_eq!(pool.detached_readbacks, 0);
-            assert!(!pool.spare_outputs.is_empty());
+            assert!(!pool.detached_readback);
+            assert!(pool.spare_output.is_some());
         });
     }
 
@@ -4330,6 +4741,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn generic_metallib_loads_and_exposes_original_kernels() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let library = device
+            .new_library_with_data(GENERIC_SHADER_METALLIB)
+            .expect("generic 59c metallib must load");
+        for name in GENERIC_METALLIB_REQUIRED_KERNELS {
+            assert!(
+                library.get_function(name, None).is_ok(),
+                "generic 59c metallib is missing kernel {name}"
+            );
+        }
+        assert!(
+            library
+                .get_function("poseidon2_hash_leaves_colmajor_hot", None)
+                .is_err(),
+            "generic fallback must not expose the hot-only kernel"
+        );
+    }
+
+    #[test]
+    fn empty_archive_is_a_strict_miss() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        autoreleasepool(|| {
+            let library = device
+                .new_library_with_data(SHADER_METALLIB)
+                .expect("hot metallib must load");
+            let descriptor = BinaryArchiveDescriptor::new();
+            let archive = device
+                .new_binary_archive_with_descriptor(&descriptor)
+                .expect("empty Metal archive must create");
+            let error = pipeline_from_archive(
+                &device,
+                &library,
+                &archive,
+                "poseidon2_hash_leaves",
+            )
+            .expect_err("FailOnBinaryArchiveMiss must reject an empty archive");
+            assert!(error.contains("miss") || error.contains("failed"));
+        });
     }
 
     #[test]
