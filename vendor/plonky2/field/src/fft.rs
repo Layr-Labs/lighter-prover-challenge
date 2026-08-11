@@ -538,6 +538,41 @@ fn fft_classic_simd_single_layer_neon(
         let mut k = 0;
         while k + m <= values.len() {
             let mut j = 0;
+            // Four lanes per iteration: two independent paired
+            // `NeonGoldilocksField` multiplies issued back-to-back, then two
+            // butterfly add/sub pairs stored. Every product and every
+            // `gl_add_neon`/`gl_sub_neon` is exactly the same operation for the
+            // same lane as the two-wide loop below, in the same order, so each
+            // raw `GoldilocksField.0` word is identical.
+            while j + 4 <= half {
+                let v0 = NeonGoldilocksField([
+                    *values.get_unchecked(k + half + j),
+                    *values.get_unchecked(k + half + j + 1),
+                ]);
+                let w0 = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j),
+                    *omega_row.get_unchecked(j + 1),
+                ]);
+                let v1 = NeonGoldilocksField([
+                    *values.get_unchecked(k + half + j + 2),
+                    *values.get_unchecked(k + half + j + 3),
+                ]);
+                let w1 = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j + 2),
+                    *omega_row.get_unchecked(j + 3),
+                ]);
+                let t0 = w0 * v0;
+                let t1 = w1 * v1;
+                let t0v = vcombine_u64(vcreate_u64(t0.0[0].0), vcreate_u64(t0.0[1].0));
+                let t1v = vcombine_u64(vcreate_u64(t1.0[0].0), vcreate_u64(t1.0[1].0));
+                let u0 = vld1q_u64(base.add(k + j));
+                let u1 = vld1q_u64(base.add(k + j + 2));
+                vst1q_u64(base.add(k + j), gl_add_neon(u0, t0v, eps));
+                vst1q_u64(base.add(k + half + j), gl_sub_neon(u0, t0v, eps));
+                vst1q_u64(base.add(k + j + 2), gl_add_neon(u1, t1v, eps));
+                vst1q_u64(base.add(k + half + j + 2), gl_sub_neon(u1, t1v, eps));
+                j += 4;
+            }
             while j + 2 <= half {
                 let v = NeonGoldilocksField([
                     *values.get_unchecked(k + half + j),
