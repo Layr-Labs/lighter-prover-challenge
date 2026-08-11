@@ -822,6 +822,13 @@ pub(crate) fn prove_block_after_pre(
     // own extensions on top of them.
     circuits.release_finished_circuit_extensions();
 
+    // After both transaction/chain paths have joined, this caller owns the
+    // remaining serial critical path: final witness completion and the block
+    // proof. Reuse the proven chain-spine QoS hint only for that tail. The
+    // broad QoS variants (including the Metal prewarm and child builders) are
+    // deliberately not enabled here because their ranked evidence was weaker.
+    mark_spine_thread_latency_critical();
+
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context =
         plonky2::util::profile::enter_context("final_block", block.block_number, &[]);
