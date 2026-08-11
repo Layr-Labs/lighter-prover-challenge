@@ -2025,39 +2025,53 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         absorb_commands.push(command_buffer);
     }
 
-    // Parent levels over the completed leaf digests, exactly as in the
-    // classic single-command build.
+    // Parent levels over the completed leaf digests. The final absorb remains
+    // in its own early-committed command buffer so the CPU can overlap the
+    // preceding fills with GPU work. Queue FIFO makes those leaf writes visible
+    // to this later command buffer; explicit output barriers then order every
+    // parent level after the preceding parent dispatch.
     let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
     let parents_command = autoreleasepool(|| -> CommandBuffer {
         let command_buffer = context.queue.new_command_buffer();
         let mut level_offset = 0usize;
         let mut child_count = leaf_count;
         level_offsets.push(level_offset);
-        while child_count > cap_count {
-            let parent_count = child_count / 2;
-            let child_offset = level_offset;
-            level_offset += child_count * 4;
-            level_offsets.push(level_offset);
-
-            let parent_count_u32 = parent_count as u32;
+        if child_count > cap_count {
             let parent_encoder = command_buffer.new_compute_command_encoder();
             parent_encoder.set_compute_pipeline_state(&context.parent_pipeline);
-            parent_encoder.set_buffer(
-                0,
-                Some(output_buffer),
-                (child_offset * size_of::<u64>()) as NSUInteger,
-            );
-            parent_encoder.set_buffer(
-                1,
-                Some(output_buffer),
-                (level_offset * size_of::<u64>()) as NSUInteger,
-            );
-            parent_encoder.set_buffer(2, Some(&context.parameters), 0);
-            set_u32(parent_encoder, 3, parent_count_u32);
-            dispatch(parent_encoder, &context.parent_pipeline, parent_count);
-            parent_encoder.end_encoding();
+            let output_resource: &metal::ResourceRef = output_buffer;
+            let mut first_parent = true;
+            while child_count > cap_count {
+                // The leaf digest comes from the preceding command buffer, so
+                // FIFO ordering supplies the first dependency. Subsequent
+                // levels share this encoder and require an explicit barrier.
+                if !first_parent {
+                    parent_encoder.memory_barrier_with_resources(&[output_resource]);
+                }
 
-            child_count = parent_count;
+                let parent_count = child_count / 2;
+                let child_offset = level_offset;
+                level_offset += child_count * 4;
+                level_offsets.push(level_offset);
+
+                parent_encoder.set_buffer(
+                    0,
+                    Some(output_buffer),
+                    (child_offset * size_of::<u64>()) as NSUInteger,
+                );
+                parent_encoder.set_buffer(
+                    1,
+                    Some(output_buffer),
+                    (level_offset * size_of::<u64>()) as NSUInteger,
+                );
+                parent_encoder.set_buffer(2, Some(&context.parameters), 0);
+                set_u32(parent_encoder, 3, parent_count as u32);
+                dispatch(parent_encoder, &context.parent_pipeline, parent_count);
+
+                first_parent = false;
+                child_count = parent_count;
+            }
+            parent_encoder.end_encoding();
         }
         #[cfg(feature = "diagnostic_profile")]
         profile_command_buffer(command_buffer, "merkle_parents", leaf_count as u64);
@@ -6313,7 +6327,7 @@ kernel void goldilocks_mul_bench_native(
     }
 
     #[test]
-    fn streamed_merkle_keeps_digests_resident_and_matches_classic() {
+    fn streamed_merkle_parent_encoder_matches_classic_across_shapes_and_caps() {
         type F = GoldilocksField;
         struct ExclusiveReset;
         impl Drop for ExclusiveReset {
@@ -6324,31 +6338,96 @@ kernel void goldilocks_mul_bench_native(
 
         let context = shared_context().expect("Metal context");
         let rows = 1usize << 20;
-        let cols = 16;
-        let cap_height = 4;
-        let columns = context
-            .allocate_columns::<F>(rows, cols)
-            .expect("shared columns");
         set_exclusive_gpu_phase(true);
         let _reset = ExclusiveReset;
         assert!(is_exclusive_gpu_phase());
         assert!(absorb_pass_pipeline().is_some(), "absorb pipeline");
-        let streamed = build_merkle_tree_shared_streamed(
-            &columns,
-            cap_height,
-            &|group, destinations| {
-                for (index, destination) in destinations.iter_mut().enumerate() {
-                    destination.fill(F::from_canonical_usize(group * 8 + index + 1));
-                }
-            },
-        )
-        .expect("streamed tree");
-        assert!(streamed.0.nodes.is_shared());
+        for cols in [16usize, 17, 136] {
+            let columns = context
+                .allocate_columns::<F>(rows, cols)
+                .expect("shared columns");
+            for cap_height in [0usize, rows.ilog2() as usize] {
+                let fill_schedule = Mutex::new(Vec::new());
+                let streamed = build_merkle_tree_shared_streamed(
+                    &columns,
+                    cap_height,
+                    &|group, destinations| {
+                        fill_schedule
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push((group, destinations.len()));
+                        for (index, destination) in destinations.iter_mut().enumerate() {
+                            let column = group * 8 + index;
+                            destination.fill(F::from_canonical_usize(column + 1));
+                        }
+                    },
+                )
+                .expect("streamed tree");
+                assert!(streamed.0.nodes.is_shared());
 
-        let classic = context
-            .build(LeafSource::Shared(&columns), cols, rows, cap_height)
-            .expect("classic tree");
-        assert_eq!(streamed, classic);
+                let expected_schedule = (0..cols.div_ceil(8))
+                    .map(|group| (group, (cols - group * 8).min(8)))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    *fill_schedule
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    expected_schedule,
+                );
+
+                let classic = context
+                    .build(LeafSource::Shared(&columns), cols, rows, cap_height)
+                    .expect("classic tree");
+                assert_tree_raw_eq(&streamed, &classic, cols, cap_height);
+            }
+        }
+    }
+
+    #[test]
+    fn metal_merkle_matches_cpu_for_streamed_widths_and_extreme_caps() {
+        let mut rng = StdRng::seed_from_u64(0x5354_5245_414d);
+        let context = shared_context().expect("Metal context");
+        let rows = 64usize;
+        let log_rows = rows.ilog2() as usize;
+
+        for cols in [16usize, 17, 136] {
+            let columns = (0..cols)
+                .map(|column| {
+                    (0..rows)
+                        .map(|row| {
+                            let raw = match (column * rows + row) & 7 {
+                                0 => 0,
+                                1 => 1,
+                                2 => GoldilocksField::ORDER - 1,
+                                3 => GoldilocksField::ORDER,
+                                4 => GoldilocksField::ORDER + 1,
+                                5 => u64::MAX,
+                                _ => rng.next_u64(),
+                            };
+                            GoldilocksField(raw)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let leaves = (0..rows)
+                .map(|leaf| {
+                    let natural = crate::util::reverse_bits(leaf, log_rows);
+                    columns
+                        .iter()
+                        .map(|column| column[natural])
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+
+            for cap_height in [0usize, log_rows] {
+                let metal = context
+                    .build(LeafSource::Columns(&columns), cols, rows, cap_height)
+                    .expect("Metal tree");
+                let cpu = cpu_tree(&leaves, cap_height);
+                assert_tree_eq(&metal, &cpu, cols, cap_height);
+                assert_all_paths_match_cpu(&metal, &cpu, rows, cap_height);
+            }
+        }
     }
 
     #[test]
