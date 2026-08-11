@@ -43,6 +43,8 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // step. Allocator page retention changes no computed value.
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+const METAL_PIPELINE_ARCHIVE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/poseidon2-pipelines.binary.metallib"));
 
 fn main() {
     #[cfg(feature = "diagnostic_profile")]
@@ -59,7 +61,7 @@ fn main() {
     {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("startup", "metal_prewarm_submit");
-        plonky2::hash::poseidon2::prewarm_gpu();
+        plonky2::hash::poseidon2::prewarm_gpu_with_required_archive(METAL_PIPELINE_ARCHIVE);
     }
     // `log` is statically disabled in release builds: the ranked worker has no
     // log consumer, and diagnostics remain available in debug/test builds.
@@ -195,6 +197,10 @@ fn main() {
         let _span = plonky2::util::profile::span("orchestration", "block_pipeline");
         prover::prove_block_after_pre(block, circuits, pre_proof)
     };
+    // Required archive hits gate only context readiness. Optional kernels are
+    // ordinary asynchronous lowers from the same retained target15 library and
+    // deliberately do not participate in this completion check.
+    plonky2::hash::poseidon2::verify_required_gpu_archive_hits();
     #[cfg(feature = "diagnostic_profile")]
     let _output_span = plonky2::util::profile::span("output", "serialize_and_flush_proof");
     let mut writer = BufWriter::with_capacity(
