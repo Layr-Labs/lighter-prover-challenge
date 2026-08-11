@@ -1,4 +1,4 @@
-// Redraw marker 701-claude-fable-r2
+// Redraw marker rlm-sig-1786412046
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
@@ -184,6 +184,12 @@ impl Circuits {
             // as the commitment above, so wherever that is dead this is too.
             // Clearing it is idempotent for a path that already released its own.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            // The transposed sigma value matrix (Vec<Vec<F>>, ~335 MiB per
+            // transaction circuit) is read only by proofs of this circuit. Once
+            // the circuit's last proof is produced it is dead; release it here
+            // at the block peak-RSS backstop.
+            data.prover_only.sigmas.clear();
+            data.prover_only.sigmas.shrink_to_fit();
         }
     }
 
@@ -220,6 +226,10 @@ impl Circuits {
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            // sigmas is read only by proofs of this circuit; dead once the heavy
+            // path's chain proof exists. Release it during the light phase.
+            data.prover_only.sigmas.clear();
+            data.prover_only.sigmas.shrink_to_fit();
         }
     }
 
