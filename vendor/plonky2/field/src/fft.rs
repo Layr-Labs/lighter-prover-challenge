@@ -538,6 +538,40 @@ fn fft_classic_simd_single_layer_neon(
         let mut k = 0;
         while k + m <= values.len() {
             let mut j = 0;
+            // Four elements per iteration: two independent paired multiplies
+            // issue back-to-back (each `NeonGoldilocksField` mul is two scalar
+            // widening muls), and the two butterfly add/sub pairs run as two
+            // independent two-lane vectors. Same per-lane operations, same
+            // order as the 2-wide form, so raw limbs are identical.
+            while j + 4 <= half {
+                let v01 = NeonGoldilocksField([
+                    *values.get_unchecked(k + half + j),
+                    *values.get_unchecked(k + half + j + 1),
+                ]);
+                let v23 = NeonGoldilocksField([
+                    *values.get_unchecked(k + half + j + 2),
+                    *values.get_unchecked(k + half + j + 3),
+                ]);
+                let w01 = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j),
+                    *omega_row.get_unchecked(j + 1),
+                ]);
+                let w23 = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j + 2),
+                    *omega_row.get_unchecked(j + 3),
+                ]);
+                let t01 = w01 * v01;
+                let t23 = w23 * v23;
+                let tv01 = vcombine_u64(vcreate_u64(t01.0[0].0), vcreate_u64(t01.0[1].0));
+                let tv23 = vcombine_u64(vcreate_u64(t23.0[0].0), vcreate_u64(t23.0[1].0));
+                let u01 = vld1q_u64(base.add(k + j));
+                let u23 = vld1q_u64(base.add(k + j + 2));
+                vst1q_u64(base.add(k + j), gl_add_neon(u01, tv01, eps));
+                vst1q_u64(base.add(k + half + j), gl_sub_neon(u01, tv01, eps));
+                vst1q_u64(base.add(k + j + 2), gl_add_neon(u23, tv23, eps));
+                vst1q_u64(base.add(k + half + j + 2), gl_sub_neon(u23, tv23, eps));
+                j += 4;
+            }
             while j + 2 <= half {
                 let v = NeonGoldilocksField([
                     *values.get_unchecked(k + half + j),
@@ -1036,7 +1070,7 @@ fn fft_classic_simd_layers<P, M>(
 
 /// Small transforms do not amortize worker-pool scheduling. Production FRI
 /// first wins consistently at 2^18 elements; 2^17 is left on the serial path.
-const PARALLEL_FFT_MIN_SCALARS: usize = 1 << 18;
+const PARALLEL_FFT_MIN_SCALARS: usize = 1 << 17;
 
 #[inline(always)]
 fn fft_classic_simd_layers_parallel<P, M>(
