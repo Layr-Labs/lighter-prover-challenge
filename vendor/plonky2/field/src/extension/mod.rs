@@ -99,6 +99,27 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    /// Compute two independent dot products of extension-field values with
+    /// base-field scalars in one pass over the shared powers slice.
+    ///
+    /// The default is exactly two calls to [`Self::extension_base_dot_product`]
+    /// in input order, so every field and extension degree keeps its prior
+    /// semantics unless it explicitly specializes this hook. A base field may
+    /// specialize when one traversal loading each extension power once and
+    /// folding it into two independent accumulators deletes a full second
+    /// scan of the coefficient slice.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_products_2(
+        extension_values: &[Self::Extension],
+        base_polynomials: [&[Self]; 2],
+    ) -> [Self::Extension; 2] {
+        [
+            Self::extension_base_dot_product(extension_values, base_polynomials[0]),
+            Self::extension_base_dot_product(extension_values, base_polynomials[1]),
+        ]
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.
