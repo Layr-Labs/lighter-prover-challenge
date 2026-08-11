@@ -23,6 +23,8 @@
 //!   identity permutation (mostly zeros) instead of 8-byte usizes;
 //! * the generator watch index is stored in its CSR form (varint-delta
 //!   offsets + `u32` watcher ids);
+//! * per-generator watch counts are stored as varints, avoiding a random
+//!   counter update for every CSR edge during runtime reconstruction;
 //! * constant polynomials are stored as *values* (step-function selectors,
 //!   long constant runs) rather than incompressible coefficients;
 //! * every bulky section is independently zstd-compressed, keeping parallel
@@ -66,7 +68,7 @@ fn embed_generator_serializer() -> EmbedGeneratorSerializer {
 }
 
 const EMBED_MAGIC: u32 = 0x4C45_4331; // "LEC1"
-const EMBED_VERSION: u32 = 1;
+const EMBED_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Primitive encoding helpers
@@ -265,6 +267,26 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     }
     write_compressed_section(&mut out, &buf);
 
+    // Per-generator watch counts. These are already derived by the circuit
+    // builder and are strongly compressible (the benchmark circuits' counts
+    // fit in one-byte varints). Persisting them turns runtime reconstruction
+    // from one random counter update per watcher edge into one sequential
+    // decode per generator.
+    ensure!(
+        prover.generator_watch_counts.len() == prover.generators.len(),
+        "generator watch count length diverges from generator count"
+    );
+    ensure!(
+        prover.generator_watch_counts.iter().sum::<usize>() == watchers.len(),
+        "generator watch counts do not cover the watcher index"
+    );
+    let mut buf = Vec::with_capacity(prover.generator_watch_counts.len() + 8);
+    write_uvarint(&mut buf, prover.generator_watch_counts.len() as u64);
+    for &count in &prover.generator_watch_counts {
+        write_uvarint(&mut buf, count as u64);
+    }
+    write_compressed_section(&mut out, &buf);
+
     // constant polynomial *values* (fft of the committed coefficients; the
     // loader inverts this with the same exact-arithmetic ifft the builder's
     // from_values uses, so the round trip is bit-exact)
@@ -423,12 +445,32 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         ensure!(watcher < generator_count, "watcher index out of range");
         watchers.push(watcher);
     }
-    // Watch counts are a pure function of the (deduplicated) watcher lists;
-    // this mirrors `read_prover_only_circuit_data`'s reconstruction.
-    let mut generator_watch_counts = vec![0usize; generator_count];
-    for &watcher in &watchers {
-        generator_watch_counts[watcher] += 1;
+
+    // Watch counts were derived from this exact CSR by the untimed builder.
+    // Decode them sequentially instead of revisiting every watcher edge and
+    // scattering increments across the generator-sized count array.
+    let section = read_compressed_section(bytes, &mut pos)?;
+    let mut vpos = 0usize;
+    let counts_len = read_uvarint(&section, &mut vpos)? as usize;
+    ensure!(
+        counts_len == generator_count,
+        "generator watch count length mismatch"
+    );
+    let mut generator_watch_counts = Vec::with_capacity(counts_len);
+    let mut total_watch_count = 0usize;
+    for _ in 0..counts_len {
+        let count = usize::try_from(read_uvarint(&section, &mut vpos)?)
+            .context("generator watch count exceeds usize")?;
+        total_watch_count = total_watch_count
+            .checked_add(count)
+            .context("generator watch count total overflow")?;
+        generator_watch_counts.push(count);
     }
+    ensure!(vpos == section.len(), "trailing generator watch count bytes");
+    ensure!(
+        total_watch_count == watchers_len,
+        "generator watch counts do not cover the watcher index"
+    );
     let generator_indices_by_watches = GeneratorWatchIndex::from_parts(offsets, watchers);
 
     // constant polynomial values
