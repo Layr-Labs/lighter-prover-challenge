@@ -930,6 +930,29 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn try_fri_proof_of_work(
+        duplex_intermediate_state: &Self::Permutation,
+        witness_input_pos: usize,
+        min_leading_zeros: u32,
+    ) -> Option<F> {
+        // Keep the backend contract explicit even though this implementation
+        // currently fixes both constants. A future Poseidon2-width change must
+        // fall back, not reinterpret the precompiled WIDTH=12/RATE=8 kernel.
+        if core::any::TypeId::of::<F>()
+            != core::any::TypeId::of::<crate::field::goldilocks_field::GoldilocksField>()
+            || Self::Permutation::WIDTH != WIDTH
+            || Self::Permutation::RATE != RATE
+        {
+            return None;
+        }
+        super::metal::find_fri_proof_of_work(
+            duplex_intermediate_state.as_ref(),
+            witness_input_pos,
+            min_leading_zeros,
+        )
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     fn try_build_merkle_tree(
         leaves: &[F],
         leaf_width: usize,

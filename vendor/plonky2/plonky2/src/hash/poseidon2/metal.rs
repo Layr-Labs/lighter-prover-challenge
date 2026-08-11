@@ -152,6 +152,12 @@ const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
 // still keeping the genuinely CPU-favored tiny shapes (2^15 width-8 measured
 // 1.37) on the CPU.
 const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
+/// Production FRI grinding is fixed at 16 bits. In a 64-search release sweep,
+/// a 2^16 batch minimized total latency; its 12 shared u64 lanes occupy 6 MiB.
+const FRI_POW_BATCH_SIZE: usize = 1 << 16;
+const FRI_POW_WIDTH: usize = 12;
+const FRI_POW_RATE: usize = 8;
+const FRI_POW_MIN_LEADING_ZEROS: u32 = 16;
 /// Upper bound on concurrently in-flight GPU tree builds. One set serializes
 /// GPU tree builds exactly like the promoted base's global context mutex: a
 /// 3-set experiment measured 13-18% faster locally but scored -21.6% on the
@@ -1012,6 +1018,14 @@ impl LazyPipeline {
         }
         self.built.get()?.as_ref()
     }
+
+    /// Returns a completed build without taking the builder lock or joining
+    /// its thread. Latency-sensitive opportunistic work must fall back while
+    /// lowering is still in flight rather than move that lowering onto its
+    /// critical path.
+    fn get_if_ready(&self) -> Option<&ComputePipelineState> {
+        self.built.get()?.as_ref()
+    }
 }
 
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
@@ -1033,6 +1047,10 @@ fn permutation_quotient_pipeline() -> Option<&'static ComputePipelineState> {
 
 fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.get()
+}
+
+fn absorb_pass_pipeline_if_ready() -> Option<&'static ComputePipelineState> {
+    ABSORB_PASS_PIPELINE.get_if_ready()
 }
 
 /// Starts the two gate-quotient pipeline builds on detached threads.
@@ -1156,6 +1174,16 @@ fn context_ready() -> bool {
     CONTEXT_READY.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Reads the context only after the readiness publication proves the
+/// `LazyLock` initializer has completed. This cannot trigger or wait for Metal
+/// initialization; an early FRI caller simply keeps the CPU path.
+fn context_if_ready() -> Option<&'static MetalShared> {
+    if !context_ready() {
+        return None;
+    }
+    (&*CONTEXT).as_ref().ok()
+}
+
 /// Starts building the Metal context on a detached background thread.
 ///
 /// [`CONTEXT`] is otherwise forced by whichever proving step first wants the
@@ -1201,27 +1229,390 @@ pub fn is_exclusive_gpu_phase() -> bool {
     EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Number of Merkle builds currently occupying the serialized GPU stream
-/// (from buffer acquisition through `wait_until_completed`). Routing reads
-/// this to decide whether a small serial-path tree would enqueue behind
-/// in-flight work; the count is a heuristic only — either routing outcome
-/// hashes the identical tree, so races are benign.
+/// Number of jobs currently occupying the serialized GPU stream (from buffer
+/// acquisition through `wait_until_completed`), or [`GPU_JOB_RESERVED`] while
+/// the opportunistic FRI grinder owns idle admission. Ordinary counts are a
+/// routing heuristic — either routing outcome hashes the identical tree — but
+/// the sentinel synchronizes admission so a normal job cannot cross a grinder
+/// reservation.
 static GPU_JOBS_IN_FLIGHT: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-struct GpuJobGuard;
+/// Exclusive sentinel used by the opportunistic FRI grinder. Ordinary jobs
+/// wait while this value is installed, so none can cross the reservation
+/// between its idle CAS and command submission.
+const GPU_JOB_RESERVED: usize = usize::MAX;
+
+enum GpuJobKind {
+    Normal,
+    Reserved,
+}
+
+struct GpuJobGuard {
+    kind: GpuJobKind,
+}
+
+fn try_reserve_idle(counter: &core::sync::atomic::AtomicUsize) -> bool {
+    counter
+        .compare_exchange(
+            0,
+            GPU_JOB_RESERVED,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
+}
+
+fn begin_normal_gpu_job(
+    counter: &core::sync::atomic::AtomicUsize,
+    mut wait_reserved: impl FnMut(),
+) -> bool {
+    let mut current = counter.load(core::sync::atomic::Ordering::Acquire);
+    let mut waited_on_reservation = false;
+    loop {
+        if current == GPU_JOB_RESERVED {
+            waited_on_reservation = true;
+            wait_reserved();
+            current = counter.load(core::sync::atomic::Ordering::Acquire);
+            continue;
+        }
+        let next = current
+            .checked_add(1)
+            .filter(|&next| next != GPU_JOB_RESERVED)
+            .expect("too many concurrent Metal jobs");
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => return waited_on_reservation,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn end_normal_gpu_job(counter: &core::sync::atomic::AtomicUsize) {
+    counter
+        .fetch_update(
+            core::sync::atomic::Ordering::Release,
+            core::sync::atomic::Ordering::Relaxed,
+            |current| match current {
+                0 | GPU_JOB_RESERVED => None,
+                _ => Some(current - 1),
+            },
+        )
+        .expect("normal Metal job counter was corrupted");
+}
+
+fn end_reserved_gpu_job(counter: &core::sync::atomic::AtomicUsize) {
+    counter
+        .compare_exchange(
+            GPU_JOB_RESERVED,
+            0,
+            core::sync::atomic::Ordering::Release,
+            core::sync::atomic::Ordering::Relaxed,
+        )
+        .expect("exclusive Metal reservation was corrupted");
+}
 
 impl GpuJobGuard {
     fn begin() -> Self {
-        GPU_JOBS_IN_FLIGHT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        GpuJobGuard
+        let waited_on_reservation =
+            begin_normal_gpu_job(&GPU_JOBS_IN_FLIGHT, std::thread::yield_now);
+        #[cfg(feature = "diagnostic_profile")]
+        if waited_on_reservation {
+            crate::util::profile::counter("fri_pow", "normal_job_waited", 1);
+        }
+        #[cfg(not(feature = "diagnostic_profile"))]
+        let _ = waited_on_reservation;
+        GpuJobGuard {
+            kind: GpuJobKind::Normal,
+        }
+    }
+
+    /// Atomically reserves an idle serialized Metal stream. Ordinary jobs
+    /// wait at `begin` for at most this one batch, until the returned guard
+    /// releases the sentinel. Code holding this reservation must dispatch
+    /// directly and must not reenter [`GpuJobGuard::begin`].
+    fn try_begin_idle() -> Option<Self> {
+        try_reserve_idle(&GPU_JOBS_IN_FLIGHT).then_some(GpuJobGuard {
+            kind: GpuJobKind::Reserved,
+        })
     }
 }
 
 impl Drop for GpuJobGuard {
     fn drop(&mut self) {
-        GPU_JOBS_IN_FLIGHT.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        match self.kind {
+            GpuJobKind::Reserved => end_reserved_gpu_job(&GPU_JOBS_IN_FLIGHT),
+            GpuJobKind::Normal => end_normal_gpu_job(&GPU_JOBS_IN_FLIGHT),
+        }
     }
+}
+
+/// Reused column-major state for the host-only FRI grinder. `try_lock` is
+/// deliberate: another grinder never waits behind this optional path.
+static FRI_POW_BUFFER: Mutex<Option<Buffer>> = Mutex::new(None);
+
+#[cfg(test)]
+static FRI_POW_TEST_COMPLETED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+fn fill_fri_pow_batch<F: RichField>(
+    buffer: &Buffer,
+    state: &[F],
+    witness_input_pos: usize,
+    first_candidate: u64,
+    candidate_count: usize,
+) -> bool {
+    if state.len() != FRI_POW_WIDTH
+        || witness_input_pos >= FRI_POW_RATE
+        || candidate_count == 0
+        || first_candidate
+            .checked_add(candidate_count as u64 - 1)
+            .map_or(true, |last| last > F::NEG_ONE.to_canonical_u64())
+    {
+        return false;
+    }
+    let Some(word_count) = candidate_count.checked_mul(FRI_POW_WIDTH) else {
+        return false;
+    };
+    let Some(byte_count) = word_count.checked_mul(size_of::<u64>()) else {
+        return false;
+    };
+    if buffer.length() < byte_count as u64 {
+        return false;
+    }
+
+    // SAFETY: the caller has exclusive access to a shared buffer with at least
+    // `word_count` u64 slots (`FRI_POW_BUFFER`'s guard enforces this in
+    // production), and no command using it is in flight while this fill runs.
+    // Every slot read by the next dispatch is initialized below.
+    let words = unsafe { slice::from_raw_parts_mut(buffer.contents().cast::<u64>(), word_count) };
+    for (lane, &element) in state.iter().enumerate() {
+        let lane_words = &mut words[lane * candidate_count..(lane + 1) * candidate_count];
+        if lane == witness_input_pos {
+            for (offset, destination) in lane_words.iter_mut().enumerate() {
+                *destination = first_candidate + offset as u64;
+            }
+        } else {
+            lane_words.fill(element.to_noncanonical_u64());
+        }
+    }
+    true
+}
+
+/// Applies exactly one existing `poseidon2_absorb_pass` permutation to every
+/// column-major state in `buffer`. With no absorbed columns and no final hash
+/// write, bindings 0 and 2 are valid aliases that the kernel never accesses;
+/// binding 1 is overwritten in place.
+fn dispatch_fri_pow_batch(
+    context: &MetalShared,
+    pipeline: &ComputePipelineState,
+    buffer: &Buffer,
+    candidate_count: usize,
+) -> bool {
+    if candidate_count == 0 || candidate_count > u32::MAX as usize {
+        return false;
+    }
+    let command_buffer = autoreleasepool(|| -> CommandBuffer {
+        let command_buffer = context.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(buffer), 0);
+        encoder.set_buffer(1, Some(buffer), 0);
+        encoder.set_buffer(2, Some(buffer), 0);
+        encoder.set_buffer(3, Some(&context.parameters), 0);
+        set_u32(encoder, 4, candidate_count as u32);
+        set_u32(encoder, 5, 0);
+        set_u32(encoder, 6, 0);
+        set_u32(encoder, 7, 0);
+        set_u32(encoder, 8, 0);
+        set_u32(encoder, 9, 0);
+        dispatch(encoder, pipeline, candidate_count);
+        encoder.end_encoding();
+        #[cfg(feature = "diagnostic_profile")]
+        profile_command_buffer(command_buffer, "fri_pow", candidate_count as u64);
+        command_buffer.commit();
+        command_buffer.to_owned()
+    });
+    command_buffer.wait_until_completed();
+    command_buffer.status() == MTLCommandBufferStatus::Completed
+}
+
+fn first_valid_fri_pow_candidate<F: RichField>(
+    buffer: &Buffer,
+    candidate_count: usize,
+    first_candidate: u64,
+    min_leading_zeros: u32,
+) -> Option<F> {
+    let word_count = candidate_count.checked_mul(FRI_POW_WIDTH)?;
+    let response_start = candidate_count.checked_mul(FRI_POW_RATE - 1)?;
+    let response_end = response_start.checked_add(candidate_count)?;
+    if candidate_count == 0
+        || min_leading_zeros > 64
+        || response_end > word_count
+        || buffer.length() < word_count.checked_mul(size_of::<u64>())? as u64
+    {
+        return None;
+    }
+    // SAFETY: the completed kernel initialized all `word_count` state slots,
+    // the buffer length was checked, and the caller retains exclusive access
+    // (`FRI_POW_BUFFER`'s guard provides it in production).
+    let words = unsafe { slice::from_raw_parts(buffer.contents().cast::<u64>(), word_count) };
+    words[response_start..response_end]
+        .iter()
+        .enumerate()
+        .find_map(|(offset, &raw_response)| {
+            fri_pow_response_is_valid::<F>(raw_response, min_leading_zeros)
+                .then(|| first_candidate.checked_add(offset as u64))
+                .flatten()
+                .filter(|&candidate| candidate <= F::NEG_ONE.to_canonical_u64())
+                .map(F::from_canonical_u64)
+        })
+}
+
+fn fri_pow_response_is_valid<F: RichField>(raw_response: u64, min_leading_zeros: u32) -> bool {
+    F::from_noncanonical_u64(raw_response)
+        .to_canonical_u64()
+        .leading_zeros()
+        >= min_leading_zeros
+}
+
+fn is_native_goldilocks<F: 'static>() -> bool {
+    core::any::TypeId::of::<F>()
+        == core::any::TypeId::of::<crate::field::goldilocks_field::GoldilocksField>()
+}
+
+fn search_fri_pow_batches<F: RichField>(
+    buffer: &Buffer,
+    state: &[F],
+    witness_input_pos: usize,
+    min_leading_zeros: u32,
+    batch_size: usize,
+    mut run_batch: impl FnMut(&Buffer, usize, u64) -> bool,
+) -> Option<F> {
+    if batch_size == 0 {
+        return None;
+    }
+    let max_candidate = F::NEG_ONE.to_canonical_u64();
+    let mut first_candidate = 0u64;
+    loop {
+        let candidate_count = batch_size.min((max_candidate - first_candidate + 1) as usize);
+        if !fill_fri_pow_batch(
+            buffer,
+            state,
+            witness_input_pos,
+            first_candidate,
+            candidate_count,
+        ) || !run_batch(buffer, candidate_count, first_candidate)
+        {
+            return None;
+        }
+        if let Some(witness) = first_valid_fri_pow_candidate::<F>(
+            buffer,
+            candidate_count,
+            first_candidate,
+            min_leading_zeros,
+        ) {
+            return Some(witness);
+        }
+        first_candidate = first_candidate.checked_add(candidate_count as u64)?;
+        if first_candidate > max_candidate {
+            return None;
+        }
+    }
+}
+
+/// Opportunistically grinds the 16-bit FRI witness with the already-built
+/// absorb pipeline. Every guard is scheduling-only; `None` replays the exact
+/// existing Rayon search in `fri::prover`.
+pub(crate) fn find_fri_proof_of_work<F: RichField>(
+    state: &[F],
+    witness_input_pos: usize,
+    min_leading_zeros: u32,
+) -> Option<F> {
+    #[cfg(feature = "diagnostic_profile")]
+    crate::util::profile::counter("fri_pow", "hook_seen", 1);
+    if !is_native_goldilocks::<F>()
+        || F::ORDER != 0xffff_ffff_0000_0001
+        || size_of::<F>() != size_of::<u64>()
+        || state.len() != FRI_POW_WIDTH
+        || witness_input_pos >= FRI_POW_RATE
+        || min_leading_zeros != FRI_POW_MIN_LEADING_ZEROS
+        || !is_exclusive_gpu_phase()
+        || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Acquire) != 0
+    {
+        return None;
+    }
+    #[cfg(feature = "diagnostic_profile")]
+    crate::util::profile::counter("fri_pow", "eligible_phase", 1);
+    let context = context_if_ready()?;
+    let pipeline = absorb_pass_pipeline_if_ready()?;
+    let mut buffer_slot = FRI_POW_BUFFER.try_lock().ok()?;
+    let required_words = FRI_POW_BATCH_SIZE.checked_mul(FRI_POW_WIDTH)?;
+    let required_bytes = required_words.checked_mul(size_of::<u64>())?;
+    if buffer_slot
+        .as_ref()
+        .map_or(true, |buffer| buffer.length() < required_bytes as u64)
+    {
+        *buffer_slot = Some(autoreleasepool(|| {
+            context.device.new_buffer(
+                required_bytes as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }));
+    }
+    let buffer = buffer_slot.as_ref()?;
+    let witness = search_fri_pow_batches(
+        buffer,
+        state,
+        witness_input_pos,
+        min_leading_zeros,
+        FRI_POW_BATCH_SIZE,
+        |buffer, candidate_count, _first_candidate| {
+            // The potentially cache-cold fill happens before claiming the
+            // queue. Recheck the traced exclusive phase and idle counter
+            // immediately before the CAS. The reservation sentinel then
+            // blocks `begin()` until this batch has completed.
+            if !is_exclusive_gpu_phase()
+                || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Acquire) != 0
+            {
+                return false;
+            }
+            let Some(job) = GpuJobGuard::try_begin_idle() else {
+                return false;
+            };
+            // Phase ownership can end between the pre-CAS check and the
+            // reservation. Recheck while late normal jobs are excluded and
+            // release without submitting if ownership has ended.
+            if !is_exclusive_gpu_phase() {
+                drop(job);
+                return false;
+            }
+            #[cfg(feature = "diagnostic_profile")]
+            if _first_candidate == 0 {
+                crate::util::profile::counter("fri_pow", "search_admitted", 1);
+            }
+            let completed = dispatch_fri_pow_batch(context, pipeline, buffer, candidate_count);
+            drop(job);
+            if !completed {
+                log::warn!("Metal FRI proof-of-work command failed; using CPU grinding");
+                return false;
+            }
+            true
+        },
+    );
+    #[cfg(feature = "diagnostic_profile")]
+    if witness.is_some() {
+        crate::util::profile::counter("fri_pow", "search_completed", 1);
+    }
+    #[cfg(test)]
+    if witness.is_some() {
+        FRI_POW_TEST_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    witness
 }
 
 fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bool {
@@ -3797,6 +4188,132 @@ mod tests {
     use crate::field::types::{Field64, PrimeField64};
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
+    use crate::hash::hashing::PlonkyPermutation;
+    use crate::hash::poseidon2::hash::{Poseidon2, Poseidon2Hash, Poseidon2Permutation};
+    use crate::iop::challenger::Challenger;
+    use crate::plonk::circuit_data::CircuitConfig;
+    use crate::plonk::config::{Hasher, Poseidon2GoldilocksConfig, PoseidonGoldilocksConfig};
+
+    type FriPowField = GoldilocksField;
+
+    static EXCLUSIVE_GPU_PHASE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ExclusivePhaseReset;
+
+    impl Drop for ExclusivePhaseReset {
+        fn drop(&mut self) {
+            set_exclusive_gpu_phase(false);
+        }
+    }
+
+    fn lock_exclusive_gpu_phase_for_test() -> std::sync::MutexGuard<'static, ()> {
+        EXCLUSIVE_GPU_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct FriPowHarness {
+        context: &'static MetalShared,
+        pipeline: &'static ComputePipelineState,
+        buffer: Buffer,
+    }
+
+    impl FriPowHarness {
+        fn new(max_batch_size: usize) -> Self {
+            assert!(max_batch_size > 0 && max_batch_size <= u32::MAX as usize);
+            let context = shared_context().unwrap_or_else(|| {
+                panic!(
+                    "Metal context: {}",
+                    force_context()
+                        .as_ref()
+                        .err()
+                        .map_or("unknown initialization failure", String::as_str)
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let pipeline = loop {
+                if let Some(pipeline) = absorb_pass_pipeline() {
+                    break pipeline;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "absorb-pass pipeline did not become ready"
+                );
+                std::thread::yield_now();
+            };
+            let bytes = max_batch_size * FRI_POW_WIDTH * size_of::<u64>();
+            let buffer = autoreleasepool(|| {
+                context
+                    .device
+                    .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+            });
+            Self {
+                context,
+                pipeline,
+                buffer,
+            }
+        }
+
+        fn search(
+            &mut self,
+            state: &[FriPowField],
+            witness_input_pos: usize,
+            min_leading_zeros: u32,
+            batch_size: usize,
+        ) -> FriPowField {
+            assert!(batch_size > 0);
+            assert!(
+                self.buffer.length()
+                    >= (batch_size * FRI_POW_WIDTH * size_of::<u64>()) as u64
+            );
+            search_fri_pow_batches(
+                &self.buffer,
+                state,
+                witness_input_pos,
+                min_leading_zeros,
+                batch_size,
+                |buffer, candidate_count, _| {
+                    let job = GpuJobGuard::begin();
+                    let completed = dispatch_fri_pow_batch(
+                        self.context,
+                        self.pipeline,
+                        buffer,
+                        candidate_count,
+                    );
+                    drop(job);
+                    completed
+                },
+            )
+            .expect("test PoW search")
+        }
+    }
+
+    fn deterministic_pow_case(
+        case: usize,
+    ) -> (
+        Challenger<FriPowField, Poseidon2Hash>,
+        Poseidon2Permutation<FriPowField>,
+        usize,
+    ) {
+        let mut challenger = Challenger::<FriPowField, Poseidon2Hash>::new();
+        for round in 0..=case % 3 {
+            for lane in 0..FRI_POW_RATE {
+                challenger.observe_element(FriPowField::from_noncanonical_u64(
+                    ((case + 1) as u64) << 40
+                        ^ ((round * FRI_POW_RATE + lane + 1) as u64 * 0x9e37_79b9),
+                ));
+            }
+        }
+        let witness_input_pos = case % FRI_POW_RATE;
+        for input in 0..witness_input_pos {
+            challenger.observe_element(FriPowField::from_noncanonical_u64(
+                u64::MAX - (case * FRI_POW_RATE + input) as u64,
+            ));
+        }
+        let mut intermediate_state = challenger.sponge_state;
+        intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
+        (challenger, intermediate_state, witness_input_pos)
+    }
 
     /// The prebuilt AIR library is only sound while it is the compiled form of
     /// the MSL we ship. Nothing in the type system ties the two together, so
@@ -3837,6 +4354,320 @@ mod tests {
             assert!(
                 library.get_function(name, None).is_ok(),
                 "prebuilt metallib is missing kernel {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn fri_pow_absorb_pass_matches_cpu_for_every_state_lane() {
+        let count = 257usize;
+        let mut rng = StdRng::seed_from_u64(0xf1_16_12_08);
+        let states: Vec<[FriPowField; FRI_POW_WIDTH]> = (0..count)
+            .map(|row| {
+                core::array::from_fn(|lane| {
+                    let raw = match (row + lane) % 6 {
+                        0 => 0,
+                        1 => FriPowField::ORDER - 1,
+                        2 => FriPowField::ORDER,
+                        3 => FriPowField::ORDER + 1,
+                        4 => u64::MAX,
+                        _ => rng.next_u64(),
+                    };
+                    FriPowField::from_noncanonical_u64(raw)
+                })
+            })
+            .collect();
+        let harness = FriPowHarness::new(count);
+        let word_count = count * FRI_POW_WIDTH;
+        // SAFETY: the harness allocated exactly `word_count` shared u64s, and
+        // no command can read the test-owned buffer until the fill completes.
+        let words = unsafe {
+            slice::from_raw_parts_mut(harness.buffer.contents().cast::<u64>(), word_count)
+        };
+        for (row, state) in states.iter().enumerate() {
+            for lane in 0..FRI_POW_WIDTH {
+                words[lane * count + row] = state[lane].to_noncanonical_u64();
+            }
+        }
+        let job = GpuJobGuard::begin();
+        assert!(dispatch_fri_pow_batch(
+            harness.context,
+            harness.pipeline,
+            &harness.buffer,
+            count,
+        ));
+        drop(job);
+
+        // SAFETY: the command completed successfully and initialized all
+        // `word_count` state words before this immutable readback.
+        let words = unsafe {
+            slice::from_raw_parts(harness.buffer.contents().cast::<u64>(), word_count)
+        };
+        for (row, state) in states.into_iter().enumerate() {
+            let expected = FriPowField::poseidon2(state);
+            for lane in 0..FRI_POW_WIDTH {
+                let actual = FriPowField::from_noncanonical_u64(words[lane * count + row]);
+                assert_eq!(
+                    actual.to_canonical_u64(),
+                    expected[lane].to_canonical_u64(),
+                    "row {row}, lane {lane}"
+                );
+            }
+            assert_eq!(
+                FriPowField::from_noncanonical_u64(
+                    words[(FRI_POW_RATE - 1) * count + row]
+                )
+                .to_canonical_u64(),
+                expected[FRI_POW_RATE - 1].to_canonical_u64(),
+                "canonical PoW response lane for row {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn fri_pow_predicate_canonicalizes_and_covers_threshold_boundaries() {
+        for min_leading_zeros in [0u32, 4, 12, 16, 32, 64] {
+            let passing = if min_leading_zeros == 64 {
+                0
+            } else {
+                1u64 << (63 - min_leading_zeros)
+            };
+            assert!(fri_pow_response_is_valid::<FriPowField>(
+                passing,
+                min_leading_zeros
+            ));
+            if min_leading_zeros > 0 {
+                let failing = if min_leading_zeros == 64 {
+                    1
+                } else {
+                    1u64 << (64 - min_leading_zeros)
+                };
+                assert!(!fri_pow_response_is_valid::<FriPowField>(
+                    failing,
+                    min_leading_zeros
+                ));
+            }
+        }
+        assert!(fri_pow_response_is_valid::<FriPowField>(
+            FriPowField::ORDER,
+            64
+        ));
+        assert!(!fri_pow_response_is_valid::<FriPowField>(0, 65));
+    }
+
+    #[test]
+    fn fri_pow_nonblocking_readiness_and_idle_admission_are_fail_closed() {
+        let pipeline = LazyPipeline::new();
+        assert!(pipeline.get_if_ready().is_none());
+
+        let counter = core::sync::atomic::AtomicUsize::new(0);
+        assert!(try_reserve_idle(&counter));
+        assert_eq!(
+            counter.load(core::sync::atomic::Ordering::Acquire),
+            GPU_JOB_RESERVED
+        );
+        assert!(!try_reserve_idle(&counter));
+        end_reserved_gpu_job(&counter);
+        assert_eq!(counter.load(core::sync::atomic::Ordering::Acquire), 0);
+        assert!(try_reserve_idle(&counter));
+        end_reserved_gpu_job(&counter);
+    }
+
+    #[test]
+    fn fri_pow_type_gate_is_exact() {
+        assert!(is_native_goldilocks::<GoldilocksField>());
+        assert!(!is_native_goldilocks::<u64>());
+    }
+
+    #[test]
+    fn fri_pow_normal_gpu_job_waits_until_exclusive_reservation_is_released() {
+        let counter = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        assert!(try_reserve_idle(&counter));
+        let entered = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let thread_counter = Arc::clone(&counter);
+        let thread_entered = Arc::clone(&entered);
+        let waiter = std::thread::spawn(move || {
+            let mut reported_wait = false;
+            let waited = begin_normal_gpu_job(&thread_counter, || {
+                if !reported_wait {
+                    observed_tx.send(()).expect("reservation observation");
+                    reported_wait = true;
+                }
+                std::thread::yield_now();
+            });
+            assert!(waited);
+            thread_entered.store(true, core::sync::atomic::Ordering::Release);
+            end_normal_gpu_job(&thread_counter);
+        });
+
+        let observed = observed_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        let entered_before_release = entered.load(core::sync::atomic::Ordering::Acquire);
+        let value_before_release = counter.load(core::sync::atomic::Ordering::Acquire);
+        end_reserved_gpu_job(&counter);
+        waiter.join().expect("normal GPU waiter");
+        assert!(observed, "normal job never observed the reservation");
+        assert_eq!(value_before_release, GPU_JOB_RESERVED);
+        assert!(!entered_before_release, "normal job crossed the reservation");
+        assert!(entered.load(core::sync::atomic::Ordering::Acquire));
+        assert_eq!(counter.load(core::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn fri_pow_production_shape_guards_fall_back() {
+        let state = [FriPowField::ZERO; FRI_POW_WIDTH];
+        assert!(find_fri_proof_of_work(&state, 0, 15).is_none());
+        assert!(find_fri_proof_of_work(&state, FRI_POW_RATE, 16).is_none());
+        assert!(find_fri_proof_of_work(&state[..FRI_POW_WIDTH - 1], 0, 16).is_none());
+    }
+
+    #[test]
+    fn fri_pow_witness_replays_for_every_challenger_input_position() {
+        let mut harness = FriPowHarness::new(1 << 12);
+        for case in 0..FRI_POW_RATE {
+            let (challenger, intermediate_state, witness_input_pos) =
+                deterministic_pow_case(case);
+            let witness = harness.search(
+                intermediate_state.as_ref(),
+                witness_input_pos,
+                8,
+                1 << 12,
+            );
+
+            let mut direct_state = intermediate_state;
+            direct_state.set_elt(witness, witness_input_pos);
+            direct_state.permute();
+            let direct_response = direct_state.squeeze()[FRI_POW_RATE - 1];
+            assert!(direct_response.to_canonical_u64().leading_zeros() >= 8);
+
+            let mut prover = challenger.clone();
+            prover.observe_element(witness);
+            assert_eq!(
+                prover.get_challenge().to_canonical_u64(),
+                direct_response.to_canonical_u64()
+            );
+            let mut verifier = challenger;
+            verifier.observe_element(witness);
+            assert_eq!(
+                verifier.get_challenge().to_canonical_u64(),
+                direct_response.to_canonical_u64()
+            );
+            for _ in 0..FRI_POW_RATE {
+                assert_eq!(prover.get_challenge(), verifier.get_challenge());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "serial Metal integration test"]
+    fn exclusive_phase_fri_pow_generic_dispatch_activates_when_idle() {
+        let _exclusive_phase_lock = lock_exclusive_gpu_phase_for_test();
+        // Force the context and optional absorb pipeline before exercising the
+        // production hook; the hook itself is required never to do either.
+        let _harness = FriPowHarness::new(1);
+        let (challenger, intermediate_state, witness_input_pos) = deterministic_pow_case(7);
+        assert!(
+            <Poseidon2Hash as Hasher<FriPowField>>::try_fri_proof_of_work(
+                &intermediate_state,
+                witness_input_pos,
+                FRI_POW_MIN_LEADING_ZEROS,
+            )
+            .is_none(),
+            "non-exclusive work must stay on the CPU"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Acquire) != 0 {
+            assert!(Instant::now() < deadline, "GPU did not become idle");
+            std::thread::yield_now();
+        }
+        set_exclusive_gpu_phase(true);
+        let _reset = ExclusivePhaseReset;
+
+        let busy_job = GpuJobGuard::begin();
+        assert!(
+            <Poseidon2Hash as Hasher<FriPowField>>::try_fri_proof_of_work(
+                &intermediate_state,
+                witness_input_pos,
+                FRI_POW_MIN_LEADING_ZEROS,
+            )
+            .is_none(),
+            "busy stream must stay on the CPU"
+        );
+        drop(busy_job);
+
+        let buffer_lock = FRI_POW_BUFFER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            <Poseidon2Hash as Hasher<FriPowField>>::try_fri_proof_of_work(
+                &intermediate_state,
+                witness_input_pos,
+                FRI_POW_MIN_LEADING_ZEROS,
+            )
+            .is_none(),
+            "contended shared buffer must stay on the CPU"
+        );
+        drop(buffer_lock);
+
+        let config = CircuitConfig::standard_recursion_config().fri_config;
+        assert_eq!(config.proof_of_work_bits, FRI_POW_MIN_LEADING_ZEROS);
+        let completed_before =
+            FRI_POW_TEST_COMPLETED.load(core::sync::atomic::Ordering::Relaxed);
+        let (witness, mut prover) = loop {
+            while GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Acquire) != 0 {
+                assert!(Instant::now() < deadline, "GPU did not become idle");
+                std::thread::yield_now();
+            }
+            let mut prover = challenger.clone();
+            let witness = crate::fri::prover::fri_proof_of_work::<
+                FriPowField,
+                Poseidon2GoldilocksConfig,
+                2,
+            >(&mut prover, &config);
+            let completed =
+                FRI_POW_TEST_COMPLETED.load(core::sync::atomic::Ordering::Relaxed);
+            if completed == completed_before + 1 {
+                break (witness, prover);
+            }
+            assert_eq!(completed, completed_before);
+            assert!(Instant::now() < deadline, "generic GPU hook was never admitted");
+            std::thread::yield_now();
+        };
+        let mut replay = challenger;
+        replay.observe_element(witness);
+        let response = replay.get_challenge();
+        assert!(
+            response.to_canonical_u64().leading_zeros() >= FRI_POW_MIN_LEADING_ZEROS
+        );
+        for _ in 0..FRI_POW_RATE {
+            assert_eq!(prover.get_challenge(), replay.get_challenge());
+        }
+
+        let mut fallback_config = config;
+        fallback_config.proof_of_work_bits = 0;
+        let mut fallback_prover =
+            Challenger::<FriPowField, crate::hash::poseidon::PoseidonHash>::new();
+        fallback_prover.observe_element(FriPowField::from_canonical_u64(0xfeed_f00d));
+        let mut fallback_replay = fallback_prover.clone();
+        let completed_before_fallback =
+            FRI_POW_TEST_COMPLETED.load(core::sync::atomic::Ordering::Relaxed);
+        let fallback_witness = crate::fri::prover::fri_proof_of_work::<
+            FriPowField,
+            PoseidonGoldilocksConfig,
+            2,
+        >(&mut fallback_prover, &fallback_config);
+        assert_eq!(
+            FRI_POW_TEST_COMPLETED.load(core::sync::atomic::Ordering::Relaxed),
+            completed_before_fallback,
+            "default Hasher hook must use the CPU fallback"
+        );
+        fallback_replay.observe_element(fallback_witness);
+        let _ = fallback_replay.get_challenge();
+        for _ in 0..FRI_POW_RATE {
+            assert_eq!(
+                fallback_prover.get_challenge(),
+                fallback_replay.get_challenge()
             );
         }
     }
@@ -3948,7 +4779,6 @@ mod tests {
     use crate::gates::selectors::UNUSED_SELECTOR;
     use crate::hash::hash_types::HashOut;
     use crate::hash::merkle_tree::{capacity_up_to_mut, fill_digests_buf, merkle_tree_prove};
-    use crate::hash::poseidon2::hash::Poseidon2Hash;
     use crate::plonk::vars::EvaluationVarsBaseBatch;
 
     #[test]
@@ -6313,15 +7143,10 @@ kernel void goldilocks_mul_bench_native(
     }
 
     #[test]
-    fn streamed_merkle_keeps_digests_resident_and_matches_classic() {
+    fn exclusive_phase_streamed_merkle_keeps_digests_resident_and_matches_classic() {
         type F = GoldilocksField;
-        struct ExclusiveReset;
-        impl Drop for ExclusiveReset {
-            fn drop(&mut self) {
-                set_exclusive_gpu_phase(false);
-            }
-        }
 
+        let _exclusive_phase_lock = lock_exclusive_gpu_phase_for_test();
         let context = shared_context().expect("Metal context");
         let rows = 1usize << 20;
         let cols = 16;
@@ -6330,7 +7155,7 @@ kernel void goldilocks_mul_bench_native(
             .allocate_columns::<F>(rows, cols)
             .expect("shared columns");
         set_exclusive_gpu_phase(true);
-        let _reset = ExclusiveReset;
+        let _reset = ExclusivePhaseReset;
         assert!(is_exclusive_gpu_phase());
         assert!(absorb_pass_pipeline().is_some(), "absorb pipeline");
         let streamed = build_merkle_tree_shared_streamed(
