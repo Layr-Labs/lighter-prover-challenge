@@ -35,6 +35,15 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    #[inline]
+    fn extension_base_dot_product_pair(
+        extension_values_a: &[QuadraticExtension<Self>],
+        extension_values_b: &[QuadraticExtension<Self>],
+        base_scalars: &[Self],
+    ) -> (QuadraticExtension<Self>, QuadraticExtension<Self>) {
+        ext2_base_scalar_dot_product_pair(extension_values_a, extension_values_b, base_scalars)
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -278,6 +287,107 @@ fn ext2_base_scalar_dot_product(
     }
     result
 }
+
+/// Compute both `sum_i a_values[i].scalar_mul(base_scalars[i])` and
+/// `sum_i b_values[i].scalar_mul(base_scalars[i])` in GF(p^2), delaying
+/// reduction across the complete pair of dot products.
+///
+/// Each base scalar is loaded once and folded into two independent 160-bit
+/// accumulators (one per result, two limbs each). The per-accumulator bound is
+/// identical to the single-point case: with `n` terms each product below
+/// `2^128`, a 160-bit accumulator holds `n * 2^128` plus a sub-`2^32` high
+/// limb, so `reduce160`'s `2^160 - 2^128 + 2^96` precondition holds through
+/// `n = 2^32 - 1`. Both results are the same field elements as the
+/// reduce-per-term form; the raw representatives may differ.
+#[inline]
+fn ext2_base_scalar_dot_product_pair(
+    extension_values_a: &[QuadraticExtension<GoldilocksField>],
+    extension_values_b: &[QuadraticExtension<GoldilocksField>],
+    base_scalars: &[GoldilocksField],
+) -> (QuadraticExtension<GoldilocksField>, QuadraticExtension<GoldilocksField>) {
+    const MAX_TERMS_PER_REDUCTION: usize = u32::MAX as usize;
+
+    // Each dot product zips to its own shortest input length, matching the
+    // single-point behavior. Production callers supply equal-length inputs, so
+    // the loops below iterate to the longer of the two effective lengths and
+    // skip the shorter accumulator once its terms are exhausted.
+    let a_len = extension_values_a.len().min(base_scalars.len());
+    let b_len = extension_values_b.len().min(base_scalars.len());
+    let len = a_len.max(b_len);
+    if len == 0 {
+        return (
+            QuadraticExtension::ZERO,
+            QuadraticExtension::ZERO,
+        );
+    }
+
+    let reduce_chunk = |values_a: &[QuadraticExtension<GoldilocksField>],
+                        values_b: &[QuadraticExtension<GoldilocksField>],
+                        scalars: &[GoldilocksField],
+                        a_terms: usize,
+                        b_terms: usize| {
+        debug_assert!(a_terms <= values_a.len());
+        debug_assert!(b_terms <= values_b.len());
+        debug_assert!(a_terms <= scalars.len());
+        debug_assert!(b_terms <= scalars.len());
+        debug_assert!(a_terms.max(b_terms) <= MAX_TERMS_PER_REDUCTION);
+        let (mut a0_lo, mut a0_hi) = (0u128, 0u32);
+        let (mut a1_lo, mut a1_hi) = (0u128, 0u32);
+        let (mut b0_lo, mut b0_hi) = (0u128, 0u32);
+        let (mut b1_lo, mut b1_hi) = (0u128, 0u32);
+        for i in 0..a_terms.max(b_terms) {
+            let scalar = scalars[i].0;
+            if i < a_terms {
+                let QuadraticExtension([a0, a1]) = values_a[i];
+                u160_add_product(&mut a0_lo, &mut a0_hi, a0.0, scalar);
+                u160_add_product(&mut a1_lo, &mut a1_hi, a1.0, scalar);
+            }
+            if i < b_terms {
+                let QuadraticExtension([b0, b1]) = values_b[i];
+                u160_add_product(&mut b0_lo, &mut b0_hi, b0.0, scalar);
+                u160_add_product(&mut b1_lo, &mut b1_hi, b1.0, scalar);
+            }
+        }
+        // SAFETY: the worst-case bound documented above covers arbitrary u64
+        // representatives for every term in this chunk.
+        (
+            QuadraticExtension([unsafe { reduce160(a0_lo, a0_hi) }, unsafe {
+                reduce160(a1_lo, a1_hi)
+            }]),
+            QuadraticExtension([unsafe { reduce160(b0_lo, b0_hi) }, unsafe {
+                reduce160(b1_lo, b1_hi)
+            }]),
+        )
+    };
+
+    let first_a = a_len.min(MAX_TERMS_PER_REDUCTION);
+    let first_b = b_len.min(MAX_TERMS_PER_REDUCTION);
+    let (mut ra, mut rb) = reduce_chunk(
+        &extension_values_a[..first_a],
+        &extension_values_b[..first_b],
+        &base_scalars[..len.min(MAX_TERMS_PER_REDUCTION)],
+        first_a,
+        first_b,
+    );
+    let mut start = len.min(MAX_TERMS_PER_REDUCTION);
+    while start < len {
+        let end = len.min(start + MAX_TERMS_PER_REDUCTION);
+        let a_end = a_len.min(end);
+        let b_end = b_len.min(end);
+        let (ta, tb) = reduce_chunk(
+            &extension_values_a[start..a_end],
+            &extension_values_b[start..b_end],
+            &base_scalars[start..end],
+            a_end - start,
+            b_end - start,
+        );
+        ra += ta;
+        rb += tb;
+        start = end;
+    }
+    (ra, rb)
+}
+
 
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction
 /// across the complete production FRI arity. For raw limbs below 2^64,
@@ -898,6 +1008,84 @@ mod tests {
         assert!(max_safe_sum < reduce160_limit);
         assert!(first_unsafe_worst_case >= reduce160_limit);
     }
+
+    #[test]
+    fn ext2_extension_base_dot_product_pair_matches_two_singles() {
+        let p = GF::ORDER;
+        let raw_specials = [0, 1, 2, p - 1, p, p + 1, u64::MAX];
+        let lengths = [
+            (0, 0),
+            (1, 1),
+            (1, 2),
+            (2, 1),
+            (16, 16),
+            (17, 17),
+            (63, 64),
+            (255, 255),
+            (256, 256),
+            (257, 257),
+            (2048, 2048),
+            (4097, 4097),
+        ];
+
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for (a_len, b_len) in lengths {
+            let base_len = a_len.max(b_len);
+            let values_a: Vec<Q2> = (0..a_len)
+                .map(|i| {
+                    QuadraticExtension([
+                        GoldilocksField(if i < raw_specials.len() { raw_specials[i] } else { next() }),
+                        GoldilocksField(if i < raw_specials.len() { raw_specials[raw_specials.len() - 1 - i] } else { next() }),
+                    ])
+                })
+                .collect();
+            let values_b: Vec<Q2> = (0..b_len)
+                .map(|i| {
+                    QuadraticExtension([
+                        GoldilocksField(if i < raw_specials.len() { raw_specials[(i * 3) % raw_specials.len()] } else { next() }),
+                        GoldilocksField(if i < raw_specials.len() { raw_specials[(i * 5 + 1) % raw_specials.len()] } else { next() }),
+                    ])
+                })
+                .collect();
+            let scalars: Vec<GF> = (0..base_len)
+                .map(|i| {
+                    GoldilocksField(if i < raw_specials.len() {
+                        raw_specials[(i * 7 + 3) % raw_specials.len()]
+                    } else {
+                        next()
+                    })
+                })
+                .collect();
+
+            let expected_a = generic_extension_base_dot_product(&values_a, &scalars);
+            let expected_b = generic_extension_base_dot_product(&values_b, &scalars);
+            let (actual_a, actual_b) =
+                <GF as Extendable<2>>::extension_base_dot_product_pair(&values_a, &values_b, &scalars);
+            for limb in 0..2 {
+                assert_eq!(
+                    actual_a.0[limb].to_canonical_u64(),
+                    expected_a.0[limb].to_canonical_u64(),
+                    "pair A limb {limb} mismatch at (a={a_len}, b={b_len})"
+                );
+                assert_eq!(
+                    actual_b.0[limb].to_canonical_u64(),
+                    expected_b.0[limb].to_canonical_u64(),
+                    "pair B limb {limb} mismatch at (a={a_len}, b={b_len})"
+                );
+            }
+        }
+        // Empty inputs.
+        let (za, zb) = <GF as Extendable<2>>::extension_base_dot_product_pair(&[], &[], &[]);
+        assert_eq!(za, Q2::ZERO);
+        assert_eq!(zb, Q2::ZERO);
+    }
+
 
     #[test]
     fn fri_fold_arity16_matches_horner_raw() {

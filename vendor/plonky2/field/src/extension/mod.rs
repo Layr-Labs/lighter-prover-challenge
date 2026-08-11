@@ -99,6 +99,27 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    /// Compute two dot products of base-field scalars against two sets of
+    /// extension values: `sum_i base_scalars[i] * extension_values_a[i]` and
+    /// `sum_i base_scalars[i] * extension_values_b[i]`. The slices are zipped
+    /// to the shortest length, matching the single-point behavior.
+    ///
+    /// The default preserves the reduce-per-product implementation. A base
+    /// field may specialize this to load each base scalar once and fold it
+    /// into both result accumulators, deleting a second coefficient read.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_product_pair(
+        extension_values_a: &[Self::Extension],
+        extension_values_b: &[Self::Extension],
+        base_scalars: &[Self],
+    ) -> (Self::Extension, Self::Extension) {
+        (
+            Self::extension_base_dot_product(extension_values_a, base_scalars),
+            Self::extension_base_dot_product(extension_values_b, base_scalars),
+        )
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.
