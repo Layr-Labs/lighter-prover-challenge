@@ -14,8 +14,9 @@ use objc::runtime::Sel;
 #[cfg(feature = "diagnostic_profile")]
 use objc::Message;
 use metal::{
-    Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSUInteger,
+    BinaryArchive, BinaryArchiveDescriptor, Buffer, CommandBuffer, CommandQueue, CompileOptions,
+    ComputePipelineDescriptor, ComputePipelineState, Device, MTLCommandBufferStatus,
+    MTLResourceOptions, MTLSize, NSUInteger, URL,
 };
 use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
@@ -110,6 +111,87 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
     "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
+
+/// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
+/// [`SHADER_METALLIB`], recorded on an Apple M4 Pro. The metallib skip above
+/// removes the MSL front end; this removes the backend: with the archive
+/// attached to each pipeline descriptor, cold-cache pipeline creation for all
+/// ten kernels drops from ~1.66 s (serial; ~0.9 s parallel wall) to under 1 ms
+/// on the recording device. The archive is looked up by device and compiler
+/// build, so on any other GPU or OS revision every lookup misses and Metal
+/// lowers the AIR exactly as before — behavior and pipeline contents are
+/// identical either way, only the instant they become available changes.
+///
+/// `MTLBinaryArchive` loads from a file URL only, and the ranked sandbox's sole
+/// writable path is the per-fixture scratch directory, so the worker stages
+/// these bytes there at startup ([`set_pipeline_archive_dir`]). Regenerate with
+/// the `record_pipeline_archive` ignored test whenever `poseidon2.metallib`
+/// changes.
+const PIPELINE_ARCHIVE: &[u8] = include_bytes!("poseidon2-pipelines.metalarchive");
+
+/// Directory the worker may write the staged pipeline archive into. Set once by
+/// the bench worker (its proof-output directory: writable under the ranked
+/// Seatbelt profile) before the first GPU use; unset (tests, library users)
+/// means pipeline creation simply proceeds without an archive.
+static PIPELINE_ARCHIVE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Registers the writable directory used to stage the embedded pipeline
+/// archive. Call before the first GPU use (in practice: before `prewarm`).
+/// Later calls are ignored; scheduling only, proof bytes are unaffected.
+pub fn set_pipeline_archive_dir(dir: &std::path::Path) {
+    let _ = PIPELINE_ARCHIVE_DIR.set(dir.to_path_buf());
+}
+
+/// Stages the embedded archive to disk and opens it. Any failure — no
+/// registered directory, an unwritable directory, or a Metal load error —
+/// yields `None`, and pipeline creation proceeds exactly as without an archive.
+fn load_pipeline_archive(device: &Device) -> Option<BinaryArchive> {
+    let dir = PIPELINE_ARCHIVE_DIR.get()?;
+    let path = dir.join("poseidon2-pipelines.metalarchive");
+    if !path.is_file() && std::fs::write(&path, PIPELINE_ARCHIVE).is_err() {
+        return None;
+    }
+    let descriptor = BinaryArchiveDescriptor::new();
+    let url = URL::new_with_string(&format!("file://{}", path.display()));
+    descriptor.set_url(&url);
+    // `URLWithString:` returns an autoreleased object, but metal-rs wraps it in
+    // an owned `URL` whose drop releases it again. Forget the wrapper so the
+    // enclosing autorelease pool performs the single balancing release.
+    std::mem::forget(url);
+    match device.new_binary_archive_with_descriptor(&descriptor) {
+        Ok(archive) => Some(archive),
+        Err(error) => {
+            log::debug!("pipeline archive unavailable ({error}); lowering AIR directly");
+            None
+        }
+    }
+}
+
+/// Builds a compute pipeline for `name`, consulting the staged binary archive
+/// when one is available. An archive hit skips the AIR->ISA lowering; a miss or
+/// any descriptor-path error falls back to the plain function path, which is
+/// byte-for-byte the previous behavior.
+fn build_pipeline(
+    device: &Device,
+    library: &metal::Library,
+    archive: Option<&BinaryArchive>,
+    name: &str,
+) -> Result<ComputePipelineState, String> {
+    let function = library
+        .get_function(name, None)
+        .map_err(|error| format!("{name} kernel unavailable: {error}"))?;
+    if let Some(archive) = archive {
+        let descriptor = ComputePipelineDescriptor::new();
+        descriptor.set_compute_function(Some(&function));
+        descriptor.set_binary_archives(&[archive]);
+        if let Ok(pipeline) = device.new_compute_pipeline_state(&descriptor) {
+            return Ok(pipeline);
+        }
+    }
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(|error| format!("{name} pipeline creation failed: {error}"))
+}
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -1044,7 +1126,11 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
 /// Scheduling only. The pipelines are the same objects the blocking build
 /// produced, lowered from the same library, so nothing they later compute can
 /// differ; only the instant at which they become available does.
-fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
+fn spawn_optional_pipelines(
+    device: &Device,
+    library: &metal::Library,
+    archive: Option<&BinaryArchive>,
+) {
     for (name, slot) in [
         ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
         (
@@ -1056,15 +1142,12 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
     ] {
         let device = device.clone();
         let library = library.clone();
+        let archive = archive.cloned();
         let spawned = std::thread::Builder::new()
             .name(format!("poseidon2-metal-{name}"))
             .spawn(move || {
                 let pipeline = autoreleasepool(|| {
-                    library.get_function(name, None).ok().and_then(|function| {
-                        device
-                            .new_compute_pipeline_state_with_function(&function)
-                            .ok()
-                    })
+                    build_pipeline(&device, &library, archive.as_ref(), name).ok()
                 });
                 if pipeline.is_none() {
                     log::debug!("{name} pipeline unavailable; evaluating those gates on the CPU");
@@ -2302,17 +2385,18 @@ impl MetalShared {
             // each worker thread gets its own autorelease pool so the temporary
             // `NSError`s the Metal API autoreleases are drained on the thread
             // that created them rather than leaking.
+            // Staged prebuilt pipeline archive: hits skip the AIR->ISA lowering
+            // below entirely; misses (other device, other OS build, no writable
+            // stage directory) leave every path exactly as it was.
+            let archive = load_pipeline_archive(&device);
             let device_ref = &device;
             let library_ref = &library;
+            let archive_ref = archive.as_ref();
             let required = |name: &'static str, kind: &'static str| {
                 move || -> Result<ComputePipelineState, String> {
                     autoreleasepool(|| {
-                        let function = library_ref
-                            .get_function(name, None)
-                            .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
-                        device_ref
-                            .new_compute_pipeline_state_with_function(&function)
-                            .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
+                        build_pipeline(device_ref, library_ref, archive_ref, name)
+                            .map_err(|error| format!("{kind}: {error}"))
                     })
                 }
             };
@@ -2384,7 +2468,7 @@ impl MetalShared {
             let ntt_stage_pipeline = ntt_stage_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
-            spawn_optional_pipelines(&device, &library);
+            spawn_optional_pipelines(&device, &library, archive.as_ref());
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -3839,6 +3923,94 @@ mod tests {
                 "prebuilt metallib is missing kernel {name}"
             );
         }
+    }
+
+    /// On a device matching the one the archive was recorded on, every kernel
+    /// must resolve from the archive without falling back to an AIR lowering —
+    /// otherwise the archive is stale and gives back the startup cost it
+    /// exists to remove. Device- and OS-build-specific by design, hence
+    /// ignored; run it on the recording machine after any metallib change.
+    #[test]
+    #[ignore = "device-specific: validates the recorded archive on the recording machine"]
+    fn pipeline_archive_covers_metallib_on_this_device() {
+        use metal::MTLPipelineOption;
+
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let library = device
+            .new_library_with_data(SHADER_METALLIB)
+            .expect("prebuilt metallib must load");
+        let dir = std::env::temp_dir().join("lighter-archive-guard");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("poseidon2-pipelines.metalarchive");
+        std::fs::write(&path, PIPELINE_ARCHIVE).expect("stage archive");
+        let descriptor = BinaryArchiveDescriptor::new();
+        let url = URL::new_with_string(&format!("file://{}", path.display()));
+        descriptor.set_url(&url);
+        // See `load_pipeline_archive`: `URLWithString:` is autoreleased; the
+        // owned wrapper's drop would over-release it.
+        std::mem::forget(url);
+        let archive = device
+            .new_binary_archive_with_descriptor(&descriptor)
+            .expect("recorded archive must load on the recording device");
+        for name in METALLIB_REQUIRED_KERNELS {
+            let function = library.get_function(name, None).expect(name);
+            let pipeline_descriptor = ComputePipelineDescriptor::new();
+            pipeline_descriptor.set_compute_function(Some(&function));
+            pipeline_descriptor.set_binary_archives(&[&archive]);
+            // `ArgumentInfo` keeps the reflection object non-nil; the metal-rs
+            // binding dereferences it unconditionally and segfaults otherwise.
+            device
+                .new_compute_pipeline_state_with_reflection(
+                    &pipeline_descriptor,
+                    MTLPipelineOption::ArgumentInfo | MTLPipelineOption::FailOnBinaryArchiveMiss,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "kernel {name} missed the recorded pipeline archive ({error}); \
+                         regenerate with the record_pipeline_archive test"
+                    )
+                });
+        }
+    }
+
+    /// Regenerates `poseidon2-pipelines.metalarchive` from the committed
+    /// metallib on this machine. Run after any `poseidon2.metal`/metallib
+    /// change:
+    ///   cargo test --release -p plonky2 record_pipeline_archive -- --ignored
+    /// then commit the artifact and re-run
+    /// `pipeline_archive_covers_metallib_on_this_device`.
+    #[test]
+    #[ignore = "writes the committed archive artifact; run manually on the recording machine"]
+    fn record_pipeline_archive() {
+        let Some(device) = Device::system_default() else {
+            panic!("recording requires a Metal device");
+        };
+        let library = device
+            .new_library_with_data(SHADER_METALLIB)
+            .expect("prebuilt metallib must load");
+        let descriptor = BinaryArchiveDescriptor::new();
+        let archive = device
+            .new_binary_archive_with_descriptor(&descriptor)
+            .expect("new archive");
+        for name in METALLIB_REQUIRED_KERNELS {
+            let function = library.get_function(name, None).expect(name);
+            let pipeline_descriptor = ComputePipelineDescriptor::new();
+            pipeline_descriptor.set_compute_function(Some(&function));
+            archive
+                .add_compute_pipeline_functions_with_descriptor(&pipeline_descriptor)
+                .unwrap_or_else(|error| panic!("recording {name} failed: {error}"));
+        }
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/hash/poseidon2/poseidon2-pipelines.metalarchive"
+        );
+        let url = URL::new_with_string(&format!("file://{path}"));
+        archive.serialize_to_url(&url).expect("serialize archive");
+        // See `load_pipeline_archive`: `URLWithString:` is autoreleased; the
+        // owned wrapper's drop would over-release it.
+        std::mem::forget(url);
     }
 
     #[test]
