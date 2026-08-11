@@ -515,11 +515,11 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
 const GATHER_TILE_LEAVES: usize = 16;
 
 /// Widest leaf the gathering path keeps on the stack. The tile is
-/// `GATHER_TILE_LEAVES * GATHER_MAX_WIDTH` field elements (4 KiB at
+/// `GATHER_TILE_LEAVES * GATHER_MAX_WIDTH` field elements (17 KiB at width 136;
 /// `size_of::<F>() == 8`), and one tile is live per recursion frame, so the
 /// bound also bounds the recursion's stack growth. Wider leaves take the
 /// materializing path in [`MerkleTree::new_column_store`].
-const GATHER_MAX_WIDTH: usize = 32;
+const GATHER_MAX_WIDTH: usize = 136;
 
 /// [`fill_subtree_flat`] over natural-order columns instead of a materialized
 /// bit-reversed row-major matrix: leaf `i` of the tree is
@@ -1156,6 +1156,11 @@ pub(crate) mod tests {
             (20, 9, 2),
             (31, 7, 1),
             (32, 11, 4),
+            (33, 6, 1),
+            (64, 7, 2),
+            (82, 6, 2),
+            (135, 5, 1),
+            (136, 6, 2),
         ] {
             let n = 1usize << log_n;
             let columns: Vec<Vec<F>> = (0..width).map(|_| F::rand_vec(n)).collect();
