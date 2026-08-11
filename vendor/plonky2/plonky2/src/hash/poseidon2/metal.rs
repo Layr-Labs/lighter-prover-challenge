@@ -2033,32 +2033,36 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         let mut level_offset = 0usize;
         let mut child_count = leaf_count;
         level_offsets.push(level_offset);
+        let output_resource: &metal::ResourceRef = output_buffer;
+        let encoder = command_buffer.new_compute_command_encoder();
+        if child_count > cap_count {
+            encoder.set_compute_pipeline_state(&context.parent_pipeline);
+        }
         while child_count > cap_count {
+            encoder.memory_barrier_with_resources(&[output_resource]);
             let parent_count = child_count / 2;
             let child_offset = level_offset;
             level_offset += child_count * 4;
             level_offsets.push(level_offset);
 
             let parent_count_u32 = parent_count as u32;
-            let parent_encoder = command_buffer.new_compute_command_encoder();
-            parent_encoder.set_compute_pipeline_state(&context.parent_pipeline);
-            parent_encoder.set_buffer(
+            encoder.set_buffer(
                 0,
                 Some(output_buffer),
                 (child_offset * size_of::<u64>()) as NSUInteger,
             );
-            parent_encoder.set_buffer(
+            encoder.set_buffer(
                 1,
                 Some(output_buffer),
                 (level_offset * size_of::<u64>()) as NSUInteger,
             );
-            parent_encoder.set_buffer(2, Some(&context.parameters), 0);
-            set_u32(parent_encoder, 3, parent_count_u32);
-            dispatch(parent_encoder, &context.parent_pipeline, parent_count);
-            parent_encoder.end_encoding();
+            encoder.set_buffer(2, Some(&context.parameters), 0);
+            set_u32(encoder, 3, parent_count_u32);
+            dispatch(encoder, &context.parent_pipeline, parent_count);
 
             child_count = parent_count;
         }
+        encoder.end_encoding();
         #[cfg(feature = "diagnostic_profile")]
         profile_command_buffer(command_buffer, "merkle_parents", leaf_count as u64);
         command_buffer.commit();
@@ -3022,116 +3026,115 @@ impl MetalShared {
                 // butterflies over the degree-sized columns. The head of the
                 // column buffer serves as scratch; it is dead once the IFFT
                 // finalize gather has produced the coefficients.
-                let gather = command_buffer.new_compute_command_encoder();
-                gather.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
-                gather.set_buffer(0, Some(input_buffer), 0);
-                gather.set_buffer(1, Some(&ones_buffer), 0);
-                gather.set_buffer(2, Some(&column_buffer), 0);
-                set_u32(gather, 3, degree_u32);
-                set_u32(gather, 4, degree_u32);
-                set_u32(gather, 5, log_degree_u32);
-                set_u32(gather, 6, 0);
-                dispatch2d(gather, &self.ntt_prepare_pipeline, degree, cols);
-                gather.end_encoding();
+                let encoder = command_buffer.new_compute_command_encoder();
+                let col_res: &metal::ResourceRef = &column_buffer;
+                let coeffs_res: &metal::ResourceRef = &coeffs_buffer;
+                let out_res: &metal::ResourceRef = output_buffer;
 
+                encoder.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+                encoder.set_buffer(0, Some(input_buffer), 0);
+                encoder.set_buffer(1, Some(&ones_buffer), 0);
+                encoder.set_buffer(2, Some(&column_buffer), 0);
+                set_u32(encoder, 3, degree_u32);
+                set_u32(encoder, 4, degree_u32);
+                set_u32(encoder, 5, log_degree_u32);
+                set_u32(encoder, 6, 0);
+                dispatch2d(encoder, &self.ntt_prepare_pipeline, degree, cols);
+
+                encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
                 for stage in 0..log_degree_u32 {
-                    let stage_encoder = command_buffer.new_compute_command_encoder();
-                    stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
-                    stage_encoder.set_buffer(0, Some(&column_buffer), 0);
-                    stage_encoder.set_buffer(
+                    encoder.memory_barrier_with_resources(&[col_res]);
+                    encoder.set_buffer(0, Some(&column_buffer), 0);
+                    encoder.set_buffer(
                         1,
                         Some(&roots_buffer),
                         (roots_offsets[stage as usize] * size_of::<u64>()) as NSUInteger,
                     );
-                    set_u32(stage_encoder, 2, degree_u32);
-                    set_u32(stage_encoder, 3, stage);
-                    set_u32(stage_encoder, 4, 0);
-                    dispatch2d(stage_encoder, &self.ntt_stage_pipeline, degree / 2, cols);
-                    stage_encoder.end_encoding();
+                    set_u32(encoder, 2, degree_u32);
+                    set_u32(encoder, 3, stage);
+                    set_u32(encoder, 4, 0);
+                    dispatch2d(encoder, &self.ntt_stage_pipeline, degree / 2, cols);
                 }
 
-                let finalize = command_buffer.new_compute_command_encoder();
-                finalize.set_compute_pipeline_state(&self.ifft_finalize_pipeline);
-                finalize.set_buffer(0, Some(&column_buffer), 0);
-                finalize.set_buffer(1, Some(&coeffs_buffer), 0);
-                set_u32(finalize, 2, degree_u32);
-                finalize.set_bytes(
+                encoder.memory_barrier_with_resources(&[col_res]);
+                encoder.set_compute_pipeline_state(&self.ifft_finalize_pipeline);
+                encoder.set_buffer(0, Some(&column_buffer), 0);
+                encoder.set_buffer(1, Some(&coeffs_buffer), 0);
+                set_u32(encoder, 2, degree_u32);
+                encoder.set_bytes(
                     3,
                     size_of::<u64>() as NSUInteger,
                     (&n_inv as *const u64).cast::<c_void>(),
                 );
-                dispatch2d(finalize, &self.ifft_finalize_pipeline, degree, cols);
-                finalize.end_encoding();
+                dispatch2d(encoder, &self.ifft_finalize_pipeline, degree, cols);
 
-                // Coset LDE of the coefficients, exactly as build_from_coeffs.
-                let prepare = command_buffer.new_compute_command_encoder();
-                prepare.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
-                prepare.set_buffer(0, Some(&coeffs_buffer), 0);
-                prepare.set_buffer(1, Some(&shift_buffer), 0);
-                prepare.set_buffer(2, Some(&column_buffer), 0);
-                set_u32(prepare, 3, degree_u32);
-                set_u32(prepare, 4, lde_size_u32);
-                set_u32(prepare, 5, log_degree_u32);
-                set_u32(prepare, 6, rate_bits_u32);
-                dispatch2d(prepare, &self.ntt_prepare_pipeline, lde_size, cols);
-                prepare.end_encoding();
+                encoder.memory_barrier_with_resources(&[coeffs_res]);
+                encoder.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+                encoder.set_buffer(0, Some(&coeffs_buffer), 0);
+                encoder.set_buffer(1, Some(&shift_buffer), 0);
+                encoder.set_buffer(2, Some(&column_buffer), 0);
+                set_u32(encoder, 3, degree_u32);
+                set_u32(encoder, 4, lde_size_u32);
+                set_u32(encoder, 5, log_degree_u32);
+                set_u32(encoder, 6, rate_bits_u32);
+                dispatch2d(encoder, &self.ntt_prepare_pipeline, lde_size, cols);
 
+                encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
                 for stage in rate_bits as u32..log_lde {
-                    let stage_encoder = command_buffer.new_compute_command_encoder();
-                    stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
-                    stage_encoder.set_buffer(0, Some(&column_buffer), 0);
-                    stage_encoder.set_buffer(
+                    encoder.memory_barrier_with_resources(&[col_res]);
+                    encoder.set_buffer(0, Some(&column_buffer), 0);
+                    encoder.set_buffer(
                         1,
                         Some(&roots_buffer),
                         (roots_offsets[stage as usize] * size_of::<u64>()) as NSUInteger,
                     );
-                    set_u32(stage_encoder, 2, lde_size_u32);
-                    set_u32(stage_encoder, 3, stage);
-                    set_u32(stage_encoder, 4, u32::from(stage == log_lde - 1));
-                    dispatch2d(stage_encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
-                    stage_encoder.end_encoding();
+                    set_u32(encoder, 2, lde_size_u32);
+                    set_u32(encoder, 3, stage);
+                    set_u32(encoder, 4, u32::from(stage == log_lde - 1));
+                    dispatch2d(encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
                 }
 
-                let leaf_encoder = command_buffer.new_compute_command_encoder();
-                leaf_encoder.set_compute_pipeline_state(&self.leaf_colmajor_pipeline);
-                leaf_encoder.set_buffer(0, Some(&column_buffer), 0);
-                leaf_encoder.set_buffer(1, Some(output_buffer), 0);
-                leaf_encoder.set_buffer(2, Some(&self.parameters), 0);
-                set_u32(leaf_encoder, 3, cols_u32);
-                set_u32(leaf_encoder, 4, lde_size_u32);
-                set_u32(leaf_encoder, 5, log_lde);
-                dispatch(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
-                leaf_encoder.end_encoding();
+                encoder.memory_barrier_with_resources(&[col_res]);
+                encoder.set_compute_pipeline_state(&self.leaf_colmajor_pipeline);
+                encoder.set_buffer(0, Some(&column_buffer), 0);
+                encoder.set_buffer(1, Some(output_buffer), 0);
+                encoder.set_buffer(2, Some(&self.parameters), 0);
+                set_u32(encoder, 3, cols_u32);
+                set_u32(encoder, 4, lde_size_u32);
+                set_u32(encoder, 5, log_lde);
+                dispatch(encoder, &self.leaf_colmajor_pipeline, lde_size);
 
                 let mut level_offset = 0usize;
                 let mut child_count = lde_size;
                 level_offsets.push(level_offset);
+                if child_count > cap_count {
+                    encoder.set_compute_pipeline_state(&self.parent_pipeline);
+                }
                 while child_count > cap_count {
+                    encoder.memory_barrier_with_resources(&[out_res]);
                     let parent_count = child_count / 2;
                     let child_offset = level_offset;
                     level_offset += child_count * 4;
                     level_offsets.push(level_offset);
 
                     let parent_count_u32 = parent_count as u32;
-                    let parent_encoder = command_buffer.new_compute_command_encoder();
-                    parent_encoder.set_compute_pipeline_state(&self.parent_pipeline);
-                    parent_encoder.set_buffer(
+                    encoder.set_buffer(
                         0,
                         Some(output_buffer),
                         (child_offset * size_of::<u64>()) as NSUInteger,
                     );
-                    parent_encoder.set_buffer(
+                    encoder.set_buffer(
                         1,
                         Some(output_buffer),
                         (level_offset * size_of::<u64>()) as NSUInteger,
                     );
-                    parent_encoder.set_buffer(2, Some(&self.parameters), 0);
-                    set_u32(parent_encoder, 3, parent_count_u32);
-                    dispatch(parent_encoder, &self.parent_pipeline, parent_count);
-                    parent_encoder.end_encoding();
+                    encoder.set_buffer(2, Some(&self.parameters), 0);
+                    set_u32(encoder, 3, parent_count_u32);
+                    dispatch(encoder, &self.parent_pipeline, parent_count);
 
                     child_count = parent_count;
                 }
+                encoder.end_encoding();
 
                 #[cfg(feature = "diagnostic_profile")]
                 profile_command_buffer(
@@ -3324,78 +3327,80 @@ impl MetalShared {
             let cols_u32 = cols as u32;
             let command_buffer = self.queue.new_command_buffer();
 
-            let prepare = command_buffer.new_compute_command_encoder();
-            prepare.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
-            prepare.set_buffer(0, Some(input_buffer), 0);
-            prepare.set_buffer(1, Some(shift_buffer), 0);
-            prepare.set_buffer(2, Some(column_buffer), 0);
-            set_u32(prepare, 3, degree_u32);
-            set_u32(prepare, 4, lde_size_u32);
-            set_u32(prepare, 5, log_degree_u32);
-            set_u32(prepare, 6, rate_bits_u32);
-            dispatch2d(prepare, &self.ntt_prepare_pipeline, lde_size, cols);
-            prepare.end_encoding();
+            let encoder = command_buffer.new_compute_command_encoder();
+            let col_res: &metal::ResourceRef = column_buffer;
+            let out_res: &metal::ResourceRef = output_buffer;
 
+            encoder.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+            encoder.set_buffer(0, Some(input_buffer), 0);
+            encoder.set_buffer(1, Some(shift_buffer), 0);
+            encoder.set_buffer(2, Some(column_buffer), 0);
+            set_u32(encoder, 3, degree_u32);
+            set_u32(encoder, 4, lde_size_u32);
+            set_u32(encoder, 5, log_degree_u32);
+            set_u32(encoder, 6, rate_bits_u32);
+            dispatch2d(encoder, &self.ntt_prepare_pipeline, lde_size, cols);
+
+            encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
             for stage in rate_bits as u32..log_lde {
-                let stage_encoder = command_buffer.new_compute_command_encoder();
-                stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
-                stage_encoder.set_buffer(0, Some(column_buffer), 0);
-                stage_encoder.set_buffer(
+                encoder.memory_barrier_with_resources(&[col_res]);
+                encoder.set_buffer(0, Some(column_buffer), 0);
+                encoder.set_buffer(
                     1,
                     Some(roots_buffer),
                     (roots_offsets[stage as usize] * size_of::<u64>()) as NSUInteger,
                 );
-                set_u32(stage_encoder, 2, lde_size_u32);
-                set_u32(stage_encoder, 3, stage);
+                set_u32(encoder, 2, lde_size_u32);
+                set_u32(encoder, 3, stage);
                 set_u32(
-                    stage_encoder,
+                    encoder,
                     4,
                     u32::from(stage == log_lde - 1),
                 );
-                dispatch2d(stage_encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
-                stage_encoder.end_encoding();
+                dispatch2d(encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
             }
 
-            let leaf_encoder = command_buffer.new_compute_command_encoder();
-            leaf_encoder.set_compute_pipeline_state(&self.leaf_colmajor_pipeline);
-            leaf_encoder.set_buffer(0, Some(column_buffer), 0);
-            leaf_encoder.set_buffer(1, Some(output_buffer), 0);
-            leaf_encoder.set_buffer(2, Some(&self.parameters), 0);
-            set_u32(leaf_encoder, 3, cols_u32);
-            set_u32(leaf_encoder, 4, lde_size_u32);
-            set_u32(leaf_encoder, 5, log_lde);
-            dispatch(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
-            leaf_encoder.end_encoding();
+            encoder.memory_barrier_with_resources(&[col_res]);
+            encoder.set_compute_pipeline_state(&self.leaf_colmajor_pipeline);
+            encoder.set_buffer(0, Some(column_buffer), 0);
+            encoder.set_buffer(1, Some(output_buffer), 0);
+            encoder.set_buffer(2, Some(&self.parameters), 0);
+            set_u32(encoder, 3, cols_u32);
+            set_u32(encoder, 4, lde_size_u32);
+            set_u32(encoder, 5, log_lde);
+            dispatch(encoder, &self.leaf_colmajor_pipeline, lde_size);
 
             let mut level_offset = 0usize;
             let mut child_count = lde_size;
             level_offsets.push(level_offset);
+            if child_count > cap_count {
+                encoder.set_compute_pipeline_state(&self.parent_pipeline);
+            }
             while child_count > cap_count {
+                encoder.memory_barrier_with_resources(&[out_res]);
                 let parent_count = child_count / 2;
                 let child_offset = level_offset;
                 level_offset += child_count * 4;
                 level_offsets.push(level_offset);
 
                 let parent_count_u32 = parent_count as u32;
-                let parent_encoder = command_buffer.new_compute_command_encoder();
-                parent_encoder.set_compute_pipeline_state(&self.parent_pipeline);
-                parent_encoder.set_buffer(
+                encoder.set_buffer(
                     0,
                     Some(output_buffer),
                     (child_offset * size_of::<u64>()) as NSUInteger,
                 );
-                parent_encoder.set_buffer(
+                encoder.set_buffer(
                     1,
                     Some(output_buffer),
                     (level_offset * size_of::<u64>()) as NSUInteger,
                 );
-                parent_encoder.set_buffer(2, Some(&self.parameters), 0);
-                set_u32(parent_encoder, 3, parent_count_u32);
-                dispatch(parent_encoder, &self.parent_pipeline, parent_count);
-                parent_encoder.end_encoding();
+                encoder.set_buffer(2, Some(&self.parameters), 0);
+                set_u32(encoder, 3, parent_count_u32);
+                dispatch(encoder, &self.parent_pipeline, parent_count);
 
                 child_count = parent_count;
             }
+            encoder.end_encoding();
 
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
