@@ -82,42 +82,133 @@ pub fn final_poly_coeff_len(mut degree_bits: usize, reduction_arity_bits: &Vec<u
     1 << degree_bits
 }
 
+/// Tile side, in bits, for the blocked bit-reversal in [`bitrev_flatten`].
+///
+/// A tile stages `2 ^ (2 * BITREV_TILE_BITS)` extension elements — 16 KiB for
+/// the quadratic extension — so the staging buffer sits in L1 while both of its
+/// streams run, and each of the `2 ^ BITREV_TILE_BITS` runs it moves is 512 B,
+/// eight cache lines, off one page walk.
+const BITREV_TILE_BITS: usize = 5;
+
+/// A `*mut T` that the tiled bit-reversal below hands to every worker.
+///
+/// That walk cannot be phrased as a `par_chunks_mut` partition: a single tile's
+/// stores land in `2 ^ BITREV_TILE_BITS` runs spread across the whole output, so
+/// no worker owns a contiguous slice. The tiles still partition the output
+/// exactly — see [`bitrev_flatten`] — so every slot is written by exactly one
+/// worker and no two workers ever touch the same slot.
+#[derive(Clone, Copy)]
+struct SharedOut<T>(*mut T);
+
+// SAFETY: a raw pointer carries no aliasing claim of its own; the disjointness
+// that makes the concurrent writes sound is argued at the single use site.
+unsafe impl<T> Send for SharedOut<T> {}
+unsafe impl<T> Sync for SharedOut<T> {}
+
+impl<T> SharedOut<T> {
+    /// Taking `self` by value is what keeps a closure capturing the whole
+    /// wrapper instead of the bare (non-`Sync`) pointer field, which is what
+    /// edition-2021 precise capture would otherwise do.
+    #[inline(always)]
+    fn ptr(self) -> *mut T {
+        self.0
+    }
+}
+
 /// Bit-reversal + flatten in one gather pass: output leaf `i` is the base-field
 /// limb array of `values[reverse_bits(i, log2(values.len()))]`, so the returned
 /// flat buffer is the bit-reversed codeword laid out row-major, ready for
 /// [`MerkleTree::new_flat`].
 ///
-/// The gather is bandwidth- and latency-bound rather than arithmetic-bound:
-/// `reverse_bits` scatters consecutive outputs across the whole codeword, so
-/// essentially every read is a cache miss and a single thread can only keep a
-/// handful of them in flight. Splitting the *output* range into blocks lets one
-/// worker per core drive its own independent miss stream. Block `b` owns
-/// outputs `b * FLATTEN_BLOCK .. (b + 1) * FLATTEN_BLOCK`, a partition of
-/// `0..n`, so every slot is written exactly once and the source is only read —
-/// the result is index-for-index identical to the serial fill.
+/// The pass is latency-bound rather than arithmetic-bound, and the cost is
+/// entirely in how the permutation is walked. Reading it one output leaf at a
+/// time — `out[i] = values[reverse_bits(i)]` over a block of consecutive `i` —
+/// makes consecutive sources `n / FLATTEN_BLOCK` elements apart, so a block of
+/// 1024 outputs issues 1024 loads that share no cache line and, on the larger
+/// codewords, no page either: one miss and one page walk per element, with only
+/// as many in flight as a core has fill buffers.
+///
+/// Splitting the index into three fields fixes both streams at once. Write
+/// `i = (x, y, z)` with `|x| = |z| = BITREV_TILE_BITS` and `y` the rest;
+/// reversing all of `i` is the same as reversing each field and swapping the
+/// outer two, so `reverse_bits(i) = (rev z, rev y, rev x)`. Hold the middle
+/// field fixed and the permutation restricted to the remaining
+/// `2 ^ BITREV_TILE_BITS` squared indices is a transpose of the outer fields:
+/// it reads `2 ^ BITREV_TILE_BITS` runs of consecutive sources and writes
+/// `2 ^ BITREV_TILE_BITS` runs of consecutive leaves. Both sides stream, and a
+/// tile is small enough to stage in L1 in between. Each middle value owns one
+/// tile and the middle values partition `0..n`, so the tiles are disjoint and
+/// cover the output exactly — the same slots receive the same values as the
+/// serial fill, only the order in which they are written differs.
+///
+/// Codewords too short to carry three fields (`log_n <= 2 * BITREV_TILE_BITS`,
+/// i.e. at most 1024 leaves) fit in cache whole, where the walk order does not
+/// matter; they keep the plain output-blocked gather.
 fn bitrev_flatten<F: RichField + Extendable<D>, const D: usize>(values: &[F::Extension]) -> Vec<F> {
     const FLATTEN_BLOCK: usize = 1 << 10;
+    const Q: usize = BITREV_TILE_BITS;
+    const TILE: usize = 1 << Q;
 
     let n = values.len();
     let log_n = log2_strict(n);
     let mut flat: Vec<F> = Vec::with_capacity(n * D);
     {
         let spare = &mut flat.spare_capacity_mut()[..n * D];
-        spare
-            .par_chunks_mut(FLATTEN_BLOCK * D)
-            .enumerate()
-            .for_each(|(block, out)| {
-                let base = block * FLATTEN_BLOCK;
-                for (j, slot) in out.chunks_exact_mut(D).enumerate() {
-                    let limbs = values[reverse_bits(base + j, log_n)].to_basefield_array();
-                    for k in 0..D {
-                        slot[k].write(limbs[k]);
+        if log_n > 2 * Q {
+            let mid_bits = log_n - 2 * Q;
+            let num_tiles = 1usize << mid_bits;
+            let out = SharedOut(spare.as_mut_ptr());
+            (0..num_tiles).into_par_iter().for_each(|b| {
+                let out = out.ptr();
+                let rev_b = reverse_bits(b, mid_bits);
+                // Gather `TILE` runs of `TILE` consecutive sources, staging
+                // them transposed so the scatter can read the tile in order.
+                let mut staged = [[F::ZERO; D]; TILE * TILE];
+                for a in 0..TILE {
+                    let rev_a = reverse_bits(a, Q);
+                    let src = (a << (mid_bits + Q)) | (b << Q);
+                    for c in 0..TILE {
+                        staged[c * TILE + rev_a] = values[src + c].to_basefield_array();
+                    }
+                }
+                // Scatter `TILE` runs of `TILE` consecutive leaves. Run `c`
+                // covers leaves `(rev c, rev b, 0 ..= TILE - 1)`, and `staged`
+                // already holds it in ascending `rev a` order.
+                for c in 0..TILE {
+                    let rev_c = reverse_bits(c, Q);
+                    let dst = ((rev_c << (mid_bits + Q)) | (rev_b << Q)) * D;
+                    // SAFETY: `[F; D]` is `[F]`-layout-compatible and
+                    // `MaybeUninit<F>` shares `F`'s layout, so both sides are
+                    // `TILE * D` well-aligned `F` slots. The destination lies
+                    // inside the `n * D` prefix because the leaf index is
+                    // `< n`, and the (b, c) pairs enumerate every leaf exactly
+                    // once, so no two workers write the same slot.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            staged.as_ptr().add(c * TILE).cast::<F>(),
+                            out.add(dst).cast::<F>(),
+                            TILE * D,
+                        );
                     }
                 }
             });
+        } else {
+            spare
+                .par_chunks_mut(FLATTEN_BLOCK * D)
+                .enumerate()
+                .for_each(|(block, out)| {
+                    let base = block * FLATTEN_BLOCK;
+                    for (j, slot) in out.chunks_exact_mut(D).enumerate() {
+                        let limbs = values[reverse_bits(base + j, log_n)].to_basefield_array();
+                        for k in 0..D {
+                            slot[k].write(limbs[k]);
+                        }
+                    }
+                });
+        }
     }
-    // SAFETY: the loop above wrote every one of the `n * D` slots of spare
-    // capacity exactly once, so the whole prefix is initialized.
+    // SAFETY: whichever branch ran wrote every one of the `n * D` slots of
+    // spare capacity exactly once, so the whole prefix is initialized.
     unsafe { flat.set_len(n * D) };
     flat
 }
@@ -379,9 +470,12 @@ mod tests {
         type F = GoldilocksField;
         type FE = <F as Extendable<D>>::Extension;
 
-        // Sizes on both sides of the `FLATTEN_BLOCK = 1 << 10` grain: below it
-        // (a single partial chunk), exactly on it, and several blocks past it.
-        for log_n in [0usize, 1, 5, 10, 11, 13] {
+        // Sizes on both sides of both grains: the `FLATTEN_BLOCK = 1 << 10`
+        // chunking of the short-codeword path, and the
+        // `log_n > 2 * BITREV_TILE_BITS` threshold at which the tiled walk
+        // takes over (including the first tiled size, `log_n = 11`, where the
+        // middle field is a single bit).
+        for log_n in [0usize, 1, 5, 9, 10, 11, 12, 13, 14, 16] {
             let n = 1usize << log_n;
             let values: Vec<FE> = (0..n).map(|_| FE::rand()).collect();
 
