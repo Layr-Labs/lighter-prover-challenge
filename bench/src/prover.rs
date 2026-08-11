@@ -822,6 +822,12 @@ pub(crate) fn prove_block_after_pre(
     // own extensions on top of them.
     circuits.release_finished_circuit_extensions();
 
+    // The final block witness and proof run on the serial tail with nothing
+    // else proving, but their per-step serial sections still compete with the
+    // Rayon pool's cleanup and bookkeeping work. Ask the scheduler to keep
+    // this thread latency-critical for the remainder of the worker.
+    mark_spine_thread_latency_critical();
+
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context =
         plonky2::util::profile::enter_context("final_block", block.block_number, &[]);
