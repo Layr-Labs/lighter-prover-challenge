@@ -217,6 +217,26 @@ fn fft_dispatch_parallel<F: Field>(
     fft_classic_parallel(input, zero_factor.unwrap_or(0), &computed_root_table);
 }
 
+#[inline]
+fn fft_dispatch_from_bit_reversed<F: Field>(
+    input: &mut [F],
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+    parallel: bool,
+) {
+    let r = zero_factor.unwrap_or(0);
+    if let Some(table) = root_table {
+        fft_classic_from_bit_reversed(input, r, table, parallel);
+        return;
+    }
+    #[cfg(feature = "std")]
+    let computed_root_table = root_table_cache::get::<F>(log2_strict(input.len()));
+    #[cfg(not(feature = "std"))]
+    let computed_root_table = fft_root_table::<F>(input.len());
+
+    fft_classic_from_bit_reversed(input, r, &computed_root_table, parallel);
+}
+
 /// Computes an FFT in the caller-provided buffer.
 ///
 /// This is equivalent to [`fft_with_options`], but permits buffers backed by
@@ -230,6 +250,20 @@ pub fn fft_in_place_with_options<F: Field>(
     fft_dispatch(buffer, zero_factor, root_table);
 }
 
+/// Computes an FFT from a buffer whose live coefficient prefix is already in
+/// bit-reversed order. With `zero_factor = Some(r)`, exactly the first
+/// `buffer.len() >> r` elements are live; the expansion initializes the tail
+/// before reading it.
+#[doc(hidden)]
+#[inline]
+pub fn fft_in_place_with_options_from_bit_reversed<F: Field>(
+    buffer: &mut [F],
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+) {
+    fft_dispatch_from_bit_reversed(buffer, zero_factor, root_table, false);
+}
+
 /// Computes an FFT in place, distributing independent blocks of the large
 /// outer stages across the feature-gated worker pool. Callers should use this
 /// only when the transform is not already nested in a wider parallel phase.
@@ -241,6 +275,17 @@ pub fn fft_in_place_with_options_parallel<F: Field>(
     root_table: Option<&FftRootTable<F>>,
 ) {
     fft_dispatch_parallel(buffer, zero_factor, root_table);
+}
+
+/// Parallel sibling of [`fft_in_place_with_options_from_bit_reversed`].
+#[doc(hidden)]
+#[inline]
+pub fn fft_in_place_with_options_from_bit_reversed_parallel<F: Field>(
+    buffer: &mut [F],
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+) {
+    fft_dispatch_from_bit_reversed(buffer, zero_factor, root_table, true);
 }
 
 #[inline]
@@ -1229,7 +1274,7 @@ fn fft_zero_padded_cache_blocks<P, M>(
 }
 
 #[inline(never)]
-fn prepare_zero_padded_fft<F, M>(
+fn prepare_bit_reversed_zero_padded_fft<F, M>(
     values: &mut [F],
     r: usize,
     lg_n: usize,
@@ -1242,13 +1287,10 @@ where
 {
     debug_assert!(r > 0 && r <= lg_n);
 
-    // A zero-padded input only has n/2^r live coefficients. Bit-reversing the full buffer would
-    // place those coefficients at multiples of 2^r, after which the skipped FFT layers copy each
-    // one across its following 2^r-element run. Produce that exact state directly by reversing
-    // just the live prefix.
+    // The live prefix is already bit-reversed. Expand the skipped zero-padding
+    // layers and finish block-local layers while each expanded block is hot.
     let repeat = 1 << r;
     let nonzero_len = values.len() >> r;
-    reverse_index_bits_in_place(&mut values[..nonzero_len]);
 
     if r >= lg_packed_width && r < lg_n {
         // Keep values plus the largest local twiddle row within Apple Silicon's 128 KiB L1D.
@@ -1276,6 +1318,35 @@ where
         }
         r
     }
+}
+
+#[inline(never)]
+fn prepare_zero_padded_fft<F, M>(
+    values: &mut [F],
+    r: usize,
+    lg_n: usize,
+    lg_packed_width: usize,
+    root_table: &FftRootTable<F>,
+) -> usize
+where
+    F: Field,
+    M: FftTwiddleMul<<F as Packable>::Packing>,
+{
+    debug_assert!(r > 0 && r <= lg_n);
+
+    // A zero-padded input only has n/2^r live coefficients. Bit-reversing the full buffer would
+    // place those coefficients at multiples of 2^r, after which the skipped FFT layers copy each
+    // one across its following 2^r-element run. Produce that exact state directly by reversing
+    // just the live prefix.
+    let nonzero_len = values.len() >> r;
+    reverse_index_bits_in_place(&mut values[..nonzero_len]);
+    prepare_bit_reversed_zero_padded_fft::<F, M>(
+        values,
+        r,
+        lg_n,
+        lg_packed_width,
+        root_table,
+    )
 }
 
 /// FFT implementation based on Section 32.3 of "Introduction to
@@ -1306,6 +1377,57 @@ where
         fft_classic_simd_with::<F, M>(values, first_layer, lg_n, root_table);
     } else {
         fft_classic_simd_with::<<F as Packable>::Packing, M>(values, first_layer, lg_n, root_table);
+    }
+}
+
+/// Runs the same FFT layers from a buffer whose live prefix is already in
+/// bit-reversed order. `parallel` selects the established outer-layer worker
+/// distribution; the permutation and every butterfly are otherwise shared
+/// with the ordinary path.
+#[inline(always)]
+fn fft_classic_with_bit_reversed<F, M>(
+    values: &mut [F],
+    r: usize,
+    root_table: &FftRootTable<F>,
+    parallel: bool,
+) where
+    F: Field,
+    M: FftTwiddleMul<F> + FftTwiddleMul<<F as Packable>::Packing>,
+{
+    let lg_n = log2_strict(values.len());
+    let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
+    let first_layer = if r == 0 {
+        0
+    } else {
+        prepare_bit_reversed_zero_padded_fft::<F, M>(
+            values,
+            r,
+            lg_n,
+            lg_packed_width,
+            root_table,
+        )
+    };
+
+    if lg_n <= lg_packed_width {
+        if parallel {
+            fft_classic_simd_with_parallel::<F, M>(values, first_layer, lg_n, root_table);
+        } else {
+            fft_classic_simd_with::<F, M>(values, first_layer, lg_n, root_table);
+        }
+    } else if parallel {
+        fft_classic_simd_with_parallel::<<F as Packable>::Packing, M>(
+            values,
+            first_layer,
+            lg_n,
+            root_table,
+        );
+    } else {
+        fft_classic_simd_with::<<F as Packable>::Packing, M>(
+            values,
+            first_layer,
+            lg_n,
+            root_table,
+        );
     }
 }
 
@@ -1354,6 +1476,33 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
         fft_classic_with::<F, GeneralTwiddle>(values, r, root_table);
     } else {
         fft_classic_with::<F, BaseSubfieldTwiddle>(values, r, root_table);
+    }
+}
+
+fn fft_classic_from_bit_reversed<F: Field>(
+    values: &mut [F],
+    r: usize,
+    root_table: &FftRootTable<F>,
+    parallel: bool,
+) {
+    let lg_n = log2_strict(values.len());
+    if root_table.len() != lg_n {
+        panic!(
+            "Expected root table of length {}, but it was {}.",
+            lg_n,
+            root_table.len()
+        );
+    }
+
+    if lg_n == F::TWO_ADICITY {
+        fft_classic_with_bit_reversed::<F, GeneralTwiddle>(values, r, root_table, parallel);
+    } else {
+        fft_classic_with_bit_reversed::<F, BaseSubfieldTwiddle>(
+            values,
+            r,
+            root_table,
+            parallel,
+        );
     }
 }
 
@@ -2424,7 +2573,9 @@ mod tests {
     use crate::extension::quadratic::QuadraticExtension;
     use crate::fft::{
         FftRootTable, fft, fft_classic, fft_classic_parallel, fft_in_place_with_options,
-        fft_in_place_with_options_parallel, fft_root_table, fft_with_options, ifft,
+        fft_in_place_with_options_from_bit_reversed,
+        fft_in_place_with_options_from_bit_reversed_parallel, fft_in_place_with_options_parallel,
+        fft_root_table, fft_with_options, ifft,
     };
     use crate::goldilocks_field::GoldilocksField;
 
@@ -3161,6 +3312,40 @@ mod tests {
         fft_in_place_with_options(&mut serial, Some(3), None);
         fft_in_place_with_options_parallel(&mut parallel, Some(3), None);
         assert_eq!(parallel, serial, "packed base-field public entry diverged");
+    }
+
+    #[test]
+    fn pre_bitreversed_zero_padded_fft_matches_serial_and_parallel() {
+        type F = GoldilocksField;
+        type E = QuadraticExtension<F>;
+
+        const R: usize = 3;
+        let n = 1 << 18;
+        let live = n >> R;
+        let value = |i: usize| {
+            QuadraticExtension([
+                GoldilocksField((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                GoldilocksField((i as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)),
+            ])
+        };
+        let mut expected = (0..live)
+            .map(value)
+            .chain(core::iter::repeat_n(E::ZERO, n - live))
+            .collect::<Vec<_>>();
+        let mut prepared = expected.clone();
+        reverse_index_bits_in_place(&mut prepared[..live]);
+        let mut parallel = prepared.clone();
+
+        fft_in_place_with_options(&mut expected, Some(R), None);
+        fft_in_place_with_options_from_bit_reversed(&mut prepared, Some(R), None);
+        fft_in_place_with_options_from_bit_reversed_parallel(
+            &mut parallel,
+            Some(R),
+            None,
+        );
+
+        assert_eq!(prepared, expected);
+        assert_eq!(parallel, expected);
     }
 
 }

@@ -6,9 +6,10 @@ use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
-use crate::field::extension::Extendable;
+use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::fft::{
-    FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
+    FftRootTable, fft_in_place_with_options, fft_in_place_with_options_from_bit_reversed,
+    fft_in_place_with_options_from_bit_reversed_parallel, fft_in_place_with_options_parallel,
 };
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
@@ -677,6 +678,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // prefix, and the fold consumes only `[..live_chunks * arity]`, which is
         // `<= read_bound`. Same pattern as the promoted `lde_values` fast path.
         unsafe { lde_final_poly.coeffs.set_len(lde_len) };
+        let final_coset_powers =
+            crate::plonk::prover::precomputed::coset_shift_powers::<F>(live_coeffs);
         let lde_final_values = timed!(
             timing,
             "perform final FFT",
@@ -684,9 +687,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // zeros written by the `resize` just above, so the FFT's zero-run
             // shortcut applies and the coset scaling over that tail is a
             // multiply-by-zero: scale only the `live_coeffs` prefix.
-            coset_fft_zero_tail(
+            coset_fft_zero_tail_bitrev_gather::<F, D>(
                 &lde_final_poly,
-                F::coset_shift().into(),
+                &final_coset_powers,
                 live_coeffs,
                 Some(fri_params.config.rate_bits),
                 None,
@@ -755,6 +758,69 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
         fft_in_place_with_options_parallel(&mut scaled, zero_factor, root_table);
     } else {
         fft_in_place_with_options(&mut scaled, zero_factor, root_table);
+    }
+    PolynomialValues::new(scaled)
+}
+
+/// Production final-FRI coset FFT. Scale and bit-reverse the live extension
+/// coefficients in one parallel out-of-place gather, then enter the ordinary
+/// zero-padded FFT after its permutation boundary.
+///
+/// This path is deliberately separate from retained commitment LDEs: its
+/// destination is a fresh CPU `Vec`, no Metal shared-buffer write order or
+/// streamed GPU absorption is involved, and independent output blocks expose
+/// several random-read streams just like FRI's promoted `bitrev_flatten`.
+fn coset_fft_zero_tail_bitrev_gather<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
+    coeffs: &PolynomialCoeffs<F::Extension>,
+    coset_powers: &[F],
+    live: usize,
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F::Extension>>,
+) -> PolynomialValues<F::Extension> {
+    const BITREV_SCALE_BLOCK: usize = 1 << 10;
+
+    let len = coeffs.len();
+    assert_eq!(coset_powers.len(), live);
+    assert!(live.is_power_of_two());
+    assert!(matches!(
+        zero_factor,
+        Some(r) if r > 0 && live >= 2 && live == len >> r
+    ));
+
+    let log_live = log2_strict(live);
+    let mut scaled = Vec::<F::Extension>::with_capacity(len);
+    {
+        let output = &mut scaled.spare_capacity_mut()[..live];
+        output
+            .par_chunks_mut(BITREV_SCALE_BLOCK)
+            .enumerate()
+            .for_each(|(block, output)| {
+                let output_start = block * BITREV_SCALE_BLOCK;
+                for (offset, slot) in output.iter_mut().enumerate() {
+                    let source = reverse_bits(output_start + offset, log_live);
+                    slot.write(coeffs.coeffs[source].scalar_mul(coset_powers[source]));
+                }
+            });
+    }
+    // SAFETY: every slot in the live prefix was written exactly once by the
+    // indexed parallel chunks. The remaining tail is not read: the
+    // zero-padded preparation expands the live prefix back-to-front and writes
+    // each tail slot before any butterfly can observe it. `F::Extension` is a
+    // plain field value with no destructor, matching the established
+    // `coset_fft_zero_tail` uninitialized-tail contract above.
+    unsafe { scaled.set_len(len) };
+
+    if crate::hash::poseidon2::is_exclusive_gpu_phase() {
+        fft_in_place_with_options_from_bit_reversed_parallel(
+            &mut scaled,
+            zero_factor,
+            root_table,
+        );
+    } else {
+        fft_in_place_with_options_from_bit_reversed(&mut scaled, zero_factor, root_table);
     }
     PolynomialValues::new(scaled)
 }
@@ -1024,6 +1090,41 @@ mod tests {
 
         check::<GoldilocksField>();
         check::<<GoldilocksField as Extendable<2>>::Extension>();
+    }
+
+    /// The production final-FRI gather must preserve the exact extension
+    /// values of the established sequential scale + FFT path at both small
+    /// and cache-sized shapes.
+    #[test]
+    fn bitrev_gather_final_fri_fft_matches_classic() {
+        const D: usize = 2;
+        const RATE_BITS: usize = 3;
+        type F = GoldilocksField;
+        type E = <F as Extendable<D>>::Extension;
+
+        for degree in [2usize, 8, 64, 1 << 14] {
+            let len = degree << RATE_BITS;
+            let mut coeffs = E::rand_vec(degree);
+            coeffs.resize(len, E::ZERO);
+            let polynomial = PolynomialCoeffs::new(coeffs);
+            let powers = crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
+
+            let expected = coset_fft_zero_tail(
+                &polynomial,
+                F::coset_shift().into(),
+                degree,
+                Some(RATE_BITS),
+                None,
+            );
+            let actual = coset_fft_zero_tail_bitrev_gather::<F, D>(
+                &polynomial,
+                &powers,
+                degree,
+                Some(RATE_BITS),
+                None,
+            );
+            assert_eq!(actual.values, expected.values, "degree 2^{}", degree.ilog2());
+        }
     }
 
     /// The fused quotient accumulation must be bit-identical (raw u64
