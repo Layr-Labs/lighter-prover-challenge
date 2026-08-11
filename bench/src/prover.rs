@@ -237,6 +237,16 @@ fn generate_tx_witness<'a>(
     );
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "generate_tx_witness");
+    // Ranked workload witness parallelism (report #1): the ranked fixtures carry
+    // ACTIVE transactions whose witness generators (ECDSA verify, keccak, Merkle
+    // path construction) dominate path-thread time and today run single-threaded
+    // on the main path thread. In the ranked sequential-worker model each worker
+    // owns all ten cores; the generator worklist is a deterministic fixpoint
+    // regardless of how many threads run a round, so witness values -- and thus
+    // proof bytes -- are schedule-independent. This opts the tx witness worklist
+    // into parallel rounds. (The prior empty-tx smoke regression did not exercise
+    // the ACTIVE witness cost this targets.)
+    let _parallel_tx_witness = ParallelWitnessGuard::new();
     let block_tx = BlockTx {
         created_at,
         state_metadata_hash,
