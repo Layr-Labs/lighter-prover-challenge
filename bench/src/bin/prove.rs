@@ -64,7 +64,20 @@ fn main() {
     // `log` is statically disabled in release builds: the ranked worker has no
     // log consumer, and diagnostics remain available in debug/test builds.
     // Do not link and initialize an unused logger in every scored process.
+    // Reserve cores for the dedicated chain-spine pool: reduce the global pool
+    // by the chain reservation so total rayon threads stay bounded by the core
+    // count. The chain pool thread count is read from the same env knob so the
+    // two stay consistent.
+    let chain_reserved = std::env::var("LIGHTER_CHAIN_POOL_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(4);
+    let total = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    let global_threads = total.saturating_sub(chain_reserved).max(1);
     rayon::ThreadPoolBuilder::new()
+        .num_threads(global_threads)
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
         .expect("cannot configure prover thread pool");
@@ -252,4 +265,4 @@ fn main() {
     unsafe { _exit(0) }
 }
 
-// p90-fire-b7-1786376354
+// p90-fire-rlm-chn-1786417771

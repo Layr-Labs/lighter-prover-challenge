@@ -31,6 +31,34 @@ use plonky2::util::timing::TimingTree;
 
 use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
 
+use std::sync::OnceLock;
+
+/// Dedicated rayon pool for the serial chain-spine folds.
+///
+/// The chain spine (49 light + 3 heavy sequential folds) is the latency-critical
+/// path of the block pipeline. Each fold's `prove_with_partition_witness` runs
+/// its FRI/merkle/quotient parallel work on the global rayon pool, where it
+/// contends with the hideable tx-proof window (4 in flight) and the concurrent
+/// final-block build lane. Giving the spine its own pool reserves dedicated
+/// threads so the critical path is not queued behind hideable work. Thread count
+/// is env-overridable (LIGHTER_CHAIN_POOL_THREADS) and defaults to a modest
+/// reservation; the global pool is reduced by the same amount in the worker so
+/// total threads stay bounded by the machine's core count.
+pub(crate) fn chain_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let n = std::env::var("LIGHTER_CHAIN_POOL_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(4);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .build()
+            .expect("cannot build dedicated chain pool")
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxPath {
     Heavy,
@@ -191,7 +219,12 @@ fn chain_step_proof(
                 feeder,
             )
         })?;
-        BlockTxChainCircuit::prove_prepared(pending, chain_data)
+        // Run the fold's parallel work (FRI/merkle/quotient) on the dedicated
+        // chain pool so the serial spine is not queued behind the hideable
+        // tx-proof window and block-build lane on the global pool. Scheduling
+        // only: the same work, same order, same witness, same committed values,
+        // so proof bytes are byte-identical.
+        chain_pool().install(|| BlockTxChainCircuit::prove_prepared(pending, chain_data))
     })();
     result.unwrap_or_else(|error| {
         panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")
