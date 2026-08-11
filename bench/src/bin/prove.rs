@@ -13,13 +13,14 @@ mod prover;
 use std::env;
 use std::fs::{self, File};
 use std::io::BufWriter;
+use std::path::Path;
 
 use api::{
     Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
     PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
 };
-use circuit::block_pre_execution_constraints::Circuit as _;
 use circuit::block::Block;
+use circuit::block_pre_execution_constraints::Circuit as _;
 use circuit::types::config::{C, F};
 use plonky2::fri::oracle::PolynomialBatch;
 
@@ -45,6 +46,11 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
+    let mut args = env::args().skip(1);
+    let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
+    let output = args.next().expect("usage: prove FIXTURE OUTPUT");
+    assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
+
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context("worker", 0, &[]);
     #[cfg(feature = "diagnostic_profile")]
@@ -59,6 +65,10 @@ fn main() {
     {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("startup", "metal_prewarm_submit");
+        let output_directory = Path::new(&output)
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        plonky2::hash::poseidon2::set_binary_archive_directory(output_directory);
         plonky2::hash::poseidon2::prewarm_gpu();
     }
     // `log` is statically disabled in release builds: the ranked worker has no
@@ -74,11 +84,6 @@ fn main() {
         "rayon_threads",
         rayon::current_num_threads() as u64,
     );
-
-    let mut args = env::args().skip(1);
-    let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
-    let output = args.next().expect("usage: prove FIXTURE OUTPUT");
-    assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
     // Fixture parse overlaps the pre-execution circuit load; both are fast.
     let (block, pre_circuits) = rayon::join(
