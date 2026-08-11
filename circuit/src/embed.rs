@@ -23,6 +23,8 @@
 //!   identity permutation (mostly zeros) instead of 8-byte usizes;
 //! * the generator watch index is stored in its CSR form (varint-delta
 //!   offsets + `u32` watcher ids);
+//! * precomputed `generator_watch_counts` are stored alongside the CSR so the
+//!   loader does not re-scatter over every watcher edge at startup;
 //! * constant polynomials are stored as *values* (step-function selectors,
 //!   long constant runs) rather than incompressible coefficients;
 //! * every bulky section is independently zstd-compressed, keeping parallel
@@ -66,7 +68,10 @@ fn embed_generator_serializer() -> EmbedGeneratorSerializer {
 }
 
 const EMBED_MAGIC: u32 = 0x4C45_4331; // "LEC1"
-const EMBED_VERSION: u32 = 1;
+/// Version 2 adds a compressed section of precomputed `generator_watch_counts`
+/// immediately after the watch-index watcher list. Build scripts regenerate
+/// every blob, so there is no need to accept version-1 payloads at runtime.
+const EMBED_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Primitive encoding helpers
@@ -265,6 +270,33 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     }
     write_compressed_section(&mut out, &buf);
 
+    // Precomputed per-generator watch counts (identical to the builder's
+    // `ProverOnlyCircuitData::generator_watch_counts`). Counts are a pure
+    // function of the CSR watcher list above, but reconstructing them at load
+    // walks every edge with scattered read-modify-writes across a generator-
+    // sized vector. For the five production circuits that is millions of
+    // non-contiguous increments during parallel circuit load. The build job is
+    // untimed, so store the vector once and memcpy it back at runtime.
+    ensure!(
+        prover.generator_watch_counts.len() == prover.generators.len(),
+        "generator_watch_counts length diverges from generator list"
+    );
+    let count_sum: usize = prover.generator_watch_counts.iter().sum();
+    ensure!(
+        count_sum == watchers.len(),
+        "generator_watch_counts sum {count_sum} diverges from watcher edge count {}",
+        watchers.len()
+    );
+    let mut buf = Vec::with_capacity(prover.generator_watch_counts.len() + 16);
+    write_uvarint(&mut buf, prover.generator_watch_counts.len() as u64);
+    for &count in &prover.generator_watch_counts {
+        // Production max counts are tens (see builder diagnostics); u16 is a
+        // hard safety bound that keeps the section dense under zstd.
+        let count = u16::try_from(count).context("generator watch count exceeds u16")?;
+        buf.extend_from_slice(&count.to_le_bytes());
+    }
+    write_compressed_section(&mut out, &buf);
+
     // constant polynomial *values* (fft of the committed coefficients; the
     // loader inverts this with the same exact-arithmetic ifft the builder's
     // from_values uses, so the round trip is bit-exact)
@@ -299,10 +331,11 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
 ///
 /// The returned `CircuitData` is value-identical to the freshly built one:
 /// deserialized components are byte round trips, and every recomputed
-/// component (subgroup, FFT root table, sigma values/transpose, watch counts,
+/// component (subgroup, FFT root table, sigma values/transpose,
 /// constants/sigmas commitment) is derived by the same code paths the builder
-/// itself runs, from the same inputs. The recomputed commitment cap is checked
-/// against the embedded verifier data before returning.
+/// itself runs, from the same inputs. `generator_watch_counts` are restored
+/// from the blob (v2) and checked against the CSR edge sum. The recomputed
+/// commitment cap is checked against the embedded verifier data before returning.
 pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, CircuitData<F, C, D>)> {
     let gate_serializer = BlockGateSerializer;
     let generator_serializer = embed_generator_serializer();
@@ -423,12 +456,34 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         ensure!(watcher < generator_count, "watcher index out of range");
         watchers.push(watcher);
     }
-    // Watch counts are a pure function of the (deduplicated) watcher lists;
-    // this mirrors `read_prover_only_circuit_data`'s reconstruction.
-    let mut generator_watch_counts = vec![0usize; generator_count];
-    for &watcher in &watchers {
-        generator_watch_counts[watcher] += 1;
+    // Precomputed watch counts (embed v2). Contiguous decode replaces the old
+    // edge-scatter reconstruction (`for &watcher in &watchers { counts[w] += 1 }`),
+    // which performed millions of non-local RMW ops across four parallel loads.
+    // Cheap invariants still pin correctness to the CSR: length and edge sum.
+    let section = read_compressed_section(bytes, &mut pos)?;
+    let mut vpos = 0usize;
+    let counts_len = read_uvarint(&section, &mut vpos)? as usize;
+    ensure!(
+        counts_len == generator_count,
+        "embedded generator_watch_counts length {counts_len} diverges from generator count {generator_count}"
+    );
+    ensure!(
+        section.len() == vpos + 2 * counts_len,
+        "generator_watch_counts section length mismatch"
+    );
+    let mut generator_watch_counts = Vec::with_capacity(counts_len);
+    let mut count_sum = 0usize;
+    for chunk in section[vpos..].chunks_exact(2) {
+        let count = u16::from_le_bytes(chunk.try_into().unwrap()) as usize;
+        count_sum = count_sum
+            .checked_add(count)
+            .context("generator_watch_counts sum overflow")?;
+        generator_watch_counts.push(count);
     }
+    ensure!(
+        count_sum == watchers_len,
+        "embedded generator_watch_counts sum {count_sum} diverges from watcher edge count {watchers_len}"
+    );
     let generator_indices_by_watches = GeneratorWatchIndex::from_parts(offsets, watchers);
 
     // constant polynomial values
