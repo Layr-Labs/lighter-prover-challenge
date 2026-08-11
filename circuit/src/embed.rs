@@ -260,7 +260,6 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     let mut buf = Vec::with_capacity(4 * watchers.len() + 8);
     write_uvarint(&mut buf, watchers.len() as u64);
     for &watcher in watchers {
-        let watcher = u32::try_from(watcher).context("generator index exceeds u32")?;
         buf.extend_from_slice(&watcher.to_le_bytes());
     }
     write_compressed_section(&mut out, &buf);
@@ -419,15 +418,18 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     );
     let mut watchers = Vec::with_capacity(watchers_len);
     for chunk in section[vpos..].chunks_exact(4) {
-        let watcher = u32::from_le_bytes(chunk.try_into().unwrap()) as usize;
-        ensure!(watcher < generator_count, "watcher index out of range");
+        let watcher = u32::from_le_bytes(chunk.try_into().unwrap());
+        ensure!(
+            (watcher as usize) < generator_count,
+            "watcher index out of range"
+        );
         watchers.push(watcher);
     }
     // Watch counts are a pure function of the (deduplicated) watcher lists;
     // this mirrors `read_prover_only_circuit_data`'s reconstruction.
     let mut generator_watch_counts = vec![0usize; generator_count];
     for &watcher in &watchers {
-        generator_watch_counts[watcher] += 1;
+        generator_watch_counts[watcher as usize] += 1;
     }
     let generator_indices_by_watches = GeneratorWatchIndex::from_parts(offsets, watchers);
 
@@ -608,6 +610,8 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plonky2::plonk::circuit_builder::CircuitBuilder;
+    use plonky2::plonk::circuit_data::CircuitConfig;
 
     #[test]
     fn varint_round_trips() {
@@ -655,5 +659,32 @@ mod tests {
         let decoded = read_compressed_section(&framed, &mut pos).unwrap();
         assert_eq!(decoded, input);
         assert_eq!(pos, framed.len());
+    }
+
+    #[test]
+    fn embedded_watch_index_round_trip_is_byte_stable() -> Result<()> {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let x = builder.add_virtual_target();
+        let y = builder.add_virtual_target();
+        let sum = builder.add(x, y);
+        builder.register_public_input(sum);
+        let circuit = builder.build::<C>();
+        assert!(!circuit.prover_only.generator_indices_by_watches.watchers().is_empty());
+
+        let blob = serialize_embedded(&17u32, &circuit)?;
+        let (target, decoded) = deserialize_embedded::<u32>(&blob)?;
+        assert_eq!(target, 17);
+        assert_eq!(
+            decoded.prover_only.generator_indices_by_watches,
+            circuit.prover_only.generator_indices_by_watches
+        );
+        assert_eq!(
+            decoded.prover_only.generator_watch_counts,
+            circuit.prover_only.generator_watch_counts
+        );
+
+        let re_encoded = serialize_embedded(&target, &decoded)?;
+        assert_eq!(blob, re_encoded, "embedded bytes changed after round trip");
+        Ok(())
     }
 }

@@ -1956,7 +1956,9 @@ pub trait Write {
         self.write_usize(generator_indices_by_watches.len())?;
         for (k, v) in generator_indices_by_watches.iter() {
             self.write_usize(k)?;
-            self.write_usize_vec(v)?;
+            // Watchers are stored as `u32` in memory but retain the legacy word encoding on the
+            // wire, just like the narrowed representative map below.
+            self.write_usize_encoded_u32_vec(v)?;
         }
 
         self.write_polynomial_batch(constants_sigmas_commitment)?;
@@ -2409,12 +2411,11 @@ mod tests {
         (builder.build::<C>(), x, y)
     }
 
-    /// Prover-only data with a `u32` representative map keeps the legacy serialized format: the
-    /// re-encoding of a decoded buffer is byte-identical, the decoded map matches entry for entry,
-    /// the runtime-only watch counts are reconstructed to exactly the builder-derived vector, and
-    /// the decoded data still proves and verifies.
+    /// Prover-only data with `u32` representative and watcher indices keeps the legacy serialized
+    /// format: re-encoding is byte-identical, both narrowed indices match entry for entry, runtime
+    /// watch counts are reconstructed exactly, and the decoded data still proves and verifies.
     #[test]
-    fn prover_only_data_round_trip_preserves_rep_map_and_watch_counts() -> Result<()> {
+    fn prover_only_data_round_trip_preserves_narrow_indices_and_legacy_bytes() -> Result<()> {
         let (circuit, x, y) = small_circuit();
         let generator_serializer = DefaultGeneratorSerializer::<C, D>::default();
 
@@ -2481,6 +2482,32 @@ mod tests {
                 .windows(legacy_map_bytes.len())
                 .any(|w| w == legacy_map_bytes.as_slice()),
             "the legacy representative-map encoding does not appear in the serialized bytes"
+        );
+
+        // The watcher CSR payload likewise remains a length-prefixed sequence of 8-byte words in
+        // the generic format even though each in-memory generator index now occupies four bytes.
+        let watch_index = &circuit.prover_only.generator_indices_by_watches;
+        assert!(!watch_index.watchers().is_empty());
+        let mut legacy_watch_index_bytes = Vec::new();
+        legacy_watch_index_bytes.write_usize(watch_index.len()).unwrap();
+        for (representative, watchers) in watch_index.iter() {
+            legacy_watch_index_bytes
+                .write_usize(representative)
+                .unwrap();
+            legacy_watch_index_bytes
+                .write_usize_vec(
+                    &watchers
+                        .iter()
+                        .map(|&watcher| watcher as usize)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+        }
+        assert!(
+            bytes
+                .windows(legacy_watch_index_bytes.len())
+                .any(|window| window == legacy_watch_index_bytes.as_slice()),
+            "the legacy watcher-index encoding does not appear in the serialized bytes"
         );
 
         let mut inputs = PartialWitness::new();

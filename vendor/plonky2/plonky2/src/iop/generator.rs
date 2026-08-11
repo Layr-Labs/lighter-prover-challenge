@@ -170,7 +170,7 @@ fn run_generator_worklist<
             #[allow(clippy::type_complexity)]
             let round_outputs: Vec<(
                 Vec<(usize, bool, usize)>,
-                Vec<(Target, F, Option<&[usize]>)>,
+                Vec<(Target, F, Option<&[u32]>)>,
             )> = pending_generator_indices
                 .par_chunks(PARALLEL_WORKLIST_CHUNK)
                 .map(|chunk| {
@@ -221,6 +221,7 @@ fn run_generator_worklist<
                         }
                         if let Some(watchers) = watchers {
                             for &watching_generator_idx in watchers {
+                                let watching_generator_idx = watching_generator_idx as usize;
                                 if !generator_is_expired[watching_generator_idx] {
                                     debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
                                     unresolved_watches[watching_generator_idx] -= 1;
@@ -265,6 +266,7 @@ fn run_generator_worklist<
                 if let Some(watch) = witness.set_target_returning_rep(t, v)? {
                     if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                         for &watching_generator_idx in watchers {
+                            let watching_generator_idx = watching_generator_idx as usize;
                             if !generator_is_expired[watching_generator_idx] {
                                 debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
                                 unresolved_watches[watching_generator_idx] -= 1;
@@ -310,6 +312,7 @@ fn seed_inputs_and_unresolved_watches<F: Field>(
         if let Some(watch) = witness.set_target_returning_rep(t, v)? {
             if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                 for &generator_idx in watchers {
+                    let generator_idx = generator_idx as usize;
                     debug_assert_ne!(unresolved_watches[generator_idx], 0);
                     unresolved_watches[generator_idx] -= 1;
                 }
@@ -344,6 +347,7 @@ impl<F: Field> WitnessWrite<F> for PartitionSeeder<'_, '_, F> {
         if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
             if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
                 for &generator_idx in watchers {
+                    let generator_idx = generator_idx as usize;
                     debug_assert_ne!(self.unresolved_watches[generator_idx], 0);
                     self.unresolved_watches[generator_idx] -= 1;
                 }
@@ -383,6 +387,7 @@ impl<F: Field> WitnessWrite<F> for PartitionFeeder<'_, '_, F> {
         if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
             if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
                 for &watching_generator_idx in watchers {
+                    let watching_generator_idx = watching_generator_idx as usize;
                     if !self.generator_is_expired[watching_generator_idx] {
                         debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
                         self.unresolved_watches[watching_generator_idx] -= 1;
@@ -556,6 +561,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             if let Some(watch) = self.witness.set_target_returning_rep(t, v)? {
                 if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                     for &watching_generator_idx in watchers {
+                        let watching_generator_idx = watching_generator_idx as usize;
                         if !self.generator_is_expired[watching_generator_idx] {
                             debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
                             self.unresolved_watches[watching_generator_idx] -= 1;
@@ -993,8 +999,8 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D> for Con
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
@@ -1101,6 +1107,69 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ScheduleRecordingGenerator {
+        ordinal: usize,
+        dependencies: Vec<Target>,
+        output: Target,
+        schedule: Arc<Mutex<Vec<(usize, bool)>>>,
+    }
+
+    impl WitnessGenerator<F, D> for ScheduleRecordingGenerator {
+        fn id(&self) -> String {
+            format!("ScheduleRecordingGenerator({})", self.ordinal)
+        }
+
+        fn watch_list(&self) -> Vec<Target> {
+            self.dependencies.clone()
+        }
+
+        fn run(&self, witness: &PartitionWitness<F>, out_buffer: &mut GeneratedValues<F>) -> bool {
+            self.run_with_ready_hint(
+                witness,
+                out_buffer,
+                witness.contains_all(&self.dependencies),
+            )
+        }
+
+        fn run_with_ready_hint(
+            &self,
+            witness: &PartitionWitness<F>,
+            out_buffer: &mut GeneratedValues<F>,
+            all_watches_populated: bool,
+        ) -> bool {
+            self.schedule
+                .lock()
+                .unwrap()
+                .push((self.ordinal, all_watches_populated));
+            if !all_watches_populated {
+                return false;
+            }
+            let value = self
+                .dependencies
+                .iter()
+                .map(|&target| witness.get_target(target))
+                .sum();
+            out_buffer.set_target(self.output, value).unwrap();
+            true
+        }
+
+        fn serialize(
+            &self,
+            _dst: &mut Vec<u8>,
+            _common_data: &CommonCircuitData<F, D>,
+        ) -> IoResult<()> {
+            unreachable!("test generator is never serialized")
+        }
+
+        fn deserialize(
+            _src: &mut Buffer,
+            _common_data: &CommonCircuitData<F, D>,
+        ) -> IoResult<Self> {
+            unreachable!("test generator is never deserialized")
+        }
+    }
+
     #[test]
     fn simple_generator_uses_representative_readiness_without_rescanning_dependencies() {
         let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
@@ -1137,6 +1206,55 @@ mod tests {
             dependency_calls.load(Ordering::Relaxed),
             dependency_calls_after_build
         );
+    }
+
+    /// The CSR payload is narrower, but watcher iteration must enqueue exactly the same generator
+    /// indices in the same order. The consumer is deliberately registered before both producers:
+    /// it first runs unready, each producer then queues it, and it expires on the first retry.
+    #[test]
+    fn u32_csr_watchers_preserve_scheduler_order() -> Result<()> {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let a = builder.add_virtual_target();
+        let b = builder.add_virtual_target();
+        let x = builder.add_virtual_target();
+        let y = builder.add_virtual_target();
+        let output = builder.add_virtual_target();
+        let schedule = Arc::new(Mutex::new(Vec::new()));
+
+        builder.add_generators(vec![
+            WitnessGeneratorRef::new(ScheduleRecordingGenerator {
+                ordinal: 2,
+                dependencies: vec![x, y],
+                output,
+                schedule: Arc::clone(&schedule),
+            }),
+            WitnessGeneratorRef::new(ScheduleRecordingGenerator {
+                ordinal: 0,
+                dependencies: vec![a],
+                output: x,
+                schedule: Arc::clone(&schedule),
+            }),
+            WitnessGeneratorRef::new(ScheduleRecordingGenerator {
+                ordinal: 1,
+                dependencies: vec![a, b],
+                output: y,
+                schedule: Arc::clone(&schedule),
+            }),
+        ]);
+        builder.register_public_input(output);
+        let circuit = builder.build::<C>();
+
+        let mut inputs = PartialWitness::new();
+        inputs.set_target(a, F::from_canonical_u64(2))?;
+        inputs.set_target(b, F::from_canonical_u64(3))?;
+        let witness = generate_partial_witness(inputs, &circuit.prover_only, &circuit.common)?;
+
+        assert_eq!(
+            *schedule.lock().unwrap(),
+            vec![(2, false), (0, true), (1, true), (2, true)]
+        );
+        assert_eq!(witness.get_target(output), F::from_canonical_u64(7));
+        Ok(())
     }
 
     /// Builds an outer circuit verifying two independent inner proofs, mirroring a chain step's
@@ -1216,7 +1334,7 @@ mod tests {
         for (watch, watchers) in prover_data.generator_indices_by_watches.iter() {
             if !witness.is_set_by_rep_index(watch) {
                 for &generator_idx in watchers {
-                    unresolved_watches[generator_idx] += 1;
+                    unresolved_watches[generator_idx as usize] += 1;
                 }
             }
         }
@@ -1236,7 +1354,7 @@ mod tests {
         let mut occurrences = vec![0usize; prover_data.generators.len()];
         for (_, watchers) in prover_data.generator_indices_by_watches.iter() {
             for &generator_idx in watchers {
-                occurrences[generator_idx] += 1;
+                occurrences[generator_idx as usize] += 1;
             }
         }
         assert_eq!(
