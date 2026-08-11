@@ -680,11 +680,36 @@ impl<T> AsRef<[T]> for Poseidon2Permutation<T> {
 
 trait Permuter: Sized {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH];
+
+    #[inline]
+    fn permute_x4(
+        input_a: [Self; WIDTH],
+        input_b: [Self; WIDTH],
+        input_c: [Self; WIDTH],
+        input_d: [Self; WIDTH],
+    ) -> ([Self; WIDTH], [Self; WIDTH], [Self; WIDTH], [Self; WIDTH]) {
+        (
+            Self::permute(input_a),
+            Self::permute(input_b),
+            Self::permute(input_c),
+            Self::permute(input_d),
+        )
+    }
 }
 
 impl<F: Poseidon2> Permuter for F {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH] {
         <F as Poseidon2>::poseidon2(input)
+    }
+
+    #[inline]
+    fn permute_x4(
+        input_a: [Self; WIDTH],
+        input_b: [Self; WIDTH],
+        input_c: [Self; WIDTH],
+        input_d: [Self; WIDTH],
+    ) -> ([Self; WIDTH], [Self; WIDTH], [Self; WIDTH], [Self; WIDTH]) {
+        <F as Poseidon2>::poseidon2_x4(input_a, input_b, input_c, input_d)
     }
 }
 
@@ -726,6 +751,20 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
 
     fn permute(&mut self) {
         self.state = T::permute(self.state);
+    }
+
+    #[inline]
+    fn permute_x4(states: &mut [Self; 4]) {
+        let (a, b, c, d) = T::permute_x4(
+            states[0].state,
+            states[1].state,
+            states[2].state,
+            states[3].state,
+        );
+        states[0].state = a;
+        states[1].state = b;
+        states[2].state = c;
+        states[3].state = d;
     }
 
     fn squeeze(&self) -> &[T] {
@@ -1113,6 +1152,24 @@ mod test {
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::PoseidonGoldilocksConfig;
+
+    #[test]
+    fn test_poseidon2_permutation_x4_matches_scalar() {
+        let states = core::array::from_fn(|lane| {
+            Poseidon2Permutation::<F>::new(
+                (0..WIDTH).map(|i| F::from_canonical_usize(1 + lane * WIDTH + i)),
+            )
+        });
+        let mut scalar = states;
+        let mut interleaved = states;
+
+        for state in &mut scalar {
+            state.permute();
+        }
+        Poseidon2Permutation::<F>::permute_x4(&mut interleaved);
+
+        assert_eq!(interleaved, scalar);
+    }
 
     #[test]
     fn test_poseidon2_with_plonky3() {

@@ -65,6 +65,7 @@ pub struct Circuits {
 // Revalidate the fixed permutation-mask and release-log stack on the ranked host.
 // Repeat the validated stack after the official runner spread exceeded four percent.
 // Keep the production diff fixed while sampling the ranked-host tail once more.
+// Redraw the FRI PoW x4 mechanism once after a documented cross-source low-tail band.
 
 pub(crate) struct PathCircuits {
     pub(crate) tx_target: BlockTxTarget,
