@@ -53,7 +53,7 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // Light-proof throughput is the run's terminal constraint (the chain drains
 // concurrently and finishes within a step of the last tx proof; the block
 // waits for both), so the window depth divides the longest phase directly.
-// Series draw marker: v11 surface (ramp depth 2), sample 5.
+// Series draw marker: v11 surface (ramp depth 2), sample 9.
 // The depth-4 ceiling dated from tighter-memory hosts: measured peak RSS is
 // ~6.8 GB at depth 4 against 24 GB local / 48 GB ranked, and mid-run CPU
 // occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
