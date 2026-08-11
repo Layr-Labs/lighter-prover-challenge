@@ -1,4 +1,4 @@
-// Redraw marker 701-claude-fable-r2
+// Tip redraw on 59c0155 — marker 623-redraw-1786456192
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
