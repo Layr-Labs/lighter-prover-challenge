@@ -373,10 +373,30 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
             }
         }
         let eval_polynomials = |pows: &[F::Extension], polynomials: &[PolynomialCoeffs<F>]| {
-            polynomials
-                .par_iter()
-                .map(|p| F::extension_base_dot_product(pows, &p.coeffs))
-                .collect::<Vec<_>>()
+            const BATCH_WIDTH: usize = 2;
+
+            // Allocate only the final ordered result. Full groups use the
+            // field's fixed-stack same-point hook; a final group of at most
+            // one polynomial retains the historical single-dot path.
+            let full_len = polynomials.len() / BATCH_WIDTH * BATCH_WIDTH;
+            let mut evaluations = vec![F::Extension::ZERO; polynomials.len()];
+            evaluations[..full_len]
+                .par_chunks_exact_mut(BATCH_WIDTH)
+                .zip(polynomials[..full_len].par_chunks_exact(BATCH_WIDTH))
+                .for_each(|(output, group)| {
+                    let values = F::extension_base_dot_products_2(
+                        pows,
+                        [group[0].coeffs.as_slice(), group[1].coeffs.as_slice()],
+                    );
+                    output.copy_from_slice(&values);
+                });
+            for (output, polynomial) in evaluations[full_len..]
+                .iter_mut()
+                .zip(&polynomials[full_len..])
+            {
+                *output = F::extension_base_dot_product(pows, &polynomial.coeffs);
+            }
+            evaluations
         };
         let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
             eval_polynomials(pows, &c.polynomials)
