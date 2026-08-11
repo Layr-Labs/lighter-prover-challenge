@@ -2,6 +2,7 @@
 use alloc::{vec, vec::Vec};
 use core::any::TypeId;
 use core::borrow::Borrow;
+use core::mem::MaybeUninit;
 
 use plonky2_maybe_rayon::*;
 
@@ -261,35 +262,50 @@ where
         )
     };
 
-    let mut acc = vec![F::ZERO; max_len];
+    // The specialized dot-product routine assigns every output slot. Keep
+    // the result uninitialized until that routine has written it, avoiding a
+    // full zero-fill of the (often large) coefficient vector.
+    let mut acc: Vec<MaybeUninit<F>> = Vec::with_capacity(max_len);
+    // SAFETY: the buffer is only exposed through raw pointers below until
+    // `ext2_base_scalar_dot_slots` has assigned every slot.
+    unsafe { acc.set_len(max_len) };
     // Same shape split as the generic path: small batches stay serial, large
     // batches partition the coefficient slots so each worker visits all
     // polynomials for one cache-sized output range.
     const PARALLEL_CHUNK: usize = 16;
     const SLOT_BLOCK: usize = 2048;
     if slices.len() <= PARALLEL_CHUNK {
-        let out = unsafe {
-            core::slice::from_raw_parts_mut(
-                acc.as_mut_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
-                acc.len(),
-            )
-        };
+        let out = unsafe { q2_uninit_slice_mut(acc.as_mut_slice()) };
         ext2_base_scalar_dot_slots(out, 0, &slices, powers);
     } else {
         acc.par_chunks_mut(SLOT_BLOCK)
             .enumerate()
             .for_each(|(block, out)| {
                 let start = block * SLOT_BLOCK;
-                let out = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        out.as_mut_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
-                        out.len(),
-                    )
-                };
+                let out = unsafe { q2_uninit_slice_mut(out) };
                 ext2_base_scalar_dot_slots(out, start, &slices, powers);
             });
     }
-    Some(acc)
+    // SAFETY: the serial or parallel dot-product pass wrote every element.
+    let (ptr, len, cap) = (acc.as_mut_ptr().cast::<F>(), acc.len(), acc.capacity());
+    core::mem::forget(acc);
+    Some(unsafe { Vec::from_raw_parts(ptr, len, cap) })
+}
+
+/// Reinterpret an uninitialized Goldilocks-extension output buffer as the
+/// concrete quadratic type written by `ext2_base_scalar_dot_slots`.
+///
+/// The caller must write every returned element before reading it. The
+/// `TypeId` checks in `goldilocks_ext2_reduce_polys_base` establish that `F`
+/// is exactly the quadratic Goldilocks extension, so the cast preserves
+/// layout, alignment, length, and ownership.
+unsafe fn q2_uninit_slice_mut<F>(
+    values: &mut [MaybeUninit<F>],
+) -> &mut [QuadraticExtension<GoldilocksField>] {
+    core::slice::from_raw_parts_mut(
+        values.as_mut_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
+        values.len(),
+    )
 }
 
 #[derive(Debug, Clone)]

@@ -99,6 +99,42 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    /// Compute two extension/base-field dot products over the same extension
+    /// values. The default preserves the two independent dot products; a
+    /// concrete base field may specialize this to share the input traversal.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_products_2(
+        extension_values: &[Self::Extension],
+        base_scalars_0: &[Self],
+        base_scalars_1: &[Self],
+    ) -> (Self::Extension, Self::Extension) {
+        (
+            Self::extension_base_dot_product(extension_values, base_scalars_0),
+            Self::extension_base_dot_product(extension_values, base_scalars_1),
+        )
+    }
+
+    /// Compute four extension/base-field dot products over the same extension
+    /// values. The default preserves four independent dot products; concrete
+    /// fields may specialize this to share the input traversal further.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_products_4(
+        extension_values: &[Self::Extension],
+        base_scalars_0: &[Self],
+        base_scalars_1: &[Self],
+        base_scalars_2: &[Self],
+        base_scalars_3: &[Self],
+    ) -> [Self::Extension; 4] {
+        [
+            Self::extension_base_dot_product(extension_values, base_scalars_0),
+            Self::extension_base_dot_product(extension_values, base_scalars_1),
+            Self::extension_base_dot_product(extension_values, base_scalars_2),
+            Self::extension_base_dot_product(extension_values, base_scalars_3),
+        ]
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.
