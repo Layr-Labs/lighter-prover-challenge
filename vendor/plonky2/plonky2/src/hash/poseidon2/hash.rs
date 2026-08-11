@@ -817,6 +817,47 @@ pub(crate) fn hash_quad_no_pad<F: RichField + Poseidon2>(
     (out(&state_a), out(&state_b), out(&state_c), out(&state_d))
 }
 
+/// Hash sixteen rows directly from column-major storage. Each rate-sized
+/// column group is gathered into sixteen resident sponge states and consumed
+/// immediately, avoiding a row-major staging tile while retaining one pass
+/// over each source column for the full group of rows.
+pub(crate) fn hash_16_columns_no_pad<F: RichField + Poseidon2>(
+    columns: &[&[F]],
+    row_indices: &[usize; 16],
+) -> [HashOut<F>; 16] {
+    debug_assert!(columns.len() > NUM_HASH_OUT_ELTS);
+    let mut states = [[F::ZERO; WIDTH]; 16];
+
+    for chunk_start in (0..columns.len()).step_by(RATE) {
+        let chunk_end = core::cmp::min(chunk_start + RATE, columns.len());
+        for (lane, column) in columns[chunk_start..chunk_end].iter().enumerate() {
+            for row in 0..16 {
+                // SAFETY: the Merkle gather supplies in-range natural-order
+                // row indices for every equally sized source column.
+                states[row][lane] = unsafe { *column.get_unchecked(row_indices[row]) };
+            }
+        }
+
+        for group in 0..4 {
+            let base = 4 * group;
+            let (a, b, c, d) = F::poseidon2_x4(
+                states[base],
+                states[base + 1],
+                states[base + 2],
+                states[base + 3],
+            );
+            states[base] = a;
+            states[base + 1] = b;
+            states[base + 2] = c;
+            states[base + 3] = d;
+        }
+    }
+
+    states.map(|state| HashOut {
+        elements: state[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
+    })
+}
+
 /// Two independent `compress` calls with their permutations interleaved via
 /// `poseidon2_x2`. Each output is bit-identical to `compress` on that pair.
 pub(crate) fn compress_pair<F: RichField + Poseidon2>(
@@ -910,6 +951,24 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
         } else {
             hash_quad_no_pad::<F>(input_a, input_b, input_c, input_d)
         }
+    }
+
+    fn hash_or_noop_16_columns(
+        columns: &[&[F]],
+        row_indices: &[usize; 16],
+    ) -> [Self::Hash; 16] {
+        if columns.len() <= NUM_HASH_OUT_ELTS {
+            return core::array::from_fn(|row| {
+                let mut elements = [F::ZERO; NUM_HASH_OUT_ELTS];
+                for (element, column) in elements.iter_mut().zip(columns) {
+                    *element = F::from_canonical_u64(
+                        column[row_indices[row]].to_canonical_u64(),
+                    );
+                }
+                HashOut { elements }
+            });
+        }
+        hash_16_columns_no_pad::<F>(columns, row_indices)
     }
 
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash {

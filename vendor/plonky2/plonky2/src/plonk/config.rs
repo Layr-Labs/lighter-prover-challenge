@@ -105,6 +105,22 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
         )
     }
 
+    /// Hash sixteen equal-width rows read from column-major storage. This lets
+    /// implementations fuse a Merkle gather with their sponge input loads;
+    /// the default preserves the exact row-wise `hash_or_noop` semantics.
+    fn hash_or_noop_16_columns(
+        columns: &[&[F]],
+        row_indices: &[usize; 16],
+    ) -> [Self::Hash; 16] {
+        core::array::from_fn(|row| {
+            let input: Vec<F> = columns
+                .iter()
+                .map(|column| column[row_indices[row]])
+                .collect();
+            Self::hash_or_noop(&input)
+        })
+    }
+
     /// Two independent `two_to_one` compressions, allowing implementations to
     /// interleave them. Must return exactly
     /// `(Self::two_to_one(x0, y0), Self::two_to_one(x1, y1))`.

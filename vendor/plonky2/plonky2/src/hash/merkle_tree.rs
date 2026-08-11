@@ -521,6 +521,64 @@ const GATHER_TILE_LEAVES: usize = 16;
 /// materializing path in [`MerkleTree::new_column_store`].
 const GATHER_MAX_WIDTH: usize = 32;
 
+/// Wide direct gather is restricted to separately allocated Owned columns.
+/// Its column-outer base case visits one source allocation/page at a time;
+/// Shared Metal storage retains the established narrow path and materializes
+/// wider rows because its columns already share one contiguous allocation.
+const GATHER_OWNED_MAX_WIDTH: usize = 136;
+
+/// Finish the fully synchronous 16-leaf subtree once its leaf hashes have
+/// already been produced. The writes exactly mirror `fill_subtree_flat`'s
+/// 16-leaf layout.
+fn finish_subtree_16<F: RichField, H: Hasher<F>>(
+    digests_buf: &mut [MaybeUninit<H::Hash>],
+    h: [H::Hash; 16],
+) -> H::Hash {
+    debug_assert_eq!(digests_buf.len(), 30);
+    let (left_digests_buf, right_digests_buf) = digests_buf.split_at_mut(15);
+    let (left_digest_mem, left_digests_buf) = left_digests_buf.split_last_mut().unwrap();
+    let (right_digest_mem, right_digests_buf) = right_digests_buf.split_first_mut().unwrap();
+
+    let n_a = H::two_to_one_quad([(h[0], h[1]), (h[2], h[3]), (h[4], h[5]), (h[6], h[7])]);
+    let n_b =
+        H::two_to_one_quad([(h[8], h[9]), (h[10], h[11]), (h[12], h[13]), (h[14], h[15])]);
+    let m = H::two_to_one_quad([
+        (n_a[0], n_a[1]),
+        (n_a[2], n_a[3]),
+        (n_b[0], n_b[1]),
+        (n_b[2], n_b[3]),
+    ]);
+    let (left_digest, right_digest) = H::two_to_one_pair(m[0], m[1], m[2], m[3]);
+
+    for half in 0..2 {
+        let buf: &mut [MaybeUninit<H::Hash>] = if half == 0 {
+            &mut *left_digests_buf
+        } else {
+            &mut *right_digests_buf
+        };
+        let h = &h[8 * half..8 * (half + 1)];
+        let n = if half == 0 { &n_a } else { &n_b };
+        let m = &m[2 * half..2 * (half + 1)];
+        buf[0].write(h[0]);
+        buf[1].write(h[1]);
+        buf[2].write(n[0]);
+        buf[3].write(n[1]);
+        buf[4].write(h[2]);
+        buf[5].write(h[3]);
+        buf[6].write(m[0]);
+        buf[7].write(m[1]);
+        buf[8].write(h[4]);
+        buf[9].write(h[5]);
+        buf[10].write(n[2]);
+        buf[11].write(n[3]);
+        buf[12].write(h[6]);
+        buf[13].write(h[7]);
+    }
+    left_digest_mem.write(left_digest);
+    right_digest_mem.write(right_digest);
+    H::two_to_one(left_digest, right_digest)
+}
+
 /// [`fill_subtree_flat`] over natural-order columns instead of a materialized
 /// bit-reversed row-major matrix: leaf `i` of the tree is
 /// `columns[j][reverse_bits(i, log_rows)]` for each column `j`.
@@ -613,6 +671,98 @@ pub(crate) fn fill_subtree_gather<F: RichField, H: Hasher<F>>(
     H::two_to_one(left_digest, right_digest)
 }
 
+/// Wide-`Owned` variant of [`fill_subtree_gather`]. Its recursive digest
+/// layout is identical, but the 16-leaf base case loops over source columns
+/// first. Owned columns are independent allocations, so this keeps one source
+/// page active for all 16 gathers instead of cycling through up to 136 pages
+/// once per leaf. Destination writes remain inside one 17 KiB stack tile.
+fn fill_subtree_gather_wide_owned<F: RichField, H: Hasher<F>>(
+    digests_buf: &mut [MaybeUninit<H::Hash>],
+    columns: &[&[F]],
+    log_rows: usize,
+    start_leaf: usize,
+    num_leaves: usize,
+) -> H::Hash {
+    debug_assert_eq!(num_leaves, digests_buf.len() / 2 + 1);
+    let width = columns.len();
+    debug_assert!(width > GATHER_MAX_WIDTH && width <= GATHER_OWNED_MAX_WIDTH);
+
+    if num_leaves <= GATHER_TILE_LEAVES {
+        let mut natural_indices = [0usize; GATHER_TILE_LEAVES];
+        for (leaf, natural) in natural_indices[..num_leaves].iter_mut().enumerate() {
+            *natural = crate::util::reverse_bits(start_leaf + leaf, log_rows);
+        }
+        if num_leaves == GATHER_TILE_LEAVES {
+            let h = H::hash_or_noop_16_columns(columns, &natural_indices);
+            return finish_subtree_16::<F, H>(digests_buf, h);
+        }
+
+        let mut tile: [MaybeUninit<F>; GATHER_TILE_LEAVES * GATHER_OWNED_MAX_WIDTH] =
+            unsafe { MaybeUninit::uninit().assume_init() };
+        for (column_index, column) in columns.iter().enumerate() {
+            for (leaf, &natural) in natural_indices[..num_leaves].iter().enumerate() {
+                // SAFETY: reverse_bits maps the in-tree leaf index back into
+                // this column, and every destination pair is unique.
+                tile[leaf * width + column_index]
+                    .write(unsafe { *column.get_unchecked(natural) });
+            }
+        }
+        // SAFETY: the nested loop initialized the full row-major prefix.
+        let leaves: &[F] =
+            unsafe { slice::from_raw_parts(tile.as_ptr().cast::<F>(), num_leaves * width) };
+        return fill_subtree_flat::<F, H>(digests_buf, leaves, width, num_leaves);
+    }
+
+    let (left_digests_buf, right_digests_buf) = digests_buf.split_at_mut(digests_buf.len() / 2);
+    let (left_digest_mem, left_digests_buf) = left_digests_buf.split_last_mut().unwrap();
+    let (right_digest_mem, right_digests_buf) = right_digests_buf.split_first_mut().unwrap();
+    let half = num_leaves / 2;
+
+    let (left_digest, right_digest) = if num_leaves > 64 {
+        plonky2_maybe_rayon::join(
+            || {
+                fill_subtree_gather_wide_owned::<F, H>(
+                    left_digests_buf,
+                    columns,
+                    log_rows,
+                    start_leaf,
+                    half,
+                )
+            },
+            || {
+                fill_subtree_gather_wide_owned::<F, H>(
+                    right_digests_buf,
+                    columns,
+                    log_rows,
+                    start_leaf + half,
+                    half,
+                )
+            },
+        )
+    } else {
+        (
+            fill_subtree_gather_wide_owned::<F, H>(
+                left_digests_buf,
+                columns,
+                log_rows,
+                start_leaf,
+                half,
+            ),
+            fill_subtree_gather_wide_owned::<F, H>(
+                right_digests_buf,
+                columns,
+                log_rows,
+                start_leaf + half,
+                half,
+            ),
+        )
+    };
+
+    left_digest_mem.write(left_digest);
+    right_digest_mem.write(right_digest);
+    H::two_to_one(left_digest, right_digest)
+}
+
 /// [`fill_digests_buf_flat`] driven from natural-order columns. The subtree
 /// partition is identical; only the leaf source differs.
 pub(crate) fn fill_digests_buf_gather<F: RichField, H: Hasher<F>>(
@@ -653,6 +803,52 @@ pub(crate) fn fill_digests_buf_gather<F: RichField, H: Hasher<F>>(
     digests_chunks.zip(cap_buf).enumerate().for_each(
         |(subtree_index, (subtree_digests, subtree_cap))| {
             subtree_cap.write(fill_subtree_gather::<F, H>(
+                subtree_digests,
+                columns,
+                log_rows,
+                subtree_index * subtree_leaves_len,
+                subtree_leaves_len,
+            ));
+        },
+    );
+}
+
+fn fill_digests_buf_gather_wide_owned<F: RichField, H: Hasher<F>>(
+    digests_buf: &mut [MaybeUninit<H::Hash>],
+    cap_buf: &mut [MaybeUninit<H::Hash>],
+    columns: &[&[F]],
+    log_rows: usize,
+    num_leaves: usize,
+    cap_height: usize,
+) {
+    let width = columns.len();
+    debug_assert!(width > GATHER_MAX_WIDTH && width <= GATHER_OWNED_MAX_WIDTH);
+    if digests_buf.is_empty() {
+        debug_assert_eq!(cap_buf.len(), num_leaves);
+        cap_buf
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(leaf, cap_buf)| {
+                let mut tile: [MaybeUninit<F>; GATHER_OWNED_MAX_WIDTH] =
+                    unsafe { MaybeUninit::uninit().assume_init() };
+                let natural = crate::util::reverse_bits(leaf, log_rows);
+                for (slot, column) in tile[..width].iter_mut().zip(columns) {
+                    slot.write(unsafe { *column.get_unchecked(natural) });
+                }
+                let leaf: &[F] =
+                    unsafe { slice::from_raw_parts(tile.as_ptr().cast::<F>(), width) };
+                cap_buf.write(H::hash_or_noop(leaf));
+            });
+        return;
+    }
+
+    let subtree_digests_len = digests_buf.len() >> cap_height;
+    let subtree_leaves_len = num_leaves >> cap_height;
+    let digests_chunks = digests_buf.par_chunks_exact_mut(subtree_digests_len);
+    assert_eq!(digests_chunks.len(), cap_buf.len());
+    digests_chunks.zip(cap_buf).enumerate().for_each(
+        |(subtree_index, (subtree_digests, subtree_cap))| {
+            subtree_cap.write(fill_subtree_gather_wide_owned::<F, H>(
                 subtree_digests,
                 columns,
                 log_rows,
@@ -840,6 +1036,30 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             };
         }
 
+        if num_columns <= GATHER_OWNED_MAX_WIDTH {
+            match &columns {
+                ColumnStore::Owned(owned) => {
+                    let borrowed: Vec<&[F]> =
+                        owned.iter().map(|column| column.as_slice()).collect();
+                    let (digests, cap) = Self::cpu_digests_gather_wide_owned(
+                        &borrowed,
+                        log_rows,
+                        num_leaves,
+                        cap_height,
+                    );
+                    return Self {
+                        leaves: MerkleLeaves::Columns { columns, log_rows },
+                        num_leaves,
+                        digests,
+                        level_digests: None,
+                        cap: MerkleCap(cap),
+                    };
+                }
+                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                ColumnStore::Shared(_) => {}
+            }
+        }
+
         let flat = match &columns {
             ColumnStore::Owned(owned) => crate::util::transpose_to_bitrev_flat(owned),
             #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -914,6 +1134,38 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             // SAFETY: as in `cpu_digests` — `fill_digests_buf_gather` writes
             // every one of the `num_digests` digest slots and every one of the
             // `len_cap` cap slots before returning.
+            digests.set_len(num_digests);
+            cap.set_len(len_cap);
+        }
+        (digests, cap)
+    }
+
+    fn cpu_digests_gather_wide_owned(
+        columns: &[&[F]],
+        log_rows: usize,
+        num_leaves: usize,
+        cap_height: usize,
+    ) -> (Vec<H::Hash>, Vec<H::Hash>) {
+        let num_digests = 2 * (num_leaves - (1 << cap_height));
+        let mut digests = Vec::with_capacity(num_digests);
+
+        let len_cap = 1 << cap_height;
+        let mut cap = Vec::with_capacity(len_cap);
+
+        let digests_buf = capacity_up_to_mut(&mut digests, num_digests);
+        let cap_buf = capacity_up_to_mut(&mut cap, len_cap);
+        fill_digests_buf_gather_wide_owned::<F, H>(
+            digests_buf,
+            cap_buf,
+            columns,
+            log_rows,
+            num_leaves,
+            cap_height,
+        );
+
+        unsafe {
+            // SAFETY: the wide gather writes every digest and cap slot before
+            // returning, exactly like the narrow gather above.
             digests.set_len(num_digests);
             cap.set_len(len_cap);
         }
@@ -1142,9 +1394,9 @@ pub(crate) mod tests {
 
         // Widths spanning the `hash_or_noop` no-op boundary (<= 4 elements),
         // one and two sponge chunks, a non-power width and the widest the
-        // gathering path accepts; leaf counts spanning the tile size, the
-        // rayon-join threshold and several levels above it; cap heights
-        // including the all-cap degenerate tree.
+        // narrow and wide-Owned gathering paths accept; leaf counts spanning
+        // the tile size, rayon-join threshold and several levels above it; cap
+        // heights including the all-cap degenerate tree.
         for &(width, log_n, cap_height) in &[
             (1usize, 5usize, 0usize),
             (4, 5, 5),
@@ -1156,6 +1408,10 @@ pub(crate) mod tests {
             (20, 9, 2),
             (31, 7, 1),
             (32, 11, 4),
+            (33, 7, 2),
+            (40, 6, 6),
+            (65, 8, 4),
+            (136, 10, 4),
         ] {
             let n = 1usize << log_n;
             let columns: Vec<Vec<F>> = (0..width).map(|_| F::rand_vec(n)).collect();
@@ -1167,8 +1423,16 @@ pub(crate) mod tests {
                 MerkleTree::<F, H>::cpu_digests(&flat, width, n, cap_height);
 
             let borrowed: Vec<&[F]> = columns.iter().map(Vec::as_slice).collect();
-            let (got_digests, got_cap) =
-                MerkleTree::<F, H>::cpu_digests_gather(&borrowed, log_n, n, cap_height);
+            let (got_digests, got_cap) = if width <= GATHER_MAX_WIDTH {
+                MerkleTree::<F, H>::cpu_digests_gather(&borrowed, log_n, n, cap_height)
+            } else {
+                MerkleTree::<F, H>::cpu_digests_gather_wide_owned(
+                    &borrowed,
+                    log_n,
+                    n,
+                    cap_height,
+                )
+            };
 
             assert_eq!(
                 raw(&want_digests),
@@ -1193,6 +1457,7 @@ pub(crate) mod tests {
             }
         }
     }
+
 
     /// Builds the level-order digest representation directly from the leaves,
     /// bottom-up, matching the GPU buffer convention: level 0 holds the leaf
