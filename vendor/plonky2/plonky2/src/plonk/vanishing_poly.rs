@@ -18,7 +18,7 @@ use crate::hash::hash_types::RichField;
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::Target;
 use crate::plonk::circuit_builder::CircuitBuilder;
-use crate::plonk::circuit_data::CommonCircuitData;
+use crate::plonk::circuit_data::{CommonCircuitData, SelectorFilterCache};
 use crate::plonk::plonk_common;
 use crate::plonk::plonk_common::eval_l_0_circuit;
 use crate::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBaseBatch};
@@ -27,6 +27,12 @@ use crate::util::partial_products::{
 };
 use crate::util::reducing::ReducingFactorTarget;
 use crate::with_context;
+
+/// Test-only gate for a same-batch raw-limb differential between cached and
+/// live selector filters inside the quotient evaluator.
+#[cfg(test)]
+pub(crate) static COMPARE_SELECTOR_FILTER_CACHE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Get the polynomial associated to a lookup table with current challenges.
 pub(crate) fn get_lut_poly<F: RichField + Extendable<D>, const D: usize>(
@@ -547,6 +553,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     cpu_gate_indices: &[usize],
     cpu_num_gate_constraints: usize,
     interleave_pair: Option<&InterleavePairPlan>,
+    selector_filter_cache: Option<&SelectorFilterCache<F>>,
     permutation_products_offloaded: bool,
     permutation_gate_scales: &[F],
     z_h_on_coset: &ZeroPolyOnCoset<F>,
@@ -580,7 +587,38 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         &mut scratch.gate_filters,
         cpu_num_gate_constraints,
         interleave_pair,
+        selector_filter_cache.map(|cache| (cache, indices_batch)),
     );
+    #[cfg(test)]
+    if selector_filter_cache.is_some()
+        && COMPARE_SELECTOR_FILTER_CACHE.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        let mut live_constraints = Vec::new();
+        let mut live_filters = Vec::with_capacity(vars_batch.len());
+        evaluate_gate_constraints_base_batch_into_cpu_gates::<F, D>(
+            common_data,
+            vars_batch,
+            &mut live_constraints,
+            cpu_gate_indices,
+            &mut live_filters,
+            cpu_num_gate_constraints,
+            interleave_pair,
+            None,
+        );
+        assert_eq!(scratch.constraint_terms_batch.len(), live_constraints.len());
+        for (index, (&cached, &live)) in scratch
+            .constraint_terms_batch
+            .iter()
+            .zip(&live_constraints)
+            .enumerate()
+        {
+            assert_eq!(
+                cached.to_noncanonical_u64(),
+                live.to_noncanonical_u64(),
+                "selector-filter quotient differential at constraint cell {index}"
+            );
+        }
+    }
     let constraint_terms_batch = &scratch.constraint_terms_batch;
     // `<=`, not `==`: the buffer is sized by the widest gate still on the CPU,
     // which is at most `num_gate_constraints` and strictly less whenever a
@@ -1449,6 +1487,7 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
         &mut filters,
         num_constraint_rows,
         None,
+        None,
     );
 }
 
@@ -1463,40 +1502,71 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
     filters: &mut Vec<F>,
     num_constraint_rows: usize,
     interleave_pair: Option<&InterleavePairPlan>,
+    selector_filter_cache: Option<(&SelectorFilterCache<F>, &[usize])>,
 ) {
     debug_assert!(num_constraint_rows <= common_data.num_gate_constraints);
     constraints_batch.clear();
     constraints_batch.resize(num_constraint_rows * vars_batch.len(), F::ZERO);
+    let selector_filter_cache = selector_filter_cache.and_then(|(cache, indices)| {
+        SelectorFilterCache::<F>::contiguous_batch_start(indices)
+            .map(|start| (cache, start, indices.len()))
+    });
     for &i in cpu_gate_indices {
         if let Some(plan) = interleave_pair {
             if i == plan.interleave_index {
-                filters.clear();
-                filters.resize(3 * vars_batch.len(), F::ZERO);
-                let (interleave_filter, rest) = filters.split_at_mut(vars_batch.len());
-                let (uninterleave_filter, summed_filter) = rest.split_at_mut(vars_batch.len());
-                fill_interleave_gate_filter(
-                    common_data,
-                    vars_batch,
-                    plan.interleave_index,
-                    interleave_filter,
-                );
-                fill_interleave_gate_filter(
-                    common_data,
-                    vars_batch,
-                    plan.uninterleave_index,
-                    uninterleave_filter,
-                );
-                for point in 0..vars_batch.len() {
-                    summed_filter[point] = interleave_filter[point] + uninterleave_filter[point];
+                let cached_pair = selector_filter_cache.and_then(|(cache, start, len)| {
+                    Some((
+                        cache.gate_contiguous_batch(plan.interleave_index, start, len)?,
+                        cache.gate_contiguous_batch(plan.uninterleave_index, start, len)?,
+                    ))
+                });
+                if let Some((interleave_filter, uninterleave_filter)) = cached_pair {
+                    filters.clear();
+                    filters.extend(
+                        interleave_filter
+                            .iter()
+                            .zip(uninterleave_filter)
+                            .map(|(&interleave, &uninterleave)| interleave + uninterleave),
+                    );
+                    eval_interleave_pair_dense_fused(
+                        vars_batch.local_wires,
+                        vars_batch.len(),
+                        interleave_filter,
+                        uninterleave_filter,
+                        filters,
+                        constraints_batch,
+                    );
+                } else {
+                    filters.clear();
+                    filters.resize(3 * vars_batch.len(), F::ZERO);
+                    let (interleave_filter, rest) = filters.split_at_mut(vars_batch.len());
+                    let (uninterleave_filter, summed_filter) =
+                        rest.split_at_mut(vars_batch.len());
+                    fill_interleave_gate_filter(
+                        common_data,
+                        vars_batch,
+                        plan.interleave_index,
+                        interleave_filter,
+                    );
+                    fill_interleave_gate_filter(
+                        common_data,
+                        vars_batch,
+                        plan.uninterleave_index,
+                        uninterleave_filter,
+                    );
+                    for point in 0..vars_batch.len() {
+                        summed_filter[point] =
+                            interleave_filter[point] + uninterleave_filter[point];
+                    }
+                    eval_interleave_pair_dense_fused(
+                        vars_batch.local_wires,
+                        vars_batch.len(),
+                        interleave_filter,
+                        uninterleave_filter,
+                        summed_filter,
+                        constraints_batch,
+                    );
                 }
-                eval_interleave_pair_dense_fused(
-                    vars_batch.local_wires,
-                    vars_batch.len(),
-                    interleave_filter,
-                    uninterleave_filter,
-                    summed_filter,
-                    constraints_batch,
-                );
                 continue;
             }
             if i == plan.uninterleave_index {
@@ -1505,16 +1575,28 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
         }
         let gate = &common_data.gates[i];
         let selector_index = common_data.selectors_info.selector_indices[i];
-        gate.0.eval_filtered_base_batch(
-            vars_batch,
-            i,
-            selector_index,
-            common_data.selectors_info.groups[selector_index].clone(),
-            common_data.selectors_info.num_selectors(),
-            common_data.num_lookup_selectors,
-            filters,
-            constraints_batch,
-        );
+        let cached_filter = selector_filter_cache
+            .and_then(|(cache, start, len)| cache.gate_contiguous_batch(i, start, len));
+        if let Some(filter) = cached_filter {
+            gate.0.eval_filtered_base_batch_with_filter(
+                vars_batch,
+                common_data.selectors_info.num_selectors(),
+                common_data.num_lookup_selectors,
+                filter,
+                constraints_batch,
+            );
+        } else {
+            gate.0.eval_filtered_base_batch(
+                vars_batch,
+                i,
+                selector_index,
+                common_data.selectors_info.groups[selector_index].clone(),
+                common_data.selectors_info.num_selectors(),
+                common_data.num_lookup_selectors,
+                filters,
+                constraints_batch,
+            );
+        }
     }
 }
 

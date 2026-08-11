@@ -966,6 +966,9 @@ pub trait Read {
             constants_sigmas_quotient_cache: None,
             constants_sigmas_quotient_step: 0,
             constants_sigmas_quotient_domain: 0,
+            // Runtime-only and opt-in; deserialization retains the live
+            // selector-filter path until the owning runtime enables it.
+            selector_filter_cache: None,
         })
     }
 
@@ -1934,6 +1937,8 @@ pub trait Write {
             constants_sigmas_quotient_cache: _,
             constants_sigmas_quotient_step: _,
             constants_sigmas_quotient_domain: _,
+            // Runtime-only: contributes no bytes.
+            selector_filter_cache: _,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
@@ -2415,8 +2420,15 @@ mod tests {
     /// the decoded data still proves and verifies.
     #[test]
     fn prover_only_data_round_trip_preserves_rep_map_and_watch_counts() -> Result<()> {
-        let (circuit, x, y) = small_circuit();
+        let (mut circuit, x, y) = small_circuit();
         let generator_serializer = DefaultGeneratorSerializer::<C, D>::default();
+
+        assert!(
+            circuit
+                .prover_only
+                .try_cache_quotient_selector_filters(&circuit.common, 64 << 20)
+        );
+        assert!(circuit.prover_only.selector_filter_cache_bytes() > 0);
 
         let bytes = circuit
             .prover_only
@@ -2433,6 +2445,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(bytes, re_encoded, "serialized bytes are not stable");
+        assert_eq!(
+            decoded.selector_filter_cache_bytes(),
+            0,
+            "runtime selector filters must not enter the serialized format"
+        );
         assert_eq!(
             decoded.representative_map,
             circuit.prover_only.representative_map

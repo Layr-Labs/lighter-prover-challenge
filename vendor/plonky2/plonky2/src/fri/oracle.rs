@@ -514,18 +514,31 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         col_range: core::ops::Range<usize>,
         q_domain: usize,
     ) -> Option<Vec<F>> {
-        let w = col_range.len();
+        let w = col_range.end.checked_sub(col_range.start)?;
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
+                if step == 0
+                    || q_domain == 0
+                    || col_range.end > columns.num_cols()
+                    || q_domain
+                        .checked_sub(1)?
+                        .checked_mul(step)?
+                        .checked_add(1)?
+                        > columns.num_rows()
+                {
+                    return None;
+                }
+                let len = w.checked_mul(q_domain)?;
                 if step == 1 {
                     // Contiguous: column[i * 1] == column[i] for i in 0..q_domain,
                     // so memcpy of the prefix is bit-identical to the strided map.
-                    let mut out = Vec::with_capacity(w * q_domain);
+                    let mut out = Vec::new();
+                    out.try_reserve_exact(len).ok()?;
                     // SAFETY: every of the `w * q_domain` slots is overwritten by
                     // `copy_from_slice` below before any is read. `F` is a plain
                     // field wrapper (any bit pattern is a valid `F`).
                     unsafe {
-                        out.set_len(w * q_domain);
+                        out.set_len(len);
                     }
                     let col_start = col_range.start;
                     out.par_chunks_mut(q_domain)
@@ -535,7 +548,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         });
                     Some(out)
                 } else {
-                    let mut out = Vec::with_capacity(w * q_domain);
+                    let mut out = Vec::new();
+                    out.try_reserve_exact(len).ok()?;
                     for c in col_range {
                         let column = columns.col(c);
                         out.extend((0..q_domain).map(|i| column[i * step]));

@@ -1,4 +1,4 @@
-// Redraw marker 701-claude-fable-r2
+// Redraw marker 621-codex-selector-filter-cache
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
@@ -25,6 +25,24 @@ pub const ON_CHAIN_OPERATIONS_LIMIT: usize = 1;
 pub const PUBLIC_HEAVY_TX_COUNT: usize = 10;
 pub const PUBLIC_LIGHT_TX_COUNT: usize = 490;
 pub const PROVER_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
+/// Hard steady-cache allocation guard for the only full selector-filter cache
+/// enabled by the benchmark. The LIGHT chain cache is expected to be well
+/// below this cap; any future shape growth simply retains live computation.
+const LIGHT_CHAIN_SELECTOR_FILTER_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+pub(crate) fn enable_light_chain_selector_filter_cache(data: &mut CircuitData<F, C, D>) {
+    if data.prover_only.try_cache_quotient_selector_filters(
+        &data.common,
+        LIGHT_CHAIN_SELECTOR_FILTER_CACHE_MAX_BYTES,
+    ) {
+        log::info!(
+            "LIGHT chain selector-filter cache enabled: {} bytes",
+            data.prover_only.selector_filter_cache_bytes(),
+        );
+    } else {
+        log::info!("LIGHT chain selector-filter cache unavailable; using live computation");
+    }
+}
 
 pub struct Circuits {
     pub heavy_tx_target: BlockTxTarget,
@@ -83,7 +101,10 @@ impl PathCircuits {
         let chain =
             BlockTxChainCircuit::define(CIRCUIT_CONFIG, &tx_data, ON_CHAIN_OPERATIONS_LIMIT);
         let chain_target = chain.target;
-        let chain_data = chain.builder.build::<C>();
+        let mut chain_data = chain.builder.build::<C>();
+        if tx_mode == TX_LIGHT {
+            enable_light_chain_selector_filter_cache(&mut chain_data);
+        }
 
         let proof_bytes: &[u8] = match tx_mode {
             TX_HEAVY => include_bytes!("../dummy-heavy-chain-proof.bin"),
@@ -170,6 +191,9 @@ impl Circuits {
     pub fn release_finished_circuit_extensions(&mut self) {
         self.pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
         self.pre_data.prover_only.constants_sigmas_quotient_cache = None;
+        self.pre_data
+            .prover_only
+            .clear_quotient_selector_filter_cache();
         for lock in [
             &mut self.light_tx_data,
             &mut self.light_chain_data,
@@ -184,6 +208,7 @@ impl Circuits {
             // as the commitment above, so wherever that is dead this is too.
             // Clearing it is idempotent for a path that already released its own.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            data.prover_only.clear_quotient_selector_filter_cache();
         }
     }
 
@@ -220,6 +245,7 @@ impl Circuits {
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            data.prover_only.clear_quotient_selector_filter_cache();
         }
     }
 
@@ -244,6 +270,7 @@ impl Circuits {
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            data.prover_only.clear_quotient_selector_filter_cache();
         }
     }
 

@@ -1479,6 +1479,9 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             constants_sigmas_quotient_cache,
             constants_sigmas_quotient_step,
             constants_sigmas_quotient_domain,
+            // Opt-in runtime cache. The benchmark enables it only for the
+            // repeatedly proven LIGHT chain after construction/loading.
+            selector_filter_cache: None,
         };
 
         let verifier_only = VerifierOnlyCircuitData::<C, D> {

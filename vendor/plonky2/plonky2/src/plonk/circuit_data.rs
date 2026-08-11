@@ -32,7 +32,7 @@ use crate::fri::structure::{
     FriPolynomialInfo,
 };
 use crate::fri::{FriConfig, FriParams};
-use crate::gates::gate::GateRef;
+use crate::gates::gate::{fill_selector_filter_base_batch, GateRef};
 use crate::gates::lookup::Lookup;
 use crate::gates::lookup_table::LookupTable;
 use crate::gates::selectors::SelectorsInfo;
@@ -52,6 +52,7 @@ use crate::util::serialization::{
     Buffer, GateSerializer, IoResult, Read, WitnessGeneratorSerializer, Write,
 };
 use crate::util::timing::TimingTree;
+use crate::util::log2_ceil;
 
 /// Configuration to be used when building a circuit. This defines the shape of the circuit
 /// as well as its targeted security level and sub-protocol (e.g. FRI) parameters.
@@ -563,6 +564,53 @@ impl GeneratorWatchIndex {
 
 /// Circuit data required by the prover, but not the verifier.
 #[derive(Eq, PartialEq, Debug)]
+pub struct SelectorFilterCache<F> {
+    /// Gate-major quotient-domain filter values. Gate `g` owns
+    /// `values[g * quotient_domain..(g + 1) * quotient_domain]`.
+    pub(crate) values: Vec<F>,
+    pub(crate) step: usize,
+    pub(crate) quotient_domain: usize,
+    pub(crate) num_gates: usize,
+}
+
+impl<F> SelectorFilterCache<F> {
+    pub(crate) fn bytes(&self) -> usize {
+        self.values.len().saturating_mul(core::mem::size_of::<F>())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gate_batch(&self, gate: usize, indices: &[usize]) -> Option<&[F]> {
+        let start = Self::contiguous_batch_start(indices)?;
+        self.gate_contiguous_batch(gate, start, indices.len())
+    }
+
+    pub(crate) fn contiguous_batch_start(indices: &[usize]) -> Option<usize> {
+        let &start = indices.first()?;
+        indices
+            .iter()
+            .enumerate()
+            .all(|(offset, &index)| start.checked_add(offset) == Some(index))
+            .then_some(start)
+    }
+
+    pub(crate) fn gate_contiguous_batch(
+        &self,
+        gate: usize,
+        start: usize,
+        len: usize,
+    ) -> Option<&[F]> {
+        let gate_start = gate.checked_mul(self.quotient_domain)?;
+        let range_start = gate_start.checked_add(start)?;
+        let range_end = range_start.checked_add(len)?;
+        let gate_end = gate_start.checked_add(self.quotient_domain)?;
+        (gate < self.num_gates && range_end <= gate_end)
+            .then(|| self.values.get(range_start..range_end))
+            .flatten()
+    }
+}
+
+/// Circuit data required by the prover, but not the verifier.
+#[derive(Eq, PartialEq, Debug)]
 pub struct ProverOnlyCircuitData<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -629,11 +677,163 @@ pub struct ProverOnlyCircuitData<
     pub constants_sigmas_quotient_step: usize,
     /// Quotient domain size used to extract [`Self::constants_sigmas_quotient_cache`].
     pub constants_sigmas_quotient_domain: usize,
+    /// Full selector-filter values on the quotient domain, enabled explicitly
+    /// only for circuits that are proven repeatedly enough to repay the
+    /// storage (the benchmark's LIGHT chain). Runtime-only and never
+    /// serialized; a missing or structurally mismatched cache falls back to
+    /// the ordinary live filter computation.
+    #[doc(hidden)]
+    pub selector_filter_cache: Option<SelectorFilterCache<F>>,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ProverOnlyCircuitData<F, C, D>
 {
+    /// Attempts to build a runtime-only quotient selector-filter cache.
+    /// Allocation, layout, arithmetic-overflow, and metadata failures all
+    /// leave the cache disabled so proving retains the live computation.
+    pub fn try_cache_quotient_selector_filters(
+        &mut self,
+        common_data: &CommonCircuitData<F, D>,
+        max_bytes: usize,
+    ) -> bool {
+        self.selector_filter_cache = None;
+
+        let num_gates = common_data.gates.len();
+        let num_selectors = common_data.selectors_info.num_selectors();
+        if num_gates == 0
+            || num_selectors == 0
+            || common_data.selectors_info.selector_indices.len() != num_gates
+            || common_data.selectors_info.groups.len() != num_selectors
+            || common_data.constants_range().len() < num_selectors
+        {
+            return false;
+        }
+        for gate in 0..num_gates {
+            let Some(&selector) = common_data.selectors_info.selector_indices.get(gate) else {
+                return false;
+            };
+            if selector >= num_selectors
+                || !common_data.selectors_info.groups[selector].contains(&gate)
+            {
+                return false;
+            }
+        }
+
+        let quotient_degree_bits = log2_ceil(common_data.quotient_degree_factor);
+        let Some(step_bits) = common_data
+            .config
+            .fri_config
+            .rate_bits
+            .checked_sub(quotient_degree_bits)
+        else {
+            return false;
+        };
+        let Some(step) = 1usize.checked_shl(step_bits as u32) else {
+            return false;
+        };
+        let Some(domain_bits) = common_data.degree_bits().checked_add(quotient_degree_bits) else {
+            return false;
+        };
+        let Some(quotient_domain) = 1usize.checked_shl(domain_bits as u32) else {
+            return false;
+        };
+        let Some(value_count) = num_gates.checked_mul(quotient_domain) else {
+            return false;
+        };
+        let Some(bytes) = value_count.checked_mul(core::mem::size_of::<F>()) else {
+            return false;
+        };
+        if bytes > max_bytes {
+            return false;
+        }
+
+        let Some(selector_value_count) = num_selectors.checked_mul(quotient_domain) else {
+            return false;
+        };
+        let Some(selector_columns) = self.constants_sigmas_commitment.extract_lde_batch_columns(
+            step,
+            0..num_selectors,
+            quotient_domain,
+        ) else {
+            return false;
+        };
+        if selector_columns.len() != selector_value_count {
+            return false;
+        }
+
+        let mut values = Vec::new();
+        if values.try_reserve_exact(value_count).is_err() {
+            return false;
+        }
+        let mut filter = Vec::new();
+        if filter.try_reserve_exact(quotient_domain).is_err() {
+            return false;
+        }
+        let many_selectors = num_selectors > 1;
+        for gate in 0..num_gates {
+            let selector = common_data.selectors_info.selector_indices[gate];
+            let selector_col = &selector_columns
+                [selector * quotient_domain..(selector + 1) * quotient_domain];
+            fill_selector_filter_base_batch(
+                gate,
+                common_data.selectors_info.groups[selector].clone(),
+                selector_col,
+                many_selectors,
+                &mut filter,
+            );
+            if filter.len() != quotient_domain {
+                return false;
+            }
+            values.extend_from_slice(&filter);
+        }
+        if values.len() != value_count {
+            return false;
+        }
+
+        self.selector_filter_cache = Some(SelectorFilterCache {
+            values,
+            step,
+            quotient_domain,
+            num_gates,
+        });
+        true
+    }
+
+    pub(crate) fn quotient_selector_filter_cache(
+        &self,
+        common_data: &CommonCircuitData<F, D>,
+        step: usize,
+        quotient_domain: usize,
+    ) -> Option<&SelectorFilterCache<F>> {
+        let cache = self.selector_filter_cache.as_ref()?;
+        let expected_len = common_data
+            .gates
+            .len()
+            .checked_mul(quotient_domain)?;
+        (cache.step == step
+            && cache.quotient_domain == quotient_domain
+            && cache.num_gates == common_data.gates.len()
+            && cache.values.len() == expected_len)
+            .then_some(cache)
+    }
+
+    pub fn selector_filter_cache_bytes(&self) -> usize {
+        self.selector_filter_cache
+            .as_ref()
+            .map_or(0, SelectorFilterCache::bytes)
+    }
+
+    pub fn selector_filter_cache_shape(&self) -> Option<(usize, usize, usize)> {
+        self.selector_filter_cache
+            .as_ref()
+            .map(|cache| (cache.num_gates, cache.quotient_domain, cache.step))
+    }
+
+    pub fn clear_quotient_selector_filter_cache(&mut self) {
+        self.selector_filter_cache = None;
+    }
+
     pub fn to_bytes(
         &self,
         generator_serializer: &dyn WitnessGeneratorSerializer<F, D>,

@@ -1857,6 +1857,14 @@ fn compute_quotient_polys<
     );
     let lde_size = points.len();
     debug_assert_eq!(shifted_points.len(), lde_size);
+    // Runtime cache is opt-in (the benchmark enables only LIGHT chain). A
+    // stale or mismatched entry is ignored and every batch retains the live
+    // filter computation as its correctness fallback.
+    let selector_filter_cache = prover_data.quotient_selector_filter_cache(
+        common_data,
+        step,
+        lde_size,
+    );
     // `points` is the two-adic subgroup of size `1 << (degree_bits +
     // quotient_degree_bits)`, so `lde_size` is a power of two — but it is a
     // runtime value, so `% lde_size` in the per-point wrap below compiled to a
@@ -2326,6 +2334,7 @@ fn compute_quotient_polys<
                     &cpu_gate_indices,
                     cpu_num_gate_constraints,
                     interleave_pair.as_ref(),
+                    selector_filter_cache,
                     permutation_products_offloaded,
                     &permutation_gate_scales,
                     &z_h_on_coset,
@@ -2662,7 +2671,8 @@ mod quotient_layout_tests {
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::{Field, Field64};
+    use crate::field::types::{Field, Field64, PrimeField64};
+    use crate::gates::gate::fill_selector_filter_base_batch;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::gate::U32QuotientGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2673,6 +2683,7 @@ mod quotient_layout_tests {
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
+    use crate::plonk::vanishing_poly::COMPARE_SELECTOR_FILTER_CACHE;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::plonk::config::Poseidon2GoldilocksConfig;
 
@@ -2727,6 +2738,90 @@ mod quotient_layout_tests {
         COMPARE_QUOTIENT_LAYOUTS.store(false, Ordering::SeqCst);
 
         data.verify(proof?)?;
+        Ok(())
+    }
+
+    /// The persistent gate-major cache must be raw-u64 identical to the live
+    /// batch algorithm for every gate, full batch, and short final batch.
+    #[test]
+    fn selector_filter_cache_matches_live_raw_words() {
+        let (mut data, _) = small_circuit();
+        assert!(
+            data.prover_only
+                .try_cache_quotient_selector_filters(&data.common, 64 << 20)
+        );
+        let cache = data.prover_only.selector_filter_cache.as_ref().unwrap();
+        let num_selectors = data.common.selectors_info.num_selectors();
+
+        for batch_size in [1usize, 3, 8, 32] {
+            let last_start = cache.quotient_domain.saturating_sub(batch_size / 2 + 1);
+            for start in [0usize, batch_size.min(cache.quotient_domain), last_start] {
+                let n = batch_size.min(cache.quotient_domain - start);
+                if n == 0 {
+                    continue;
+                }
+                let indices = (start..start + n).collect::<Vec<_>>();
+                let mut selector_columns = Vec::new();
+                data.prover_only.constants_sigmas_commitment.fill_lde_batch(
+                    &indices,
+                    cache.step,
+                    0..num_selectors,
+                    BatchLayout::PolyMajor,
+                    &mut selector_columns,
+                );
+                for gate in 0..data.common.gates.len() {
+                    let selector = data.common.selectors_info.selector_indices[gate];
+                    let mut live = Vec::new();
+                    fill_selector_filter_base_batch(
+                        gate,
+                        data.common.selectors_info.groups[selector].clone(),
+                        &selector_columns[selector * n..(selector + 1) * n],
+                        num_selectors > 1,
+                        &mut live,
+                    );
+                    let cached = cache.gate_batch(gate, &indices).unwrap();
+                    assert_eq!(cached.len(), live.len());
+                    for (point, (&cached, &live)) in cached.iter().zip(&live).enumerate() {
+                        assert_eq!(
+                            cached.to_noncanonical_u64(),
+                            live.to_noncanonical_u64(),
+                            "gate={gate} batch={batch_size} start={start} point={point}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // An intentionally impossible cap is a non-panicking allocation/
+        // policy fallback and clears the prior entry.
+        assert!(!data
+            .prover_only
+            .try_cache_quotient_selector_filters(&data.common, 0));
+        assert_eq!(data.prover_only.selector_filter_cache_bytes(), 0);
+    }
+
+    /// Same proof, witness, commitments, and challenges: evaluate every
+    /// quotient batch through both cached and live selector filters, compare
+    /// raw constraint cells in-process, and then verify the resulting proof.
+    #[test]
+    fn selector_filter_cached_quotient_matches_live_and_verifies() -> Result<()> {
+        let (mut data, pw) = small_circuit();
+        assert!(
+            data.prover_only
+                .try_cache_quotient_selector_filters(&data.common, 64 << 20)
+        );
+
+        struct ResetCompare;
+        impl Drop for ResetCompare {
+            fn drop(&mut self) {
+                COMPARE_SELECTOR_FILTER_CACHE.store(false, Ordering::SeqCst);
+            }
+        }
+        COMPARE_SELECTOR_FILTER_CACHE.store(true, Ordering::SeqCst);
+        let reset = ResetCompare;
+        let proof = data.prove(pw)?;
+        drop(reset);
+        data.verify(proof)?;
         Ok(())
     }
 
