@@ -109,7 +109,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
+    "b8174a28786ad7f1228b894e92577e1324ed666a2d1ec84a352bf64d8d2ee430";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -2697,7 +2697,9 @@ impl MetalShared {
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            // Each thread evaluates the row pair (2 * gid, 2 * gid + 1); see
+            // `range_check_gate_quotient` in the shader.
+            dispatch(encoder, pipeline, quotient_rows.div_ceil(2));
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
