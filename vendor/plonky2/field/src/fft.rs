@@ -538,6 +538,49 @@ fn fft_classic_simd_single_layer_neon(
         let mut k = 0;
         while k + m <= values.len() {
             let mut j = 0;
+            // Keep two independent paired multiplies in flight. The scalar
+            // 64x64->128 reduction has a long dependency chain on AArch64;
+            // issuing the second pair before crossing either result into
+            // vector registers exposes instruction-level parallelism without
+            // changing any lane's arithmetic or memory order.
+            while j + 4 <= half {
+                let v01 = NeonGoldilocksField([
+                    *values.get_unchecked(k + half + j),
+                    *values.get_unchecked(k + half + j + 1),
+                ]);
+                let w01 = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j),
+                    *omega_row.get_unchecked(j + 1),
+                ]);
+                let v23 = NeonGoldilocksField([
+                    *values.get_unchecked(k + half + j + 2),
+                    *values.get_unchecked(k + half + j + 3),
+                ]);
+                let w23 = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j + 2),
+                    *omega_row.get_unchecked(j + 3),
+                ]);
+                let t01 = w01 * v01;
+                let t23 = w23 * v23;
+
+                let tv01 =
+                    vcombine_u64(vcreate_u64(t01.0[0].0), vcreate_u64(t01.0[1].0));
+                let tv23 =
+                    vcombine_u64(vcreate_u64(t23.0[0].0), vcreate_u64(t23.0[1].0));
+                let u01 = vld1q_u64(base.add(k + j));
+                let u23 = vld1q_u64(base.add(k + j + 2));
+                vst1q_u64(base.add(k + j), gl_add_neon(u01, tv01, eps));
+                vst1q_u64(
+                    base.add(k + half + j),
+                    gl_sub_neon(u01, tv01, eps),
+                );
+                vst1q_u64(base.add(k + j + 2), gl_add_neon(u23, tv23, eps));
+                vst1q_u64(
+                    base.add(k + half + j + 2),
+                    gl_sub_neon(u23, tv23, eps),
+                );
+                j += 4;
+            }
             while j + 2 <= half {
                 let v = NeonGoldilocksField([
                     *values.get_unchecked(k + half + j),
@@ -548,7 +591,6 @@ fn fft_classic_simd_single_layer_neon(
                     *omega_row.get_unchecked(j + 1),
                 ]);
                 let t = w * v;
-                // The only register-file crossing in the loop: two fmovs.
                 let tv = vcombine_u64(vcreate_u64(t.0[0].0), vcreate_u64(t.0[1].0));
                 let u = vld1q_u64(base.add(k + j));
                 vst1q_u64(base.add(k + j), gl_add_neon(u, tv, eps));
