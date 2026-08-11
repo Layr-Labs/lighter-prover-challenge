@@ -197,41 +197,22 @@ where
     let public_inputs = partition_witness.get_targets(&prover_data.public_inputs);
     let public_inputs_hash = C::InnerHasher::hash_no_pad(&public_inputs);
 
-    let mut witness = timed!(
+    let witness = timed!(
         timing,
         "compute full witness",
         partition_witness.full_witness()
     );
 
-    // Only the routed columns are read again after this point (the
-    // permutation argument covers wires `j < num_routed_wires`; nothing else
-    // consumes the matrix). Non-routed columns are moved out and IFFT'd in
-    // place; routed columns are IFFT'd from the borrowed witness column
-    // (`ifft_borrowed` fuses the former clone with the FFT's initial
-    // bit-reversal gather), so no witness column is copied.
-    let num_routed_wires = common_data.config.num_routed_wires;
-    let wires_coeffs: Vec<PolynomialCoeffs<F>> = timed!(
-        timing,
-        "compute wire polynomials (IFFT)",
-        witness
-            .wire_values
-            .par_iter_mut()
-            .enumerate()
-            .map(|(j, column)| {
-                if j < num_routed_wires {
-                    ifft_borrowed(column)
-                } else {
-                    PolynomialValues::new(core::mem::take(column)).ifft()
-                }
-            })
-            .collect()
-    );
-
+    let wire_value_columns: Vec<&[F]> = witness
+        .wire_values
+        .iter()
+        .map(Vec::as_slice)
+        .collect();
     let wires_commitment = timed!(
         timing,
         "compute wires commitment",
-        PolynomialBatch::<F, C, D>::from_coeffs(
-            wires_coeffs,
+        PolynomialBatch::<F, C, D>::from_value_slices(
+            &wire_value_columns,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::WIRES.blinding,
             config.fri_config.cap_height,

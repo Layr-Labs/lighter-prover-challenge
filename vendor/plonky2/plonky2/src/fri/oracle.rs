@@ -73,6 +73,65 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> D
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     PolynomialBatch<F, C, D>
 {
+    /// Builds a commitment from borrowed evaluation columns.
+    ///
+    /// The Metal values backend consumes the columns before returning the
+    /// coefficient columns it derives, so callers which still need their
+    /// original evaluation matrix can avoid cloning it on that default path.
+    /// Backends without that fused path retain the historical owned-values
+    /// behavior by materializing a copy only for the CPU fallback.
+    pub fn from_value_slices(
+        value_columns: &[&[F]],
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Self {
+        assert!(!value_columns.is_empty(), "commitment needs at least one value column");
+        let degree = value_columns[0].len();
+        assert!(
+            value_columns.iter().all(|column| column.len() == degree),
+            "Polynomial degrees inconsistent"
+        );
+
+        if GPU_NTT_COMMITMENTS && !blinding {
+            if let Some((columns, digests, cap, coeff_columns)) = timed!(
+                timing,
+                "build Merkle tree",
+                C::Hasher::try_build_commitment_from_values(
+                    value_columns,
+                    rate_bits,
+                    cap_height,
+                )
+            ) {
+                let merkle_tree = MerkleTree::from_prebuilt_columns(columns, digests, cap);
+                return Self {
+                    polynomials: coeff_columns
+                        .into_iter()
+                        .map(PolynomialCoeffs::new)
+                        .collect(),
+                    merkle_tree,
+                    degree_log: log2_strict(degree),
+                    rate_bits,
+                    blinding,
+                };
+            }
+        }
+
+        Self::from_values(
+            value_columns
+                .iter()
+                .map(|column| PolynomialValues::new((*column).to_vec()))
+                .collect(),
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+        )
+    }
+
     /// Creates a list polynomial commitment for the polynomials interpolating the values in `values`.
     pub fn from_values(
         values: Vec<PolynomialValues<F>>,
