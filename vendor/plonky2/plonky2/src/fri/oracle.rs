@@ -200,7 +200,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                     if rate_bits == 0 || degree < 2 {
                                         destination[degree..].fill(F::ZERO);
                                     }
-                                    fft_in_place_with_options(
+                                    fft_in_place_with_options_parallel(
                                         destination,
                                         Some(rate_bits),
                                         fft_root_table,
@@ -361,7 +361,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // For a nontrivial zero-padded FFT, the expansion path writes
                 // every tail element before reading it. This is the same
                 // invariant used by `lde_values` to avoid a dead tail memset.
-                fft_in_place_with_options(destination, Some(rate_bits), fft_root_table);
+                fft_in_place_with_options_parallel(destination, Some(rate_bits), fft_root_table);
             });
         true
     }
