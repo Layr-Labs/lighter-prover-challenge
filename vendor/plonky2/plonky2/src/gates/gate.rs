@@ -244,7 +244,7 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
     /// Constraint `j` for point `i` is at index `j * batch_size + i`.
     fn eval_filtered_base_batch(
         &self,
-        mut vars_batch: EvaluationVarsBaseBatch<F>,
+        vars_batch: EvaluationVarsBaseBatch<F>,
         row: usize,
         selector_index: usize,
         group_range: Range<usize>,
@@ -260,22 +260,36 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         // order, as the per-point `compute_filter` — identical field values
         // without the per-point strided views.
         let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
-        let mut factors = group_range
-            .filter(|&i| i != row)
-            .chain((num_selectors > 1).then_some(UNUSED_SELECTOR));
-        filters.clear();
-        if let Some(i) = factors.next() {
-            let k = F::from_canonical_usize(i);
-            filters.extend(selector_col.iter().map(|&s| k - s));
-        } else {
-            filters.resize(batch_size, F::ONE);
-        }
-        for i in factors {
-            let k = F::from_canonical_usize(i);
-            for (filter, &s) in filters.iter_mut().zip(selector_col) {
-                *filter *= k - s;
-            }
-        }
+        fill_selector_filter_base_batch(
+            row,
+            group_range,
+            selector_col,
+            num_selectors > 1,
+            filters,
+        );
+        self.eval_filtered_base_batch_with_filter(
+            vars_batch,
+            num_selectors,
+            num_lookup_selectors,
+            filters,
+            combined_gate_constraints,
+        );
+    }
+
+    /// Applies an already-computed selector filter to this gate's base-field
+    /// constraints. The caller must have produced `filters` with
+    /// [`fill_selector_filter_base_batch`] (or a raw-identical runtime cache).
+    /// This seam lets repeated proofs reuse circuit-fixed quotient-domain
+    /// filter values without changing constraint order or field operations.
+    fn eval_filtered_base_batch_with_filter(
+        &self,
+        mut vars_batch: EvaluationVarsBaseBatch<F>,
+        num_selectors: usize,
+        num_lookup_selectors: usize,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        debug_assert_eq!(filters.len(), vars_batch.len());
         vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
         self.eval_unfiltered_base_batch_accumulate(vars_batch, filters, combined_gate_constraints);
     }
@@ -463,6 +477,36 @@ fn compute_filter<K: Field>(row: usize, group_range: Range<usize>, s: K, many_se
         .chain(many_selector.then_some(UNUSED_SELECTOR))
         .map(|i| K::from_canonical_usize(i) - s)
         .product()
+}
+
+/// Fills one selector-filter column in exactly the scalar [`compute_filter`]
+/// factor order. Keeping the first factor as an assignment is intentional:
+/// Goldilocks arithmetic may retain non-canonical representatives, so an
+/// algebraically equivalent reassociation is not necessarily raw-limb equal.
+pub(crate) fn fill_selector_filter_base_batch<F: Field>(
+    row: usize,
+    group_range: Range<usize>,
+    selector_col: &[F],
+    many_selectors: bool,
+    output: &mut Vec<F>,
+) {
+    debug_assert!(group_range.contains(&row));
+    let mut factors = group_range
+        .filter(|&i| i != row)
+        .chain(many_selectors.then_some(UNUSED_SELECTOR));
+    output.clear();
+    if let Some(i) = factors.next() {
+        let k = F::from_canonical_usize(i);
+        output.extend(selector_col.iter().map(|&s| k - s));
+    } else {
+        output.resize(selector_col.len(), F::ONE);
+    }
+    for i in factors {
+        let k = F::from_canonical_usize(i);
+        for (filter, &s) in output.iter_mut().zip(selector_col) {
+            *filter *= k - s;
+        }
+    }
 }
 
 fn compute_filter_circuit<F: RichField + Extendable<D>, const D: usize>(

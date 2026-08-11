@@ -515,11 +515,18 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
 const GATHER_TILE_LEAVES: usize = 16;
 
 /// Widest leaf the gathering path keeps on the stack. The tile is
-/// `GATHER_TILE_LEAVES * GATHER_MAX_WIDTH` field elements (4 KiB at
+/// `GATHER_TILE_LEAVES * GATHER_MAX_WIDTH` field elements (17 KiB at
 /// `size_of::<F>() == 8`), and one tile is live per recursion frame, so the
-/// bound also bounds the recursion's stack growth. Wider leaves take the
-/// materializing path in [`MerkleTree::new_column_store`].
-const GATHER_MAX_WIDTH: usize = 32;
+/// bound also bounds the recursion's stack growth. This covers the ranked
+/// circuit's 82- and 136-column stores without making the stack allocation
+/// unbounded; wider leaves keep the materializing fallback in
+/// [`MerkleTree::new_column_store`].
+const GATHER_MAX_WIDTH: usize = 136;
+
+#[inline]
+fn use_cpu_column_gather(width: usize) -> bool {
+    width <= GATHER_MAX_WIDTH
+}
 
 /// [`fill_subtree_flat`] over natural-order columns instead of a materialized
 /// bit-reversed row-major matrix: leaf `i` of the tree is
@@ -826,7 +833,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         // same order, so every digest is bit-identical (asserted below by
         // `gathered_matches_materialized`).
         let num_columns = columns.num_cols();
-        if num_columns <= GATHER_MAX_WIDTH {
+        if use_cpu_column_gather(num_columns) {
             let (digests, cap) = {
                 let borrowed: Vec<&[F]> = (0..num_columns).map(|j| columns.col(j)).collect();
                 Self::cpu_digests_gather(&borrowed, log_rows, num_leaves, cap_height)
@@ -1051,7 +1058,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
 pub(crate) mod tests {
     use anyhow::Result;
 
-    use plonky2_field::types::{PrimeField64, Sample};
+    use plonky2_field::types::{Field, PrimeField64, Sample};
 
     use super::*;
     use crate::field::extension::Extendable;
@@ -1191,6 +1198,142 @@ pub(crate) mod tests {
                 let proof = tree.prove(i);
                 verify_merkle_proof_to_cap(tree.leaf_vec(i), i, &tree.cap, &proof).unwrap();
             }
+        }
+    }
+
+    /// The ranked circuit's real 82- and 136-column commitments must be raw
+    /// identical through the direct gather, flat materialization, classic row
+    /// tree, public column constructor, cap and queried authentication paths.
+    #[test]
+    fn ranked_gather_widths_match_flat_classic_and_paths_raw() {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        let raw_hashes = |digests: &[<H as Hasher<F>>::Hash]| -> Vec<u64> {
+            digests
+                .iter()
+                .flat_map(|hash| hash.elements.iter().map(|e| e.to_noncanonical_u64()))
+                .collect()
+        };
+        let raw_fields = |values: &[F]| -> Vec<u64> {
+            values.iter().map(|value| value.to_noncanonical_u64()).collect()
+        };
+
+        for &(width, log_n, cap_height) in &[(82usize, 7usize, 3usize), (136, 8, 4)] {
+            assert!(use_cpu_column_gather(width));
+            let n = 1usize << log_n;
+            let columns: Vec<Vec<F>> = (0..width)
+                .map(|column| {
+                    (0..n)
+                        .map(|row| F::from_canonical_u64((1 + row * width + column) as u64))
+                        .collect()
+                })
+                .collect();
+            let flat = crate::util::transpose_to_bitrev_flat(&columns);
+            let classic_rows: Vec<Vec<F>> = flat
+                .chunks_exact(width)
+                .map(|row| row.to_vec())
+                .collect();
+
+            let (flat_digests, flat_cap) =
+                MerkleTree::<F, H>::cpu_digests(&flat, width, n, cap_height);
+            let borrowed: Vec<&[F]> = columns.iter().map(Vec::as_slice).collect();
+            let (gathered_digests, gathered_cap) =
+                MerkleTree::<F, H>::cpu_digests_gather(&borrowed, log_n, n, cap_height);
+            assert_eq!(raw_hashes(&gathered_digests), raw_hashes(&flat_digests));
+            assert_eq!(raw_hashes(&gathered_cap), raw_hashes(&flat_cap));
+
+            let flat_tree = MerkleTree::<F, H>::new_flat(flat.clone(), width, cap_height);
+            let classic_tree = MerkleTree::<F, H>::new(classic_rows, cap_height);
+            let gathered_tree = MerkleTree::<F, H>::new_columns(columns, cap_height);
+            assert!(matches!(gathered_tree.leaves, MerkleLeaves::Columns { .. }));
+            assert!(gathered_tree.level_digests.is_none());
+            assert_eq!(raw_hashes(&gathered_tree.digests), raw_hashes(&flat_digests));
+            assert_eq!(raw_hashes(&gathered_tree.cap.0), raw_hashes(&flat_cap));
+            assert_eq!(raw_hashes(&gathered_tree.digests), raw_hashes(&flat_tree.digests));
+            assert_eq!(raw_hashes(&gathered_tree.cap.0), raw_hashes(&flat_tree.cap.0));
+            assert_eq!(raw_hashes(&gathered_tree.digests), raw_hashes(&classic_tree.digests));
+            assert_eq!(raw_hashes(&gathered_tree.cap.0), raw_hashes(&classic_tree.cap.0));
+
+            for &leaf_index in &[0, 1, n / 2 - 1, n / 2, n - 2, n - 1] {
+                let gathered_leaf = gathered_tree.leaf_vec(leaf_index);
+                assert_eq!(raw_fields(&gathered_leaf), raw_fields(flat_tree.get(leaf_index)));
+                assert_eq!(raw_fields(&gathered_leaf), raw_fields(classic_tree.get(leaf_index)));
+
+                let gathered_proof = gathered_tree.prove(leaf_index);
+                let flat_proof = flat_tree.prove(leaf_index);
+                let classic_proof = classic_tree.prove(leaf_index);
+                assert_eq!(
+                    raw_hashes(&gathered_proof.siblings),
+                    raw_hashes(&flat_proof.siblings)
+                );
+                assert_eq!(
+                    raw_hashes(&gathered_proof.siblings),
+                    raw_hashes(&classic_proof.siblings)
+                );
+                verify_merkle_proof_to_cap(
+                    gathered_leaf,
+                    leaf_index,
+                    &gathered_tree.cap,
+                    &gathered_proof,
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// Keep the old <=32 coverage, admit the new ranked widths, and leave an
+    /// explicit materializing fallback immediately above the bounded stack
+    /// tile. The fallback itself is checked against the classic row tree.
+    #[test]
+    fn gather_width_boundaries_preserve_materializing_fallback() {
+        assert!(use_cpu_column_gather(32));
+        assert!(use_cpu_column_gather(33));
+        assert!(use_cpu_column_gather(136));
+        assert!(!use_cpu_column_gather(137));
+
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        let width = GATHER_MAX_WIDTH + 1;
+        let log_n = 6;
+        let n = 1usize << log_n;
+        let cap_height = 2;
+        let columns: Vec<Vec<F>> = (0..width)
+            .map(|column| {
+                (0..n)
+                    .map(|row| F::from_canonical_u64((1 + row * width + column) as u64))
+                    .collect()
+            })
+            .collect();
+        let flat = crate::util::transpose_to_bitrev_flat(&columns);
+        let classic = MerkleTree::<F, H>::new_flat(flat, width, cap_height);
+        let fallback = MerkleTree::<F, H>::new_columns(columns, cap_height);
+
+        let raw = |digests: &[<H as Hasher<F>>::Hash]| -> Vec<u64> {
+            digests
+                .iter()
+                .flat_map(|hash| hash.elements.iter().map(|e| e.to_noncanonical_u64()))
+                .collect()
+        };
+        assert_eq!(raw(&fallback.digests), raw(&classic.digests));
+        assert_eq!(raw(&fallback.cap.0), raw(&classic.cap.0));
+        for &leaf_index in &[0, 1, n / 2, n - 1] {
+            assert_eq!(
+                raw(&fallback.prove(leaf_index).siblings),
+                raw(&classic.prove(leaf_index).siblings)
+            );
+            verify_merkle_proof_to_cap(
+                fallback.leaf_vec(leaf_index),
+                leaf_index,
+                &fallback.cap,
+                &fallback.prove(leaf_index),
+            )
+            .unwrap();
         }
     }
 

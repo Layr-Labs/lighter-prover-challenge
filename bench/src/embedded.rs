@@ -21,7 +21,7 @@ use circuit::embed::deserialize_embedded;
 use circuit::types::config::{C, D, F};
 use plonky2::plonk::circuit_data::CircuitData;
 
-use crate::api::{Circuits, Proof};
+use crate::api::{enable_light_chain_selector_filter_cache, Circuits, Proof};
 
 static PRE_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pre.embed"));
 static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx.embed"));
@@ -102,7 +102,12 @@ impl Circuits {
             || {
                 rayon::join(
                     || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
-                    || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
+                    || -> anyhow::Result<_> {
+                        let (target, mut data) =
+                            load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB)?;
+                        enable_light_chain_selector_filter_cache(&mut data);
+                        Ok((target, data))
+                    },
                 )
             },
         );
@@ -178,6 +183,65 @@ mod tests {
             .expect("test thread must start")
             .join()
             .expect("test thread must finish");
+    }
+
+    #[test]
+    fn selector_filter_cache_is_light_chain_only_and_bounded() {
+        on_big_stack(|| {
+            let mut remaining = Circuits::load_remaining_embedded()
+                .expect("embedded circuit set must load for cache-shape audit");
+            assert_eq!(
+                remaining.heavy_tx.1.prover_only.selector_filter_cache_bytes(),
+                0
+            );
+            assert_eq!(
+                remaining
+                    .heavy_chain
+                    .1
+                    .prover_only
+                    .selector_filter_cache_bytes(),
+                0
+            );
+            assert_eq!(
+                remaining.light_tx.1.prover_only.selector_filter_cache_bytes(),
+                0
+            );
+            let bytes = remaining
+                .light_chain
+                .1
+                .prover_only
+                .selector_filter_cache_bytes();
+            let shape = remaining
+                .light_chain
+                .1
+                .prover_only
+                .selector_filter_cache_shape()
+                .expect("LIGHT chain cache should fit the runtime cap");
+            println!(
+                "LIGHT chain selector-filter cache: gates={} quotient_domain={} step={} bytes={}",
+                shape.0, shape.1, shape.2, bytes
+            );
+            assert!(bytes > 0);
+            assert!(bytes <= 64 << 20);
+
+            remaining
+                .light_chain
+                .1
+                .prover_only
+                .clear_quotient_selector_filter_cache();
+            let started = std::time::Instant::now();
+            enable_light_chain_selector_filter_cache(&mut remaining.light_chain.1);
+            let elapsed = started.elapsed();
+            assert_eq!(
+                remaining
+                    .light_chain
+                    .1
+                    .prover_only
+                    .selector_filter_cache_bytes(),
+                bytes
+            );
+            println!("LIGHT chain selector-filter cache rebuild: {elapsed:?}");
+        });
     }
 
     fn generator_stream_bytes(data: &CircuitData<F, C, D>) -> Vec<u8> {

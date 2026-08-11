@@ -580,6 +580,9 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         constants_sigmas_quotient_cache,
         constants_sigmas_quotient_step,
         constants_sigmas_quotient_domain,
+        // Runtime-only and benchmark-owned; LIGHT chain enables it after the
+        // embedded circuit has been reconstructed and checked.
+        selector_filter_cache: None,
         generators,
         generator_indices_by_watches,
         generator_watch_counts,
