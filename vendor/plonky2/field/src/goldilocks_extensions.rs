@@ -391,6 +391,57 @@ pub fn ext2_base_scalar_dot_slots(
     }
 }
 
+/// Equal-length specialization of [`ext2_base_scalar_dot_slots`].
+///
+/// This is the dense production layout used by the large FRI opening batch.
+/// Its caller has already proved once, before slot-block partitioning, that
+/// every polynomial has the same length. Keeping that proof outside this
+/// function avoids rebuilding `full`/`partial` vectors and reclassifying the
+/// entire polynomial batch for every output block.
+///
+/// # Safety
+///
+/// - `polys.len()` must equal `powers.len()` and be less than `2^24`;
+/// - `start + out.len()` must not overflow;
+/// - every polynomial must cover the complete range
+///   `start..start + out.len()`.
+///
+/// The first two preconditions are asserted here. The final precondition is a
+/// debug assertion because checking it in release would reintroduce the
+/// per-block classification traversal this specialization removes.
+pub unsafe fn ext2_base_scalar_dot_slots_equal_len(
+    out: &mut [QuadraticExtension<GoldilocksField>],
+    start: usize,
+    polys: &[&[GoldilocksField]],
+    powers: &[QuadraticExtension<GoldilocksField>],
+) {
+    assert_eq!(polys.len(), powers.len());
+    assert!(polys.len() < 1 << 24);
+    let end = start
+        .checked_add(out.len())
+        .expect("slot range end must not overflow usize");
+    debug_assert!(polys.iter().all(|p| p.len() >= end));
+
+    for (i, o) in out.iter_mut().enumerate() {
+        let slot = start + i;
+        let (mut lo0, mut hi0) = (0u128, 0u32);
+        let (mut lo1, mut hi1) = (0u128, 0u32);
+        for (&p, &QuadraticExtension([b0, b1])) in polys.iter().zip(powers) {
+            // SAFETY: the caller guarantees that every polynomial covers the
+            // complete output range, and `slot < end` by construction.
+            let c = unsafe { p.get_unchecked(slot).0 };
+            u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+            u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+        }
+        // SAFETY: the same term-count assertion and accumulator bound as
+        // `ext2_base_scalar_dot_slots` apply to this equal-length layout.
+        *o = QuadraticExtension([
+            unsafe { reduce160(lo0, hi0) },
+            unsafe { reduce160(lo1, hi1) },
+        ]);
+    }
+}
+
 /*
  * Quadratic multiplication and squaring
  */

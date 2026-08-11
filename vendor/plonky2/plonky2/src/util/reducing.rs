@@ -7,7 +7,9 @@ use plonky2_maybe_rayon::*;
 
 use crate::field::extension::quadratic::QuadraticExtension;
 use crate::field::extension::{Extendable, FieldExtension};
-use crate::field::goldilocks_extensions::ext2_base_scalar_dot_slots;
+use crate::field::goldilocks_extensions::{
+    ext2_base_scalar_dot_slots, ext2_base_scalar_dot_slots_equal_len,
+};
 use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::packed::PackedField;
 use crate::field::polynomial::PolynomialCoeffs;
@@ -230,6 +232,65 @@ where
     BF: Extendable<D, Extension = F>,
     F: FieldExtension<D, BaseField = BF>,
 {
+    goldilocks_ext2_reduce_polys_base_impl(
+        polys,
+        base_powers,
+        max_len,
+        ext2_direct_slots_disabled(),
+        &NoopExt2SlotObserver,
+    )
+}
+
+const EXT2_DIRECT_SLOTS_DISABLE_ENV: &str = "LIGHTER_DISABLE_EXT2_DIRECT_SLOTS";
+
+#[cfg(feature = "std")]
+fn ext2_direct_slots_disable_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+/// Diagnostic same-binary control switch. Only the exact value `1` disables
+/// the candidate; a cleared worker environment and every other value keep the
+/// equal-length direct path active. Cache the process-level choice so no FRI
+/// reduction after the first one performs another environment lookup.
+#[cfg(feature = "std")]
+fn ext2_direct_slots_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        let value = std::env::var_os(EXT2_DIRECT_SLOTS_DISABLE_ENV);
+        ext2_direct_slots_disable_value(value.as_deref())
+    })
+}
+
+#[cfg(not(feature = "std"))]
+#[inline(always)]
+fn ext2_direct_slots_disabled() -> bool {
+    false
+}
+
+trait Ext2SlotObserver: Sync {
+    #[inline(always)]
+    fn direct_block(&self) {}
+
+    #[inline(always)]
+    fn classified_block(&self) {}
+}
+
+struct NoopExt2SlotObserver;
+
+impl Ext2SlotObserver for NoopExt2SlotObserver {}
+
+fn goldilocks_ext2_reduce_polys_base_impl<BF, F, const D: usize, O>(
+    polys: &[impl Borrow<PolynomialCoeffs<BF>> + Sync],
+    base_powers: &[F],
+    max_len: usize,
+    disable_direct_slots: bool,
+    observer: &O,
+) -> Option<Vec<F>>
+where
+    BF: Extendable<D, Extension = F>,
+    F: FieldExtension<D, BaseField = BF>,
+    O: Ext2SlotObserver,
+{
     if TypeId::of::<BF>() != TypeId::of::<GoldilocksField>()
         || TypeId::of::<F>() != TypeId::of::<QuadraticExtension<GoldilocksField>>()
     {
@@ -261,6 +322,13 @@ where
         )
     };
 
+    // The production opening batch has one common degree. Prove that layout
+    // once per reduction, rather than rebuilding `full`/`partial` vectors and
+    // traversing every polynomial again for each 2048-slot block. A ragged
+    // batch, or the exact diagnostic control value, follows the pre-existing
+    // classified kernel unchanged.
+    let use_direct_slots = !disable_direct_slots && slices.iter().all(|p| p.len() == max_len);
+
     let mut acc = vec![F::ZERO; max_len];
     // Same shape split as the generic path: small batches stay serial, large
     // batches partition the coefficient slots so each worker visits all
@@ -274,7 +342,15 @@ where
                 acc.len(),
             )
         };
-        ext2_base_scalar_dot_slots(out, 0, &slices, powers);
+        if use_direct_slots {
+            observer.direct_block();
+            // SAFETY: `use_direct_slots` proves every polynomial has length
+            // `max_len`, exactly the length of `out` in this serial branch.
+            unsafe { ext2_base_scalar_dot_slots_equal_len(out, 0, &slices, powers) };
+        } else {
+            observer.classified_block();
+            ext2_base_scalar_dot_slots(out, 0, &slices, powers);
+        }
     } else {
         acc.par_chunks_mut(SLOT_BLOCK)
             .enumerate()
@@ -286,7 +362,18 @@ where
                         out.len(),
                     )
                 };
-                ext2_base_scalar_dot_slots(out, start, &slices, powers);
+                if use_direct_slots {
+                    observer.direct_block();
+                    // SAFETY: `use_direct_slots` proves all polynomial lengths
+                    // equal `max_len`; every output chunk is a subrange of the
+                    // accumulator of that exact length.
+                    unsafe {
+                        ext2_base_scalar_dot_slots_equal_len(out, start, &slices, powers)
+                    };
+                } else {
+                    observer.classified_block();
+                    ext2_base_scalar_dot_slots(out, start, &slices, powers);
+                }
             });
     }
     Some(acc)
@@ -457,13 +544,39 @@ impl<const D: usize> ReducingFactorTarget<D> {
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::field::types::{PrimeField64, Sample};
+    use crate::field::types::{Field64, PrimeField64, Sample};
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
     use crate::plonk::verifier::verify;
+
+    #[derive(Default)]
+    struct TestExt2SlotCensus {
+        direct_blocks: AtomicUsize,
+        classified_blocks: AtomicUsize,
+    }
+
+    impl Ext2SlotObserver for TestExt2SlotCensus {
+        fn direct_block(&self) {
+            self.direct_blocks.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn classified_block(&self) {
+            self.classified_blocks.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl TestExt2SlotCensus {
+        fn counts(&self) -> (usize, usize) {
+            (
+                self.direct_blocks.load(Ordering::Relaxed),
+                self.classified_blocks.load(Ordering::Relaxed),
+            )
+        }
+    }
 
     fn test_reduce_gadget_base(n: usize) -> Result<()> {
         const D: usize = 2;
@@ -674,5 +787,262 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The equal-length production shape must enter the allocation-free
+    /// direct kernel by default for every output-length edge around
+    /// `SLOT_BLOCK`. Use arbitrary raw Goldilocks representatives, including
+    /// values at and above the modulus, to exercise the delayed-reduction
+    /// bounds rather than only canonical random inputs.
+    #[test]
+    fn ext2_direct_slots_default_census_raw_reps_and_length_edges() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type FF = QuadraticExtension<F>;
+
+        fn legacy(alpha: FF, polys: &[PolynomialCoeffs<F>]) -> Vec<FF> {
+            let mut acc = Vec::new();
+            for (power, poly) in alpha.powers().zip(polys) {
+                if poly.coeffs.len() > acc.len() {
+                    acc.resize(poly.coeffs.len(), FF::ZERO);
+                }
+                for (a, &c) in acc.iter_mut().zip(&poly.coeffs) {
+                    *a += <FF as FieldExtension<D>>::scalar_mul(&power, c);
+                }
+            }
+            acc
+        }
+
+        fn assert_value_eq(actual: &[FF], expected: &[FF], len: usize) {
+            assert_eq!(actual.len(), expected.len(), "output length for {len}");
+            for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
+                let a: [F; D] = a.to_basefield_array();
+                let e: [F; D] = e.to_basefield_array();
+                for limb in 0..D {
+                    assert_eq!(
+                        a[limb].to_canonical_u64(),
+                        e[limb].to_canonical_u64(),
+                        "length {len}, coefficient {i}, limb {limb}"
+                    );
+                }
+            }
+        }
+
+        let p = F::ORDER;
+        let raw = [0, 1, p - 1, p, p + 1, u64::MAX];
+        let alpha = QuadraticExtension([
+            GoldilocksField(p + 1),
+            GoldilocksField(u64::MAX),
+        ]);
+
+        for len in [0, 1, 2047, 2048, 2049, 4096] {
+            // Seventeen polynomials force the slot-partitioned branch.
+            let polys: Vec<_> = (0..17)
+                .map(|poly| {
+                    PolynomialCoeffs::new(
+                        (0..len)
+                            .map(|i| GoldilocksField(raw[(i + poly) % raw.len()]))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let powers: Vec<_> = alpha.powers().take(polys.len()).collect();
+            let expected = legacy(alpha, &polys);
+            let census = TestExt2SlotCensus::default();
+            let actual = goldilocks_ext2_reduce_polys_base_impl::<F, FF, D, _>(
+                &polys, &powers, len, false, &census,
+            )
+            .expect("Goldilocks ext2 must take its specialized reducer");
+
+            assert_value_eq(&actual, &expected, len);
+            let expected_blocks = len.div_ceil(2048);
+            assert_eq!(
+                census.counts(),
+                (expected_blocks, 0),
+                "default route census for all-equal length {len}"
+            );
+        }
+    }
+
+    /// Mixed, empty and unequal lengths retain the exact pre-existing
+    /// classified kernel, including blocks on both sides of `SLOT_BLOCK`.
+    #[test]
+    fn ext2_direct_slots_mixed_lengths_use_classified_fallback() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type FF = QuadraticExtension<F>;
+
+        let mut lens = vec![4097usize; 17];
+        lens.extend([0, 1, 2047, 2048, 2049, 4096]);
+        let alpha = FF::rand();
+        let polys: Vec<_> = lens
+            .iter()
+            .enumerate()
+            .map(|(poly, &len)| {
+                PolynomialCoeffs::new(
+                    (0..len)
+                        .map(|i| F::from_noncanonical_u64((i * 17 + poly) as u64))
+                        .collect(),
+                )
+            })
+            .collect();
+        let powers: Vec<_> = alpha.powers().take(polys.len()).collect();
+
+        let mut expected = Vec::new();
+        for (power, poly) in powers.iter().zip(&polys) {
+            if poly.coeffs.len() > expected.len() {
+                expected.resize(poly.coeffs.len(), FF::ZERO);
+            }
+            for (a, &c) in expected.iter_mut().zip(&poly.coeffs) {
+                *a += <FF as FieldExtension<D>>::scalar_mul(power, c);
+            }
+        }
+
+        let census = TestExt2SlotCensus::default();
+        let actual = goldilocks_ext2_reduce_polys_base_impl::<F, FF, D, _>(
+            &polys,
+            &powers,
+            4097,
+            false,
+            &census,
+        )
+        .unwrap();
+
+        assert_eq!(census.counts(), (0, 3));
+        assert_eq!(actual.len(), expected.len());
+        for (a, e) in actual.iter().zip(expected) {
+            let a: [F; D] = a.to_basefield_array();
+            let e: [F; D] = e.to_basefield_array();
+            for limb in 0..D {
+                assert_eq!(
+                    a[limb].to_canonical_u64(),
+                    e[limb].to_canonical_u64()
+                );
+            }
+        }
+    }
+
+    /// The diagnostic control is exact-disable-only: missing and arbitrary
+    /// values are candidate-on, while exactly `1` routes the same equal-length
+    /// input through the original classified kernel.
+    #[cfg(feature = "std")]
+    #[test]
+    fn ext2_direct_slots_disable_toggle_is_exact_and_control_is_semantic_equal() {
+        use std::ffi::OsStr;
+
+        assert!(!ext2_direct_slots_disable_value(None));
+        for value in ["", "0", "true", "01", " 1", "1 ", "candidate"] {
+            assert!(!ext2_direct_slots_disable_value(Some(OsStr::new(value))));
+        }
+        assert!(ext2_direct_slots_disable_value(Some(OsStr::new("1"))));
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type FF = QuadraticExtension<F>;
+        let alpha = FF::rand();
+        let polys: Vec<_> = (0..17)
+            .map(|poly| {
+                PolynomialCoeffs::new(
+                    (0..2049)
+                        .map(|i| F::from_noncanonical_u64((i + poly) as u64))
+                        .collect(),
+                )
+            })
+            .collect();
+        let powers: Vec<_> = alpha.powers().take(polys.len()).collect();
+
+        let candidate_census = TestExt2SlotCensus::default();
+        let candidate = goldilocks_ext2_reduce_polys_base_impl::<F, FF, D, _>(
+            &polys,
+            &powers,
+            2049,
+            false,
+            &candidate_census,
+        )
+        .unwrap();
+        let control_census = TestExt2SlotCensus::default();
+        let control = goldilocks_ext2_reduce_polys_base_impl::<F, FF, D, _>(
+            &polys,
+            &powers,
+            2049,
+            true,
+            &control_census,
+        )
+        .unwrap();
+
+        assert_eq!(candidate_census.counts(), (2, 0));
+        assert_eq!(control_census.counts(), (0, 2));
+        assert_eq!(candidate, control);
+    }
+
+    /// The specialization is exactly Goldilocks quadratic: quartic extension
+    /// reductions remain on the generic implementation and retain semantics.
+    /// This repository has no non-Goldilocks base field implementing
+    /// `Extendable`, so the degree-4 guard is the closest practical negative
+    /// TypeId case.
+    #[test]
+    fn reduce_polys_base_quartic_remains_generic() {
+        const D: usize = 4;
+        type F = GoldilocksField;
+        type FF = <F as Extendable<D>>::Extension;
+
+        let alpha = FF::rand();
+        let polys: Vec<_> = (0..17)
+            .map(|poly| {
+                PolynomialCoeffs::new(
+                    (0..2049)
+                        .map(|i| F::from_noncanonical_u64((i * 13 + poly) as u64))
+                        .collect(),
+                )
+            })
+            .collect();
+        let powers: Vec<_> = alpha.powers().take(polys.len()).collect();
+        let census = TestExt2SlotCensus::default();
+        assert!(
+            goldilocks_ext2_reduce_polys_base_impl::<F, FF, D, _>(
+                &polys,
+                &powers,
+                2049,
+                false,
+                &census,
+            )
+            .is_none()
+        );
+        assert_eq!(census.counts(), (0, 0));
+
+        let mut expected = Vec::new();
+        for (power, poly) in powers.iter().zip(&polys) {
+            if poly.coeffs.len() > expected.len() {
+                expected.resize(poly.coeffs.len(), FF::ZERO);
+            }
+            for (a, &c) in expected.iter_mut().zip(&poly.coeffs) {
+                *a += <FF as FieldExtension<D>>::scalar_mul(power, c);
+            }
+        }
+        let actual = ReducingFactor::new(alpha).reduce_polys_base::<F, D>(polys.iter());
+        assert_eq!(actual.coeffs, expected);
+    }
+
+    #[test]
+    #[should_panic(expected = "slot range end must not overflow usize")]
+    fn ext2_direct_slots_rejects_slot_range_overflow() {
+        type F = GoldilocksField;
+        type FF = QuadraticExtension<F>;
+        let mut out = [FF::ZERO];
+        // SAFETY: this deliberately violates the documented range
+        // precondition to prove it fails before any unchecked access.
+        unsafe { ext2_base_scalar_dot_slots_equal_len(&mut out, usize::MAX, &[], &[]) };
+    }
+
+    #[test]
+    #[should_panic]
+    fn ext2_direct_slots_rejects_power_count_mismatch() {
+        type F = GoldilocksField;
+        type FF = QuadraticExtension<F>;
+        let mut out: [FF; 0] = [];
+        let empty: &[F] = &[];
+        // SAFETY: this deliberately violates the documented count
+        // precondition to prove it is asserted before unchecked access.
+        unsafe { ext2_base_scalar_dot_slots_equal_len(&mut out, 0, &[empty], &[]) };
     }
 }
