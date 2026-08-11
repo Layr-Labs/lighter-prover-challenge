@@ -504,89 +504,6 @@ pub(crate) struct U32QuotientSpec {
     pub kind: U32QuotientKind,
 }
 
-/// Bounded exact-size cache of shared column-store buffers.
-///
-/// The commitment column stores recur at identical byte sizes every proof
-/// (three per transaction/chain step, plus the quotient gather stores), and
-/// each was previously a fresh `new_buffer` whose pages the kernel
-/// zero-faults again during the fill — kernel time repaid 50+ times per
-/// worker. Reuse is sound because no consumer relies on zero initialization:
-/// the LDE column fill writes the live prefix without reading it and the
-/// zero-padded FFT writes every tail element before reading it (the
-/// `fill_lde_column_store` / `lde_values` invariant), and every other
-/// allocation site fully writes its store before any read. Buffers above the
-/// per-buffer cap (the one-off final-block stores) are never retained.
-struct ColumnStorePool {
-    free: Vec<Buffer>,
-    total_bytes: u64,
-}
-
-const MAX_CACHED_COLUMN_STORE_BYTES: u64 = 640 << 20;
-const MAX_COLUMN_STORE_POOL_BYTES: u64 = 2560 << 20;
-
-static COLUMN_STORE_POOL: Mutex<ColumnStorePool> = Mutex::new(ColumnStorePool {
-    free: Vec::new(),
-    total_bytes: 0,
-});
-
-impl ColumnStorePool {
-    /// Smallest free buffer that fits `bytes`. The recurring shapes match
-    /// their own previous allocation exactly; best-fit additionally tolerates
-    /// any allocator size rounding in `Buffer::length` without silent misses.
-    fn take_best_fit(&mut self, bytes: u64) -> Option<Buffer> {
-        let (index, length) = self
-            .free
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.length() >= bytes)
-            .min_by_key(|(_, b)| b.length())
-            .map(|(index, b)| (index, b.length()))?;
-        self.total_bytes -= length;
-        Some(self.free.swap_remove(index))
-    }
-
-    fn recycle(&mut self, buffer: Buffer) {
-        let bytes = buffer.length();
-        if bytes <= MAX_CACHED_COLUMN_STORE_BYTES
-            && self.total_bytes + bytes <= MAX_COLUMN_STORE_POOL_BYTES
-        {
-            self.total_bytes += bytes;
-            self.free.push(buffer);
-        }
-    }
-}
-
-/// Returns a pooled buffer of exactly `bytes` when one is free, else a fresh
-/// device allocation. Misses (including lock contention) fall through to the
-/// allocator; the pool is a best-effort page-warm cache, never a correctness
-/// dependency.
-fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
-    if bytes <= MAX_CACHED_COLUMN_STORE_BYTES {
-        if let Ok(mut pool) = COLUMN_STORE_POOL.try_lock() {
-            if let Some(buffer) = pool.take_best_fit(bytes) {
-                return buffer;
-            }
-        }
-    }
-    autoreleasepool(|| device.new_buffer(bytes, MTLResourceOptions::StorageModeShared))
-}
-
-/// Owns one column-store buffer for the lifetime of all `MetalColumns`
-/// handles over it; the last handle's drop returns the buffer to the pool
-/// (same pattern as `MetalDigestInner`). `try_lock`: on contention the
-/// buffer simply drops.
-struct ColumnStoreLease {
-    buffer: Buffer,
-}
-
-impl Drop for ColumnStoreLease {
-    fn drop(&mut self) {
-        if let Ok(mut pool) = COLUMN_STORE_POOL.try_lock() {
-            pool.recycle(self.buffer.clone());
-        }
-    }
-}
-
 /// LDE columns computed and retained in a CPU-visible Metal shared buffer.
 /// Written once during the fused NTT + Merkle build, immutable afterwards.
 pub struct MetalColumns<F> {
@@ -606,26 +523,20 @@ pub struct MetalColumns<F> {
     base: usize,
     rows: usize,
     cols: usize,
-    /// Handle counter (exclusive access iff the count is 1) whose final drop
-    /// returns the buffer to `COLUMN_STORE_POOL`.
-    uniqueness: Arc<ColumnStoreLease>,
+    uniqueness: Arc<()>,
     _phantom: PhantomData<F>,
 }
 
 impl<F> MetalColumns<F> {
-    /// Wraps a freshly allocated (or pool-reused) shared buffer, capturing
-    /// its contents pointer.
+    /// Wraps a freshly allocated shared buffer, capturing its contents pointer.
     fn with_buffer(buffer: Buffer, rows: usize, cols: usize) -> Self {
         let base = buffer.contents() as usize;
-        let lease = ColumnStoreLease {
-            buffer: buffer.clone(),
-        };
         Self {
             buffer,
             base,
             rows,
             cols,
-            uniqueness: Arc::new(lease),
+            uniqueness: Arc::new(()),
             _phantom: PhantomData,
         }
     }
@@ -2436,7 +2347,10 @@ impl MetalShared {
         let bytes = len
             .checked_mul(size_of::<u64>())
             .ok_or("Metal column size overflow")?;
-        let buffer = take_or_new_column_buffer(&self.device, bytes as u64);
+        let buffer = autoreleasepool(|| {
+            self.device
+                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+        });
         Ok(MetalColumns::with_buffer(buffer, rows, cols))
     }
 
@@ -2960,7 +2874,10 @@ impl MetalShared {
         )
         .to_canonical_u64();
 
-        let column_buffer = take_or_new_column_buffer(&self.device, column_bytes as u64);
+        let column_buffer = autoreleasepool(|| {
+            self.device
+                .new_buffer(column_bytes as u64, MTLResourceOptions::StorageModeShared)
+        });
         // Coefficients need their own buffer: the LDE prepare reads them while
         // writing the full column buffer.
         let coeffs_buffer = autoreleasepool(|| {
@@ -3224,10 +3141,12 @@ impl MetalShared {
         let (roots_buffer, roots_offsets) = self.roots_for(log_lde)?;
         let shift_buffer = self.shift_powers_for(degree)?;
 
-        // The LDE columns outlive this call as the oracle's leaf storage —
-        // distinct from the transient `BufferSet` staging pool; they use the
-        // column-store pool keyed by exact size.
-        let column_buffer = take_or_new_column_buffer(&self.device, column_bytes as u64);
+        // The LDE columns outlive this call as the oracle's leaf storage, so
+        // they get their own buffer rather than a pooled one.
+        let column_buffer = autoreleasepool(|| {
+            self.device
+                .new_buffer(column_bytes as u64, MTLResourceOptions::StorageModeShared)
+        });
 
         let mut set = self.acquire_set()?;
         let result = self.build_from_coeffs_with_set(
@@ -3667,7 +3586,7 @@ fn dispatch2d(
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(64)
+        .min(128)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
@@ -3691,7 +3610,7 @@ fn dispatch(
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(128)
+        .min( 256)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
