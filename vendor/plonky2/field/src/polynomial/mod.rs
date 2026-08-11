@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::extension::{Extendable, FieldExtension};
 use crate::fft::{
-    FftRootTable, fft, fft_with_options, ifft, ifft_with_options_and_postscale,
+    FftRootTable, fft, fft_with_options, ifft, ifft_with_options_and_normalized_postscale,
+    ifft_with_options_and_postscale,
 };
 use crate::types::Field;
 
@@ -78,6 +79,20 @@ impl<F: Field> PolynomialValues<F> {
     /// already has the inverse powers of that coset's shift.
     pub fn coset_ifft_with_powers(self, inverse_shift_powers: &[F]) -> PolynomialCoeffs<F> {
         ifft_with_options_and_postscale(self, None, None, Some(inverse_shift_powers))
+    }
+
+    /// Returns the polynomial evaluated by `self` on a coset when the caller
+    /// already has inverse powers of the coset shift multiplied by `1 / n`.
+    pub fn coset_ifft_with_normalized_powers(
+        self,
+        normalized_inverse_shift_powers: &[F],
+    ) -> PolynomialCoeffs<F> {
+        ifft_with_options_and_normalized_postscale(
+            self,
+            None,
+            None,
+            normalized_inverse_shift_powers,
+        )
     }
 
     pub fn lde_multiple(polys: Vec<Self>, rate_bits: usize) -> Vec<Self> {
@@ -550,6 +565,48 @@ mod tests {
                     .coeffs
                     .iter()
                     .map(|value| value.0)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_coset_ifft_with_normalized_powers_matches_value() {
+        type F = GoldilocksField;
+
+        for k in [1usize, 3, 8] {
+            let n = 1 << k;
+            let evals = PolynomialValues::new(
+                (0..n)
+                    .map(|i| {
+                        F::from_noncanonical_u64(
+                            u64::MAX.wrapping_sub((i as u64 + 7) * 0x9E37_79B9),
+                        )
+                    })
+                    .collect(),
+            );
+            let shift = F::coset_shift();
+            let n_inv = F::inverse_2exp(k);
+            let normalized_powers = shift
+                .inverse()
+                .powers()
+                .take(n)
+                .map(|power| n_inv * power)
+                .collect::<Vec<_>>();
+
+            let expected = evals.clone().coset_ifft(shift);
+            let actual = evals.coset_ifft_with_normalized_powers(&normalized_powers);
+
+            assert_eq!(
+                actual
+                    .coeffs
+                    .iter()
+                    .map(|value| value.to_canonical_u64())
+                    .collect::<Vec<_>>(),
+                expected
+                    .coeffs
+                    .iter()
+                    .map(|value| value.to_canonical_u64())
                     .collect::<Vec<_>>()
             );
         }
