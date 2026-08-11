@@ -1,15 +1,20 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec::Vec};
 
+use core::any::TypeId;
+
 use itertools::Itertools;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
 use crate::field::extension::Extendable;
+use crate::field::extension::quadratic::QuadraticExtension;
 use crate::field::fft::{
     FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
 };
+use crate::field::goldilocks_extensions::ext2_mul_add;
+use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
@@ -782,6 +787,31 @@ fn accumulate_linear_quotient<F: Field>(
     let d = composition_poly.len();
     let coeffs = &composition_poly.coeffs;
     let buf = &mut final_poly.coeffs;
+    if TypeId::of::<F>() == TypeId::of::<QuadraticExtension<GoldilocksField>>() {
+        if buf.len() < coeffs.len() {
+            buf.resize(coeffs.len(), F::ZERO);
+        }
+        // SAFETY: the TypeId check proves that F is exactly the quadratic
+        // Goldilocks extension; the casts preserve layout and alignment.
+        let composition_ext = unsafe {
+            core::slice::from_raw_parts(
+                coeffs.as_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
+                coeffs.len(),
+            )
+        };
+        let final_ext = unsafe {
+            core::slice::from_raw_parts_mut(
+                buf.as_mut_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
+                buf.len(),
+            )
+        };
+        let z_ext = unsafe { *(&z as *const F).cast::<QuadraticExtension<GoldilocksField>>() };
+        let shift_ext = unsafe {
+            *(&shift as *const F).cast::<QuadraticExtension<GoldilocksField>>()
+        };
+        accumulate_linear_quotient_ext2(final_ext, composition_ext, z_ext, shift_ext);
+        return;
+    }
     // Entries past the padded quotient's length only see the shift.
     for l in buf.iter_mut().skip(d) {
         *l *= shift;
@@ -800,6 +830,42 @@ fn accumulate_linear_quotient<F: Field>(
     for i in (0..d - 1).rev() {
         acc = acc * z + coeffs[i + 1];
         buf[i] = buf[i] * shift + acc;
+    }
+}
+
+#[inline(always)]
+fn q2_raw(value: QuadraticExtension<GoldilocksField>) -> [u64; 2] {
+    [value.0[0].0, value.0[1].0]
+}
+
+#[inline(always)]
+fn q2_from_raw(value: [GoldilocksField; 2]) -> QuadraticExtension<GoldilocksField> {
+    QuadraticExtension(value)
+}
+
+/// Goldilocks quadratic specialization of `accumulate_linear_quotient`.
+///
+/// Both Horner recurrences use `a * b + c`; combining the addend with the
+/// unreduced product removes two extension additions and their intermediate
+/// reductions per coefficient while preserving the field value.
+fn accumulate_linear_quotient_ext2(
+    buf: &mut [QuadraticExtension<GoldilocksField>],
+    coeffs: &[QuadraticExtension<GoldilocksField>],
+    z: QuadraticExtension<GoldilocksField>,
+    shift: QuadraticExtension<GoldilocksField>,
+) {
+    let d = coeffs.len();
+    for value in buf.iter_mut().skip(d) {
+        *value *= shift;
+    }
+    if d == 0 {
+        return;
+    }
+    buf[d - 1] *= shift;
+    let mut acc = QuadraticExtension::<GoldilocksField>::ZERO;
+    for i in (0..d - 1).rev() {
+        acc = q2_from_raw(ext2_mul_add(q2_raw(acc), q2_raw(z), q2_raw(coeffs[i + 1])));
+        buf[i] = q2_from_raw(ext2_mul_add(q2_raw(buf[i]), q2_raw(shift), q2_raw(acc)));
     }
 }
 
@@ -1026,12 +1092,14 @@ mod tests {
         check::<<GoldilocksField as Extendable<2>>::Extension>();
     }
 
-    /// The fused quotient accumulation must be bit-identical (raw u64
-    /// representation) to the pre-fusion op sequences it replaces: both the
+    /// The fused quotient accumulation must be field-value identical to the
+    /// pre-fusion op sequences it replaces: both the
     /// classic reference (`divide_by_linear` + explicit zero pad +
     /// `shift_poly` + add) and this tree's in-place variant
     /// (`divide_by_linear_padded_in_place` + `shift_poly` + add), including
-    /// the empty-accumulator first batch and mismatched lengths.
+    /// the empty-accumulator first batch and mismatched lengths. The
+    /// Goldilocks quadratic fast path may use a different raw representative
+    /// after delayed reduction, so the test compares canonical field values.
     #[test]
     fn fused_quotient_accumulation_matches_reference() {
         use crate::field::extension::FieldExtension;
@@ -1039,11 +1107,11 @@ mod tests {
 
         type F = <GoldilocksField as Extendable<2>>::Extension;
 
-        fn raw(values: &[F]) -> Vec<u64> {
+        fn canonical(values: &[F]) -> Vec<u64> {
             values
                 .iter()
                 .flat_map(|x| FieldExtension::<2>::to_basefield_array(x))
-                .map(|c: GoldilocksField| c.to_noncanonical_u64())
+                .map(|c: GoldilocksField| c.to_canonical_u64())
                 .collect()
         }
 
@@ -1081,8 +1149,11 @@ mod tests {
             let mut actual = initial;
             accumulate_linear_quotient(&mut actual, &composition_poly, z, shift);
 
-            assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
-            assert_eq!(raw(&actual.coeffs), raw(&expected_in_place.coeffs));
+            assert_eq!(canonical(&actual.coeffs), canonical(&expected.coeffs));
+            assert_eq!(
+                canonical(&actual.coeffs),
+                canonical(&expected_in_place.coeffs)
+            );
         }
     }
 

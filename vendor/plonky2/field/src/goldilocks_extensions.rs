@@ -35,6 +35,15 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    #[inline]
+    fn extension_base_dot_products_2(
+        extension_values: &[QuadraticExtension<Self>],
+        base_scalars_0: &[Self],
+        base_scalars_1: &[Self],
+    ) -> (QuadraticExtension<Self>, QuadraticExtension<Self>) {
+        ext2_base_scalar_dot_products_2(extension_values, base_scalars_0, base_scalars_1)
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -279,6 +288,56 @@ fn ext2_base_scalar_dot_product(
     result
 }
 
+/// Compute two quadratic Goldilocks base-scalar dot products in one shared
+/// traversal of the extension values. The common prefix is branch-free; only
+/// unequal-length tails use separate loops, preserving zipped semantics.
+#[inline]
+fn ext2_base_scalar_dot_products_2(
+    extension_values: &[QuadraticExtension<GoldilocksField>],
+    base_scalars_0: &[GoldilocksField],
+    base_scalars_1: &[GoldilocksField],
+) -> (
+    QuadraticExtension<GoldilocksField>,
+    QuadraticExtension<GoldilocksField>,
+) {
+    let len_0 = extension_values.len().min(base_scalars_0.len());
+    let len_1 = extension_values.len().min(base_scalars_1.len());
+    let common_len = len_0.min(len_1);
+    let (mut lo_00, mut hi_00) = (0u128, 0u32);
+    let (mut lo_01, mut hi_01) = (0u128, 0u32);
+    let (mut lo_10, mut hi_10) = (0u128, 0u32);
+    let (mut lo_11, mut hi_11) = (0u128, 0u32);
+
+    for i in 0..common_len {
+        let QuadraticExtension([a0, a1]) = extension_values[i];
+        u160_add_product(&mut lo_00, &mut hi_00, a0.0, base_scalars_0[i].0);
+        u160_add_product(&mut lo_01, &mut hi_01, a1.0, base_scalars_0[i].0);
+        u160_add_product(&mut lo_10, &mut hi_10, a0.0, base_scalars_1[i].0);
+        u160_add_product(&mut lo_11, &mut hi_11, a1.0, base_scalars_1[i].0);
+    }
+    for i in common_len..len_0 {
+        let QuadraticExtension([a0, a1]) = extension_values[i];
+        u160_add_product(&mut lo_00, &mut hi_00, a0.0, base_scalars_0[i].0);
+        u160_add_product(&mut lo_01, &mut hi_01, a1.0, base_scalars_0[i].0);
+    }
+    for i in common_len..len_1 {
+        let QuadraticExtension([a0, a1]) = extension_values[i];
+        u160_add_product(&mut lo_10, &mut hi_10, a0.0, base_scalars_1[i].0);
+        u160_add_product(&mut lo_11, &mut hi_11, a1.0, base_scalars_1[i].0);
+    }
+
+    (
+        QuadraticExtension([
+            unsafe { reduce160(lo_00, hi_00) },
+            unsafe { reduce160(lo_01, hi_01) },
+        ]),
+        QuadraticExtension([
+            unsafe { reduce160(lo_10, hi_10) },
+            unsafe { reduce160(lo_11, hi_11) },
+        ]),
+    )
+}
+
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction
 /// across the complete production FRI arity. For raw limbs below 2^64,
 ///
@@ -441,6 +500,43 @@ pub(crate) fn ext2_mul(a: [u64; 2], b: [u64; 2]) -> [GoldilocksField; 2] {
     let c0 = ext2_add_prods0(&a, &b);
     let c1 = ext2_add_prods1(&a, &b);
     [c0, c1]
+}
+
+/// Multiply two quadratic Goldilocks elements and add a third one before
+/// reducing either output limb.
+///
+/// This is the value-equivalent fast path for Horner sweeps of the form
+/// `a * b + c`. The unreduced accumulators stay well below `reduce160`'s
+/// precondition for arbitrary raw u64 representatives.
+#[inline(always)]
+pub fn ext2_mul_add(
+    a: [u64; 2],
+    b: [u64; 2],
+    addend: [u64; 2],
+) -> [GoldilocksField; 2] {
+    const_assert!(<GoldilocksField as Extendable<2>>::W.0 == 7u64);
+
+    let [a0, a1] = a;
+    let [b0, b1] = b;
+    let [add0, add1] = addend;
+
+    let (mut c0_lo, mut c0_hi) = u160_times_7((a1 as u128) * (b1 as u128), 0);
+    let (sum, carry) = c0_lo.overflowing_add((a0 as u128) * (b0 as u128));
+    c0_lo = sum;
+    c0_hi += carry as u32;
+    let (sum, carry) = c0_lo.overflowing_add(add0 as u128);
+    c0_lo = sum;
+    c0_hi += carry as u32;
+
+    let mut c1_lo = (a0 as u128) * (b1 as u128);
+    let (sum, carry) = c1_lo.overflowing_add((a1 as u128) * (b0 as u128));
+    c1_lo = sum;
+    let c1_hi = carry as u32;
+    let (sum, carry) = c1_lo.overflowing_add(add1 as u128);
+    c1_lo = sum;
+    let c1_hi = c1_hi + carry as u32;
+
+    [unsafe { reduce160(c0_lo, c0_hi) }, unsafe { reduce160(c1_lo, c1_hi) }]
 }
 
 /*
@@ -884,6 +980,69 @@ mod tests {
         // Raw representatives are deliberately not part of the assertion:
         // delayed and per-term reduction are required to agree as field
         // values, including when every input can occupy the full u64 range.
+    }
+
+    #[test]
+    fn ext2_extension_base_dot_products_2_matches_two_singles() {
+        type E = <GF as Extendable<2>>::Extension;
+        for &(values_len, scalars_0_len, scalars_1_len) in &[
+            (0usize, 0usize, 0usize),
+            (1, 2, 1),
+            (2, 1, 3),
+            (17, 17, 17),
+            (257, 256, 255),
+            (4097, 4096, 4095),
+        ] {
+            let values: Vec<E> = (0..values_len)
+                .map(|i| {
+                    QuadraticExtension([
+                        GF::from_noncanonical_u64(
+                            (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                        ),
+                        GF::from_noncanonical_u64(
+                            (i as u64 + 11).wrapping_mul(0xD1B5_4A32_D192_ED03),
+                        ),
+                    ])
+                })
+                .collect();
+            let scalars_0: Vec<GF> = (0..scalars_0_len)
+                .map(|i| {
+                    GF::from_noncanonical_u64(
+                        (i as u64 + 3).wrapping_mul(u64::MAX / 17),
+                    )
+                })
+                .collect();
+            let scalars_1: Vec<GF> = (0..scalars_1_len)
+                .map(|i| {
+                    GF::from_noncanonical_u64(
+                        (i as u64 + 7).wrapping_mul(u64::MAX / 19),
+                    )
+                })
+                .collect();
+
+            let expected_0 = <GF as Extendable<2>>::extension_base_dot_product(
+                &values,
+                &scalars_0,
+            );
+            let expected_1 = <GF as Extendable<2>>::extension_base_dot_product(
+                &values,
+                &scalars_1,
+            );
+            let (actual_0, actual_1) = <GF as Extendable<2>>::extension_base_dot_products_2(
+                &values,
+                &scalars_0,
+                &scalars_1,
+            );
+            for (actual, expected) in [(actual_0, expected_0), (actual_1, expected_1)] {
+                for limb in 0..2 {
+                    assert_eq!(
+                        actual.0[limb].to_canonical_u64(),
+                        expected.0[limb].to_canonical_u64(),
+                        "pair dot product mismatch at lengths ({values_len}, {scalars_0_len}, {scalars_1_len})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

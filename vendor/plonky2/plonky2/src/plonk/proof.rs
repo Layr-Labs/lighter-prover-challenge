@@ -373,10 +373,26 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
             }
         }
         let eval_polynomials = |pows: &[F::Extension], polynomials: &[PolynomialCoeffs<F>]| {
-            polynomials
-                .par_iter()
-                .map(|p| F::extension_base_dot_product(pows, &p.coeffs))
-                .collect::<Vec<_>>()
+            let mut evaluations = vec![F::Extension::ZERO; polynomials.len()];
+            evaluations
+                .par_chunks_mut(2)
+                .enumerate()
+                .for_each(|(pair_index, output)| {
+                    let first = pair_index * 2;
+                    if output.len() == 2 {
+                        let (first_eval, second_eval) = F::extension_base_dot_products_2(
+                            pows,
+                            &polynomials[first].coeffs,
+                            &polynomials[first + 1].coeffs,
+                        );
+                        output[0] = first_eval;
+                        output[1] = second_eval;
+                    } else {
+                        output[0] =
+                            F::extension_base_dot_product(pows, &polynomials[first].coeffs);
+                    }
+                });
+            evaluations
         };
         let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
             eval_polynomials(pows, &c.polynomials)
