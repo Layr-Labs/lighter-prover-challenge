@@ -43,23 +43,34 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // step. Allocator page retention changes no computed value.
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+const METAL_PIPELINE_ARCHIVE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/poseidon2-pipelines.binary.metallib"));
 
 fn main() {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context("worker", 0, &[]);
     #[cfg(feature = "diagnostic_profile")]
     let profile_process = plonky2::util::profile::span("process", "prove_worker");
-    // First statement in the process: the Metal shader compile and pipeline
-    // lowering behind the GPU hash path cost the better part of a second on a
-    // cold OS shader cache, and the benchmark sandbox denies writes to that
-    // cache, which disables it entirely — so every scored worker pays the full
-    // price. Starting it here overlaps it with the startup work below instead
-    // of stalling the first proving step that wants the GPU. Pure scheduling:
-    // the compiled kernels are identical either way.
+    let mut args = env::args().skip(1);
+    let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
+    let output = args.next().expect("usage: prove FIXTURE OUTPUT");
+    assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
+
+    // This one-shot diagnostic uses the exact bridge-approved proof-output path,
+    // not a sibling or process-global temporary path. The harness guarantees the
+    // output is absent and writable. On Apple silicon the call never returns: it
+    // stages and opens the exact target-26 archive there, probes the six required
+    // pipelines, and exits in the result's wall-clock slot before any fixture
+    // byte is read or proof work begins. The archive can remain at `output`
+    // because this diagnostic never reaches proof serialization. Non-Metal
+    // builds keep the no-op API so ordinary Linux validation can continue below.
     {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("startup", "metal_prewarm_submit");
-        plonky2::hash::poseidon2::prewarm_gpu();
+        plonky2::hash::poseidon2::prewarm_gpu_with_required_archive(
+            METAL_PIPELINE_ARCHIVE,
+            std::path::Path::new(&output),
+        );
     }
     // `log` is statically disabled in release builds: the ranked worker has no
     // log consumer, and diagnostics remain available in debug/test builds.
@@ -74,11 +85,6 @@ fn main() {
         "rayon_threads",
         rayon::current_num_threads() as u64,
     );
-
-    let mut args = env::args().skip(1);
-    let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
-    let output = args.next().expect("usage: prove FIXTURE OUTPUT");
-    assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
     // Fixture parse overlaps the pre-execution circuit load; both are fast.
     let (block, pre_circuits) = rayon::join(
@@ -195,6 +201,10 @@ fn main() {
         let _span = plonky2::util::profile::span("orchestration", "block_pipeline");
         prover::prove_block_after_pre(block, circuits, pre_proof)
     };
+    // The five non-readiness archive probes overlap the full proof. Joining
+    // them here should be free, and makes a successful diagnostic run proof of
+    // all eleven strict archive hits even if an optional kernel was never used.
+    plonky2::hash::poseidon2::verify_required_gpu_archive_hits();
     #[cfg(feature = "diagnostic_profile")]
     let _output_span = plonky2::util::profile::span("output", "serialize_and_flush_proof");
     let mut writer = BufWriter::with_capacity(
@@ -230,9 +240,9 @@ fn main() {
     // reclaims the address space wholesale at exit. Every Metal command buffer
     // in the hash path is `commit()`ed and then `wait_until_completed()`ed
     // before its results are read. The one detached thread this binary spawns
-    // is the GPU pre-warm above, which only populates a cache of compiled
-    // kernels and produces nothing anyone reads back, so there is no in-flight
-    // background work left to lose here.
+    // is the GPU pre-warm above; its required and optional archive work was
+    // explicitly joined by `verify_required_gpu_archive_hits`, so there is no
+    // in-flight background work left to lose here.
     // `std::process::exit` skips Rust destructors but still enters libc
     // `exit(3)`, which runs every registered `atexit`/`__cxa_atexit` handler and
     // finalises each loaded image — the Objective-C runtime, Metal and the
