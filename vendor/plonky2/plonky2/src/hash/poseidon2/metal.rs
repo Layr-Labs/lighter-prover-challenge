@@ -107,6 +107,20 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// `metallib_matches_shader_source` test enforces it.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
+/// AIR-specialized copies of the ranked Range/U32 quotient kernel. The first
+/// contains the range and low-private-state gate families; the second adds the
+/// quintic and random-access families to the same output after a resource
+/// barrier. Both retain the ordinary kernel ABI, so loading or lowering either
+/// artifact can fail closed to [`SHADER_METALLIB`].
+const RANGE_LIGHT_METALLIB: &[u8] = include_bytes!("poseidon2_range_light.metallib");
+const RANGE_HEAVY_METALLIB: &[u8] = include_bytes!("poseidon2_range_heavy.metallib");
+#[cfg(test)]
+const RANGE_LIGHT_METALLIB_SHA256: &str =
+    "43bdfaadf15cc3de4378a67e10fc4ade0dfac6985d49ba47284a09a34f593ebf";
+#[cfg(test)]
+const RANGE_HEAVY_METALLIB_SHA256: &str =
+    "b53e7db5eaafefa63ddcfeb0b3a3989860e8808941cd6a0cd2033072472ae591";
+
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
     "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
@@ -1019,6 +1033,39 @@ static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
 
+/// Exact ranked light-transaction Range/U32 metadata on the 59c frontier.
+/// The AIR specialization is selected only on byte-for-byte equality with
+/// this vector and its domain/column shape; every other circuit uses the
+/// generic prebuilt kernel.
+const LIGHT_TX_RANGE_METADATA: [u32; 180] = [
+    2, 14, 12, 17, 1, 15, 8, 4, 0, 0,
+    2, 15, 12, 17, 1, 5, 24, 4, 0, 0,
+    2, 16, 12, 17, 1, 8, 16, 4, 0, 0,
+    0, 2, 0, 7, 1, 10, 26, 6, 0, 0,
+    0, 3, 0, 7, 1, 11, 63, 2, 0, 0,
+    0, 4, 0, 7, 1, 8, 22, 6, 0, 0,
+    0, 5, 0, 7, 1, 4, 5, 0, 0, 0,
+    0, 6, 0, 7, 1, 5, 6, 0, 0, 0,
+    1, 7, 7, 12, 1, 12, 20, 0, 0, 0,
+    1, 10, 7, 12, 1, 11, 16, 4, 0, 0,
+    1, 11, 7, 12, 1, 3, 3, 8, 0, 0,
+    2, 13, 12, 17, 1, 6, 8, 3, 0, 6,
+    3, 17, 17, 22, 1, 1, 10, 0, 8, 0,
+    3, 18, 17, 22, 1, 2, 5, 6, 16, 2,
+    3, 19, 17, 22, 1, 0, 3, 0, 16, 0,
+    3, 20, 17, 22, 1, 1, 6, 0, 16, 0,
+    3, 21, 17, 22, 1, 1, 4, 0, 24, 0,
+    4, 22, 22, 24, 1, 6, 4, 4, 2, 6,
+];
+
+struct RangeSplitPipelines {
+    light: ComputePipelineState,
+    heavy: ComputePipelineState,
+}
+
+static LIGHT_TX_RANGE_PIPELINES: std::sync::OnceLock<Option<RangeSplitPipelines>> =
+    std::sync::OnceLock::new();
+
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     POSEIDON_GATE_QUOTIENT_PIPELINE.get()
 }
@@ -1033,6 +1080,35 @@ fn permutation_quotient_pipeline() -> Option<&'static ComputePipelineState> {
 
 fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.get()
+}
+
+fn light_tx_range_pipelines() -> Option<&'static RangeSplitPipelines> {
+    LIGHT_TX_RANGE_PIPELINES.get()?.as_ref()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn is_light_tx_range_request(
+    wire_rows: usize,
+    wire_cols: usize,
+    constant_rows: usize,
+    constant_cols: usize,
+    quotient_rows: usize,
+    step: usize,
+    metadata: &[u32],
+    range_count: usize,
+    u32_count: usize,
+    alpha_stride: usize,
+) -> bool {
+    wire_rows == 1 << 19
+        && wire_cols == 136
+        && constant_rows == wire_rows
+        && constant_cols == 8
+        && quotient_rows == 1 << 19
+        && step == 1
+        && range_count == 3
+        && u32_count == 15
+        && alpha_stride == 136
+        && metadata == LIGHT_TX_RANGE_METADATA
 }
 
 /// Starts the two gate-quotient pipeline builds on detached threads.
@@ -1083,6 +1159,73 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
                 let _ = slot.built.set(None);
             }
         }
+    }
+}
+
+/// Lowers the two exact-light-tx Range pipelines after the ordinary optional
+/// pipelines have settled. This keeps their compiler-service work off the
+/// context's critical path and publishes the pair atomically: a proof either
+/// runs both halves or the generic kernel, never a partial specialization.
+fn spawn_light_tx_range_pipelines(device: &Device) {
+    let device = device.clone();
+    let spawned = std::thread::Builder::new()
+        .name("poseidon2-metal-range-light-split".to_string())
+        .spawn(move || {
+            // Avoid adding AIR->ISA contention to the four existing optional
+            // pipelines. Their work begins first and is needed by every
+            // circuit shape; this pair is useful only for the 49 light tx
+            // proofs that arrive later in the worker.
+            let _ = POSEIDON_GATE_QUOTIENT_PIPELINE.get();
+            let _ = RANGE_CHECK_GATE_QUOTIENT_PIPELINE.get();
+            let _ = PERMUTATION_QUOTIENT_PIPELINE.get();
+            let _ = ABSORB_PASS_PIPELINE.get();
+
+            let light_device = device.clone();
+            let heavy_device = device;
+            let (light, heavy) = std::thread::scope(|scope| {
+                let light = scope.spawn(move || {
+                    autoreleasepool(|| {
+                        let library = light_device
+                            .new_library_with_data(RANGE_LIGHT_METALLIB)
+                            .ok()?;
+                        let function = library
+                            .get_function("range_check_gate_quotient", None)
+                            .ok()?;
+                        light_device
+                            .new_compute_pipeline_state_with_function(&function)
+                            .ok()
+                    })
+                });
+                let heavy = scope.spawn(move || {
+                    autoreleasepool(|| {
+                        let library = heavy_device
+                            .new_library_with_data(RANGE_HEAVY_METALLIB)
+                            .ok()?;
+                        let function = library
+                            .get_function("range_check_gate_quotient", None)
+                            .ok()?;
+                        heavy_device
+                            .new_compute_pipeline_state_with_function(&function)
+                            .ok()
+                    })
+                });
+                (light.join().ok().flatten(), heavy.join().ok().flatten())
+            });
+            let pair = light.zip(heavy).map(|(light, heavy)| RangeSplitPipelines {
+                light,
+                heavy,
+            });
+            if pair.is_some() {
+                log::info!("light-tx split Range pipelines ready");
+            } else {
+                log::debug!(
+                    "light-tx Range specialization unavailable; using the generic pipeline"
+                );
+            }
+            let _ = LIGHT_TX_RANGE_PIPELINES.set(pair);
+        });
+    if spawned.is_err() {
+        let _ = LIGHT_TX_RANGE_PIPELINES.set(None);
     }
 }
 
@@ -2385,6 +2528,7 @@ impl MetalShared {
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
             spawn_optional_pipelines(&device, &library);
+            spawn_light_tx_range_pipelines(&device);
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -2532,13 +2676,30 @@ impl MetalShared {
         alpha_powers: &[u64],
         alpha_stride: usize,
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
-        let pipeline = range_check_gate_quotient_pipeline()
-            .ok_or("RangeCheck gate quotient pipeline unavailable")?;
         if metadata.len() != (range_count + u32_count) * 10
             || alpha_powers.len() != alpha_stride * 2
         {
             return Err("invalid RangeCheck quotient metadata".to_string());
         }
+        let split = is_light_tx_range_request(
+            wires.rows,
+            wires.cols,
+            constants.rows,
+            constants.cols,
+            quotient_rows,
+            step,
+            metadata,
+            range_count,
+            u32_count,
+            alpha_stride,
+        )
+        .then(light_tx_range_pipelines)
+        .flatten();
+        let pipeline = match split {
+            Some(split) => &split.light,
+            None => range_check_gate_quotient_pipeline()
+                .ok_or("RangeCheck gate quotient pipeline unavailable")?,
+        };
         let len = quotient_rows
             .checked_mul(2)
             .ok_or("RangeCheck gate quotient output length overflow")?;
@@ -2571,6 +2732,15 @@ impl MetalShared {
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
             dispatch(encoder, pipeline, quotient_rows);
+            if let Some(split) = split {
+                // The light half initializes every output word. Make those
+                // writes visible before the heavy half reads and adds its four
+                // gate families in place.
+                let output_resource: &metal::ResourceRef = &output;
+                encoder.memory_barrier_with_resources(&[output_resource]);
+                encoder.set_compute_pipeline_state(&split.heavy);
+                dispatch(encoder, &split.heavy, quotient_rows);
+            }
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
@@ -3839,6 +4009,70 @@ mod tests {
                 "prebuilt metallib is missing kernel {name}"
             );
         }
+    }
+
+    #[test]
+    fn range_split_metallibs_are_pinned_and_lowerable() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
+        for (file, bytes, expected) in [
+            (
+                "poseidon2_range_light.metallib",
+                RANGE_LIGHT_METALLIB,
+                RANGE_LIGHT_METALLIB_SHA256,
+            ),
+            (
+                "poseidon2_range_heavy.metallib",
+                RANGE_HEAVY_METALLIB,
+                RANGE_HEAVY_METALLIB_SHA256,
+            ),
+        ] {
+            let output = std::process::Command::new("/usr/bin/shasum")
+                .args(["-a", "256", &format!("{dir}/{file}")])
+                .output()
+                .expect("shasum must be available");
+            assert!(output.status.success(), "shasum failed for {file}");
+            let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
+            assert_eq!(digest.split_whitespace().next(), Some(expected));
+
+            let Some(device) = Device::system_default() else {
+                continue;
+            };
+            autoreleasepool(|| {
+                let library = device
+                    .new_library_with_data(bytes)
+                    .unwrap_or_else(|error| panic!("{file} failed to load: {error}"));
+                let function = library
+                    .get_function("range_check_gate_quotient", None)
+                    .unwrap_or_else(|error| panic!("{file} is missing the Range kernel: {error}"));
+                device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .unwrap_or_else(|error| panic!("{file} failed to lower: {error}"));
+            });
+        }
+    }
+
+    #[test]
+    fn light_tx_range_specialization_is_exact_shape_only() {
+        let exact = |metadata: &[u32], wire_cols, quotient_rows| {
+            is_light_tx_range_request(
+                1 << 19,
+                wire_cols,
+                1 << 19,
+                8,
+                quotient_rows,
+                1,
+                metadata,
+                3,
+                15,
+                136,
+            )
+        };
+        assert!(exact(&LIGHT_TX_RANGE_METADATA, 136, 1 << 19));
+        assert!(!exact(&LIGHT_TX_RANGE_METADATA, 135, 1 << 19));
+        assert!(!exact(&LIGHT_TX_RANGE_METADATA, 136, 1 << 18));
+        let mut changed = LIGHT_TX_RANGE_METADATA;
+        changed[31] ^= 1;
+        assert!(!exact(&changed, 136, 1 << 19));
     }
 
     #[test]
