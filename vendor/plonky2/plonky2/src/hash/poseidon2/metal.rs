@@ -529,16 +529,34 @@ static COLUMN_STORE_POOL: Mutex<ColumnStorePool> = Mutex::new(ColumnStorePool {
     total_bytes: 0,
 });
 
+/// Same-binary control for the historical smallest-fitting policy. Exact-size
+/// reuse is the production default: the recurring commitment shapes request
+/// exact byte counts, and lending a 64 MiB buffer to a 20 MiB request can make
+/// the next 64 MiB commitment fault a fresh shared allocation while the
+/// undersized borrower keeps those pages live.
+static COLUMN_STORE_BEST_FIT_CONTROL: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("PLONKY2_METAL_COLUMN_BEST_FIT").is_some_and(|value| value == "1")
+});
+
+/// Small recurring stores have distinct future consumers, so keep them in
+/// exact-size bins. At and above 256 MiB, requests occur at the startup/final
+/// edges or are already the pool's largest recurring shape; lending a larger
+/// idle buffer there avoids a terminal first-touch allocation without
+/// starving a later small commitment.
+const COLUMN_STORE_EXACT_BIN_MAX_BYTES: u64 = (256 << 20) - 1;
+
 impl ColumnStorePool {
     /// Smallest free buffer that fits `bytes`. The recurring shapes match
     /// their own previous allocation exactly; best-fit additionally tolerates
     /// any allocator size rounding in `Buffer::length` without silent misses.
-    fn take_best_fit(&mut self, bytes: u64) -> Option<Buffer> {
+    fn take_best_fit(&mut self, bytes: u64, allow_oversize: bool) -> Option<Buffer> {
         let (index, length) = self
             .free
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.length() >= bytes)
+            .filter(|(_, b)| {
+                b.length() == bytes || (allow_oversize && b.length() > bytes)
+            })
             .min_by_key(|(_, b)| b.length())
             .map(|(index, b)| (index, b.length()))?;
         self.total_bytes -= length;
@@ -563,7 +581,9 @@ impl ColumnStorePool {
 fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
     if bytes <= MAX_CACHED_COLUMN_STORE_BYTES {
         if let Ok(mut pool) = COLUMN_STORE_POOL.try_lock() {
-            if let Some(buffer) = pool.take_best_fit(bytes) {
+            let allow_oversize =
+                *COLUMN_STORE_BEST_FIT_CONTROL || bytes > COLUMN_STORE_EXACT_BIN_MAX_BYTES;
+            if let Some(buffer) = pool.take_best_fit(bytes, allow_oversize) {
                 return buffer;
             }
         }
