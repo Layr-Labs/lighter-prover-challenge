@@ -1801,6 +1801,41 @@ fn start_gpu_permutation_quotient<
     Some(job)
 }
 
+/// Merges one raw Metal constraint contribution into the point-major CPU
+/// accumulator. All but the last admitted job only add; the last job performs
+/// the single `Z_H` division for the complete sum.
+fn merge_gpu_quotient_values<F: RichField>(
+    accumulated_values: &mut [F],
+    contribution_values: &[F],
+    num_challenges: usize,
+    z_h_on_coset: &ZeroPolyOnCoset<F>,
+    normalize_after_merge: bool,
+) {
+    assert_ne!(num_challenges, 0);
+    assert_eq!(accumulated_values.len(), contribution_values.len());
+    assert_eq!(accumulated_values.len() % num_challenges, 0);
+
+    // Keep this branch outside the Rayon loops: admission/finish order fixes
+    // the mode once per job, not once per point or field cell.
+    if normalize_after_merge {
+        accumulated_values
+            .par_chunks_exact_mut(num_challenges)
+            .zip(contribution_values.par_chunks_exact(num_challenges))
+            .enumerate()
+            .for_each(|(i, (accumulated, contribution))| {
+                let denominator_inv = z_h_on_coset.eval_inverse(i);
+                for (accumulated, &contribution) in accumulated.iter_mut().zip(contribution) {
+                    *accumulated = (*accumulated + contribution) * denominator_inv;
+                }
+            });
+    } else {
+        accumulated_values
+            .par_iter_mut()
+            .zip(contribution_values.par_iter())
+            .for_each(|(accumulated, &contribution)| *accumulated += contribution);
+    }
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -1921,6 +1956,17 @@ fn compute_quotient_polys<
     let permutation_products_offloaded = gpu_permutation.is_some();
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     let permutation_products_offloaded = false;
+
+    // Once any Metal job has been admitted, leave the CPU contribution raw.
+    // Successful jobs are finished in Poseidon -> Range -> permutation order;
+    // the last present one divides their complete sum by `Z_H` exactly once.
+    // If no job was admitted (including every non-macOS build), the CPU keeps
+    // the original inline-normalization path below.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_quotient_job_admitted =
+        gpu_poseidon.is_some() || gpu_range.is_some() || gpu_permutation.is_some();
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let gpu_quotient_job_admitted = false;
 
     let permutation_gate_scales = if permutation_products_offloaded {
         let prefix_len = num_challenges * (common_data.num_partial_products + 2);
@@ -2334,14 +2380,16 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
+                if !gpu_quotient_job_admitted {
+                    for (&i, quotient_values) in indices_batch
+                        .iter()
+                        .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
+                    {
+                        let denominator_inv = z_h_on_coset.eval_inverse(i);
+                        quotient_values
+                            .iter_mut()
+                            .for_each(|v| *v *= denominator_inv);
+                    }
                 }
             },
         );
@@ -2379,17 +2427,13 @@ fn compute_quotient_polys<
                 );
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        merge_gpu_quotient_values(
+            &mut quotient_values,
+            &gpu_values,
+            num_challenges,
+            &z_h_on_coset,
+            gpu_range.is_none() && gpu_permutation.is_none(),
+        );
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2428,17 +2472,13 @@ fn compute_quotient_polys<
                 return result;
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        merge_gpu_quotient_values(
+            &mut quotient_values,
+            &gpu_values,
+            num_challenges,
+            &z_h_on_coset,
+            gpu_permutation.is_none(),
+        );
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2465,17 +2505,13 @@ fn compute_quotient_polys<
                 );
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        merge_gpu_quotient_values(
+            &mut quotient_values,
+            &gpu_values,
+            num_challenges,
+            &z_h_on_coset,
+            true,
+        );
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
@@ -3223,6 +3259,166 @@ mod flat_chunk_products_tests {
                     raw(legacy_column),
                     "column {k} mismatch for {n_points} points"
                 );
+            }
+        }
+    }
+}
+
+/// Delaying `Z_H` division can change a Goldilocks raw representative, but
+/// it must not change the canonical quotient value.
+#[cfg(all(test, feature = "std"))]
+mod quotient_merge_tests {
+    use core::hint::black_box;
+    use std::time::Instant;
+
+    use plonky2_field::goldilocks_field::GoldilocksField;
+    use plonky2_field::types::{Field, Field64, PrimeField64};
+    use plonky2_field::zero_poly_coset::ZeroPolyOnCoset;
+
+    use super::merge_gpu_quotient_values;
+
+    type F = GoldilocksField;
+    const NUM_CHALLENGES: usize = 2;
+    const JOBS: usize = 3;
+
+    fn noncanonical_values(len: usize, stream: u64) -> Vec<F> {
+        (0..len)
+            .map(|i| {
+                // Goldilocks' noncanonical u64 window is the top 2^32 - 1
+                // words. Keep every input in it so canonical comparison is a
+                // deliberate part of the oracle, rather than test decoration.
+                let offset = stream
+                    .wrapping_mul(0x9e37_79b9)
+                    .wrapping_add((i as u64).wrapping_mul(0x85eb_ca6b))
+                    & 0xffff_fffe;
+                let raw = u64::MAX - offset;
+                assert!(raw >= F::ORDER);
+                F::from_noncanonical_u64(raw)
+            })
+            .collect()
+    }
+
+    fn normalize_inline(values: &mut [F], z_h_on_coset: &ZeroPolyOnCoset<F>) {
+        for (i, point_values) in values.chunks_exact_mut(NUM_CHALLENGES).enumerate() {
+            let denominator_inv = z_h_on_coset.eval_inverse(i);
+            for value in point_values {
+                *value *= denominator_inv;
+            }
+        }
+    }
+
+    /// Canonical old-vs-new differential for all eight admission masks. The
+    /// legacy side normalizes CPU and every present job independently. The new
+    /// side keeps CPU raw, raw-adds non-last jobs in Poseidon/Range/permutation
+    /// order, then normalizes `(accumulated + last)` once.
+    #[test]
+    fn normalize_once_matches_legacy_for_all_gpu_job_masks() {
+        const DEGREE_BITS: usize = 5;
+        const QUOTIENT_DEGREE_BITS: usize = 3;
+        let z_h_on_coset = ZeroPolyOnCoset::<F>::new(DEGREE_BITS, QUOTIENT_DEGREE_BITS);
+        let num_points = 1 << (DEGREE_BITS + QUOTIENT_DEGREE_BITS);
+        let len = num_points * NUM_CHALLENGES;
+        let cpu = noncanonical_values(len, 1);
+        let contributions = [
+            noncanonical_values(len, 2),
+            noncanonical_values(len, 3),
+            noncanonical_values(len, 4),
+        ];
+
+        for mask in 0u8..(1 << JOBS) {
+            let mut legacy = cpu.clone();
+            normalize_inline(&mut legacy, &z_h_on_coset);
+            for (job_index, contribution) in contributions.iter().enumerate() {
+                if mask & (1 << job_index) == 0 {
+                    continue;
+                }
+                for (i, (accumulated, contribution)) in legacy
+                    .chunks_exact_mut(NUM_CHALLENGES)
+                    .zip(contribution.chunks_exact(NUM_CHALLENGES))
+                    .enumerate()
+                {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    for (accumulated, &contribution) in
+                        accumulated.iter_mut().zip(contribution)
+                    {
+                        *accumulated += contribution * denominator_inv;
+                    }
+                }
+            }
+
+            let mut normalize_once = cpu.clone();
+            let mut normalization_passes = 0;
+            if mask == 0 {
+                normalize_inline(&mut normalize_once, &z_h_on_coset);
+                normalization_passes += 1;
+            } else {
+                for (job_index, contribution) in contributions.iter().enumerate() {
+                    if mask & (1 << job_index) == 0 {
+                        continue;
+                    }
+                    let is_last =
+                        (job_index + 1..JOBS).all(|later| mask & (1 << later) == 0);
+                    normalization_passes += usize::from(is_last);
+                    merge_gpu_quotient_values(
+                        &mut normalize_once,
+                        contribution,
+                        NUM_CHALLENGES,
+                        &z_h_on_coset,
+                        is_last,
+                    );
+                }
+            }
+            assert_eq!(normalization_passes, 1, "job mask {mask:03b}");
+
+            for (cell, (actual, expected)) in
+                normalize_once.iter().zip(&legacy).enumerate()
+            {
+                assert_eq!(
+                    actual.to_canonical_u64(),
+                    expected.to_canonical_u64(),
+                    "job mask {mask:03b}, cell {cell}"
+                );
+            }
+        }
+    }
+
+    /// Manual release-mode microbenchmark for the two merge-helper paths over
+    /// 2^14, 2^16 and 2^18 quotient points.
+    #[test]
+    #[ignore = "microbenchmark; run explicitly in release mode with --nocapture"]
+    fn benchmark_quotient_merge_helper_d14_d16_d18() {
+        for domain_bits in [14usize, 16, 18] {
+            const QUOTIENT_DEGREE_BITS: usize = 3;
+            let z_h_on_coset = ZeroPolyOnCoset::<F>::new(
+                domain_bits - QUOTIENT_DEGREE_BITS,
+                QUOTIENT_DEGREE_BITS,
+            );
+            let len = (1 << domain_bits) * NUM_CHALLENGES;
+            let contribution = noncanonical_values(len, domain_bits as u64 + 1);
+            // Hold total processed points approximately constant across sizes.
+            let iterations = 1usize << (25 - domain_bits);
+
+            for (label, normalize_after_merge) in
+                [("raw-add", false), ("final-normalize", true)]
+            {
+                let mut accumulated = noncanonical_values(len, domain_bits as u64 + 9);
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    merge_gpu_quotient_values(
+                        black_box(&mut accumulated),
+                        black_box(&contribution),
+                        NUM_CHALLENGES,
+                        &z_h_on_coset,
+                        normalize_after_merge,
+                    );
+                }
+                let elapsed = start.elapsed();
+                let ns_per_point = elapsed.as_nanos() as f64
+                    / (iterations * (1 << domain_bits)) as f64;
+                println!(
+                    "quotient merge {label:>15} d{domain_bits}: {ns_per_point:.3} ns/point ({iterations} iterations, {elapsed:?})"
+                );
+                black_box(accumulated);
             }
         }
     }
