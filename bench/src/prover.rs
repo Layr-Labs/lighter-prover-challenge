@@ -29,7 +29,9 @@ use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::util::timing::TimingTree;
 
-use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
+use crate::api::{prover_thread_stack_bytes, Circuits, Proof};
+#[cfg(test)]
+use crate::api::PROVER_THREAD_STACK_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxPath {
@@ -404,7 +406,7 @@ fn prove_path(
                 let previous = chain.take();
                 let handle = std::thread::Builder::new()
                     .name(format!("{path:?}-chain-step-{chain_step}"))
-                    .stack_size(PROVER_THREAD_STACK_BYTES)
+                    .stack_size(prover_thread_stack_bytes())
                     .spawn_scoped(scope, move || {
                         chain_step_proof(
                             path,
@@ -424,7 +426,7 @@ fn prove_path(
             let witness = current_witness;
             let proof_handle = std::thread::Builder::new()
                 .name(format!("{path:?}-tx-proof-{current_step}"))
-                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .stack_size(prover_thread_stack_bytes())
                 .spawn_scoped(scope, move || {
                     prove_tx_witness(path, current_chunk_index, tx_data, witness)
                 })
@@ -484,7 +486,7 @@ fn prove_path(
             let previous = chain.take();
             let handle = std::thread::Builder::new()
                 .name(format!("{path:?}-chain-step-{chain_step}"))
-                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .stack_size(prover_thread_stack_bytes())
                 .spawn_scoped(scope, move || {
                     chain_step_proof(
                         path,
@@ -684,7 +686,7 @@ pub(crate) fn prove_block_after_pre(
             // worker exits via `process::exit`.
             let heavy_handle_outer = std::thread::Builder::new()
                 .name("heavy-tx-chain".into())
-                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .stack_size(prover_thread_stack_bytes())
                 .spawn_scoped(scope, || {
                     prove_path(
                         TxPath::Heavy,
@@ -703,7 +705,7 @@ pub(crate) fn prove_block_after_pre(
             let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
-                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .stack_size(prover_thread_stack_bytes())
                 .spawn_scoped(scope, move || {
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_context = plonky2::util::profile::enter_context(
@@ -766,7 +768,7 @@ pub(crate) fn prove_block_after_pre(
             let light_chunks = std::mem::take(&mut light_chunks);
             let light_handle = std::thread::Builder::new()
                 .name("light-tx-chain".into())
-                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .stack_size(prover_thread_stack_bytes())
                 .spawn_scoped(scope, || {
                     mark_spine_thread_latency_critical();
                     prove_path(

@@ -15,7 +15,7 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 
 use api::{
-    Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
+    prover_thread_stack_bytes, Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF,
     PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
 };
 use circuit::block_pre_execution_constraints::Circuit as _;
@@ -65,7 +65,7 @@ fn main() {
     // log consumer, and diagnostics remain available in debug/test builds.
     // Do not link and initialize an unused logger in every scored process.
     rayon::ThreadPoolBuilder::new()
-        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .stack_size(prover_thread_stack_bytes())
         .build_global()
         .expect("cannot configure prover thread pool");
     #[cfg(feature = "diagnostic_profile")]
@@ -132,7 +132,7 @@ fn main() {
         };
         let pre_handle = std::thread::Builder::new()
             .name("pre-exec-startup".into())
-            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .stack_size(prover_thread_stack_bytes())
             .spawn(move || {
                 let (pre_target, mut pre_data) = pre_circuits;
                 let pre_proof =

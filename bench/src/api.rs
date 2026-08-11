@@ -24,7 +24,20 @@ pub const LIGHT_TX_MODE: u8 = TX_LIGHT;
 pub const ON_CHAIN_OPERATIONS_LIMIT: usize = 1;
 pub const PUBLIC_HEAVY_TX_COUNT: usize = 10;
 pub const PUBLIC_LIGHT_TX_COUNT: usize = 490;
-pub const PROVER_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
+pub const PROVER_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
+
+/// The candidate default is 32 MiB. `LIGHTER_PROVER_STACK_64=1` exists only
+/// for same-binary diagnostic control; an empty or unrelated cleared worker
+/// environment keeps the candidate path.
+pub fn prover_thread_stack_bytes() -> usize {
+    if std::env::var_os("LIGHTER_PROVER_STACK_64").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        64 * 1024 * 1024
+    } else {
+        PROVER_THREAD_STACK_BYTES
+    }
+}
 
 pub struct Circuits {
     pub heavy_tx_target: BlockTxTarget,
