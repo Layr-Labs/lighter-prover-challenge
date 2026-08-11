@@ -1285,13 +1285,8 @@ mod tests {
                 new_counts, legacy_counts,
                 "unresolved-watch counts diverge from the legacy map scan"
             );
+            assert_eq!(new_witness.values, legacy_witness.values);
             assert_eq!(new_witness.set_bitmap, legacy_witness.set_bitmap);
-            // Unset slots are uninitialized storage; compare set slots only.
-            for rep in 0..new_witness.values.len() {
-                if new_witness.is_set_by_rep_index(rep) {
-                    assert_eq!(new_witness.values[rep], legacy_witness.values[rep]);
-                }
-            }
         }
 
         Ok(())
@@ -1418,23 +1413,12 @@ mod tests {
         let two_phase = pending.finish()?;
 
         let mut nondeterministic_positions = 0usize;
-        // `values` slots are uninitialized storage unless their bitmap bit is
-        // set, so compare only slots every witness actually set; unset slots
-        // are F::ZERO at every real observation point (full_witness,
-        // try_get_target) and carry no information here.
-        for (rep, (single, split)) in single_shot
+        for ((single, repeat), split) in single_shot
             .values
             .iter()
+            .zip(&single_shot_repeat.values)
             .zip(&two_phase.values)
-            .enumerate()
         {
-            if !(single_shot.is_set_by_rep_index(rep)
-                && single_shot_repeat.is_set_by_rep_index(rep)
-                && two_phase.is_set_by_rep_index(rep))
-            {
-                continue;
-            }
-            let repeat = &single_shot_repeat.values[rep];
             if single == repeat {
                 assert_eq!(single, split);
             } else {
@@ -1498,18 +1482,12 @@ mod tests {
         let direct_seeded = direct_seeded.finish()?;
 
         let mut nondeterministic_positions = 0usize;
-        // Unset slots are uninitialized storage; compare bitmap-set slots only
-        // (same masking as the other witness-equality tests in this module).
-        for rep in 0..map_seeded.values.len() {
-            if !(map_seeded.is_set_by_rep_index(rep)
-                && map_seeded_repeat.is_set_by_rep_index(rep)
-                && direct_seeded.is_set_by_rep_index(rep))
-            {
-                continue;
-            }
-            let map = &map_seeded.values[rep];
-            let map_repeat = &map_seeded_repeat.values[rep];
-            let direct = &direct_seeded.values[rep];
+        for ((map, map_repeat), direct) in map_seeded
+            .values
+            .iter()
+            .zip(&map_seeded_repeat.values)
+            .zip(&direct_seeded.values)
+        {
             if map == map_repeat {
                 assert_eq!(map, direct);
             } else {
@@ -1595,18 +1573,6 @@ mod tests {
 
         let mut nondeterministic_positions = 0usize;
         for position in 0..sequential.values.len() {
-            // Unset slots are uninitialized storage; only bitmap-set slots
-            // carry witness values (all five witnesses set the same slots —
-            // their bitmaps are checked for agreement below via full use).
-            if !(sequential.is_set_by_rep_index(position)
-                && sequential_repeat.is_set_by_rep_index(position)
-                && ungated.is_set_by_rep_index(position)
-                && parallel_default.is_set_by_rep_index(position)
-                && parallel_stress.is_set_by_rep_index(position)
-                && parallel_two_phase.is_set_by_rep_index(position))
-            {
-                continue;
-            }
             if sequential.values[position] == sequential_repeat.values[position] {
                 assert_eq!(sequential.values[position], ungated.values[position]);
                 assert_eq!(
