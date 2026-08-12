@@ -53,7 +53,7 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // Light-proof throughput is the run's terminal constraint (the chain drains
 // concurrently and finishes within a step of the last tx proof; the block
 // waits for both), so the window depth divides the longest phase directly.
-// Series draw marker: v11 surface (ramp depth 2), sample 5.
+// Series draw marker: v14 surface (committed pipeline archive on v13), sample 1.
 // The depth-4 ceiling dated from tighter-memory hosts: measured peak RSS is
 // ~6.8 GB at depth 4 against 24 GB local / 48 GB ranked, and mid-run CPU
 // occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
@@ -260,7 +260,7 @@ fn chain_step_proof(
         BlockTxChainCircuit::prove_prepared(pending, chain_data)
     })();
     // This step is no longer part of the runnable backlog (see the matching
-    // spine_backlog_add(1) at all spawn sites).
+    // spine_backlog_add(1) at both spawn sites).
     plonky2::hash::poseidon2::spine_backlog_add(-1);
     result.unwrap_or_else(|error| {
         panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")
@@ -565,9 +565,6 @@ fn prove_path(
         }
 
         if let Some((chain_step, tx_proof)) = pending_tx.take() {
-            // This post-loop step is runnable and decrements the global
-            // backlog in `chain_step_proof`, exactly like both spawn loops.
-            plonky2::hash::poseidon2::spine_backlog_add(1);
             let previous = chain.take();
             let handle = std::thread::Builder::new()
                 .name(format!("{path:?}-chain-step-{chain_step}"))
