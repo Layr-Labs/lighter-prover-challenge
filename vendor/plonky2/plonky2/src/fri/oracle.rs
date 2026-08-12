@@ -125,6 +125,75 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         )
     }
 
+    /// Reconstructs a fixed non-blinded commitment while reusing one
+    /// build-time hash per small Merkle subtree. Coefficients and LDE columns
+    /// are still derived normally because quotient evaluation and openings
+    /// need them; the wide leaf sponge is paid only for subtrees selected by
+    /// actual FRI queries.
+    #[cfg(feature = "std")]
+    pub fn from_values_with_precomputed_subtree_roots(
+        values: Vec<PolynomialValues<F>>,
+        rate_bits: usize,
+        cap_height: usize,
+        subtree_log: usize,
+        subtree_roots: Vec<<C::Hasher as Hasher<F>>::Hash>,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Self {
+        let coeffs = timed!(
+            timing,
+            "IFFT",
+            values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
+        );
+        let degree = coeffs[0].len();
+        let lde_len = degree << rate_bits;
+        assert_eq!(subtree_roots.len(), lde_len >> subtree_log);
+
+        let mut shared_columns =
+            C::Hasher::try_allocate_merkle_tree_columns(coeffs.len(), lde_len, cap_height);
+        let columns = if let Some(columns) = shared_columns.as_mut() {
+            let initialized = timed!(
+                timing,
+                "FFT + blinding",
+                Self::fill_lde_column_store(columns, &coeffs, rate_bits, fft_root_table)
+            );
+            if initialized {
+                shared_columns.take().unwrap()
+            } else {
+                ColumnStore::Owned(Self::lde_values(
+                    &coeffs,
+                    rate_bits,
+                    false,
+                    fft_root_table,
+                ))
+            }
+        } else {
+            ColumnStore::Owned(timed!(
+                timing,
+                "FFT + blinding",
+                Self::lde_values(&coeffs, rate_bits, false, fft_root_table)
+            ))
+        };
+
+        let merkle_tree = timed!(
+            timing,
+            "build sparse fixed Merkle upper tree",
+            MerkleTree::from_prehashed_subtree_roots(
+                columns,
+                subtree_roots,
+                subtree_log,
+                cap_height,
+            )
+        );
+        Self {
+            polynomials: coeffs,
+            merkle_tree,
+            degree_log: log2_strict(degree),
+            rate_bits,
+            blinding: false,
+        }
+    }
+
     /// Creates a list polynomial commitment for the polynomials `polynomials`.
     pub fn from_coeffs(
         polynomials: Vec<PolynomialCoeffs<F>>,

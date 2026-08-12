@@ -365,6 +365,8 @@ pub trait Read {
             num_leaves,
             digests,
             level_digests: None,
+            #[cfg(feature = "std")]
+            sparse_digests: None,
             cap,
         })
     }
@@ -1500,12 +1502,10 @@ pub trait Write {
             self.write_usize(leaf.len())?;
             self.write_field_vec(&leaf)?;
         }
-        match &tree.level_digests {
-            // GPU-built trees keep their digests in level order; materialize
-            // the interleaved layout the wire format expects (cold path).
-            Some(levels) => self.write_hash_vec::<F, H>(&levels.to_interleaved())?,
-            None => self.write_hash_vec::<F, H>(&tree.digests)?,
-        }
+        // GPU-built and sparse fixed trees use alternative internal layouts;
+        // materialize the canonical interleaved wire representation on this
+        // cold serialization path.
+        self.write_hash_vec::<F, H>(&tree.interleaved_digests())?;
         self.write_usize(tree.cap.height())?;
         self.write_merkle_cap(&tree.cap)?;
 

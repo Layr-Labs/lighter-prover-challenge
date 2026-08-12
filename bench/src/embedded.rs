@@ -159,6 +159,7 @@ impl Circuits {
 mod tests {
     use circuit::circuit_serializer::BlockGateSerializer;
     use circuit::embed::EmbedGeneratorSerializer;
+    use plonky2::hash::merkle_proofs::verify_merkle_proof_to_cap;
     use plonky2::util::serialization::Write as _;
 
     use super::*;
@@ -430,5 +431,27 @@ mod tests {
                 "embedded circuit blob {name} is an empty stub"
             );
         }
+    }
+
+    /// Loads a real production blob, opens paths across several eight-leaf
+    /// subtree boundaries, and verifies them against the embedded verifier cap.
+    #[test]
+    fn embedded_sparse_commitment_paths_verify() {
+        on_big_stack(|| {
+            let (_, data) =
+                load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB).expect("pre blob must load");
+            let tree = &data.prover_only.constants_sigmas_commitment.merkle_tree;
+            assert!(tree.sparse_digests.is_some(), "pre commitment must be sparse");
+            for &leaf_index in &[0usize, 7, 8, 1023, tree.num_leaves - 1, 8] {
+                let proof = tree.prove(leaf_index);
+                verify_merkle_proof_to_cap(
+                    tree.leaf_vec(leaf_index),
+                    leaf_index,
+                    &tree.cap,
+                    &proof,
+                )
+                .expect("sparse production Merkle path must verify");
+            }
+        });
     }
 }

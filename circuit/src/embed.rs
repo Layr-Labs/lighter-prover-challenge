@@ -36,11 +36,11 @@
 use anyhow::{Context, Result, bail, ensure};
 use plonky2::field::fft::{cached_fft_root_table, cached_two_adic_subgroup};
 use plonky2::field::polynomial::PolynomialValues;
-use plonky2::field::types::Field;
 use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::plonk::circuit_data::{
     CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
 };
+use plonky2::plonk::config::GenericConfig;
 use plonky2::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
@@ -66,7 +66,11 @@ fn embed_generator_serializer() -> EmbedGeneratorSerializer {
 }
 
 const EMBED_MAGIC: u32 = 0x4C45_4331; // "LEC1"
-const EMBED_VERSION: u32 = 1;
+const EMBED_VERSION: u32 = 2;
+/// Eight wide leaves per lazily materialized fixed Merkle subtree. This is the
+/// measured compute/embedded-size sweet spot: one 32-byte root replaces eight
+/// wide leaves and dozens of Poseidon2 sponge permutations at startup.
+const FIXED_SUBTREE_LOG: usize = 3;
 
 // ---------------------------------------------------------------------------
 // Primitive encoding helpers
@@ -287,6 +291,19 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     }
     write_compressed_section(&mut out, &buf);
 
+    // One root per eight constants/sigmas LDE leaves. Unlike embedding every
+    // incompressible leaf digest, this adds only about 5.5 MiB across all five
+    // circuits. Runtime builds the small upper tree immediately and hashes an
+    // eight-leaf lower subtree only when a random FRI query touches it.
+    let subtree_roots = prover
+        .constants_sigmas_commitment
+        .merkle_tree
+        .subtree_roots(FIXED_SUBTREE_LOG);
+    let mut buf = Vec::with_capacity(8 + subtree_roots.len() * 32);
+    buf.write_hash_vec::<F, <C as GenericConfig<D>>::Hasher>(&subtree_roots)
+        .map_err(|e| anyhow::anyhow!("serializing fixed Merkle subtree roots: {e:?}"))?;
+    write_section(&mut out, &buf);
+
     Ok(out)
 }
 
@@ -468,6 +485,16 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         representative_map
             .push(u32::try_from(parent).context("representative map entry out of range")?);
     }
+
+    // Canonical roots of fixed eight-leaf Merkle subtrees, in tree order.
+    let section = read_section(bytes, &mut pos)?;
+    let mut reader = Buffer::new(section);
+    let root_count = reader
+        .read_usize()
+        .map_err(|e| anyhow::anyhow!("deserializing fixed Merkle root count: {e:?}"))?;
+    let constants_sigmas_subtree_roots = reader
+        .read_hash_vec::<F, <C as GenericConfig<D>>::Hasher>(root_count)
+        .map_err(|e| anyhow::anyhow!("deserializing fixed Merkle subtree roots: {e:?}"))?;
     ensure!(pos == bytes.len(), "trailing bytes in embedded circuit blob");
 
     // ---- recompute the derived prover-only components ----
@@ -508,15 +535,23 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // of two independent reads changes — no quantity is computed differently.
     let sigmas = transpose_poly_values_ref(&sigma_vecs);
 
-    // The builder's commitment path: values in, IFFT inside, LDE + Merkle.
-    // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).
+    // Reconstruct coefficients and LDE columns through the builder's exact
+    // path, then attach the embedded upper commitment. Only queried
+    // eight-leaf subtrees pay the wide Poseidon2 leaf sponge at runtime.
     let mut constants_sigmas_vecs = constant_values;
     constants_sigmas_vecs.extend(sigma_vecs);
-    let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
+    ensure!(
+        constants_sigmas_subtree_roots.len()
+            == (degree << rate_bits) >> FIXED_SUBTREE_LOG,
+        "embedded fixed Merkle root count diverges from the LDE domain"
+    );
+    let constants_sigmas_commitment =
+        PolynomialBatch::<F, C, D>::from_values_with_precomputed_subtree_roots(
         constants_sigmas_vecs,
         rate_bits,
-        false,
         cap_height,
+        FIXED_SUBTREE_LOG,
+        constants_sigmas_subtree_roots,
         &mut TimingTree::default(),
         Some(&root_table),
     );
