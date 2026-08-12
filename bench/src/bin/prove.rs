@@ -255,3 +255,4 @@ fn main() {
 // arithmetic-on-promoted-frontier-1786506400
 
 // p90-fire-top1-50-1786515495
+// INV_BATCH256 isolate marker arsuxa-inv256-1-1786563081
