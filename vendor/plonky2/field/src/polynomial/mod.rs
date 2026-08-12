@@ -85,8 +85,15 @@ impl<F: Field> PolynomialValues<F> {
     }
 
     pub fn lde(self, rate_bits: usize) -> Self {
-        let coeffs = ifft(self).lde(rate_bits);
-        fft_with_options(coeffs, Some(rate_bits), None)
+        let coeffs = ifft(self);
+        let len = coeffs.len() << rate_bits;
+        let mut padded = Vec::with_capacity(len);
+        // SAFETY: `prepare_zero_padded_fft`'s expansion writes every slot of the
+        // padded buffer before any read (differential-gated: tail content is
+        // provably unobserved); `F: Field` is `Copy` with no drop glue.
+        unsafe { padded.set_len(len) };
+        padded[..coeffs.len()].copy_from_slice(&coeffs.coeffs);
+        fft_with_options(PolynomialCoeffs { coeffs: padded }, Some(rate_bits), None)
     }
 
     /// Low-degree extend `Self` (seen as evaluations over the subgroup) onto a coset.
