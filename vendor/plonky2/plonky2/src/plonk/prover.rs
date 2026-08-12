@@ -761,10 +761,11 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
         quotient_products_1.set_len(product_count);
     }
 
-    vec![
-        z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
-        z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
-    ]
+    let (z_0, z_1) = rayon::join(
+        || z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
+        || z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
+    );
+    vec![z_0, z_1]
 }
 
 /// Compute the partial products used in the `Z` polynomial.
@@ -1953,6 +1954,30 @@ fn compute_quotient_polys<
     };
 
     let z_h_on_coset = ZeroPolyOnCoset::new(common_data.degree_bits(), quotient_degree_bits);
+    // When at least one Metal quotient job is active, every producer's values
+    // are numerators on the same quotient domain. Leave the CPU batch
+    // unscaled, merge the GPU numerators additively, and apply the common
+    // `Z_H(i)^-1` scale once per point afterwards. Without any Metal job the
+    // established CPU-only schedule is kept unchanged (the denominator
+    // multiplication stays inside the hot 32-point batch, exactly as before).
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let any_gpu_quotient =
+        gpu_poseidon.is_some() || gpu_range.is_some() || gpu_permutation.is_some();
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let any_gpu_quotient = false;
+    // The common `Z_H(i)^-1` scale is applied inside the *last* active GPU
+    // merge, so the merged buffer is traversed exactly as many times as the
+    // promoted per-job merges did, with no extra final pass.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let scale_in_poseidon_merge =
+        gpu_poseidon.is_some() && gpu_range.is_none() && gpu_permutation.is_none();
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let scale_in_range_merge = gpu_range.is_some() && gpu_permutation.is_none();
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let scale_in_permutation_merge = gpu_permutation.is_some();
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let (_scale_in_poseidon_merge, _scale_in_range_merge, _scale_in_permutation_merge) =
+        (false, false, false);
     // The `L_0` denominator inverses consumed by `eval_l_0` depend only on
     // `(degree_bits, quotient_degree_bits, coset shift)` — not on any challenge — so they are
     // computed once per circuit shape for the process and shared across proofs. Each cached
@@ -2334,14 +2359,16 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
+                if !any_gpu_quotient {
+                    for (&i, quotient_values) in indices_batch
+                        .iter()
+                        .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
+                    {
+                        let denominator_inv = z_h_on_coset.eval_inverse(i);
+                        quotient_values
+                            .iter_mut()
+                            .for_each(|v| *v *= denominator_inv);
+                    }
                 }
             },
         );
@@ -2385,9 +2412,12 @@ fn compute_quotient_polys<
             .zip(gpu_values.par_chunks_exact(num_challenges))
             .enumerate()
             .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    *cpu += gpu;
+                }
+                if scale_in_range_merge {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    cpu_values.iter_mut().for_each(|v| *v *= denominator_inv);
                 }
             });
     }
@@ -2434,9 +2464,12 @@ fn compute_quotient_polys<
             .zip(gpu_values.par_chunks_exact(num_challenges))
             .enumerate()
             .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    *cpu += gpu;
+                }
+                if scale_in_poseidon_merge {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    cpu_values.iter_mut().for_each(|v| *v *= denominator_inv);
                 }
             });
     }
@@ -2471,9 +2504,12 @@ fn compute_quotient_polys<
             .zip(gpu_values.par_chunks_exact(num_challenges))
             .enumerate()
             .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    *cpu += gpu;
+                }
+                if scale_in_permutation_merge {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    cpu_values.iter_mut().for_each(|v| *v *= denominator_inv);
                 }
             });
     }
