@@ -594,21 +594,28 @@ fn divide_chunk_products<F: Field>(
 /// and the whole-phase transpose. Values and their order are identical to the
 /// swap-based version: for each point, column k receives the k-th running
 /// product, and the last column receives the previous Z(x).
-fn z_polynomials_from_quotient_chunk_products<F: Field>(
+fn z_polynomials_from_quotient_chunk_products<F: Field, const SKIP_FIXED_CHUNKS: bool>(
     all_quotient_chunk_products: Vec<F>,
     num_prods: usize,
+    fixed_chunk_mask: &[u8],
 ) -> Vec<PolynomialValues<F>> {
     let num_chunks = num_prods + 1;
     debug_assert_eq!(all_quotient_chunk_products.len() % num_chunks, 0);
+    debug_assert!(!SKIP_FIXED_CHUNKS || fixed_chunk_mask.len() == all_quotient_chunk_products.len());
     let n_points = all_quotient_chunk_products.len() / num_chunks;
     let mut columns: Vec<Vec<F>> = (0..num_chunks)
         .map(|_| Vec::with_capacity(n_points))
         .collect();
     let mut z_x = F::ONE;
-    for quotient_chunk_products in all_quotient_chunk_products.chunks_exact(num_chunks) {
+    for (point, quotient_chunk_products) in all_quotient_chunk_products
+        .chunks_exact(num_chunks)
+        .enumerate()
+    {
         let mut acc = z_x;
         for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
-            acc *= quotient_chunk_product;
+            if !SKIP_FIXED_CHUNKS || fixed_chunk_mask[point * num_chunks + k] != u8::MAX {
+                acc *= quotient_chunk_product;
+            }
             if k == num_prods {
                 // The last term is Z(gx), but we store Z(x) in its place,
                 // otherwise Z would end up shifted.
@@ -631,13 +638,18 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
 /// wires of every row — 80 columns at the production shape — and keeps nothing
 /// warm for the next challenge, which then re-streams the identical bytes.
 /// Fusing collapses two full traversals of the witness and sigma matrices, and
-/// two Rayon fork/joins over the subgroup, into one.
+/// two Rayon fork/joins over the subgroup, into one. The paired field hook also
+/// maps the two independent challenge lanes onto AArch64's existing two-lane
+/// Goldilocks multiply backend, so the shared traversal does paired arithmetic
+/// instead of merely issuing the same scalar instruction stream twice.
 ///
 /// Value-exactness: each challenge keeps its own accumulators, its own
 /// numerator/denominator multiplication order (`for j in start..end`), its own
-/// inversion batch in the same push order, and its own Z chain. Only the
-/// memory traversal and the Rayon scheduling are shared, so every output limb
-/// is bit-identical to running the per-challenge path twice.
+/// inversion batch in the same push order, and its own Z chain. The paired
+/// multiply is raw-representative-identical lane by lane. The two Z chains are
+/// evaluated concurrently but retain their original left-to-right recurrence,
+/// so every output limb is bit-identical to running the per-challenge path
+/// twice.
 fn two_challenge_wires_permutation_partial_products_and_zs<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -650,6 +662,7 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
 ) -> Vec<Vec<PolynomialValues<F>>> {
+    // Source-identical redraw after the first official run landed in the 25.6 TPS runner band.
     debug_assert_eq!(betas.len(), 2);
     debug_assert_eq!(gammas.len(), 2);
     let degree = common_data.quotient_degree_factor;
@@ -662,6 +675,17 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     let (beta_k_is_0, beta_k_is_1) = beta_k_is.split_at(num_routed_wires);
     let (beta_0, beta_1) = (betas[0], betas[1]);
     let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
+
+    // At the production quotient degree every partial-product chunk is exactly
+    // one byte of the row-major fixed-wire mask (80 routed wires = 10 bytes).
+    // Consume that byte once and visit only its non-fixed bits, in ascending
+    // wire order. This deletes the eight per-wire mask probes/branches and the
+    // loop bodies for symbolically cancelled factors without changing either
+    // challenge's multiplication order. Keep the generic path for other
+    // quotient degrees and partial final chunks.
+    let byte_aligned_fixed_chunks = degree == 8
+        && num_routed_wires.is_multiple_of(8)
+        && prover_data.fixed_routed_wires.len() * 8 == subgroup.len() * num_routed_wires;
 
     const INV_BATCH: usize = 128;
     let product_count = subgroup.len() * num_chunks;
@@ -691,13 +715,22 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                         Vec::with_capacity(num_chunks * INV_BATCH),
                         Vec::with_capacity(num_chunks * INV_BATCH),
                         Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(num_chunks * INV_BATCH),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
                     let base = chunk_idx * INV_BATCH;
-                    let (denominators_0, denominators_1, denominator_inverses) = scratch;
+                    let (
+                        denominators_0,
+                        denominators_1,
+                        denominator_inverses_0,
+                        denominator_inverses_1,
+                        active_outputs,
+                    ) = scratch;
                     denominators_0.clear();
                     denominators_1.clear();
+                    active_outputs.clear();
                     for (t, &x) in xs.iter().enumerate() {
                         let i = base + t;
                         let s_sigmas = &prover_data.sigmas[i];
@@ -705,34 +738,118 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                         for chunk in 0..num_chunks {
                             let start = chunk * degree;
                             let end = min(start + degree, num_routed_wires);
-                            let mut numerator_0 = F::ONE;
-                            let mut numerator_1 = F::ONE;
-                            let mut denominator_0 = F::ONE;
-                            let mut denominator_1 = F::ONE;
-                            for j in start..end {
-                                // A singleton routed copy component maps this position to itself:
-                                // sigma(i,j) = k_j * x. Its numerator and denominator factors are
-                                // therefore identical for both challenges and cancel symbolically,
-                                // including when that common factor evaluates to zero. Check the
-                                // circuit-fixed bit before touching witness, sigma, x, or shifts.
-                                if fixed_routed_wire(
-                                    &prover_data.fixed_routed_wires,
-                                    routed_base + j,
-                                ) {
-                                    continue;
+                            let mut numerators = [F::ONE; 2];
+                            let mut denominators = [F::ONE; 2];
+                            let live_product = if byte_aligned_fixed_chunks {
+                                let mut active = !prover_data.fixed_routed_wires
+                                    [(routed_base + start) >> 3];
+                                let live = active != 0;
+                                // Peel the first live factor into a direct
+                                // assignment. `ONE * factor` is a raw-word
+                                // identity for Goldilocks (pinned below), so
+                                // this removes two paired accumulator
+                                // multiplications per nonempty byte without
+                                // changing either challenge's value or
+                                // representative. An all-fixed byte keeps the
+                                // multiplicative identity.
+                                let mut first = true;
+                                while active != 0 {
+                                    let bit = active.trailing_zeros() as usize;
+                                    let j = start + bit;
+                                    active &= active - 1;
+                                    let wire_value = witness.get_wire(i, j);
+                                    let sigma = s_sigmas[j];
+                                    let wire_gamma =
+                                        [wire_value + gamma_0, wire_value + gamma_1];
+                                    let factors = F::multiply_accumulate_quad(
+                                        [
+                                            wire_gamma[0],
+                                            wire_gamma[1],
+                                            wire_gamma[0],
+                                            wire_gamma[1],
+                                        ],
+                                        [beta_k_is_0[j], beta_k_is_1[j], beta_0, beta_1],
+                                        [x, x, sigma, sigma],
+                                    );
+                                    let numerator_factors = [factors[0], factors[1]];
+                                    let denominator_factors = [factors[2], factors[3]];
+                                    if first {
+                                        numerators = numerator_factors;
+                                        denominators = denominator_factors;
+                                        first = false;
+                                    } else {
+                                        let products = F::multiply_quad(
+                                            [
+                                                numerators[0],
+                                                numerators[1],
+                                                denominators[0],
+                                                denominators[1],
+                                            ],
+                                            [
+                                                numerator_factors[0],
+                                                numerator_factors[1],
+                                                denominator_factors[0],
+                                                denominator_factors[1],
+                                            ],
+                                        );
+                                        numerators = [products[0], products[1]];
+                                        denominators = [products[2], products[3]];
+                                    }
                                 }
-                                let wire_value = witness.get_wire(i, j);
-                                let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
-                            }
+                                live
+                            } else {
+                                for j in start..end {
+                                    // A singleton routed copy component maps this position to itself:
+                                    // sigma(i,j) = k_j * x. Its numerator and denominator factors are
+                                    // therefore identical for both challenges and cancel symbolically,
+                                    // including when that common factor evaluates to zero. Check the
+                                    // circuit-fixed bit before touching witness, sigma, x, or shifts.
+                                    if fixed_routed_wire(
+                                        &prover_data.fixed_routed_wires,
+                                        routed_base + j,
+                                    ) {
+                                        continue;
+                                    }
+                                    let wire_value = witness.get_wire(i, j);
+                                    let sigma = s_sigmas[j];
+                                    let wire_gamma =
+                                        [wire_value + gamma_0, wire_value + gamma_1];
+                                    let factors = F::multiply_accumulate_quad(
+                                        [
+                                            wire_gamma[0],
+                                            wire_gamma[1],
+                                            wire_gamma[0],
+                                            wire_gamma[1],
+                                        ],
+                                        [beta_k_is_0[j], beta_k_is_1[j], beta_0, beta_1],
+                                        [x, x, sigma, sigma],
+                                    );
+                                    let products = F::multiply_quad(
+                                        [
+                                            numerators[0],
+                                            numerators[1],
+                                            denominators[0],
+                                            denominators[1],
+                                        ],
+                                        factors,
+                                    );
+                                    numerators = [products[0], products[1]];
+                                    denominators = [products[2], products[3]];
+                                }
+                                // Keep uncommon/generic geometries on the
+                                // original dense inversion schedule.
+                                true
+                            };
                             let output = t * num_chunks + chunk;
-                            products_0[output].write(numerator_0);
-                            products_1[output].write(numerator_1);
-                            denominators_0.push(denominator_0);
-                            denominators_1.push(denominator_1);
+                            products_0[output].write(numerators[0]);
+                            products_1[output].write(numerators[1]);
+                            if live_product {
+                                denominators_0.push(denominators[0]);
+                                denominators_1.push(denominators[1]);
+                                if byte_aligned_fixed_chunks {
+                                    active_outputs.push(output);
+                                }
+                            }
                         }
                     }
                     // SAFETY: the loop above wrote every slot of both
@@ -747,24 +864,89 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     let products_1 = unsafe {
                         &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
                     };
-                    divide_chunk_products(products_0, denominators_0, denominator_inverses);
-                    divide_chunk_products(products_1, denominators_1, denominator_inverses);
+                    F::batch_multiplicative_inverse_pair_into(
+                        denominators_0,
+                        denominators_1,
+                        denominator_inverses_0,
+                        denominator_inverses_1,
+                    );
+                    if byte_aligned_fixed_chunks {
+                        // Empty mask bytes have numerator/denominator ONE and
+                        // therefore quotient ONE. Leave their already-written
+                        // product slots alone; invert and divide only nonempty
+                        // chunks. The following Z accumulation is raw-limb
+                        // identical for canonical and Montgomery-produced ONE
+                        // representatives (pinned by the differential tests).
+                        for (packed, &index) in active_outputs.iter().enumerate() {
+                            let quotient_pair = F::multiply_pair(
+                                [products_0[index], products_1[index]],
+                                [
+                                    denominator_inverses_0[packed],
+                                    denominator_inverses_1[packed],
+                                ],
+                            );
+                            products_0[index] = quotient_pair[0];
+                            products_1[index] = quotient_pair[1];
+                        }
+                    } else {
+                        for index in 0..products_0.len() {
+                            let quotient_pair = F::multiply_pair(
+                                [products_0[index], products_1[index]],
+                                [denominator_inverses_0[index], denominator_inverses_1[index]],
+                            );
+                            products_0[index] = quotient_pair[0];
+                            products_1[index] = quotient_pair[1];
+                        }
+                    }
                 },
             );
     }
 
-    // SAFETY: the parallel pass above wrote and then divided every one of the
-    // `product_count` slots of both buffers; `par_chunks_mut` partitions each
+    // SAFETY: the parallel pass above wrote every one of the `product_count`
+    // slots of both buffers, then divided each live slot (empty fixed-mask
+    // chunks already contain quotient ONE); `par_chunks_mut` partitions each
     // buffer exactly, so none is left uninitialized.
     unsafe {
         quotient_products_0.set_len(product_count);
         quotient_products_1.set_len(product_count);
     }
 
-    vec![
-        z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
-        z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
-    ]
+    let (z_0, z_1) = if byte_aligned_fixed_chunks {
+        join(
+            || {
+                z_polynomials_from_quotient_chunk_products::<F, true>(
+                    quotient_products_0,
+                    num_prods,
+                    &prover_data.fixed_routed_wires,
+                )
+            },
+            || {
+                z_polynomials_from_quotient_chunk_products::<F, true>(
+                    quotient_products_1,
+                    num_prods,
+                    &prover_data.fixed_routed_wires,
+                )
+            },
+        )
+    } else {
+        join(
+            || {
+                z_polynomials_from_quotient_chunk_products::<F, false>(
+                    quotient_products_0,
+                    num_prods,
+                    &[],
+                )
+            },
+            || {
+                z_polynomials_from_quotient_chunk_products::<F, false>(
+                    quotient_products_1,
+                    num_prods,
+                    &[],
+                )
+            },
+        )
+    };
+    vec![z_0, z_1]
 }
 
 /// Compute the partial products used in the `Z` polynomial.
@@ -831,8 +1013,11 @@ fn wires_permutation_partial_products_and_zs<
                         let mut denominator_product = F::ONE;
                         for j in start..end {
                             let wire_value = witness.get_wire(i, j);
-                            numerator_product *= wire_value + beta_k_is[j] * x + gamma;
-                            denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
+                            let wire_gamma = wire_value + gamma;
+                            numerator_product *=
+                                wire_gamma.multiply_accumulate(beta_k_is[j], x);
+                            denominator_product *=
+                                wire_gamma.multiply_accumulate(beta, s_sigmas[j]);
                         }
                         quotient_products[t * num_chunks + chunk].write(numerator_product);
                         denominator_products.push(denominator_product);
@@ -859,7 +1044,11 @@ fn wires_permutation_partial_products_and_zs<
     // none is left uninitialized.
     unsafe { all_quotient_chunk_products.set_len(product_count) };
 
-    z_polynomials_from_quotient_chunk_products(all_quotient_chunk_products, num_prods)
+    z_polynomials_from_quotient_chunk_products::<F, false>(
+        all_quotient_chunk_products,
+        num_prods,
+        &[],
+    )
 }
 
 /// Computes lookup polynomials for a given challenge.
@@ -3470,10 +3659,10 @@ mod permutation_pairing_tests {
         assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
         assert_eq!(data.common.k_is.len(), num_routed_wires);
 
-        // Point counts spanning: a single point, a short first batch, the
-        // inversion batch boundary (INV_BATCH = 128) exactly, one past it, and
-        // several batches with a short tail.
-        for &n_points in &[1usize, 5, 127, 128, 129, 300] {
+        // Polynomial domains are powers of two. Span a single point, short
+        // batches, the inversion boundary (INV_BATCH = 128), and multiple
+        // complete batches without constructing invalid PolynomialValues.
+        for &n_points in &[1usize, 4, 64, 128, 256, 512] {
             let mut rng = Rng::new(0x9e37_79b9_7f4a_7c15 ^ ((n_points as u64) << 8));
 
             let subgroup: Vec<F> = (0..n_points).map(|_| rng.next_field()).collect();
@@ -3736,4 +3925,5 @@ mod permutation_pairing_tests {
             }
         }
     }
+
 }
