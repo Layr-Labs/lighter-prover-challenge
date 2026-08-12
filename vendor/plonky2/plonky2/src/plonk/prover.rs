@@ -2516,15 +2516,14 @@ fn compute_quotient_polys<
                 }
             }
         });
-    let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
+    let inverse_coset_shift_powers = precomputed::normalized_inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
         .map(|column| {
-            // Fuse the coset post-scaling into the IFFT instead of walking the
-            // whole coefficient vector again afterwards, reusing a
-            // process-global inverse-shift power chain.
+            // Scales already include n^{-1}, so the IFFT reverse/normalize
+            // pass is one multiply per coefficient, not two.
             PolynomialValues::new(column)
-                .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
+                .coset_ifft_with_normalized_powers(inverse_coset_shift_powers.as_slice())
         })
         .collect()
 }
@@ -2552,6 +2551,7 @@ pub(crate) mod precomputed {
         static COSET_POWERS: OnceLock<Map> = OnceLock::new();
         static SHIFTED_SUBGROUPS: OnceLock<Map> = OnceLock::new();
         static INVERSE_COSET_POWERS: OnceLock<Map> = OnceLock::new();
+        static NORMALIZED_INVERSE_COSET_POWERS: OnceLock<Map> = OnceLock::new();
 
         fn get_or_compute<F: Field>(
             cache: &'static OnceLock<Map>,
@@ -2611,6 +2611,23 @@ pub(crate) mod precomputed {
                 F::coset_shift().inverse().powers().take(degree).collect()
             })
         }
+
+        /// Cached `n^{-1} * shift^{-i}` for the quotient coset IFFT.
+        /// Folding the IFFT 1/n factor into the process-global table
+        /// deletes one multiply per coefficient on every proof of this size.
+        pub(crate) fn normalized_inverse_coset_shift_powers<F: Field>(
+            degree: usize,
+        ) -> Arc<Vec<F>> {
+            get_or_compute(&NORMALIZED_INVERSE_COSET_POWERS, degree, || {
+                let n_inv = F::inverse_2exp(plonky2_util::log2_strict(degree));
+                F::coset_shift()
+                    .inverse()
+                    .powers()
+                    .take(degree)
+                    .map(|p| n_inv * p)
+                    .collect()
+            })
+        }
     }
 
     /// Without `std` there is no process-global synchronization; fall back to
@@ -2644,10 +2661,25 @@ pub(crate) mod precomputed {
                     .collect::<Vec<F>>(),
             )
         }
+
+        pub(crate) fn normalized_inverse_coset_shift_powers<F: Field>(
+            degree: usize,
+        ) -> Arc<Vec<F>> {
+            let n_inv = F::inverse_2exp(plonky2_util::log2_strict(degree));
+            Arc::new(
+                F::coset_shift()
+                    .inverse()
+                    .powers()
+                    .take(degree)
+                    .map(|p| n_inv * p)
+                    .collect::<Vec<F>>(),
+            )
+        }
     }
 
     pub(crate) use imp::{
-        coset_shift_powers, inverse_coset_shift_powers, shifted_two_adic_subgroup,
+        coset_shift_powers, inverse_coset_shift_powers, normalized_inverse_coset_shift_powers,
+        shifted_two_adic_subgroup,
         two_adic_subgroup,
     };
 }
