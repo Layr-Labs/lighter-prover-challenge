@@ -109,7 +109,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -167,8 +167,12 @@ const STAGING_CHUNK: usize = 1 << 19;
 /// Reuse only the recurring transaction/chain quotient outputs. The final
 /// block's one-off 32 MiB outputs remain uncached so the pool cannot amplify
 /// peak unified-memory pressure.
-const MAX_CACHED_QUOTIENT_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
+const MAX_CACHED_QUOTIENT_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+/// Total bytes the quotient-output pool may retain across all cached
+/// buffers (bytes-budget discipline, sibling of ColumnStorePool and the
+/// digest pool: covers the ~3 live quotient outputs per proof, each
+/// 16 B x quotient_rows, without unbounded RSS growth).
+const MAX_CACHED_QUOTIENT_OUTPUT_BUDGET: u64 = 128 * 1024 * 1024;
 /// Retain the recurring d14/d16 digest buffers, but not the one-off d18 final
 /// tree. These buffers replace equally large CPU digest vectors.
 const MAX_CACHED_DIGEST_OUTPUT_BYTES: u64 = 40 * 1024 * 1024;
@@ -790,6 +794,8 @@ struct BufferPool {
 #[derive(Default)]
 struct QuotientOutputPool {
     free: Vec<Buffer>,
+    /// Total bytes currently retained (the bytes-budget discipline).
+    free_bytes: u64,
 }
 
 impl QuotientOutputPool {
@@ -802,31 +808,35 @@ impl QuotientOutputPool {
             .filter(|(_, buffer)| buffer.length() >= bytes)
             .min_by_key(|(_, buffer)| buffer.length())
             .map(|(index, _)| index)?;
-        Some(self.free.swap_remove(index))
+        let buffer = self.free.swap_remove(index);
+        self.free_bytes -= buffer.length();
+        Some(buffer)
     }
 
-    /// Retains at most the two largest recurring-size buffers. A larger buffer
-    /// can service every smaller quotient shape, while final-proof outputs are
-    /// rejected by the size cap before they reach the cache.
+    /// Retains buffers under the per-buffer cap, bounded in total by the
+    /// bytes budget: a recycle that would exceed the budget evicts the
+    /// smallest cached buffer first. Larger buffers (final-proof outputs)
+    /// are rejected by the size cap before they reach the cache.
     fn recycle(&mut self, buffer: Buffer) {
         let length = buffer.length();
-        if length > MAX_CACHED_QUOTIENT_OUTPUT_BYTES {
+        if length > MAX_CACHED_QUOTIENT_OUTPUT_BYTES
+            || length > MAX_CACHED_QUOTIENT_OUTPUT_BUDGET
+        {
             return;
         }
-        if self.free.len() < MAX_CACHED_QUOTIENT_OUTPUTS {
-            self.free.push(buffer);
-            return;
+        while self.free_bytes + length > MAX_CACHED_QUOTIENT_OUTPUT_BUDGET {
+            let (smallest_index, smallest_length) = self
+                .free
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, cached)| cached.length())
+                .map(|(index, cached)| (index, cached.length()))
+                .expect("quotient output budget exceeded with an empty pool");
+            self.free.swap_remove(smallest_index);
+            self.free_bytes -= smallest_length;
         }
-        let (smallest_index, smallest_length) = self
-            .free
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, cached)| cached.length())
-            .map(|(index, cached)| (index, cached.length()))
-            .expect("full quotient output pool is nonempty");
-        if length > smallest_length {
-            self.free[smallest_index] = buffer;
-        }
+        self.free.push(buffer);
+        self.free_bytes += length;
     }
 }
 
@@ -4011,19 +4021,38 @@ mod tests {
         pool.recycle(buffer(2 * mib));
         pool.recycle(buffer(8 * mib));
         pool.recycle(buffer(4 * mib));
-        assert_eq!(pool.free.len(), MAX_CACHED_QUOTIENT_OUTPUTS);
+        assert_eq!(pool.free.len(), 3);
+        assert_eq!(pool.free_bytes, 14 * mib);
         let mut lengths = pool.free.iter().map(|buffer| buffer.length()).collect::<Vec<_>>();
         lengths.sort_unstable();
-        assert_eq!(lengths, vec![4 * mib, 8 * mib]);
+        assert_eq!(lengths, vec![2 * mib, 4 * mib, 8 * mib]);
 
         let four = pool.take_best_fit(3 * mib).expect("4 MiB best fit");
         assert_eq!(four.length(), 4 * mib);
+        assert_eq!(pool.free_bytes, 10 * mib);
+        let two = pool.take_best_fit(1).expect("remaining 2 MiB buffer");
+        assert_eq!(two.length(), 2 * mib);
+        assert_eq!(pool.free_bytes, 8 * mib);
         let eight = pool.take_best_fit(1).expect("remaining 8 MiB buffer");
         assert_eq!(eight.length(), 8 * mib);
+        assert_eq!(pool.free_bytes, 0);
         assert!(pool.take_best_fit(1).is_none());
 
         pool.recycle(buffer(MAX_CACHED_QUOTIENT_OUTPUT_BYTES + 1));
         assert!(pool.free.is_empty(), "oversized output must not be cached");
+
+        // Bytes-budget eviction: recycles under the budget all land; a
+        // recycle that would exceed the budget evicts the smallest first.
+        pool.recycle(buffer(16 * mib));
+        pool.recycle(buffer(32 * mib));
+        assert_eq!(pool.free_bytes, 48 * mib);
+        pool.recycle(buffer(48 * mib));
+        assert_eq!(pool.free_bytes, 96 * mib);
+        pool.recycle(buffer(48 * mib));
+        assert_eq!(pool.free_bytes, 128 * mib);
+        let mut lengths = pool.free.iter().map(|buffer| buffer.length()).collect::<Vec<_>>();
+        lengths.sort_unstable();
+        assert_eq!(lengths, vec![32 * mib, 48 * mib, 48 * mib]);
     }
 
     #[test]
