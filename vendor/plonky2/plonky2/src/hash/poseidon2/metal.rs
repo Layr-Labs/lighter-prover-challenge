@@ -2026,6 +2026,69 @@ pub(crate) fn allocate_columns<F: RichField>(
 /// serializes any unexpected second caller onto the classic path.
 static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
 
+/// Pre-faulted (state, digest) pair for the final-block streamed sponge.
+/// Those two buffers are the first things `poseidon2_absorb_pass` binds on
+/// the serial tail; they are larger than any pipelined 2^19 stream, so the
+/// live `STREAMED_BUFFERS` slot is reallocated there today. A size miss
+/// falls through to that fresh allocation.
+static PREWARMED_STREAMED: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
+
+/// Allocates and page-walks the streamed Merkle state + digest buffers for
+/// a `leaf_count`-row tree (12-lane column-major state, level-order digest
+/// output with cap height 4). Scheduling-only: both buffers are fully
+/// overwritten by absorb / parent passes before any read.
+pub fn prewarm_streamed_merkle_buffers(leaf_count: u64) {
+    let Some(context) = shared_context() else {
+        return;
+    };
+    if leaf_count == 0 || !leaf_count.is_power_of_two() {
+        return;
+    }
+    let state_bytes = leaf_count.saturating_mul(12).saturating_mul(8);
+    let cap_count = 16u64;
+    let total_nodes = 2u64.saturating_mul(leaf_count).saturating_sub(cap_count);
+    let output_bytes = total_nodes.saturating_mul(4).saturating_mul(8);
+    if state_bytes == 0 || output_bytes == 0 {
+        return;
+    }
+    let (state, output) = autoreleasepool(|| {
+        (
+            context
+                .device
+                .new_buffer(state_bytes, MTLResourceOptions::StorageModeShared),
+            context
+                .device
+                .new_buffer(output_bytes, MTLResourceOptions::StorageModeShared),
+        )
+    });
+    if let Ok(mut slot) = PREWARMED_STREAMED.lock() {
+        *slot = Some((state.clone(), output.clone()));
+    }
+    const PAGE: isize = 16 * 1024;
+    for buffer in [&state, &output] {
+        let base = buffer.contents().cast::<u8>();
+        if base.is_null() {
+            continue;
+        }
+        let bytes = buffer.length();
+        let mut offset: isize = 0;
+        while (offset as u64) < bytes {
+            // SAFETY: offset stays within the buffer's allocated length.
+            unsafe { base.offset(offset).write_volatile(0) };
+            offset += PAGE;
+        }
+    }
+}
+
+fn take_prewarmed_streamed(state_bytes: u64, output_bytes: u64) -> Option<(Buffer, Buffer)> {
+    let mut slot = PREWARMED_STREAMED.try_lock().ok()?;
+    let (state, output) = slot.as_ref()?;
+    if state.length() >= state_bytes && output.length() >= output_bytes {
+        return slot.take();
+    }
+    None
+}
+
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
 /// the GPU absorbs each group while the CPU fills the next. Only used inside
@@ -2089,18 +2152,20 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         state.length() < state_bytes as u64 || output.length() < output_bytes as u64
     });
     if needs_new {
-        *buffers = Some(autoreleasepool(|| {
-            (
-                context.device.new_buffer(
-                    state_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
-                context.device.new_buffer(
-                    output_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
-            )
-        }));
+        *buffers = take_prewarmed_streamed(state_bytes as u64, output_bytes as u64).or_else(|| {
+            Some(autoreleasepool(|| {
+                (
+                    context.device.new_buffer(
+                        state_bytes as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    ),
+                    context.device.new_buffer(
+                        output_bytes as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    ),
+                )
+            }))
+        });
     }
     let (state_buffer, output_buffer) = buffers.as_mut()?;
 
@@ -6503,6 +6568,23 @@ kernel void goldilocks_mul_bench_native(
             .build(LeafSource::Shared(&columns), cols, rows, cap_height)
             .expect("classic tree");
         assert_eq!(streamed, classic);
+    }
+
+    #[test]
+    fn prewarmed_streamed_pair_is_consumed_once() {
+        assert!(shared_context().is_some(), "Metal context must initialize");
+        let leaves = 1u64 << 10;
+        prewarm_streamed_merkle_buffers(leaves);
+        let state_bytes = leaves * 12 * 8;
+        let output_bytes = (2 * leaves - 16) * 4 * 8;
+        let (state, output) = take_prewarmed_streamed(state_bytes, output_bytes)
+            .expect("matching streamed prewarm");
+        assert!(state.length() >= state_bytes);
+        assert!(output.length() >= output_bytes);
+        assert!(
+            take_prewarmed_streamed(state_bytes, output_bytes).is_none(),
+            "stash must be single-use"
+        );
     }
 
     #[test]

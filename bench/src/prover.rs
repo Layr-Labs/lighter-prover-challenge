@@ -677,6 +677,10 @@ fn prove_path(
                 const BLOCK_WIRES_STORE_BYTES: u64 =
                     (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
                 plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
+                // Absorb-pass state (12 lanes x 2^21) + d18 digest output —
+                // the first binds of the streamed wires commit, not the LDE
+                // column store. Size drift misses the stash harmlessly.
+                plonky2::hash::poseidon2::prewarm_streamed_merkle_buffers(1 << 21);
             })
             .ok();
     }
